@@ -1,0 +1,19 @@
+{
+  "bun-lockb-trusted": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/simple-git-hooks@2.11.1",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  }
+}

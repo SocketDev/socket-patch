@@ -38,6 +38,10 @@
 //! the fixture build (a failure instead under
 //! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); all assertions after that are hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -68,10 +72,6 @@ const GHSA: &str = "GHSA-migr-cargo-test";
 /// `--cap-lints allow`.
 const PATCH_SUFFIX: &str =
     "\n/// Socket-patch capstone marker (added by the patch).\npub fn socket_patched() -> u32 { 1 }\n";
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
     run_socket_env(cwd, args, cargo_home, &[])
@@ -127,10 +127,6 @@ fn assert_build_ok(tag: &str, out: &Output) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    compute_git_sha256_from_bytes(content)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

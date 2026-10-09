@@ -28,8 +28,8 @@ use crate::constants::npm_family::{
     RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
 use crate::patch::redirect::npmrc::{
-    plan_npmrc_allow_remote_with, NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND,
-    NPMRC_REL,
+    effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
+    NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
 };
 use crate::patch::redirect::presence::groups_present;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
@@ -39,19 +39,20 @@ use crate::patch::redirect::{
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
-use crate::vendor::lock_inventory::{MemoryEntry, ProjectView};
+use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
     npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
-    npm_allow_remote_user_set_detail, npm_lock_url_needles, plan_workspace_trust, pnpm_heal_root,
-    pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
-    pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
-    pnpm_trust_policy_preamble, pnpm_trust_workspace_unreadable_detail,
+    npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_replace_registry_host_detail,
+    plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
+    pnpm_lock_version_major, pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
+    pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_not_needed_detail,
+    pnpm_trust_policy_preamble, pnpm_trust_rush_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    url_host, TrustPlan, NPM_LOCKS, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
-    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    url_host, TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
+    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -305,23 +306,11 @@ pub fn build_candidates(
     candidates
 }
 
-/// Whether the text `bun.lock` is present (disk: `exists`). Text retains
-/// Bun's precedence when both lock spellings are present.
-pub fn bun_lock_present(view: &ProjectView<'_>) -> bool {
-    match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join("bun.lock").exists(),
-        ProjectView::Memory(project) => project.contains("bun.lock"),
-    }
-}
-
 /// Whether an npm candidate would rewrite a `bun.lockb` that is a symbolic
 /// link (atomic replacement cannot preserve a link; previews refuse too).
 pub fn bun_lockb_symlinked(view: &ProjectView<'_>, candidates: &[Candidate]) -> bool {
     candidates.iter().any(|c| c.dep.ecosystem == "npm")
-        && !bun_lock_present(view)
+        && !bun_text_lock_drives(view)
         && view.is_symlink("bun.lockb")
 }
 
@@ -348,6 +337,9 @@ pub struct CandidateFiles {
     pub files: BTreeMap<String, String>,
     /// The Rush locks among `files` (the repo-state warning keys on them).
     pub rush_lock_keys: Vec<String>,
+    /// The workspace members' own locks among `files`, read beside the
+    /// root's when the workspace turned the shared lock off (#492).
+    pub pnpm_member_lock_keys: Vec<String>,
     /// In memory only: candidate files the disk flow reads through a
     /// symbolic link. Their bytes are unknown here, so a project whose
     /// candidates could rewrite one is refused like the disk symlink guard
@@ -373,6 +365,13 @@ pub struct CandidateFiles {
     /// lock was left out of `files`, and the rewrite reports this instead
     /// of a redirect.
     pub gem_refusal: Option<RewriteWarning>,
+    /// Set when the root pnpm lock pins nothing pnpm installs: the
+    /// workspace keeps one lock per member but the members cannot be
+    /// listed (#492), or `gitBranchLockfile` installs the branch from a
+    /// `pnpm-lock.<branch>.yaml` (#556). The root lock was left out of
+    /// `files`, and the rewrite reports this instead of a redirect or a
+    /// "no lockfile" hint.
+    pub pnpm_refusal: Option<RewriteWarning>,
 }
 
 impl CandidateFiles {
@@ -430,31 +429,13 @@ impl CandidateFiles {
     }
 }
 
-/// The root-level Python lock names (sorted).
-async fn python_lock_paths(view: &ProjectView<'_>) -> Vec<String> {
-    match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default(),
-        ProjectView::Memory(project) => project
-            .children("")
-            .into_iter()
-            .filter(|(name, is_dir)| {
-                !is_dir && crate::utils::python_lock::is_python_lock_name(name)
-            })
-            .map(|(name, _)| name)
-            .collect(),
-    }
-}
-
 /// Whether the project is a Rush monorepo (disk: `rush.json` is a file).
 fn rush_repo(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join("rush.json").is_file(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join("rush.json").is_file()
+        }
         ProjectView::Memory(project) => project.contains("rush.json"),
     }
 }
@@ -500,7 +481,8 @@ async fn read_advisory(
 
 /// Read the project's candidate files: [`REDIRECT_CANDIDATE_FILES`], the
 /// Cargo workspace members (when a cargo candidate meets a root
-/// `Cargo.toml`), the Python locks and their scripts, and the Rush locks.
+/// `Cargo.toml`), the Python locks and their scripts, the Rush locks, and
+/// the pnpm workspace members' own locks.
 /// `unreadable` are the in-memory paths that exist without content.
 pub async fn read_candidate_files(
     view: &ProjectView<'_>,
@@ -608,6 +590,35 @@ pub async fn read_candidate_files(
         out.read(view, unreadable, crate::patch::redirect::YARNRC_REL)
             .await;
         out.read(view, unreadable, NPMRC_REL).await;
+        // A `file:` directory copy is locked under the DEPENDENCY name, so
+        // the classic rewriter reads which package it is from the
+        // directory's `package.json` (#1236). Advisory: never rewritten,
+        // and an unreadable one only leaves that copy unnamed.
+        let dirs: BTreeSet<String> = out
+            .files
+            .get("yarn.lock")
+            .map(|lock| {
+                crate::vendor::lock_inventory::yarn::classic_entries(lock)
+                    .iter()
+                    .filter_map(|e| {
+                        crate::formats::yarn::source::classic_file_directory(&e.patterns)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for dir in dirs {
+            let rel = if dir.is_empty() {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            };
+            if out.files.contains_key(&rel) {
+                continue;
+            }
+            if let Some(text) = read_advisory(view, unreadable, &rel).await {
+                out.files.insert(rel, text);
+            }
+        }
     }
 
     // Cargo workspace members (and in-root path dependencies) declare
@@ -621,7 +632,7 @@ pub async fn read_candidate_files(
         }
     }
 
-    for path in python_lock_paths(view).await {
+    for path in view.python_lock_paths() {
         if let Some(script) = crate::utils::python_lock::script_of_lock(&path) {
             out.read(view, unreadable, script).await;
         }
@@ -646,6 +657,12 @@ pub async fn read_candidate_files(
                     out.rush_lock_keys.push(key);
                 }
             }
+        }
+    } else if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
+            refuse_git_branch_locks(&mut out, &branch);
+        } else {
+            read_pnpm_member_locks(view, unreadable, &mut out).await;
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
@@ -694,6 +711,110 @@ pub async fn read_candidate_files(
     out.undecodable_reads.dedup();
     out
 }
+
+/// A pnpm workspace with `sharedWorkspaceLockfile: false` installs each
+/// member from the member's own `pnpm-lock.yaml`; the root lock covers the
+/// root project alone (pnpm 7 writes none at all). Every member lock is a
+/// rewrite target, read strictly under its root-relative key: the pnpm
+/// rewriter is basename-generalized and the write-back path-generic, like
+/// the Rush locks above. Members whose list cannot be read leave the root
+/// lock out too and refuse (see [`CandidateFiles::pnpm_refusal`]).
+/// In memory too: the in-memory engine demotes each member lock into its
+/// workspace root once that root's files confirm it reads them
+/// (`confirm_pnpm_members` in [`super::memory`]),
+/// so the root reads them here as a disk run from it does; a member lock
+/// whose content was not provided refuses the project like an unreadable
+/// root lock.
+async fn read_pnpm_member_locks(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
+    match member_locks(view).await {
+        MemberLocks::Shared => {}
+        MemberLocks::PerMember(keys) => {
+            for key in keys {
+                if out.read(view, unreadable, &key).await {
+                    out.pnpm_member_lock_keys.push(key);
+                    continue;
+                }
+                // A member lock that exists but cannot be read (a FIFO, not
+                // UTF-8) still drives that member's install: pinning the
+                // others would confirm the dep while it stays upstream there.
+                for read in std::mem::take(&mut out.pnpm_member_lock_keys) {
+                    out.files.remove(&read);
+                }
+                refuse_pnpm_members(
+                    out,
+                    format!(
+                        "{key} (a workspace member's own lock under \
+                         sharedWorkspaceLockfile: false) cannot be read as text"
+                    ),
+                );
+                return;
+            }
+        }
+        MemberLocks::Unresolved(why) => refuse_pnpm_members(out, why),
+    }
+}
+
+/// Leave the root pnpm lock out and record why (see
+/// [`CandidateFiles::pnpm_refusal`]).
+fn refuse_pnpm_members(out: &mut CandidateFiles, why: String) {
+    out.files.remove("pnpm-lock.yaml");
+    out.pnpm_refusal = Some(RewriteWarning {
+        code: PNPM_MEMBER_LOCKS_UNRESOLVED.into(),
+        detail: format!(
+            "{why}; no pnpm lock was rewritten — make every member lock a readable \
+             file listed by plain `packages:` globs (or install the members) and re-run"
+        ),
+    });
+}
+
+/// `gitBranchLockfile` with a branch lock present (#556): pnpm installs
+/// the branch from that lock, which hosted mode cannot pin, so the root
+/// lock (stale on the branch) is left out and the run refuses every pnpm
+/// pin (see [`CandidateFiles::pnpm_refusal`]). In memory the root lock is
+/// dropped from the link and unreadable lists too: it is not written.
+fn refuse_git_branch_locks(
+    out: &mut CandidateFiles,
+    branch: &crate::utils::pnpm_workspace::GitBranchLocks,
+) {
+    const ROOT_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
+    for lock in ROOT_LOCKS {
+        out.files.remove(lock);
+    }
+    out.symlinked_reads
+        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
+    out.unreadable_reads
+        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
+    out.pnpm_refusal = Some(git_branch_lock_refusal(branch));
+}
+
+/// The [`PNPM_GIT_BRANCH_LOCKFILE`] warning for `branch`: the hosted
+/// rewrite's, and the vendored→hosted takeover's (which keeps the vendored
+/// wiring rather than revert it into a lock pnpm does not install from).
+pub fn git_branch_lock_refusal(
+    branch: &crate::utils::pnpm_workspace::GitBranchLocks,
+) -> RewriteWarning {
+    RewriteWarning {
+        code: PNPM_GIT_BRANCH_LOCKFILE.into(),
+        detail: format!(
+            "{}; no pnpm lock was rewritten — {}",
+            branch.describe(),
+            crate::utils::pnpm_workspace::GitBranchLocks::REMEDY
+        ),
+    }
+}
+
+/// Refusal code for a `sharedWorkspaceLockfile: false` workspace whose
+/// member locks cannot be listed.
+pub const PNPM_MEMBER_LOCKS_UNRESOLVED: &str = "redirect_pnpm_member_locks_unresolved";
+
+/// Refusal code for a project whose `gitBranchLockfile` setting makes pnpm
+/// install from a `pnpm-lock.<branch>.yaml` (#556).
+pub const PNPM_GIT_BRANCH_LOCKFILE: &str = "redirect_pnpm_git_branch_lockfile";
 
 /// Read what the hosted Gradle planner needs into `out` (see
 /// [`crate::patch::redirect::gradle::GradleFiles`]): the script graph is
@@ -816,8 +937,8 @@ async fn keep_bundler_loaded_gem_files(
         .collect();
     let loaded = crate::crawlers::ruby_crawler::bundler_loaded_manifest_in(view).await;
     let mirror = match view {
-        ProjectView::Disk(root)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let root = view.disk_root().expect("a disk view has a root");
             crate::crawlers::ruby_crawler::bundler_source_mirror(root, &sources).await
         }
         ProjectView::Memory(_) => {
@@ -1014,6 +1135,7 @@ pub fn pipenv_lock_targets(files: &BTreeMap<String, String>, candidates: &[Candi
 }
 
 /// The host-dependent inputs of [`rewrite`].
+#[derive(Clone)]
 pub struct RewriteOptions<'a> {
     pub dry_run: bool,
     /// Whether a pypi candidate targets `Pipfile.lock`
@@ -1038,6 +1160,28 @@ pub struct RewriteOptions<'a> {
     /// Run the rewriters on the blocking pool (the disk flow: pure CPU over
     /// every lock text).
     pub blocking: bool,
+    /// Uuids of the run's staged vendored→hosted takeovers (wet and dry
+    /// runs alike): the caller reverted their vendored wiring in the group
+    /// overlay before the rewrite, so the attribution gate never drops
+    /// them, and their pin keeps the rewriters' verdict (a takeover the
+    /// rewriters do not pin is retracted by the caller and stays vendored).
+    /// Empty for the in-memory engine, which takes nothing over.
+    pub takeover_uuids: BTreeSet<String>,
+    /// The operator's extra patch-server origins (`--patch-server-url`):
+    /// the allowlist `vex`, `list`, `rollback`, `remove` and `vendor`
+    /// discover with, so the attribution gate sees an existing pin on a
+    /// configured server even when this run's grants live on another host.
+    /// Empty for the in-memory engine, which has no such knob.
+    pub patch_server_origins: Vec<String>,
+    /// Lockfile discovery of the project exactly as this rewrite reads it,
+    /// made with exactly `patch_server_origins` (the caller's pre-rewrite
+    /// discovery, `None` when nothing was discovered or the project may
+    /// have changed since). The attribution gate reuses it instead of
+    /// discovering again when a pass writes nothing and this run's grants
+    /// name no origin that `patch_server_origins` does not already count
+    /// (see [`reusable_prior`]): the project it would discover is then the
+    /// same, read the same way.
+    pub prior_discovery: Option<&'a crate::vex::discover::Discovery>,
 }
 
 /// One project's rewrite, ready for the guard, the record fetch and the
@@ -1057,6 +1201,10 @@ pub struct Rewritten {
     /// `(purl, uuid)` of each candidate whose redirect is pinned by the
     /// project's final files, in candidate order.
     pub confirmed: Vec<(String, String)>,
+    /// Candidates left out of the rewrite because lockfile discovery could
+    /// not attribute the pin they would land (see [`rewrite`]): reported as
+    /// skipped, written nowhere.
+    pub unattributed: Vec<SkippedPatch>,
     /// A `bun.lockb` without a text `bun.lock` drives npm.
     pub binary_bun: bool,
     pub rush_warnings: Vec<RewriteWarning>,
@@ -1069,6 +1217,46 @@ pub struct Rewritten {
     /// In memory only: the trust auto-config would write through a
     /// symlinked `pnpm-workspace.yaml`.
     pub(crate) workspace_symlinked: bool,
+    /// The attribution gate's discovery of the project as this rewrite
+    /// leaves it, when it equals a discovery made with exactly
+    /// [`RewriteOptions::patch_server_origins`] (this run's grants name no
+    /// other origin). `None` when the gate discovered nothing (no
+    /// confirmed candidate) or counted another origin. A caller that
+    /// writes exactly [`RewriteResult::files`] and
+    /// [`RewriteResult::binary_files`] and nothing else may use it in place
+    /// of discovering the written project again (see [`FinalDiscovery`]).
+    pub final_discovery: Option<FinalDiscovery>,
+}
+
+/// Where [`Rewritten::final_discovery`] lives.
+#[derive(Debug)]
+pub enum FinalDiscovery {
+    /// The pass wrote nothing, and the gate reused the caller's
+    /// [`RewriteOptions::prior_discovery`]: still the caller's to read.
+    Prior,
+    /// A discovery of the project with the pass's writes overlaid (the
+    /// project read when the gate ran). Every read the view mediates sees
+    /// the overlay, created files included (see
+    /// [`DiskSnapshot::overlay`](crate::vendor::lock_inventory::DiskSnapshot::overlay)),
+    /// so it equals a discovery of the written disk when every written file
+    /// already existed, or when discovery read nothing around the view
+    /// (`view_only`), or when each created file is one no such read can
+    /// see ([`overlay_creation_is_invisible`]).
+    Overlaid {
+        discovery: Box<crate::vex::discover::Discovery>,
+        /// Discovery read the project only through the overlaid view (no
+        /// raw disk read: the vlt store, sbt evidence, a vendored feed).
+        view_only: bool,
+    },
+}
+
+/// Whether CREATING `rel` (a write over no existing regular file) leaves a
+/// discovery over the overlaid project equal to one over the written disk:
+/// the root config files the install-policy auto-configs create
+/// ([`NPMRC_REL`], [`PNPM_WORKSPACE_REL`]), which discovery reads, if at
+/// all, by path and never finds by listing a directory.
+pub fn overlay_creation_is_invisible(rel: &str) -> bool {
+    rel == NPMRC_REL || rel == PNPM_WORKSPACE_REL
 }
 
 /// The pnpm-workspace.yaml read, classified for the trust auto-config
@@ -1076,13 +1264,13 @@ pub struct Rewritten {
 /// symbolic link (absent to the planner, refused by [`guard`]).
 fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, bool) {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => (
-            read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)),
-            false,
-        ),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            (
+                read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)),
+                false,
+            )
+        }
         ProjectView::Memory(project) => match project.get(PNPM_WORKSPACE_REL) {
             None => (Ok(None), false),
             Some(MemoryEntry::Text(text)) => (Ok(Some(text.to_string())), false),
@@ -1109,10 +1297,10 @@ fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, b
 /// [`read_npmrc_for_allow_remote`]).
 fn read_npmrc(view: &ProjectView<'_>) -> Result<Option<String>, String> {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => read_npmrc_for_allow_remote(&cwd.join(NPMRC_REL)),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            read_npmrc_for_allow_remote(&cwd.join(NPMRC_REL))
+        }
         ProjectView::Memory(project) => match project.get(NPMRC_REL) {
             None => Ok(None),
             Some(MemoryEntry::Symlink) => {
@@ -1129,14 +1317,25 @@ fn read_npmrc(view: &ProjectView<'_>) -> Result<Option<String>, String> {
     }
 }
 
-/// Whether Rush's repo-state file is present (disk: a regular file).
-fn rush_repo_state_present(view: &ProjectView<'_>) -> bool {
+/// The repo-state.json that carries the pnpmShrinkwrapHash of the Rush lock
+/// at `lock_key`: the file beside it. The common lock maps to
+/// [`RUSH_REPO_STATE_REL`]; with subspaces enabled each subspace keeps its
+/// own, at `common/config/subspaces/<name>/repo-state.json`.
+fn rush_repo_state_for_lock(lock_key: &str) -> String {
+    match lock_key.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/repo-state.json"),
+        None => "repo-state.json".to_string(),
+    }
+}
+
+/// Whether the Rush repo-state file `rel` is present (disk: a regular file).
+fn rush_repo_state_present(view: &ProjectView<'_>, rel: &str) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join(RUSH_REPO_STATE_REL).is_file(),
-        ProjectView::Memory(project) => project.contains(RUSH_REPO_STATE_REL),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join(rel).is_file()
+        }
+        ProjectView::Memory(project) => project.contains(rel),
     }
 }
 
@@ -1192,20 +1391,320 @@ pub async fn rewrite(
     withheld_from_vlt: &BTreeSet<String>,
     options: RewriteOptions<'_>,
 ) -> Rewritten {
+    // The run must never leave wiring that lockfile discovery — what `vex`,
+    // `list`, `rollback`, `remove` and `vendor` read — calls contested. A
+    // candidate the rewriters confirm but discovery cannot attribute to one
+    // package version (another lock resolving the same version elsewhere, a
+    // pin Maven never consumes) would be refused by every later command, so
+    // it is dropped and the rest rewritten without it. Each pass drops at
+    // least one candidate, so this ends. A staged takeover is never dropped
+    // (see [`RewriteOptions::takeover_uuids`]): its vendored wiring is
+    // reverted in the overlay, and its pin keeps the rewriters' verdict.
+    let exempt: BTreeSet<String> = withheld_from_vlt
+        .union(&options.takeover_uuids)
+        .cloned()
+        .collect();
+    let mut kept: Vec<Candidate> = candidates.to_vec();
+    let mut unattributed: Vec<SkippedPatch> = Vec::new();
+    loop {
+        let mut done = rewrite_once(
+            view,
+            read.clone(),
+            &kept,
+            python_metadata.clone(),
+            withheld_from_vlt,
+            options.clone(),
+        )
+        .await;
+        let Gated {
+            vetoed,
+            lockless,
+            discovery,
+        } = unattributed_pins(
+            view,
+            &done,
+            &kept,
+            &exempt,
+            &options.patch_server_origins,
+            options.prior_discovery,
+        )
+        .await;
+        if vetoed.is_empty() {
+            done.unattributed = unattributed;
+            done.rewrite.warnings.extend(lockless);
+            done.final_discovery = discovery;
+            return done;
+        }
+        kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
+        unattributed.extend(vetoed);
+    }
+}
+
+/// Lockfile discovery over the project as `done` would leave it, read as
+/// the management commands read it ([`HostedInventory`]): the skips for
+/// the confirmed candidates whose pin would be contested wiring, and a
+/// [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin. A lockless NuGet /
+/// Cargo pin ([`UnlockedPin`]) is written as before — whether such a pin
+/// may be written at all is the open hosted-rollback decision (E45) — but
+/// the run says that nothing can manage it until a lockfile exists.
+///
+/// A deliberate partial redirect keeps its behavior too: a dep whose
+/// bundled or user-patched copy the rewriters knowingly left on the
+/// registry (`bundled_skipped_uuids`, or a bundled copy in vlt's store;
+/// both are warned and kept out of the in-run VEX), or one withheld from
+/// the vlt rewrite while a sibling lock takes it, and a wet vendored→hosted
+/// takeover whose vendored wiring the caller already reverted (both in
+/// `exempt`). Which unreachable copies should block a redirect is the
+/// copy-source policy (audit B16), not decided here.
+///
+/// [`HostedInventory`]: crate::patch::redirect::upstream::HostedInventory
+/// [`UnlockedPin`]: crate::vex::discover::UnlockedPin
+async fn unattributed_pins(
+    view: &ProjectView<'_>,
+    done: &Rewritten,
+    candidates: &[Candidate],
+    exempt: &BTreeSet<String>,
+    configured: &[String],
+    prior: Option<&crate::vex::discover::Discovery>,
+) -> Gated {
+    if done.confirmed.is_empty() {
+        return Gated::default();
+    }
+    // The management commands' allowlist plus the hosts this run's grants
+    // name: a pin on either counts, as it will for them. A grant on
+    // Socket's own server or a configured one adds nothing discovery does
+    // not already count, so the discovery is then the one `configured`
+    // alone makes.
+    let foreign = crate::patch::redirect::upstream::foreign_dep_origins(
+        candidates.iter().map(|c| &c.dep),
+        configured,
+    );
+    let same_origins = foreign.is_empty();
+    let mut origins = configured.to_vec();
+    for origin in foreign {
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    let opts = crate::vex::DiscoverOptions {
+        patch_server_origins: origins,
+    };
+    let mut written: Vec<(&str, &[u8])> = Vec::new();
+    for (rel, text) in &done.rewrite.files {
+        if !crate::patch::redirect::sbt::is_synthetic_key(rel) {
+            written.push((rel.as_str(), text.as_bytes()));
+        }
+    }
+    for (rel, bytes) in &done.rewrite.binary_files {
+        written.push((rel.as_str(), bytes.as_slice()));
+    }
+    let reused = reusable_prior(prior, written.is_empty(), same_origins);
+    let fresh = if reused.is_some() {
+        None
+    } else {
+        Some(match view.disk_root() {
+            None => {
+                let ProjectView::Memory(project) = *view else {
+                    unreachable!("only a memory view has no disk root")
+                };
+                let mut after = project.clone();
+                for (rel, bytes) in written {
+                    let entry = match std::str::from_utf8(bytes) {
+                        Ok(text) => crate::vendor::lock_inventory::MemoryEntry::Text(text.into()),
+                        Err(_) => crate::vendor::lock_inventory::MemoryEntry::Binary(bytes.into()),
+                    };
+                    after.insert(rel, entry);
+                }
+                let discovery = crate::vex::discover::discover_patched_refs_view(
+                    ProjectView::Memory(&after),
+                    &opts,
+                )
+                .await;
+                (discovery, true)
+            }
+            Some(root) => {
+                // Tracked only to learn whether discovery read around the
+                // overlay (see `FinalDiscovery::Overlaid::view_only`).
+                let after = crate::vendor::lock_inventory::DiskSnapshot::tracked(root);
+                for (rel, bytes) in written {
+                    after.overlay(rel, bytes);
+                }
+                after.begin_recording();
+                let discovery = crate::vex::discover::discover_patched_refs_view(
+                    ProjectView::Snapshot(&after),
+                    &opts,
+                )
+                .await;
+                (discovery, after.end_recording().is_some())
+            }
+        })
+    };
+    let discovery = match (reused, &fresh) {
+        (Some(prior), _) => prior,
+        (None, Some((fresh, _))) => fresh,
+        (None, None) => unreachable!("a pass reuses the prior discovery or discovers afresh"),
+    };
+    // The management commands' own view of the result: an attributable
+    // pin, or contested wiring they would refuse around.
+    let inventory = crate::patch::redirect::upstream::HostedInventory::of(discovery);
+    let attributed: BTreeSet<&str> = inventory.pins.iter().map(|p| p.uuid.as_str()).collect();
+    let lockless: Vec<RewriteWarning> = discovery
+        .unlocked_pins
+        .iter()
+        .filter(|pin| {
+            !attributed.contains(pin.uuid.as_str())
+                && done.confirmed.iter().any(|(_, uuid)| *uuid == pin.uuid)
+        })
+        .map(|pin| {
+            let create = match pin.ecosystem.as_str() {
+                "nuget" => "create packages.lock.json (`dotnet restore --use-lock-file`)",
+                "cargo" => "create Cargo.lock (`cargo generate-lockfile`)",
+                _ => "create the lockfile",
+            };
+            warning(
+                REDIRECT_PIN_LOCKLESS,
+                format!(
+                    "{}: {} is pinned to patch {} without a lockfile that records its version, \
+                     so `vex` cannot attest it and `rollback`, `remove` and `vendor` refuse it \
+                     as unattributable; {create} and re-run `socket-patch scan --mode hosted` \
+                     to make it manageable",
+                    pin.file.display(),
+                    pin.name,
+                    pin.uuid
+                ),
+            )
+        })
+        .collect();
+    // Contested wiring (not a lockless pin, see above) is what the run must
+    // never leave behind. A pin discovery does not see at all (a file it
+    // does not read, such as a pre-2.6 bundler Gemfile the next `bundle
+    // install` locks) is no such wiring and keeps the rewriters' verdict.
+    let contested: BTreeSet<&str> = inventory
+        .contested
+        .iter()
+        .filter(|c| c.lockless.is_empty())
+        .map(|c| c.uuid.as_str())
+        .collect();
+    // vlt's bundled copies live only in its installed store, which the
+    // rewriters never read (the scan warns about them after the writes).
+    let vlt_bundled: BTreeSet<String> = match view.disk_root() {
+        Some(root) if !contested.is_empty() => crate::vendor::vlt_bundled::bundled_copies(root)
+            .await
+            .into_keys()
+            .collect(),
+        _ => BTreeSet::new(),
+    };
+    let vetoed = done
+        .confirmed
+        .iter()
+        .filter(|(purl, uuid)| {
+            !attributed.contains(uuid.as_str())
+                && contested.contains(uuid.as_str())
+                && !done.rewrite.bundled_skipped_uuids.contains(uuid)
+                && !exempt.contains(uuid)
+                && !vlt_bundled.contains(&crate::utils::purl_key::canonical_base_purl(purl))
+        })
+        .map(|(purl, uuid)| {
+            let findings: Vec<&str> = discovery
+                .diagnostics
+                .iter()
+                .filter(|d| d.detail.contains(uuid.as_str()) || d.detail.contains(purl.as_str()))
+                .map(|d| d.detail.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let why = if findings.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", findings.join("; "))
+            };
+            SkippedPatch {
+                purl: purl.clone(),
+                uuid: uuid.clone(),
+                reason: REDIRECT_UNATTRIBUTABLE.to_string(),
+                detail: Some(format!(
+                    "the rewrite would wire patch {uuid} for {purl}, but lockfile discovery (what \
+                     `vex`, `list`, `rollback` and `vendor` read) cannot attribute that pin to \
+                     one package version{why}, so nothing was changed for it; reconcile the \
+                     project's lockfiles and re-run"
+                )),
+            }
+        })
+        .collect();
+    let discovery = match (same_origins, fresh) {
+        (false, _) => None,
+        (true, None) => Some(FinalDiscovery::Prior),
+        (true, Some((fresh, view_only))) => Some(FinalDiscovery::Overlaid {
+            discovery: Box::new(fresh),
+            view_only,
+        }),
+    };
+    Gated {
+        vetoed,
+        lockless,
+        discovery,
+    }
+}
+
+/// What [`unattributed_pins`] decided for one pass.
+#[derive(Default)]
+struct Gated {
+    /// The confirmed candidates whose pin would be contested wiring.
+    vetoed: Vec<SkippedPatch>,
+    /// A [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin.
+    lockless: Vec<RewriteWarning>,
+    /// The discovery the verdict read, for [`Rewritten::final_discovery`].
+    discovery: Option<FinalDiscovery>,
+}
+
+/// The caller's pre-rewrite discovery, when it is exactly what the gate
+/// would discover: the pass writes nothing (so the project is the one the
+/// caller discovered) and the gate's origins (`configured` plus the
+/// grants' hosts) count exactly the pins the caller's (`configured` alone)
+/// did: `same_origins`, no grant on a host outside Socket's own server and
+/// `configured` ([`foreign_dep_origins`]).
+///
+/// [`foreign_dep_origins`]: crate::patch::redirect::upstream::foreign_dep_origins
+fn reusable_prior(
+    prior: Option<&crate::vex::discover::Discovery>,
+    nothing_written: bool,
+    same_origins: bool,
+) -> Option<&crate::vex::discover::Discovery> {
+    prior.filter(|_| nothing_written && same_origins)
+}
+
+/// Warning: a confirmed pin no lockfile records a version for (a lockless
+/// NuGet / Cargo redirect), which no later command can attribute.
+pub const REDIRECT_PIN_LOCKLESS: &str = "redirect_pin_lockless";
+
+/// `skipped[].reason` of a candidate whose pin lockfile discovery would not
+/// attribute (see [`rewrite`]).
+pub const REDIRECT_UNATTRIBUTABLE: &str = "redirect_unattributable";
+
+async fn rewrite_once(
+    view: &ProjectView<'_>,
+    read: CandidateFiles,
+    candidates: &[Candidate],
+    python_metadata: BTreeMap<String, String>,
+    withheld_from_vlt: &BTreeSet<String>,
+    options: RewriteOptions<'_>,
+) -> Rewritten {
     let CandidateFiles {
         files,
         rush_lock_keys,
+        pnpm_member_lock_keys,
         symlinked_reads,
         unreadable_reads,
         undecodable_reads,
         gradle_unreadable,
         gem_refusal,
+        pnpm_refusal,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
     // candidate filter, so it can never disagree with `candidates`.
     let overrides: Vec<DepOverride> = candidates.iter().map(|c| c.dep.clone()).collect();
     let bun_lockb = bun_lockb_present(view);
-    let binary_bun = !bun_lock_present(view) && bun_lockb;
+    let binary_bun = !bun_text_lock_drives(view) && bun_lockb;
     let binary_content = if binary_bun && overrides.iter().any(|o| o.ecosystem == "npm") {
         Some(
             view.read_bytes("bun.lockb")
@@ -1283,6 +1782,14 @@ pub async fn rewrite(
             .retain(|w| w.code != "redirect_gem_no_gemfile");
         rewrite.warnings.push(warning);
     }
+    // The pnpm locks were withheld on purpose: say why, not "run `pnpm
+    // install`" (which never writes a root lock in either layout).
+    if let Some(warning) = pnpm_refusal {
+        rewrite.warnings.retain(|w| {
+            w.code != "redirect_pnpm_no_lockfile" && w.code != "redirect_npm_no_lockfile"
+        });
+        rewrite.warnings.push(warning);
+    }
     if let Some(content) = binary_content {
         rewrite
             .warnings
@@ -1308,7 +1815,25 @@ pub async fn rewrite(
                     })
                     .cloned()
                     .collect();
-                crate::patch::redirect::rewrite_bun_binary(&bytes, &binary_overrides, &mut rewrite)
+                crate::patch::redirect::rewrite_bun_binary(&bytes, &binary_overrides, &mut rewrite);
+                // A pinned default-trusted package loses Bun's default trust
+                // (#371); the text rewriter warns the same way.
+                for o in &binary_overrides {
+                    let name = crate::patch::redirect::full_name(o);
+                    if rewrite.confirmed_bun_binary_uuids.contains(&o.patch_uuid)
+                        && crate::vendor::bun_lock_text::loses_default_trust(
+                            files.get("package.json").map(String::as_str),
+                            None,
+                            &name,
+                        )
+                    {
+                        rewrite
+                            .warnings
+                            .push(crate::patch::redirect::bun_default_trust_warning(
+                                &name, &o.version,
+                            ));
+                    }
+                }
             }
             Err(warning) => rewrite.warnings.push(warning),
         }
@@ -1332,12 +1857,14 @@ pub async fn rewrite(
     // refuses until `rush update` refreshes that hash — but the redirect
     // survives `rush update` (pnpm preserves locked resolutions for
     // unchanged specifiers). Warn only when the rewrite actually landed in
-    // a Rush lock and the repo-state file that carries the hash is present.
+    // a Rush lock and the repo-state file that carries THAT lock's hash is
+    // present: it sits beside the lock, so with subspaces enabled each
+    // subspace lock pairs with its own subspace's repo-state.json (#714).
     let mut rush_warnings: Vec<RewriteWarning> = Vec::new();
     if rush_lock_keys
         .iter()
-        .any(|key| rewrite.files.contains_key(key))
-        && rush_repo_state_present(view)
+        .filter(|key| rewrite.files.contains_key(*key))
+        .any(|key| rush_repo_state_present(view, &rush_repo_state_for_lock(key)))
     {
         rush_warnings.push(warning(
             "redirect_rush_repo_state_stale",
@@ -1348,8 +1875,15 @@ pub async fn rewrite(
         ));
     }
 
-    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) =
-        pnpm_trust(view, &files, &rewrite, &overrides, &options);
+    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) = pnpm_trust(
+        view,
+        &files,
+        &pnpm_member_lock_keys,
+        &rewrite,
+        &rush_lock_keys,
+        &overrides,
+        &options,
+    );
     let (npm_warnings, npmrc_config_write) =
         npm_allow_remote(view, &files, &rewrite, &overrides, &options);
     if let Some((text, edit)) = trust_config_write {
@@ -1380,12 +1914,14 @@ pub async fn rewrite(
         rewrite,
         rewritten,
         confirmed,
+        unattributed: Vec::new(),
         binary_bun,
         rush_warnings,
         pnpm_warnings,
         npm_warnings,
         pnpm_rerun_only,
         workspace_symlinked,
+        final_discovery: None,
     }
 }
 
@@ -1403,22 +1939,33 @@ type ConfigWrite = Option<(String, FileEdit)>;
 /// `trustLockfile: true` key; the `.npmrc` `trust-lockfile=true` spelling
 /// is IGNORED by pnpm and must never be recommended.
 ///
-/// ZERO-TOUCH DEFAULT: when this run rewrote the ROOT pnpm-lock.yaml and
-/// its lockfileVersion is >= 9 (5.x/6.0 locks mean pnpm 7/8, which have
-/// neither the policy nor the flag and get their own guidance), the run
+/// ZERO-TOUCH DEFAULT: when this run rewrote a GOVERNING pnpm lock (the
+/// root pnpm-lock.yaml, or a workspace member's own lock under
+/// `sharedWorkspaceLockfile: false`, #492) and its lockfileVersion is >= 9
+/// (5.x/6.0 locks mean pnpm 7/8, which have neither the policy nor the
+/// flag and get their own guidance), the run
 /// auto-ensures `trustLockfile: true` in pnpm-workspace.yaml. The same
-/// auto-config re-engages on a run that spliced NOTHING when the root v9
-/// lock already carries a granted hosted artifact URL (HEAL-ON-RERUN).
+/// auto-config re-engages on a run that spliced NOTHING when a governing v9
+/// lock already carries a granted hosted artifact URL (HEAL-ON-RERUN). The
+/// key always goes to the root pnpm-workspace.yaml, the only one pnpm reads
+/// for every member.
 /// pnpm <=10 ignores the key; the per-entry sha512 pin still fails closed
 /// on tampered bytes. An explicit user `trustLockfile: <non-true>` is
 /// RESPECTED (never flipped), and `--no-trust-lockfile-config` opts out.
-/// Rush nested/subspace locks are excluded: rush runs pnpm in common/temp,
-/// which never reads the repo-root pnpm-workspace.yaml. The warning names
-/// the host(s) the lock now points at (they follow --api-url).
+/// Rush common/subspace locks (`rush_lock_keys`) are excluded from the
+/// write: rush runs pnpm in common/temp with a pnpm-workspace.yaml it
+/// generates, which never reads the repo-root one. When every spliced lock
+/// is a Rush lock the warning carries the Rush remedy instead of the
+/// pnpm-only one (#713); a run that also spliced a non-Rush pnpm lock keeps
+/// the generic text plus a Rush note. The warning names the host(s) the
+/// lock now points at (they follow --api-url).
+#[allow(clippy::too_many_arguments)]
 fn pnpm_trust(
     view: &ProjectView<'_>,
     files: &BTreeMap<String, String>,
+    member_lock_keys: &[String],
     rewrite: &RewriteResult,
+    rush_lock_keys: &[String],
     overrides: &[DepOverride],
     options: &RewriteOptions<'_>,
 ) -> (Vec<RewriteWarning>, ConfigWrite, bool, bool) {
@@ -1428,7 +1975,7 @@ fn pnpm_trust(
     let mut workspace_symlinked = false;
     // pnpm locks spliced THIS run (any depth — the rewriter is
     // basename-generalized).
-    let mut pnpm_lock_texts: Vec<&String> = rewrite
+    let (spliced_keys, mut pnpm_lock_texts): (Vec<&String>, Vec<&String>) = rewrite
         .files
         .iter()
         .filter(|(key, _)| {
@@ -1437,22 +1984,47 @@ fn pnpm_trust(
                 .and_then(|n| n.to_str())
                 .is_some_and(|name| matches!(name, "pnpm-lock.yaml" | "shrinkwrap.yaml"))
         })
-        .map(|(_, content)| content)
+        .unzip();
+    // Rush locks spliced this run. The heal and takeover roots below are
+    // only ever governing locks, never a Rush one.
+    let mut spliced_rush = spliced_keys
+        .iter()
+        .filter(|key| rush_lock_keys.contains(key))
+        .count();
+    // The locks pnpm installs the project from: the root lock, plus each
+    // member's own under `sharedWorkspaceLockfile: false` (#492). A Rush
+    // lock is never one: rush installs it from common/temp.
+    let governing: Vec<&str> = std::iter::once("pnpm-lock.yaml")
+        .chain(member_lock_keys.iter().map(String::as_str))
+        .filter(|key| !rush_lock_keys.iter().any(|rush| rush == key))
         .collect();
-    // HEAL-ON-RERUN: a root v9 lock that ALREADY carries a granted hosted
-    // artifact URL (spliced by an earlier run) still plans the trust config
-    // even though this run spliced nothing — so a project that missed the
-    // config once (opted-out first run, or a crash between the lock write
-    // and the workspace write) is healed by simply re-running the scan. An
-    // AlreadyTrue workspace keeps the re-run a byte-stable no-op.
-    let heal_root: Option<&String> = pnpm_heal_root(
-        rewrite.files.contains_key("pnpm-lock.yaml"),
-        files.get("pnpm-lock.yaml"),
-        overrides,
-    );
+    // HEAL-ON-RERUN: a governing v9 lock that ALREADY carries a granted
+    // hosted artifact URL (spliced by an earlier run) still plans the trust
+    // config even though this run spliced nothing — so a project that
+    // missed the config once (opted-out first run, or a crash between the
+    // lock write and the workspace write) is healed by simply re-running
+    // the scan. An AlreadyTrue workspace keeps the re-run a byte-stable
+    // no-op.
+    let heal_locks: Vec<&String> = governing
+        .iter()
+        .filter_map(|key| {
+            pnpm_heal_root(rewrite.files.contains_key(*key), files.get(*key), overrides)
+        })
+        .collect();
     let spliced_pnpm_locks = pnpm_lock_texts.len();
-    if let Some(text) = heal_root {
-        pnpm_lock_texts.push(text);
+    pnpm_lock_texts.extend(heal_locks.iter().copied());
+    // HEAL-ON-RERUN for Rush: a common/subspace v9 lock an earlier run
+    // already redirected splices nothing now, but its `rush install` still
+    // needs the Rush trust remedy (#713) — nothing persists it, so it is
+    // re-issued on every run. Same gate as the governing heal; never
+    // configured.
+    for key in rush_lock_keys {
+        if let Some(text) =
+            pnpm_heal_root(rewrite.files.contains_key(key), files.get(key), overrides)
+        {
+            pnpm_lock_texts.push(text);
+            spliced_rush += 1;
+        }
     }
     if pnpm_lock_texts.is_empty() {
         return (
@@ -1487,17 +2059,15 @@ fn pnpm_trust(
     } else {
         format!("the hosted patch server ({})", hosts.join(", "))
     };
-    // Root-lock gate: only the plain project lock at lockfileVersion >= 9
-    // gets the auto-config — spliced this run, or detected
-    // already-redirected (heal path).
-    let root_lock_v9 = heal_root
-        .and_then(|text| pnpm_lock_version_major(text))
-        .is_some_and(|major| major >= 9)
-        || rewrite
-            .files
-            .get("pnpm-lock.yaml")
-            .and_then(|text| pnpm_lock_version_major(text))
-            .is_some_and(|major| major >= 9);
+    // Governing-lock gate: only a governing lock (never a Rush one) at
+    // lockfileVersion >= 9 gets the auto-config — spliced this run, or
+    // detected already-redirected (heal path).
+    let is_v9 = |text: &String| pnpm_lock_version_major(text).is_some_and(|major| major >= 9);
+    let governing_lock_v9 = heal_locks.iter().copied().any(is_v9)
+        || governing
+            .iter()
+            .filter_map(|key| rewrite.files.get(*key))
+            .any(is_v9);
     // Every touched pnpm lock is a KNOWN legacy (5.x/6.0) format, where
     // `--trust-lockfile` is rejected as an unknown option. An unparseable
     // version stays on the manual guidance: never claim "no trust step
@@ -1506,9 +2076,12 @@ fn pnpm_trust(
         pnpm_lock_version_major(text).is_some_and(|major| major < 9)
             || pnpm_is_shrinkwrap_lock(text)
     });
+    let rush_only = spliced_rush > 0 && spliced_rush == pnpm_lock_texts.len();
     let detail = if all_locks_legacy {
         pnpm_trust_legacy_detail(&server)
-    } else if !root_lock_v9 || !options.trust_lockfile_config {
+    } else if rush_only {
+        pnpm_trust_rush_detail(&server)
+    } else if !governing_lock_v9 || !options.trust_lockfile_config {
         pnpm_trust_manual_guidance(&server)
     } else if let Some(root_file) = governing_workspace(view) {
         // A workspace member with its own lock: pnpm reads `trustLockfile`
@@ -1541,7 +2114,19 @@ fn pnpm_trust(
             original: None,
             new: Some(serde_json::json!("true")),
         };
+        // No workspace file and a project pinned to pnpm 9.0–10.4: creating
+        // one would make it a root-only workspace those releases refuse
+        // `pnpm add` in, for a key they never read (#734).
+        let pinned_pre_10_5 = match &workspace {
+            Ok(None) if !symlinked => root_only_workspace_breaks_add(view),
+            _ => None,
+        };
         match workspace {
+            Ok(None) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
+                &server,
+                pinned_pre_10_5.as_deref().unwrap_or_default(),
+                options.dry_run,
+            ),
             // Present but UNREADABLE: never plan a Create (it would
             // overwrite the user's workspace file) — fall back to
             // warning-only guidance naming the file and the error.
@@ -1557,7 +2142,18 @@ fn pnpm_trust(
                 }
                 TrustPlan::AlreadyTrue => {
                     pnpm_rerun_only = spliced_pnpm_locks == 0;
-                    pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL)
+                    let detail = pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL);
+                    // The root-only scaffold an earlier run created (4.x and
+                    // early v5 did so whatever the pnpm), in a project pinned
+                    // to a pnpm that refuses `pnpm add` there (#734).
+                    match ws_existing
+                        .as_deref()
+                        .filter(|text| is_trust_scaffold(text))
+                        .and_then(|_| root_only_workspace_breaks_add(view))
+                    {
+                        Some(pins) => format!("{detail} {}", pnpm_scaffold_breaks_add_note(&pins)),
+                        None => detail,
+                    }
                 }
                 TrustPlan::UserSet(value) => {
                     pnpm_trust_user_set_detail(&server, PNPM_WORKSPACE_REL, &value)
@@ -1578,8 +2174,17 @@ fn pnpm_trust(
     } else {
         ""
     };
-    pnpm_warnings.push(warning(
-        "redirect_pnpm_trust_lockfile",
+    // Rush keeps its own store under common/temp and the Rush detail
+    // carries its own reinstall advice; the legacy text is right for Rush on
+    // pnpm 7/8 as well, so it keeps the generic tail.
+    let message = if rush_only && !all_locks_legacy {
+        format!("{detail}.")
+    } else {
+        let rush_note = if spliced_rush > 0 && !all_locks_legacy {
+            format!(" {PNPM_TRUST_RUSH_MIXED_NOTE}.")
+        } else {
+            String::new()
+        };
         format!(
             "{}. After a lock-only change, existing node_modules or a warm pnpm store \
              can still contain upstream files. For a reliable reinstall, use a clean \
@@ -1587,10 +2192,11 @@ fn pnpm_trust(
              `pnpm install --frozen-lockfile --store-dir <new-empty-directory>`\
              {store_note}. Do not rely on `--force`: some versions re-resolve the \
              upstream artifact. Run `socket-patch vex` after installation to verify \
-             the patched files.",
+             the patched files.{rush_note}",
             detail.trim_end_matches('.')
-        ),
-    ));
+        )
+    };
+    pnpm_warnings.push(warning("redirect_pnpm_trust_lockfile", message));
     (
         pnpm_warnings,
         trust_config_write,
@@ -1610,6 +2216,29 @@ fn pnpm_trust_already_true_detail(server: &str, file: &str) -> String {
     )
 }
 
+/// Whether a pnpm-workspace.yaml is exactly the root-only scaffold the
+/// trust auto-config creates ([`plan_workspace_trust`] with no file), in
+/// either line ending.
+fn is_trust_scaffold(text: &str) -> bool {
+    let TrustPlan::Create(scaffold) = plan_workspace_trust(None) else {
+        return false;
+    };
+    text == scaffold || text == scaffold.replace('\n', "\r\n")
+}
+
+/// The note added when a project pinned to pnpm 9.0–10.4 (`pins`, as
+/// prose) still carries the root-only scaffold (#734).
+fn pnpm_scaffold_breaks_add_note(pins: &str) -> String {
+    format!(
+        "Note: {PNPM_WORKSPACE_REL} is the root-only file an earlier socket-patch run \
+         created, but the project's pnpm ({pins}) does not read `trustLockfile`, and \
+         in a root-only workspace pnpm 9.0–10.4 refuse `pnpm add <pkg>` \
+         (ERR_PNPM_ADDING_TO_ROOT). Delete {PNPM_WORKSPACE_REL} (re-run after \
+         upgrading to pnpm >= 11 to recreate it), or add dependencies with \
+         `pnpm add -w <pkg>`."
+    )
+}
+
 /// The trust detail for a settings file (`file`) whose explicit
 /// `trustLockfile: <value>` was respected.
 fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
@@ -1622,15 +2251,38 @@ fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
     )
 }
 
+/// The pnpm pins of a project with no pnpm-workspace.yaml, when every one
+/// is a release that refuses `pnpm add` in a root-only workspace (see
+/// [`pnpm_root_only_workspace_breaks_add`]). Reads the root package.json
+/// and the installed `node_modules/.modules.yaml`, both advisory: FIFO-safe
+/// on disk, and an in-memory entry that is not text counts as absent.
+fn root_only_workspace_breaks_add(view: &ProjectView<'_>) -> Option<String> {
+    let read = |rel: &str| match view {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            crate::utils::fs::read_regular_to_string_sync(&cwd.join(rel)).ok()
+        }
+        ProjectView::Memory(project) if !project.is_symlink(rel) => match project.get(rel) {
+            Some(MemoryEntry::Text(text)) => Some(text.to_string()),
+            _ => None,
+        },
+        ProjectView::Memory(_) => None,
+    };
+    pnpm_root_only_workspace_breaks_add(
+        read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
+        read("node_modules/.modules.yaml").as_deref(),
+    )
+}
+
 /// The ancestor `pnpm-workspace.yaml` governing a disk project's pnpm
 /// settings (see [`governing_workspace_file`]); an in-memory project has
 /// no ancestors.
 fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => governing_workspace_file(cwd),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            governing_workspace_file(cwd)
+        }
         ProjectView::Memory(_) => None,
     }
 }
@@ -1655,7 +2307,9 @@ fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
 /// opts out entirely; every variant still WARNS
 /// (`redirect_npm_allow_remote`) with the whole-tree tradeoff. Vendored
 /// mode is unaffected: its `file:.socket/vendor/…` specs are npm `file`
-/// specs, gated by `allow-file` (default `all`), not `allow-remote`.
+/// specs, gated by `allow-file` (default `all`), not `allow-remote` — an
+/// explicit refusing `allow-file` is the vendored flow's own advisory
+/// (`vendor_npm_allow_file`, #969).
 fn npm_allow_remote(
     view: &ProjectView<'_>,
     files: &BTreeMap<String, String>,
@@ -1697,34 +2351,52 @@ fn npm_allow_remote(
         original: None,
         new: Some(serde_json::json!("all")),
     };
-    let detail = match read_npmrc(view) {
+    let npmrc = read_npmrc(view);
+    let outer = (options.npm_outer)();
+    let detail = match &npmrc {
         // Opt-out still reports an explicit / already-set value truthfully;
         // only the WRITE is suppressed.
-        Ok(existing) => {
-            match plan_npmrc_allow_remote_with(existing.as_deref(), &(options.npm_outer)()) {
-                NpmrcPlan::AlreadyAll => npm_allow_remote_already_detail(&npm_hosts),
-                NpmrcPlan::UserSet(value) => npm_allow_remote_user_set_detail(&npm_hosts, &value),
-                NpmrcPlan::EnvSet { var, value } => {
-                    npm_allow_remote_env_set_detail(&npm_hosts, &var, &value)
-                }
-                NpmrcPlan::OuterSet { layer, path, value } => {
-                    npm_allow_remote_outer_set_detail(&npm_hosts, layer, &path, &value)
-                }
-                NpmrcPlan::Unsupported(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
-                _ if !options.npm_allow_remote_config => npm_allow_remote_manual_detail(&npm_hosts),
-                NpmrcPlan::Create(text) => {
-                    npmrc_config_write = Some((text, edit("created")));
-                    npm_allow_remote_configured_detail(&npm_hosts, true, options.dry_run)
-                }
-                NpmrcPlan::Append(text) => {
-                    npmrc_config_write = Some((text, edit("added")));
-                    npm_allow_remote_configured_detail(&npm_hosts, false, options.dry_run)
-                }
+        Ok(existing) => match plan_npmrc_allow_remote_with(existing.as_deref(), &outer) {
+            NpmrcPlan::AlreadyAll => npm_allow_remote_already_detail(&npm_hosts),
+            NpmrcPlan::UserSet(value) => npm_allow_remote_user_set_detail(&npm_hosts, &value),
+            NpmrcPlan::EnvSet { var, value } => {
+                npm_allow_remote_env_set_detail(&npm_hosts, &var, &value)
             }
-        }
-        Err(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
+            NpmrcPlan::OuterSet { layer, path, value } => {
+                npm_allow_remote_outer_set_detail(&npm_hosts, layer, &path, &value)
+            }
+            NpmrcPlan::Unsupported(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
+            _ if !options.npm_allow_remote_config => npm_allow_remote_manual_detail(&npm_hosts),
+            NpmrcPlan::Create(text) => {
+                npmrc_config_write = Some((text, edit("created")));
+                npm_allow_remote_configured_detail(&npm_hosts, true, options.dry_run)
+            }
+            NpmrcPlan::Append(text) => {
+                npmrc_config_write = Some((text, edit("added")));
+                npm_allow_remote_configured_detail(&npm_hosts, false, options.dry_run)
+            }
+        },
+        Err(why) => npm_allow_remote_unreadable_detail(&npm_hosts, why),
     };
     npm_warnings.push(warning("redirect_npm_allow_remote", detail));
+    // #812: npm >= 8's `replace-registry-host` (`always`, or the pinned
+    // host itself) rewrites the hosted pins to the configured registry,
+    // so every install 404s. The setting is the user's, so it is reported
+    // (from whichever layer sets it), never overridden.
+    let project = npmrc.as_ref().ok().and_then(|t| t.as_deref());
+    if let Some((value, source)) = effective_replace_registry_host(project, &outer) {
+        let blocked: Vec<&str> = npm_hosts
+            .iter()
+            .copied()
+            .filter(|host| replace_registry_host_rewrites(&value, host))
+            .collect();
+        if !blocked.is_empty() {
+            npm_warnings.push(warning(
+                NPM_REPLACE_REGISTRY_HOST_CODE,
+                npm_replace_registry_host_detail(&blocked, &value, &source),
+            ));
+        }
+    }
     (npm_warnings, npmrc_config_write)
 }
 
@@ -1796,7 +2468,9 @@ fn confirm(
             let uuid = c.dep.patch_uuid.as_str();
             // vlt decides before the binary-bun rule, so `bun.lockb` beside
             // a vlt-driven `vlt-lock.json` never confirms an npm purl.
-            if rewrite.refused_vlt_uuids.contains(uuid) || rewrite.refused_bun_uuids.contains(uuid)
+            if rewrite.refused_vlt_uuids.contains(uuid)
+                || rewrite.refused_bun_uuids.contains(uuid)
+                || rewrite.refused_npm_uuids.contains(uuid)
             {
                 return ProbeStep::Decided(false);
             }
@@ -2196,6 +2870,9 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let mut skipped = Vec::new();
         let candidates = build_candidates(&selected, &refs, &mut skipped);
@@ -2264,6 +2941,9 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2497,6 +3177,16 @@ mod tests {
         assert!(confirmed.is_empty(), "{confirmed:?}");
     }
 
+    /// The grant token and patch uuid of the engine fixtures' hosted urls:
+    /// real uuids, so lockfile discovery recognizes the pins the rewrite
+    /// lands (the engine keeps only the ones it attributes).
+    const FIXTURE_TOKEN: &str = "11111111-1111-4111-8111-111111111111";
+    const FIXTURE_UUID: &str = "77777777-7777-4777-8777-777777777777";
+
+    fn left_pad_url() -> String {
+        format!("https://patch.test/{FIXTURE_TOKEN}/{FIXTURE_UUID}/left-pad-1.3.0.tgz")
+    }
+
     fn left_pad_candidate() -> Candidate {
         use crate::patch::redirect::Integrity;
         Candidate {
@@ -2506,9 +3196,9 @@ mod tests {
                 name: "left-pad".into(),
                 namespace: None,
                 version: "1.3.0".into(),
-                token: "tok".into(),
-                patch_uuid: "uuid".into(),
-                artifact_url: "https://patch.test/left-pad-1.3.0.tgz".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: left_pad_url(),
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some("sha512-PATCHED==".into()),
@@ -2555,6 +3245,9 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![left_pad_candidate()];
         let read = read_candidate_files(view, unreadable, &candidates).await;
@@ -2576,7 +3269,7 @@ mod tests {
             done.rewrite
                 .files
                 .get("package-lock.json")
-                .is_some_and(|lock| lock.contains("https://patch.test/left-pad-1.3.0.tgz"))
+                .is_some_and(|lock| lock.contains(&left_pad_url()))
         };
         // In memory.
         let mut p = MemoryProject::new();
@@ -2618,6 +3311,116 @@ mod tests {
         assert!(redirected(&done), "{:?}", done.rewrite.warnings);
     }
 
+    const LEFT_PAD_V9_LOCK: &str = "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+
+snapshots:
+  left-pad@1.3.0: {}
+";
+
+    #[test]
+    fn rush_repo_state_pairs_with_the_lock_beside_it() {
+        assert_eq!(
+            rush_repo_state_for_lock(RUSH_COMMON_LOCK_REL),
+            RUSH_REPO_STATE_REL
+        );
+        assert_eq!(
+            rush_repo_state_for_lock("common/config/subspaces/tools/pnpm-lock.yaml"),
+            "common/config/subspaces/tools/repo-state.json"
+        );
+    }
+
+    fn pnpm_trust_detail(done: &Rewritten) -> &str {
+        done.pnpm_warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_trust_lockfile")
+            .map(|w| w.detail.as_str())
+            .expect("redirect_pnpm_trust_lockfile")
+    }
+
+    /// #713: a run that spliced only Rush locks gets the Rush remedy (the
+    /// env var rush forwards, the pnpm 11 experiment, `rush purge`), never
+    /// the pnpm-only one, and writes no workspace file. The same lock at the
+    /// repo root still plans the trustLockfile write, and a run that spliced
+    /// both keeps the generic text plus the Rush note.
+    #[tokio::test]
+    async fn issue_713_rush_locks_get_the_rush_trust_remedy() {
+        let mut rush = MemoryProject::new();
+        rush.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        rush.insert_text(RUSH_COMMON_LOCK_REL, LEFT_PAD_V9_LOCK);
+        let (read, done) = npm_rewrite(&ProjectView::Memory(&rush), &BTreeSet::new()).await;
+        assert_eq!(read.rush_lock_keys, [RUSH_COMMON_LOCK_REL]);
+        assert!(done.rewrite.files.contains_key(RUSH_COMMON_LOCK_REL));
+        assert!(!done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("pnpm_config_trust_lockfile=true rush install"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("usePnpmFrozenLockfileForRushInstall"),
+            "{detail}"
+        );
+        assert!(detail.contains("rush purge"), "{detail}");
+        assert!(
+            !detail.contains("pnpm install --trust-lockfile"),
+            "{detail}"
+        );
+        assert!(!detail.contains("--store-dir"), "{detail}");
+
+        let mut root = MemoryProject::new();
+        root.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&root), &BTreeSet::new()).await;
+        assert!(done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+        assert!(!pnpm_trust_detail(&done).contains("rush"));
+
+        let mut mixed = rush.clone();
+        mixed.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&mixed), &BTreeSet::new()).await;
+        assert!(done.rewrite.files.contains_key(RUSH_COMMON_LOCK_REL));
+        let detail = pnpm_trust_detail(&done);
+        assert!(detail.contains("--store-dir"), "{detail}");
+        assert!(detail.contains(PNPM_TRUST_RUSH_MIXED_NOTE), "{detail}");
+    }
+
+    /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
+    /// splices nothing on a re-run, yet its `rush install` still needs the
+    /// Rush remedy — the re-run re-issues it (and still writes nothing).
+    #[tokio::test]
+    async fn issue_713_rerun_on_a_redirected_rush_lock_keeps_the_rush_remedy() {
+        let mut first = MemoryProject::new();
+        first.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        first.insert_text(RUSH_COMMON_LOCK_REL, LEFT_PAD_V9_LOCK);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&first), &BTreeSet::new()).await;
+        let redirected = done.rewrite.files[RUSH_COMMON_LOCK_REL].clone();
+
+        let mut rerun = MemoryProject::new();
+        rerun.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        rerun.insert_text(RUSH_COMMON_LOCK_REL, redirected.as_str());
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&rerun), &BTreeSet::new()).await;
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(!done.pnpm_rerun_only);
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("pnpm_config_trust_lockfile=true rush install"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("pnpm install --trust-lockfile"),
+            "{detail}"
+        );
+    }
+
     /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
     /// manifest is read for its `patchedDependencies`, and a package the
     /// project patches itself with `bun patch` keeps its registry record,
@@ -2634,9 +3437,11 @@ mod tests {
                 name: "is-number".into(),
                 namespace: None,
                 version: "7.0.0".into(),
-                token: "tok".into(),
-                patch_uuid: "uuid".into(),
-                artifact_url: "https://patch.test/is-number-7.0.0.tgz".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: format!(
+                    "https://patch.test/{FIXTURE_TOKEN}/{FIXTURE_UUID}/is-number-7.0.0.tgz"
+                ),
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some(format!("sha512-{}==", "A".repeat(86))),
@@ -2674,6 +3479,9 @@ mod tests {
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 blocking: false,
+                takeover_uuids: Default::default(),
+                patch_server_origins: Vec::new(),
+                prior_discovery: None,
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
             assert!(read.files.contains_key("package.json"));
@@ -2702,7 +3510,7 @@ mod tests {
                     "{}",
                     skipped.detail
                 );
-                assert!(done.rewrite.bundled_skipped_uuids.contains("uuid"));
+                assert!(done.rewrite.bundled_skipped_uuids.contains(FIXTURE_UUID));
             } else {
                 assert!(
                     done.rewrite.binary_files.contains_key("bun.lockb"),
@@ -2712,6 +3520,104 @@ mod tests {
                 assert!(skipped.is_none(), "{:?}", done.rewrite.warnings);
             }
             assert!(!done.rewrite.files.contains_key("package.json"));
+        }
+    }
+
+    /// REGRESSION (#371), binary lock: a default-trusted package pinned to
+    /// its hosted URL in a `bun.lockb` loses Bun 1.3.5+'s default trust, so
+    /// its install scripts are silently skipped; the run says so unless the
+    /// root manifest declares `trustedDependencies`. The fixture is real Bun
+    /// 1.4.2 output: `simple-git-hooks` is on the default list, `is-number`
+    /// is not.
+    #[tokio::test]
+    async fn issue_371_bun_lockb_default_trusted_package_warns_that_trust_is_lost() {
+        use crate::patch::redirect::Integrity;
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bun-lockb-trusted");
+        let candidate = |name: &str, version: &str, uuid: &str| Candidate {
+            purl: format!("pkg:npm/{name}@{version}"),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: name.into(),
+                namespace: None,
+                version: version.into(),
+                token: "tok".into(),
+                patch_uuid: uuid.into(),
+                artifact_url: format!("https://patch.test/{name}-{version}.tgz"),
+                registry_override: None,
+                integrity: Integrity {
+                    sha512: Some(format!("sha512-{}==", "A".repeat(86))),
+                    ..Default::default()
+                },
+            },
+        };
+        let candidates = vec![
+            candidate("simple-git-hooks", "2.11.1", "uuid-hooks"),
+            candidate("is-number", "7.0.0", "uuid-isn"),
+        ];
+        let manifest = std::fs::read_to_string(fixture.join("package.json")).unwrap();
+        let declared = manifest.replacen(
+            "\"private\": true,",
+            "\"private\": true,\n  \"trustedDependencies\": [\"simple-git-hooks\"],",
+            1,
+        );
+        assert_ne!(declared, manifest);
+        for trusted in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::copy(fixture.join("bun.lockb"), tmp.path().join("bun.lockb")).unwrap();
+            std::fs::write(
+                tmp.path().join("package.json"),
+                if trusted { &declared } else { &manifest },
+            )
+            .unwrap();
+            let view = ProjectView::Disk(tmp.path());
+            let outer = OuterAllowRemote::default;
+            let options = RewriteOptions {
+                dry_run: false,
+                targets_pipenv_lock: false,
+                pipenv_major: None,
+                pipenv_unknown_detail: String::new(),
+                trust_lockfile_config: true,
+                npm_allow_remote_config: true,
+                npm_outer: &outer,
+                yarn_classic_outer: &OuterYarnMirror::default,
+                blocking: false,
+                takeover_uuids: Default::default(),
+                patch_server_origins: Vec::new(),
+                prior_discovery: None,
+            };
+            let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+            let done = rewrite(
+                &view,
+                read,
+                &candidates,
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                options,
+            )
+            .await;
+            assert!(
+                done.rewrite.binary_files.contains_key("bun.lockb"),
+                "{:?}",
+                done.rewrite.warnings
+            );
+            assert_eq!(done.confirmed.len(), 2, "{:?}", done.confirmed);
+            let lost: Vec<&RewriteWarning> = done
+                .rewrite
+                .warnings
+                .iter()
+                .filter(|w| w.code == "redirect_bun_default_trust_lost")
+                .collect();
+            if trusted {
+                assert!(lost.is_empty(), "{:?}", done.rewrite.warnings);
+            } else {
+                assert_eq!(lost.len(), 1, "{:?}", done.rewrite.warnings);
+                assert!(
+                    lost[0].detail.contains("simple-git-hooks@2.11.1"),
+                    "{}",
+                    lost[0].detail
+                );
+            }
         }
     }
 
@@ -2774,12 +3680,14 @@ mod tests {
                 name: "rails".into(),
                 namespace: None,
                 version: "7.0.0".into(),
-                token: "tok".into(),
-                patch_uuid: "uuid".into(),
-                artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: format!(
+                    "https://patch.test/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/gems/rails-7.0.0.gem"
+                ),
                 registry_override: Some(RegistryOverride {
                     kind: "rubygems-compact-index".into(),
-                    index_url: "https://patch.test/gem/tok/uuid/".into(),
+                    index_url: format!("https://patch.test/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"),
                     identifiers: RegistryOverrideIdentifiers {
                         name: "rails".into(),
                         version: "7.0.0".into(),
@@ -2848,6 +3756,9 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![gradle_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
@@ -3138,6 +4049,299 @@ mod tests {
         assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
     }
 
+    /// The gate reuses the caller's discovery only for a pass that writes
+    /// nothing and counts exactly the origins it was made with.
+    #[test]
+    fn the_prior_discovery_is_reused_only_unwritten_with_the_same_origins() {
+        let prior = crate::vex::discover::Discovery::default();
+        assert!(reusable_prior(Some(&prior), true, true).is_some());
+        assert!(reusable_prior(Some(&prior), false, true).is_none());
+        assert!(reusable_prior(Some(&prior), true, false).is_none());
+        assert!(reusable_prior(None, true, true).is_none());
+    }
+
+    /// A registry-resolved left-pad: the hosted rewrite redirects it.
+    const LEFT_PAD_LOCK: &str = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "dependencies": { "left-pad": "1.3.0" } },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+
+    /// The left-pad rewrite of the project on disk at `root`, counting
+    /// `configured` patch servers and handed `prior` as the caller's
+    /// pre-rewrite discovery.
+    async fn gated_left_pad_rewrite(
+        root: &std::path::Path,
+        configured: &[&str],
+        prior: Option<&crate::vex::discover::Discovery>,
+    ) -> Rewritten {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
+            prior_discovery: prior,
+        };
+        let view = ProjectView::Disk(root);
+        let candidates = vec![left_pad_candidate()];
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        rewrite(
+            &view,
+            read,
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            options,
+        )
+        .await
+    }
+
+    /// Lockfile discovery of `root` as the management commands make it.
+    async fn discover_configured(
+        root: &std::path::Path,
+        configured: &[&str],
+    ) -> crate::vex::discover::Discovery {
+        crate::vex::discover_patched_refs_with(
+            root,
+            &crate::vex::DiscoverOptions {
+                patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
+            },
+        )
+        .await
+    }
+
+    /// Write `done`'s files under `root`, as the disk flow does.
+    fn write_rewrite(root: &std::path::Path, done: &Rewritten) {
+        for (rel, text) in &done.rewrite.files {
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        for (rel, bytes) in &done.rewrite.binary_files {
+            std::fs::write(root.join(rel), bytes).unwrap();
+        }
+    }
+
+    /// A writing pass hands back the gate's discovery over its overlaid
+    /// writes, and it is the discovery of the written disk; the caller's
+    /// prior discovery is never reused for a pass that writes.
+    #[tokio::test]
+    async fn a_writing_pass_hands_back_the_discovery_of_its_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
+        let configured = ["https://patch.test"];
+        let before = discover_configured(tmp.path(), &configured).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &configured, Some(&before)).await;
+        assert!(done.rewrite.files.contains_key("package-lock.json"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+        let Some(FinalDiscovery::Overlaid {
+            discovery: overlaid,
+            view_only,
+        }) = &done.final_discovery
+        else {
+            panic!(
+                "expected the overlaid discovery: {:?}",
+                done.final_discovery
+            );
+        };
+        assert!(*view_only, "npm discovery reads only through the view");
+        write_rewrite(tmp.path(), &done);
+        let after = discover_configured(tmp.path(), &configured).await;
+        assert_eq!(format!("{overlaid:?}"), format!("{after:?}"));
+        assert_ne!(format!("{before:?}"), format!("{after:?}"));
+        assert_eq!(
+            crate::patch::redirect::upstream::HostedPin::all(overlaid).len(),
+            1
+        );
+    }
+
+    /// A pass that writes nothing (an already-redirected project) reuses
+    /// the caller's discovery and says so.
+    #[tokio::test]
+    async fn an_unwritten_pass_hands_back_the_prior_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
+        let configured = ["https://patch.test"];
+        let first = gated_left_pad_rewrite(tmp.path(), &configured, None).await;
+        write_rewrite(tmp.path(), &first);
+        let prior = discover_configured(tmp.path(), &configured).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &configured, Some(&prior)).await;
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        assert_eq!(done.confirmed.len(), 1);
+        assert!(matches!(done.final_discovery, Some(FinalDiscovery::Prior)));
+        // Without a prior discovery, the gate discovers the (unwritten)
+        // project itself and hands that back.
+        let done = gated_left_pad_rewrite(tmp.path(), &configured, None).await;
+        let Some(FinalDiscovery::Overlaid {
+            discovery: fresh, ..
+        }) = &done.final_discovery
+        else {
+            panic!("expected a fresh discovery: {:?}", done.final_discovery);
+        };
+        assert_eq!(format!("{fresh:?}"), format!("{prior:?}"));
+    }
+
+    /// A grant on a server the caller did not configure makes the gate count
+    /// another origin: its discovery is not the caller's, so the gate never
+    /// reuses the prior one and hands back none.
+    #[tokio::test]
+    async fn a_foreign_grant_origin_hands_back_no_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
+        let done = gated_left_pad_rewrite(tmp.path(), &[], None).await;
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+        assert!(done.final_discovery.is_none());
+        write_rewrite(tmp.path(), &done);
+        // Unwritten now, with a prior discovery made without the grant's
+        // origin: still not reused.
+        let prior = discover_configured(tmp.path(), &[]).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &[], Some(&prior)).await;
+        assert!(done.rewrite.files.is_empty());
+        assert_eq!(done.confirmed.len(), 1);
+        assert!(done.final_discovery.is_none());
+    }
+
+    /// Nothing confirmed: the gate discovers nothing and hands back none.
+    #[tokio::test]
+    async fn an_unconfirmed_rewrite_hands_back_no_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            LEFT_PAD_LOCK.replace("left-pad", "right-pad"),
+        )
+        .unwrap();
+        let prior = discover_configured(tmp.path(), &["https://patch.test"]).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &["https://patch.test"], Some(&prior)).await;
+        assert!(done.confirmed.is_empty());
+        assert!(done.final_discovery.is_none());
+    }
+
+    /// Only the install-policy auto-configs' root config files may be
+    /// created under an overlaid discovery.
+    #[test]
+    fn only_root_config_files_are_invisible_overlay_creations() {
+        assert!(overlay_creation_is_invisible(".npmrc"));
+        assert!(overlay_creation_is_invisible("pnpm-workspace.yaml"));
+        for rel in [
+            "package-lock.json",
+            "pylock.toml",
+            "pylock.dev.toml",
+            "packages/a/.npmrc",
+            "common/config/subspaces/a/pnpm-lock.yaml",
+            "settings.gradle",
+            "NuGet.Config",
+        ] {
+            assert!(!overlay_creation_is_invisible(rel), "{rel}");
+        }
+    }
+
+    /// A lockless NuGet pin (a Socket source mapping, no
+    /// `packages.lock.json`) is still written, but the run says no later
+    /// command can manage it and names the lockfile that fixes that.
+    #[tokio::test]
+    async fn a_lockless_nuget_pin_is_written_with_the_lockless_warning() {
+        use crate::patch::redirect::{Integrity, RegistryOverride, RegistryOverrideIdentifiers};
+        let base =
+            format!("https://patch.test/patch-registry/nuget/{FIXTURE_TOKEN}/{FIXTURE_UUID}");
+        let candidate = Candidate {
+            purl: "pkg:nuget/Newtonsoft.Json@13.0.3".into(),
+            dep: DepOverride {
+                ecosystem: "nuget".into(),
+                name: "Newtonsoft.Json".into(),
+                namespace: None,
+                version: "13.0.3".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: format!(
+                    "{base}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+                ),
+                registry_override: Some(RegistryOverride {
+                    kind: "nuget-v3".into(),
+                    index_url: format!("{base}/index.json"),
+                    identifiers: RegistryOverrideIdentifiers {
+                        name: "Newtonsoft.Json".into(),
+                        version: "13.0.3".into(),
+                        nuget_id_lower: Some("newtonsoft.json".into()),
+                        nuget_version_norm: Some("13.0.3".into()),
+                        ..Default::default()
+                    },
+                }),
+                integrity: Integrity {
+                    sha512: Some("sha512-NUGETPATCHED==".into()),
+                    ..Default::default()
+                },
+            },
+        };
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "nuget.config",
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+             <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+             </packageSources>\n</configuration>\n",
+        );
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
+        };
+        let candidates = vec![candidate];
+        let view = ProjectView::Memory(&p);
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let done = rewrite(
+            &view,
+            read,
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            options,
+        )
+        .await;
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+        assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
+        let lockless: Vec<&RewriteWarning> = done
+            .rewrite
+            .warnings
+            .iter()
+            .filter(|w| w.code == REDIRECT_PIN_LOCKLESS)
+            .collect();
+        assert_eq!(lockless.len(), 1, "{:?}", done.rewrite.warnings);
+        let detail = &lockless[0].detail;
+        assert!(detail.contains("Newtonsoft.Json"), "{detail}");
+        assert!(
+            detail.contains("dotnet restore --use-lock-file"),
+            "{detail}"
+        );
+    }
+
     const GEMFILE: &str = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
     const GEM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.22\n";
@@ -3158,6 +4362,9 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![gem_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
@@ -3425,9 +4632,9 @@ mod tests {
     #[tokio::test]
     async fn bundler_mirror_for_the_patch_source_redirects_nothing() {
         for key in [
-            "BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/TOK/UUID/",
-            "BUNDLE_MIRROR__PATCH__TEST",
-            "BUNDLE_MIRROR__PATCH__TEST/",
+            format!("BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"),
+            "BUNDLE_MIRROR__PATCH__TEST".to_string(),
+            "BUNDLE_MIRROR__PATCH__TEST/".to_string(),
         ] {
             let mut p = MemoryProject::new();
             p.insert_text("Gemfile", GEMFILE);
@@ -3563,6 +4770,463 @@ mod tests {
         assert_eq!(file_ecosystem("crates/a/Cargo.toml"), Some("cargo"));
         assert_eq!(file_ecosystem("build.gradle"), None);
         assert_eq!(file_ecosystem("Pipfile"), None);
+    }
+
+    // ── #492: `sharedWorkspaceLockfile: false` member locks ──
+
+    const MEMBER_UUID: &str = "u-member";
+    const MEMBER_URL: &str =
+        "https://patch.example/patch/npm/is-number/7.0.0/tok/u-member/is-number-7.0.0.tgz";
+
+    fn is_number_candidates() -> Vec<Candidate> {
+        let mut refs: HashMap<String, PackageVendorResult> = HashMap::new();
+        refs.insert(
+            MEMBER_UUID.into(),
+            reference(serde_json::json!({
+                "status": "granted",
+                "url": MEMBER_URL,
+                "purl": "pkg:npm/is-number@7.0.0",
+                "artifacts": [{"kind": "tarball", "url": MEMBER_URL,
+                               "integrity": {"sha512": "sha512-PATCHED=="}}],
+                "registryOverride": null
+            })),
+        );
+        let selected = vec![(
+            "pkg:npm/is-number@7.0.0".to_string(),
+            MEMBER_UUID.to_string(),
+        )];
+        build_candidates(&selected, &refs, &mut Vec::new())
+    }
+
+    fn v9_member_lock(direct: bool) -> String {
+        let importer = if direct {
+            "      is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n"
+        } else {
+            "      to-regex-range:\n        specifier: 5.0.1\n        version: 5.0.1\n"
+        };
+        format!(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n{importer}\n\
+             packages:\n\n  is-number@7.0.0:\n    resolution: {{integrity: sha512-UPSTREAM==}}\n\n\
+             snapshots:\n\n  is-number@7.0.0: {{}}\n"
+        )
+    }
+
+    const V5_MEMBER_LOCK: &str = "lockfileVersion: 5.4\n\nspecifiers:\n  is-number: 7.0.0\n\n\
+        dependencies:\n  is-number: 7.0.0\n\npackages:\n\n  /is-number/7.0.0:\n    \
+        resolution: {integrity: sha512-UPSTREAM==}\n    dev: false\n";
+
+    const ROOT_ONLY_LOCK: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+
+    fn write_rel(root: &std::path::Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// The issue's layout: a root lock covering only `.` and one lock per
+    /// member (`a` direct, `b` transitive).
+    fn write_member_workspace(root: &std::path::Path, workspace: &str) {
+        write_rel(root, "package.json", r#"{"name":"root","private":true}"#);
+        write_rel(root, "pnpm-workspace.yaml", workspace);
+        write_rel(root, "pnpm-lock.yaml", ROOT_ONLY_LOCK);
+        write_rel(root, "packages/a/package.json", r#"{"name":"a"}"#);
+        write_rel(root, "packages/a/pnpm-lock.yaml", &v9_member_lock(true));
+        write_rel(root, "packages/b/package.json", r#"{"name":"b"}"#);
+        write_rel(root, "packages/b/pnpm-lock.yaml", &v9_member_lock(false));
+        // An installed copy's own lock is never a member's.
+        write_rel(
+            root,
+            "packages/a/node_modules/x/pnpm-lock.yaml",
+            &v9_member_lock(true),
+        );
+    }
+
+    async fn member_rewrite(root: &std::path::Path) -> (CandidateFiles, Rewritten) {
+        view_rewrite(&ProjectView::Disk(root)).await
+    }
+
+    async fn view_rewrite(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
+        };
+        let candidates = is_number_candidates();
+        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
+        let done = rewrite(
+            view,
+            read.clone(),
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            options,
+        )
+        .await;
+        (read, done)
+    }
+
+    const MEMBER_KEYS: [&str; 2] = ["packages/a/pnpm-lock.yaml", "packages/b/pnpm-lock.yaml"];
+
+    #[tokio::test]
+    async fn member_locks_are_pinned_when_the_shared_lock_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_eq!(read.pnpm_member_lock_keys, MEMBER_KEYS);
+        for key in MEMBER_KEYS {
+            let text = done
+                .rewrite
+                .files
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be pinned: {:?}", done.rewrite.warnings));
+            assert!(text.contains(&format!("tarball: {MEMBER_URL}")), "{text}");
+        }
+        assert!(!done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
+        assert!(
+            !warning_codes(&done).contains(&"redirect_pnpm_entry_not_found"),
+            "{:?}",
+            warning_codes(&done)
+        );
+        // pnpm reads `trustLockfile` from the root file for every member.
+        assert_eq!(
+            done.rewrite
+                .files
+                .get(PNPM_WORKSPACE_REL)
+                .map(String::as_str),
+            Some(format!("{ws}trustLockfile: true\n").as_str())
+        );
+        assert_eq!(
+            done.rewrite.edits.last().map(|e| e.kind.as_str()),
+            Some(REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND)
+        );
+
+        // HEAL-ON-RERUN: the member locks already pinned, the trust key
+        // missing (an opted-out first run): a re-run plans it again.
+        for key in MEMBER_KEYS {
+            write_rel(tmp.path(), key, &done.rewrite.files[key]);
+        }
+        let (_, again) = member_rewrite(tmp.path()).await;
+        assert!(
+            MEMBER_KEYS
+                .iter()
+                .all(|k| !again.rewrite.files.contains_key(*k)),
+            "{:?}",
+            again.rewrite.files.keys()
+        );
+        assert_eq!(again.confirmed.len(), 1);
+        assert!(again.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+    }
+
+    #[tokio::test]
+    async fn member_locks_are_ignored_while_the_root_lock_is_shared() {
+        // The default shared lock: member locks are stale leftovers.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(tmp.path(), "packages:\n  - 'packages/*'\n");
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert!(read.pnpm_member_lock_keys.is_empty());
+        assert!(MEMBER_KEYS.iter().all(|k| !read.files.contains_key(*k)));
+        assert!(done.confirmed.is_empty());
+
+        // The setting says off, but the root lock lists member importers:
+        // pnpm installs from it, so the member locks are still stale.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        write_rel(
+            tmp.path(),
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  packages/a: {}\n",
+        );
+        let (read, _) = member_rewrite(tmp.path()).await;
+        assert!(read.pnpm_member_lock_keys.is_empty());
+    }
+
+    /// pnpm 7 with `shared-workspace-lockfile=false` in `.npmrc` writes no
+    /// root lock at all, only the members' (lockfile 5.4).
+    #[tokio::test]
+    async fn npmrc_member_locks_without_a_root_lock_are_pinned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_rel(root, "package.json", r#"{"name":"root","private":true}"#);
+        write_rel(root, "pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+        write_rel(root, ".npmrc", "shared-workspace-lockfile=false\n");
+        write_rel(root, "node_modules/.modules.yaml", "layoutVersion: 5\n");
+        write_rel(root, "packages/a/package.json", r#"{"name":"a"}"#);
+        write_rel(root, "packages/a/pnpm-lock.yaml", V5_MEMBER_LOCK);
+        let (read, done) = member_rewrite(root).await;
+        assert_eq!(
+            read.pnpm_member_lock_keys,
+            vec!["packages/a/pnpm-lock.yaml"]
+        );
+        let text = &done.rewrite.files["packages/a/pnpm-lock.yaml"];
+        assert!(text.contains(MEMBER_URL), "{text}");
+        assert_eq!(done.confirmed.len(), 1);
+        let codes = warning_codes(&done);
+        assert!(
+            !codes.contains(&"redirect_pnpm_no_lockfile")
+                && !codes.contains(&"redirect_npm_no_lockfile"),
+            "{codes:?}"
+        );
+        // A legacy lock gets no trust config.
+        assert!(!done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+    }
+
+    /// Members that cannot be listed refuse instead of pinning the root
+    /// lock alone (which no member installs from) and reporting success.
+    #[tokio::test]
+    async fn unlisted_member_locks_refuse_every_pnpm_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages: *members\nsharedWorkspaceLockfile: false\n",
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert!(!read.files.contains_key("pnpm-lock.yaml"));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty());
+        let codes = warning_codes(&done);
+        assert!(codes.contains(&PNPM_MEMBER_LOCKS_UNRESOLVED), "{codes:?}");
+        assert!(!codes.contains(&"redirect_npm_no_lockfile"), "{codes:?}");
+
+        // A member lock that cannot be read refuses the whole set.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        std::fs::write(tmp.path().join("packages/b/pnpm-lock.yaml"), [0xff, 0xfe]).unwrap();
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert!(read.pnpm_member_lock_keys.is_empty());
+        assert!(MEMBER_KEYS.iter().all(|k| !read.files.contains_key(*k)));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty());
+        assert!(warning_codes(&done).contains(&PNPM_MEMBER_LOCKS_UNRESOLVED));
+
+        // No member lock and no root lock: not "run `pnpm install`".
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_rel(root, "pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+        write_rel(root, ".npmrc", "shared-workspace-lockfile=false\n");
+        write_rel(root, "node_modules/.modules.yaml", "layoutVersion: 5\n");
+        write_rel(root, "packages/a/package.json", r#"{"name":"a"}"#);
+        let (_, done) = member_rewrite(root).await;
+        let codes = warning_codes(&done);
+        assert!(codes.contains(&PNPM_MEMBER_LOCKS_UNRESOLVED), "{codes:?}");
+        assert!(!codes.contains(&"redirect_pnpm_no_lockfile"), "{codes:?}");
+    }
+
+    const BRANCH_LOCK: &str = "pnpm-lock.feature.yaml";
+    const BRANCH_WS: &str = "packages:\n  - '.'\ngitBranchLockfile: true\n";
+
+    /// The issue's layout: `pnpm-lock.yaml` as committed on main, and the
+    /// lock pnpm writes for the `feature` branch under `gitBranchLockfile`.
+    fn write_branch_lock_project(root: &std::path::Path, workspace: &str, root_lock: bool) {
+        write_rel(
+            root,
+            "package.json",
+            r#"{"name":"app","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        write_rel(root, "pnpm-workspace.yaml", workspace);
+        write_rel(root, "node_modules/.modules.yaml", "layoutVersion: 5\n");
+        if root_lock {
+            write_rel(root, "pnpm-lock.yaml", &v9_member_lock(true));
+        }
+        write_rel(root, BRANCH_LOCK, &v9_member_lock(true));
+    }
+
+    fn assert_branch_lock_refused(read: &CandidateFiles, done: &Rewritten) {
+        assert!(!read.files.contains_key("pnpm-lock.yaml"));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        let codes = warning_codes(done);
+        assert!(codes.contains(&PNPM_GIT_BRANCH_LOCKFILE), "{codes:?}");
+        assert!(
+            !codes.contains(&"redirect_pnpm_no_lockfile")
+                && !codes.contains(&"redirect_npm_no_lockfile"),
+            "{codes:?}"
+        );
+        let detail = &done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == PNPM_GIT_BRANCH_LOCKFILE)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains(BRANCH_LOCK) && detail.contains("--merge-git-branch-lockfiles"),
+            "{detail}"
+        );
+    }
+
+    /// `gitBranchLockfile` with a branch lock beside `pnpm-lock.yaml`: pnpm
+    /// installs the branch from the branch lock, so pinning the stale
+    /// `pnpm-lock.yaml` would confirm a pin nothing installs (#556).
+    #[tokio::test]
+    async fn a_git_branch_lock_refuses_the_stale_root_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), BRANCH_WS, true);
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+
+        // pnpm 10 and older read the setting from `.npmrc`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "packages:\n  - '.'\n", true);
+        write_rel(tmp.path(), ".npmrc", "git-branch-lockfile=true\n");
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+
+        // The in-memory engine refuses the same project.
+        let mut project = MemoryProject::new();
+        project.insert_text("package.json", r#"{"name":"app"}"#);
+        project.insert_text("pnpm-workspace.yaml", BRANCH_WS);
+        project.insert_text("pnpm-lock.yaml", v9_member_lock(true));
+        project.insert_text(BRANCH_LOCK, v9_member_lock(true));
+        let (read, done) = view_rewrite(&ProjectView::Memory(&project)).await;
+        assert_branch_lock_refused(&read, &done);
+    }
+
+    /// Only the branch lock: not "run `pnpm install`", which just rewrites
+    /// the branch lock again (#556).
+    #[tokio::test]
+    async fn a_lone_git_branch_lock_is_not_a_missing_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), BRANCH_WS, false);
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+    }
+
+    /// Under `sharedWorkspaceLockfile: false` pnpm looks for the branch
+    /// lock in every member's directory too: a member whose deps changed on
+    /// the branch installs from `<member>/pnpm-lock.<branch>.yaml`, so its
+    /// `pnpm-lock.yaml` is stale and no member lock is pinned (#492 x #556).
+    #[tokio::test]
+    async fn a_member_git_branch_lock_refuses_the_stale_member_locks() {
+        // pnpm 8+: the settings in the YAML, a root lock covering `.` only,
+        // and no branch lock at the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n\
+                  gitBranchLockfile: true\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            &format!("packages/a/{BRANCH_LOCK}"),
+            &v9_member_lock(true),
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+        assert!(read.pnpm_member_lock_keys.is_empty());
+        for key in MEMBER_KEYS {
+            assert!(!read.files.contains_key(key), "{key}");
+        }
+
+        // pnpm 7: both settings in `.npmrc` and no root lock at all.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(tmp.path(), "packages:\n  - 'packages/*'\n");
+        std::fs::remove_file(tmp.path().join("pnpm-lock.yaml")).unwrap();
+        write_rel(
+            tmp.path(),
+            ".npmrc",
+            "shared-workspace-lockfile=false\ngit-branch-lockfile=true\n",
+        );
+        write_rel(
+            tmp.path(),
+            &format!("packages/a/{BRANCH_LOCK}"),
+            &v9_member_lock(true),
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+        assert!(read.pnpm_member_lock_keys.is_empty());
+
+        // The setting off: the member branch lock is a stray file.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        write_rel(
+            tmp.path(),
+            &format!("packages/a/{BRANCH_LOCK}"),
+            &v9_member_lock(true),
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_eq!(read.pnpm_member_lock_keys, MEMBER_KEYS);
+        assert!(!warning_codes(&done).contains(&PNPM_GIT_BRANCH_LOCKFILE));
+    }
+
+    /// Run from a member, the setting lives in the ancestor
+    /// `pnpm-workspace.yaml` pnpm reads it from, not in the member.
+    #[tokio::test]
+    async fn a_member_run_reads_the_setting_from_the_governing_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n\
+                  gitBranchLockfile: true\n";
+        write_member_workspace(tmp.path(), ws);
+        let member = tmp.path().join("packages/a");
+        write_rel(&member, BRANCH_LOCK, &v9_member_lock(true));
+        let (read, done) = member_rewrite(&member).await;
+        assert_branch_lock_refused(&read, &done);
+        let detail = &done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == PNPM_GIT_BRANCH_LOCKFILE)
+            .unwrap()
+            .detail;
+        assert!(detail.contains("gitBranchLockfile: true"), "{detail}");
+
+        // pnpm 10 and older: the `.npmrc` beside the ancestor file.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        write_rel(tmp.path(), ".npmrc", "git-branch-lockfile=true\n");
+        let member = tmp.path().join("packages/a");
+        write_rel(&member, BRANCH_LOCK, &v9_member_lock(true));
+        let (read, done) = member_rewrite(&member).await;
+        assert_branch_lock_refused(&read, &done);
+    }
+
+    /// The setting alone (no branch lock: main, or a branch whose deps never
+    /// changed) installs from `pnpm-lock.yaml`, so it is pinned as usual; so
+    /// is a stray branch lock while the setting is off.
+    #[tokio::test]
+    async fn the_root_lock_is_pinned_without_a_live_git_branch_lock() {
+        for (workspace, branch_lock) in [
+            (BRANCH_WS, false),
+            ("packages:\n  - '.'\ngitBranchLockfile: false\n", true),
+            ("packages:\n  - '.'\n", true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_branch_lock_project(tmp.path(), workspace, true);
+            if !branch_lock {
+                std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+            }
+            let (_, done) = member_rewrite(tmp.path()).await;
+            let text = done
+                .rewrite
+                .files
+                .get("pnpm-lock.yaml")
+                .unwrap_or_else(|| panic!("{workspace}: {:?}", done.rewrite.warnings));
+            assert!(text.contains(MEMBER_URL), "{text}");
+            assert_eq!(done.confirmed.len(), 1, "{workspace}");
+            assert!(!warning_codes(&done).contains(&PNPM_GIT_BRANCH_LOCKFILE));
+            assert!(!done.rewrite.files.contains_key(BRANCH_LOCK));
+        }
     }
 }
 

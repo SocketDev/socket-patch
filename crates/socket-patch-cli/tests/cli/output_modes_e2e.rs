@@ -11,19 +11,11 @@
 //! like SOCKET_DRY_RUN — an ambient SOCKET_DRY_RUN=true turned every
 //! apply below into a silent no-op and failed the on-disk assertions.
 
+use crate::common::git_sha256;
+
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
-
 use crate::common;
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn write_root(root: &Path) {
     std::fs::write(
@@ -693,7 +685,7 @@ fn bare_uuid_fallback_treats_uuid_as_get_identifier() {
 fn each_subcommand_help_prints_usage() {
     let tmp = tempfile::tempdir().unwrap();
     let subcommands = [
-        "apply", "rollback", "get", "scan", "list", "remove", "repair", "gc",
+        "apply", "rollback", "get", "scan", "list", "remove", "repair",
     ];
     for sub in subcommands {
         let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &[sub, "--help"], &[]);
@@ -718,8 +710,6 @@ fn top_level_help_prints_all_subcommands() {
             "top-level help missing {sub}; got: {stdout}"
         );
     }
-    // `gc` is the visible alias.
-    assert!(stdout.contains("gc"), "top-level help missing `gc` alias");
 }
 
 #[test]

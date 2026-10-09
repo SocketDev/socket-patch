@@ -29,8 +29,8 @@
 pub(crate) mod bun;
 pub mod cargo;
 pub mod composer;
-pub mod governing_locks;
 pub mod gem;
+pub mod governing_locks;
 pub(crate) mod json;
 pub(crate) mod maven;
 pub(crate) mod nuget;

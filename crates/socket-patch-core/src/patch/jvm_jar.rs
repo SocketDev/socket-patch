@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::crawlers::gradle_cache;
-use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+use crate::hash::git_sha256::{compute_git_sha256_from_bytes, zip_member_git_sha256};
 use crate::manifest::schema::PatchFileInfo;
 use crate::patch::apply::{
     apply_file_patch_at, files_in_order, normalize_file_path, ApplyResult, VerifyResult,
@@ -95,21 +95,15 @@ pub fn verify_member_bytes(
     jar: &[u8],
     files: &HashMap<String, PatchFileInfo>,
 ) -> Vec<VerifyResult> {
-    use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar)).ok();
     files_in_order(files)
         .into_iter()
         .map(|(key, info)| {
             let member = normalize_file_path(key);
-            let content = archive.as_mut().and_then(|a| {
-                let mut entry = a.by_name(member).ok()?;
-                // Not `with_capacity(entry.size())`: the size is the jar's own claim,
-                // and a crafted one would abort the allocation.
-                let mut buf = Vec::new();
-                entry.read_to_end(&mut buf).ok()?;
-                Some(buf)
-            });
-            let (status, current) = match content.map(|c| compute_git_sha256_from_bytes(&c)) {
+            let hash = archive
+                .as_mut()
+                .and_then(|a| zip_member_git_sha256(a, member)?.ok());
+            let (status, current) = match hash {
                 None if info.before_hash.is_empty() => (VerifyStatus::Ready, None),
                 None => (VerifyStatus::NotFound, None),
                 Some(h) if h == info.after_hash => (VerifyStatus::AlreadyPatched, Some(h)),
@@ -1034,8 +1028,7 @@ mod tests {
         let client = crate::api::client::ApiClient::new(crate::api::client::ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: crate::api::client::ApiRoute::Proxy,
         });
         let cfg = VendorServiceConfig {
             maven_config: None,
@@ -1274,5 +1267,57 @@ mod tests {
         let back = rollback_jar_swap(&restore, &[copy.clone()]).await;
         assert!(back[0].success, "{:?}", back[0].error);
         assert_eq!(std::fs::read(copy.join("lib-1.0.jar")).unwrap(), original);
+    }
+
+    /// A large deflated member is verified by streaming it through the
+    /// shared zip-member hasher: the verdict matches the buffered hash for
+    /// both record states, and an absent member keeps its own status.
+    #[test]
+    fn verify_member_bytes_streams_a_large_deflated_member() {
+        use std::io::Read as _;
+        const SIZE: u64 = 16 * 1024 * 1024;
+        let zeros_hash = crate::hash::git_sha256::compute_git_sha256_from_std_reader(
+            SIZE,
+            std::io::repeat(0).take(SIZE),
+        )
+        .unwrap();
+        let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        out.start_file("big.bin", opts).unwrap();
+        std::io::copy(&mut std::io::repeat(0).take(SIZE), &mut out).unwrap();
+        out.start_file("a/B.class", opts).unwrap();
+        out.write_all(b"code").unwrap();
+        let bytes = out.finish().unwrap().into_inner();
+        assert!((bytes.len() as u64) < SIZE / 100, "member must be deflated");
+
+        let ready = HashMap::from([(
+            "big.bin".to_string(),
+            PatchFileInfo {
+                before_hash: zeros_hash.clone(),
+                after_hash: compute_git_sha256_from_bytes(b"patched"),
+            },
+        )]);
+        let got = verify_member_bytes(&bytes, &ready);
+        assert_eq!(got[0].status, VerifyStatus::Ready);
+        assert_eq!(got[0].current_hash.as_deref(), Some(zeros_hash.as_str()));
+
+        let applied = HashMap::from([(
+            "big.bin".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"pristine"),
+                after_hash: zeros_hash.clone(),
+            },
+        )]);
+        assert_eq!(
+            verify_member_bytes(&bytes, &applied)[0].status,
+            VerifyStatus::AlreadyPatched
+        );
+
+        let absent = HashMap::from([("gone.bin".to_string(), info(b"x", b"y"))]);
+        assert_eq!(
+            verify_member_bytes(&bytes, &absent)[0].status,
+            VerifyStatus::NotFound
+        );
     }
 }

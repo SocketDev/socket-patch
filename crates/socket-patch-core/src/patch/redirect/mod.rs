@@ -28,8 +28,10 @@ use crate::utils::digest::is_hex64_lower;
 #[cfg(test)]
 use crate::utils::line_endings::LineEndings;
 use crate::vendor::common::{parse_json_text, JsonLayout};
-use crate::vendor::lock_inventory::npm_legacy_identity;
-use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
+use crate::vendor::lock_inventory::{npm_lock_entries, NpmLockEntry, NpmLockSection};
+use crate::vendor::npm_origin::{
+    npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+};
 
 mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
@@ -48,6 +50,8 @@ mod lock_index_equivalence_tests;
 pub mod npmrc;
 mod pdm;
 mod pipenv;
+#[cfg(test)]
+mod pipenv_pylock_tests;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
 use crate::formats::cargo::hosted::CargoLockPlan;
@@ -77,9 +81,9 @@ use crate::formats::yarn::patterns::{
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
 #[cfg(test)]
-mod pnpm_equivalence_tests;
-#[cfg(test)]
 mod platform_wheel_tests;
+#[cfg(test)]
+mod pnpm_equivalence_tests;
 mod poetry;
 mod pypi_takeover;
 pub use pypi_takeover::preflight_pypi_takeover;
@@ -283,6 +287,16 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_bun_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids the npm lock rewriter left on their registry entry
+    /// because the project patches that package itself with npm 12's
+    /// native `npm patch` (#711). Never confirmed: npm applies the user's
+    /// diff on top of whatever tarball the lock names, so a hosted pin
+    /// either fails `EPATCHFAILED` or installs bytes VEX can't attest.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub refused_npm_uuids: std::collections::BTreeSet<String>,
     /// Patch uuids whose package version a yarn berry `yarn.lock` locks, so
     /// the berry rewriter alone decides them: the hosted pin is the
     /// URL-keyed lock entry AND the root `package.json` `resolutions`
@@ -565,7 +579,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
-     &yarnrc::OuterYarnMirror::default(),
+        &yarnrc::OuterYarnMirror::default(),
     )
 }
 
@@ -790,6 +804,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_pdm_uuids,
         refused_pnpm_uuids,
         refused_bun_uuids,
+        refused_npm_uuids,
         yarn_berry_uuids,
         confirmed_yarn_berry_uuids,
         refused_yarn_classic_uuids,
@@ -825,6 +840,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.refused_pdm_uuids.extend(refused_pdm_uuids);
     result.refused_pnpm_uuids.extend(refused_pnpm_uuids);
     result.refused_bun_uuids.extend(refused_bun_uuids);
+    result.refused_npm_uuids.extend(refused_npm_uuids);
     result.yarn_berry_uuids.extend(yarn_berry_uuids);
     result
         .confirmed_yarn_berry_uuids
@@ -1052,14 +1068,17 @@ fn rewrite_npm_lock(
         return;
     }
     // BOTH npm locks can legitimately co-exist and BOTH must be rewritten.
-    // `npm shrinkwrap` was removed in npm 12, which now auto-creates a
-    // `package-lock.json` beside any committed `npm-shrinkwrap.json` on first
-    // install and reifies the install FROM `package-lock.json`. So the
+    // `npm shrinkwrap` was removed in npm 12, which never reads a committed
+    // `npm-shrinkwrap.json`: its first install resolves from the registry,
+    // writes a `package-lock.json` beside it and reifies FROM that. So the
     // dual-lock state is the DEFAULT for a shrinkwrap repo under npm 12.
     // Rewriting only the first present lock would patch the file npm doesn't
     // install from — a silent FALSE SUCCESS. Rewrite EVERY present npm lock so
-    // a fresh `npm install`/`npm ci` from EITHER is redirected (shrinkwrap-only
-    // repos on npm <= 6 keep working: only that one file is present).
+    // a fresh `npm install`/`npm ci` from EITHER is redirected. A
+    // shrinkwrap-ONLY repo is still rewritten (npm <= 11 installs from it),
+    // but npm 12 never reads npm-shrinkwrap.json — it resolves from the
+    // registry and writes its own package-lock.json — so that is SAID
+    // (#899, `redirect_npm_shrinkwrap_only`).
     let present: Vec<&str> = crate::constants::npm_family::NPM_LOCKS
         .into_iter()
         .filter(|f| files.contains_key(*f))
@@ -1108,14 +1127,201 @@ fn rewrite_npm_lock(
         .get("package.json")
         .map(|text| NpmOverrides::from_manifest_text(text))
         .unwrap_or_default();
-    for lockfile in present {
+    // A package the project patches itself with npm 12's native `npm patch`
+    // is left on its registry entries in EVERY present lock (#711): the root
+    // `patchedDependencies` key, or the `"patched": {integrity, path}`
+    // record npm writes on the lock entry (lockfileVersion 4). npm applies
+    // that diff to every install of the entry, so rewriting a sibling lock
+    // would still stack the user's diff on the hosted bytes. Each present
+    // lock is parsed ONCE, here, and the parse is handed to its rewrite;
+    // only a lock that spells `"patched"` at all is walked for the gate.
+    let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
+        files.get("package.json").map(String::as_str),
+        None,
+    );
+    let parsed: Vec<(&str, Option<Value>)> = present
+        .iter()
+        .map(|lockfile| (*lockfile, parse_json_text(&files[*lockfile]).ok()))
+        .collect();
+    let lock_patched: Vec<(String, String, &str, String)> = parsed
+        .iter()
+        .filter(|(lockfile, _)| files[*lockfile].contains("\"patched\""))
+        .filter_map(|(lockfile, lock)| Some((*lockfile, lock.as_ref()?)))
+        .flat_map(|(lockfile, lock)| {
+            npm_lock_entries(lock)
+                .into_iter()
+                .filter(|e| e.section == NpmLockSection::Packages && e.is_dependency())
+                .filter(|e| e.value.get("patched").is_some_and(|p| !p.is_null()))
+                .filter_map(|e| {
+                    let version = e.node.version?.to_string();
+                    Some((
+                        e.node.name.to_string(),
+                        version,
+                        lockfile,
+                        e.key.to_string(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let npm: Vec<&DepOverride> = npm
+        .into_iter()
+        .filter(|dep| {
+            let fname = full_name(dep);
+            let source = if let Some(key) = crate::vendor::bun_lock_text::patched_dependency_key(
+                &user_patched,
+                &fname,
+                &dep.version,
+            ) {
+                format!("package.json `patchedDependencies` has `{key}`")
+            } else if let Some((_, _, lockfile, key)) = lock_patched
+                .iter()
+                .find(|(name, version, _, _)| *name == fname && *version == dep.version)
+            {
+                format!("{lockfile} entry `{key}` carries npm's `patched` record")
+            } else {
+                return true;
+            };
+            // A lock an earlier (pre-#711) hosted run already pinned keeps
+            // that pin: say so, or the warning's "left unchanged" would
+            // read as healthy while every install still fails.
+            let pinned_in: Vec<&str> = present
+                .iter()
+                .copied()
+                .filter(|lockfile| files[*lockfile].contains(dep.artifact_url.as_str()))
+                .collect();
+            skip_npm_user_patched(&source, &fname, dep, &pinned_in, result);
+            false
+        })
+        .collect();
+    for (lockfile, lock) in parsed {
         rewrite_one_npm_lock(
             &files[lockfile],
+            lock,
             lockfile,
             &npm,
             &manifest_overrides,
             result,
         );
+    }
+    if let [SHRINKWRAP] = present.as_slice() {
+        warn_npm_shrinkwrap_only(files, &npm, result);
+    }
+}
+
+const SHRINKWRAP: &str = crate::constants::npm_family::NPM_LOCKS[0];
+const PACKAGE_LOCK: &str = crate::constants::npm_family::NPM_LOCKS[1];
+
+/// #899: the root `npm-shrinkwrap.json` is the ONLY npm lock and it carries
+/// a hosted redirect (spliced this run or by an earlier one — the warning
+/// repeats until the project gains the twin). npm 12 ignores the shrinkwrap,
+/// so its installs fetch the unpatched registry bytes.
+fn warn_npm_shrinkwrap_only(
+    files: &BTreeMap<String, String>,
+    npm: &[&DepOverride],
+    result: &mut RewriteResult,
+) {
+    let lock = result
+        .files
+        .get(SHRINKWRAP)
+        .or_else(|| files.get(SHRINKWRAP));
+    let wired: Vec<String> = npm
+        .iter()
+        .filter(|dep| lock.is_some_and(|text| text.contains(dep.artifact_url.as_str())))
+        .map(|dep| format!("{}@{}", full_name(dep), dep.version))
+        .collect();
+    if wired.is_empty() {
+        return;
+    }
+    result.warnings.push(RewriteWarning {
+        code: "redirect_npm_shrinkwrap_only".into(),
+        detail: npm_shrinkwrap_only_detail(&wired, "redirected"),
+    });
+}
+
+/// The shared detail of the hosted (`redirect_npm_shrinkwrap_only`) and
+/// vendored (`vendor_npm_shrinkwrap_only`) shrinkwrap-only warnings.
+pub fn npm_shrinkwrap_only_detail(packages: &[String], how: &str) -> String {
+    format!(
+        "{} {how} in {SHRINKWRAP} only — there is no {PACKAGE_LOCK}, and npm >= 12 never \
+         reads {SHRINKWRAP}: it resolves the tree from the registry and writes a fresh \
+         {PACKAGE_LOCK}, so npm >= 12 installs stay UNPATCHED (npm <= 11 installs from the \
+         shrinkwrap and is patched); rename the lock to {PACKAGE_LOCK} (or commit a copy \
+         under that name) and re-run",
+        packages.join(", ")
+    )
+}
+
+/// Leave `dep` on its registry entry because the project patches it with
+/// npm 12's native `npm patch` (#711). npm extracts whatever tarball the
+/// lock names and then applies the user's diff, failing the whole install
+/// `EPATCHFAILED` when the diff no longer applies: a hosted pin of the
+/// same lines breaks every later `npm ci` / `npm install`, and one that
+/// does apply installs bytes that are neither the original nor the Socket
+/// patch, which VEX can never attest. Warns, keeps the in-run VEX from
+/// assuming the uuid patched, and keeps any other lock from confirming it.
+fn skip_npm_user_patched(
+    source: &str,
+    name: &str,
+    dep: &DepOverride,
+    pinned_in: &[&str],
+    result: &mut RewriteResult,
+) {
+    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+    result.refused_npm_uuids.insert(dep.patch_uuid.clone());
+    let state = if pinned_in.is_empty() {
+        "It is left unchanged and stays without the Socket patch".to_string()
+    } else {
+        format!(
+            "An earlier hosted run already pinned it in {}, which keeps breaking installs \
+             until `socket-patch rollback {}` restores the registry entry",
+            pinned_in.join(" and "),
+            dep.patch_uuid
+        )
+    };
+    result.warnings.push(RewriteWarning {
+        code: "redirect_npm_patched_dependency_skipped".into(),
+        detail: format!(
+            "{source}, a patch the project applies with npm's native `npm patch`; npm applies \
+             it on top of whatever tarball the lock names, so pinning {name}@{} to the hosted \
+             patch would fail every install `EPATCHFAILED` (or install bytes that match \
+             neither the original nor the Socket patch). {state}. To get the Socket fix, fold \
+             it into your own patch, or remove the `patchedDependencies` entry and re-run",
+            dep.version
+        ),
+    });
+}
+
+/// An installed npm lock entry ([`npm_lock_entries`]), detached from the
+/// lock so the rewrite can edit the document through `pointer`.
+struct NpmLockTarget {
+    section: NpmLockSection,
+    /// The `packages` key, or the legacy dependency name: what warnings
+    /// name and the ledger records as the edit key.
+    key: String,
+    pointer: String,
+    packages_key: String,
+    name: String,
+    version: Option<String>,
+    link: bool,
+    bundled: bool,
+    /// A legacy alias node (#432).
+    alias: bool,
+}
+
+impl From<NpmLockEntry<'_>> for NpmLockTarget {
+    fn from(entry: NpmLockEntry<'_>) -> Self {
+        NpmLockTarget {
+            section: entry.section,
+            key: entry.key.to_string(),
+            alias: entry.is_legacy_alias(),
+            pointer: entry.pointer,
+            packages_key: entry.packages_key.into_owned(),
+            name: entry.node.name.to_string(),
+            version: entry.node.version.map(str::to_string),
+            link: entry.link,
+            bundled: entry.bundled,
+        }
     }
 }
 
@@ -1124,13 +1330,15 @@ fn rewrite_npm_lock(
 /// the identical override rewrite (see the dual-lock note there).
 fn rewrite_one_npm_lock(
     content: &str,
+    lock: Option<Value>,
     lockfile: &str,
     npm: &[&DepOverride],
     manifest_overrides: &NpmOverrides,
     result: &mut RewriteResult,
 ) {
-    // npm reads past a leading UTF-8 BOM; so do we.
-    let Ok(mut lock) = parse_json_text(content) else {
+    // `lock` is `content` parsed (npm reads past a leading UTF-8 BOM; so
+    // does that parse), `None` when it is not JSON.
+    let Some(mut lock) = lock else {
         // A corrupt lockfile is strictly worse than a missing one (which
         // warns in the caller) — never skip the whole npm redirect silently.
         result.warnings.push(RewriteWarning {
@@ -1139,43 +1347,25 @@ fn rewrite_one_npm_lock(
         });
         return;
     };
-    // The (package, version) each `packages` entry stands for, by map
-    // position, computed once: the per-dep scan below compares against it
-    // instead of re-deriving it for every entry for every dep. Sound
-    // because a rewrite only ever touches an entry's `resolved`/`integrity`
-    // (never a key, `name` or `version`), so positions and identities hold.
-    let package_ids: Vec<Option<(String, Option<String>)>> = lock
-        .get("packages")
-        .and_then(Value::as_object)
-        .map(|packages| {
-            packages
-                .iter()
-                .map(|(key, entry)| {
-                    // Only `node_modules/` keys are installable dependencies:
-                    // "" is the project root and other bare keys are workspace
-                    // members — SOURCE dirs a resolved/integrity insert would
-                    // corrupt.
-                    let (_, key_name) = key.rsplit_once("node_modules/")?;
-                    // The package a lock entry stands for: the explicit `name`
-                    // field when present (npm writes it for aliases — `npm i
-                    // alias@npm:real` keys the entry by the ALIAS), else the
-                    // key's trailing path. Mirrors `vendor::npm_lock`'s
-                    // `entry_name`, so an alias install of the patched package
-                    // redirects and an entry that merely SHARES the key name
-                    // (`npm i <fname>@npm:other`) is never hijacked.
-                    let entry_nm = entry
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or(key_name);
-                    let version = entry.get("version").and_then(Value::as_str);
-                    Some((entry_nm.to_string(), version.map(str::to_string)))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Every installed entry, detached from the lock and computed once: the
+    // per-dep scan below compares against it instead of re-walking the lock
+    // for every dep. Sound because a rewrite only ever touches an entry's
+    // `resolved`/`integrity` (never a key, `name`, `version` or flag), so
+    // addresses and identities hold.
+    let targets: Vec<NpmLockTarget> = npm_lock_entries(&lock)
+        .into_iter()
+        .filter(NpmLockEntry::is_dependency)
+        .map(NpmLockTarget::from)
+        .collect();
     // Entries npm installs from a git / url / `file:` spec: see
     // `vendor::npm_origin` (#326).
     let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
+    // Entries npm 7–11 install from a dependency's own shrinkwrap (#753).
+    let shrinkwrapped = npm_shrinkwrapped_entries(&lock);
+    // The legacy mirror of an entry the `packages` scan skips (and warns
+    // about) is never rewired either.
+    let mut mirror_skipped = non_registry.clone();
+    mirror_skipped.extend(shrinkwrapped.clone());
     // npm 7+ reads `packages` when it exists; the legacy `dependencies`
     // mirror must not suppress an attestation for that install tree.
     // Match the shared npm lock inventory's object-valued-map precedence.
@@ -1193,90 +1383,124 @@ fn rewrite_one_npm_lock(
             continue;
         };
         let mut matched_any = false;
-        if let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) {
-            for ((key, entry), id) in packages.iter_mut().zip(&package_ids) {
-                let Some((entry_nm, version)) = id else {
-                    continue;
-                };
-                if *entry_nm != fname || version.as_deref() != Some(dep.version.as_str()) {
-                    continue;
+        for target in &targets {
+            if target.name != fname || target.version.as_deref() != Some(dep.version.as_str()) {
+                continue;
+            }
+            let key = target.key.as_str();
+            matched_any = true;
+            let (kind, edit_key) = match target.section {
+                NpmLockSection::Packages => {
+                    if target.link {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_npm_link_entry_skipped".into(),
+                            detail: format!(
+                                "lock entry `{key}` is a link (npm workspaces/file: dir); skipped"
+                            ),
+                        });
+                        continue;
+                    }
+                    // npm reify extracts a bundled copy from its PARENT's
+                    // tarball and ignores the entry's resolved/integrity, so a
+                    // rewrite here would put the hosted URL in the lockfile
+                    // (confirming and VEX-attesting the patch) while the
+                    // unpatched bundled bytes keep installing. Mirrors the
+                    // vendored backend's `vendor_bundled_instance_skipped`
+                    // refusal. The uuid is recorded so the in-run `--vex`
+                    // verifies instead of assuming the patch applied (#325, as
+                    // Bun's #469).
+                    if target.bundled {
+                        result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_npm_bundled_instance_skipped".into(),
+                            detail: format!(
+                                "lock entry `{key}` is bundled inside its parent's tarball \
+                                 and CANNOT be redirected — that copy stays UNPATCHED; vendor \
+                                 or update the bundling parent to cover it"
+                            ),
+                        });
+                        continue;
+                    }
+                    // npm 7–11 install everything beneath a `hasShrinkwrap`
+                    // package from that package's own npm-shrinkwrap.json and
+                    // ignore the root lock's entry, so a rewrite here would
+                    // confirm (and VEX-attest) a patch that never installs
+                    // there (#753). Recorded like a bundled copy so the in-run
+                    // `--vex` verifies instead of assuming.
+                    if let Some(ancestor) = shrinkwrapped.get(key) {
+                        result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_npm_shrinkwrapped_instance_skipped".into(),
+                            detail: format!(
+                                "lock entry `{key}` is installed from `{ancestor}`'s own \
+                                 npm-shrinkwrap.json (hasShrinkwrap), which npm 7–11 read \
+                                 instead of this lock, so it CANNOT be redirected — that copy \
+                                 stays UNPATCHED; vendor or update `{ancestor}` to cover it"
+                            ),
+                        });
+                        continue;
+                    }
+                    // npm installs a git / url / `file:` dependency from the
+                    // dependent's spec and ignores `resolved`, so a rewrite
+                    // here would confirm (and VEX-attest) a patch that never
+                    // installs.
+                    if let Some(reason) = non_registry.get(key) {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_npm_non_registry_entry_skipped".into(),
+                            detail: format!(
+                                "lock entry `{key}` is not installed from the registry \
+                                 ({reason}) and CANNOT be redirected — npm installs it from \
+                                 that spec, so that copy stays UNPATCHED; depend on the \
+                                 registry release to patch it"
+                            ),
+                        });
+                        continue;
+                    }
+                    ("redirect_npm_lock_entry", key)
                 }
-                if entry.get("link").and_then(Value::as_bool) == Some(true) {
-                    matched_any = true;
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_npm_link_entry_skipped".into(),
-                        detail: format!(
-                            "lock entry `{key}` is a link (npm workspaces/file: dir); skipped"
-                        ),
-                    });
-                    continue;
+                // The legacy `dependencies` tree (keyed by name): an alias
+                // node (`"lp": {"version": "npm:left-pad@1.3.0"}`) is an
+                // install of its target, like the `packages` twin's `name`
+                // field.
+                NpmLockSection::Legacy => {
+                    // Legacy spelling of `inBundle`: same
+                    // npm-ignores-the-rewrite fail-open as the `packages`
+                    // guard above.
+                    if target.bundled {
+                        if legacy_is_install_tree {
+                            result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                        }
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_npm_bundled_instance_skipped".into(),
+                            detail: format!(
+                                "legacy dependencies entry `{key}` is bundled inside its \
+                                 parent's tarball and CANNOT be redirected — that copy stays \
+                                 UNPATCHED; vendor or update the bundling parent to cover it"
+                            ),
+                        });
+                        continue;
+                    }
+                    // The mirror of a `packages` entry npm installs from a git
+                    // / url / `file:` spec, or from a dependency's own
+                    // shrinkwrap (#753): that twin was skipped (and warned
+                    // about) above, so rewriting this copy would only record
+                    // an edit for bytes that never install.
+                    if mirror_skipped.contains_key(&target.packages_key) {
+                        continue;
+                    }
+                    ("redirect_npm_lock_dep", key)
                 }
-                // npm reify extracts a bundled copy from its PARENT's tarball
-                // and ignores the entry's resolved/integrity, so a rewrite
-                // here would put the hosted URL in the lockfile (confirming
-                // and VEX-attesting the patch) while the unpatched bundled
-                // bytes keep installing. Mirrors the vendored backend's
-                // `vendor_bundled_instance_skipped` refusal. The uuid is
-                // recorded so the in-run `--vex` verifies instead of
-                // assuming the patch applied (#325, as Bun's #469).
-                if entry.get("inBundle").and_then(Value::as_bool) == Some(true) {
-                    matched_any = true;
-                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_npm_bundled_instance_skipped".into(),
-                        detail: format!(
-                            "lock entry `{key}` is bundled inside its parent's tarball and \
-                             CANNOT be redirected — that copy stays UNPATCHED; vendor or \
-                             update the bundling parent to cover it"
-                        ),
-                    });
-                    continue;
-                }
-                // npm installs a git / url / `file:` dependency from the
-                // dependent's spec and ignores `resolved`, so a rewrite here
-                // would confirm (and VEX-attest) a patch that never installs.
-                if let Some(reason) = non_registry.get(key.as_str()) {
-                    matched_any = true;
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_npm_non_registry_entry_skipped".into(),
-                        detail: format!(
-                            "lock entry `{key}` is not installed from the registry ({reason}) \
-                             and CANNOT be redirected — npm installs it from that spec, so \
-                             that copy stays UNPATCHED; depend on the registry release to \
-                             patch it"
-                        ),
-                    });
-                    continue;
-                }
-                matched_any = true;
-                if let Some(edit) = rewrite_npm_entry(
-                    entry,
-                    dep,
-                    &sha512,
-                    lockfile,
-                    "redirect_npm_lock_entry",
-                    key,
-                ) {
-                    result.edits.push(edit);
-                    changed = true;
+            };
+            let Some(entry) = lock.pointer_mut(&target.pointer) else {
+                continue;
+            };
+            if let Some(edit) = rewrite_npm_entry(entry, dep, &sha512, lockfile, kind, edit_key) {
+                result.edits.push(edit);
+                changed = true;
+                if target.alias {
+                    aliased.push(target.key.clone());
                 }
             }
-        }
-        // v2 legacy `dependencies` tree (keyed by name), recursive.
-        if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
-            changed = rewrite_npm_v2_deps(
-                deps,
-                "",
-                &non_registry,
-                &fname,
-                dep,
-                &sha512,
-                lockfile,
-                legacy_is_install_tree,
-                result,
-                &mut matched_any,
-                &mut aliased,
-            ) || changed;
         }
         // Parity with the pnpm/berry/uv rewriters: a granted dep the
         // lockfile cannot pin must be SAID, not silently dropped from the
@@ -1368,82 +1592,6 @@ fn rewrite_npm_entry(
         original: Some(original),
         new: Some(json!({ "resolved": dep.artifact_url, "integrity": sha512 })),
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rewrite_npm_v2_deps(
-    deps: &mut serde_json::Map<String, Value>,
-    parent_key: &str,
-    non_registry: &BTreeMap<String, String>,
-    fname: &str,
-    dep: &DepOverride,
-    sha512: &str,
-    lockfile: &str,
-    legacy_is_install_tree: bool,
-    result: &mut RewriteResult,
-    matched_any: &mut bool,
-    aliased: &mut Vec<String>,
-) -> bool {
-    let mut changed = false;
-    for (name, entry) in deps.iter_mut() {
-        let packages_key = legacy_packages_key(parent_key, name);
-        // An alias node (`"lp": {"version": "npm:left-pad@1.3.0"}`) is an
-        // install of its target, like the `packages` twin's `name` field.
-        let (node_name, node_version) =
-            npm_legacy_identity(name, entry.get("version").and_then(Value::as_str));
-        let is_alias = node_name != name.as_str();
-        if node_name == fname && node_version == Some(dep.version.as_str()) {
-            // Legacy spelling of `inBundle`: same npm-ignores-the-rewrite
-            // fail-open as the `packages` guard above.
-            if entry.get("bundled").and_then(Value::as_bool) == Some(true) {
-                *matched_any = true;
-                if legacy_is_install_tree {
-                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
-                }
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_npm_bundled_instance_skipped".into(),
-                    detail: format!(
-                        "legacy dependencies entry `{name}` is bundled inside its parent's \
-                         tarball and CANNOT be redirected — that copy stays UNPATCHED; vendor \
-                         or update the bundling parent to cover it"
-                    ),
-                });
-            } else if non_registry.contains_key(&packages_key) {
-                // The mirror of a `packages` entry npm installs from a git /
-                // url / `file:` spec: that twin was skipped (and warned about)
-                // above, so rewriting this copy would only record an edit for
-                // bytes that never install.
-                *matched_any = true;
-            } else {
-                *matched_any = true;
-                if let Some(edit) =
-                    rewrite_npm_entry(entry, dep, sha512, lockfile, "redirect_npm_lock_dep", name)
-                {
-                    result.edits.push(edit);
-                    changed = true;
-                    if is_alias {
-                        aliased.push(name.clone());
-                    }
-                }
-            }
-        }
-        if let Some(nested) = entry.get_mut("dependencies").and_then(Value::as_object_mut) {
-            changed = rewrite_npm_v2_deps(
-                nested,
-                &packages_key,
-                non_registry,
-                fname,
-                dep,
-                sha512,
-                lockfile,
-                legacy_is_install_tree,
-                result,
-                matched_any,
-                aliased,
-            ) || changed;
-        }
-    }
-    changed
 }
 
 // ── cargo (Cargo.toml + .cargo/config.toml + Cargo.lock) ─────────────────────
@@ -3559,6 +3707,22 @@ fn rewrite_yarn_classic_with(
     // re-pin never changes a block's key line.
     let heads: Vec<(Vec<String>, Option<String>)> =
         blocks.iter().map(|b| classic_block_head(&b.key)).collect();
+    // The package each `file:` directory / url copy really installs, with
+    // its version, when its key names another (#1236): read once per block.
+    let renamed: Vec<Option<(String, String, CopySource)>> = blocks
+        .iter()
+        .zip(&heads)
+        .map(|(b, (patterns, _))| {
+            let version = classic_field(&b.lines, "version")?;
+            let (name, source) = crate::formats::yarn::source::classic_copy_real_name(
+                patterns,
+                classic_field(&b.lines, "resolved"),
+                version,
+                |rel| files.get(rel).cloned(),
+            )?;
+            Some((name, version.to_string(), source))
+        })
+        .collect();
     // A pinned block's new lines are kept in `blocks[i].lines` (so a later
     // dep reads the pinned fields) and spliced over the block's original
     // byte span once, at the end: re-scanning and re-copying the whole lock
@@ -3589,6 +3753,43 @@ fn rewrite_yarn_classic_with(
             // matching on the alias name alone would hijack the fork.
             let (patterns, real_name) = &heads[i];
             if real_name.as_deref() != Some(fname.as_str()) {
+                // yarn 1 keys a `file:` directory or url copy by the
+                // DEPENDENCY name (`"lp2@file:./lpdir"`), so a copy of this
+                // package under another name is read from the copy itself
+                // (#1236). No rewrite reaches it: named, and never assumed
+                // applied by the in-run VEX.
+                let Some((version, source)) = renamed[i]
+                    .as_ref()
+                    .filter(|(name, _, _)| *name == fname)
+                    .map(|(_, version, source)| (version, *source))
+                else {
+                    continue;
+                };
+                if *version != dep.version {
+                    continue;
+                }
+                copy_skipped = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                let (code, from) = match source {
+                    CopySource::Directory => (
+                        "redirect_yarn_classic_directory_skipped",
+                        "a file: directory, which yarn copies into node_modules rather than \
+                         fetching a tarball",
+                    ),
+                    _ => (
+                        "redirect_yarn_classic_non_registry_entry_skipped",
+                        "a URL tarball",
+                    ),
+                };
+                result.warnings.push(RewriteWarning {
+                    code: code.into(),
+                    detail: format!(
+                        "lock entry `{}` installs {fname}@{version} under another dependency \
+                         name, from {from}; the hosted redirect leaves it untouched, so this \
+                         copy stays unpatched",
+                        blocks[i].key
+                    ),
+                });
                 continue;
             }
             let block = &blocks[i];
@@ -4727,6 +4928,19 @@ fn parse_bun_hosted_lock(
     Ok((lines, entries))
 }
 
+/// The warning for a package the bun rewriters pinned to its hosted URL that
+/// Bun 1.3.5+ no longer trusts by default (#371).
+pub(crate) fn bun_default_trust_warning(name: &str, version: &str) -> RewriteWarning {
+    RewriteWarning {
+        code: "redirect_bun_default_trust_lost".into(),
+        detail: crate::vendor::bun_lock_text::default_trust_detail(
+            name,
+            version,
+            "a hosted tarball URL",
+        ),
+    }
+}
+
 /// Leave `dep` on its registry resolution when the project's own
 /// `patchedDependencies` patches it (#367): Bun applies that patch only to
 /// the registry `name@version`, so a hosted pin would silently drop it from
@@ -4757,7 +4971,9 @@ fn rewrite_bun_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::bun_lock_text::{decode_json_string, is_bundled_entry};
+    use crate::vendor::bun_lock_text::{
+        decode_json_string, is_bundled_entry, is_user_tarball_spec,
+    };
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() {
@@ -4821,6 +5037,9 @@ fn rewrite_bun_lock(
         let target_spec = format!("{fname}@{}", dep.version);
         let url_spec = format!("{fname}@{}", dep.artifact_url);
         let mut matched_any = false;
+        // A non-bundled instance now resolves to the hosted URL.
+        let mut wired = false;
+        let mut user_tarball_skipped = false;
         for (i, entry) in entries.iter().enumerate() {
             let Some(spec) = specs[i].as_deref() else {
                 continue;
@@ -4872,6 +5091,7 @@ fn rewrite_bun_lock(
                 // `new` (`bun_lock_text::same_wiring_modulo_integrity`), so
                 // the chain still unwinds to the pristine registry line.
                 matched_any = true;
+                wired = true;
                 if entry.elems.len() == 3 && entry.elems[2] == format!("\"{sha512}\"") {
                     continue;
                 }
@@ -4893,10 +5113,28 @@ fn rewrite_bun_lock(
                 deps_verbatim = entry.elems[1].clone();
             } else {
                 // Same-name-but-unowned entry (user file:/URL dep, other
-                // version) — never touched.
+                // version) — never touched. A user URL / `file:` tarball of
+                // this very version is installed from that spec beside the
+                // pinned copy and stays unpatched (#497, npm's #326): say so,
+                // and keep the in-run VEX from assuming the uuid patched.
+                if is_user_tarball_spec(spec, &fname, &dep.version) && spec != url_spec {
+                    user_tarball_skipped = true;
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_bun_non_registry_entry_skipped".into(),
+                        detail: format!(
+                            "bun.lock entry `{}` installs {fname}@{} from a URL or local \
+                             tarball, not the registry, and CANNOT be redirected — bun installs \
+                             it from that spec, so that copy stays UNPATCHED; depend on the \
+                             registry release to patch it",
+                            entry.key, dep.version
+                        ),
+                    });
+                }
                 continue;
             }
             matched_any = true;
+            wired = true;
             let original = lines[entry.line_idx].clone();
             // Lines come from a bare `split('\n')`, so a CRLF lock's lines
             // carry a trailing `\r` (the grammar trims it away when parsing).
@@ -4931,7 +5169,18 @@ fn rewrite_bun_lock(
             changed = true;
         }
         pinned_any |= matched_any;
-        if !matched_any {
+        if wired
+            && crate::vendor::bun_lock_text::loses_default_trust(
+                files.get("package.json").map(String::as_str),
+                Some(content),
+                &fname,
+            )
+        {
+            result
+                .warnings
+                .push(bun_default_trust_warning(&fname, &dep.version));
+        }
+        if !matched_any && !user_tarball_skipped {
             // Mirrors the pnpm/berry/uv rewriters: a granted dep that matched
             // no rewritable tuple (lock re-resolved to another version, entry
             // occupied by an unowned URL/file: spec) must be diagnosable, not
@@ -5185,6 +5434,24 @@ fn record_python_metadata_edit(
     result.files.insert(edit.path, edit.rewritten);
 }
 
+/// #912: the refusal for a pylock Pipenv installs from
+/// ([`pipenv_reads_pylock`]): Pipenv drops the `archive` entry a pin
+/// writes, so `pipenv sync` would install the upstream release.
+///
+/// [`pipenv_reads_pylock`]: crate::utils::python_lock::pipenv_reads_pylock
+fn pipenv_pylock_refusal(path: &str, dep: &DepOverride) -> RewriteWarning {
+    RewriteWarning {
+        code: "redirect_pipenv_pylock_unsupported".into(),
+        detail: format!(
+            "{path} is installed by Pipenv (a Pipfile sits beside it and there is no \
+             Pipfile.lock), and Pipenv keeps only the version and hashes of a pylock \
+             entry, so a pin of {}=={} would be dropped and the upstream release \
+             installed; run `pipenv lock` to write a Pipfile.lock and re-run the scan",
+            dep.name, dep.version
+        ),
+    }
+}
+
 /// Each lock is parsed once ([`PythonLockSession`]) and every dep is
 /// planned, refused or applied against that one document. The lock is still
 /// rendered after every rewritten dep: each dep's FileEdit fragments are
@@ -5197,7 +5464,9 @@ fn rewrite_uv_lock(
     python_metadata: &BTreeMap<String, String>,
     result: &mut RewriteResult,
 ) {
-    use crate::utils::python_lock::{is_python_lock_name, ArtifactSource, PythonLockSession};
+    use crate::utils::python_lock::{
+        is_python_lock_name, pipenv_reads_pylock, ArtifactSource, PythonLockSession,
+    };
 
     let locks: Vec<(&String, &String)> = files
         .iter()
@@ -5223,9 +5492,17 @@ fn rewrite_uv_lock(
     for (path, original) in locks {
         let mut content = original.clone();
         let mut session = PythonLockSession::new(original);
+        let pipenv_reads = pipenv_reads_pylock(path, |rel| files.contains_key(rel));
         for &(dep, sha256) in &usable {
             let artifact = ArtifactSource::Url(&dep.artifact_url);
             let plan = match session.plan(&content, &dep.name, &dep.version, artifact) {
+                Ok(Some(_)) if pipenv_reads => {
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
+                    result.warnings.push(pipenv_pylock_refusal(path, dep));
+                    continue;
+                }
                 Ok(Some(plan)) => plan,
                 Ok(None) => {
                     result.warnings.push(RewriteWarning {
@@ -6773,8 +7050,10 @@ fn rewrite_maven_pom(
     // One pass over the pom's repositories: `(id, url)` of each, which also
     // answers the per-dep URL-refresh check below while the pom is still
     // unchanged (a no-op rescan then never re-scans the pom per dep).
-    let original_repos: Vec<(String, Option<String>)> =
-        pom.as_deref().map(maven_repository_ids_and_urls).unwrap_or_default();
+    let original_repos: Vec<(String, Option<String>)> = pom
+        .as_deref()
+        .map(maven_repository_ids_and_urls)
+        .unwrap_or_default();
     let hosted_repo_generations: std::collections::BTreeSet<String> = original_repos
         .iter()
         .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
@@ -10846,7 +11125,10 @@ mod tests {
             &[(YARNRC_REL, "yarn-offline-mirror: false\n")],
             &[(YARNRC_REL, "yarn-offline-mirror:\n")],
             &[(YARNRC_REL, "yarn-offline-mirror \"\"\n")],
-            &[(YARNRC_REL, "yarn-offline-mirror-pruning true\n# yarn-offline-mirror ./m\n")],
+            &[(
+                YARNRC_REL,
+                "yarn-offline-mirror-pruning true\n# yarn-offline-mirror ./m\n",
+            )],
             &[(npmrc::NPMRC_REL, "[scope]\nyarn-offline-mirror=./m\n")],
             &[
                 (YARNRC_REL, "yarn-offline-mirror false\n"),
@@ -10862,7 +11144,10 @@ mod tests {
             let mut r = RewriteResult::default();
             rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
             assert!(r.warnings.is_empty(), "{rcs:?}: {:?}", r.warnings);
-            assert!(r.files["yarn.lock"].contains("http://p.test/lp.tgz"), "{rcs:?}");
+            assert!(
+                r.files["yarn.lock"].contains("http://p.test/lp.tgz"),
+                "{rcs:?}"
+            );
             assert!(r.refused_yarn_classic_uuids.is_empty(), "{rcs:?}");
         }
     }
@@ -10887,7 +11172,10 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&other), &mut r);
         assert!(r.refused_yarn_classic_uuids.is_empty());
         assert_eq!(
-            r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
             ["redirect_yarn_classic_entry_not_found"]
         );
     }
@@ -11048,6 +11336,79 @@ mod tests {
             let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
             assert_eq!(codes, ["redirect_yarn_classic_directory_skipped"], "{only}");
             assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+        }
+    }
+
+    /// #1236: yarn 1 locks a `file:` directory or url copy under the
+    /// DEPENDENCY name (`"lp2@file:./lpdir"`), so a copy of the patched
+    /// left-pad@1.3.0 declared as `lp2` is read from the copy itself (the
+    /// directory's `package.json`, the registry url's path). The registry
+    /// block is still pinned; the copy is named with the same codes as a
+    /// same-name copy and kept out of the in-run VEX. Controls: a copy of
+    /// another package, of another version, or whose manifest is not
+    /// readable is not named.
+    #[test]
+    fn issue_1236_yarn_classic_other_name_copy_is_named() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let registry_block = "left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        let dir_block = "\"lp2@file:./lpdir\":\n  version \"1.3.0\"\n";
+        let url_block = "\"lp2@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\":\n  \
+             version \"1.3.0\"\n  \
+             resolved \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n";
+        let run = |copy: &str, manifest: Option<&str>| {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "yarn.lock".to_string(),
+                format!("# yarn lockfile v1\n\n\n{registry_block}\n{copy}"),
+            );
+            if let Some(m) = manifest {
+                files.insert("lpdir/package.json".to_string(), m.to_string());
+            }
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(
+                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz\""),
+                "the registry block is still pinned: {:?}",
+                r.files
+            );
+            assert!(r.files["yarn.lock"].contains(copy), "copy byte-identical");
+            r
+        };
+        let left_pad = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        for (copy, code) in [
+            (dir_block, "redirect_yarn_classic_directory_skipped"),
+            (
+                url_block,
+                "redirect_yarn_classic_non_registry_entry_skipped",
+            ),
+        ] {
+            let r = run(copy, Some(left_pad));
+            let named: Vec<&RewriteWarning> =
+                r.warnings.iter().filter(|w| w.code == code).collect();
+            assert_eq!(named.len(), 1, "{copy}: {:?}", r.warnings);
+            assert!(named[0].detail.contains("lp2@"), "{:?}", named[0]);
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid), "{copy}");
+        }
+        let other_version = dir_block.replace("1.3.0", "1.2.0");
+        for (case, copy, manifest) in [
+            (
+                "another package",
+                dir_block,
+                Some(r#"{"name":"other-pkg","version":"1.3.0"}"#),
+            ),
+            ("another version", other_version.as_str(), Some(left_pad)),
+            ("no readable manifest", dir_block, None),
+        ] {
+            let r = run(copy, manifest);
+            assert!(r.warnings.is_empty(), "{case}: {:?}", r.warnings);
+            assert!(r.bundled_skipped_uuids.is_empty(), "{case}");
         }
     }
 
@@ -11411,6 +11772,69 @@ mod tests {
         );
     }
 
+    /// REGRESSION (#578): the bundled-copy check JSON-parses an entry's meta,
+    /// so running it before the spec compare cost one parse per dep × entry
+    /// (bun/hosted wall +110%). Only an entry whose spec matches the dep may
+    /// pay it, and the bundled copy must still be skipped and reported.
+    #[test]
+    fn bun_lock_bundled_check_runs_only_on_matching_entries() {
+        use crate::vendor::bun_lock_text::BUNDLED_CHECKS;
+
+        const ENTRIES: usize = 200;
+        const DEPS: usize = 20;
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let mut body: Vec<String> = (0..ENTRIES)
+            .map(|i| format!("\"pkg{i}\": [\"pkg{i}@1.0.0\", \"\", {{}}, \"sha512-OLD==\"],"))
+            .collect();
+        body.push(
+            "\"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }, \"sha512-OLD==\"],"
+                .into(),
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(&body.join("\n    "), 1),
+        );
+        let overrides: Vec<DepOverride> = (0..DEPS)
+            .map(|i| {
+                npm_override(
+                    &format!("pkg{i}"),
+                    "1.0.0",
+                    &format!("http://p.test/pkg{i}.tgz"),
+                    &sha512,
+                )
+            })
+            .collect();
+
+        BUNDLED_CHECKS.with(|checks| checks.set(0));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, &overrides, &mut r);
+        let checks = BUNDLED_CHECKS.with(std::cell::Cell::get);
+
+        let out = r.files.get("bun.lock").expect("matching deps are rewired");
+        for i in 0..DEPS {
+            assert!(out.contains(&format!("http://p.test/pkg{i}.tgz")), "{out}");
+        }
+        assert!(
+            out.contains("\"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }"),
+            "the bundled copy is never rewired: {out}"
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_bun_bundled_instance_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        // One check per spec-matching entry (DEPS registry tuples + the
+        // bundled copy), not DEPS × (ENTRIES + 1).
+        assert!(
+            checks <= DEPS + 1,
+            "{checks} bundled checks for {DEPS} deps over {} entries",
+            ENTRIES + 1
+        );
+    }
+
     /// A bun.lock already redirected by an earlier run holds a URL 3-tuple —
     /// the registry `name@version` spec is gone — so when the artifact URL
     /// changes (patch republish rotates the uuid segment, token rotation
@@ -11477,7 +11901,11 @@ mod tests {
             r.files.is_empty(),
             "foreign-origin URL dep must not be touched"
         );
-        assert_eq!(r.warnings[0].code, "redirect_bun_entry_not_found");
+        // ...but bun installs it from that URL, unpatched (#497).
+        assert_eq!(
+            r.warnings[0].code,
+            "redirect_bun_non_registry_entry_skipped"
+        );
 
         // Our origin but ANOTHER version's leaf is never claimed either.
         let other_version_url = "https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.2.0.tgz";
@@ -11856,6 +12284,82 @@ mod tests {
         );
     }
 
+    /// REGRESSION (#497): bun installs a remote-URL or `file:` tarball
+    /// dependency from its own spec, never the registry, so a registry copy
+    /// of the same version rewired beside it leaves the copy the app loads
+    /// unpatched. The tarball tuple is left alone LOUDLY (npm's #326), the
+    /// uuid is kept out of the in-run VEX's assumptions, and a lock holding
+    /// only the tarball copy says why instead of `redirect_bun_entry_not_found`.
+    #[test]
+    fn bun_lock_user_tarball_copy_is_skipped_with_loud_warning() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override(
+            "is-number",
+            "6.0.0",
+            "http://p.test/is-number-6.0.0.tgz",
+            &sha512,
+        );
+        let nested = "\"is-odd/is-number\": [\"is-number@6.0.0\", \"\", {}, \"sha512-UP==\"],";
+        for user in [
+            "\"is-number\": [\"is-number@https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz\", {}, \"sha512-UP==\"],",
+            "\"is-number\": [\"is-number@./is-number-6.0.0.tgz\", {}, \"sha512-UP==\"],",
+            "\"is-number\": [\"is-number@vendor/is-number-6.0.0.tgz\", {}],",
+        ] {
+            let both = format!("{user}\n    {nested}");
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(&both, 2));
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert_eq!(r.edits.len(), 1, "{user}: {:?}", r.edits);
+            assert_eq!(r.edits[0].key.as_deref(), Some("is-odd/is-number"));
+            let out = r.files.get("bun.lock").expect("nested copy rewired");
+            assert!(out.contains(user), "{user}: tarball line untouched: {out}");
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_bun_non_registry_entry_skipped"],
+                "{user}: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.warnings[0].detail.contains("`is-number`")
+                    && r.warnings[0].detail.contains("UNPATCHED"),
+                "{}",
+                r.warnings[0].detail
+            );
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+            // The tarball copy alone: nothing to rewire, and the warning
+            // names the real reason.
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(user, 2));
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_bun_non_registry_entry_skipped"],
+                "{user}: {:?}",
+                r.warnings
+            );
+        }
+
+        // A tarball of ANOTHER version, or one whose leaf names no version,
+        // is not this copy: no warning.
+        for other in [
+            "\"is-number\": [\"is-number@https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz\", {}, \"sha512-UP==\"],",
+            "\"is-number\": [\"is-number@./is-number.tgz\", {}, \"sha512-UP==\"],",
+        ] {
+            let both = format!("{other}\n    {nested}");
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(&both, 2));
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert_eq!(r.edits.len(), 1, "{other}: {:?}", r.edits);
+            assert!(r.warnings.is_empty(), "{other}: {:?}", r.warnings);
+            assert!(r.bundled_skipped_uuids.is_empty());
+        }
+    }
+
     /// #580: the bundled check runs only for entries whose spec matches the
     /// patch. A bundled copy of ANOTHER package (or another version) beside
     /// the target never warns or keeps the patch out of VEX, while a bundled
@@ -11963,6 +12467,106 @@ mod tests {
         rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
+    /// (better-sqlite3, esbuild, sharp, simple-git-hooks, …) applies only to
+    /// packages resolved from the npm registry, so a default-trusted package
+    /// rewired to a hosted URL has its install scripts skipped with exit 0.
+    /// The rewrite says so, on the first run and on an already-wired re-run;
+    /// a project that declares `trustedDependencies` (in package.json or
+    /// bun.lock's mirror) decides trust by name alone and is not warned, nor
+    /// is a package off the default list.
+    #[test]
+    fn bun_lock_default_trusted_package_warns_that_trust_is_lost() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let hooks = npm_override(
+            "simple-git-hooks",
+            "2.11.1",
+            "http://p.test/simple-git-hooks-2.11.1.tgz",
+            &sha512,
+        );
+        let mut other = npm_override("is-number", "7.0.0", "http://p.test/isn.tgz", &sha512);
+        other.patch_uuid = "22222222-2222-4222-8222-222222222222".into();
+        let entries = "\"is-number\": [\"is-number@7.0.0\", \"\", {}, \"sha512-UP==\"],\n    \
+                       \"simple-git-hooks\": [\"simple-git-hooks@2.11.1\", \"\", { \"bin\": \
+                       { \"simple-git-hooks\": \"cli.js\" } }, \"sha512-OLD==\"],";
+        let manifest =
+            r#"{"name":"app","dependencies":{"is-number":"7.0.0","simple-git-hooks":"2.11.1"}}"#;
+        let overrides = [hooks.clone(), other.clone()];
+        let run = |lock: &str, manifest: Option<&str>| {
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), lock.to_string());
+            if let Some(manifest) = manifest {
+                files.insert("package.json".to_string(), manifest.to_string());
+            }
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, &overrides, &mut r);
+            r
+        };
+
+        let lock = bun_lock_file(entries, 1);
+        let first = run(&lock, Some(manifest));
+        let wired = first.files.get("bun.lock").expect("both rewired").clone();
+        assert_eq!(first.edits.len(), 2, "{:?}", first.edits);
+        assert_eq!(
+            warning_codes(&first),
+            vec!["redirect_bun_default_trust_lost"],
+            "{:?}",
+            first.warnings
+        );
+        let detail = &first.warnings[0].detail;
+        assert!(
+            detail.contains("simple-git-hooks@2.11.1")
+                && detail.contains("trustedDependencies")
+                && detail.contains("1.3.5"),
+            "{detail}"
+        );
+        // Without a readable manifest Bun still has no explicit list.
+        assert_eq!(
+            warning_codes(&run(&lock, None)),
+            vec!["redirect_bun_default_trust_lost"]
+        );
+        // An already-wired re-run keeps saying so until trust is declared.
+        let rerun = run(&wired, Some(manifest));
+        assert!(rerun.files.is_empty() && rerun.edits.is_empty());
+        assert_eq!(
+            warning_codes(&rerun),
+            vec!["redirect_bun_default_trust_lost"]
+        );
+
+        // An explicit list (even one that omits the package: Bun then never
+        // trusted it by default) leaves trust unchanged by the rewire.
+        for declared in [
+            r#"{"name":"app","trustedDependencies":["simple-git-hooks"]}"#,
+            r#"{"name":"app","trustedDependencies":[]}"#,
+            "{\n  // JSONC, as Bun reads it\n  \"trustedDependencies\": [\"simple-git-hooks\",],\n}",
+        ] {
+            let r = run(&lock, Some(declared));
+            assert_eq!(r.edits.len(), 2);
+            assert!(r.warnings.is_empty(), "{declared}: {:?}", r.warnings);
+        }
+        let mirrored = lock.replacen(
+            "  \"packages\": {",
+            "  \"trustedDependencies\": [\n    \"simple-git-hooks\",\n  ],\n  \"packages\": {",
+            1,
+        );
+        assert_ne!(mirrored, lock);
+        assert!(run(&mirrored, None).warnings.is_empty());
+
+        // A bundled copy is not rewired, so its trust is not the rewire's
+        // to lose (its own warning says it stays unpatched).
+        let bundled = bun_lock_file(
+            "\"p/simple-git-hooks\": [\"simple-git-hooks@2.11.1\", \"\", { \"bundled\": true }, \
+             \"sha512-OLD==\"],",
+            1,
+        );
+        let r = run(&bundled, Some(manifest));
+        assert!(
+            !warning_codes(&r).contains(&"redirect_bun_default_trust_lost"),
+            "{:?}",
+            r.warnings
+        );
     }
 
     /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on
@@ -15601,6 +16205,162 @@ mod tests {
         );
     }
 
+    /// A superseding patch (new uuid) refreshes an existing patch-registry
+    /// section's remote — and must then move that section to where bundler
+    /// writes it. Bundler sorts the rubygems `GEM` sections by identifier,
+    /// so with a sibling patch-registry section in between, an in-place
+    /// refresh leaves the lock out of order and every frozen install on
+    /// bundler 4.0.19+ exits 16 (#1186).
+    #[test]
+    fn gem_superseded_remote_moves_section_to_sorted_position() {
+        fn ov(name: &str, uuid: &str) -> DepOverride {
+            let mut o = gem_override(name, "1.0.0");
+            o.patch_uuid = uuid.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/tok/{uuid}/");
+            }
+            o
+        }
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"vuln-gem\", \"1.0.0\"\n";
+        for eol in ["\n", "\r\n"] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.replace('\n', eol));
+            files.insert(
+                "Gemfile.lock".to_string(),
+                format!(
+                    "GEM\n  remote: https://rubygems.org/\n  specs:\n    tiny-dep (1.0.0)\n    \
+                     vuln-gem (1.0.0)\n      tiny-dep\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  \
+                     vuln-gem (= 1.0.0)\n\nCHECKSUMS\n  tiny-dep (1.0.0) sha256={a}\n  \
+                     vuln-gem (1.0.0) sha256={a}\n\nBUNDLED WITH\n   4.0.22\n",
+                    a = "2".repeat(64)
+                )
+                .replace('\n', eol),
+            );
+            let gen1 = [ov("vuln-gem", "10000000"), ov("tiny-dep", "80000000")];
+            let first = rewrite_registry_redirect(&files, &gen1);
+            for (name, content) in first.files {
+                files.insert(name, content);
+            }
+            let remotes = |lock: &str| -> Vec<String> {
+                lock.lines()
+                    .filter_map(|l| l.trim_end_matches('\r').strip_prefix("  remote: "))
+                    .map(str::to_string)
+                    .collect()
+            };
+            assert_eq!(
+                remotes(&files["Gemfile.lock"]),
+                [
+                    "https://patch.test/gem/tok/10000000/",
+                    "https://patch.test/gem/tok/80000000/",
+                    "https://rubygems.org/",
+                ],
+                "generation 1 inserts sorted: {}",
+                files["Gemfile.lock"]
+            );
+
+            let gen2 = [ov("vuln-gem", "9a9a9a9a"), ov("tiny-dep", "80000000")];
+            let second = rewrite_registry_redirect(&files, &gen2);
+            let lock = second.files.get("Gemfile.lock").expect("lock refreshed");
+            assert_eq!(
+                remotes(lock),
+                [
+                    "https://patch.test/gem/tok/80000000/",
+                    "https://patch.test/gem/tok/9a9a9a9a/",
+                    "https://rubygems.org/",
+                ],
+                "refreshed section re-placed in bundler's order ({eol:?}): {lock}"
+            );
+            let expected_sections = format!(
+                "GEM\n  remote: https://patch.test/gem/tok/80000000/\n  specs:\n    \
+                 tiny-dep (1.0.0)\n\nGEM\n  remote: https://patch.test/gem/tok/9a9a9a9a/\n  \
+                 specs:\n    vuln-gem (1.0.0)\n      tiny-dep\n\nGEM\n  remote: \
+                 https://rubygems.org/\n  specs:\n\nPLATFORMS\n"
+            )
+            .replace('\n', eol);
+            assert!(
+                lock.starts_with(&expected_sections),
+                "sections move whole, endings kept ({eol:?}): {lock}"
+            );
+            assert!(
+                second
+                    .edits
+                    .iter()
+                    .any(|e| e.kind == "redirect_gemfile_lock_source_url"
+                        && e.original
+                            == Some(Value::String("https://patch.test/gem/tok/10000000/".into()))),
+                "refresh still recorded: {:?}",
+                second.edits
+            );
+
+            // Converged: a re-run is a no-op.
+            for (name, content) in second.files {
+                files.insert(name, content);
+            }
+            let third = rewrite_registry_redirect(&files, &gen2);
+            assert!(
+                third.files.is_empty(),
+                "re-run after the move must be a no-op: {:?}",
+                third.files
+            );
+        }
+    }
+
+    /// A converged lock an earlier run left out of bundler's section order
+    /// (#1186) is healed by the next run even though the remote is
+    /// unchanged — here by moving the patch section after a sibling that
+    /// sorts first, to the end of the `GEM` sections.
+    #[test]
+    fn gem_out_of_order_patch_section_is_healed_on_rerun() {
+        let index = "https://z.test/gem/tok/uuid/";
+        let mut o = gem_override("rails", "7.0.0");
+        if let Some(r) = o.registry_override.as_mut() {
+            r.index_url = index.into();
+        }
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&o));
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let sorted = files["Gemfile.lock"].clone();
+        let rails = format!("GEM\n  remote: {index}\n  specs:\n    rails (7.0.0)\n\n");
+        let upstream = "GEM\n  remote: https://rubygems.org/\n  specs:\n\n";
+        assert!(
+            sorted.starts_with(&format!("{upstream}{rails}PLATFORMS\n")),
+            "fresh insert sorts the patch section last: {sorted}"
+        );
+        // An out-of-order lock as an earlier run could leave it.
+        files.insert(
+            "Gemfile.lock".to_string(),
+            sorted.replacen(
+                &format!("{upstream}{rails}"),
+                &format!("{rails}{upstream}"),
+                1,
+            ),
+        );
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&o));
+        assert_eq!(
+            second.files.get("Gemfile.lock"),
+            Some(&sorted),
+            "re-run restores bundler's order"
+        );
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_lock_section_order"),
+            "the move is recorded: {:?}",
+            second.edits
+        );
+    }
+
     /// A TRANSITIVE redirected dep (undeclared in the Gemfile, appended as a
     /// source block) becomes a direct source-pinned dependency, so the
     /// converged lock must gain its `<name> (= <ver>)!` DEPENDENCIES entry —
@@ -16445,12 +17205,15 @@ mod tests {
         );
     }
 
-    /// A shrinkwrap-ONLY project (the npm <= 6 world, where `npm shrinkwrap`
-    /// wrote the sole lock and no `package-lock.json` was auto-created) must
-    /// still be rewritten with zero warnings — the dual-lock handling must
-    /// not perturb the single-lock path.
+    /// A shrinkwrap-ONLY project (what `npm shrinkwrap` leaves: no
+    /// `package-lock.json`) is still rewritten — npm <= 11 installs from it —
+    /// and NO package-lock.json is invented. REGRESSION (#899): npm 12 never
+    /// reads the shrinkwrap (it resolves from the registry and writes a
+    /// fresh package-lock.json), so the run warns
+    /// `redirect_npm_shrinkwrap_only` — again on an in-sync re-run — instead
+    /// of reporting a clean success.
     #[test]
-    fn npm_shrinkwrap_only_still_rewritten_no_warnings() {
+    fn npm_shrinkwrap_only_rewritten_and_warns_npm12_ignores_it() {
         let ovr = npm_override(
             "left-pad",
             "1.3.0",
@@ -16492,10 +17255,196 @@ mod tests {
         );
         assert_eq!(
             warning_codes(&r),
-            Vec::<&str>::new(),
-            "a clean shrinkwrap-only success must emit NO warnings: {:?}",
+            vec!["redirect_npm_shrinkwrap_only"],
+            "{:?}",
             r.warnings
         );
+        let detail = &r.warnings[0].detail;
+        for needle in [
+            "left-pad@1.3.0",
+            "npm >= 12",
+            "no package-lock.json",
+            "UNPATCHED",
+        ] {
+            assert!(detail.contains(needle), "{needle}: {detail}");
+        }
+
+        // The in-sync re-run writes nothing and still warns.
+        files.insert("npm-shrinkwrap.json".to_string(), out.clone());
+        let again = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
+        assert_eq!(warning_codes(&again), vec!["redirect_npm_shrinkwrap_only"]);
+
+        // The twin npm 12 reads: both rewritten, no shrinkwrap-only warning.
+        files.insert("package-lock.json".to_string(), out.clone());
+        let twin = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert_eq!(
+            warning_codes(&twin),
+            Vec::<&str>::new(),
+            "{:?}",
+            twin.warnings
+        );
+
+        // A shrinkwrap without any of the deps carries no redirect: no warning.
+        let mut other = BTreeMap::new();
+        other.insert(
+            "npm-shrinkwrap.json".to_string(),
+            r#"{"lockfileVersion":3,"packages":{"":{"name":"app"}}}"#.to_string(),
+        );
+        let none = rewrite_registry_redirect(&other, std::slice::from_ref(&ovr));
+        assert!(
+            !warning_codes(&none).contains(&"redirect_npm_shrinkwrap_only"),
+            "{:?}",
+            none.warnings
+        );
+    }
+
+    /// REGRESSION (#711): npm 12.1+ `npm patch` records the project's own
+    /// diff in the root `patchedDependencies` and on the lock entry
+    /// (`"patched"`, lockfileVersion 4), then applies it on top of whatever
+    /// tarball the lock names. Pinning that entry to the hosted patch made
+    /// every later `npm ci` fail `EPATCHFAILED` while the scan reported a
+    /// clean switch. The entry keeps its registry tuple in EVERY present
+    /// lock, the run says why, and the in-run VEX never assumes it patched;
+    /// another granted package in the same lock is still rewired.
+    #[test]
+    fn npm_lock_user_patched_dependency_is_left_alone_loudly() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut other = npm_override(
+            "is-number",
+            "7.0.0",
+            "http://p.test/isn.tgz",
+            "sha512-PATCHED==",
+        );
+        other.patch_uuid = "22222222-2222-4222-8222-222222222222".into();
+        let lock = |patched: bool| {
+            let record = if patched {
+                ",\n      \"patched\": {\n        \"integrity\": \"sha512-USER==\",\n        \
+                 \"path\": \"patches/left-pad@1.3.0.patch\"\n      }"
+            } else {
+                ""
+            };
+            format!(
+                "{{\n  \"name\": \"app\",\n  \"lockfileVersion\": {},\n  \"packages\": {{\n    \
+                 \"\": {{\n      \"name\": \"app\"\n    }},\n    \"node_modules/is-number\": {{\n      \
+                 \"version\": \"7.0.0\",\n      \
+                 \"resolved\": \"https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz\",\n      \
+                 \"integrity\": \"sha512-UPSTREAM==\"\n    }},\n    \"node_modules/left-pad\": {{\n      \
+                 \"version\": \"1.3.0\",\n      \
+                 \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\",\n      \
+                 \"integrity\": \"sha512-UPSTREAM==\"{record}\n    }}\n  }}\n}}\n",
+                if patched { 4 } else { 3 }
+            )
+        };
+        let manifest = r#"{"name":"app","dependencies":{"left-pad":"1.3.0","is-number":"7.0.0"},"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad@1.3.0.patch"}}"#;
+
+        // Each signal alone gates the dep: the manifest key (over a lock
+        // that does not record it), or the lock's `patched` record (with no
+        // manifest read), and both together. A shrinkwrap beside a
+        // `patched` package-lock is left alone for that dep too.
+        for (with_manifest, with_record, shrinkwrap) in [
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, true, true),
+        ] {
+            let case = format!("manifest={with_manifest} record={with_record} sw={shrinkwrap}");
+            let mut files = BTreeMap::new();
+            files.insert("package-lock.json".to_string(), lock(with_record));
+            if shrinkwrap {
+                files.insert("npm-shrinkwrap.json".to_string(), lock(false));
+            }
+            if with_manifest {
+                files.insert("package.json".to_string(), manifest.to_string());
+            }
+            let r = rewrite_registry_redirect(&files, &[ovr.clone(), other.clone()]);
+            assert_eq!(r.edits.len(), if shrinkwrap { 2 } else { 1 }, "{case}");
+            assert!(
+                r.edits
+                    .iter()
+                    .all(|e| e.key.as_deref() == Some("node_modules/is-number")),
+                "{case}: {:?}",
+                r.edits
+            );
+            for out in r.files.values() {
+                assert!(
+                    out.contains("https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz")
+                        && !out.contains("http://p.test/lp.tgz"),
+                    "{case}: the user-patched entry keeps its registry tuple: {out}"
+                );
+            }
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_npm_patched_dependency_skipped"],
+                "{case}: {:?}",
+                r.warnings
+            );
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains("left-pad@1.3.0")
+                    && detail.contains("npm patch")
+                    && detail.contains("EPATCHFAILED"),
+                "{case}: {detail}"
+            );
+            if !with_manifest {
+                assert!(
+                    detail.contains("package-lock.json entry `node_modules/left-pad`"),
+                    "{case}: {detail}"
+                );
+            }
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid), "{case}");
+            assert!(r.refused_npm_uuids.contains(&ovr.patch_uuid), "{case}");
+            assert!(!r.refused_npm_uuids.contains(&other.patch_uuid), "{case}");
+        }
+
+        // A patch for ANOTHER version, or a null `patched`, gates nothing.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            lock(false).replace(
+                "\"integrity\": \"sha512-UPSTREAM==\"\n    }\n  }",
+                "\"integrity\": \"sha512-UPSTREAM==\",\n      \"patched\": null\n    }\n  }",
+            ),
+        );
+        files.insert(
+            "package.json".to_string(),
+            manifest.replace("left-pad@1.3.0\":", "left-pad@1.2.0\":"),
+        );
+        let r = rewrite_registry_redirect(&files, &[ovr.clone(), other.clone()]);
+        assert_eq!(r.edits.len(), 2, "{:?} {:?}", r.edits, r.warnings);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.refused_npm_uuids.is_empty());
+
+        // A lock an earlier (pre-fix) hosted run already pinned keeps that
+        // pin: the warning must say so and name the rollback, never claim
+        // the entry is unchanged while every install still fails.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            lock(true).replace(
+                "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "http://p.test/lp.tgz",
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_npm_patched_dependency_skipped"]
+        );
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("already pinned it in package-lock.json")
+                && detail.contains(&format!("socket-patch rollback {}", ovr.patch_uuid))
+                && !detail.contains("left unchanged"),
+            "{detail}"
+        );
+        assert!(r.refused_npm_uuids.contains(&ovr.patch_uuid));
     }
 
     /// #324: the hosted npm rewrite changes only the rewired values and keeps
@@ -16631,6 +17580,106 @@ mod tests {
             r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
             "#325: the skipped bundled copy must keep the patch out of the in-run VEX"
         );
+    }
+
+    /// REGRESSION (#753): npm 7–11 install everything beneath a
+    /// `hasShrinkwrap` package from that package's own npm-shrinkwrap.json,
+    /// ignoring the root lock's entry. Rewriting the nested entry (or its
+    /// v2 legacy mirror) would confirm a patch npm never installs, so it is
+    /// skipped loudly, while a hoisted copy of the same version elsewhere
+    /// is still redirected.
+    #[test]
+    fn npm_entry_under_has_shrinkwrap_parent_is_skipped_with_loud_warning() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 2,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/@bh/sw": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+      "integrity": "sha512-SW==",
+      "hasShrinkwrap": true
+    },
+    "node_modules/@bh/sw/node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  },
+  "dependencies": {
+    "@bh/sw": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+      "integrity": "sha512-SW==",
+      "dependencies": {
+        "left-pad": {
+          "version": "1.3.0",
+          "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+          "integrity": "sha512-UPSTREAM=="
+        }
+      }
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a shrinkwrapped-only dep must change nothing: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        let skipped = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_npm_shrinkwrapped_instance_skipped")
+            .unwrap_or_else(|| panic!("shrinkwrapped skip must warn: {:?}", r.warnings));
+        assert!(
+            skipped.detail.contains("UNPATCHED")
+                && skipped
+                    .detail
+                    .contains("node_modules/@bh/sw/node_modules/left-pad")
+                && skipped.detail.contains("`node_modules/@bh/sw`"),
+            "the warning must name the entry and its shrinkwrap owner: {}",
+            skipped.detail
+        );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
+            "a shrinkwrapped skip is a MATCH: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "the skipped copy must keep the patch out of the in-run VEX"
+        );
+
+        // A hoisted copy outside the shrinkwrapped subtree still redirects.
+        let lock = files["package-lock.json"].replace(
+            r#""node_modules/@bh/sw": {"#,
+            r#""node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    },
+    "node_modules/@bh/sw": {"#,
+        );
+        files.insert("package-lock.json".to_string(), lock);
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let keys: Vec<_> = r.edits.iter().filter_map(|e| e.key.as_deref()).collect();
+        assert_eq!(keys, ["node_modules/left-pad"], "edits: {:?}", r.edits);
+        assert!(warning_codes(&r).contains(&"redirect_npm_shrinkwrapped_instance_skipped"));
     }
 
     /// #326: npm installs a git, remote-tarball or `file:` dependency from
@@ -17107,8 +18156,8 @@ mod tests {
     /// An alias install (`npm i my-alias@npm:left-pad@1.3.0`) keys the lock
     /// entry by the ALIAS with the real package in `name`. Discovery is
     /// alias-aware (the crawler reads the installed package.json name), so
-    /// the rewriter must be too — matching on the entry's `name`, mirroring
-    /// `vendor::npm_lock::entry_name`.
+    /// the rewriter must be too — matching on the entry's `name`, the
+    /// shared `vendor::lock_inventory::npm_lock_entries` identity rule.
     #[test]
     fn npm_alias_entry_is_redirected() {
         let mut files = BTreeMap::new();
@@ -21128,13 +22177,23 @@ packages:
             Some(format!("    {stale}").as_str())
         );
 
-        for unowned in [
-            // Foreign origin, same leaf: a user's own URL dep.
-            "\"left-pad\": [\"left-pad@https://example.com/mirror/left-pad-1.3.0.tgz\", {}],",
+        for (unowned, code) in [
+            // Foreign origin, same leaf: a user's own URL dep, which bun
+            // installs from that URL, unpatched (#497).
+            (
+                "\"left-pad\": [\"left-pad@https://example.com/mirror/left-pad-1.3.0.tgz\", {}],",
+                "redirect_bun_non_registry_entry_skipped",
+            ),
             // Our origin, another version's leaf.
-            "\"left-pad\": [\"left-pad@https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.2.0.tgz\", {}],",
+            (
+                "\"left-pad\": [\"left-pad@https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.2.0.tgz\", {}],",
+                "redirect_bun_entry_not_found",
+            ),
             // Registry spec in a 2-tuple: not bun's registry grammar.
-            "\"left-pad\": [\"left-pad@1.3.0\", {}],",
+            (
+                "\"left-pad\": [\"left-pad@1.3.0\", {}],",
+                "redirect_bun_entry_not_found",
+            ),
         ] {
             let mut files = BTreeMap::new();
             files.insert("bun.lock".to_string(), bun_lock_file(unowned, 1));
@@ -21146,7 +22205,7 @@ packages:
             );
             assert_eq!(
                 r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
-                vec!["redirect_bun_entry_not_found"],
+                vec![code],
                 "{unowned}"
             );
         }
@@ -21170,7 +22229,8 @@ packages:
     /// Fail-closed ownership legs of the URL-tuple takeover: an OTHER-name
     /// spec, a non-http `file:` spec, and a foreign-origin URL all survive
     /// byte-identically while the target registry tuple in the same lock is
-    /// rewritten.
+    /// rewritten. The foreign-origin URL names the target's own leaf, so it
+    /// is reported as a copy that stays unpatched (#497).
     #[test]
     fn bun_lock_unowned_url_and_file_tuples_survive_untouched() {
         let sha = format!("sha512-{}==", "A".repeat(86));
@@ -21205,7 +22265,13 @@ packages:
             );
         }
         assert_eq!(r.edits.len(), 1, "only the target is edited: {:?}", r.edits);
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_non_registry_entry_skipped"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.warnings[0].detail.contains("`mirror/left-pad`"));
     }
 
     /// The uv block iteration must find the target mid-file and leave both

@@ -83,10 +83,8 @@ fn hosted_scan_args(cwd: &Path, api_url: String) -> ScanArgs {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: Some(ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
@@ -179,6 +177,15 @@ fn scrubbed_cli() -> std::process::Command {
         .env_remove("SOCKET_ECOSYSTEMS")
         .env_remove("SOCKET_MANIFEST_PATH")
         .env_remove("SOCKET_PRESERVE_STATE");
+    // A registry exported by npm (`npm_config_registry`) or Bun would
+    // steer the Bun restores off the fixtures' registry.
+    for key in [
+        "BUN_CONFIG_REGISTRY",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+    ] {
+        cmd.env_remove(key);
+    }
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
@@ -758,6 +765,27 @@ async fn npm_hosted_round_trip_envelope() {
 #[serial]
 async fn pypi_requirements_hosted_round_trip() {
     pypi_requirements_round_trip("flask==2.0.1\nrequests==2.31.0\n", &[]).await;
+}
+
+/// REGRESSION (#1212): the same round trip when the file opens with a
+/// PEP 263 coding line naming a codec beyond UTF-8 / ASCII / Latin-1 /
+/// cp1252 (a header copied from a template; the bytes are plain ASCII).
+/// pip decodes it with that codec, so `get --mode hosted` must wire it,
+/// `vex` attest it and `rollback` restore it (they read it as absent:
+/// nothing wired, then exit 2 and `manifest_not_found`).
+#[tokio::test]
+#[serial]
+async fn pypi_requirements_hosted_round_trip_with_an_unmodelled_coding_line() {
+    pypi_requirements_round_trip(
+        "# -*- coding: iso-8859-15 -*-\nflask==2.0.1\nrequests==2.31.0\n",
+        &[],
+    )
+    .await;
+    pypi_requirements_round_trip(
+        "# deps\n# vim: set fileencoding=cp1250 :\nflask==2.0.1\nrequests==2.31.0\n",
+        &[],
+    )
+    .await;
 }
 
 /// REGRESSION (#1086): the same round trip when an in-root `-r` include
@@ -1439,6 +1467,42 @@ async fn npm_hosted_round_trip_manifest_less_vex() {
             .join()
             .expect("manifest-less VEX cells panicked");
     });
+}
+
+/// REGRESSION (#828, yarn classic twin): a hosted registry block beside a
+/// git-sourced block of the same `name@version` (the hosted rewriter skips
+/// the git block, `redirect_yarn_classic_git_skipped`). Discovery withholds
+/// the pin from VEX, but rollback must still restore its upstream entry —
+/// it refused it as `hosted_wiring_contested` / `patched_ref_unattributable`
+/// with a remedy (re-run the hosted scan) that only rewrote the same state.
+/// The git block is left exactly as it was.
+#[tokio::test]
+#[serial]
+async fn yarn_classic_hosted_pin_beside_a_git_copy_rolls_back() {
+    let server = MockServer::start().await;
+    mock_yarn_registry(&server, "left-pad", "1.2.3").await;
+    let git_block = "\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.2.3\":\n  \
+                     version \"1.2.3\"\n  \
+                     resolved \"git+https://github.com/stevemao/left-pad.git#5e5f1a6e23f6fa2bd1e4a3d0c2bb1c0e1bb0f00a\"";
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("yarn.lock"),
+        yarn_lock_content(&format!("{git_block}\n\n{}", yarn_redirected_block())),
+    )
+    .unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "rollback must restore the pin: {envelope}");
+    assert_eq!(
+        envelope["hosted"]["reverted"],
+        serde_json::json!([LP_PURL]),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&format!("{git_block}\n\n{}", yarn_original_block())),
+        "only the hosted block is restored"
+    );
 }
 
 // ---------------------------------------------------------------------------

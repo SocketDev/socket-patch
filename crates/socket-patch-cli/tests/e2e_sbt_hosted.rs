@@ -29,6 +29,7 @@ mod sbt_common;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use common::envelope::all_codes;
 use sbt_common::{copy_evidence, record_pinned_resolution, write_sbt_build, Gav, SbtHome};
 use socket_patch_core::formats::sbt::owned_file::{
     render, SbtFileMode, SbtLine, SbtOwnedFile, SbtPin, HOSTED_FILE, HOSTED_REPO_REL,
@@ -165,29 +166,6 @@ fn get_hosted(home: &SbtHome, project: &Path, api: &Api, uuid: &str) -> (i32, se
     (code, json)
 }
 
-/// The warning codes anywhere in an envelope.
-fn codes(json: &serde_json::Value) -> Vec<String> {
-    let mut out = Vec::new();
-    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
-        match v {
-            serde_json::Value::Object(map) => {
-                for (k, v) in map {
-                    if k == "code" || k == "errorCode" {
-                        if let Some(s) = v.as_str() {
-                            out.push(s.to_string());
-                        }
-                    }
-                    walk(v, out);
-                }
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
-            _ => {}
-        }
-    }
-    walk(json, &mut out);
-    out
-}
-
 /// The test-compile evidence build, its records touched newer than every
 /// build source (copying sets every mtime to "now", in copy order).
 fn evidence_project(tmp: &Path) -> PathBuf {
@@ -247,7 +225,7 @@ fn hosted_no_evidence_warns_and_writes_nothing() {
     api.grant(UUID, GROUP, ARTIFACT, BASE);
     let (_, json) = get_hosted(&home, &project, &api, UUID);
     assert!(
-        codes(&json).contains(&"redirect_sbt_no_resolution_evidence".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_no_resolution_evidence".to_string()),
         "{json}"
     );
     assert!(!project.join(HOSTED_FILE).exists(), "nothing is wired");
@@ -281,7 +259,7 @@ fn hosted_mixed_root_confirms_the_pom_pin_when_sbt_refuses() {
     api.grant(UUID, GROUP, ARTIFACT, BASE);
     let (_, json) = get_hosted(&home, &project, &api, UUID);
     assert!(
-        codes(&json).contains(&"redirect_sbt_no_resolution_evidence".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_no_resolution_evidence".to_string()),
         "{json}"
     );
     assert!(
@@ -373,7 +351,7 @@ fn hosted_unreadable_owned_file_is_refused_untouched() {
     // A whole-run refusal: `get` fails, with nothing written.
     assert_eq!(code, 1, "{json}");
     assert!(
-        codes(&json).contains(&"redirect_sbt_owned_file_unreadable".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_owned_file_unreadable".to_string()),
         "{json}"
     );
     assert_eq!(std::fs::read(project.join(HOSTED_FILE)).unwrap(), latin1);
@@ -388,7 +366,7 @@ fn hosted_version_conflict_is_refused() {
     api.grant(TEXT_UUID, "org.apache.commons", "commons-text", "1.9");
     let (_, json) = get_hosted(&home, &project, &api, TEXT_UUID);
     assert!(
-        codes(&json).contains(&"redirect_sbt_version_conflict".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_version_conflict".to_string()),
         "{json}"
     );
     assert!(!project.join(HOSTED_FILE).exists());
@@ -442,7 +420,7 @@ fn hosted_vex_without_evidence_is_unverified() {
     api.grant(UUID, GROUP, ARTIFACT, BASE);
     let (_, json) = vex(&home, &project, &api.server.uri());
     assert!(
-        codes(&json).contains(&"sbt_resolution_unverified".to_string()),
+        all_codes(&json).contains(&"sbt_resolution_unverified".to_string()),
         "{json}"
     );
     let doc = std::fs::read_to_string(project.join("vex.json")).unwrap_or_default();
@@ -505,14 +483,16 @@ fn hosted_rerun_checks_the_pin_by_content_not_location() {
     let (_, json) = get_hosted(&home, &project, &api, UUID);
     assert_eq!(json["redirect"]["redirected"], 1, "{json}");
     assert!(
-        !codes(&json).iter().any(|c| c.starts_with("redirect_sbt_")),
+        !all_codes(&json)
+            .iter()
+            .any(|c| c.starts_with("redirect_sbt_")),
         "{json}"
     );
 
     std::fs::write(&jar, b"other bytes").unwrap();
     let (_, json) = get_hosted(&home, &project, &api, UUID);
     assert!(
-        codes(&json).contains(&"redirect_sbt_resolved_elsewhere".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_resolved_elsewhere".to_string()),
         "{json}"
     );
 }
@@ -543,7 +523,7 @@ fn hosted_vex_attests_with_post_wiring_evidence() {
     api.grant(UUID, GROUP, ARTIFACT, BASE);
     let (_, json) = vex(&home, &project, &api.server.uri());
     assert!(
-        !codes(&json).contains(&"sbt_resolution_unverified".to_string()),
+        !all_codes(&json).contains(&"sbt_resolution_unverified".to_string()),
         "{json}"
     );
     let vex = std::fs::read_to_string(project.join("vex.json")).unwrap();

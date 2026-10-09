@@ -58,6 +58,10 @@
 //! cannot reach the registry — unless `SOCKET_PATCH_NPM_E2E_REQUIRED` is set;
 //! every assertion after that is hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -99,10 +103,6 @@ const UUID_UNINSTALLED: &str = "9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f";
 const PURL_UNINSTALLED: &str = "pkg:npm/left-pad@9.9.9";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run the socket-patch binary with a scrubbed environment: every ambient
 /// `SOCKET_*` var is removed (so a developer's `SOCKET_DRY_RUN=1` etc. can't
@@ -996,7 +996,9 @@ fn post_install_vex(fresh: &Path, server: &str) {
 /// renamed), npm 12's shrinkwrap + package-lock.json twin (the command is
 /// gone and installs read the twin). The redirect must land in EVERY
 /// committed lock, the fresh `npm ci` must install the patched bytes, and
-/// the manifest-less VEX tail must attest them (and stop once reverted).
+/// the manifest-less VEX tail must attest them (and stop once reverted) —
+/// a shrinkwrap-only checkout only once its package-lock.json twin is
+/// committed (npm 12 never reads the shrinkwrap, #899).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_redirect_shrinkwrap_fresh_checkout_and_manifestless_vex() {

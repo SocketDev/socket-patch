@@ -153,16 +153,6 @@ pub(crate) fn detect_indent(text: &str) -> String {
     "  ".to_string()
 }
 
-/// The file's dominant line terminator (new lines we write use it; bytes
-/// outside edited spans keep whatever they had).
-pub(crate) fn detect_eol(text: &str) -> &'static str {
-    if text.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
-
 /// Pretty-print JSON with `indent` + a trailing newline (the shape npm and
 /// composer themselves emit), so untouched keys stay byte-identical and a
 /// later `npm install` / `composer update` produces no format-only churn.
@@ -615,17 +605,6 @@ pub(crate) fn pep508_name(spec: &str) -> &str {
         .map(|(i, _)| i)
         .unwrap_or(s.len());
     &s[..end]
-}
-
-/// Whether a `[[package]]` unit (as its lines) names `canon` — PEP 503
-/// canonical comparison, the form the pypi lock generators record.
-pub(crate) fn unit_has_canon_name(lines: &[&str], canon: &str) -> bool {
-    lines
-        .iter()
-        .find_map(|l| l.strip_prefix("name = "))
-        .map(|r| canonicalize_pypi_name(r.trim().trim_matches('"')))
-        .as_deref()
-        == Some(canon)
 }
 
 /// The lock's `[[package]]` tables whose `name` canonicalizes (PEP 503) to

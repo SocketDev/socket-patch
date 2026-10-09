@@ -14,6 +14,7 @@ use crate::crawlers::Ecosystem;
 use crate::manifest::schema::PatchManifest;
 pub use crate::policy::Offers;
 use crate::utils::purl_key::PurlKey;
+use crate::vex::UnlockedPin;
 
 use super::{plan_rollout, severity_label, Candidate, MaxNew, MaxNewSource, Recorded, RolloutPlan};
 
@@ -104,6 +105,10 @@ pub struct RecordedIndex {
     /// [`PurlKey::qualified`]: one release variant in any spelling.
     qualified: HashMap<PurlKey, Vec<String>>,
     by_base: HashMap<PurlKey, Vec<String>>,
+    /// Lockless hosted pins ([`UnlockedPin`]), each with its uuid as a
+    /// one-element list: they route every satisfying version of a package,
+    /// so they are matched per purl rather than indexed by key.
+    unlocked: Vec<(UnlockedPin, Vec<String>)>,
 }
 
 /// The recorded view one project root classifies against: the merged
@@ -149,19 +154,41 @@ impl RecordedIndex {
         index
     }
 
+    /// Also count discovery's lockless pins (a cargo `registry =` or nuget
+    /// source-mapping pin with no lockfile) as recorded. They are the
+    /// hosted rewriter's own output for a lockless project but never refs,
+    /// so without them a re-scan would read the pin it wrote as NEW and
+    /// spend a `--max-new-patches` slot on it every run.
+    pub fn with_unlocked_pins(mut self, pins: impl IntoIterator<Item = UnlockedPin>) -> Self {
+        self.unlocked.extend(pins.into_iter().map(|pin| {
+            let uuid = vec![pin.uuid.clone()];
+            (pin, uuid)
+        }));
+        self
+    }
+
     /// The uuids recorded for `purl`, sorted: the exact key, else the same
-    /// purl in another spelling, else any qualifier twin.
+    /// purl in another spelling, else any qualifier twin, else the uuid of a
+    /// lockless pin that routes it.
     pub fn uuids(&self, purl: &str) -> &[String] {
         self.exact
             .get(purl)
             .or_else(|| self.qualified.get(&PurlKey::qualified(purl)))
             .or_else(|| self.by_base.get(&PurlKey::new(purl)))
+            .or_else(|| self.unlocked_uuid(purl))
             .map_or(&[], Vec::as_slice)
+    }
+
+    fn unlocked_uuid(&self, purl: &str) -> Option<&Vec<String>> {
+        self.unlocked
+            .iter()
+            .find(|(pin, _)| pin.routes(purl))
+            .map(|(_, uuid)| uuid)
     }
 
     /// Whether any patch is recorded for `purl`'s base purl.
     pub fn records_package(&self, purl: &str) -> bool {
-        self.by_base.contains_key(&PurlKey::new(purl))
+        self.by_base.contains_key(&PurlKey::new(purl)) || self.unlocked_uuid(purl).is_some()
     }
 }
 
@@ -229,47 +256,49 @@ pub fn lookup_incomplete(
             .any(|purl| !recorded.records_package(purl))
 }
 
-/// Every canonical-shaped uuid (`8-4-4-4-12` hex) `text` mentions,
-/// lowercased, in one linear pass.
-pub fn mentioned_uuids(text: &str, out: &mut HashSet<String>) {
-    let bytes = text.as_bytes();
-    if bytes.len() < 36 {
-        return;
-    }
-    let mut i = 0;
-    while i + 36 <= bytes.len() {
-        let window = &bytes[i..i + 36];
-        let shaped = window.iter().enumerate().all(|(k, b)| match k {
-            8 | 13 | 18 | 23 => *b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        });
-        if shaped {
-            out.insert(String::from_utf8_lossy(window).to_ascii_lowercase());
-            i += 36;
-        } else {
-            i += 1;
+/// Re-classify NEW rows against the pins discovery finds
+/// ([`HostedPin::discover`]): the selected uuid pinned is ALREADY, another
+/// uuid pinned for the same package is an UPGRADE
+/// ([`Recorded::Superseded`]). The recorded view is discovery over the
+/// configured patch servers; a pin on the server THIS run's references name
+/// (an origin missing from `--patch-server-url`) is only recognized once
+/// those references are known, so the caller re-runs discovery with their
+/// origins ([`dep_origins`]) and hands the pins here. Without it such a pin
+/// would read as NEW on every run and hold its slot forever, and an upgrade
+/// on that server would spend a NEW slot. Only discovery's attributable pins
+/// count: a uuid a stale or inactive file merely mentions (an unused
+/// `pdm.lock`, a `package.json` `resolutions` leftover, a comment) pins
+/// nothing and stays NEW.
+///
+/// The writers were already chosen from the selection, so a pinned uuid
+/// that the selection does not supersede is reported as an UPGRADE rather
+/// than kept ([`Recorded::Kept`]): what is written does not change, only
+/// that it spends no NEW slot.
+///
+/// [`HostedPin::discover`]: crate::patch::redirect::upstream::HostedPin::discover
+/// [`dep_origins`]: crate::patch::redirect::upstream::dep_origins
+pub fn mark_pinned(rows: &mut [Row], pins: &[crate::patch::redirect::upstream::HostedPin]) {
+    let pairs: Vec<(String, String)> = pins
+        .iter()
+        .map(|p| (p.purl.clone(), p.uuid.to_ascii_lowercase()))
+        .collect();
+    let index = RecordedIndex::new(None, &pairs);
+    for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
+        let uuids = index.uuids(&row.candidate.purl);
+        let selected = row.candidate.uuid.to_ascii_lowercase();
+        if uuids.contains(&selected) {
+            row.candidate.recorded = Recorded::Same;
+        } else if let Some(old) = uuids.first() {
+            row.candidate.recorded = Recorded::Superseded {
+                old_uuid: old.clone(),
+            };
         }
     }
 }
 
-/// Mark NEW rows whose selected uuid the project's lockfile texts already
-/// mention as ALREADY. A hosted pin on a patch server discovery does not
-/// recognize (an origin missing from `--patch-server-url`) would otherwise
-/// read as NEW on every run and hold its slot forever; patch uuids are
-/// unique, so a mention is a pin.
-pub fn mark_pinned(rows: &mut [Row], texts: &[&str]) {
-    if !rows.iter().any(|r| r.candidate.recorded.is_new()) {
-        return;
-    }
-    let mut mentioned = HashSet::new();
-    for text in texts {
-        mentioned_uuids(text, &mut mentioned);
-    }
-    for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
-        if mentioned.contains(&row.candidate.uuid.to_ascii_lowercase()) {
-            row.candidate.recorded = Recorded::Same;
-        }
-    }
+/// Whether any row is NEW (only then can [`mark_pinned`] change anything).
+pub fn any_new(rows: &[Row]) -> bool {
+    rows.iter().any(|r| r.candidate.recorded.is_new())
 }
 
 /// One directory's budget and the outcome of its plan.

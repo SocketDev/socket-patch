@@ -1,7 +1,8 @@
 //! Which repository files the in-memory engine needs: root detection plus,
 //! per root, the same root-relative candidate set the disk hosted flow
 //! reads (`REDIRECT_CANDIDATE_FILES`, Python lock / script pairs, Cargo
-//! member manifests, Rush locks, the install-policy configs, the
+//! member manifests, Rush locks, pnpm workspace members' own locks, the
+//! install-policy configs, the
 //! Plug'n'Play markers and the vendored ledger), plus one
 //! presence-only Maven / NuGet marker per ecosystem so a repo holding only
 //! those still gets its `ecosystem_unsupported_in_memory` warning.
@@ -20,8 +21,8 @@ use crate::policy::{
 };
 
 use super::roots::{
-    detect_roots, join_root, root_markers, split_path, strict_ancestors, strip_root,
-    EXCLUDED_ROOT_SEGMENTS, UNSUPPORTED_MARKERS, YARNRC_NAME,
+    detect_roots, join_root, pnpm_member_candidates, root_markers, split_path, strict_ancestors,
+    strip_root, EXCLUDED_ROOT_SEGMENTS, UNSUPPORTED_MARKERS, YARNRC_NAME,
 };
 use super::types::{
     IgnoredPath, PathSelection, PolicyErrorInfo, PolicyFileInput, SelectOptions, TreeEntryInput,
@@ -134,14 +135,15 @@ enum Need {
     Present,
 }
 
-fn is_rush_subspace_lock(rel: &str) -> bool {
+/// Whether `rel` is `common/config/subspaces/<name>/<basename>`.
+fn is_rush_subspace_file(rel: &str, basename: &str) -> bool {
     let Some(rest) = rel
         .strip_prefix(RUSH_SUBSPACES_DIR)
         .and_then(|r| r.strip_prefix('/'))
     else {
         return false;
     };
-    matches!(rest.split_once('/'), Some((name, "pnpm-lock.yaml")) if !name.is_empty())
+    matches!(rest.split_once('/'), Some((name, file)) if !name.is_empty() && file == basename)
 }
 
 /// What `rel` (relative to a root whose files are `root_files`) is needed
@@ -163,14 +165,26 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         if rel.ends_with(".py") && root_files.contains(format!("{rel}.lock").as_str()) {
             return Some(Need::Text);
         }
+        // A pnpm branch lock refuses the pnpm pins under
+        // `gitBranchLockfile` (#556); only its presence matters.
+        if crate::utils::pnpm_workspace::is_git_branch_lock_name(rel) {
+            return Some(Need::Present);
+        }
         return None;
     }
     let rush = root_files.contains("rush.json");
-    if rush && (rel == RUSH_COMMON_LOCK_REL || is_rush_subspace_lock(rel)) {
+    if rush && (rel == RUSH_COMMON_LOCK_REL || is_rush_subspace_file(rel, "pnpm-lock.yaml")) {
         return Some(Need::Text);
     }
-    if rush && rel == RUSH_REPO_STATE_REL {
+    // Presence-only: the stale-hash warning keys on the repo-state.json
+    // beside each rewritten lock (per subspace when subspaces are enabled).
+    if rush && (rel == RUSH_REPO_STATE_REL || is_rush_subspace_file(rel, "repo-state.json")) {
         return Some(Need::Present);
+    }
+    if root_files.contains(PNPM_WORKSPACE_REL) {
+        if let Some(need) = pnpm_member_need(rel, root_files) {
+            return Some(need);
+        }
     }
     if let Some(manifest_dir) = rel.strip_suffix("/Cargo.toml") {
         if root_files.contains("Cargo.toml")
@@ -181,6 +195,48 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         }
     }
     None
+}
+
+/// What a pnpm workspace root (one with a `pnpm-workspace.yaml`) needs of
+/// its nested file `rel` to read its members' own locks (#492, see
+/// `utils::pnpm_workspace::member_locks`): in a directory holding a package
+/// manifest (pnpm's test for a project; a lock in any other directory is
+/// one pnpm never installs from), the `pnpm-lock.yaml`, the branch locks
+/// (#556) and the manifest itself, outside the trees pnpm's project finder
+/// skips. The `packages:` globs decide the members once the text is in;
+/// like Cargo member manifests, a lock the globs do not list is fetched and
+/// ignored (see the module docs of [`super`]).
+fn pnpm_member_need(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
+    use crate::utils::pnpm_workspace::{is_git_branch_lock_name, MEMBER_SKIP, PROJECT_MANIFESTS};
+    let (dir, base) = split_path(rel);
+    if dir.split('/').any(|seg| MEMBER_SKIP.contains(&seg)) {
+        return None;
+    }
+    let lock = base == "pnpm-lock.yaml";
+    let branch = is_git_branch_lock_name(base);
+    let manifest = PROJECT_MANIFESTS.contains(&base);
+    if !(lock || branch || manifest) {
+        return None;
+    }
+    let beside = |name: &str| root_files.contains(format!("{dir}/{name}").as_str());
+    if !PROJECT_MANIFESTS.iter().any(|m| beside(m)) {
+        return None;
+    }
+    if lock {
+        return Some(Need::Text);
+    }
+    if branch {
+        return Some(Need::Present);
+    }
+    let prefix = format!("{dir}/");
+    root_files
+        .range::<&str, _>(prefix.as_str()..)
+        .take_while(|path| path.starts_with(prefix.as_str()))
+        .filter_map(|path| path.strip_prefix(prefix.as_str()))
+        .any(|name| {
+            !name.contains('/') && (name == "pnpm-lock.yaml" || is_git_branch_lock_name(name))
+        })
+        .then_some(Need::Present)
 }
 
 /// The listed root policy files with the text the caller fetched first. A
@@ -303,6 +359,24 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
                 options.ecosystems.as_deref(),
             );
             ignored.extend(skipped);
+            // A pnpm workspace member's lock is read from its workspace
+            // root (#492), which becomes a root of its own even with no
+            // lock there (pnpm 7 writes none). Without content every root
+            // a workspace file sits above is a candidate member: its
+            // workspace root is added (and fetched) and the candidate kept.
+            // The session confirms members from the files, and given these
+            // roots as `projectRoots` it drops a confirmed member beside its
+            // workspace root and a lockless workspace root that pins none,
+            // so it detects the same roots either way.
+            let mut found = found;
+            let candidates = pnpm_member_candidates(
+                &found,
+                |p| blobs.contains_key(p),
+                options.ecosystems.as_deref(),
+            );
+            found.extend(candidates.into_iter().map(|(_, workspace)| workspace));
+            found.sort();
+            found.dedup();
             found
         }
     };
@@ -379,6 +453,28 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
         }
     }
 
+    // A pnpm root with no pnpm-workspace.yaml of its own reads its settings
+    // from the nearest ancestor one when that file lists it (#492): the
+    // session needs that file to tell a workspace member, whose lock it
+    // demotes into the workspace root, from a standalone project (see
+    // `roots::pnpm_member_candidates`), also when the caller named the
+    // roots.
+    for (root, files) in &per_root {
+        if !files.contains("pnpm-lock.yaml") || files.contains(PNPM_WORKSPACE_REL) {
+            continue;
+        }
+        let mut dir: &str = root;
+        while !dir.is_empty() {
+            dir = split_path(dir).0;
+            let path = join_root(dir, PNPM_WORKSPACE_REL);
+            if blobs.contains_key(&path) {
+                let slot = needs.entry(path).or_insert(Need::Text);
+                *slot = (*slot).min(Need::Text);
+                break;
+            }
+        }
+    }
+
     for (eco, markers) in UNSUPPORTED_MARKERS {
         if !options
             .ecosystems
@@ -449,10 +545,12 @@ pub fn candidate_files() -> Vec<String> {
         RUSH_COMMON_LOCK_REL,
         RUSH_REPO_STATE_REL,
         "common/config/subspaces/*/pnpm-lock.yaml",
+        "common/config/subspaces/*/repo-state.json",
         "*.py.lock",
         "*.py (beside *.py.lock)",
         "pylock.toml",
         "pylock.*.toml",
+        "pnpm-lock.*.yaml (presence only)",
         "**/Cargo.toml (Cargo workspaces)",
     ] {
         out.insert(pattern.to_string());
@@ -489,6 +587,7 @@ mod tests {
             blob("web/yarn.lock"),
             blob("web/.yarnrc.yml"),
             blob("web/node_modules/x/package-lock.json"),
+            blob("pnpm-lock.feature.yaml"),
         ];
         entries.push(TreeEntryInput {
             path: "pnpm-workspace.yaml".into(),
@@ -518,7 +617,7 @@ mod tests {
             ]
         );
         assert_eq!(s.fetch_binary, vec!["bun.lockb"]);
-        assert_eq!(s.present_only, vec![".pnp.cjs"]);
+        assert_eq!(s.present_only, vec![".pnp.cjs", "pnpm-lock.feature.yaml"]);
         assert_eq!(s.symlinks, vec!["pnpm-workspace.yaml"]);
         assert_eq!(s.ignored_count, 2);
     }
@@ -557,6 +656,8 @@ mod tests {
             blob("common/config/rush/pnpm-lock.yaml"),
             blob("common/config/rush/repo-state.json"),
             blob("common/config/subspaces/a/pnpm-lock.yaml"),
+            blob("common/config/subspaces/a/repo-state.json"),
+            blob("common/config/subspaces/a/b/repo-state.json"),
             blob("rs/Cargo.toml"),
             blob("rs/Cargo.lock"),
             blob("rs/crates/x/Cargo.toml"),
@@ -583,7 +684,11 @@ mod tests {
         );
         assert_eq!(
             s.present_only,
-            vec!["common/config/rush/repo-state.json", "rush.json"]
+            vec![
+                "common/config/rush/repo-state.json",
+                "common/config/subspaces/a/repo-state.json",
+                "rush.json"
+            ]
         );
     }
 

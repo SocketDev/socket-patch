@@ -8,6 +8,28 @@ name: Go patch compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Only this ecosystem's own files. A change to shared engine code
+    # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
+    # push to main (when it is in the push filter below) or nightly, or on
+    # demand via workflow_dispatch on the PR branch;
+    # ci.yml's per-ecosystem blocking slice still runs on every PR and in
+    # the merge queue (#1198).
+    paths:
+      - '.github/workflows/go-compatibility.yml'
+      - 'crates/*/src/**/*golang*'
+      - 'crates/*/src/**/*golang*/**'
+      - 'crates/socket-patch-core/src/vendor/go*.rs'
+      - 'crates/socket-patch-core/src/crawlers/go_crawler.rs'
+      - 'crates/socket-patch-core/src/crawlers/go_crawler/**'
+      - 'crates/socket-patch-cli/tests/e2e_golang_*build.rs'
+      - 'crates/socket-patch-cli/tests/e2e_vendor_golang_build.rs'
+      - 'crates/socket-patch-cli/tests/golang_e2e_matrix/**'
+      - 'crates/socket-patch-cli/tests/e2e_vex_lockfile/golang.rs'
+  push:
+    branches: [main]
+    # The ecosystem's pre-#1198 relevance set (the shared engine code its
+    # cells run through), its PR paths and the toolchain files. A main
+    # push outside this set waits for the nightly run below.
     paths:
       - '.github/workflows/go-compatibility.yml'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
@@ -22,8 +44,18 @@ on:
       - 'crates/socket-patch-cli/tests/golang_e2e_matrix/**'
       - 'crates/socket-patch-cli/tests/e2e_vex_lockfile/golang.rs'
       - 'crates/socket-patch-cli/tests/vex_e2e_common/**'
-  push:
-    branches: [main]
+      - 'crates/*/src/**/*golang*'
+      - 'crates/*/src/**/*golang*/**'
+      - 'crates/socket-patch-core/src/crawlers/go_crawler/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly full matrix, so a main change outside the push filter
+    # still gets a run within a day.
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:

@@ -7,7 +7,7 @@
 //!    hosted = `scan --mode hosted --vex` on the lock-only checkout (the lock is
 //!    repointed at a patched wheel the mock serves — v5 writes NO redirect
 //!    ledger — the same-run VEX attests from the lock's sha256 pin); vendored
-//!    = `scan --vendor --vendor-source build --vex` over the pristine
+//!    = `scan --mode vendored --vendor-source build --vex` over the pristine
 //!    install (the patched wheel is committed under
 //!    `.socket/vendor/pypi/<uuid>/`, the lock is rewired to it, and only the
 //!    ledger is written — vendored mode is manifest-free, so the ledger
@@ -931,7 +931,8 @@ fn poetry_vendored_fresh_install_then_manifestless_vex() {
         &service,
         &[
             "scan",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--vendor-source",
             "service",
             "--vex",
@@ -940,7 +941,7 @@ fn poetry_vendored_fresh_install_then_manifestless_vex() {
             PRODUCT,
         ],
     );
-    assert_eq!(code, Some(0), "scan --vendor: {env}");
+    assert_eq!(code, Some(0), "scan --mode vendored: {env}");
     let rel = format!(".socket/vendor/pypi/{VENDORED_UUID}/{WHEEL}");
     assert!(
         project.join(&rel).is_file(),
@@ -954,7 +955,7 @@ fn poetry_vendored_fresh_install_then_manifestless_vex() {
         lock.contains(&wheel_sha),
         "the lock pins the committed wheel:\n{lock}"
     );
-    // Vendored mode is manifest-free (v5.0, CLI_CONTRACT `scan --vendor`):
+    // Vendored mode is manifest-free (v5.0, CLI_CONTRACT `scan --mode vendored`):
     // the ledger entry is detached and embeds the patch record, and
     // `.socket/manifest.json` is never written.
     assert!(

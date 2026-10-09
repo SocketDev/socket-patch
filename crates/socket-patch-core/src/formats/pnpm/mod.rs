@@ -27,7 +27,10 @@
 pub(crate) mod grammar;
 pub(crate) mod hosted;
 pub(crate) mod lines;
+mod version;
 pub(crate) mod workspace;
+
+pub use version::root_only_workspace_breaks_add;
 
 pub(crate) use grammar::{
     entry_bundled, entry_field, is_pnpm_lock_text, Bundled, Entry, Resolution,
@@ -296,8 +299,10 @@ fn lock_versions(text: &str) -> impl Iterator<Item = (Option<u32>, u32)> + '_ {
 }
 
 /// `lockfileVersion` major of a pnpm lock. pnpm 9-12 emit
-/// `lockfileVersion: '9.0'` (single doc, first line); pnpm 8 emits `'6.0'`,
-/// pnpm 7 an unquoted `5.4`. `None` when no parseable version line exists —
+/// `lockfileVersion: '9.0'` (first line; pnpm >= 11 with config
+/// dependencies or a `packageManager` pin writes two documents, each with
+/// its own version line after a `---`); pnpm 8 emits `'6.0'`, pnpm 7 an
+/// unquoted `5.4`. `None` when no parseable version line exists —
 /// the hosted trust-config gate treats that as "not trust-policy era" and
 /// stays hands-off (fail closed: never write config for a lock it can't
 /// read).

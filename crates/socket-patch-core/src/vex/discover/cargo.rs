@@ -119,11 +119,11 @@ use super::{
     Discovery, PatchedRef, TomlDiag, UnlockedPin, VendorRef, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::formats::cargo::{CargoLock, CopyClaim, LockedPackage};
+use crate::formats::cargo::{is_registry_source, CargoLock, CopyClaim, LockedPackage};
 use crate::patch::redirect::generation::{hosted_pin_name, PIN_NAME_PREFIX};
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
-    effective_config_rel, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
+    effective_config_rel_in, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
     CONFIG_TOML,
 };
 use crate::vendor::cargo_manifest::{crates_io_url_alias_tables, is_crates_io_source};
@@ -314,7 +314,7 @@ fn parse_toml(file: &str, text: &str, out: &mut Discovery) -> Option<DocumentMut
     toml_or_diag(file, text, TomlDiag::TrimEnd, out)
 }
 
-/// The config file cargo actually reads ([`effective_config_rel`]), parsed,
+/// The config file cargo actually reads ([`effective_config_rel_in`]), parsed,
 /// with its root-relative name. When `.cargo/config` exists cargo ignores
 /// `.cargo/config.toml` entirely (and warns); Socket-shaped wiring left in
 /// the ignored file is diagnosed so a "why is my patch not attested" has an
@@ -323,7 +323,7 @@ async fn read_config(
     ctx: &DiscoverCtx<'_>,
     out: &mut Discovery,
 ) -> Option<(&'static str, DocumentMut)> {
-    if effective_config_rel(ctx.root).await == CONFIG_TOML {
+    if effective_config_rel_in(ctx.view).await == CONFIG_TOML {
         return read_toml(ctx, CONFIG_TOML, out)
             .await
             .map(|doc| (CONFIG_TOML, doc));
@@ -427,11 +427,10 @@ fn dependency_entries(doc: &DocumentMut) -> Vec<DepEntry> {
 /// The patch uuid a Cargo.lock `source` routes to, when it is a registry
 /// source on a Socket patch server.
 fn source_uuid(ctx: &DiscoverCtx<'_>, source: &str) -> Option<String> {
-    let s = source.trim();
-    if !(s.starts_with("sparse+") || s.starts_with("registry+")) {
+    if !is_registry_source(source) {
         return None; // git / path / local-registry sources are never ours
     }
-    ctx.hosted_uuid(s)
+    ctx.hosted_uuid(source.trim())
 }
 
 fn hosted_from_lock(
@@ -601,6 +600,7 @@ fn unresolved_manifest_pins(
                             uuid: uuid.clone(),
                             file: CARGO_TOML.into(),
                             version_reqs,
+                            index_url: definitions.get(reg.as_str()).cloned(),
                         });
                     }
                     format!("there is no {CARGO_LOCK} to fix its version")
@@ -668,7 +668,7 @@ async fn vendored_from_patches(
     file: &str,
     doc: &DocumentMut,
     lock: &Lock,
-    shadowed: &dyn Fn(&CargoPatchEntry<'_>) -> Option<String>,
+    shadowed: &(dyn Fn(&CargoPatchEntry<'_>) -> Option<String> + Sync),
     out: &mut Discovery,
 ) {
     for entry in patch_entries(doc) {

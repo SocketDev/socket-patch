@@ -11,10 +11,11 @@ use crate::formats::yarn::{grammar as yarn_grammar, YarnLockGrammar};
 use crate::utils::purl::npm_purl;
 use crate::vendor::npm_flavor::NpmLockFlavor;
 
-use super::bun::{bun_text_lock_present_in, inventory_bun_binary_in, inventory_bun_in};
+use super::bun::{bun_text_lock_drives, inventory_bun_binary_in, inventory_bun_in};
 use super::npm::inventory_package_lock_in;
 use super::pnpm::{
-    inventory_pnpm_lock_in, inventory_pnpm_lock_rel_in, inventory_rush_pnpm_locks_in,
+    inventory_pnpm_lock_in, inventory_pnpm_lock_rel_in, inventory_pnpm_member_locks_in,
+    inventory_rush_pnpm_locks_in,
 };
 use super::view::ProjectView;
 use super::vlt::inventory_vlt_in;
@@ -36,7 +37,10 @@ use crate::vendor::npm_flavor::detect_npm_lock_flavor_in;
 /// otherwise have chosen sits beside it (a pnpm→yarn/npm migration
 /// leftover), in which case the SIBLING is inventoried instead
 /// ([`inventory_live_sibling_lock_in`]) — and `vendor_lockfile_missing` reads
-/// the pnpm <=2-era `shrinkwrap.yaml` (same v5 grammar, older filename).
+/// the pnpm <=2-era `shrinkwrap.yaml` (same v5 grammar, older filename) or,
+/// failing that, the workspace members' own locks. A pnpm workspace with
+/// `sharedWorkspaceLockfile: false` reads those beside its root lock
+/// ([`inventory_pnpm_member_locks_in`], #492).
 /// Any remaining probe failure falls back to Rush's common lock when
 /// `rush.json` is present.
 #[cfg(test)]
@@ -133,6 +137,12 @@ pub(super) async fn inventory_npm_lock_raw_in(
                 if !legacy.is_empty() {
                     return Ok(Some((NpmLockFlavor::PnpmLegacy, guard_npm(legacy))));
                 }
+                // pnpm 7 under `shared-workspace-lockfile=false` writes no
+                // root lock at all, only the members' own (#492).
+                let members = inventory_pnpm_member_locks_in(view).await;
+                if !members.is_empty() {
+                    return Ok(Some((NpmLockFlavor::Pnpm, guard_npm(members))));
+                }
             }
             // Rush monorepos have no root package.json/lock pair; their
             // single pnpm source-of-truth lives under common/config/rush/.
@@ -148,11 +158,21 @@ pub(super) async fn inventory_npm_lock_raw_in(
         // The pnpm reader is grammar-agnostic (it also serves legacy
         // 5.4/6.0 locks through the version-refusal fallback above), so
         // both pnpm flavors share it.
-        NpmLockFlavor::Pnpm | NpmLockFlavor::PnpmLegacy => inventory_pnpm_lock_in(view).await,
+        // Under `sharedWorkspaceLockfile: false` the members install from
+        // their own locks, read beside the root's (#492).
+        NpmLockFlavor::Pnpm | NpmLockFlavor::PnpmLegacy => {
+            let root = inventory_pnpm_lock_in(view).await;
+            let members = inventory_pnpm_member_locks_in(view).await;
+            if members.is_empty() {
+                root
+            } else {
+                Some(root.into_iter().flatten().chain(members).collect())
+            }
+        }
         NpmLockFlavor::YarnClassic => inventory_yarn_classic_in(view).await,
         NpmLockFlavor::YarnBerry => inventory_yarn_berry_in(view).await,
         NpmLockFlavor::Bun => {
-            if bun_text_lock_present_in(view).await {
+            if bun_text_lock_drives(view) {
                 inventory_bun_in(view).await
             } else {
                 Some(inventory_bun_binary_in(view).await?)
@@ -176,9 +196,18 @@ pub(super) async fn inventory_npm_lock_raw_in(
 pub(super) async fn inventory_live_sibling_lock_in(
     view: &ProjectView<'_>,
 ) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
+    // A `bun.lock` that exists but can't be stat'd (dangling symlink,
+    // ELOOP, EACCES) still shadows `bun.lockb` for Bun, so its presence
+    // comes from the same predicate the router uses.
+    let bun_text = bun_text_lock_drives(view);
     let mut present = Vec::new();
     for file in npm_lock_files() {
-        if view.exists(file).await {
+        let here = if file == BUN_LOCK {
+            bun_text
+        } else {
+            view.exists(file).await
+        };
+        if here {
             present.push(file);
         }
     }
@@ -191,7 +220,7 @@ pub(super) async fn inventory_live_sibling_lock_in(
         // The router's bun step runs BEFORE its pnpm sniff, so when the
         // version refusal fired no bun lock can actually be present; kept
         // for the table's sake. The text lock wins over the binary one.
-        NpmLockFamily::Bun if present.contains(&BUN_LOCK) => (
+        NpmLockFamily::Bun if bun_text => (
             NpmLockFlavor::Bun,
             inventory_bun_in(view).await.unwrap_or_default(),
         ),

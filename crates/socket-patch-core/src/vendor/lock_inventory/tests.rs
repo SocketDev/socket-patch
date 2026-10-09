@@ -999,7 +999,10 @@ async fn headerless_yarn_classic_lock_is_inventoried_as_classic_by_the_fallback(
         .filter(|l| !l.starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!headerless.contains("lockfile v1"), "fixture drops the header");
+    assert!(
+        !headerless.contains("lockfile v1"),
+        "fixture drops the header"
+    );
     write(tmp.path(), "yarn.lock", &headerless).await;
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
     assert_eq!(flavor, NpmLockFlavor::YarnClassic);
@@ -3558,6 +3561,36 @@ async fn requirements_in_root_includes_are_inventoried() {
     assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
 }
 
+/// #1249: pip's `join_lines` strips the backslash of a continued line
+/// that is the file's last and flushes it at EOF, so `six==1.16.0 \` with
+/// nothing after it installs six 1.16.0. Lock-only discovery reads it as
+/// that pin, in the root file and in a `-r` include, LF and CRLF.
+#[tokio::test]
+async fn requirements_dangling_eof_continuation_is_inventoried() {
+    for root in ["six==1.16.0 \\", "six==1.16.0 \\\n", "six==1.16.0 \\\r\n"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "requirements.txt", root).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![("six".to_string(), "1.16.0".to_string())],
+            "{root:?}"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "requirements.txt", "-r dev.txt\n").await;
+    write(tmp.path(), "dev.txt", "idna==3.4\nsix==1.16.0 \\\n").await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("idna".to_string(), "3.4".to_string()),
+            ("six".to_string(), "1.16.0".to_string()),
+        ]
+    );
+}
+
 /// #721: pip decodes a requirements file by its BOM, so a UTF-16 root
 /// file and a UTF-16 include (what Windows PowerShell 5.1's `pip freeze >`
 /// writes) are inventoried like their UTF-8 text, on disk and in memory.
@@ -3593,6 +3626,56 @@ async fn requirements_utf16_files_are_inventoried() {
                 ("six".to_string(), "1.16.0".to_string()),
             ],
             "le={le}: {entries:?}"
+        );
+
+        let mut project = MemoryProject::new();
+        project.insert("requirements.txt", MemoryEntry::Binary(root_bytes.into()));
+        project.insert(
+            "requirements/base.txt",
+            MemoryEntry::Binary(base_bytes.into()),
+        );
+        let in_memory = super::pypi::inventory_pypi_locks_in(&ProjectView::Memory(&project))
+            .await
+            .unwrap();
+        assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
+    }
+}
+
+/// #1119: with no BOM, pip decodes a requirements file through a PEP 263
+/// coding line, so a Latin-1 root file and a Latin-1 include are
+/// inventoried on a fresh checkout instead of reading as "no requirements",
+/// on disk and in memory.
+#[tokio::test]
+async fn requirements_pep_263_files_are_inventoried() {
+    let latin1 = |pins: &str| {
+        let mut bytes = b"# -*- coding: latin-1 -*-\n# Maintainer: Jos\xe9\n".to_vec();
+        bytes.extend_from_slice(pins.as_bytes());
+        bytes
+    };
+    for (root_bytes, base_bytes) in [
+        // The root file itself.
+        (
+            latin1("-r requirements/base.txt\nidna==3.7\n"),
+            b"six==1.16.0\n".to_vec(),
+        ),
+        // Only the include.
+        (
+            b"-r requirements/base.txt\nidna==3.7\n".to_vec(),
+            latin1("six==1.16.0\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("requirements")).unwrap();
+        std::fs::write(tmp.path().join("requirements.txt"), &root_bytes).unwrap();
+        std::fs::write(tmp.path().join("requirements/base.txt"), &base_bytes).unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![
+                ("idna".to_string(), "3.7".to_string()),
+                ("six".to_string(), "1.16.0".to_string()),
+            ],
+            "{entries:?}"
         );
 
         let mut project = MemoryProject::new();
@@ -3647,6 +3730,110 @@ async fn requirements_index_option_in_an_include_spans_the_tree() {
         entry(&entries, "idna").integrity,
         LockIntegrity::Sha256AnyOf(vec![sha.clone()])
     );
+}
+
+/// REGRESSION (#735): Bun opens `bun.lock` through symlinks, so a
+/// dangling `bun.lock` link is absent to it and it installs from the
+/// `bun.lockb` beside it (verified with Bun 1.2.23 and 1.3.14:
+/// `bun install --frozen-lockfile` installs from the binary lock). The
+/// inventory, the wired-integrity probe and vendored routing must all pick
+/// `bun.lockb` too, instead of losing every package of the live lock.
+#[cfg(unix)]
+#[tokio::test]
+async fn bun_dangling_text_lock_link_leaves_the_binary_lock_live() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    let mut lock = super::super::bun_lockb::BunLockb::parse(bytes).unwrap();
+    let minimist = lock
+        .packages()
+        .unwrap()
+        .into_iter()
+        .find(|package| package.name == "minimist")
+        .unwrap();
+    let rel = ".socket/vendor/npm/11111111-1111-4111-8111-111111111111/minimist-1.2.2.tgz";
+    let sri = format!("sha512-{}", "A".repeat(86) + "==");
+    lock.set_package(minimist.id, rel, &sri).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink("missing-target", tmp.path().join("bun.lock")).unwrap();
+
+    let (entries, diagnoses) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(diagnoses.is_empty(), "{diagnoses:?}");
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("is-number".into(), "7.0.0".into())],
+        "the binary lock's registry packages (minimist is vendored)"
+    );
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        Some(LockIntegrity::Sri(sri))
+    );
+    assert!(super::super::bun_lock::binary_lock_drives(tmp.path()));
+    // The hosted engine's view-level answer (disk and snapshot) agrees.
+    assert!(!bun_text_lock_drives(&ProjectView::Disk(tmp.path())));
+    let snapshot = DiskSnapshot::new(tmp.path());
+    assert!(!bun_text_lock_drives(&ProjectView::Snapshot(&snapshot)));
+}
+
+/// The #735 control: a `bun.lock` DIRECTORY is not absent to Bun — it
+/// opens it, fails to read it and ignores BOTH locks ("warn: Ignoring
+/// lockfile", Bun 1.2.23 and 1.3.14). The binary lock is therefore not
+/// live; every reader keeps choosing the text lock, whose unreadable read
+/// refuses rather than wiring a `bun.lockb` Bun would not install from.
+#[tokio::test]
+async fn bun_text_lock_directory_still_shadows_the_binary_lock() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("bun.lockb"), bytes)
+        .await
+        .unwrap();
+    tokio::fs::create_dir(tmp.path().join("bun.lock"))
+        .await
+        .unwrap();
+
+    let (entries, _) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(entries.is_empty(), "{entries:?}");
+    assert!(!super::super::bun_lock::binary_lock_drives(tmp.path()));
+    assert!(bun_text_lock_drives(&ProjectView::Disk(tmp.path())));
+}
+
+/// The #735 errno control: Bun falls back to `bun.lockb` only when opening
+/// `bun.lock` fails with ENOENT. A self-referencing link fails with ELOOP
+/// and a link through a regular file with ENOTDIR; Bun then prints
+/// "Ignoring lockfile" and installs from NEITHER lock (Bun 1.2.23 and
+/// 1.3.14). So the text lock keeps shadowing the binary one and nothing is
+/// inventoried from a `bun.lockb` Bun would not install from.
+#[cfg(unix)]
+#[tokio::test]
+async fn bun_text_lock_link_failing_with_other_errno_still_shadows_the_binary_lock() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    for target in ["bun.lock", "package.json/x"] {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package.json"), "{}")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(target, tmp.path().join("bun.lock")).unwrap();
+
+        let (entries, _) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty(), "{target}: {entries:?}");
+        assert!(
+            !super::super::bun_lock::binary_lock_drives(tmp.path()),
+            "{target}"
+        );
+        assert!(
+            bun_text_lock_drives(&ProjectView::Disk(tmp.path())),
+            "{target}"
+        );
+        let snapshot = DiskSnapshot::new(tmp.path());
+        assert!(
+            bun_text_lock_drives(&ProjectView::Snapshot(&snapshot)),
+            "{target}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -33,7 +33,10 @@ socket-patch get pkg:npm/lodash@4.17.20 --mode agent
 ```
 
 Replace the example identifiers with the advisory or package you need. `get` also
-accepts a patch UUID or package name. It defaults to hosted mode; `--save-only` and
+accepts a patch UUID or an exact package name, which covers every installed version
+of that package. `remove` and `rollback` take the same names. A short name that
+names several packages (`core` for `@angular/core` and `@babel/core`) is refused:
+use the full name or a purl. `get` defaults to hosted mode; `--save-only` and
 global targeting default to agent mode instead. Hosted and vendored `get` do not
 prompt. Agent-mode searches can offer an interactive choice.
 
@@ -110,12 +113,14 @@ Repair cannot reconstruct a lost vendor ledger. Restore it from version control.
 The N-API crate and in-memory patch engine remain available for hosted GitHub
 App workflows. Removing local vendoring builders does not remove those APIs.
 
-### Maven reactors and Gradle
+### Maven and Gradle
 
-Maven reactors use suffixed versions in `.socket/vendor/maven2`; Gradle 6.8+
-keeps its coordinates and lockfiles, with settings wiring and a configuration-time
-SHA-256 check. Existing Gradle verification files are updated. Single-POM Maven
-projects retain their existing vendoring behavior.
+Maven projects, single-module or reactor, use suffixed versions in
+`.socket/vendor/maven2`; Gradle 6.8+ keeps its coordinates and lockfiles, with
+settings wiring and a configuration-time SHA-256 check. Existing Gradle
+verification files are updated. A project vendored before v5 through the
+single-POM `<repository>` wiring must run `socket-patch vendor --revert` before
+vendoring again.
 
 ```sh
 socket-patch vendor --check                       # read-only offline artifact and wiring audit

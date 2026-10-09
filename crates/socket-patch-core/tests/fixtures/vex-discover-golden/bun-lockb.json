@@ -354,6 +354,14 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "bun-lockb/1.2.23-migrated": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "bun-lockb/1.3.0": {
     "refs": [],
     "diagnostics": [],
@@ -423,6 +431,14 @@
     "live_claims": []
   },
   "bun-lockb/1.4.2-extensions/packages/helper": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "bun-lockb/late-dependent": {
     "refs": [],
     "diagnostics": [],
     "recognized": [],

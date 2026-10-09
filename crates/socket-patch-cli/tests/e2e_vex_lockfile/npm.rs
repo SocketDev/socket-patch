@@ -21,8 +21,10 @@
 //! pin); a uuid-shaped segment on a NON-Socket host is nothing at all (no
 //! ref, zero API requests); a record naming another package or another
 //! uuid is `record_mismatch`; a vendored artifact attests, and a tampered
-//! member is `vendor_hash_mismatch`; and the npm 12 dual-lock hazard — one
-//! lock wired, the other still on the registry — attests nothing.
+//! member is `vendor_hash_mismatch`; the npm 12 dual-lock hazard — one
+//! lock wired, the other still on the registry — attests nothing; and a
+//! `shrinkwrap` with no package-lock.json twin attests nothing either (npm
+//! 12 never reads it, #899), so the attesting cells cover the other shapes.
 
 use crate::vex_e2e_common;
 
@@ -60,6 +62,11 @@ const SHAPES: [Shape; 5] = [
     Shape::Shrinkwrap,
     Shape::Dual,
 ];
+
+/// The shapes every npm major installs the wiring from: all but a lone
+/// `shrinkwrap`, which npm 12 ignores
+/// ([`shrinkwrap_without_a_package_lock_twin_attests_nothing`]).
+const ATTESTABLE_SHAPES: [Shape; 4] = [Shape::V1, Shape::V2, Shape::V3, Shape::Dual];
 
 fn hosted_url(host: &str, uuid: &str) -> String {
     format!("https://{host}/patch/npm/{NAME}/{VERSION}/{TOKEN}/{uuid}/{NAME}-{VERSION}.tgz")
@@ -169,13 +176,13 @@ fn assert_no_manifest_or_ledgers(p: &Path) {
     }
 }
 
-/// Hosted, nothing installed: every shape attests `(redirected)` from the
+/// Hosted, nothing installed: every attestable shape attests `(redirected)` from the
 /// patched sha512 pin (the in-run `scan --mode hosted --vex` basis) with
 /// the API's record; `--offline` is `record_unavailable` with zero requests.
 #[test]
 fn hosted_uninstalled_attests_from_the_integrity_pin_in_every_shape() {
     let api = api_for(UUID, PURL);
-    for shape in SHAPES {
+    for shape in ATTESTABLE_SHAPES {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
         write_locks(p, shape, &hosted_url("patch.socket.dev", UUID), PIN);
@@ -203,7 +210,7 @@ fn hosted_uninstalled_attests_from_the_integrity_pin_in_every_shape() {
 #[test]
 fn hosted_installed_tree_is_the_evidence_in_every_shape() {
     let api = api_for(UUID, PURL);
-    for shape in SHAPES {
+    for shape in ATTESTABLE_SHAPES {
         for (label, bytes, attested) in [
             ("patched", PATCHED, true),
             ("pristine", PRISTINE, false),
@@ -300,13 +307,13 @@ fn record_purl_or_uuid_mismatch_is_record_mismatch() {
     }
 }
 
-/// Vendored (v2 / v3 / shrinkwrap / dual — vendoring refuses v1): the
+/// Vendored (v2 / v3 / dual — vendoring refuses v1): the
 /// committed artifact is the evidence, nothing need be installed; a tampered
 /// artifact MEMBER is `vendor_hash_mismatch` even with a patched install.
 #[test]
 fn vendored_artifact_is_the_evidence_and_a_tampered_member_is_omitted() {
     let api = api_for(UUID, PURL);
-    for shape in [Shape::V2, Shape::V3, Shape::Shrinkwrap, Shape::Dual] {
+    for shape in [Shape::V2, Shape::V3, Shape::Dual] {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
         write_locks(p, shape, &format!("file:{}", vendored_rel(UUID)), PIN);
@@ -358,6 +365,43 @@ fn dual_lock_with_one_lock_on_the_registry_attests_nothing() {
                 );
             }
         }
+    }
+}
+
+/// REGRESSION (#899): a shrinkwrap with NO package-lock.json twin attests
+/// nothing. npm 12 never reads npm-shrinkwrap.json — it resolves the tree
+/// from the registry and writes a fresh package-lock.json — so the wiring
+/// reaches npm <= 11 only. Hosted (uninstalled, and installed patched under
+/// an npm <= 11) and vendored: omitted `vex_npm_shrinkwrap_only`, and the
+/// run says why.
+#[test]
+fn shrinkwrap_without_a_package_lock_twin_attests_nothing() {
+    let api = api_for(UUID, PURL);
+    for (mode, wired, installed) in [
+        ("hosted", hosted_url("patch.socket.dev", UUID), false),
+        (
+            "hosted installed",
+            hosted_url("patch.socket.dev", UUID),
+            true,
+        ),
+        ("vendored", format!("file:{}", vendored_rel(UUID)), false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        write_locks(p, Shape::Shrinkwrap, &wired, PIN);
+        write_artifact(p, UUID, PATCHED);
+        if installed {
+            install(p, PATCHED);
+        }
+        let out = run_vex(&binary(), p, &VexRun::online(&api));
+        assert_eq!(out.code, Some(1), "{mode}:\n{out}");
+        assert_not_attested(&out.envelope, PURL, "vex_npm_shrinkwrap_only");
+        assert_absent(out.doc.as_ref(), PURL);
+        let text = out.stdout.clone() + &out.stderr;
+        assert!(
+            text.contains("no package-lock.json") && text.contains("npm >= 12"),
+            "the shrinkwrap-only wiring must be explained:\n{out}"
+        );
     }
 }
 

@@ -22,7 +22,7 @@
 //! - no build script sets a custom lock-file location (`lockFile`), which
 //!   would hide a lock from the check above;
 //! - none of the hosted planner's build- or GA-level refusals holds now
-//!   (`pinned_row_refusal`: a settings-classpath declaration, a
+//!   (`PinnedRowChecks`: a settings-classpath declaration, a
 //!   non-literal `includeBuild`, an Android / KMP plugin, a classifier
 //!   request, a user `exclusiveContent` claiming the group, …): a build
 //!   changed after the scan in a way the pin cannot reach stops attesting.
@@ -53,13 +53,13 @@ use super::{
     maven_purl, DiscoverCtx, Discovery, PatchedRef, UnattestedKind, DIAG_LOCKFILE_UNPARSEABLE,
     DIAG_REF_INVALID,
 };
-use crate::gradle::eol::eol_eq;
 use crate::gradle::locks;
 use crate::patch::redirect::gradle::{
     apply_line_digest, graph_of, index_digest, is_settings_lock, lockfile_paths, parse_index,
-    pinned_row_refusal, settings_targets, GradleFiles, HOSTED_INDEX_REL, HOSTED_SCRIPT,
+    settings_targets, GradleFiles, PinnedRowChecks, HOSTED_INDEX_REL, HOSTED_SCRIPT,
     HOSTED_SCRIPT_REL, MAX_ROUNDS,
 };
+use crate::utils::line_endings::eol_eq;
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Some(index) = ctx.read_text(HOSTED_INDEX_REL, out).await else {
@@ -112,6 +112,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             Some((rel, state))
         })
         .collect();
+    let pinned_checks = PinnedRowChecks::new(&files, &graph);
     for row in rows {
         let ga = row.ga();
         let problem = wiring.clone().or_else(|| match ctx.hosted_uuid(&row.url) {
@@ -169,7 +170,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         // `includeBuild` added after the scan resolves the upstream jar
         // where the pin never reaches.
         let problem = problem.or_else(|| {
-            pinned_row_refusal(&files, &graph, &row).map(|(code, detail)| {
+            pinned_checks.refusal(&row).map(|(code, detail)| {
                 format!("the hosted planner would refuse it now ({code}): {detail}")
             })
         });

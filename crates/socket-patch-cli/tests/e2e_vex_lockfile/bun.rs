@@ -202,7 +202,12 @@ fn text_tuple(wiring: &Wiring) -> String {
 
 /// `bun.lockb` for `release`, rewired by the production binary rewriter.
 fn binary_lock(release: &str, wiring: &Wiring) -> Vec<u8> {
-    let fixture = binary_fixture(release);
+    rewire_binary(binary_fixture(release), wiring)
+}
+
+/// `fixture` with its registry minimist record rewired per `wiring` by the
+/// production binary rewriter.
+fn rewire_binary(fixture: Vec<u8>, wiring: &Wiring) -> Vec<u8> {
     let (artifact_url, sri, uuid) = match wiring {
         Wiring::Registry => return fixture,
         Wiring::Hosted { url, sri } => (
@@ -721,6 +726,91 @@ fn b_api_without_the_record_is_record_unavailable() {
             );
             let (code, env) = vex_online(cwd, &api, &[]);
             assert_omitted(cwd, code, &env, "record_unavailable", &what);
+        }
+    }
+}
+
+/// REGRESSION (#497 follow-up): real Bun locks (1.4.2 / 1.2.23 / 1.1.45
+/// text, 1.1.45 binary) where the root depends on minimist by
+/// `file:./pkg.tgz`, a codeload tarball URL or `github:…#v1.2.2`, and a
+/// folder dependency pulls minimist@1.2.2 from the registry. Bun records
+/// no version for the root copy and installs it from its own spec, so
+/// wiring the nested registry copy is never attested: hosted under
+/// `--no-verify`, vendored by default (both lockfile-only), and the run
+/// says why. The same text lock without the root copy attests.
+#[test]
+fn unversioned_own_source_copy_withholds_the_nested_wiring() {
+    let api = Api::start();
+    api.serve_view(UUID, view(UUID, PURL));
+    for dir in [
+        "text-0/file",
+        "text-1/file",
+        "text-2/file",
+        "text-2/url",
+        "text-2/git",
+        "lockb/file",
+        "lockb/url",
+        "lockb/git",
+    ] {
+        let fixture = fixture_dir(&format!("bun-unversioned-copy/{dir}"));
+        for mode in modes() {
+            let what = format!("{dir} {mode}");
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path();
+            std::fs::copy(fixture.join("package.json"), cwd.join("package.json")).unwrap();
+            let wiring = match mode {
+                "hosted" => hosted(UUID),
+                _ => commit_artifact(cwd, UUID, PATCHED),
+            };
+            let extra: &[&str] = if mode == "hosted" {
+                &["--no-verify"]
+            } else {
+                &[]
+            };
+            if dir.starts_with("lockb/") {
+                let bytes = std::fs::read(fixture.join("bun.lockb")).unwrap();
+                std::fs::write(cwd.join("bun.lockb"), rewire_binary(bytes, &wiring)).unwrap();
+            } else {
+                let text = std::fs::read_to_string(fixture.join("bun.lock")).unwrap();
+                let nested = format!("\"dep/{NAME}\": ");
+                let lock: String = text
+                    .lines()
+                    .map(
+                        |line| match line.trim_start().strip_prefix(nested.as_str()) {
+                            Some(_) => format!("    {nested}{},\n", text_tuple(&wiring)),
+                            None => format!("{line}\n"),
+                        },
+                    )
+                    .collect();
+                std::fs::write(cwd.join("bun.lock"), &lock).unwrap();
+
+                // Control: without the root copy the wiring attests.
+                let root = format!("\"{NAME}\": ");
+                let alone: String = lock
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with(root.as_str()))
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+                let control = tempfile::tempdir().unwrap();
+                let ccwd = control.path();
+                std::fs::copy(cwd.join("package.json"), ccwd.join("package.json")).unwrap();
+                std::fs::write(ccwd.join("bun.lock"), alone).unwrap();
+                if mode == "vendored" {
+                    commit_artifact(ccwd, UUID, PATCHED);
+                }
+                let (code, env) = vex_online(ccwd, &api, extra);
+                assert_attested(ccwd, code, &env, UUID, mode, &format!("{what} control"));
+            }
+            // The withdrawn wiring was the only patch reference.
+            let (code, env) = vex_online(cwd, &api, extra);
+            assert_nothing_found(code, &env, &what);
+            assert!(read_doc(&cwd.join("out.vex.json")).is_none(), "{what}");
+            let text = env.to_string();
+            assert!(
+                text.contains("patched_ref_unattributable")
+                    && text.contains("whose version the lock does not record"),
+                "{what}: the withheld wiring must be explained: {env}"
+            );
         }
     }
 }

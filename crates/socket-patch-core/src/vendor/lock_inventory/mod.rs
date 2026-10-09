@@ -69,15 +69,16 @@ pub(crate) mod vlt;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 
+pub use self::bun::{bun_binary_lock_drives, bun_text_lock_drives};
 pub(crate) use self::npm::{
-    npm_legacy_identity, npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes,
-    npm_lock_located_nodes, NpmLockNode,
+    npm_lock_bundled_nodes, npm_lock_entries, npm_lock_legacy_mirror_nodes, npm_lock_located_nodes,
+    NpmLockEntry, NpmLockNode, NpmLockSection,
 };
 #[cfg(test)]
 pub(crate) use self::npm_family::inventory_npm_lock;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
-pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView};
+pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView, ReadSet};
 pub use self::wired::wired_vendor_integrity;
 
 // The per-format views `inventory_project_diagnosed` unions (and the test

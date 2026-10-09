@@ -628,7 +628,7 @@ fn strip_url_query_fragment(url: &str) -> &str {
 ///   this form) — everything up to the last `@` before the first `/`,
 ///   but only when a `:` follows it; otherwise the `@` belongs to the
 ///   path (`host:repo@v1`) or the string is not a remote URL at all.
-fn strip_url_userinfo(url: &str) -> String {
+pub(crate) fn strip_url_userinfo(url: &str) -> String {
     if let Some(scheme_end) = url.find("://") {
         let (scheme, rest) = url.split_at(scheme_end + 3);
         let authority_end = rest.find('/').unwrap_or(rest.len());
@@ -1425,7 +1425,9 @@ mod tests {
     async fn detect_git_remote_handles_non_existent_start_path() {
         let dir = tempfile::tempdir().unwrap();
         let nonexistent = dir.path().join("does/not/exist");
-        assert!(detect_git_remote(&nonexistent, &mut Vec::new()).await.is_none());
+        assert!(detect_git_remote(&nonexistent, &mut Vec::new())
+            .await
+            .is_none());
     }
 
     /// B22: inside a submodule (`.git` is a `gitdir:` FILE), the product is

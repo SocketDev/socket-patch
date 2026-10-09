@@ -3,9 +3,27 @@ name: pnpm hosted compatibility
 on:
   # PRs: any crate source, but only the test files these capstones
   # compile (a later `!` pattern excludes, a later plain one re-includes).
-  # Main pushes stay unfiltered.
+  # Main pushes use the wider push filter below, plus a nightly full run.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Only this ecosystem's own files. A change to shared engine code
+    # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
+    # push to main (when it is in the push filter below) or nightly, or on
+    # demand via workflow_dispatch on the PR branch;
+    # ci.yml's per-ecosystem blocking slice still runs on every PR and in
+    # the merge queue (#1198).
+    paths:
+      - '.github/actions/upload-artifact/**'
+      - '.github/workflows/pnpm-compatibility.yml'
+      - 'crates/*/src/**/*pnpm*'
+      - 'crates/*/src/**/*pnpm*/**'
+      - 'crates/socket-patch-cli/tests/e2e_redirect_pnpm_build.rs'
+      - 'crates/socket-patch-cli/tests/e2e_vendor_pnpm_build.rs'
+  push:
+    branches: [main]
+    # The ecosystem's pre-#1198 relevance set (the shared engine code its
+    # cells run through), its PR paths and the toolchain files. A main
+    # push outside this set waits for the nightly run below.
     paths:
       - '.github/actions/upload-artifact/**'
       - 'Cargo.lock'
@@ -22,8 +40,11 @@ on:
       - 'crates/socket-patch-cli/tests/e2e_redirect_pnpm_build.rs'
       - 'crates/socket-patch-cli/tests/e2e_vendor_pnpm_build.rs'
       - 'crates/socket-patch-cli/tests/common/cache_env.rs'
-  push:
-    branches: [main]
+      - '.cargo/**'
+  schedule:
+    # Nightly full matrix, so a main change outside the push filter
+    # still gets a run within a day.
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:

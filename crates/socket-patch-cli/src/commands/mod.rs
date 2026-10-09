@@ -96,7 +96,16 @@ pub(crate) async fn discover_wiring(
     common: &crate::args::GlobalArgs,
     root: &Path,
 ) -> socket_patch_core::vex::discover::Discovery {
+    #[cfg(test)]
+    DISCOVERIES.with(|n| n.set(n.get() + 1));
     socket_patch_core::vex::discover_patched_refs_with(root, &discover_options(common)).await
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread ran [`discover_wiring`]: discovery walks
+    /// every lockfile, so tests pin the paths that must not repeat it.
+    pub(crate) static DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`discover_wiring`] of the snapshot's root, reading through `snapshot`.
@@ -128,13 +137,9 @@ pub(crate) async fn hosted_inventory(
     )
 }
 
-/// The project's hosted state, v5-style: v5 hosted mode keeps no ledger,
-/// so the hosted pins [`discover_wiring`] finds in the lockfiles are the
-/// whole record. Shaped as a [`RedirectState`] for the readers that classify
-/// hosted against vendored state (one uuid-only record per pinned purl, no
-/// edits) — it is never persisted.
-///
-/// [`RedirectState`]: socket_patch_core::patch::redirect::RedirectState
+/// [`hosted_state_from_pins`] over a fresh [`discover_wiring`] of `root`
+/// (the unit tests' load-then-derive entry point).
+#[cfg(test)]
 pub(crate) async fn hosted_state_from_lockfiles(
     common: &crate::args::GlobalArgs,
     root: &Path,
@@ -146,8 +151,14 @@ pub(crate) async fn hosted_state_from_lockfiles(
     )
 }
 
-/// [`hosted_state_from_lockfiles`] over already-discovered pins. A purl
-/// pinned to several uuids (different lockfiles) keeps the first.
+/// The project's hosted state, v5-style: v5 hosted mode keeps no ledger,
+/// so the hosted pins [`discover_wiring`] finds in the lockfiles are the
+/// whole record. Shaped as a [`RedirectState`] for the readers that classify
+/// hosted against vendored state (one uuid-only record per pinned purl, no
+/// edits) — it is never persisted. A purl pinned to several uuids
+/// (different lockfiles) keeps the first.
+///
+/// [`RedirectState`]: socket_patch_core::patch::redirect::RedirectState
 pub(crate) fn hosted_state_from_pins(
     pins: &[socket_patch_core::patch::redirect::upstream::HostedPin],
 ) -> socket_patch_core::patch::redirect::RedirectState {

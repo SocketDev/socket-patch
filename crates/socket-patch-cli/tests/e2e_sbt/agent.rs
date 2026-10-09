@@ -13,6 +13,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::common;
+use super::common::envelope::codes_in;
 use super::sbt_common::{
     write_coursier_artifact, write_ivy_artifact, write_sbt_build, Gav, SbtHome,
 };
@@ -774,15 +775,6 @@ fn ivy_opts(fx: &Fixture) -> (&'static str, String) {
     )
 }
 
-fn warning_codes(envelope: &Value) -> Vec<String> {
-    [&envelope["warnings"], &envelope["vex"]["warnings"]]
-        .into_iter()
-        .filter_map(Value::as_array)
-        .flatten()
-        .filter_map(|w| w["code"].as_str().map(str::to_string))
-        .collect()
-}
-
 /// An sbt build beside a Gradle build that never declares `mavenLocal()`:
 /// the sbt build's own `Resolver.mavenLocal` reads `~/.m2`, so its copy is
 /// patched, not refused as one "this Gradle build never reads".
@@ -930,8 +922,9 @@ fn agent_vex_names_a_lone_partly_unpatched_ivy_copy() {
     let (statements, env) = vex_statements(&fx, std::slice::from_ref(&opts));
     assert_eq!(statements, 0, "{env}");
     assert!(
-        warning_codes(&env)
-            .iter()
+        [&env["warnings"], &env["vex"]["warnings"]]
+            .into_iter()
+            .flat_map(codes_in)
             .any(|c| c == "vex_gradle_unpatched_copy"),
         "{env}"
     );

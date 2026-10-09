@@ -13,6 +13,8 @@
 //! remove_invariants.rs / remove_duality_invariants.rs /
 //! interactive_prompts_e2e.rs.
 
+use crate::common::binary;
+
 use std::path::{Path, PathBuf};
 
 use crate::common;
@@ -800,6 +802,99 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
         read_bytes(&socket.join("manifest.json")),
         manifest_before,
         "--preserve-state must keep the manifest entry"
+    );
+}
+
+/// Manifest-backed JSON twin: the note rides the envelope's `warnings[]`
+/// as `hosted_state_not_preservable` (the code `rollback
+/// --preserve-state` reports), not only human stderr.
+#[test]
+fn remove_hosted_preserve_state_json_warns_no_preservable_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("package-lock.json"), redirected_lock_text()).unwrap();
+    write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
+    let registry = NpmRegistry::start(true);
+
+    let (code, stdout, stderr) = run_remove_online(
+        tmp.path(),
+        &[NPM_PURL, "--json", "--yes", "--preserve-state"],
+        &registry,
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v = parse_envelope(&stdout);
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["code"] == "hosted_state_not_preservable"),
+        "expected a hosted_state_not_preservable warning; envelope={v}"
+    );
+}
+
+/// Hosted-only twin (#433): with no manifest — the default v5 shape after
+/// a bare `scan` — `remove --preserve-state` still restores the pin, and
+/// must say so: the `Note: …` line on stderr in human mode, the
+/// `hosted_state_not_preservable` warning in `--json`.
+#[test]
+fn remove_hosted_only_preserve_state_notes_no_preservable_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let lock_path = tmp.path().join("package-lock.json");
+    std::fs::write(&lock_path, redirected_lock_text()).unwrap();
+    let registry = NpmRegistry::start(true);
+
+    let (code, stdout, stderr) = run_remove_online(
+        tmp.path(),
+        &[NPM_PURL, "--yes", "--preserve-state"],
+        &registry,
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("Note: hosted wiring has no preservable local state"),
+        "the preserve-state hosted note must reach stderr; got:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        expected_reverted_lock_text(),
+        "the lock must hold exactly the upstream registry entry"
+    );
+
+    // JSON: re-pin, then the warning must ride the envelope.
+    std::fs::write(&lock_path, redirected_lock_text()).unwrap();
+    let (code, stdout, stderr) = run_remove_online(
+        tmp.path(),
+        &[NPM_PURL, "--json", "--yes", "--preserve-state"],
+        &registry,
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        !stderr.contains("no preservable local state"),
+        "--json keeps the note off stderr; got:\n{stderr}"
+    );
+    let v = parse_envelope(&stdout);
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["code"] == "hosted_state_not_preservable"),
+        "expected a hosted_state_not_preservable warning; envelope={v}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        expected_reverted_lock_text(),
+        "the JSON run restores the pin too"
+    );
+
+    // Without --preserve-state there is nothing to note.
+    std::fs::write(&lock_path, redirected_lock_text()).unwrap();
+    let (code, stdout, stderr) =
+        run_remove_online(tmp.path(), &[NPM_PURL, "--json", "--yes"], &registry);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v = parse_envelope(&stdout);
+    assert!(
+        !v["warnings"].as_array().is_some_and(|ws| ws
+            .iter()
+            .any(|w| w["code"] == "hosted_state_not_preservable")),
+        "a plain remove must not warn about preserve-state; envelope={v}"
     );
 }
 
@@ -1799,10 +1894,6 @@ mod pty {
     use super::*;
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::time::Duration;
-
-    fn binary() -> PathBuf {
-        env!("CARGO_BIN_EXE_socket-patch").into()
-    }
 
     /// Spawn the binary inside a PTY, send `input`, collect all output
     /// until exit (watchdog-killed after `timeout`).

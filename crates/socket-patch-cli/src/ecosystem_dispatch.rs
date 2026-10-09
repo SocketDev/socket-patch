@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use crate::args::GlobalArgs;
 
-use socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies;
+use socket_patch_core::crawlers::npm_crawler::{
+    retain_live_store_copies, with_store_peer_variant_copies,
+};
 use socket_patch_core::crawlers::walk_pool;
 use socket_patch_core::crawlers::CargoCrawler;
 use socket_patch_core::crawlers::ComposerCrawler;
@@ -17,7 +19,7 @@ use socket_patch_core::crawlers::GoCrawler;
 use socket_patch_core::crawlers::MavenCrawler;
 use socket_patch_core::crawlers::NuGetCrawler;
 
-/// Whether [`crawl_all_ecosystems`] actually visits this PURL's ecosystem
+/// Whether [`crawl_ecosystems`] actually visits this PURL's ecosystem
 /// in THIS process. An unrecognized `pkg:<type>/` (a newer CLI's ecosystem
 /// in a committed manifest) has no crawler at all — for those, absence
 /// from the crawl carries no information about whether the package is
@@ -195,6 +197,45 @@ fn merge_npm_copies(
     for (purl, pkgs) in packages {
         for pkg in pkgs {
             push_path(out, purl.clone(), pkg.path);
+        }
+    }
+}
+
+/// `paths` in order with every path that resolves to an already-listed
+/// directory dropped: two discovered site-packages paths can name ONE
+/// directory (a `lib64 -> lib` symlink, a symlinked venv), as can two npm
+/// copies (see [`distinct_npm_copies`]), and patching it twice would report
+/// the second pass `already_patched`. A path that can't be canonicalized is
+/// kept as-is.
+pub(crate) async fn distinct_install_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let key = tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
+/// Collapse each npm PURL's copies to distinct physical directories, in
+/// discovery order (the first spelling of each directory wins). The
+/// resolver walks every `node_modules` root, so a pnpm / Bun isolated
+/// workspace yields one copy twice: as the root's `.pnpm` store entry and
+/// as a member's `packages/a/node_modules/<dep>` link to it. Visiting both
+/// patched (or restored) it once and reported the second visit as a
+/// phantom `already_patched` / already-original event (#633). The map
+/// itself keeps every spelling, because path targets (`scan` / `rollback
+/// packages/a`) select a copy by the member's link; only the commands that
+/// act per copy collapse it. Genuinely distinct copies (nested duplicates,
+/// store peer variants) have distinct real paths and are all kept.
+pub(crate) async fn distinct_npm_copies(map: &mut HashMap<String, Vec<PathBuf>>) {
+    for (purl, paths) in map.iter_mut() {
+        if paths.len() > 1 && Ecosystem::from_purl(purl) == Some(Ecosystem::Npm) {
+            *paths = distinct_install_dirs(paths).await;
         }
     }
 }
@@ -439,7 +480,23 @@ pub async fn find_all_packages_for_rollback(
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, Vec<PathBuf>> {
-    dispatch_find(partitioned, options, silent, merge_qualified, None).await
+    find_all_packages_for_rollback_reusing(partitioned, options, silent, None).await
+}
+
+/// [`find_all_packages_for_rollback`], taking the npm `node_modules` roots
+/// from `prior` as [`find_packages_for_rollback_reusing`] does. Used by
+/// `scan`'s path scoping, which must see the same copies `rollback`'s path
+/// targets do.
+pub async fn find_all_packages_for_rollback_reusing(
+    partitioned: &HashMap<Ecosystem, Vec<String>>,
+    options: &CrawlerOptions,
+    silent: bool,
+    prior: Option<&NpmCrawlSnapshot>,
+) -> HashMap<String, Vec<PathBuf>> {
+    let npm_roots = prior
+        .filter(|p| p.taken_with(options))
+        .map(|p| p.roots.as_slice());
+    dispatch_find(partitioned, options, silent, merge_qualified, npm_roots).await
 }
 
 /// Qualified-aware PURL resolution for rollback, vendor, repair and
@@ -548,14 +605,13 @@ impl NpmRootsCrawler<'_> {
 
 /// The installed copy of each npm purl in `purls`, found by its
 /// `package.json` identity (a full npm crawl) instead of its install path.
-/// An npm ALIAS dependency (`"lp": "npm:left-pad@1.3.0"`) is installed under
-/// its dependency key (`node_modules/lp`), which the name-keyed resolvers
-/// above never probe; callers use this as the last lookup before calling a
+/// An npm ALIAS dependency (`"lp": "npm:left-pad@1.3.0"`) reached through a
+/// symlinked importer entry is one the name-keyed resolvers above never
+/// take as a copy; callers use this as the last lookup before calling a
 /// package missing (`vendor`, and `vex` for a purl nothing else found).
 /// The crawl dedups by name@version, so this yields ONE copy per purl — the
 /// first the crawl reaches — never every alias beside a normal install
-/// (`vex`'s per-dir alias walk, `vex_consumed::npm_alias_copies`, finds
-/// those). Keyed by the caller's spelling; a purl with no copy has no
+/// (the core resolver's alias pass returns those). Keyed by the caller's spelling; a purl with no copy has no
 /// entry. No crawl runs when `purls` is empty.
 pub(crate) async fn npm_paths_by_identity(
     options: &CrawlerOptions,
@@ -641,6 +697,17 @@ pub async fn find_manifest_package_copies_reusing(
             *paths = with_store_peer_variant_copies(std::mem::take(paths)).await;
         }
     }
+    // A Bun store entry nothing links any more (Bun never prunes `.bun`)
+    // is no copy the install loads, so the check skips it (#599). Rollback
+    // and remove, which resolve without this, still restore it.
+    retain_live_store_copies(
+        copies
+            .iter_mut()
+            .filter(|(purl, _)| purl.starts_with("pkg:npm/"))
+            .map(|(_, paths)| paths),
+    )
+    .await;
+    copies.retain(|_, paths| !paths.is_empty());
     // Verification also READS a `.bundle/config` bundle path the crawler
     // refused as a write root (it resolves outside the project): bundler
     // installs into and loads from it, so a copy there must verify too —
@@ -774,22 +841,13 @@ where
     Box::pin(make())
 }
 
-/// Crawl all ecosystems and return all packages, per-ecosystem counts and
+/// Crawl the ecosystems and return all packages, per-ecosystem counts and
 /// the gem crawl's refused config-sourced `BUNDLE_PATH`
 /// (`BundleStoreDiscovery::skipped_config_path`, local mode only) —
 /// recovered from the crawl that hit it, so callers surfacing the advisory
 /// never probe the Bundler roots a second time.
-pub async fn crawl_all_ecosystems(
-    options: &CrawlerOptions,
-) -> (
-    Vec<CrawledPackage>,
-    HashMap<Ecosystem, usize>,
-    Option<String>,
-) {
-    crawl_ecosystems(options, None).await
-}
-
-/// [`crawl_all_ecosystems`] over only the ecosystems `only` names
+///
+/// Restricted to the ecosystems `only` names
 /// (`--ecosystems` spellings; `None` crawls every one). A crawler that is
 /// not selected never runs: it contributes no packages and no `counts`
 /// entry. Each crawler reports only its own ecosystem's purls, so the
@@ -807,7 +865,7 @@ pub async fn crawl_ecosystems(
     (packages, counts, skipped_config_path)
 }
 
-/// [`crawl_all_ecosystems`], also handing back the npm half of the crawl as
+/// [`crawl_ecosystems`], also handing back the npm half of the crawl as
 /// an [`NpmCrawlSnapshot`] (its packages are the leading `counts[Npm]`
 /// entries of the package list).
 #[cfg(test)]
@@ -1059,6 +1117,34 @@ mod tests {
     }
 
     // ---- merge_npm_copies -------------------------------------------------
+
+    /// #633: a pnpm workspace member's link into the root store is the
+    /// copy the root walk already found, so it collapses to the first
+    /// spelling; a genuine second copy, a missing path and a non-npm PURL
+    /// are kept as they are.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn distinct_npm_copies_drops_a_second_spelling_of_one_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("node_modules/.pnpm/a@1.0.0/node_modules/a");
+        let nested = tmp.path().join("node_modules/b/node_modules/a");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let member_nm = tmp.path().join("packages/m/node_modules");
+        std::fs::create_dir_all(&member_nm).unwrap();
+        let link = member_nm.join("a");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let missing = tmp.path().join("gone");
+        let mut map: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        map.insert(
+            "pkg:npm/a@1.0.0".into(),
+            vec![store.clone(), link.clone(), nested.clone(), missing.clone()],
+        );
+        map.insert("pkg:gem/a@1.0.0".into(), vec![store.clone(), link.clone()]);
+        distinct_npm_copies(&mut map).await;
+        assert_eq!(map["pkg:npm/a@1.0.0"], vec![store.clone(), nested, missing]);
+        assert_eq!(map["pkg:gem/a@1.0.0"], vec![store, link]);
+    }
 
     #[test]
     fn merge_npm_copies_carries_every_copy_per_purl() {
@@ -1744,7 +1830,7 @@ mod tests {
     #[tokio::test]
     async fn crawl_all_includes_every_ecosystem_unconditionally() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_, counts, _) = crawl_all_ecosystems(&local_options(tmp.path().to_path_buf())).await;
+        let (_, counts, _) = crawl_ecosystems(&local_options(tmp.path().to_path_buf()), None).await;
         for eco in [
             Ecosystem::Npm,
             Ecosystem::Pypi,
@@ -1837,6 +1923,18 @@ mod tests {
             find_packages_for_rollback_reusing(&partitioned, &options, true, Some(&snapshot)).await;
         assert_eq!(reused, crawled);
         assert!(crawled.contains_key("pkg:npm/baz@3.0.0"), "{crawled:?}");
+        // The multi-copy twin keeps every copy, the member's nested one too.
+        let all_crawled = find_all_packages_for_rollback(&partitioned, &options, true).await;
+        let all_reused =
+            find_all_packages_for_rollback_reusing(&partitioned, &options, true, Some(&snapshot))
+                .await;
+        assert_eq!(all_reused, all_crawled);
+        assert!(
+            all_crawled
+                .get("pkg:npm/foo@0.9.0")
+                .is_some_and(|paths| paths.len() == 2),
+            "{all_crawled:?}"
+        );
         // The resolver finds the alias install itself (#356).
         let left_pad = "pkg:npm/left-pad@1.3.0".to_string();
         assert_eq!(crawled.get(&left_pad), Some(&root.join("node_modules/lp")));
@@ -1861,6 +1959,17 @@ mod tests {
             find_packages_for_rollback_reusing(&app_partitioned, &elsewhere, true, Some(&snapshot))
                 .await,
             find_packages_for_rollback(&app_partitioned, &elsewhere, true).await,
+            "a snapshot of another root must not answer for this one"
+        );
+        assert_eq!(
+            find_all_packages_for_rollback_reusing(
+                &app_partitioned,
+                &elsewhere,
+                true,
+                Some(&snapshot)
+            )
+            .await,
+            find_all_packages_for_rollback(&app_partitioned, &elsewhere, true).await,
             "a snapshot of another root must not answer for this one"
         );
     }
@@ -2027,7 +2136,7 @@ mod tests {
             global_prefix: Some(root.to_path_buf()),
         };
 
-        let (packages, counts, _) = crawl_all_ecosystems(&options).await;
+        let (packages, counts, _) = crawl_ecosystems(&options, None).await;
 
         let mut serial: Vec<CrawledPackage> = Vec::new();
         let mut serial_counts: HashMap<Ecosystem, usize> = HashMap::new();

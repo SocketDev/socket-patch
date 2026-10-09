@@ -58,10 +58,8 @@ fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
@@ -1668,6 +1666,80 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
     }
 }
 
+/// #992: Bun writes a package's full tarball URL into the `bun.lock`
+/// registry slot whenever it is not under registry.npmjs.org, and Bun
+/// 1.1.39–1.3.6 read an empty slot as npmjs whatever bunfig says. A hosted
+/// rollback in a project whose `bunfig.toml` names a mirror must write the
+/// mirror's URL back, not `""`: read from the mirror's own version document
+/// when it answers, and rebuilt on the mirror from the default registry's
+/// conventional URL (with `upstream_registry_fallback`) when it doesn't.
+#[tokio::test]
+#[serial]
+async fn bun_rollback_keeps_the_bunfig_registry_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let integrity = "sha512-UPSTREAMupstream==";
+    mock_npm_registry(&server, integrity, None).await;
+    // A mirror that serves its version document (conventional URLs).
+    let mirror_tarball = format!("{}/mirror/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri());
+    Mock::given(method("GET"))
+        .and(path(format!("/mirror/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": { "tarball": mirror_tarball, "integrity": integrity },
+        })))
+        .mount(&server)
+        .await;
+
+    // `private` answers nothing: the restore falls back to the default
+    // registry's document and re-bases its conventional URL on the mirror.
+    for (mirror, readable) in [("mirror", true), ("private", false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bun_project(tmp.path(), 1);
+        let lock_path = tmp.path().join("bun.lock");
+        let slot = format!("{}/{mirror}/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri());
+        let pristine = std::fs::read_to_string(&lock_path)
+            .unwrap()
+            .replace("\"\", {}", &format!("\"{slot}\", {{}}"));
+        std::fs::write(&lock_path, &pristine).unwrap();
+        std::fs::write(
+            tmp.path().join("bunfig.toml"),
+            format!("[install]\nregistry = \"{}/{mirror}/\"\n", server.uri()),
+        )
+        .unwrap();
+
+        let env = run_redirect_subprocess(tmp.path(), &server.uri());
+        assert_eq!(env["redirect"]["redirected"], 1, "{mirror}: {env:#}");
+        assert!(
+            std::fs::read_to_string(&lock_path)
+                .unwrap()
+                .contains(HOSTED_URL),
+            "{mirror}: the lock is hosted"
+        );
+
+        let (code, env) = rollback_json(tmp.path(), &server);
+        assert_eq!(code, Some(0), "{mirror}: rollback: {env:#}");
+        assert_eq!(
+            env["hosted"]["reverted"],
+            serde_json::json!([PURL]),
+            "{mirror}: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            pristine,
+            "{mirror}: rollback writes the mirror's tarball URL back into the registry slot"
+        );
+        assert_eq!(
+            env.to_string().contains("upstream_registry_fallback"),
+            !readable,
+            "{mirror}: {env:#}"
+        );
+    }
+}
+
 // Native binary lockfiles are parsed and patched without invoking Bun.
 const INVALID_LOCKB_BYTES: &[u8] = b"\x00BUN-BINARY\xff\xfe\x00LOCK";
 
@@ -1685,9 +1757,21 @@ fn rollback_json_with_origin(
     registry: &MockServer,
     origin: &str,
 ) -> (Option<i32>, serde_json::Value) {
+    hosted_unwind_json(cwd, registry, origin, &["rollback"])
+}
+
+/// `<command…> --json --yes` as a subprocess against the hosted pins of
+/// `origin`, the upstream restore reading `registry` — the shared runner
+/// behind [`rollback_json`] and [`remove_json`].
+fn hosted_unwind_json(
+    cwd: &Path,
+    registry: &MockServer,
+    origin: &str,
+    command: &[&str],
+) -> (Option<i32>, serde_json::Value) {
     let out = scrubbed_cli()
+        .args(command)
         .args([
-            "rollback",
             "--json",
             "--yes",
             "--patch-server-url",
@@ -1700,10 +1784,11 @@ fn rollback_json_with_origin(
             format!("{}/npm-registry", registry.uri()),
         )
         .output()
-        .expect("run socket-patch rollback");
+        .unwrap_or_else(|e| panic!("run socket-patch {}: {e}", command[0]));
     let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
-            "rollback --json stdout must be JSON: {e}\nstdout:\n{}\nstderr:\n{}",
+            "{} --json stdout must be JSON: {e}\nstdout:\n{}\nstderr:\n{}",
+            command[0],
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         )
@@ -2004,6 +2089,15 @@ fn scrubbed_cli() -> std::process::Command {
         .env_remove("SOCKET_OFFLINE")
         .env_remove("SOCKET_ECOSYSTEMS")
         .env_remove("SOCKET_MANIFEST_PATH");
+    // A registry exported by npm (`npm_config_registry`) or Bun would
+    // steer the Bun restores off the fixtures' registry.
+    for key in [
+        "BUN_CONFIG_REGISTRY",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+    ] {
+        cmd.env_remove(key);
+    }
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
@@ -2767,6 +2861,218 @@ async fn rush_repo_state_stale_warning_is_gated_on_repo_state_presence() {
     assert!(
         lock.contains(HOSTED_URL),
         "the common lock must still be redirected without repo-state.json; got:\n{lock}"
+    );
+}
+
+/// With Rush subspaces enabled, the pnpmShrinkwrapHash carrier lives next to
+/// each subspace lock, at common/config/subspaces/<name>/repo-state.json, and
+/// there is no common/config/rush/repo-state.json (#714). A rewrite that
+/// landed in a subspace lock must still warn, keyed on that sibling file, and
+/// must leave it byte-identical.
+#[tokio::test]
+#[serial]
+async fn rush_subspace_repo_state_stale_warning_fires_for_subspace_repo_state() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("rush.json"),
+        r#"{ "rushVersion": "5.100.0" }"#,
+    )
+    .unwrap();
+    for name in ["default", "tools"] {
+        let dir = tmp.path().join("common/config/subspaces").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pnpm-lock.yaml"), rush_pnpm_lock(NAME)).unwrap();
+    }
+    let state_rel = "common/config/subspaces/default/repo-state.json";
+    let state = "{\n  \"pnpmShrinkwrapHash\": \"deadbeef\"\n}\n";
+    std::fs::write(tmp.path().join(state_rel), state).unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    for name in ["default", "tools"] {
+        let lock = std::fs::read_to_string(
+            tmp.path()
+                .join(format!("common/config/subspaces/{name}/pnpm-lock.yaml")),
+        )
+        .unwrap();
+        assert!(
+            lock.contains(HOSTED_URL),
+            "the {name} subspace lock must be redirected; got:\n{lock}"
+        );
+    }
+    assert!(
+        warning_codes(&env).contains(&"redirect_rush_repo_state_stale".to_string()),
+        "a subspace repo-state.json beside a rewritten subspace lock must trigger \
+         the stale-hash warning; got warnings {:?}",
+        warning_codes(&env)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(state_rel)).unwrap(),
+        state,
+        "the redirect must not rewrite the subspace repo-state.json"
+    );
+}
+
+/// The stale-hash warning pairs each rewritten lock with the repo-state.json
+/// in its own directory: a subspace repo-state.json says nothing about a
+/// rewrite that landed only in the common lock (that subspace's lock, and so
+/// its hash, is untouched).
+#[tokio::test]
+#[serial]
+async fn rush_subspace_repo_state_does_not_flag_a_common_only_rewrite() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("rush.json"),
+        r#"{ "rushVersion": "5.100.0" }"#,
+    )
+    .unwrap();
+    let common = tmp.path().join("common/config/rush");
+    std::fs::create_dir_all(&common).unwrap();
+    std::fs::write(common.join("pnpm-lock.yaml"), rush_pnpm_lock(NAME)).unwrap();
+    let subspace = tmp.path().join("common/config/subspaces/tools");
+    std::fs::create_dir_all(&subspace).unwrap();
+    let sub_lock = rush_pnpm_lock("unrelated-pkg");
+    std::fs::write(subspace.join("pnpm-lock.yaml"), &sub_lock).unwrap();
+    std::fs::write(subspace.join("repo-state.json"), "{}\n").unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    let lock = std::fs::read_to_string(common.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(HOSTED_URL),
+        "common lock must be redirected; got:\n{lock}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(subspace.join("pnpm-lock.yaml")).unwrap(),
+        sub_lock,
+        "the subspace lock resolves nothing patched and must be untouched"
+    );
+    assert!(
+        !warning_codes(&env).contains(&"redirect_rush_repo_state_stale".to_string()),
+        "only the common lock changed and it has no repo-state.json beside it; got \
+         warnings {:?}",
+        warning_codes(&env)
+    );
+}
+
+/// pnpm >=11 rejects (or, under Rush's `--no-prefer-frozen-lockfile`
+/// install, silently re-resolves) a hosted-redirected lock unless the
+/// lockfile is trusted — but the generic `redirect_pnpm_trust_lockfile`
+/// remedies (`pnpm install --trust-lockfile`, a repo-root
+/// pnpm-workspace.yaml `trustLockfile` key, a `--store-dir` reinstall) do
+/// nothing in a Rush repo: rush runs pnpm in common/temp with a workspace
+/// file it generates itself (#713). A run that spliced only Rush locks must
+/// carry the Rush remedy instead: the `pnpm_config_trust_lockfile=true rush
+/// install` env var, the pnpm 11 `usePnpmFrozenLockfileForRushInstall`
+/// experiment, and a `rush purge` clean reinstall.
+#[tokio::test]
+#[serial]
+async fn rush_pnpm_trust_warning_gives_rush_remedy() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_rush_project(tmp.path(), false);
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+                .and_then(|w| w["detail"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("redirect_pnpm_trust_lockfile must fire; envelope: {env}"));
+    for needle in [
+        "pnpm_config_trust_lockfile=true rush install",
+        "usePnpmFrozenLockfileForRushInstall",
+        "common/config/rush/experiments.json",
+        "rush purge",
+        "socket-patch vex",
+    ] {
+        assert!(
+            detail.contains(needle),
+            "the Rush trust detail must name `{needle}`; got:\n{detail}"
+        );
+    }
+    for needle in [
+        "pnpm install --trust-lockfile",
+        "--store-dir",
+        "pnpm clean --lockfile",
+    ] {
+        assert!(
+            !detail.contains(needle),
+            "the Rush trust detail must not offer the pnpm-only `{needle}`; got:\n{detail}"
+        );
+    }
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "rush nested-lock redirects must not create a root pnpm-workspace.yaml"
+    );
+}
+
+/// HEAL-ON-RERUN for #713: a Rush repo whose locks an earlier run (any
+/// release) already redirected splices nothing on a re-scan, yet its `rush
+/// install` still needs the Rush trust remedy — so the re-run re-issues it
+/// instead of going silent, and still writes no root pnpm-workspace.yaml.
+#[tokio::test]
+#[serial]
+async fn rush_rerun_on_redirected_locks_reissues_the_rush_remedy() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_rush_project(tmp.path(), false);
+    run_redirect_subprocess(tmp.path(), &server.uri());
+    let common_rel = "common/config/rush/pnpm-lock.yaml";
+    let redirected = std::fs::read_to_string(tmp.path().join(common_rel)).unwrap();
+    assert!(
+        redirected.contains(HOSTED_URL),
+        "first run must redirect:\n{redirected}"
+    );
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(common_rel)).unwrap(),
+        redirected,
+        "the re-run must leave the redirected Rush lock byte-identical"
+    );
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+                .and_then(|w| w["detail"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("the re-run must re-issue the Rush remedy; envelope: {env}"));
+    assert!(
+        detail.contains("pnpm_config_trust_lockfile=true rush install"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("pnpm install --trust-lockfile"),
+        "{detail}"
+    );
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "a Rush re-run must not create a root pnpm-workspace.yaml"
     );
 }
 
@@ -4895,6 +5201,12 @@ fn write_pnpm_tarball_project(root: &Path, tarball: &str) -> String {
 
 /// Scan hosted, then roll back, and return the restored pnpm-lock.yaml.
 fn pnpm_pin_and_rollback(root: &Path, server: &MockServer) -> String {
+    pnpm_pin_and_rollback_env(root, server).0
+}
+
+/// [`pnpm_pin_and_rollback`], also returning the rollback's `--json`
+/// envelope.
+fn pnpm_pin_and_rollback_env(root: &Path, server: &MockServer) -> (String, serde_json::Value) {
     let env = run_redirect_subprocess(root, &server.uri());
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
     let pinned = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
@@ -4906,7 +5218,10 @@ fn pnpm_pin_and_rollback(root: &Path, server: &MockServer) -> String {
         serde_json::json!([PURL]),
         "{env:#}"
     );
-    std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap()
+    (
+        std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+        env,
+    )
 }
 
 /// #557: under `.npmrc` `lockfile-include-tarball-url=true` (pnpm 9/10),
@@ -4976,6 +5291,601 @@ async fn pnpm_rollback_keeps_an_unconventional_registry_tarball() {
     let tmp = tempfile::tempdir().unwrap();
     let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
     assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// Mount the version document of the project's `.npmrc` mirror at
+/// `<server>/mirror`, advertising `tarball` as `dist.tarball`, and return
+/// the mirror's base URL.
+async fn mock_pnpm_mirror(server: &MockServer, tarball: &str) -> String {
+    Mock::given(method("GET"))
+        .and(path(format!("/mirror/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": { "tarball": tarball, "integrity": "sha512-UPSTREAMupstream==" },
+        })))
+        .mount(server)
+        .await;
+    format!("{}/mirror/", server.uri())
+}
+
+/// #919: pnpm's restore reads `dist.tarball` from the registry the
+/// project's `.npmrc` names, not from the default registry. A CDN-style
+/// mirror tarball pnpm recorded as `tarball:` stays, even though the
+/// default registry (`SOCKET_NPM_REGISTRY` here, npmjs normally) serves a
+/// conventional URL pnpm would derive — and the mirror would 404 on.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_reads_the_npmrc_mirror_document_for_an_offpath_tarball() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let advertised = format!("{}/cdn/files/{NAME}-{VERSION}.tgz", server.uri());
+    let mirror = mock_pnpm_mirror(&server, &advertised).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
+    std::fs::write(tmp.path().join(".npmrc"), format!("registry={mirror}\n")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #919, under `lockfile-include-tarball-url=true`: the restored `tarball:`
+/// is the mirror's URL pnpm wrote, not the default registry's.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_keeps_the_mirror_tarball_under_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let advertised = format!("{}/mirror/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri());
+    let mirror = mock_pnpm_mirror(&server, &advertised).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        format!("registry={mirror}\nlockfile-include-tarball-url=true\n"),
+    )
+    .unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #919 on pnpm 11+: the mirror is named by pnpm-workspace.yaml's
+/// `registry:` (which pnpm 11 reads ahead of `.npmrc`), not `.npmrc`.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_reads_the_workspace_mirror_on_pnpm_11() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let advertised = format!("{}/cdn/files/{NAME}-{VERSION}.tgz", server.uri());
+    let mirror = mock_pnpm_mirror(&server, &advertised).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
+    write_pnpm_modules_json(tmp.path(), "11.27.0");
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        format!("packages:\n  - '.'\nregistry: {mirror}\n"),
+    )
+    .unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// The scoped package and hosted URL of the #919 scope-registry case.
+const SCOPED_NAME: &str = "@socktest/scoped-pkg";
+const SCOPED_HOSTED_URL: &str = "http://patch.test/patch/npm/%40socktest/scoped-pkg/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/scoped-pkg-1.0.0.tgz";
+
+/// A v9 pnpm lock resolving `SCOPED_NAME@VERSION` with `resolution`.
+fn scoped_pnpm_lock(resolution: &str) -> String {
+    format!(
+        "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+         '{SCOPED_NAME}':\n        specifier: {VERSION}\n        version: {VERSION}\n\n\
+         packages:\n\n  '{SCOPED_NAME}@{VERSION}':\n    resolution: {resolution}\n\n\
+         snapshots:\n\n  '{SCOPED_NAME}@{VERSION}': {{}}\n"
+    )
+}
+
+/// #919, scoped: a scoped name resolves against `.npmrc`'s
+/// `@scope:registry`, not `registry`. Its version document is read from
+/// there (an off-path CDN tarball stays recorded), and a URL conventional
+/// under it stays derived (the bare `{integrity}` stays bare). `registry`
+/// names a mirror that 404s and the default registry advertises the other
+/// shape each time, so reading either one changes the restored lock.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_reads_the_scope_registry_for_a_scoped_name() {
+    let server = MockServer::start().await;
+    let scope_registry = format!("{}/scoped/", server.uri());
+    let cdn = format!("{}/cdn/scoped-pkg-{VERSION}.tgz", server.uri());
+    let conventional = format!("{scope_registry}{SCOPED_NAME}/-/scoped-pkg-{VERSION}.tgz");
+    for (advertised, default_advertises, recorded) in [
+        (&cdn, &conventional, Some(&cdn)),
+        (&conventional, &cdn, None),
+    ] {
+        server.reset().await;
+        for (prefix, tarball) in [("scoped", advertised), ("npm-registry", default_advertises)] {
+            Mock::given(method("GET"))
+                .and(path_regex(format!(
+                    "^/{prefix}/@socktest%2[fF]scoped-pkg/{VERSION}$"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "name": SCOPED_NAME,
+                    "version": VERSION,
+                    "dist": { "tarball": tarball, "integrity": "sha512-UPSTREAMupstream==" },
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pristine = scoped_pnpm_lock(&match recorded {
+            Some(tarball) => {
+                format!("{{integrity: sha512-UPSTREAMupstream==, tarball: {tarball}}}")
+            }
+            None => "{integrity: sha512-UPSTREAMupstream==}".to_string(),
+        });
+        let pinned = scoped_pnpm_lock(&format!(
+            "{{integrity: {PATCHED_SHA512}, tarball: {SCOPED_HOSTED_URL}}}"
+        ));
+        std::fs::write(tmp.path().join("pnpm-lock.yaml"), &pinned).unwrap();
+        std::fs::write(
+            tmp.path().join(".npmrc"),
+            format!(
+                "registry={}/unscoped/\n@socktest:registry={scope_registry}\n",
+                server.uri()
+            ),
+        )
+        .unwrap();
+
+        let (code, env) = rollback_json(tmp.path(), &server);
+        assert_eq!(code, Some(0), "rollback: {env:#}");
+        assert_eq!(
+            env["hosted"]["reverted"],
+            serde_json::json!(["pkg:npm/@socktest/scoped-pkg@1.0.0"]),
+            "{env:#}"
+        );
+        assert!(
+            !env["warnings"]
+                .to_string()
+                .contains("upstream_registry_fallback"),
+            "{env:#}"
+        );
+        let restored = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+        assert_eq!(restored, pristine, "advertised {advertised}");
+    }
+}
+
+/// #919: when the `.npmrc` mirror cannot be read (here it answers 401),
+/// pnpm's restore falls back to the default registry's document, exits 0,
+/// and says so with `upstream_registry_fallback`.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_falls_back_from_an_unreadable_mirror_and_warns() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    Mock::given(method("GET"))
+        .and(path_regex("^/private/"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        format!("registry={}/private/\n", server.uri()),
+    )
+    .unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let (code, env) = rollback_json(tmp.path(), &server);
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{env:#}"
+    );
+    let codes: Vec<_> = env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"upstream_registry_fallback"), "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        pristine
+    );
+}
+
+/// `remove <PURL>` as a subprocess, like [`rollback_json`].
+fn remove_json(cwd: &Path, registry: &MockServer) -> (Option<i32>, serde_json::Value) {
+    hosted_unwind_json(cwd, registry, "http://patch.test", &["remove", PURL])
+}
+
+/// The `node_modules/.modules.yaml` install record pnpm 10+ writes (JSON),
+/// naming `pnpm@{version}` as the pnpm that installed the project.
+fn write_pnpm_modules_json(root: &Path, version: &str) {
+    std::fs::write(
+        root.join("node_modules/.modules.yaml"),
+        format!(
+            "{{\n  \"layoutVersion\": 5,\n  \"nodeLinker\": \"isolated\",\n  \
+             \"packageManager\": \"pnpm@{version}\",\n  \"pendingBuilds\": []\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// #902: pnpm 11/12 ignore `lockfile-include-tarball-url` in `.npmrc`, so
+/// the lock they wrote has no `tarball:` and `rollback` must keep it that
+/// way, byte-exact.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_stays_bare_when_pnpm11_ignores_npmrc_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    write_pnpm_modules_json(tmp.path(), "11.28.3");
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        "lockfile-include-tarball-url=true\n",
+    )
+    .unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #902, `remove` shares the restore: same project as above.
+#[tokio::test]
+#[serial]
+async fn pnpm_remove_stays_bare_when_pnpm12_ignores_npmrc_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    write_pnpm_modules_json(tmp.path(), "12.8.1");
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        "lockfile-include-tarball-url=true\n",
+    )
+    .unwrap();
+    let lock_path = tmp.path().join("pnpm-lock.yaml");
+    let pristine = std::fs::read_to_string(&lock_path).unwrap();
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert!(std::fs::read_to_string(&lock_path)
+        .unwrap()
+        .contains("patch.test"));
+    let (code, env) = remove_json(tmp.path(), &server);
+    assert_eq!(code, Some(0), "remove: {env:#}");
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), pristine);
+}
+
+/// #902: pnpm <= 9 ignores pnpm-workspace.yaml settings, so a
+/// `lockfileIncludeTarballUrl: true` there left the lock bare. The pnpm 9
+/// install record is YAML.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_stays_bare_when_pnpm9_ignores_workspace_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    std::fs::write(
+        tmp.path().join("node_modules/.modules.yaml"),
+        "hoistPattern:\n  - '*'\nlayoutVersion: 5\nnodeLinker: isolated\n\
+         packageManager: pnpm@9.15.9\npendingBuilds: []\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #902: with no install record, package.json's corepack `packageManager`
+/// pin names the pnpm major.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_reads_the_pnpm_major_from_package_json_package_manager() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@9.15.9+sha512.abc", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #902: the lock itself is the best witness. An unpinned registry entry
+/// pnpm wrote without `tarball:` proves the setting was not in effect,
+/// whatever the settings files say.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_follows_lock_evidence_over_an_ignored_setting() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lock = rush_pnpm_lock(NAME).replace(
+        "\nsnapshots:\n",
+        "  other-dep@2.0.0:\n    resolution: {integrity: sha512-OTHERother==}\n\n\
+             snapshots:\n",
+    ) + "  other-dep@2.0.0: {}\n";
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), &lock).unwrap();
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        "lockfile-include-tarball-url=true\n",
+    )
+    .unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), lock);
+}
+
+/// Whether a rollback / remove `--json` envelope carries the run-level
+/// warning `code`.
+fn has_unwind_warning(env: &serde_json::Value, code: &str) -> bool {
+    env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["code"] == code)
+}
+
+/// #902: with no evidence of the pnpm version (no unpinned registry entry
+/// that shows the setting, no install record, no `packageManager` pin),
+/// `rollback` follows pnpm 10's reading of the settings and warns
+/// `upstream_pnpm_tarball_setting_guessed` when pnpm 9 (`.npmrc` only) or
+/// pnpm >= 11 (pnpm-workspace.yaml only) would read them the other way.
+/// Every evidenced reading, settings every pnpm reads alike, and a tarball
+/// pnpm records anyway restore without the warning.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_warns_when_it_guesses_the_npmrc_include_tarball_url() {
+    const CODE: &str = "upstream_pnpm_tarball_setting_guessed";
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let tarball = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+    const RC_ON: &str = "lockfile-include-tarball-url=true\n";
+
+    // The guess: the tarball comes back, and the warning says why.
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    let warning = env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == CODE)
+        .unwrap_or_else(|| panic!("{CODE} expected: {env:#}"));
+    let detail = warning["detail"].as_str().unwrap();
+    let entry = format!("{NAME}@{VERSION}");
+    for needle in [
+        "pnpm-lock.yaml: nothing shows which pnpm wrote this lock",
+        "from `lockfile-include-tarball-url=true` in .npmrc",
+        entry.as_str(),
+        "pnpm >= 11 reads only pnpm-workspace.yaml",
+        "`packageManager`",
+        "the same value",
+    ] {
+        assert!(detail.contains(needle), "{needle}: {detail}");
+    }
+
+    // pnpm 9 would ignore a workspace-only setting: the same guess.
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    let detail = env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == CODE)
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_else(|| panic!("{CODE} expected: {env:#}"));
+    assert!(detail.contains("pnpm 9 reads only .npmrc"), "{detail}");
+
+    // Evidence of a pnpm that reads `.npmrc` (a pnpm 10 install record or
+    // corepack pin): the same restore, no guess.
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    write_pnpm_modules_json(tmp.path(), "10.12.1");
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@9.15.9", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+
+    // pnpm 11 installed it: `.npmrc` is ignored, the lock stays bare.
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    write_pnpm_modules_json(tmp.path(), "11.28.3");
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+
+    // The lock's own bare registry entry proves the setting off.
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lock = rush_pnpm_lock(NAME).replace(
+        "\nsnapshots:\n",
+        "  other-dep@2.0.0:\n    resolution: {integrity: sha512-OTHERother==}\n\n\
+             snapshots:\n",
+    ) + "  other-dep@2.0.0: {}\n";
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), &lock).unwrap();
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, lock);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+
+    // Both files set it, so every pnpm reads it on: no guess.
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+
+    // A tarball pnpm cannot derive from the registry is recorded whatever
+    // the setting: restored with it, and no guess to warn about.
+    let cdn = MockServer::start().await;
+    mock_discovery(&cdn).await;
+    mock_reference(&cdn).await;
+    mock_view(&cdn).await;
+    let cdn_tarball = format!("{}/cdn/{NAME}.tgz", cdn.uri());
+    mock_npm_registry_advertising(&cdn, "sha512-UPSTREAMupstream==", &cdn_tarball).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &cdn_tarball);
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &cdn);
+    assert_eq!(restored, pristine);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+}
+
+/// #902 on a Rush lock: Rush installs with rush.json's `pnpmVersion` in
+/// common/temp, so no install record or package.json sits beside
+/// common/config/rush/pnpm-lock.yaml. The `pnpmVersion` decides how the
+/// sibling `.npmrc` reads (pnpm 9: `tarball:` restored, no guess); without
+/// one the guess warns with the rush.json remedy, never a package.json pin.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_reads_rush_pnpm_version_for_the_tarball_setting() {
+    const CODE: &str = "upstream_pnpm_tarball_setting_guessed";
+    const COMMON: &str = "common/config/rush/pnpm-lock.yaml";
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let tarball = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+    for (rush_json, warns) in [
+        (
+            r#"{ "rushVersion": "5.100.0", "pnpmVersion": "9.15.9" }"#,
+            false,
+        ),
+        (r#"{ "rushVersion": "5.100.0" }"#, true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_rush_project(tmp.path(), false);
+        std::fs::write(tmp.path().join("rush.json"), rush_json).unwrap();
+        let common = tmp.path().join(COMMON);
+        let pristine = std::fs::read_to_string(&common).unwrap().replace(
+            "resolution: {integrity: sha512-UPSTREAMupstream==}",
+            &format!("resolution: {{integrity: sha512-UPSTREAMupstream==, tarball: {tarball}}}"),
+        );
+        std::fs::write(&common, &pristine).unwrap();
+        std::fs::write(
+            tmp.path().join("common/config/rush/.npmrc"),
+            "lockfile-include-tarball-url=true\n",
+        )
+        .unwrap();
+        let code = run(redirect_args(tmp.path(), server.uri())).await;
+        assert_eq!(code, 0, "{rush_json}");
+        assert!(std::fs::read_to_string(&common)
+            .unwrap()
+            .contains(HOSTED_URL));
+        let (code, env) = rollback_json(tmp.path(), &server);
+        assert_eq!(code, Some(0), "rollback: {env:#}");
+        assert_eq!(
+            std::fs::read_to_string(&common).unwrap(),
+            pristine,
+            "{rush_json}"
+        );
+        let detail = env["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["code"] == CODE)
+            .and_then(|w| w["detail"].as_str());
+        assert_eq!(detail.is_some(), warns, "{rush_json}: {env:#}");
+        if let Some(detail) = detail {
+            assert!(detail.starts_with(COMMON), "{detail}");
+            assert!(detail.contains("set rush.json `pnpmVersion`"), "{detail}");
+            assert!(!detail.contains("packageManager"), "{detail}");
+        }
+    }
 }
 
 /// #417: hosted `scan` from a cargo workspace MEMBER treated it as a

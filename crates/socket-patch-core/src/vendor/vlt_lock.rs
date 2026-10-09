@@ -31,14 +31,11 @@ use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{already_patched_result, done, refused};
 use super::npm_common::{
-    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, parse_npm_purl,
+    done_failure_unstage, finish_vendored, guard_coordinates, guard_revert_uuid_dir, parse_npm_purl,
 };
 use super::npm_dir::{dependency_token, replace_dependency_token, stage_patch_dir, SpanError};
 use super::source::PackageSource;
-use super::state::{
-    load_state, write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
-    WiringRecord,
-};
+use super::state::{load_state, VendorArtifact, VendorEntry, WiringAction, WiringRecord};
 use super::vlt_lock_text::{
     brotli_for_slot3, edges_block, entry_text, file_dep_id, has_brotli_flag,
     installs_outside_registry, is_default_registry, is_importer_dep_id, is_registry_url_segment,
@@ -714,6 +711,9 @@ pub async fn vlt_vendor_preflight(
     purl: &str,
     uuid: &str,
 ) -> Result<(), Refusal> {
+    if let Some(refusal) = super::npm_flavor::member_stray_lock_refusal(project_root).await {
+        return Err(refusal);
+    }
     let Some((name, version)) = super::npm_common::parse_npm_purl(purl) else {
         return Err((
             "unsafe_coordinates",
@@ -1342,6 +1342,28 @@ pub(crate) async fn vendor_vlt<'a>(
     if staged.links_dropped {
         warnings.push(links_dropped_warning(name, version));
     }
+    let entry_for = |wiring: Vec<WiringRecord>| {
+        VendorEntry::npm(
+            coords.base_purl.clone(),
+            record.uuid.clone(),
+            VendorArtifact::dir(staged.rel_dir.clone(), staged.inventory.clone()),
+            wiring,
+            Some(FLAVOR),
+        )
+    };
+
+    if wiring.is_none() && staged.reused {
+        // In sync: the committed dir was reused and the wiring already
+        // points at it. Record nothing.
+        let rel_abs = project_root.join(&staged.rel_dir);
+        return done(
+            already_patched_result(purl, &rel_abs, &record.files),
+            None,
+            warnings,
+        );
+    }
+    // Once per run that records an entry, after the in-sync return (the
+    // tarball flavors' rule, see `npm_common::vendor_npm_family`).
     if staged.staged_pkg_json.is_some() {
         warnings.push(VendorWarning::new(
             "vendor_dep_manifest_stale",
@@ -1353,42 +1375,7 @@ pub(crate) async fn vendor_vlt<'a>(
             ),
         ));
     }
-    let entry_for = |wiring: Vec<WiringRecord>| VendorEntry {
-        ecosystem: "npm".to_string(),
-        base_purl: coords.base_purl.clone(),
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: staged.rel_dir.clone(),
-            sha256: String::new(),
-            size: None,
-            platform_locked: None,
-            file_inventory: Some(staged.inventory.clone()),
-        },
-        wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: Some(FLAVOR.to_string()),
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    };
-    let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
-    let uuid_dir = project_root.join(&coords.uuid_dir_rel);
-
     let Some(wiring) = wiring else {
-        if staged.reused {
-            let rel_abs = project_root.join(&staged.rel_dir);
-            return done(
-                already_patched_result(purl, &rel_abs, &record.files),
-                None,
-                warnings,
-            );
-        }
         warnings.push(VendorWarning::new(
             "vendor_artifact_rebuilt",
             format!(
@@ -1397,8 +1384,17 @@ pub(crate) async fn vendor_vlt<'a>(
                 staged.rel_dir
             ),
         ));
-        write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
-        return done(result, Some(entry_for(Vec::new())), warnings);
+        let entry = entry_for(Vec::new());
+        return finish_vendored(
+            project_root,
+            &coords,
+            record,
+            vendored_at,
+            result,
+            entry,
+            warnings,
+        )
+        .await;
     };
     if let Err(e) = commit(project_root, &wiring, &analysis.pkgs).await {
         return done_failure_unstage(
@@ -1410,8 +1406,17 @@ pub(crate) async fn vendor_vlt<'a>(
         )
         .await;
     }
-    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
-    done(result, Some(entry_for(wiring.records)), warnings)
+    let entry = entry_for(wiring.records);
+    finish_vendored(
+        project_root,
+        &coords,
+        record,
+        vendored_at,
+        result,
+        entry,
+        warnings,
+    )
+    .await
 }
 
 /// Which of `packages` [`vendor_vlt`] would refuse before it first asks
@@ -3282,6 +3287,62 @@ mod tests {
             crate::vendor::verify::verify_vendored_patch_record(&fx.root, &entry, &rec).await,
             Err("vendor_hash_mismatch".to_string())
         );
+    }
+
+    /// #920: the `package.json` advisory is emitted once, by the run that
+    /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
+    /// AlreadyPatched.
+    #[tokio::test]
+    async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let patched_pkg = b"{\"name\":\"left-pad\",\"version\":\"1.3.0\",\"main\":\"i.js\"}";
+        tokio::fs::write(
+            fx.blobs.join(compute_git_sha256_from_bytes(patched_pkg)),
+            patched_pkg,
+        )
+        .await
+        .unwrap();
+        let mut rec = record(UUID);
+        rec.files.insert(
+            "package/package.json".into(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: compute_git_sha256_from_bytes(patched_pkg),
+            },
+        );
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let vendor = || {
+            crate::vendor::test_support::vendor_vlt(
+                PURL,
+                &fx.installed,
+                &fx.root,
+                &rec,
+                &sources,
+                "t",
+                false,
+                true,
+                None,
+            )
+        };
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code.starts_with("vendor_dep_manifest"))
+                .count()
+        };
+        let (entry, warnings) = entry_of(vendor().await);
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+        persist(&fx, &entry).await;
+
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = vendor().await
+        else {
+            panic!("expected Done");
+        };
+        assert!(result.success && entry.is_none(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
     }
 
     #[tokio::test]

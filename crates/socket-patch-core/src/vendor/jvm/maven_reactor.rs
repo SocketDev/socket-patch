@@ -1501,7 +1501,7 @@ fn repository_edit(doc: &Doc) -> Edit {
 /// directory appended to its list, the last protocol list gets `file`.
 fn merge_maven_config(config: Option<&[u8]>) -> (Vec<u8>, Value) {
     let text = config.map(String::from_utf8_lossy).unwrap_or_default();
-    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let nl = crate::utils::line_endings::terminator(&text);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let arg_of = |line: &str| line.trim().to_string();
     let last = |key: &str| lines.iter().rposition(|l| arg_of(l).starts_with(key));
@@ -1780,7 +1780,7 @@ impl Doc {
             _ => return Err("no single <project> element".to_string()),
         };
         let unit = indent_unit(&masked);
-        let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let nl = crate::utils::line_endings::terminator(&text);
         Ok(Doc {
             text,
             masked,
@@ -3205,6 +3205,12 @@ mod tests {
             config("-T4\r\n"),
             format!("-T4\r\n{OFFLINE_LINE}\r\n{TAIL_KEY}{TAIL_DIR}\r\n")
         );
+        // #815: a mixed file's added lines take its majority terminator
+        // (`line_endings::terminator`), not "any CRLF means CRLF".
+        assert_eq!(
+            config("-T4\r\n-ntp\n-B\n"),
+            format!("-T4\r\n-ntp\n-B\n{OFFLINE_LINE}\n{TAIL_KEY}{TAIL_DIR}\n")
+        );
         assert_eq!(
             config(&format!("{TAIL_KEY}/opt/repo\n-T4\n{OFFLINE_LINE}\n")),
             format!("{TAIL_KEY}/opt/repo,{TAIL_DIR}\n-T4\n{OFFLINE_LINE}\n")
@@ -3800,7 +3806,10 @@ mod tests {
             </configuration></plugin></plugins></build></project>";
         assert!(!declares_modules(ear));
         let read = |p: &str| (p == "pom.xml").then(|| ear.as_bytes().to_vec());
-        assert_eq!(super::super::detect(&read), Shape::Other);
+        let builds = super::super::detect_builds(&read);
+        assert_eq!(builds.maven, Some(super::super::MavenShape::Single));
+        // A single pom is a reactor of one (#973).
+        assert_eq!(builds.shape(), Shape::MavenReactor);
     }
 
     #[test]

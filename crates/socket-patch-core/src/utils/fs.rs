@@ -455,6 +455,107 @@ pub async fn atomic_write_bytes_preserving_mode(
     .await
 }
 
+/// Write a file the user named on the command line (`vex --output`, the
+/// embedded `--vex <path>`): a reader, or a failed write, sees the complete
+/// old or the complete new bytes, never a prefix.
+///
+/// A regular file (or a symlink to one) is replaced by stage + rename, keeping
+/// its permission bits; a symlink is written through to its target, as a
+/// plain `write` would, so the user's link stays a link. Anything else that
+/// already exists (`/dev/stdout`, a FIFO, a character device) has no inode to
+/// swap, so it is written in place: on Windows a DOS device name (`NUL`,
+/// `CON`, `COM1`) or a `\\.\` device path such as a named pipe, which std
+/// reports as a file. A descriptor path, or a link to one (`/dev/stdout`,
+/// `/dev/fd/1`, `/proc/self/fd/1`), is a stream too, even when the
+/// descriptor behind it is a regular file (`--output /dev/stdout >
+/// vex.json`): renaming over its target would detach the caller's open
+/// descriptor, and on macOS `/dev/fd` holds no stage. Never captured by an
+/// open group commit: the path is the user's output, not one of the run's
+/// commit points.
+pub async fn write_user_output(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let special = (cfg!(windows) && is_windows_device_path(path))
+        || links_to_a_descriptor(path)
+        || matches!(
+            tokio::fs::metadata(path).await,
+            Ok(meta) if !meta.is_file() && !meta.is_dir()
+        );
+    if special {
+        return tokio::fs::write(path, content).await;
+    }
+    let target = tokio::fs::canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_path_buf());
+    write_atomic(
+        &target,
+        content,
+        WriteOpts {
+            preserve_mode: true,
+            ..WriteOpts::UNSYNCED
+        },
+    )
+    .await
+}
+
+/// Whether `path`, or any hop of the symlink chain its final component
+/// starts, names a file descriptor: `/dev/stdin`, `/dev/stdout`,
+/// `/dev/stderr`, `/dev/fd/<n>` or `/proc/<pid>/fd/<n>`. Only those: a
+/// regular file elsewhere under `/dev` (`/dev/shm`) or `/proc`
+/// (`/proc/self/cwd/…`) keeps the stage + rename. The chain is read link by
+/// link, never canonicalized: `/proc/self/fd/1` resolves to the regular file
+/// behind the descriptor, which is exactly what must not be renamed over.
+fn links_to_a_descriptor(path: &Path) -> bool {
+    fn is_descriptor(path: &Path) -> bool {
+        let parts: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
+        match parts.as_slice() {
+            [root, dev, name] if *root == "/" && *dev == "dev" => {
+                *name == "stdin" || *name == "stdout" || *name == "stderr"
+            }
+            [root, dev, fd, _] if *root == "/" && *dev == "dev" => *fd == "fd",
+            [root, proc, _, fd, _] if *root == "/" && *proc == "proc" => *fd == "fd",
+            _ => false,
+        }
+    }
+    let mut hop = path.to_path_buf();
+    // The kernel's own loop limit for symlink resolution.
+    for _ in 0..40 {
+        if is_descriptor(&hop) {
+            return true;
+        }
+        let Ok(target) = std::fs::read_link(&hop) else {
+            return false;
+        };
+        hop = match hop.parent() {
+            Some(dir) if target.is_relative() => dir.join(target),
+            _ => target,
+        };
+    }
+    false
+}
+
+/// Whether Windows resolves `path` to a device rather than a file: the
+/// `\\.\` device namespace (named pipes, `\\.\COM1`), or a final
+/// component whose name before the first dot, trailing spaces dropped, is a
+/// reserved DOS device (`NUL`, `nul.json`, `CON`, `COM1`, `LPT9`, …).
+/// Spelled on the path's text so it runs, and is tested, on every platform.
+fn is_windows_device_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    if text.starts_with("\\\\.\\") || text.starts_with("//./") {
+        return true;
+    }
+    let name = text.rsplit(['/', '\\']).next().unwrap_or("");
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let stem = stem.to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        _ => {
+            let bytes = stem.as_bytes();
+            bytes.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && (b'1'..=b'9').contains(&bytes[3])
+        }
+    }
+}
+
 /// Atomically write a CONTENT-VERIFIED artifact (a vendored `.tgz`, wheel,
 /// jar, marker, …) via stage + rename, without an fsync: the next durable
 /// commit point's [`super::durability::barrier`] makes it durable before
@@ -949,7 +1050,7 @@ mod tests {
             m
         };
         assert_ne!(fresh_mode, 0o600, "umask must make 0600 distinguishable");
-        let cases: [(&str, bool); 8] = [
+        let cases: [(&str, bool); 9] = [
             ("bytes", false),
             ("bytes_preserving", true),
             ("artifact", false),
@@ -958,6 +1059,7 @@ mod tests {
             ("unsynced_preserving", true),
             ("sync_plain", false),
             ("sync_preserving", true),
+            ("user_output", true),
         ];
         for (name, preserves) in cases {
             let dir = tmp.path().join(name);
@@ -978,6 +1080,7 @@ mod tests {
                 "unsynced_preserving" => atomic_write_unsynced(&path, content, true).await,
                 "sync_plain" => atomic_write_sync(&path, content, false),
                 "sync_preserving" => atomic_write_sync(&path, content, true),
+                "user_output" => write_user_output(&path, content).await,
                 _ => unreachable!(),
             }
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -990,6 +1093,155 @@ mod tests {
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
             assert_eq!(names, ["f"], "{name}: stage litter {names:?}");
+        }
+    }
+
+    /// A user-named output path (`vex --output`) keeps what the user put
+    /// there: a symlink stays a link and its target gets the new bytes, a
+    /// character device (`/dev/null`, like `/dev/stdout`) is written in
+    /// place rather than swapped for a regular file, and an open group
+    /// commit does not hold the write back (#1144).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn user_output_writes_through_links_and_devices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real.vex.json");
+        std::fs::write(&target, b"old").unwrap();
+        let link = tmp.path().join("out.vex.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_user_output(&link, b"new").await.unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "stage litter {names:?}");
+
+        write_user_output(Path::new("/dev/null"), b"doc")
+            .await
+            .unwrap();
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(std::fs::metadata("/dev/null")
+            .unwrap()
+            .file_type()
+            .is_char_device());
+
+        let group = super::super::group_commit::GroupCommit::begin(tmp.path());
+        let fresh = tmp.path().join("fresh.vex.json");
+        write_user_output(&fresh, b"doc").await.unwrap();
+        assert_eq!(
+            std::fs::read(&fresh).unwrap(),
+            b"doc",
+            "written, not captured"
+        );
+        drop(group);
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"doc");
+    }
+
+    /// `--output /dev/stdout > vex.json`: the descriptor behind a `/dev` or
+    /// `/proc` path is written in place even when it is a regular file, so
+    /// the caller's open file keeps the bytes; a user's link to such a path
+    /// is a stream too (review on #1262).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn user_output_writes_descriptor_paths_in_place() {
+        use std::io::{Read as _, Seek as _};
+        use std::os::fd::AsRawFd as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let captured = tmp.path().join("captured.json");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&captured)
+            .unwrap();
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        assert!(links_to_a_descriptor(&fd_path));
+        write_user_output(&fd_path, b"doc").await.unwrap();
+        let mut seen = String::new();
+        file.rewind().unwrap();
+        file.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "doc", "the open descriptor must see the bytes");
+
+        let link = tmp.path().join("out.vex.json");
+        std::os::unix::fs::symlink(&fd_path, &link).unwrap();
+        assert!(links_to_a_descriptor(&link));
+        write_user_output(&link, b"doc2").await.unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        seen.clear();
+        file.rewind().unwrap();
+        file.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "doc2");
+        let names = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(names, 2, "no stage left beside the captured file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_paths_are_streams() {
+        for stream in ["/dev/stdout", "/dev/stderr", "/dev/fd/1", "/proc/self/fd/1"] {
+            assert!(links_to_a_descriptor(Path::new(stream)), "{stream}");
+        }
+        for regular in [
+            "/dev/shm/vex.json",
+            "/dev/null",
+            "/proc/self/cwd/vex.json",
+            "/proc/self/fd",
+            "/proc/self/fdinfo/1",
+        ] {
+            assert!(!links_to_a_descriptor(Path::new(regular)), "{regular}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("vex.json");
+        std::fs::write(&file, b"{}").unwrap();
+        assert!(!links_to_a_descriptor(&file));
+        assert!(!links_to_a_descriptor(&tmp.path().join("missing.json")));
+        let relative = tmp.path().join("rel.json");
+        std::os::unix::fs::symlink("vex.json", &relative).unwrap();
+        assert!(!links_to_a_descriptor(&relative));
+        let looped = tmp.path().join("loop");
+        std::os::unix::fs::symlink("loop", &looped).unwrap();
+        assert!(!links_to_a_descriptor(&looped));
+    }
+
+    /// Windows device names and the `\\.\` namespace are written in place
+    /// (Bugbot on #1262: std reports `NUL` and named pipes as files there).
+    #[test]
+    fn windows_device_paths_are_recognized() {
+        for device in [
+            "NUL",
+            "nul",
+            "nul.json",
+            "C:\\out\\CON",
+            "out/aux.vex.json",
+            "COM1",
+            "lpt9.txt",
+            "NUL ",
+            "CONOUT$",
+            "\\\\.\\pipe\\vex",
+            "//./COM10",
+        ] {
+            assert!(is_windows_device_path(Path::new(device)), "{device}");
+        }
+        for file in [
+            "out.vex.json",
+            "null.json",
+            "console.json",
+            "COM0",
+            "COM10",
+            "LPTX",
+            "C:\\out\\nul-dir\\vex.json",
+            "nulls/vex.json",
+        ] {
+            assert!(!is_windows_device_path(Path::new(file)), "{file}");
         }
     }
 

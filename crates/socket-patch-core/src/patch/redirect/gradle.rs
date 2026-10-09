@@ -60,13 +60,13 @@ use super::{
 };
 use crate::formats::text::{split_bom, strip_bom};
 use crate::gradle::dsl::{self, is_ident, is_punct, Dsl, Tok, Token};
-use crate::gradle::eol::{eol_eq, newline_of, to_lf};
 use crate::gradle::graph::{
     filter_claims_group, wrapper_version, BuildKind, DeclKind, ScriptGraph, Site,
 };
 use crate::gradle::locks;
 use crate::gradle::selector::{admits, gradle_version_cmp, parse_selector, Selector};
 use crate::patch::path_safety::is_canonical_uuid;
+use crate::utils::line_endings::{eol_eq, terminator, to_lf};
 use crate::vendor::jvm::gradle as vendored;
 use crate::vendor::jvm::layout::GRADLE_ROOT_FILES;
 
@@ -196,7 +196,7 @@ pub fn suffixed_version(base: &str, uuid: &str) -> String {
 /// The rows of an index text (LF or CRLF). `Err` names the first line the
 /// script would refuse (an unknown header, a malformed or duplicate row).
 pub fn parse_index(text: &str) -> Result<Vec<HostedRow>, String> {
-    let lf = String::from_utf8_lossy(&to_lf(text.as_bytes())).into_owned();
+    let lf = to_lf(text);
     let mut lines = lf.split('\n');
     if lines.next() != Some(HOSTED_INDEX_HEADER) {
         return Err(format!("{HOSTED_INDEX_REL} has an unknown header"));
@@ -229,7 +229,7 @@ pub fn render_index(rows: &[HostedRow]) -> String {
 /// The apply line's digest of an index text: the first 16 hex of the
 /// sha256 of its LF form.
 pub fn index_digest(text: &str) -> String {
-    let digest = Sha256::digest(to_lf(text.as_bytes()));
+    let digest = Sha256::digest(to_lf(text).as_bytes());
     hex::encode(digest)[..16].to_string()
 }
 
@@ -380,7 +380,7 @@ pub fn with_apply_line(
         return Some(format!("{}{line}{}", &text[..start], &text[end..]));
     }
     let line = apply_line(dsl, prefix, digest, created);
-    let nl = newline_of(text);
+    let nl = terminator(text);
     let mut out = text.to_string();
     if !strip_bom(&out).is_empty() && !out.ends_with('\n') {
         out.push_str(nl);
@@ -645,6 +645,7 @@ pub fn lockfile_paths(graph: &ScriptGraph, files: &BTreeMap<String, String>) -> 
 // ── the planner ──────────────────────────────────────────────────────────
 
 /// A refusal: nothing is written for the dep.
+#[derive(Clone)]
 struct Refusal {
     code: &'static str,
     detail: String,
@@ -1005,28 +1006,48 @@ fn ga_refusal(
     None
 }
 
-/// Why the hosted wiring of `row` no longer holds in the build `files`
+/// Why the hosted wiring of a row no longer holds in the build `files`
 /// holds, by the planner's own build- and GA-level refusals (see
 /// [`ga_refusal`]): `(code, detail)`. Discovery's re-check of a pin made
-/// before the build changed.
-pub(crate) fn pinned_row_refusal(
-    files: &BTreeMap<String, String>,
-    graph: &ScriptGraph,
-    row: &HostedRow,
-) -> Option<(&'static str, String)> {
-    let lock_paths = lockfile_paths(graph, files);
-    project_refusal(files, graph, &Ok(Vec::new()))
-        .or_else(|| {
-            ga_refusal(
-                files,
-                graph,
-                &lock_paths,
-                &row.group,
-                &row.artifact,
-                &row.base,
+/// before the build changed. The build-level half (the project refusal and
+/// the lock paths) depends on no row, so it is worked out once, on the
+/// first row that asks.
+pub(crate) struct PinnedRowChecks<'a> {
+    files: &'a BTreeMap<String, String>,
+    graph: &'a ScriptGraph,
+    build: std::sync::OnceLock<(Vec<String>, Option<Refusal>)>,
+}
+
+impl<'a> PinnedRowChecks<'a> {
+    pub(crate) fn new(files: &'a BTreeMap<String, String>, graph: &'a ScriptGraph) -> Self {
+        Self {
+            files,
+            graph,
+            build: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn refusal(&self, row: &HostedRow) -> Option<(&'static str, String)> {
+        let (lock_paths, project) = self.build.get_or_init(|| {
+            (
+                lockfile_paths(self.graph, self.files),
+                project_refusal(self.files, self.graph, &Ok(Vec::new())),
             )
-        })
-        .map(|r| (r.code, r.detail))
+        });
+        project
+            .clone()
+            .or_else(|| {
+                ga_refusal(
+                    self.files,
+                    self.graph,
+                    lock_paths,
+                    &row.group,
+                    &row.artifact,
+                    &row.base,
+                )
+            })
+            .map(|r| (r.code, r.detail))
+    }
 }
 
 /// Whether `version` orders above `base` (Gradle's ordering): a newer

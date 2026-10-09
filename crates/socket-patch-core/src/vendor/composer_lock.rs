@@ -44,7 +44,6 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
-use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
@@ -53,16 +52,16 @@ use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::LineEndings;
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
-use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, any_live_file_references, copy_matches_after_hashes, done,
-    inventory_or_warn, prune_empty_vendor_levels, refused, serialize_json,
-    service_offline_conflict, stage_dir_for, swap_stage_into_place, synthesized_result,
+    already_patched_result, copy_matches_after_hashes, done, inventory_or_warn,
+    prune_empty_vendor_levels, refused, serialize_json, service_offline_conflict, stage_dir_for,
+    swap_stage_into_place, synthesized_result,
 };
 use super::parse_memo::ParseMemo;
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip};
+use super::revert::{self, KeepPolicy};
 use super::service_fetch::{
     claim_prestaged, fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal,
 };
@@ -528,7 +527,6 @@ pub async fn revert_composer_opts(
             entry.uuid
         ));
     };
-    let uuid_dir = project_root.join(&uuid_dir_rel);
     let lock_path = project_root.join(COMPOSER_LOCK);
     let mut warnings = Vec::new();
 
@@ -584,32 +582,18 @@ pub async fn revert_composer_opts(
         }
     }
 
-    let mut outcome = RevertOutcome {
+    let outcome = RevertOutcome {
         kept_artifact: false,
         success: true,
         warnings,
         error: None,
     };
-    if !dry_run {
-        if outcome.drift_skipped()
-            && any_live_file_references(project_root, &[COMPOSER_LOCK], &uuid_dir_rel).await
-        {
-            // Drift-keep (see the fn doc): never delete a uuid dir the live
-            // lock still routes composer at.
-            outcome.keep_artifact(&uuid_dir_rel);
-        } else if !keep_artifact {
-            // `--preserve-state` (`keep_artifact`) skips only this deletion:
-            // the artifact dir stays behind and the caller keeps the ledger
-            // entry. The last composer entry leaves `.socket/vendor/composer/`
-            // (and `.socket/vendor/`) empty: the shared helper prunes them so
-            // a reverted project carries no vendor residue (non-recursive:
-            // siblings keep them).
-            if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-                outcome.success = false;
-                outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
-                return outcome;
-            }
-        }
+    // Drift-keep (see the fn doc): never delete a uuid dir the live lock
+    // still routes composer at.
+    let policy = KeepPolicy::OnDriftWhileReferenced(&[COMPOSER_LOCK]);
+    let mut outcome = revert::finish(outcome, project_root, &uuid_dir_rel, opts, policy).await;
+    if outcome.error.is_some() {
+        return outcome;
     }
 
     outcome.warnings.push(VendorWarning::new(
@@ -2169,8 +2153,7 @@ mod tests {
                 ApiClient::new(ApiClientOptions {
                     api_url: uri.to_string(),
                     api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-                    use_public_proxy: false,
-                    org_slug: Some("acme".into()),
+                    route: crate::api::client::ApiRoute::org("acme"),
                 })
                 .with_vendor_retry(crate::api::client::VendorRetryPolicy::none()),
             ),

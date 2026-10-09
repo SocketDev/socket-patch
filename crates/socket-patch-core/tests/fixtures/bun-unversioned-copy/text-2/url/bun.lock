@@ -1,0 +1,20 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "dep": "file:./dep",
+        "minimist": "https://codeload.github.com/minimistjs/minimist/tar.gz/refs/tags/v1.2.2",
+      },
+    },
+  },
+  "packages": {
+    "dep": ["dep@file:dep", { "dependencies": { "minimist": "1.2.2" } }],
+
+    "minimist": ["minimist@https://codeload.github.com/minimistjs/minimist/tar.gz/refs/tags/v1.2.2", {}, "sha512-sW82WEAaqJ7QaESr+23ttzPbDAvjqsV1lgV56rlSYb+2MrIMo6wGZJPqUb06uRI51KpGdsMrzTUAFpgaDNkQow=="],
+
+    "dep/minimist": ["minimist@1.2.2", "", {}, "sha512-rIqbOrKb8GJmx/5bc2M0QchhUouMXSpd1RTclXsB41JdL+VtnojfaJR+h7F9k18/4kHUsBFgk80Uk+q569vjPA=="],
+  }
+}

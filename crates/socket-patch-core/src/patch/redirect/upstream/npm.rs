@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::client::NpmDist;
 use super::{Ctx, FormatResult, HostedPin, View};
-use crate::vendor::lock_inventory::npm_legacy_identity;
+use crate::vendor::lock_inventory::{npm_lock_entries, NpmLockEntry};
 
 /// The pins by uuid.
 pub(super) fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
@@ -28,7 +28,7 @@ pub(super) async fn fetch_dists(
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) -> BTreeMap<(String, String), NpmDist> {
-    fetch_dists_on(wanted, |_| None, ctx, result)
+    fetch_dists_on(wanted, |_| None::<String>, ctx, result)
         .await
         .into_iter()
         .map(|(key, found)| (key, found.dist))
@@ -42,39 +42,84 @@ pub(super) struct ProjectDist {
     pub from_project: bool,
 }
 
+/// Whether `base` is registry.npmjs.org or its registry.yarnpkg.com alias
+/// (either scheme).
+fn is_npmjs_registry(base: &str) -> bool {
+    let base = base.trim().trim_end_matches('/');
+    let host = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or(base);
+    matches!(host, "registry.npmjs.org" | "registry.yarnpkg.com")
+}
+
 /// The registry base a project names, unless it is the default registry
 /// (npmjs, its registry.yarnpkg.com alias, or `SOCKET_NPM_REGISTRY`), whose
 /// document [`fetch_dists`] already reads.
 pub(super) fn non_default_registry(base: &str) -> Option<String> {
     use crate::vendor::registry_fetch::npm_registry_base;
     let base = base.trim().trim_end_matches('/');
-    let host = base
-        .strip_prefix("https://")
-        .or_else(|| base.strip_prefix("http://"))
-        .unwrap_or(base);
-    let npmjs = matches!(host, "registry.npmjs.org" | "registry.yarnpkg.com");
-    (!base.is_empty() && !npmjs && base != npm_registry_base()).then(|| base.to_string())
+    (!base.is_empty() && !is_npmjs_registry(base) && base != npm_registry_base())
+        .then(|| base.to_string())
+}
+
+/// A registry a project resolves a package against, with the
+/// `Authorization` header value its settings configure for it (a private
+/// registry's token or basic credentials). Never `Debug`: it holds a secret.
+#[derive(Clone)]
+pub(super) struct ProjectRegistry {
+    pub base: String,
+    pub authorization: Option<String>,
+}
+
+impl From<String> for ProjectRegistry {
+    fn from(base: String) -> Self {
+        ProjectRegistry {
+            base,
+            authorization: None,
+        }
+    }
 }
 
 /// [`fetch_dists`], reading each version document from the registry the
 /// project resolves `name` against (`registry(name)`; `None` means the
 /// default registry), since a mirror's `dist.tarball` need not be the
-/// default registry's (#521, #908). When the project's registry can't be
-/// read (a private mirror that wants credentials the restore does not
-/// send), the default registry's document is used, as before, and
-/// `upstream_registry_fallback` says so.
-pub(super) async fn fetch_dists_on(
+/// default registry's (#521, #908), with the credentials the project
+/// configures for it (#992). A registry with credentials is read even when
+/// it is the default one (a private package on npmjs). When the project's
+/// registry can't be read, the default registry's document is used, as
+/// before, and `upstream_registry_fallback` says so.
+pub(super) async fn fetch_dists_on<R: Into<ProjectRegistry>>(
     wanted: &BTreeSet<(String, String, String)>,
-    registry: impl Fn(&str) -> Option<String>,
+    registry: impl Fn(&str) -> Option<R>,
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) -> BTreeMap<(String, String), ProjectDist> {
     let lookups = wanted.iter().map(|(uuid, name, version)| {
-        let project = registry(name).as_deref().and_then(non_default_registry);
+        let project = registry(name)
+            .map(Into::into)
+            .and_then(|r: ProjectRegistry| {
+                let base = non_default_registry(&r.base).or_else(|| {
+                    r.authorization
+                        .is_some()
+                        .then(|| r.base.trim().trim_end_matches('/').to_string())
+                })?;
+                Some(ProjectRegistry {
+                    base,
+                    authorization: r.authorization,
+                })
+            });
         async move {
             let mut fell_back = None;
             let found = match project {
-                Some(base) => match ctx.client.npm_dist_on(&base, name, version).await {
+                Some(ProjectRegistry {
+                    base,
+                    authorization,
+                }) => match ctx
+                    .client
+                    .npm_dist_authorized(&base, authorization.as_deref(), name, version)
+                    .await
+                {
                     Ok(dist) => Ok(ProjectDist {
                         dist,
                         from_project: true,
@@ -113,6 +158,11 @@ pub(super) async fn fetch_dists_on(
         match found {
             Ok(found) => {
                 if let Some((base, why)) = fell_back {
+                    // The detail is printed and persisted in `--json`
+                    // output (CI logs): never the URL's credentials.
+                    let clean = crate::vex::product::strip_url_userinfo(&base);
+                    let why = why.replace(base.trim_end_matches('/'), &clean);
+                    let base = clean;
                     result.warnings.push((
                         "upstream_registry_fallback",
                         format!(
@@ -140,86 +190,25 @@ struct NpmHit {
     version: String,
 }
 
+/// Every hosted entry of an npm lock: the installed `packages` entries
+/// (never the root or a workspace member) and every node of the legacy
+/// `dependencies` tree, an alias node restoring its target's registry dist
+/// (#432).
 fn npm_lock_hits(lock: &Value, ctx: &Ctx<'_>) -> Vec<NpmHit> {
-    let mut hits = Vec::new();
-    if let Some(packages) = lock.get("packages").and_then(Value::as_object) {
-        for (key, entry) in packages {
-            let Some((_, key_name)) = key.rsplit_once("node_modules/") else {
-                continue;
-            };
-            let Some(uuid) = entry
-                .get("resolved")
-                .and_then(Value::as_str)
-                .and_then(|u| ctx.hosted_uuid(u))
-            else {
-                continue;
-            };
-            let name = entry
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(key_name)
-                .to_string();
-            let Some(version) = entry.get("version").and_then(Value::as_str) else {
-                continue;
-            };
-            hits.push(NpmHit {
-                pointer: format!("/packages/{}", json_pointer_escape(key)),
+    npm_lock_entries(lock)
+        .into_iter()
+        .filter(NpmLockEntry::is_dependency)
+        .filter_map(|entry| {
+            let uuid = entry.node.resolved.and_then(|u| ctx.hosted_uuid(u))?;
+            let version = entry.node.version?;
+            Some(NpmHit {
+                pointer: entry.pointer,
                 uuid,
-                name,
+                name: entry.node.name.to_string(),
                 version: version.to_string(),
-            });
-        }
-    }
-    if let Some(deps) = lock.get("dependencies").and_then(Value::as_object) {
-        v2_hits(deps, "/dependencies", ctx, &mut hits, 0);
-    }
-    hits
-}
-
-fn v2_hits(
-    deps: &serde_json::Map<String, Value>,
-    prefix: &str,
-    ctx: &Ctx<'_>,
-    hits: &mut Vec<NpmHit>,
-    depth: usize,
-) {
-    if depth > 64 {
-        return;
-    }
-    for (name, entry) in deps {
-        let pointer = format!("{prefix}/{}", json_pointer_escape(name));
-        // An alias node (`"lp": {"version": "npm:left-pad@1.3.0"}`) restores
-        // its target's registry dist (#432).
-        let (node_name, node_version) =
-            npm_legacy_identity(name, entry.get("version").and_then(Value::as_str));
-        if let (Some(uuid), Some(version)) = (
-            entry
-                .get("resolved")
-                .and_then(Value::as_str)
-                .and_then(|u| ctx.hosted_uuid(u)),
-            node_version,
-        ) {
-            hits.push(NpmHit {
-                pointer: pointer.clone(),
-                uuid,
-                name: node_name.to_string(),
-                version: version.to_string(),
-            });
-        }
-        if let Some(nested) = entry.get("dependencies").and_then(Value::as_object) {
-            v2_hits(
-                nested,
-                &format!("{pointer}/dependencies"),
-                ctx,
-                hits,
-                depth + 1,
-            );
-        }
-    }
-}
-
-fn json_pointer_escape(key: &str) -> String {
-    key.replace('~', "~0").replace('/', "~1")
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn restore_npm_locks(
@@ -527,18 +516,7 @@ fn berry_registry_locator(
     }
 }
 
-/// The value of the last top-level `key` in a YAML settings file
-/// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed.
-fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
-    use crate::formats::pnpm::workspace::top_level_key;
-    text.strip_prefix('\u{feff}')
-        .unwrap_or(text)
-        .lines()
-        .filter_map(top_level_key)
-        .rfind(|(k, _)| k == key)
-        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
-        .filter(|value| !value.is_empty())
-}
+use crate::formats::pnpm::workspace::yaml_top_level_value;
 
 /// The registry a berry restore reads `name`'s version document from:
 /// `.yarnrc.yml`'s `npmRegistryServer`. A scoped package may resolve
@@ -823,45 +801,585 @@ async fn restore_berry(
 /// What decides whether pnpm records a resolution's `tarball:` in the lock
 /// at `rel`, read from its sibling settings files.
 struct PnpmTarballPolicy {
-    /// `lockfileIncludeTarballUrl` in pnpm-workspace.yaml (pnpm 10+, which
-    /// wins over `.npmrc`), else `lockfile-include-tarball-url` in `.npmrc`:
-    /// every resolution carries its tarball.
+    /// pnpm's `lockfileIncludeTarballUrl` was in effect when it wrote the
+    /// lock, so every resolution carries its tarball
+    /// (see [`pnpm_include_tarball`]).
     always: bool,
-    /// The `.npmrc` `registry`, which pnpm derives tarball URLs from.
-    registry: Option<String>,
+    /// `always` rests on the tier-3 guess that another pnpm major would
+    /// read the other way (see [`PnpmIncludeTarball::guess`]).
+    guess: Option<PnpmTarballGuess>,
+    /// The lock is a Rush lock (`rush.json` at the Rush root): its pnpm is
+    /// rush.json's `pnpmVersion`, not a sibling package.json pin.
+    rush: bool,
+    /// The sibling pnpm-workspace.yaml and `.npmrc`, and the pnpm major
+    /// that reads them ([`pnpm_settings_major`]), which name the registry
+    /// pnpm resolves a package against (see [`pnpm_lookup_registry`]).
+    workspace: Option<String>,
+    npmrc: Option<String>,
+    major: Option<u32>,
+    /// The `dir/` prefix those settings were read from
+    /// ([`pnpm_settings_prefix`]), for the guess warning.
+    settings_prefix: String,
 }
 
-async fn pnpm_tarball_policy(view: &mut View<'_>, rel: &str) -> PnpmTarballPolicy {
+impl PnpmTarballPolicy {
+    fn registry(&self, name: &str) -> Option<String> {
+        pnpm_lookup_registry(
+            self.workspace.as_deref(),
+            self.npmrc.as_deref(),
+            self.major,
+            name,
+        )
+    }
+}
+
+/// The pnpm major whose settings reading applies to the lock `text`: the
+/// installed / pinned `pm_major`, else 8 for a pre-9 lock or a shrinkwrap
+/// (only pnpm <= 8 writes those), else 11 for a lock carrying pnpm 11+'s
+/// env lockfile document ahead of the project lock (only pnpm >= 11
+/// writes one, so its `.npmrc` pnpm settings are ignored).
+fn pnpm_settings_major(text: &str, pm_major: Option<u32>) -> Option<u32> {
+    use crate::formats::pnpm::grammar::{is_pnpm_lock_text, main_document};
+    use crate::formats::pnpm::lock_version_major;
+
+    let legacy_lock = lock_version_major(text).is_some_and(|major| major < 9)
+        || text
+            .lines()
+            .any(|line| line.starts_with("shrinkwrapVersion:"));
+    let main = main_document(text);
+    let env_document = is_pnpm_lock_text(&text[..text.len() - main.len()]);
+    pm_major
+        .or(legacy_lock.then_some(8))
+        .or(env_document.then_some(11))
+}
+
+/// The value of `key` in the top-level block mapping `section` of the YAML
+/// `text` (its direct children only, the last one winning, quotes
+/// removed); `None` when absent, empty or flow-styled.
+fn yaml_block_value(text: &str, section: &str, key: &str) -> Option<String> {
+    use crate::formats::pnpm::workspace::{block_section_bounds, top_level_key};
+
+    let lines: Vec<String> = crate::formats::text::strip_bom(text)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let (start, end) = block_section_bounds(&lines, section)?;
+    let children = &lines[start + 1..end];
+    let indent = children.iter().find_map(|line| {
+        let rest = line.trim_start_matches(' ');
+        (!rest.trim().is_empty() && !rest.starts_with('#')).then(|| line.len() - rest.len())
+    })?;
+    children
+        .iter()
+        .filter_map(|line| {
+            line.get(indent..)
+                .filter(|_| line[..indent].trim().is_empty())
+        })
+        .filter_map(top_level_key)
+        .rfind(|(k, _)| k == key)
+        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The registry pnpm resolves `name` against (`None`: the default
+/// registry). pnpm both reads the version document from it and derives
+/// conventional tarball URLs under it (#919). Which settings file names it
+/// follows the pnpm `major` ([`pnpm_settings_major`]):
+///
+/// - pnpm <= 9: the lock's sibling `.npmrc`, `@scope:registry` for a
+///   scoped name when set, else `registry`;
+/// - pnpm 10: pnpm-workspace.yaml's `registries` map when present (it
+///   replaces `.npmrc`'s registries wholesale: the scope's key, else
+///   `default`), else `.npmrc`; a workspace `registry:` is ignored;
+/// - pnpm 11+ (and an unknown major, since a workspace `registry:` only
+///   takes effect there): the two merged, the workspace file winning per
+///   key: `registries."@scope"`, `.npmrc` `@scope:registry`, then
+///   `registry:`, `registries.default`, `.npmrc` `registry`.
+///
+/// (Measured with pnpm 9.15, 10.34 and 11.27.) A value still holding a
+/// `${VAR}` reference is read as unset: the restore does not expand the
+/// user's environment, and must not fetch it as a URL.
+fn pnpm_lookup_registry(
+    workspace: Option<&str>,
+    npmrc: Option<&str>,
+    major: Option<u32>,
+    name: &str,
+) -> Option<String> {
+    use super::super::npmrc::npmrc_top_level_value;
+    use crate::formats::pnpm::workspace::top_level_key;
+
+    let workspace = workspace.filter(|_| major.is_none_or(|major| major > 9));
+    let scope = name
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(scope, _)| format!("@{scope}"));
+    let rc = |key: &str| {
+        npmrc
+            .and_then(|text| npmrc_top_level_value(text, key))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let registries =
+        |key: &str| workspace.and_then(|text| yaml_block_value(text, "registries", key));
+    let from_npmrc = || {
+        scope
+            .as_ref()
+            .and_then(|scope| rc(&format!("{scope}:registry")))
+            .or_else(|| rc("registry"))
+    };
+    let value = if major == Some(10) {
+        let has_registries = workspace.is_some_and(|text| {
+            crate::formats::text::strip_bom(text)
+                .lines()
+                .filter_map(top_level_key)
+                .any(|(key, _)| key == "registries")
+        });
+        if has_registries {
+            scope
+                .as_deref()
+                .and_then(registries)
+                .or_else(|| registries("default"))
+        } else {
+            from_npmrc()
+        }
+    } else {
+        scope
+            .as_ref()
+            .and_then(|scope| registries(scope).or_else(|| rc(&format!("{scope}:registry"))))
+            .or_else(|| workspace.and_then(|text| yaml_top_level_value(text, "registry")))
+            .or_else(|| registries("default"))
+            .or_else(|| rc("registry"))
+    };
+    value.filter(|value| !value.contains("${"))
+}
+
+/// What [`pnpm_include_tarball`] concluded about the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PnpmIncludeTarball {
+    /// pnpm wrote the lock under `lockfileIncludeTarballUrl`.
+    on: bool,
+    /// `on` came from the tier-3 fallback (no lock evidence, no known pnpm
+    /// major) and pnpm 9 or pnpm >= 11, which also write a 9.0 lock, would
+    /// read the two settings files the other way.
+    guess: Option<PnpmTarballGuess>,
+}
+
+/// The settings a tier-3 guess read (`None`: unset; anything but `true`
+/// reads as off): pnpm 10 follows the workspace file, else `.npmrc`; pnpm 9
+/// reads only `.npmrc`, pnpm >= 11 only the workspace file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PnpmTarballGuess {
+    workspace: Option<bool>,
+    npmrc: Option<bool>,
+}
+
+impl PnpmTarballGuess {
+    /// pnpm 10's reading, which the restore follows.
+    fn on(self) -> bool {
+        self.workspace.or(self.npmrc).unwrap_or(false)
+    }
+
+    /// pnpm 9's reading (`.npmrc` only).
+    fn pnpm9(self) -> bool {
+        self.npmrc.unwrap_or(false)
+    }
+
+    /// pnpm >= 11's reading (pnpm-workspace.yaml only).
+    fn pnpm11(self) -> bool {
+        self.workspace.unwrap_or(false)
+    }
+}
+
+/// Whether pnpm wrote the lock `text` under `lockfileIncludeTarballUrl`
+/// (#902). The setting lives in pnpm-workspace.yaml or `.npmrc`, but which
+/// of those pnpm reads depends on its major: pnpm <= 9 ignores workspace
+/// settings, pnpm 11+ ignores pnpm settings in `.npmrc`, and pnpm 10 reads
+/// both (the workspace file wins). Strongest signal first:
+///
+/// 1. the lock's own unpinned registry resolutions ([`pnpm_lock_tarball_evidence`]);
+/// 2. the settings file the installed pnpm major (`pm_major`, or a pre-9
+///    lock / shrinkwrap, which only pnpm <= 8 writes) reads;
+/// 3. with neither, pnpm 10's reading (workspace file, else `.npmrc`).
+///    That covers a lock with no sibling install record (a fresh clone, a
+///    Rush lock whose node_modules lives in common/temp) and only pinned
+///    entries; a global `~/.npmrc` or `npm_config_*` setting is only
+///    visible through tier 1. A 9.0 lock may come from pnpm 9, 10 or 11+,
+///    so when pnpm 9's reading (`.npmrc` only) or pnpm 11+'s (the
+///    workspace file only) differs from pnpm 10's, the result says so
+///    ([`PnpmIncludeTarball::guess`]) so the restore can warn.
+fn pnpm_include_tarball(
+    text: &str,
+    workspace: Option<&str>,
+    npmrc: Option<&str>,
+    pm_major: Option<u32>,
+    is_hosted: impl Fn(&str) -> bool,
+) -> PnpmIncludeTarball {
     use super::super::npmrc::npmrc_top_level_value;
 
-    let dir_prefix = match rel.rsplit_once('/') {
+    let major = pnpm_settings_major(text, pm_major);
+    let registry = |name: &str| pnpm_lookup_registry(workspace, npmrc, major, name);
+    if let Some(on) = pnpm_lock_tarball_evidence(text, registry, is_hosted) {
+        return PnpmIncludeTarball { on, guess: None };
+    }
+    // js-yaml reads `True` / `TRUE` as true too; `.npmrc` (ini + nopt)
+    // only a lowercase `true`.
+    let from_workspace = || {
+        workspace
+            .and_then(|text| yaml_top_level_value(text, "lockfileIncludeTarballUrl"))
+            .map(|value| value.trim().eq_ignore_ascii_case("true"))
+    };
+    let from_npmrc = || {
+        npmrc
+            .and_then(|text| npmrc_top_level_value(text, "lockfile-include-tarball-url"))
+            .map(|value| value.trim() == "true")
+    };
+    let value = match major {
+        Some(major) if major <= 9 => from_npmrc(),
+        Some(major) if major >= 11 => from_workspace(),
+        Some(_) => from_workspace().or_else(from_npmrc),
+        // Tier 3: pnpm 10's reading, flagged when another major differs.
+        None => {
+            let guess = PnpmTarballGuess {
+                workspace: from_workspace(),
+                npmrc: from_npmrc(),
+            };
+            let on = guess.on();
+            let differs = guess.pnpm9() != on || guess.pnpm11() != on;
+            return PnpmIncludeTarball {
+                on,
+                guess: differs.then_some(guess),
+            };
+        }
+    };
+    PnpmIncludeTarball {
+        on: value.unwrap_or(false),
+        guess: None,
+    }
+}
+
+/// What the lock's unpinned registry resolutions (integrity, a registry
+/// key, no `type` / `directory` / `commit` / `repo`, a non-hosted and
+/// non-`file:` tarball if any) say about `lockfileIncludeTarballUrl`.
+/// With it on, pnpm records `tarball:` on every one of them, so a single
+/// bare one proves it off, whatever else the lock holds (a conventional
+/// URL can still appear with it off, under a second registry). With no
+/// bare one, a tarball pnpm could have derived proves it on. `None`: no
+/// such resolution (an unconventional URL is recorded either way). Only
+/// the main document counts: pnpm 11+'s env lockfile document records its
+/// resolutions bare whatever the setting.
+fn pnpm_lock_tarball_evidence(
+    text: &str,
+    registry: impl Fn(&str) -> Option<String>,
+    is_hosted: impl Fn(&str) -> bool,
+) -> Option<bool> {
+    use crate::formats::pnpm::{classify_pnpm_key, grammar::main_document, pnpm_packages, PnpmKey};
+
+    let mut derived = false;
+    for package in pnpm_packages(main_document(text)) {
+        let PnpmKey::Registry { name, version } = classify_pnpm_key(package.key) else {
+            continue;
+        };
+        let Some(resolution) = package.resolution.as_ref() else {
+            continue;
+        };
+        if resolution.integrity().is_none()
+            || resolution
+                .fields
+                .iter()
+                .any(|(k, _)| matches!(*k, "type" | "directory" | "commit" | "repo"))
+        {
+            continue;
+        }
+        match resolution.tarball() {
+            None => return Some(false),
+            Some(tarball) if tarball.starts_with("file:") || is_hosted(tarball) => {}
+            Some(tarball) => {
+                derived |=
+                    registry_derives_tarball(registry(name).as_deref(), name, version, tarball);
+            }
+        }
+    }
+    derived.then_some(true)
+}
+
+/// The major of a `pnpm@<version>` package-manager spec (`.modules.yaml`'s
+/// `packageManager`, package.json's corepack pin, `+sha…` suffix allowed).
+fn pnpm_spec_major(spec: &str) -> Option<u32> {
+    let version = spec
+        .trim()
+        .trim_matches(['"', '\''])
+        .strip_prefix("pnpm@")?;
+    let major = version.split(['.', '+', '-']).next()?;
+    major.parse().ok()
+}
+
+/// The pnpm major an install record names: `node_modules/.modules.yaml`'s
+/// `packageManager` (JSON on pnpm 10+, a top-level YAML scalar before).
+fn modules_yaml_pnpm_major(text: &str) -> Option<u32> {
+    let text = crate::formats::text::strip_bom(text);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        return value
+            .get("packageManager")
+            .and_then(|v| v.as_str())
+            .and_then(pnpm_spec_major);
+    }
+    yaml_top_level_value(text, "packageManager")
+        .as_deref()
+        .and_then(pnpm_spec_major)
+}
+
+/// The pnpm major package.json's corepack `packageManager` pins.
+fn package_json_pnpm_major(text: &str) -> Option<u32> {
+    serde_json::from_str::<serde_json::Value>(crate::formats::text::strip_bom(text))
+        .ok()?
+        .get("packageManager")?
+        .as_str()
+        .and_then(pnpm_spec_major)
+}
+
+/// The Rush root (`""` or a `dir/` prefix) of a Rush lock path: the common
+/// lock `common/config/rush/pnpm-lock.yaml` or a subspace's
+/// `common/config/subspaces/<name>/pnpm-lock.yaml`. Whether it is one is
+/// settled by a `rush.json` at that root.
+fn rush_lock_root(rel: &str) -> Option<&str> {
+    use crate::constants::npm_family::{RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR};
+
+    let root = match rel.strip_suffix(RUSH_COMMON_LOCK_REL) {
+        Some(root) => root,
+        None => {
+            let (dir, name) = rel.strip_suffix("/pnpm-lock.yaml")?.rsplit_once('/')?;
+            if name.is_empty() {
+                return None;
+            }
+            dir.strip_suffix(RUSH_SUBSPACES_DIR)?
+        }
+    };
+    (root.is_empty() || root.ends_with('/')).then_some(root)
+}
+
+/// The pnpm major rush.json's `pnpmVersion` names (rush.json is JSONC).
+fn rush_json_pnpm_major(text: &str) -> Option<u32> {
+    let text = crate::vendor::bun_lock_text::strip_jsonc(crate::formats::text::strip_bom(text));
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get("pnpmVersion")?
+        .as_str()?
+        .trim()
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The text of `name` next to the lock (`dir_prefix`); `None` when absent
+/// or unreadable.
+async fn read_sibling(view: &mut View<'_>, dir_prefix: &str, name: &str) -> Option<String> {
+    view.read(&format!("{dir_prefix}{name}"))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The directory (as a `dir/` prefix, `""` for the project root) whose
+/// pnpm-workspace.yaml, `.npmrc` and `package.json` pnpm reads for the lock
+/// `rel`: the lock's own directory, except for a workspace member lock
+/// (`sharedWorkspaceLockfile: false`). pnpm reads a member's settings only
+/// from its workspace root: the nearest ancestor with a
+/// pnpm-workspace.yaml whose `packages:` lists the member's directory
+/// ([`lists_as_member`]), when the member has no such file of its own.
+/// That root may sit above the project root (a rollback run from the
+/// member itself, its lock `pnpm-lock.yaml`): it is then found on disk
+/// ([`governing_workspace_file`]) and returned as an absolute directory
+/// prefix. A Rush lock (see [`rush_lock_root`], settled by its
+/// `rush.json`) keeps its own directory.
+///
+/// [`lists_as_member`]: crate::utils::pnpm_workspace::lists_as_member
+/// [`governing_workspace_file`]: crate::utils::pnpm_workspace::governing_workspace_file
+async fn pnpm_settings_prefix(view: &mut View<'_>, rel: &str) -> String {
+    let (dir, own) = match rel.rsplit_once('/') {
+        Some((dir, _)) => (dir, format!("{dir}/")),
+        None => ("", String::new()),
+    };
+    if let Some(root) = rush_lock_root(rel) {
+        if read_sibling(view, root, "rush.json").await.is_some() {
+            return own;
+        }
+    }
+    if read_sibling(view, &own, "pnpm-workspace.yaml")
+        .await
+        .is_some()
+    {
+        return own;
+    }
+    let parts: Vec<&str> = if dir.is_empty() {
+        Vec::new()
+    } else {
+        dir.split('/').collect()
+    };
+    for depth in (0..parts.len()).rev() {
+        let prefix: String = parts[..depth].iter().map(|p| format!("{p}/")).collect();
+        let Some(yaml) = read_sibling(view, &prefix, "pnpm-workspace.yaml").await else {
+            continue;
+        };
+        let member: Vec<String> = parts[depth..].iter().map(|p| p.to_string()).collect();
+        // pnpm stops at the nearest workspace file.
+        return if crate::utils::pnpm_workspace::lists_as_member(&yaml, &member) {
+            prefix
+        } else {
+            own
+        };
+    }
+    // No workspace file inside the project: pnpm keeps looking above it.
+    let member = view.root().join(dir);
+    match crate::utils::pnpm_workspace::governing_workspace_file(&member)
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    {
+        Some(root) => format!("{}{}", root.display(), std::path::MAIN_SEPARATOR),
+        None => own,
+    }
+}
+
+/// The `upstream_pnpm_tarball_setting_guessed` detail (#902): nothing
+/// showed which pnpm wrote the lock `rel`, so the restore read
+/// `lockfileIncludeTarballUrl` as pnpm 10 does (`guess`) for the derivable
+/// `entries`, and pnpm 9 or pnpm >= 11 would read it the other way. `rush`:
+/// a Rush lock, whose pnpm is rush.json's `pnpmVersion`. Worded for a dry
+/// run and every caller (rollback, remove, a vendor takeover or eject).
+fn pnpm_tarball_guess_warning(
+    rel: &str,
+    dir_prefix: &str,
+    guess: PnpmTarballGuess,
+    rush: bool,
+    entries: &[&str],
+) -> String {
+    let workspace = format!("{dir_prefix}pnpm-workspace.yaml");
+    let npmrc = format!("{dir_prefix}.npmrc");
+    let ws_value = |value: Option<bool>| match value {
+        Some(value) => format!("`lockfileIncludeTarballUrl: {value}`"),
+        None => "`lockfileIncludeTarballUrl` unset".to_string(),
+    };
+    let rc_value = |value: Option<bool>| match value {
+        Some(value) => format!("`lockfile-include-tarball-url={value}`"),
+        None => "`lockfile-include-tarball-url` unset".to_string(),
+    };
+    let on = guess.on();
+    let followed = if guess.workspace.is_some() {
+        format!("{} in {workspace}", ws_value(guess.workspace))
+    } else {
+        format!("{} in {npmrc}", rc_value(guess.npmrc))
+    };
+    let effect = |on: bool| if on { "keep it" } else { "leave it out" };
+    let mut differ = Vec::new();
+    if guess.pnpm9() != on {
+        differ.push(format!(
+            "pnpm 9 reads only {npmrc} ({}) and would {}",
+            rc_value(guess.npmrc),
+            effect(guess.pnpm9())
+        ));
+    }
+    if guess.pnpm11() != on {
+        differ.push(format!(
+            "pnpm >= 11 reads only {workspace} ({}) and would {}",
+            ws_value(guess.workspace),
+            effect(guess.pnpm11())
+        ));
+    }
+    let (unknown, pin) = if rush {
+        let root = rush_lock_root(rel).unwrap_or_default();
+        (
+            format!("no {root}rush.json `pnpmVersion`"),
+            format!(
+                "set {root}rush.json `pnpmVersion` to the pnpm Rush installs with, so the \
+                 restore reads the setting as that pnpm does"
+            ),
+        )
+    } else {
+        (
+            format!(
+                "no {dir_prefix}node_modules/.modules.yaml install record, no \
+                 {dir_prefix}package.json `packageManager` pin"
+            ),
+            format!(
+                "pin it in {dir_prefix}package.json `packageManager` (or reinstall so \
+                 {dir_prefix}node_modules/.modules.yaml records it), or give \
+                 `lockfile-include-tarball-url` in {npmrc} and `lockfileIncludeTarballUrl` \
+                 in {workspace} the same value, so every pnpm reads the setting alike"
+            ),
+        )
+    };
+    format!(
+        "{rel}: nothing shows which pnpm wrote this lock (no unpinned registry entry that \
+         shows the setting, {unknown}), so the restore reads `lockfileIncludeTarballUrl` \
+         as pnpm 10 does, from {followed}, and restores {} {} `tarball:`; {}. If the \
+         project uses that pnpm, those entries' `tarball:` lines differ from what it writes: \
+         {pin}. A rollback or remove can then be redone by restoring {rel} from version \
+         control and re-running it",
+        entries.join(", "),
+        if on { "with" } else { "without" },
+        differ.join("; ")
+    )
+}
+
+async fn pnpm_tarball_policy(
+    view: &mut View<'_>,
+    rel: &str,
+    text: &str,
+    ctx: &Ctx<'_>,
+) -> PnpmTarballPolicy {
+    let dir_prefix = pnpm_settings_prefix(view, rel).await;
+    let lock_prefix = match rel.rsplit_once('/') {
         Some((dir, _)) => format!("{dir}/"),
         None => String::new(),
     };
-    let workspace = view
-        .read(&format!("{dir_prefix}pnpm-workspace.yaml"))
-        .await
-        .ok()
-        .flatten();
-    let npmrc = view
-        .read(&format!("{dir_prefix}.npmrc"))
-        .await
-        .ok()
-        .flatten();
-    let npmrc_value = |key: &str| {
-        npmrc
-            .as_deref()
-            .and_then(|text| npmrc_top_level_value(text, key))
-            .map(|value| value.trim().to_string())
+    let workspace = read_sibling(view, &dir_prefix, "pnpm-workspace.yaml").await;
+    let npmrc = read_sibling(view, &dir_prefix, ".npmrc").await;
+    // A Rush lock: Rush installs with rush.json's `pnpmVersion` in
+    // common/temp, so neither an install record nor a package.json sits
+    // beside the lock.
+    let rush_json = match rush_lock_root(rel) {
+        Some(root) => read_sibling(view, root, "rush.json").await,
+        None => None,
     };
-    let always = workspace
-        .as_deref()
-        .and_then(|text| yaml_top_level_value(text, "lockfileIncludeTarballUrl"))
-        .or_else(|| npmrc_value("lockfile-include-tarball-url"))
-        .is_some_and(|value| value == "true");
+    let rush = rush_json.is_some();
+    let pm_major = if let Some(rush_json) = rush_json.as_deref() {
+        rush_json_pnpm_major(rush_json)
+    } else {
+        // What installed the project (the workspace root's install
+        // record, else the member's own), else what it pins.
+        let mut installed = None;
+        for prefix in [&dir_prefix, &lock_prefix] {
+            installed = read_sibling(view, prefix, "node_modules/.modules.yaml")
+                .await
+                .as_deref()
+                .and_then(modules_yaml_pnpm_major);
+            if installed.is_some() || dir_prefix == lock_prefix {
+                break;
+            }
+        }
+        match installed {
+            Some(major) => Some(major),
+            None => read_sibling(view, &dir_prefix, "package.json")
+                .await
+                .as_deref()
+                .and_then(package_json_pnpm_major),
+        }
+    };
+    let include = pnpm_include_tarball(
+        text,
+        workspace.as_deref(),
+        npmrc.as_deref(),
+        pm_major,
+        |url| ctx.hosted_uuid(url).is_some(),
+    );
     PnpmTarballPolicy {
-        always,
-        registry: npmrc_value("registry").filter(|value| !value.is_empty()),
+        always: include.on,
+        guess: include.guess,
+        rush,
+        workspace,
+        npmrc,
+        major: pnpm_settings_major(text, pm_major),
+        settings_prefix: dir_prefix,
     }
 }
 
@@ -911,10 +1429,11 @@ pub(crate) async fn restore_pnpm_locks(
             .iter()
             .map(|(_, u, n, v)| (u.clone(), n.clone(), v.clone()))
             .collect();
-        let dists = fetch_dists(&wanted, ctx, &mut result).await;
-        let policy = pnpm_tarball_policy(view, rel).await;
+        let policy = pnpm_tarball_policy(view, rel, &text, ctx).await;
+        let dists = fetch_dists_on(&wanted, |name| policy.registry(name), ctx, &mut result).await;
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-        let mut handled: Vec<String> = Vec::new();
+        // (uuid, name@version whose `tarball:` only the guessed setting decided)
+        let mut handled: Vec<(String, Option<String>)> = Vec::new();
         for entry in pnpm::entries(&text) {
             let Some(resolution) = pnpm::resolution(&entry) else {
                 continue;
@@ -926,7 +1445,7 @@ pub(crate) async fn restore_pnpm_locks(
             if result.refused.contains_key(uuid) {
                 continue;
             }
-            let Some(dist) = dists.get(&(name.clone(), version.clone())) else {
+            let Some(dist) = dists.get(&(name.clone(), version.clone())).map(|d| &d.dist) else {
                 continue;
             };
             let Some(integrity) = dist.integrity.as_deref() else {
@@ -938,30 +1457,47 @@ pub(crate) async fn restore_pnpm_locks(
             };
             // pnpm records `tarball:` under lockfileIncludeTarballUrl and for
             // a URL it cannot derive from the registry (#557).
-            let restored = if policy.always
-                || !registry_derives_tarball(
-                    policy.registry.as_deref(),
-                    name,
-                    version,
-                    &dist.tarball,
-                ) {
+            let derived = registry_derives_tarball(
+                policy.registry(name).as_deref(),
+                name,
+                version,
+                &dist.tarball,
+            );
+            let restored = if policy.always || !derived {
                 resolution.rewrite(integrity, &dist.tarball)
             } else {
                 resolution.restore(integrity)
             };
+            // A URL pnpm records anyway is no guess.
+            let guessed = (policy.guess.is_some() && derived).then(|| format!("{name}@{version}"));
             splices.push((resolution.range.clone(), restored));
-            handled.push(uuid.clone());
+            handled.push((uuid.clone(), guessed));
         }
         // A refusal recorded after a splice was planned (a second instance
         // of the same pin) drops that pin's splices too.
-        let splices: Vec<_> = splices
+        let kept: Vec<_> = splices
             .into_iter()
             .zip(&handled)
-            .filter(|(_, u)| !result.refused.contains_key(*u))
-            .map(|(s, _)| s)
+            .filter(|(_, (u, _))| !result.refused.contains_key(u))
             .collect();
+        let mut guessed: Vec<&str> = kept.iter().filter_map(|(_, (_, g))| g.as_deref()).collect();
+        guessed.sort_unstable();
+        guessed.dedup();
+        let splices: Vec<_> = kept.into_iter().map(|(s, _)| s).collect();
         if splices.is_empty() {
             continue;
+        }
+        if let Some(guess) = policy.guess.filter(|_| !guessed.is_empty()) {
+            result.warnings.push((
+                "upstream_pnpm_tarball_setting_guessed",
+                pnpm_tarball_guess_warning(
+                    rel,
+                    &policy.settings_prefix,
+                    guess,
+                    policy.rush,
+                    &guessed,
+                ),
+            ));
         }
         let mut out = String::with_capacity(text.len());
         let mut cursor = 0;
@@ -973,7 +1509,7 @@ pub(crate) async fn restore_pnpm_locks(
             cursor = range.end;
         }
         out.push_str(&text[cursor..]);
-        for uuid in handled {
+        for (uuid, _) in handled {
             if !result.refused.contains_key(&uuid) {
                 result.handled.insert(uuid);
             }
@@ -984,6 +1520,399 @@ pub(crate) async fn restore_pnpm_locks(
 }
 
 // ── bun.lock ─────────────────────────────────────────────────────────────────
+
+/// The registry Bun resolves `name` against, from the settings beside the
+/// lock (#992): a scoped package's `.npmrc` `@scope:registry`, else its
+/// `bunfig.toml` `[install.scopes]` entry; otherwise `env_registry`
+/// (`BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), the `.npmrc`
+/// `registry`, then `bunfig.toml` `[install] registry` — Bun's own order.
+/// `None` means Bun's default registry, npmjs.
+///
+/// The registry carries the credentials Bun sends it: the bunfig entry's
+/// own `token` (Bearer) or `username` / `password` (Basic), else the
+/// `.npmrc` `//host/path/:_authToken` / `:_auth` / `:username` +
+/// `:_password` whose path covers the registry URL. `$VAR` / `${VAR}` in a
+/// bunfig value and `${VAR}` in an `.npmrc` value read `var`, as Bun
+/// expands them, but only for the [`BUN_EXPANDED_VARS`] token variables:
+/// these files come with the project, and any other reference (say
+/// `$GITHUB_TOKEN`) would hand that secret to a host the project names.
+/// It expands to nothing instead. A private scope registry answers 401
+/// without them.
+fn bun_lookup_registry(
+    npmrc: Option<&str>,
+    bunfig: Option<&str>,
+    env_registry: Option<&str>,
+    var: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+) -> Option<ProjectRegistry> {
+    use super::super::npmrc::npmrc_top_level_value;
+
+    let var = &|key: &str| BUN_EXPANDED_VARS.contains(&key).then(|| var(key)).flatten();
+    fn url(value: &str) -> Option<String> {
+        let value = value.trim().trim_matches(['"', '\'']);
+        (value.starts_with("https://") || value.starts_with("http://")).then(|| value.to_string())
+    }
+    // A bunfig registry is a URL string or a table carrying `url` and
+    // maybe its credentials.
+    let toml_url = |item: Option<&toml_edit::Item>| -> Option<String> {
+        let item = item?;
+        let value = item
+            .as_str()
+            .or_else(|| item.get("url").and_then(toml_edit::Item::as_str))?;
+        url(&expand_url_env(value, var, true))
+    };
+    let toml_auth = |item: &toml_edit::Item| -> Option<String> {
+        let field = |key: &str| {
+            item.get(key)
+                .and_then(toml_edit::Item::as_str)
+                .map(|v| expand_env(v, var, true))
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(token) = field("token") {
+            return Some(format!("Bearer {token}"));
+        }
+        let (user, password) = (field("username")?, field("password")?);
+        use base64::Engine as _;
+        Some(format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+        ))
+    };
+    let npmrc_value = |key: &str| {
+        npmrc
+            .and_then(|text| npmrc_top_level_value(text, key))
+            .map(|v| expand_env(&v, var, false))
+    };
+    let npmrc_url = |key: &str| {
+        npmrc
+            .and_then(|text| npmrc_top_level_value(text, key))
+            .and_then(|v| url(&expand_url_env(&v, var, false)))
+    };
+    // Credentials in the URL itself (`https://user:${TOKEN}@host/`) go on
+    // the request only: the base is written into bun.lock and warnings.
+    let with_npmrc_auth = |base: String, own: Option<String>| -> ProjectRegistry {
+        let (base, userinfo) = split_userinfo(&base);
+        let authorization = own
+            .or(userinfo)
+            .or_else(|| npmrc_registry_auth(&base, &npmrc_value));
+        ProjectRegistry {
+            base,
+            authorization,
+        }
+    };
+    let bunfig = bunfig.and_then(|text| text.parse::<toml_edit::DocumentMut>().ok());
+    let install = bunfig.as_ref().and_then(|doc| doc.get("install"));
+    // The configured default registry before the environment applies.
+    let configured = || -> Option<ProjectRegistry> {
+        if let Some(base) = npmrc_url("registry") {
+            return Some(with_npmrc_auth(base, None));
+        }
+        let item = install?.get("registry")?;
+        let base = toml_url(Some(item))?;
+        Some(with_npmrc_auth(base, toml_auth(item)))
+    };
+    if let Some((scope, _)) = name.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
+        if let Some(scoped) = npmrc_url(&format!("@{scope}:registry")) {
+            return Some(with_npmrc_auth(scoped, None));
+        }
+        let entry = install.and_then(|i| i.get("scopes")).and_then(|scopes| {
+            scopes
+                .get(scope)
+                .or_else(|| scopes.get(format!("@{scope}")))
+        });
+        if let Some(entry) = entry {
+            if let Some(scoped) = toml_url(Some(entry)) {
+                return Some(with_npmrc_auth(scoped, toml_auth(entry)));
+            }
+            // A scope entry with no URL (a token only) takes the configured
+            // default registry, never the environment's, with its own
+            // credentials. With no default configured that is npmjs, which
+            // still gets the scope's token: a private npmjs scope 401s
+            // without it.
+            if entry.is_table_like() && entry.get("url").is_none() {
+                let own = toml_auth(entry);
+                return match configured() {
+                    Some(r) => Some(ProjectRegistry {
+                        authorization: own.or(r.authorization),
+                        ..r
+                    }),
+                    None => own.map(|own| ProjectRegistry {
+                        base: format!("{}/", crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY),
+                        authorization: Some(own),
+                    }),
+                };
+            }
+        }
+    }
+    match env_registry.and_then(url) {
+        Some(base) => Some(with_npmrc_auth(base, None)),
+        None => configured(),
+    }
+}
+
+/// The variables a project's bunfig.toml / .npmrc may expand into the
+/// registry and credentials a Bun restore sends: the conventional npm
+/// token variables, nothing else.
+const BUN_EXPANDED_VARS: &[&str] = &["NPM_TOKEN", "NODE_AUTH_TOKEN", "BUN_AUTH_TOKEN"];
+
+/// A registry URL with its variables expanded only inside its userinfo
+/// (`https://user:${NPM_TOKEN}@host/`), which goes on the request's
+/// `Authorization` header (see [`split_userinfo`]). A reference anywhere
+/// else expands to nothing: the rest of the URL is requested, printed in
+/// `upstream_registry_fallback` and written into the lock, so a token
+/// there would leak into all three.
+fn expand_url_env(value: &str, var: &dyn Fn(&str) -> Option<String>, bare: bool) -> String {
+    let none = |_: &str| None;
+    let (scheme, rest) = value.split_once("://").unwrap_or(("", value));
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, after) = match rest[..authority_end].rsplit_once('@') {
+        Some((userinfo, host)) => (Some(userinfo), &rest[authority_end - host.len()..]),
+        None => (None, rest),
+    };
+    let mut out = String::with_capacity(value.len());
+    if value.contains("://") {
+        out.push_str(scheme);
+        out.push_str("://");
+    }
+    if let Some(userinfo) = userinfo {
+        out.push_str(&expand_env(userinfo, var, bare));
+        out.push('@');
+    }
+    out.push_str(&expand_env(after, &none, bare));
+    out
+}
+
+/// `value` with each `${VAR}` (and, for a bunfig value, `$VAR`) replaced
+/// by `var(VAR)`, empty when unset.
+fn expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>, bare: bool) -> String {
+    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        if let Some(braced) = after.strip_prefix('{') {
+            if let Some(end) = braced.find('}') {
+                out.push_str(&var(&braced[..end]).unwrap_or_default());
+                rest = &braced[end + 1..];
+                continue;
+            }
+        } else if bare {
+            let end = after.find(|c| !is_name(c)).unwrap_or(after.len());
+            if end > 0 {
+                out.push_str(&var(&after[..end]).unwrap_or_default());
+                rest = &after[end..];
+                continue;
+            }
+        }
+        out.push('$');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `base` without its URL userinfo, and the Basic `Authorization` that
+/// userinfo stood for (percent-decoded, as a URL parser reads it).
+fn split_userinfo(base: &str) -> (String, Option<String>) {
+    use crate::utils::purl::percent_decode_purl_component as decode;
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return (base.to_string(), None);
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some((userinfo, host)) = rest[..authority_end].rsplit_once('@') else {
+        return (base.to_string(), None);
+    };
+    let stripped = format!("{scheme}://{host}{}", &rest[authority_end..]);
+    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    let (user, password) = (decode(user), decode(password));
+    let authorization = (!user.is_empty() || !password.is_empty()).then(|| {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+        )
+    });
+    (stripped, authorization)
+}
+
+/// The `Authorization` an `.npmrc` configures for the registry at `base`:
+/// the `//host[:port]/path/:`-keyed `_authToken` (Bearer), `_auth` (Basic)
+/// or `username` + base64 `_password` (Basic) of the longest path that
+/// covers `base`'s, on the same host.
+fn npmrc_registry_auth(base: &str, value: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let rest = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))?;
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    if host.is_empty() {
+        return None;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let non_empty = |v: Option<String>| v.filter(|v| !v.is_empty());
+    for depth in (0..=segments.len()).rev() {
+        let mut dart = format!("//{host}/");
+        for segment in &segments[..depth] {
+            dart.push_str(segment);
+            dart.push('/');
+        }
+        if let Some(token) = non_empty(value(&format!("{dart}:_authToken"))) {
+            return Some(format!("Bearer {token}"));
+        }
+        if let Some(auth) = non_empty(value(&format!("{dart}:_auth"))) {
+            return Some(format!("Basic {auth}"));
+        }
+        if let (Some(user), Some(password)) = (
+            non_empty(value(&format!("{dart}:username"))),
+            non_empty(value(&format!("{dart}:_password"))),
+        ) {
+            use base64::Engine as _;
+            let engine = base64::engine::general_purpose::STANDARD;
+            let password = engine.decode(password.trim()).ok()?;
+            let password = String::from_utf8(password).ok()?;
+            return Some(format!(
+                "Basic {}",
+                engine.encode(format!("{user}:{password}"))
+            ));
+        }
+    }
+    None
+}
+
+/// The registry Bun takes from its environment: the first of
+/// `BUN_CONFIG_REGISTRY`, `NPM_CONFIG_REGISTRY`, `npm_config_registry`
+/// that is an http(s) URL — Bun skips a key that is not and reads the
+/// next (`PackageManagerOptions.load`).
+fn bun_env_registry(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    [
+        "BUN_CONFIG_REGISTRY",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+    ]
+    .iter()
+    .find_map(|key| var(key).filter(|v| v.starts_with("https://") || v.starts_with("http://")))
+}
+
+/// The settings beside a Bun lock that decide which registry Bun resolves
+/// each package against, and so which tarball URL it recorded (#992).
+pub(super) struct BunRegistrySettings {
+    npmrc: Option<String>,
+    bunfig: Option<String>,
+    env_registry: Option<String>,
+}
+
+impl BunRegistrySettings {
+    pub(super) async fn read(view: &mut View<'_>, rel: &str) -> Self {
+        let dir_prefix = match rel.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/"),
+            None => String::new(),
+        };
+        let npmrc = view
+            .read(&format!("{dir_prefix}.npmrc"))
+            .await
+            .ok()
+            .flatten();
+        let bunfig = view
+            .read(&format!("{dir_prefix}bunfig.toml"))
+            .await
+            .ok()
+            .flatten();
+        // Unit tests read no ambient registry: npm exports
+        // `npm_config_registry` to child processes whenever one is
+        // configured, which would otherwise steer the fixtures' restores.
+        let env_registry = if cfg!(test) {
+            None
+        } else {
+            bun_env_registry(|key| std::env::var(key).ok())
+        };
+        Self {
+            npmrc,
+            bunfig,
+            env_registry,
+        }
+    }
+
+    /// The registry Bun resolves `name` against; `None` means npmjs.
+    pub(super) fn registry(&self, name: &str) -> Option<String> {
+        self.registry_with_credentials(name).map(|r| r.base)
+    }
+
+    /// [`Self::registry`] with the credentials Bun sends it.
+    pub(super) fn registry_with_credentials(&self, name: &str) -> Option<ProjectRegistry> {
+        // Unit tests read no ambient variables, as for `env_registry`.
+        let var = |key: &str| {
+            if cfg!(test) {
+                None
+            } else {
+                std::env::var(key).ok()
+            }
+        };
+        bun_lookup_registry(
+            self.npmrc.as_deref(),
+            self.bunfig.as_deref(),
+            self.env_registry.as_deref(),
+            &var,
+            name,
+        )
+    }
+}
+
+/// The tarball URL Bun recorded for `name@version` resolved against
+/// `project_registry`: the `dist.tarball` of the document read, except
+/// that a fallback from an unreadable mirror to the default registry's
+/// document re-bases its conventional URL on the mirror, the URL Bun
+/// derived there.
+pub(super) fn bun_tarball_url(
+    project_registry: Option<&str>,
+    name: &str,
+    version: &str,
+    found: &ProjectDist,
+) -> String {
+    use crate::vendor::registry_fetch::{
+        npm_registry_base, npm_tarball_is_conventional, npm_tarball_url,
+    };
+    let tarball = &found.dist.tarball;
+    // Only a fallback from a registry the default document does not stand
+    // for is re-based: npmjs, its yarnpkg alias and `SOCKET_NPM_REGISTRY`
+    // advertise the very `dist.tarball` that was read, which is what Bun
+    // recorded.
+    match project_registry.and_then(non_default_registry) {
+        Some(base)
+            if !found.from_project
+                && npm_tarball_is_conventional(&npm_registry_base(), name, version, tarball) =>
+        {
+            npm_tarball_url(&base, name, version)
+        }
+        _ => tarball.clone(),
+    }
+}
+
+/// The registry slot Bun writes in a `bun.lock` 4-tuple: `""` for a
+/// package from registry.npmjs.org (Bun's own prefix test), else the full
+/// tarball URL — which Bun 1.1.39–1.3.6 need, as they read `""` as npmjs
+/// whatever the project configures (#992).
+fn bun_registry_slot(
+    project_registry: Option<&str>,
+    name: &str,
+    version: &str,
+    found: &ProjectDist,
+) -> String {
+    use crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY;
+    // Bun resolved npmjs (unconfigured, or npmjs / its yarnpkg alias,
+    // whose documents advertise npmjs tarballs): the empty slot, whatever
+    // `SOCKET_NPM_REGISTRY` the restore itself read.
+    let Some(base) = project_registry.filter(|base| !is_npmjs_registry(base)) else {
+        return String::new();
+    };
+    let url = bun_tarball_url(Some(base), name, version, found);
+    if url.starts_with(DEFAULT_NPM_REGISTRY) {
+        String::new()
+    } else {
+        url
+    }
+}
 
 pub(crate) async fn restore_bun_locks(
     view: &mut View<'_>,
@@ -1045,16 +1974,25 @@ pub(crate) async fn restore_bun_locks(
             .iter()
             .map(|(_, u, n, v, _)| (u.clone(), n.clone(), v.clone()))
             .collect();
-        let dists = fetch_dists(&wanted, ctx, &mut result).await;
+        // Bun records the tarball URL of a package from any registry but
+        // npmjs, so the restore reads the project's registry settings.
+        let settings = BunRegistrySettings::read(view, rel).await;
+        let dists = fetch_dists_on(
+            &wanted,
+            |n| settings.registry_with_credentials(n),
+            ctx,
+            &mut result,
+        )
+        .await;
         let mut changed = false;
         for (line_idx, uuid, name, version, deps) in hits {
             if result.refused.contains_key(&uuid) {
                 continue;
             }
-            let Some(integrity) = dists
-                .get(&(name.clone(), version.clone()))
-                .and_then(|d| d.integrity.clone())
-            else {
+            let Some(found) = dists.get(&(name.clone(), version.clone())) else {
+                continue;
+            };
+            let Some(integrity) = found.dist.integrity.clone() else {
                 result.refuse(
                     &uuid,
                     format!("the registry records no integrity for {name}@{version}"),
@@ -1067,11 +2005,14 @@ pub(crate) async fn restore_bun_locks(
             let original = &lines[line_idx];
             let cr = if original.ends_with('\r') { "\r" } else { "" };
             let json = |s: &str| serde_json::to_string(s).expect("a str serializes to JSON");
+            let slot =
+                bun_registry_slot(settings.registry(&name).as_deref(), &name, &version, found);
             lines[line_idx] = format!(
-                "{indent}{key}: [{spec}, \"\", {deps}, {integrity}]{comma}{cr}",
+                "{indent}{key}: [{spec}, {slot}, {deps}, {integrity}]{comma}{cr}",
                 indent = entry.indent,
                 key = entry.key_raw,
                 spec = json(&format!("{name}@{version}")),
+                slot = json(&slot),
                 integrity = json(&integrity),
                 comma = if entry.trailing_comma { "," } else { "" },
             );
@@ -1163,9 +2104,794 @@ pub(crate) async fn cleanup_side_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        berry_lookup_registry, berry_registry_locator, non_default_registry,
-        registry_derives_tarball, yaml_top_level_value,
+        berry_lookup_registry, berry_registry_locator, bun_env_registry, bun_lookup_registry,
+        bun_registry_slot, bun_tarball_url, expand_url_env, modules_yaml_pnpm_major,
+        non_default_registry, package_json_pnpm_major, pnpm_include_tarball, pnpm_lookup_registry,
+        pnpm_tarball_guess_warning, registry_derives_tarball, rush_json_pnpm_major, rush_lock_root,
+        split_userinfo, yaml_top_level_value, PnpmTarballGuess, ProjectDist,
     };
+    use crate::patch::redirect::upstream::client::NpmDist;
+
+    #[test]
+    fn bun_reads_the_registry_in_bun_s_own_order() {
+        let bunfig = "[install]\nregistry = \"https://b.example/\"\n\n\
+                      [install.scopes]\ns = \"https://s.example/\"\n\"@t\" = { url = \"https://t.example/\", token = \"x\" }\n";
+        let npmrc = "registry=https://n.example/\n@u:registry=https://u.example/\n";
+        let lookup = |npmrc, bunfig, env, name| {
+            bun_lookup_registry(npmrc, bunfig, env, &|_| None, name).map(|r| r.base)
+        };
+        assert_eq!(
+            lookup(None, Some(bunfig), None, "a").as_deref(),
+            Some("https://b.example/")
+        );
+        // A table registry carries `url`.
+        assert_eq!(
+            lookup(
+                None,
+                Some("[install.registry]\nurl = \"https://c.example\"\n"),
+                None,
+                "a"
+            )
+            .as_deref(),
+            Some("https://c.example")
+        );
+        // .npmrc wins over bunfig, the environment over both.
+        assert_eq!(
+            lookup(Some(npmrc), Some(bunfig), None, "a").as_deref(),
+            Some("https://n.example/")
+        );
+        assert_eq!(
+            lookup(Some(npmrc), Some(bunfig), Some("https://e.example"), "a").as_deref(),
+            Some("https://e.example")
+        );
+        // A scope's registry wins over every default one; either spelling.
+        for (name, want) in [
+            ("@s/a", "https://s.example/"),
+            ("@t/a", "https://t.example/"),
+            ("@u/a", "https://u.example/"),
+            ("@v/a", "https://e.example"),
+        ] {
+            assert_eq!(
+                lookup(Some(npmrc), Some(bunfig), Some("https://e.example"), name).as_deref(),
+                Some(want),
+                "{name}"
+            );
+        }
+        // A scope entry with no URL takes the configured default registry,
+        // not the environment's (Bun's `registry.url = base.url`).
+        let token_only = "[install]\nregistry = \"https://b.example/\"\n\n\
+                          [install.scopes]\nw = { token = \"x\" }\n";
+        assert_eq!(
+            lookup(None, Some(token_only), Some("https://e.example"), "@w/a").as_deref(),
+            Some("https://b.example/")
+        );
+        assert_eq!(
+            lookup(None, Some(token_only), Some("https://e.example"), "a").as_deref(),
+            Some("https://e.example")
+        );
+        // Nothing configured, or nothing that is a URL: npmjs.
+        assert_eq!(lookup(None, None, None, "a"), None);
+        assert_eq!(
+            lookup(Some("registry=${R}\n"), Some("not toml ["), Some("x"), "a"),
+            None
+        );
+    }
+
+    #[test]
+    fn bun_registry_userinfo_goes_on_the_request_not_the_base() {
+        let vars = |key: &str| (key == "NPM_TOKEN").then(|| "s3cret".to_string());
+        let lookup = |npmrc: Option<&str>, bunfig: Option<&str>, env: Option<&str>, name: &str| {
+            bun_lookup_registry(npmrc, bunfig, env, &vars, name).map(|r| (r.base, r.authorization))
+        };
+        let basic = |pair: &str| {
+            use base64::Engine as _;
+            Some(format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair)
+            ))
+        };
+        // bunfig `$VAR` / `${VAR}`, an .npmrc `${VAR}` and the environment's
+        // registry: the expanded secret never reaches the base that
+        // bun.lock, bun.lockb and upstream_registry_fallback print.
+        let bunfig = "[install]\nregistry = \"https://ci:$NPM_TOKEN@b.example/npm/\"\n\n\
+                      [install.scopes]\n\
+                      corp = { url = \"https://u:${NPM_TOKEN}@corp.example/\", token = \"own\" }\n";
+        assert_eq!(
+            lookup(None, Some(bunfig), None, "a"),
+            Some(("https://b.example/npm/".to_string(), basic("ci:s3cret")))
+        );
+        // An explicit token still wins; the userinfo is dropped all the same.
+        assert_eq!(
+            lookup(None, Some(bunfig), None, "@corp/w"),
+            Some((
+                "https://corp.example/".to_string(),
+                Some("Bearer own".to_string())
+            ))
+        );
+        assert_eq!(
+            lookup(
+                Some("@s:registry=https://x:${NPM_TOKEN}@s.example/\n"),
+                None,
+                None,
+                "@s/w"
+            ),
+            Some(("https://s.example/".to_string(), basic("x:s3cret")))
+        );
+        assert_eq!(
+            lookup(None, None, Some("https://e%40m:p%3Aw@e.example/"), "a"),
+            Some(("https://e.example/".to_string(), basic("e@m:p:w")))
+        );
+        // No userinfo: unchanged.
+        assert_eq!(
+            split_userinfo("https://h.example/a@b"),
+            ("https://h.example/a@b".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn bun_sends_the_credentials_its_settings_give_each_registry() {
+        let vars = |key: &str| match key {
+            "NODE_AUTH_TOKEN" => Some("from-env".to_string()),
+            "BUN_AUTH_TOKEN" => Some("npmrc-env".to_string()),
+            "GITHUB_TOKEN" => Some("not-for-registries".to_string()),
+            _ => None,
+        };
+        let auth = |npmrc: Option<&str>, bunfig: Option<&str>, env: Option<&str>, name: &str| {
+            bun_lookup_registry(npmrc, bunfig, env, &vars, name).map(|r| (r.base, r.authorization))
+        };
+        let some =
+            |base: &str, auth: Option<&str>| Some((base.to_string(), auth.map(str::to_string)));
+        // The scope entry's own token, `$VAR` / `${VAR}` expanded; Basic
+        // from username + password.
+        let bunfig = "[install]\nregistry = { url = \"https://b.example/\", token = \"bt\" }\n\n\
+                      [install.scopes]\n\
+                      corp = { url = \"https://corp.example/npm/\", token = \"$NODE_AUTH_TOKEN\" }\n\
+                      braced = { url = \"https://br.example/\", token = \"x${NODE_AUTH_TOKEN}y\" }\n\
+                      basic = { url = \"https://ba.example/\", username = \"u\", password = \"p\" }\n\
+                      bare = \"https://bare.example/\"\n\
+                      own = { token = \"own\" }\n\
+                      unset = { url = \"https://un.example/\", token = \"$NOPE\" }\n\
+                      other = { url = \"https://ot.example/\", token = \"${GITHUB_TOKEN}\" }\n\
+                      inurl = \"https://u:$GITHUB_TOKEN@iu.example/\"\n\
+                      inpath = \"https://ip.example/$NODE_AUTH_TOKEN/\"\n";
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@corp/w"),
+            some("https://corp.example/npm/", Some("Bearer from-env"))
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@braced/w"),
+            some("https://br.example/", Some("Bearer xfrom-envy"))
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@basic/w"),
+            some("https://ba.example/", Some("Basic dTpw"))
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@bare/w"),
+            some("https://bare.example/", None)
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@unset/w"),
+            some("https://un.example/", None)
+        );
+        // A variable that is not a registry token variable is never
+        // expanded: the project's files cannot send it anywhere.
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@other/w"),
+            some("https://ot.example/", None)
+        );
+        let (base, authorization) = auth(None, Some(bunfig), None, "@inurl/w").unwrap();
+        assert_eq!(base, "https://iu.example/");
+        let sent = authorization.and_then(|a| {
+            use base64::Engine as _;
+            let encoded = a.strip_prefix("Basic ")?.to_string();
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        });
+        assert!(
+            !String::from_utf8_lossy(&sent.unwrap_or_default()).contains("not-for-registries"),
+            "the userinfo expanded $GITHUB_TOKEN"
+        );
+        // Even an allowed token stays out of the URL's host, path and
+        // query, which are requested, printed and written into the lock;
+        // only userinfo (moved onto the request header) expands.
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@inpath/w"),
+            some("https://ip.example//", None)
+        );
+        assert_eq!(
+            auth(
+                Some("@p:registry=https://h.example/${BUN_AUTH_TOKEN}/?t=${BUN_AUTH_TOKEN}\n"),
+                None,
+                None,
+                "@p/w"
+            ),
+            some("https://h.example//?t=", None)
+        );
+        assert_eq!(
+            expand_url_env(
+                "https://u:$NODE_AUTH_TOKEN@h.example/$NODE_AUTH_TOKEN",
+                &vars,
+                true
+            ),
+            "https://u:from-env@h.example/"
+        );
+        // A token-only scope: the configured default registry, its own token.
+        assert_eq!(
+            auth(None, Some(bunfig), Some("https://e.example/"), "@own/w"),
+            some("https://b.example/", Some("Bearer own"))
+        );
+        // ...and with no default registry configured, npmjs with that
+        // token (a private npmjs scope), still not the environment's.
+        let npmjs_scope = "[install.scopes]\nown = { token = \"$NODE_AUTH_TOKEN\" }\n\
+                           none = { username = \"u\" }\n";
+        for env in [None, Some("https://e.example/")] {
+            assert_eq!(
+                auth(None, Some(npmjs_scope), env, "@own/w"),
+                some("https://registry.npmjs.org/", Some("Bearer from-env")),
+                "{env:?}"
+            );
+        }
+        // A token-less scope entry with nothing configured stays npmjs.
+        assert_eq!(auth(None, Some(npmjs_scope), None, "@none/w"), None);
+        // The default registry's table token; the environment's registry
+        // carries none of bunfig's.
+        assert_eq!(
+            auth(None, Some(bunfig), None, "a"),
+            some("https://b.example/", Some("Bearer bt"))
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), Some("https://e.example/"), "a"),
+            some("https://e.example/", None)
+        );
+
+        // `.npmrc` nerf-darted credentials: the longest covering path on
+        // the same host; never another host's.
+        let npmrc = "@corp:registry=https://corp.example/npm/private/\n\
+                     @other:registry=https://other.example/\n\
+                     @basic:registry=https://nb.example/\n\
+                     @legacy:registry=https://lg.example/r/\n\
+                     registry=https://n.example/\n\
+                     //corp.example/:_authToken=host-wide\n\
+                     //corp.example/npm/private/:_authToken=${BUN_AUTH_TOKEN}\n\
+                     //n.example/:_authToken=default\n\
+                     //nb.example/:_auth=dTpw\n\
+                     //lg.example/r/:username=u\n//lg.example/r/:_password=cA==\n";
+        assert_eq!(
+            auth(Some(npmrc), None, None, "@corp/w"),
+            some(
+                "https://corp.example/npm/private/",
+                Some("Bearer npmrc-env")
+            )
+        );
+        assert_eq!(
+            auth(Some(npmrc), None, None, "@other/w"),
+            some("https://other.example/", None)
+        );
+        assert_eq!(
+            auth(Some(npmrc), None, None, "@basic/w"),
+            some("https://nb.example/", Some("Basic dTpw"))
+        );
+        assert_eq!(
+            auth(Some(npmrc), None, None, "@legacy/w"),
+            some("https://lg.example/r/", Some("Basic dTpw"))
+        );
+        assert_eq!(
+            auth(Some(npmrc), None, None, "a"),
+            some("https://n.example/", Some("Bearer default"))
+        );
+        // A bunfig scope registry picks up the `.npmrc` credentials for
+        // its URL; its own token wins over them.
+        let corp_npmrc = "//corp.example/:_authToken=host-wide\n";
+        assert_eq!(
+            auth(
+                Some(corp_npmrc),
+                Some("[install.scopes]\ncorp = \"https://corp.example/x/\"\n"),
+                None,
+                "@corp/w"
+            ),
+            some("https://corp.example/x/", Some("Bearer host-wide"))
+        );
+        assert_eq!(
+            auth(Some(corp_npmrc), Some(bunfig), None, "@corp/w"),
+            some("https://corp.example/npm/", Some("Bearer from-env"))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bun_writes_the_tarball_url_unless_it_is_on_npmjs() {
+        let found = |tarball: &str, from_project| ProjectDist {
+            dist: NpmDist {
+                tarball: tarball.to_string(),
+                integrity: None,
+                shasum: None,
+            },
+            from_project,
+        };
+        let mirror = found("https://m.example/npm/a/-/a-1.0.0.tgz", true);
+        assert_eq!(
+            bun_registry_slot(Some("https://m.example/npm/"), "a", "1.0.0", &mirror),
+            "https://m.example/npm/a/-/a-1.0.0.tgz"
+        );
+        // A mirror's off-path URL is kept as the mirror advertises it.
+        let cdn = found("https://cdn.example/f/a.tgz", true);
+        assert_eq!(
+            bun_registry_slot(Some("https://m.example"), "a", "1.0.0", &cdn),
+            "https://cdn.example/f/a.tgz"
+        );
+        // npmjs, configured or not, or its aliases, is Bun's empty slot:
+        // their documents advertise npmjs tarballs, never re-based.
+        let npmjs = found("https://registry.npmjs.org/a/-/a-1.0.0.tgz", false);
+        for registry in [
+            None,
+            Some("https://registry.npmjs.org/"),
+            Some("http://registry.npmjs.org/"),
+            Some("https://registry.yarnpkg.com/"),
+        ] {
+            assert_eq!(bun_registry_slot(registry, "a", "1.0.0", &npmjs), "");
+            assert_eq!(
+                bun_tarball_url(registry, "a", "1.0.0", &npmjs),
+                "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                "{registry:?}"
+            );
+        }
+        // A fallback from an unreadable mirror re-bases the conventional URL.
+        assert_eq!(
+            bun_tarball_url(Some("https://m.example/npm/"), "a", "1.0.0", &npmjs),
+            "https://m.example/npm/a/-/a-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn bun_env_registry_skips_keys_that_are_not_urls() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            bun_env_registry(env(&[
+                ("BUN_CONFIG_REGISTRY", "not-a-url"),
+                ("NPM_CONFIG_REGISTRY", ""),
+                ("npm_config_registry", "https://n.example/"),
+            ]))
+            .as_deref(),
+            Some("https://n.example/")
+        );
+        assert_eq!(
+            bun_env_registry(env(&[
+                ("BUN_CONFIG_REGISTRY", "http://b.example"),
+                ("npm_config_registry", "https://n.example/"),
+            ]))
+            .as_deref(),
+            Some("http://b.example")
+        );
+        assert_eq!(bun_env_registry(env(&[("BUN_CONFIG_REGISTRY", "x")])), None);
+    }
+
+    const HOSTED: &str = "https://patch.test/npm/u/a-1.0.0.tgz";
+    const WS_ON: &str = "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n";
+    const RC_ON: &str = "lockfile-include-tarball-url=true\n";
+
+    /// A v9 lock: `a@1.0.0` pinned to the hosted tarball, plus `extra`
+    /// `packages:` entries.
+    fn lock(extra: &str) -> String {
+        format!(
+            "lockfileVersion: '9.0'\n\npackages:\n  a@1.0.0:\n    \
+             resolution: {{integrity: sha512-A==, tarball: {HOSTED}}}\n{extra}\n\
+             snapshots:\n  a@1.0.0: {{}}\n"
+        )
+    }
+
+    fn include(text: &str, ws: Option<&str>, rc: Option<&str>, major: Option<u32>) -> bool {
+        pnpm_include_tarball(text, ws, rc, major, |url| url == HOSTED).on
+    }
+
+    fn guessed(text: &str, ws: Option<&str>, rc: Option<&str>, major: Option<u32>) -> bool {
+        pnpm_include_tarball(text, ws, rc, major, |url| url == HOSTED)
+            .guess
+            .is_some()
+    }
+
+    /// #902 tier 3: with no lock evidence and no pnpm major, the settings
+    /// are read as pnpm 10 does, and flagged as a guess exactly when pnpm 9
+    /// (`.npmrc` only) or pnpm >= 11 (the workspace file only), which also
+    /// write a 9.0 lock, would read them the other way.
+    #[test]
+    fn pnpm_include_tarball_flags_the_guess() {
+        let text = lock("");
+        let rc_off = "lockfile-include-tarball-url=false\n";
+        let ws_off = "lockfileIncludeTarballUrl: false\n";
+        // (workspace, npmrc, pnpm 10's reading, guessed)
+        for (ws, rc, on, guess) in [
+            // pnpm >= 11 ignores `.npmrc`.
+            (None, Some(RC_ON), true, true),
+            // pnpm 9 ignores the workspace file.
+            (Some(WS_ON), None, true, true),
+            (Some(WS_ON), Some(rc_off), true, true),
+            (Some(ws_off), Some(RC_ON), false, true),
+            // Every major agrees.
+            (Some(WS_ON), Some(RC_ON), true, false),
+            (None, Some(rc_off), false, false),
+            (None, None, false, false),
+            (Some(ws_off), None, false, false),
+            (Some(ws_off), Some(rc_off), false, false),
+        ] {
+            assert_eq!(include(&text, ws, rc, None), on, "{ws:?} {rc:?}");
+            assert_eq!(guessed(&text, ws, rc, None), guess, "{ws:?} {rc:?}");
+        }
+        // Evidence: a known pnpm major, a pre-9 lock, lock entries.
+        for major in [9, 10, 11] {
+            assert!(!guessed(&text, None, Some(RC_ON), Some(major)));
+            assert!(!guessed(&text, Some(WS_ON), None, Some(major)));
+        }
+        assert!(!guessed(
+            &text.replace("'9.0'", "'6.0'"),
+            None,
+            Some(RC_ON),
+            None
+        ));
+        let conventional = "  c@3.0.0:\n    resolution: {integrity: sha512-C==, \
+                            tarball: https://registry.npmjs.org/c/-/c-3.0.0.tgz}\n";
+        assert!(!guessed(&lock(conventional), None, Some(RC_ON), None));
+        // An unconventional sibling is no evidence: still a guess.
+        let cdn = "  d@1.0.0:\n    resolution: {integrity: sha512-D==, \
+                   tarball: https://cdn.example/d.tgz}\n";
+        assert!(guessed(&lock(cdn), None, Some(RC_ON), None));
+    }
+
+    /// The guess warning names what was followed, which pnpm reads it the
+    /// other way, and remedies that hold on every pnpm: a pin, or the two
+    /// files agreeing (never moving the setting, which pnpm 9 would lose).
+    #[test]
+    fn pnpm_tarball_guess_warning_names_the_disagreeing_pnpm() {
+        let rel = "apps/web/pnpm-lock.yaml";
+        let npmrc_only = PnpmTarballGuess {
+            workspace: None,
+            npmrc: Some(true),
+        };
+        let detail = pnpm_tarball_guess_warning(rel, "apps/web/", npmrc_only, false, &["a@1.0.0"]);
+        for needle in [
+            "apps/web/pnpm-lock.yaml: nothing shows which pnpm wrote this lock",
+            "no unpinned registry entry that shows the setting",
+            "from `lockfile-include-tarball-url=true` in apps/web/.npmrc",
+            "restores a@1.0.0 with `tarball:`",
+            "pnpm >= 11 reads only apps/web/pnpm-workspace.yaml (`lockfileIncludeTarballUrl` \
+             unset) and would leave it out",
+            "apps/web/package.json `packageManager`",
+            "reinstall",
+            "the same value",
+            "restoring apps/web/pnpm-lock.yaml from version control and re-running",
+        ] {
+            assert!(detail.contains(needle), "{needle}: {detail}");
+        }
+        assert!(!detail.contains("pnpm 9 reads"), "{detail}");
+        assert!(!detail.contains("move the setting"), "{detail}");
+        assert!(!detail.contains("wrote `tarball:`"), "{detail}");
+
+        let workspace_off = PnpmTarballGuess {
+            workspace: Some(false),
+            npmrc: Some(true),
+        };
+        let detail =
+            pnpm_tarball_guess_warning("pnpm-lock.yaml", "", workspace_off, false, &["a@1.0.0"]);
+        for needle in [
+            "from `lockfileIncludeTarballUrl: false` in pnpm-workspace.yaml",
+            "restores a@1.0.0 without `tarball:`",
+            "pnpm 9 reads only .npmrc (`lockfile-include-tarball-url=true`) and would keep it",
+        ] {
+            assert!(detail.contains(needle), "{needle}: {detail}");
+        }
+        assert!(!detail.contains("pnpm >= 11 reads"), "{detail}");
+
+        // A Rush lock: the pin is rush.json's, at the Rush root.
+        let detail = pnpm_tarball_guess_warning(
+            "repo/common/config/rush/pnpm-lock.yaml",
+            "repo/common/config/rush/",
+            npmrc_only,
+            true,
+            &["a@1.0.0"],
+        );
+        assert!(
+            detail.contains("no repo/rush.json `pnpmVersion`"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("set repo/rush.json `pnpmVersion`"),
+            "{detail}"
+        );
+        assert!(!detail.contains("packageManager"), "{detail}");
+        assert!(!detail.contains(".modules.yaml"), "{detail}");
+    }
+
+    #[test]
+    fn rush_lock_roots_and_pnpm_version() {
+        assert_eq!(
+            rush_lock_root("common/config/rush/pnpm-lock.yaml"),
+            Some("")
+        );
+        assert_eq!(
+            rush_lock_root("repo/common/config/rush/pnpm-lock.yaml"),
+            Some("repo/")
+        );
+        assert_eq!(
+            rush_lock_root("common/config/subspaces/web/pnpm-lock.yaml"),
+            Some("")
+        );
+        assert_eq!(rush_lock_root("xcommon/config/rush/pnpm-lock.yaml"), None);
+        assert_eq!(rush_lock_root("pnpm-lock.yaml"), None);
+        assert_eq!(
+            rush_lock_root("common/config/subspaces/pnpm-lock.yaml"),
+            None
+        );
+        let rush_json =
+            "{\n  // \"pnpmVersion\": \"8.0.0\",\n  /* c */ \"pnpmVersion\": \"9.15.9\",\n  \
+                         \"projects\": [],\n}\n";
+        assert_eq!(rush_json_pnpm_major(rush_json), Some(9));
+        assert_eq!(rush_json_pnpm_major("{ \"npmVersion\": \"10.0.0\" }"), None);
+    }
+
+    /// #902 tier 1: the lock's unpinned registry resolutions decide.
+    #[test]
+    fn pnpm_include_tarball_follows_lock_evidence() {
+        let bare = "  b@2.0.0:\n    resolution: {integrity: sha512-B==}\n";
+        let conventional = "  c@3.0.0:\n    resolution: {integrity: sha512-C==, \
+                            tarball: https://registry.npmjs.org/c/-/c-3.0.0.tgz}\n";
+        // A bare sibling: the setting was off, whatever .npmrc says.
+        assert!(!include(&lock(bare), None, Some(RC_ON), None));
+        assert!(!include(&lock(bare), Some(WS_ON), Some(RC_ON), Some(10)));
+        // A derivable tarball on the sibling: it was on, with no setting seen.
+        assert!(include(&lock(conventional), None, None, Some(9)));
+        // Mixed: bare wins (the conventional one is under a second registry).
+        let mixed = format!("{bare}{conventional}");
+        assert!(!include(&lock(&mixed), None, Some(RC_ON), None));
+        // Unconventional, `file:`, git and integrity-less entries are no
+        // evidence either way: the settings decide.
+        for silent in [
+            "  d@1.0.0:\n    resolution: {integrity: sha512-D==, tarball: https://cdn.example/d.tgz}\n",
+            "  e@file:.socket/vendor/npm/x/e-1.0.0.tgz:\n    resolution: {integrity: sha512-E==, tarball: file:.socket/vendor/npm/x/e-1.0.0.tgz}\n",
+            "  f@1.0.0:\n    resolution: {integrity: sha512-F==, tarball: file:x.tgz}\n",
+            "  g@1.0.0:\n    resolution: {type: git, repo: https://g.example/g, commit: abc}\n",
+            "  h@1.0.0:\n    resolution: {tarball: https://registry.npmjs.org/h/-/h-1.0.0.tgz}\n",
+        ] {
+            assert!(include(&lock(silent), None, Some(RC_ON), None), "{silent}");
+            assert!(!include(&lock(silent), None, None, None), "{silent}");
+        }
+    }
+
+    /// #902: pnpm 11+'s env lockfile document (as `pnpm add --config`
+    /// writes it, pnpm 11.27.0) records config dependencies bare even under
+    /// lockfileIncludeTarballUrl; only the main document is evidence.
+    #[test]
+    fn pnpm_include_tarball_ignores_the_env_lockfile_document() {
+        let env = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    \
+                   configDependencies:\n      is-number:\n        specifier: 7.0.0\n        \
+                   version: 7.0.0\n\npackages:\n\n  is-number@7.0.0:\n    \
+                   resolution: {integrity: sha512-N==}\n\nsnapshots:\n\n  \
+                   is-number@7.0.0: {}\n\n---\n";
+        let conventional = "  c@3.0.0:\n    resolution: {integrity: sha512-C==, \
+                            tarball: https://registry.npmjs.org/c/-/c-3.0.0.tgz}\n";
+        let two_docs = format!("{env}{}", lock(conventional));
+        assert!(include(&two_docs, None, None, Some(11)));
+        // No evidence in the main document: the settings decide, not the
+        // env document's bare entry.
+        let pinned_only = format!("{env}{}", lock(""));
+        assert!(include(&pinned_only, Some(WS_ON), None, Some(11)));
+        assert!(!include(&pinned_only, None, None, Some(11)));
+        // With no install record or pin, the env document itself proves
+        // pnpm >= 11, which ignores `.npmrc`'s lockfile-include-tarball-url
+        // (a fresh clone of the issue's repro).
+        assert!(!include(&pinned_only, None, Some(RC_ON), None));
+        assert!(include(&pinned_only, Some(WS_ON), Some(RC_ON), None));
+        // A one-document lock with no pin keeps pnpm 10's reading.
+        assert!(include(&lock(""), None, Some(RC_ON), None));
+        // A lone leading `---` marker is no env document.
+        let marker_only = format!("---\n{}", lock(""));
+        assert!(include(&marker_only, None, Some(RC_ON), None));
+        // A bare entry in the main document still proves it off.
+        let bare = "  b@2.0.0:\n    resolution: {integrity: sha512-B==}\n";
+        assert!(!include(
+            &format!("{env}{}", lock(bare)),
+            Some(WS_ON),
+            None,
+            Some(11)
+        ));
+    }
+
+    /// #902 tier 2: the settings file the installed pnpm major reads.
+    #[test]
+    fn pnpm_include_tarball_reads_the_settings_file_of_the_pnpm_major() {
+        let text = lock("");
+        // pnpm <= 9 ignores pnpm-workspace.yaml settings.
+        assert!(!include(&text, Some(WS_ON), None, Some(9)));
+        assert!(include(&text, None, Some(RC_ON), Some(9)));
+        // pnpm 10 reads both, the workspace file winning.
+        assert!(include(&text, Some(WS_ON), None, Some(10)));
+        assert!(include(&text, None, Some(RC_ON), Some(10)));
+        let ws_off = "lockfileIncludeTarballUrl: false\n";
+        assert!(!include(&text, Some(ws_off), Some(RC_ON), Some(10)));
+        // pnpm 11+ ignores pnpm settings in .npmrc.
+        for major in [11, 12] {
+            assert!(!include(&text, None, Some(RC_ON), Some(major)));
+            assert!(include(&text, Some(WS_ON), None, Some(major)));
+        }
+        // Unknown major: pnpm 10's reading.
+        assert!(include(&text, Some(WS_ON), None, None));
+        assert!(include(&text, None, Some(RC_ON), None));
+        // js-yaml reads `True` / `TRUE` as true in the workspace file.
+        for on in ["True", "TRUE", "'true'"] {
+            let ws = format!("lockfileIncludeTarballUrl: {on}\n");
+            assert!(include(&text, Some(&ws), None, Some(11)), "{on}");
+            assert!(include(&text, Some(&ws), None, None), "{on}");
+        }
+        // Only pnpm <= 8 writes a pre-9 lock or a shrinkwrap.yaml.
+        let v6 = text.replace("'9.0'", "'6.0'");
+        assert!(!include(&v6, Some(WS_ON), None, None));
+        assert!(include(&v6, None, Some(RC_ON), None));
+        let shrinkwrap = format!(
+            "shrinkwrapVersion: 3\n{}",
+            text.replace("lockfileVersion: '9.0'\n", "")
+        );
+        assert!(!include(&shrinkwrap, Some(WS_ON), None, None));
+    }
+
+    #[test]
+    fn pnpm_major_from_install_record_and_package_json() {
+        let json = "{\n  \"layoutVersion\": 5,\n  \"packageManager\": \"pnpm@11.28.3\"\n}\n";
+        assert_eq!(modules_yaml_pnpm_major(json), Some(11));
+        assert_eq!(
+            modules_yaml_pnpm_major("\u{feff}layoutVersion: 5\npackageManager: pnpm@9.15.9\n"),
+            Some(9)
+        );
+        assert_eq!(
+            modules_yaml_pnpm_major("packageManager: 'pnpm@8.6.0'\n"),
+            Some(8)
+        );
+        assert_eq!(
+            modules_yaml_pnpm_major("packageManager: yarn@4.0.0\n"),
+            None
+        );
+        assert_eq!(modules_yaml_pnpm_major("{}"), None);
+        assert_eq!(
+            package_json_pnpm_major(r#"{"packageManager":"pnpm@10.4.1+sha512.abc"}"#),
+            Some(10)
+        );
+        assert_eq!(
+            package_json_pnpm_major(r#"{"packageManager":"npm@10.0.0"}"#),
+            None
+        );
+        assert_eq!(package_json_pnpm_major("not json"), None);
+    }
+
+    #[test]
+    fn pnpm_reads_the_npmrc_registry_and_scope_registries() {
+        let rc_lookup = |rc, name| pnpm_lookup_registry(None, rc, None, name);
+        let rc = "registry=https://m.example/npm/\n@s:registry = https://s.example/\n";
+        assert_eq!(
+            rc_lookup(Some(rc), "a").as_deref(),
+            Some("https://m.example/npm/")
+        );
+        assert_eq!(
+            rc_lookup(Some(rc), "@s/a").as_deref(),
+            Some("https://s.example/")
+        );
+        // Another scope, and a name merely starting with the scope's text,
+        // resolve against `registry`.
+        assert_eq!(
+            rc_lookup(Some(rc), "@t/a").as_deref(),
+            Some("https://m.example/npm/")
+        );
+        assert_eq!(
+            rc_lookup(Some("@s:registry=https://s.example\n"), "a"),
+            None
+        );
+        assert_eq!(rc_lookup(None, "@s/a"), None);
+        // An unexpanded `${VAR}` is never fetched as a URL; a scoped name
+        // whose scope registry holds one keeps the default, not `registry`.
+        assert_eq!(rc_lookup(Some("registry=${MIRROR}\n"), "a"), None);
+        assert_eq!(
+            rc_lookup(
+                Some("registry=https://m.example\n@s:registry=${S}/npm\n"),
+                "@s/a"
+            ),
+            None
+        );
+        // pnpm derives a scoped package's tarball under its scope registry,
+        // so that registry's conventional URL stays out of the lock.
+        let scope = rc_lookup(Some(rc), "@s/a");
+        assert!(registry_derives_tarball(
+            scope.as_deref(),
+            "@s/a",
+            "1.0.0",
+            "https://s.example/@s/a/-/a-1.0.0.tgz"
+        ));
+    }
+
+    /// #919: pnpm 10+ also read registries from pnpm-workspace.yaml, each
+    /// major its own way (measured with pnpm 9.15, 10.34 and 11.27).
+    #[test]
+    fn pnpm_reads_the_workspace_registries_of_the_pnpm_major() {
+        let rc = "registry=https://rc.example/\n@s:registry=https://rc-s.example/\n";
+        let ws_registry = "packages:\n  - '.'\nregistry: https://ws.example/\n";
+        let ws_map = "registries:\n  default: https://ws-default.example/\n  \
+                      '@s': https://ws-s.example/\n  # '@t': x\n  \
+                      \"@u\": \"https://ws-u.example/\" # c\n";
+        let get = pnpm_lookup_registry;
+        // pnpm <= 9 reads only .npmrc.
+        for major in [Some(8), Some(9)] {
+            assert_eq!(get(Some(ws_registry), None, major, "a"), None);
+            assert_eq!(get(Some(ws_map), None, major, "@s/a"), None);
+            assert_eq!(
+                get(Some(ws_map), Some(rc), major, "@s/a").as_deref(),
+                Some("https://rc-s.example/")
+            );
+        }
+        // pnpm 10: a workspace `registries` map replaces .npmrc's wholesale;
+        // a workspace `registry:` is ignored.
+        let ten = Some(10);
+        assert_eq!(
+            get(Some(ws_registry), Some(rc), ten, "a").as_deref(),
+            Some("https://rc.example/")
+        );
+        assert_eq!(get(Some(ws_registry), None, ten, "a"), None);
+        assert_eq!(
+            get(Some(ws_map), Some(rc), ten, "@s/a").as_deref(),
+            Some("https://ws-s.example/")
+        );
+        assert_eq!(
+            get(
+                Some("registries:\n  default: https://d.example/\n"),
+                Some(rc),
+                ten,
+                "@s/a"
+            )
+            .as_deref(),
+            Some("https://d.example/")
+        );
+        assert_eq!(
+            get(Some(ws_map), Some(rc), ten, "a").as_deref(),
+            Some("https://ws-default.example/")
+        );
+        // pnpm 11+ and an unknown major: merged, the workspace winning per key.
+        for major in [Some(11), Some(12), None] {
+            assert_eq!(
+                get(Some(ws_registry), Some(rc), major, "a").as_deref(),
+                Some("https://ws.example/")
+            );
+            // .npmrc's scope registry beats the workspace's `registry:`.
+            assert_eq!(
+                get(Some(ws_registry), Some(rc), major, "@s/a").as_deref(),
+                Some("https://rc-s.example/")
+            );
+            assert_eq!(
+                get(Some(ws_map), Some(rc), major, "@s/a").as_deref(),
+                Some("https://ws-s.example/")
+            );
+            assert_eq!(
+                get(Some(ws_map), Some(rc), major, "@u/a").as_deref(),
+                Some("https://ws-u.example/")
+            );
+            // A commented-out scope falls through to `default`.
+            assert_eq!(
+                get(Some(ws_map), Some(rc), major, "@t/a").as_deref(),
+                Some("https://ws-default.example/")
+            );
+            let both = format!("{ws_registry}{ws_map}");
+            assert_eq!(
+                get(Some(&both), Some(rc), major, "a").as_deref(),
+                Some("https://ws.example/")
+            );
+            assert_eq!(
+                get(Some("registry: ${MIRROR}\n"), Some(rc), major, "a"),
+                None
+            );
+        }
+    }
 
     #[test]
     fn berry_reads_the_project_registry_except_for_npm_scopes() {
@@ -1258,5 +2984,68 @@ mod tests {
             Some("https://b.example")
         );
         assert_eq!(yaml_top_level_value("packages: []\n", "registry"), None);
+    }
+
+    fn write(root: &std::path::Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A member lock (`sharedWorkspaceLockfile: false`) rolled back from
+    /// the member itself reads the workspace root's settings above the
+    /// project root, as pnpm does; a path shaped like a Rush subspace lock
+    /// is a Rush lock only with its `rush.json`.
+    #[tokio::test]
+    async fn pnpm_settings_come_from_the_governing_workspace_root() {
+        use super::super::View;
+        use super::{pnpm_settings_prefix, read_sibling};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(dir.path()).unwrap();
+        write(
+            &ws,
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'packages/*'\n  - 'common/config/subspaces/*'\n",
+        );
+        write(&ws, ".npmrc", "registry=https://ws.example/\n");
+        write(&ws, "packages/a/pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(
+            &ws,
+            "packages/a/.npmrc",
+            "registry=https://member.example/\n",
+        );
+        let sub = "common/config/subspaces/x/pnpm-lock.yaml";
+        write(&ws, sub, "lockfileVersion: '9.0'\n");
+
+        let member = ws.join("packages/a");
+        let mut view = View::new(&member);
+        let prefix = pnpm_settings_prefix(&mut view, "pnpm-lock.yaml").await;
+        // The prefix is shown without Windows' verbatim `\\?\` prefix,
+        // which `canonicalize` added to `ws`.
+        let shown = crate::utils::pnpm_workspace::without_verbatim_prefix(ws.clone());
+        assert_eq!(
+            prefix,
+            format!("{}{}", shown.display(), std::path::MAIN_SEPARATOR)
+        );
+        assert_eq!(
+            read_sibling(&mut view, &prefix, ".npmrc").await.as_deref(),
+            Some("registry=https://ws.example/\n")
+        );
+
+        // Inside the view, as before.
+        let mut view = View::new(&ws);
+        assert_eq!(
+            pnpm_settings_prefix(&mut view, "packages/a/pnpm-lock.yaml").await,
+            ""
+        );
+        // Not a Rush lock without rush.json: a listed member.
+        assert_eq!(pnpm_settings_prefix(&mut view, sub).await, "");
+        write(&ws, "rush.json", "{}");
+        let mut view = View::new(&ws);
+        assert_eq!(
+            pnpm_settings_prefix(&mut view, sub).await,
+            "common/config/subspaces/x/"
+        );
     }
 }

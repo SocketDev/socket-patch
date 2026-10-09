@@ -20,26 +20,13 @@
 #[path = "vendor_ecosystem_fixtures/mod.rs"]
 mod fx;
 
+#[path = "common/envelope.rs"]
+mod envelope;
+
+use envelope::{event_triples, parse_json_envelope};
 use fx::{masked_tree, Fixture};
 
 const OFF: (&str, &str) = ("SOCKET_PATCH_SWITCH_OFF", "group_commit");
-
-fn events(stdout: &str) -> Vec<(String, String, String)> {
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("envelope JSON: {e}\n{stdout}"));
-    v["events"]
-        .as_array()
-        .expect("events")
-        .iter()
-        .map(|e| {
-            (
-                e["purl"].as_str().unwrap_or_default().to_string(),
-                e["action"].as_str().unwrap_or_default().to_string(),
-                e["errorCode"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
 
 /// The paths whose bytes differ between two trees (or exist in one only).
 fn differing(a: &[(String, String)], b: &[(String, String)]) -> Vec<String> {
@@ -70,7 +57,7 @@ fn group_commit_ends_where_per_package_commits_end_for_every_ecosystem() {
             oracle_code, 0,
             "{eco} (oracle): {oracle_stdout}\n{oracle_stderr}"
         );
-        let applied: Vec<_> = events(&stdout)
+        let applied: Vec<_> = event_triples(&parse_json_envelope(&stdout))
             .into_iter()
             .filter(|(_, action, _)| action == "applied")
             .map(|(purl, ..)| purl)
@@ -81,8 +68,8 @@ fn group_commit_ends_where_per_package_commits_end_for_every_ecosystem() {
             "{eco}: both packages vendor: {stdout}"
         );
         assert_eq!(
-            events(&stdout),
-            events(&oracle_stdout),
+            event_triples(&parse_json_envelope(&stdout)),
+            event_triples(&parse_json_envelope(&oracle_stdout)),
             "{eco}: same events"
         );
         assert_eq!(
@@ -160,7 +147,7 @@ fn a_partial_failure_commits_the_packages_that_succeeded() {
         let (oracle_code, oracle_stdout, _) = oracle.vendor(&[], &[OFF]);
         assert_eq!(code, oracle_code, "{eco}: {stdout}\n{oracle_stdout}");
         assert_ne!(code, 0, "{eco}: the failed package fails the run");
-        let ev = events(&stdout);
+        let ev = event_triples(&parse_json_envelope(&stdout));
         assert!(
             ev.iter()
                 .any(|(p, a, _)| *p == grouped.patches[0].purl && a == "applied"),
@@ -171,7 +158,11 @@ fn a_partial_failure_commits_the_packages_that_succeeded() {
                 .any(|(p, a, _)| *p == grouped.patches[1].purl && a == "applied"),
             "{eco}: {stdout}"
         );
-        assert_eq!(ev, events(&oracle_stdout), "{eco}: same events");
+        assert_eq!(
+            ev,
+            event_triples(&parse_json_envelope(&oracle_stdout)),
+            "{eco}: same events"
+        );
         assert_eq!(
             masked_tree(&grouped.root),
             masked_tree(&oracle.root),
@@ -244,9 +235,12 @@ fn a_crash_mid_loop_leaves_the_pre_run_commit_points() {
     }
 }
 
+/// Maven is not in the list: its JVM tree is written durably as it goes
+/// (`vendor::jvm::apply::write_plan`), so a Maven run leaves the artifact
+/// barrier nothing to sync and the failpoint first fires after the commit.
 #[test]
 fn a_crash_at_the_artifact_barrier_leaves_the_pre_run_commit_points() {
-    for eco in ["pnpm", "golang", "maven"] {
+    for eco in ["pnpm", "golang", "nuget"] {
         crash_then_rerun(eco, "durability_barrier", true);
     }
 }

@@ -10,6 +10,26 @@ name: Pipenv compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Only this ecosystem's own files. A change to shared engine code
+    # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
+    # push to main (when it is in the push filter below) or nightly, or on
+    # demand via workflow_dispatch on the PR branch;
+    # ci.yml's per-ecosystem blocking slice still runs on every PR and in
+    # the merge queue (#1198).
+    paths:
+      - '.github/actions/upload-artifact/**'
+      - '.github/workflows/pipenv-compatibility.yml'
+      - 'crates/*/src/**/*pipenv*'
+      - 'crates/*/src/**/*pipenv*/**'
+      - 'crates/socket-patch-core/src/vendor/pypi.rs'
+      - 'crates/socket-patch-core/src/crawlers/python_crawler.rs'
+      - 'scripts/backtest-pipenv.py'
+      - 'scripts/tests/test_backtest_harnesses.py'
+  push:
+    branches: [main]
+    # The ecosystem's pre-#1198 relevance set (the shared engine code its
+    # cells run through), its PR paths and the toolchain files. A main
+    # push outside this set waits for the nightly run below.
     paths:
       - '.github/actions/upload-artifact/**'
       - 'crates/socket-patch-core/src/patch/redirect/pipenv.rs'
@@ -28,8 +48,17 @@ on:
       - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/src/commands/vex_sources.rs'
       - '.github/workflows/pipenv-compatibility.yml'
-  push:
-    branches: [main]
+      - 'crates/*/src/**/*pipenv*'
+      - 'crates/*/src/**/*pipenv*/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly full matrix, so a main change outside the push filter
+    # still gets a run within a day.
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:

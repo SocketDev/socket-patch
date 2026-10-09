@@ -35,7 +35,8 @@ fn case(fixture: &'static str) -> Case {
     }
 }
 
-async fn assert_parity(case: Case) {
+/// Returns the (shared) `redirect` block so a case can assert on it too.
+async fn assert_parity(case: Case) -> Value {
     let dir = fixtures_root().join("redirect").join(case.fixture);
     let server = MockServer::start().await;
     let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
@@ -112,6 +113,7 @@ async fn assert_parity(case: Case) {
         "{}",
         case.fixture
     );
+    disk_redirect
 }
 
 #[tokio::test]
@@ -167,6 +169,39 @@ async fn parity_rush() {
         ..case("npm/pnpm/nested-rush-lock")
     })
     .await;
+}
+
+/// Rush subspaces keep a repo-state.json (the pnpmShrinkwrapHash carrier)
+/// next to each subspace lock, and there is no common one (#714). Both the
+/// disk run and the in-memory selector must see it, so both emit the
+/// stale-hash warning; parity alone would pass with neither emitting it.
+#[tokio::test]
+async fn parity_rush_subspace() {
+    let lock = std::fs::read(
+        fixtures_root()
+            .join("redirect/npm/pnpm/nested-rush-lock/input/common/config/rush/pnpm-lock.yaml"),
+    )
+    .unwrap();
+    let redirect = assert_parity(Case {
+        extra: vec![
+            ("rush.json", b"{}\n".to_vec()),
+            ("common/config/subspaces/x/pnpm-lock.yaml", lock),
+            (
+                "common/config/subspaces/x/repo-state.json",
+                b"{}\n".to_vec(),
+            ),
+        ],
+        ..case("npm/pnpm/nested-rush-lock")
+    })
+    .await;
+    let codes: Vec<&str> = redirect["warnings"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|w| w["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        codes.contains(&"redirect_rush_repo_state_stale"),
+        "a subspace repo-state.json must trigger the stale-hash warning; got {codes:?}"
+    );
 }
 
 #[tokio::test]
@@ -1225,4 +1260,538 @@ async fn memory_negation_reincludes_a_default_ignored_root() {
         "{}",
         describe(&memory_changed)
     );
+}
+
+/// A pnpm workspace (#492): the root `pnpm-workspace.yaml` (`ws`), a root
+/// `package.json`, the root lock when given, `extra` files, and each
+/// `members` directory with a manifest and the golden pnpm fixture's lock
+/// (left-pad as a direct dependency).
+fn pnpm_workspace(
+    ws: &str,
+    root_lock: Option<&str>,
+    members: &[&str],
+    extra: &[(&str, &str)],
+) -> BTreeMap<String, Vec<u8>> {
+    let lock = read_fixture("redirect/npm/pnpm/basic/input/pnpm-lock.yaml");
+    let mut files = BTreeMap::from([
+        ("pnpm-workspace.yaml".to_string(), ws.as_bytes().to_vec()),
+        (
+            "package.json".to_string(),
+            br#"{ "name": "root", "private": true }"#.to_vec(),
+        ),
+    ]);
+    if let Some(text) = root_lock {
+        files.insert("pnpm-lock.yaml".into(), text.as_bytes().to_vec());
+    }
+    for member in members {
+        files.insert(
+            format!("{member}/package.json"),
+            format!(r#"{{ "name": "{member}", "dependencies": {{ "left-pad": "1.3.0" }} }}"#)
+                .into_bytes(),
+        );
+        files.insert(format!("{member}/pnpm-lock.yaml"), lock.clone());
+    }
+    for (rel, text) in extra {
+        files.insert(rel.to_string(), text.as_bytes().to_vec());
+    }
+    files
+}
+
+/// The root lock of a workspace whose members have no lock of their own.
+const PNPM_ROOT_ONLY_LOCK: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+
+/// The in-memory run over `files` (straight, and through path selection)
+/// against the disk run from the repo root: both memory runs have the
+/// project `roots` (a member keeps a root of its own only with another
+/// lock), none fails, the root project's `redirect` block and every changed
+/// byte match the disk run, and no other project redirects anything.
+/// Returns the disk run's `redirect` block and changed files.
+async fn assert_pnpm_workspace_parity(
+    files: &BTreeMap<String, Vec<u8>>,
+    trust_lockfile_config: bool,
+) -> (Value, BTreeMap<String, Vec<u8>>) {
+    assert_pnpm_workspace_parity_with_roots(files, trust_lockfile_config, &[""]).await
+}
+
+async fn assert_pnpm_workspace_parity_with_roots(
+    files: &BTreeMap<String, Vec<u8>>,
+    trust_lockfile_config: bool,
+    roots: &[&str],
+) -> (Value, BTreeMap<String, Vec<u8>>) {
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    mount_api(&server, &patches).await;
+    let extra: &[&str] = if trust_lockfile_config {
+        &[]
+    } else {
+        &["--no-trust-lockfile-config"]
+    };
+    let disk = run_disk_with(&server, files, false, extra);
+    let mut opts = options(false);
+    opts.trust_lockfile_config = Some(trust_lockfile_config);
+    let straight = run_engine(&server, build_input(files, &[], opts)).await;
+    let mut selected = selected_input(files);
+    selected.options.trust_lockfile_config = Some(trust_lockfile_config);
+    let through_selection = run_engine(&server, selected).await;
+    for (how, memory) in [("straight", &straight), ("selection", &through_selection)] {
+        let found: Vec<&str> = memory.projects.iter().map(|p| p.root.as_str()).collect();
+        assert_eq!(
+            found, roots,
+            "{how}: member locks belong to the workspace root"
+        );
+        for project in &memory.projects {
+            assert!(
+                project.error.is_none(),
+                "{how}: {}: {:?}",
+                project.root,
+                project.error
+            );
+        }
+        let project = memory
+            .projects
+            .iter()
+            .find(|p| p.root.is_empty())
+            .unwrap_or_else(|| panic!("{how}: no workspace root project"));
+        assert!(project.error.is_none(), "{how}: {:?}", project.error);
+        assert_eq!(
+            project.redirect, disk.envelope["redirect"],
+            "{how}: redirect block differs\nstderr: {}",
+            disk.stderr
+        );
+        for other in memory.projects.iter().filter(|p| !p.root.is_empty()) {
+            assert!(other.redirected.is_empty(), "{how}: {}", other.root);
+        }
+        let changed = engine_changed(memory);
+        assert_eq!(
+            changed,
+            disk.changed,
+            "{how}\nmemory:\n{}\ndisk:\n{}",
+            describe(&changed),
+            describe(&disk.changed)
+        );
+    }
+    (disk.envelope["redirect"].clone(), disk.changed)
+}
+
+/// #492: under `sharedWorkspaceLockfile: false` (or pnpm 7's `.npmrc`
+/// spelling with no root lock at all) both engines pin every member's own
+/// lock from the workspace root and trust them in the root file.
+#[tokio::test]
+async fn parity_pnpm_member_locks_are_pinned_from_the_workspace_root() {
+    let members = ["packages/a", "packages/b"];
+    for files in [
+        pnpm_workspace(
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+            Some(PNPM_ROOT_ONLY_LOCK),
+            &members,
+            &[],
+        ),
+        pnpm_workspace(
+            "packages:\n  - 'packages/*'\n",
+            None,
+            &members,
+            &[(".npmrc", "shared-workspace-lockfile=false\n")],
+        ),
+    ] {
+        let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+        assert_eq!(redirect["redirected"], 1, "{redirect:#}");
+        let paths: Vec<&str> = changed.keys().map(String::as_str).collect();
+        assert_eq!(
+            paths,
+            [
+                "packages/a/pnpm-lock.yaml",
+                "packages/b/pnpm-lock.yaml",
+                "pnpm-workspace.yaml"
+            ]
+        );
+        assert!(String::from_utf8_lossy(&changed["pnpm-workspace.yaml"])
+            .ends_with("trustLockfile: true\n"));
+    }
+}
+
+/// #492: the trust auto-config over member locks is the same in both
+/// engines: an explicit root-file value is respected, an existing `true`
+/// is kept, and with the auto-config off nothing but the locks is written.
+#[tokio::test]
+async fn parity_pnpm_member_lock_trust_config() {
+    let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+    for (trust_line, auto_config) in [
+        ("trustLockfile: false\n", true),
+        ("trustLockfile: true\n", true),
+        ("", false),
+    ] {
+        let files = pnpm_workspace(
+            &format!("{ws}{trust_line}"),
+            Some(PNPM_ROOT_ONLY_LOCK),
+            &["packages/a"],
+            &[],
+        );
+        let (redirect, changed) = assert_pnpm_workspace_parity(&files, auto_config).await;
+        let paths: Vec<&str> = changed.keys().map(String::as_str).collect();
+        assert_eq!(paths, ["packages/a/pnpm-lock.yaml"], "{trust_line:?}");
+        let codes = redirect["warnings"].to_string();
+        assert!(codes.contains("redirect_pnpm_trust_lockfile"), "{codes}");
+    }
+}
+
+/// #492 + #556: a member's branch lock under `gitBranchLockfile` refuses
+/// every pnpm pin in both engines, nothing written.
+#[tokio::test]
+async fn parity_pnpm_member_branch_lock_refusal() {
+    let files = pnpm_workspace(
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\ngitBranchLockfile: true\n",
+        Some(PNPM_ROOT_ONLY_LOCK),
+        &["packages/a"],
+        &[(
+            "packages/a/pnpm-lock.feature.yaml",
+            "lockfileVersion: '9.0'\n",
+        )],
+    );
+    let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+    assert!(changed.is_empty(), "{}", describe(&changed));
+    assert!(
+        redirect["warnings"]
+            .to_string()
+            .contains("redirect_pnpm_git_branch_lockfile"),
+        "{redirect:#}"
+    );
+}
+
+/// #492: a member lock beside a shared root lock (one listing the member's
+/// importer) is a stale leftover pnpm never reads: both engines pin the
+/// root lock alone.
+#[tokio::test]
+async fn parity_pnpm_stale_member_lock_under_a_shared_lock() {
+    let lock =
+        String::from_utf8(read_fixture("redirect/npm/pnpm/basic/input/pnpm-lock.yaml")).unwrap();
+    let shared = lock.replacen("  .:\n", "  .: {}\n  packages/a:\n", 1);
+    assert_ne!(shared, lock);
+    let files = pnpm_workspace(
+        "packages:\n  - 'packages/*'\n",
+        Some(&shared),
+        &["packages/a"],
+        &[],
+    );
+    let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+    assert_eq!(redirect["redirected"], 1, "{redirect:#}");
+    let paths: Vec<&str> = changed.keys().map(String::as_str).collect();
+    assert_eq!(paths, ["pnpm-lock.yaml", "pnpm-workspace.yaml"]);
+}
+
+/// The two in-memory runs of `files`: straight, and through path selection
+/// (its `roots` passed back as `projectRoots`), both with `opts`.
+async fn pnpm_memory_runs(
+    server: &MockServer,
+    files: &BTreeMap<String, Vec<u8>>,
+    opts: &socket_patch_cli::hosted_memory::HostedScanOptions,
+) -> [(
+    &'static str,
+    socket_patch_cli::hosted_memory::HostedScanOutput,
+); 2] {
+    let straight = run_engine(server, build_input(files, &[], opts.clone())).await;
+    let mut selected = selected_input(files);
+    let roots = selected.options.project_roots.take();
+    selected.options = socket_patch_cli::hosted_memory::HostedScanOptions {
+        project_roots: roots,
+        ..opts.clone()
+    };
+    let through_selection = run_engine(server, selected).await;
+    [("straight", straight), ("selection", through_selection)]
+}
+
+fn project_roots(output: &socket_patch_cli::hosted_memory::HostedScanOutput) -> Vec<&str> {
+    output.projects.iter().map(|p| p.root.as_str()).collect()
+}
+
+fn changed_paths(output: &socket_patch_cli::hosted_memory::HostedScanOutput) -> Vec<&str> {
+    output
+        .changed_files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect()
+}
+
+async fn pnpm_server() -> MockServer {
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    mount_api(
+        &server,
+        &patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri())),
+    )
+    .await;
+    server
+}
+
+/// #492: a member holding another lock (npm, yarn, Cargo) stays a root of
+/// its own for that lock, while its pnpm lock is pinned from the workspace
+/// root, as on disk; only the workspace root's project redirects.
+#[tokio::test]
+async fn parity_pnpm_member_with_another_lock_keeps_its_root() {
+    let files = pnpm_workspace(
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        Some(PNPM_ROOT_ONLY_LOCK),
+        &["packages/a", "packages/b"],
+        &[(
+            "packages/a/package-lock.json",
+            r#"{ "name": "a", "lockfileVersion": 3, "requires": true, "packages": { "": { "name": "a" } } }"#,
+        )],
+    );
+    let (_, changed) =
+        assert_pnpm_workspace_parity_with_roots(&files, true, &["", "packages/a"]).await;
+    let paths: Vec<&str> = changed.keys().map(String::as_str).collect();
+    assert_eq!(
+        paths,
+        [
+            "packages/a/pnpm-lock.yaml",
+            "packages/b/pnpm-lock.yaml",
+            "pnpm-workspace.yaml"
+        ]
+    );
+}
+
+/// #492: a member lock whose workspace root cannot be confirmed to read it
+/// (an unreadable root file, a glob the matcher does not model, no package
+/// manifest beside the lock, or a shared workspace with no root lock to
+/// install from) is never silently dropped: it stays a root of its own,
+/// pinned with the trust auto-config off and refused with it on, as before.
+#[tokio::test]
+async fn an_unconfirmed_pnpm_member_keeps_its_lock() {
+    let server = pnpm_server().await;
+    let per_member = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+    let unmodeled = pnpm_workspace(
+        "packages:\n  - 'packages/{a,b}'\nsharedWorkspaceLockfile: false\n",
+        Some(PNPM_ROOT_ONLY_LOCK),
+        &["packages/a"],
+        &[],
+    );
+    let mut no_manifest =
+        pnpm_workspace(per_member, Some(PNPM_ROOT_ONLY_LOCK), &["packages/a"], &[]);
+    no_manifest.remove("packages/a/package.json");
+    let shared_no_root_lock =
+        pnpm_workspace("packages:\n  - 'packages/*'\n", None, &["packages/a"], &[]);
+    let readable = pnpm_workspace(per_member, Some(PNPM_ROOT_ONLY_LOCK), &["packages/a"], &[]);
+    // (name, files, paths passed presence-only, expected roots)
+    type Case<'a> = (
+        &'a str,
+        &'a BTreeMap<String, Vec<u8>>,
+        &'a [&'a str],
+        &'a [&'a str],
+    );
+    let cases: [Case; 4] = [
+        ("unmodeled glob", &unmodeled, &[], &["", "packages/a"]),
+        ("no manifest", &no_manifest, &[], &["", "packages/a"]),
+        (
+            "shared, no root lock",
+            &shared_no_root_lock,
+            &[],
+            &["packages/a"],
+        ),
+        (
+            "unreadable root file",
+            &readable,
+            &["pnpm-workspace.yaml"],
+            &["", "packages/a"],
+        ),
+    ];
+    for (name, files, present, roots) in cases {
+        let mut files = files.clone();
+        for path in present {
+            files.remove(*path);
+        }
+        for trust in [true, false] {
+            let mut opts = options(false);
+            opts.trust_lockfile_config = Some(trust);
+            let output = run_engine(&server, build_input(&files, present, opts)).await;
+            assert_eq!(project_roots(&output), roots, "{name}");
+            let member = output
+                .projects
+                .iter()
+                .find(|p| p.root == "packages/a")
+                .unwrap();
+            let paths = changed_paths(&output);
+            if trust {
+                let error = member
+                    .error
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{name}: not refused"));
+                assert_eq!(
+                    error.code, "redirect_pnpm_settings_elsewhere",
+                    "{name}: {error:?}"
+                );
+                assert!(
+                    !paths.iter().any(|p| p.starts_with("packages/a/")),
+                    "{name}: {paths:?}"
+                );
+            } else {
+                assert!(member.error.is_none(), "{name}: {:?}", member.error);
+                assert!(
+                    paths.contains(&"packages/a/pnpm-lock.yaml"),
+                    "{name}: {paths:?}"
+                );
+            }
+            assert!(
+                !output
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "pnpm_member_lock_ignored"),
+                "{name}: {:?}",
+                output.warnings
+            );
+        }
+    }
+}
+
+/// #492 with `--ecosystems`: a workspace root is added only for npm. A
+/// member detected for its Cargo.lock under a cargo-only filter keeps its
+/// root and no lockless workspace root joins it, straight or through
+/// selection.
+#[tokio::test]
+async fn pnpm_workspace_roots_follow_the_ecosystem_filter() {
+    use socket_patch_cli::hosted_memory::{select_paths, SelectOptions, TreeEntryInput};
+    let server = pnpm_server().await;
+    let files = pnpm_workspace(
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        None,
+        &["packages/a"],
+        &[("packages/a/Cargo.lock", "version = 3\n")],
+    );
+    let entries: Vec<TreeEntryInput> = files
+        .keys()
+        .map(|p| TreeEntryInput {
+            path: p.clone(),
+            mode: "100644".into(),
+            kind: "blob".into(),
+            size: None,
+        })
+        .collect();
+    let cargo = Some(vec!["cargo".to_string()]);
+    let selection = select_paths(
+        &entries,
+        &SelectOptions {
+            ecosystems: cargo.clone(),
+            ..SelectOptions::default()
+        },
+    );
+    assert_eq!(selection.roots, ["packages/a"]);
+    let mut opts = options(false);
+    opts.ecosystems = cargo;
+    let output = run_engine(&server, build_input(&files, &[], opts)).await;
+    assert_eq!(project_roots(&output), ["packages/a"]);
+}
+
+/// #492 with socket.yml: a member lock is demoted only into a workspace
+/// root the path policy admits. With `includePaths` leaving the root out,
+/// each member stays a root of its own and is pinned, through the host's
+/// two-phase flow and straight alike.
+#[tokio::test]
+async fn a_pnpm_member_stays_a_root_when_socket_yml_leaves_the_workspace_root_out() {
+    let server = pnpm_server().await;
+    let mut files = pnpm_workspace(
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        Some(PNPM_ROOT_ONLY_LOCK),
+        &["packages/a", "packages/b"],
+        &[],
+    );
+    files.insert(
+        "socket.yml".into(),
+        b"version: 2\npatches:\n  includePaths: [\"packages/**\"]\n".to_vec(),
+    );
+    let mut opts = options(false);
+    opts.trust_lockfile_config = Some(false);
+    let (_, two_phase_input) = two_phase(&files, opts.clone());
+    let mut direct_opts = policy_options(&files);
+    direct_opts.trust_lockfile_config = Some(false);
+    for (how, input) in [
+        ("two-phase", two_phase_input),
+        ("direct", build_input(&files, &[], direct_opts)),
+    ] {
+        let output = run_engine(&server, input).await;
+        assert_eq!(
+            project_roots(&output),
+            ["packages/a", "packages/b"],
+            "{how}"
+        );
+        assert_eq!(
+            changed_paths(&output),
+            ["packages/a/pnpm-lock.yaml", "packages/b/pnpm-lock.yaml"],
+            "{how}"
+        );
+    }
+}
+
+/// #492 with nested workspaces: a member belongs to the nearest
+/// `pnpm-workspace.yaml` (pnpm looks no further), so its lock is demoted
+/// into the inner workspace root, which the outer one lists as a member
+/// with its own file and so stays a root. Straight and through selection
+/// give the same roots and writes, with no conflicting write.
+#[tokio::test]
+async fn nested_pnpm_workspaces_demote_into_the_nearest_root() {
+    let server = pnpm_server().await;
+    let per_member =
+        |globs: &str| format!("packages:\n  - '{globs}'\nsharedWorkspaceLockfile: false\n");
+    let lock =
+        String::from_utf8(read_fixture("redirect/npm/pnpm/basic/input/pnpm-lock.yaml")).unwrap();
+    let inner_ws = per_member("m/*");
+    let files = pnpm_workspace(
+        &per_member("packages/*"),
+        Some(PNPM_ROOT_ONLY_LOCK),
+        &["packages/x/m/a"],
+        &[
+            ("packages/x/pnpm-workspace.yaml", inner_ws.as_str()),
+            ("packages/x/package.json", r#"{ "name": "x" }"#),
+            ("packages/x/pnpm-lock.yaml", lock.as_str()),
+        ],
+    );
+    let runs = pnpm_memory_runs(&server, &files, &options(false)).await;
+    for (how, output) in &runs {
+        assert_eq!(project_roots(output), ["", "packages/x"], "{how}");
+        for project in &output.projects {
+            assert!(
+                project.error.is_none(),
+                "{how}: {}: {:?}",
+                project.root,
+                project.error
+            );
+        }
+        let paths = changed_paths(output);
+        for path in ["packages/x/m/a/pnpm-lock.yaml", "packages/x/pnpm-lock.yaml"] {
+            assert!(paths.contains(&path), "{how}: {paths:?}");
+        }
+        assert!(
+            !output
+                .warnings
+                .iter()
+                .any(|w| w.code == "conflicting_write"),
+            "{how}: {:?}",
+            output.warnings
+        );
+    }
+    assert_eq!(engine_changed(&runs[0].1), engine_changed(&runs[1].1));
+}
+
+/// #492 through selection: a lockless directory selection adds only
+/// because a `pnpm-workspace.yaml` sits above a pnpm root, which that file
+/// does not list, is no project; the root keeps its lock.
+#[tokio::test]
+async fn a_pnpm_workspace_file_listing_nothing_adds_no_root() {
+    let server = pnpm_server().await;
+    let lock =
+        String::from_utf8(read_fixture("redirect/npm/pnpm/basic/input/pnpm-lock.yaml")).unwrap();
+    let files: BTreeMap<String, Vec<u8>> = [
+        ("examples/pnpm-workspace.yaml", "packages: []\n"),
+        ("examples/demo/package.json", r#"{ "name": "demo" }"#),
+        ("examples/demo/pnpm-lock.yaml", lock.as_str()),
+    ]
+    .into_iter()
+    .map(|(p, t)| (p.to_string(), t.as_bytes().to_vec()))
+    .collect();
+    for (how, output) in pnpm_memory_runs(&server, &files, &options(false)).await {
+        assert_eq!(project_roots(&output), ["examples/demo"], "{how}");
+        assert!(
+            changed_paths(&output).contains(&"examples/demo/pnpm-lock.yaml"),
+            "{how}: {:?}",
+            output.changed_files
+        );
+    }
 }
