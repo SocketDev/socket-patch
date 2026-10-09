@@ -404,8 +404,8 @@ async fn workspace_members(view: &ProjectView<'_>) -> Members {
         }
     };
     let dirs = match view {
-        ProjectView::Disk(root)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let root = view.disk_root().expect("a disk view has a root");
             member_dirs(&DiskTree(root), &globs)
         }
         ProjectView::Memory(project) => member_dirs(&MemoryTree(project), &globs),
@@ -593,8 +593,8 @@ async fn branch_lock_names(view: &ProjectView<'_>, dir: &str) -> Vec<String> {
 /// ([`governing_workspace_file`]); an in-memory project has none.
 fn governing_file(view: &ProjectView<'_>) -> Option<PathBuf> {
     match view {
-        ProjectView::Disk(root)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let root = view.disk_root().expect("a disk view has a root");
             governing_workspace_file(root)
         }
         ProjectView::Memory(_) => None,

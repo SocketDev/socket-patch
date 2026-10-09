@@ -2223,10 +2223,10 @@ fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
 /// on disk, and an in-memory entry that is not text counts as absent.
 fn root_only_workspace_breaks_add(view: &ProjectView<'_>) -> Option<String> {
     let read = |rel: &str| match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => crate::utils::fs::read_regular_to_string_sync(&cwd.join(rel)).ok(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            crate::utils::fs::read_regular_to_string_sync(&cwd.join(rel)).ok()
+        }
         ProjectView::Memory(project) if !project.is_symlink(rel) => match project.get(rel) {
             Some(MemoryEntry::Text(text)) => Some(text.to_string()),
             _ => None,
@@ -4702,6 +4702,9 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = is_number_candidates();
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
