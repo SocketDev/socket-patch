@@ -165,6 +165,11 @@ pub async fn run(args: RepairArgs) -> i32 {
     // client's public-proxy advisory ahead of its own output.
     let mut client: Option<ApiClient> = None;
     let result = repair_inner(&args, &manifest_path, &mut client, vendor_references).await;
+    // Only the download phase's client served this run; one built below for
+    // telemetry alone fetched nothing, so its org state is not a run warning.
+    let auth_fallback = client
+        .as_ref()
+        .and_then(crate::commands::vex_sources::api_auth_fallback_warning);
 
     // Resolve telemetry credentials through the API client the way
     // apply/rollback/remove do: passing the raw `--api-token`/`--org` flag
@@ -189,7 +194,11 @@ pub async fn run(args: RepairArgs) -> i32 {
     );
 
     match result {
-        Ok((env, counts)) => {
+        Ok((mut env, counts)) => {
+            // A token whose org could not be resolved put the download on the
+            // public proxy (stderr already said so); `warnings[]` is the
+            // machine channel for it, as in scan / get / apply / vendor.
+            env.warnings.extend(auth_fallback);
             // A repair where some artifacts failed to download is marked a
             // partial failure inside `repair_inner` (a `Failed` event plus
             // `mark_partial_failure`). Mirror `apply`: surface that as a
