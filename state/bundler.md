@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-09 (run 36), main `a80b89e`, latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
+Last updated: 2026-10-09 (run 37), main `a8e9397`, latest release v5.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
 
 ## Coverage matrix
 
@@ -335,7 +335,17 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Patched gem with deps (`rack-test` → `rack`) cycle + `rollback` | — | pass | — | — |
 | In-run `--vex` with 1 of 3 refused | — | pass | — | — |
 | #1224 fix, capped re-scan `Gemfile` / `gems.rb` / lockless | — | — | — | pass |
-| `bundle cache` after scan → `rollback` / `remove` | fail #1260 | fail #1260 | fail #1260 | fail #1260 |
+| `bundle cache` after scan → `rollback` / `remove` | fixed #1260 (#1263) | fixed #1260 (#1263, run 37) | fixed #1260 (#1263) | fixed #1260 (#1263) |
+
+### Run 37 (main `a8e9397`, v5.0.0; Linux Ruby 3.3.6)
+
+| Cell | 4.0.18 | 2.6.9 | 2.5.22 | 2.4.22 | 2.3.27 |
+| --- | --- | --- | --- | --- | --- |
+| #1260 fix: hosted `bundle cache` → `rollback <bare name>` / `remove <versionless purl>` / `rollback VULN-GEM` / bare `rollback` (#1034 target grammar) | pass (`upstream_gem_stale_cache` names the archive) | — | — | — | — |
+| #1260 fix with config `cache_path vendor/gems` | pass | — | — | — | — |
+| v4 `setup` plugin registered, then the v5 cleanup commit lands (block + `.socket/bundler-plugin/` removed) | warning on every install (#1295) | warning on every install (#1295) | **fail #1295** (`LoadError`) | **fail #1295** | **fail #1295** |
+| Migrator's own checkout following migrating-to-v5.md (incl. `bundle plugin uninstall`) | pass | — | — | — | — |
+| v4.0.0 hosted scan → v5 re-scan (lock byte-identical) → v5 `rollback` | — | — | pass (documented exact pin) | — | — |
 
 ### Global mode (`-g`)
 
@@ -359,11 +369,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Vendored with a committed `vendor/cache` (`bundle cache --all` and the `.socket/vendor` path gem; `vendor --revert` with a stale cache).
-2. H→V takeover with the hosted patched archive in `vendor/cache` (#1260 neighbour).
+1. Windows / macOS: the #1260 stale-cache warning and the #1295 plugin residue on a Windows checkout (probe branch; the capstones' `Command::new("bundle")` can't find `bundle.bat`, so the probe must script the CLI directly).
+2. H→V takeover with the hosted patched archive in `vendor/cache`, then `vendor --revert` / `remove`: the vendored revert has no stale-cache check (the takeover's restore does warn once). Low value; confirm with real installs before filing.
 3. #749 DSL gap: vendored DSL `lockfile`, and `lockfile false`.
 4. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch). #1056 neighbours: CRLF Gemfile and `gems.rb`.
-5. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 / #1260 when fixes merge.
+5. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 (PR #1290) / #1125 / #1295 when fixes merge.
 
 ## Known non-bugs
 
@@ -469,3 +479,7 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Bisect without rebuilding tests: temporarily make `binary()` in the e2e file honour a `ZZ_BIN` env override, and build the old commit's release binary into its own `CARGO_TARGET_DIR` (about 6 min) (run 35). `std::env::var("X").is_ok()` is true for `X=""`, so leave scratch toggles unset rather than empty.
 - A 3–4 gem hosted mock (run 36) is in the run-36 entry's description: one uuid per gem, so the patch-registry `GEM` sections sort in a known order, and the compact-index `info` carries `deps` (`rack-test` → `rack:>= 1.3`). Its `/patches/batch` offers every gem whatever the query, so a lockless or shared-home scan "finds" gems the project never declared (a mock artifact, not #1125).
 - A partial hosted `rollback` leaves a VEX statement whose subcomponents list only the still-patched gems, even when they share one advisory with the rolled-back gem (correct OpenVEX scoping, run 36).
+- A hosted unwind against the e2e harness's mock upstream on a CHECKSUMS lock is refused ("upstream GEM remote … is not rubygems.org"), so the #1260 CHECKSUMS branch can only be driven with a real rubygems.org upstream (run-36 harness); the e2e capstone covers the no-CHECKSUMS branch (run 37).
+- Bundler's `Source::Path#cache` never copies a path gem that lives inside the project root, so `bundle cache --all` leaves vendored `.socket/vendor/...` gems alone and `vendor/cache/<name>/` can't shadow them (checked in the 4.0.18 source, run 37).
+- The v4.0.0 binary still runs `setup` for migration tests (`npm pack @socketsecurity/socket-patch-linux-x64-gnu@4.0.0`); `bundle plugin uninstall` exists on Bundler 2.3+ and clears `.bundle/plugin/index` even after the plugin dir is gone (run 37).
+- v5 `list` on a hosted gem project with a loopback patch registry shows 0 results unless `--patch-server-url <mock>` is passed (discovery trust rule, same as `vex`).
