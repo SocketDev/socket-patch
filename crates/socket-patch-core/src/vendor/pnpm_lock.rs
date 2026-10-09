@@ -55,13 +55,11 @@ use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 
-use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
 };
-use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
@@ -70,6 +68,7 @@ use super::npm_common::{
 };
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
+use super::revert::{self, KeepPolicy};
 use super::source::PackageSource;
 use super::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
@@ -1128,36 +1127,11 @@ pub(super) async fn revert_pnpm_dialect(
     // or the redirect ledger's recorded originals — still points at. Keep
     // it (and let the CLI keep the ledger entry) instead of deleting evidence
     // out from under a lock we just refused to touch.
-    if outcome.drift_skipped() {
-        outcome.keep_artifact(&uuid_dir_rel);
-        return outcome;
-    }
-
-    // `--preserve-state` (`keep_artifact`): the wiring restore above already
-    // ran; the artifact dir stays behind (and the caller keeps the ledger
-    // entry), so only the deletion is skipped.
-    if !keep_artifact {
-        if super::npm_flavor::keep_artifact_while_lock_references_it(
-            &mut outcome,
-            project_root,
-            &[PNPM_LOCK, PACKAGE_JSON, PNPM_WORKSPACE],
-            &entry.uuid,
-            &uuid_dir_rel,
-        )
-        .await
-        {
-            return outcome;
-        }
-        // The last npm-family entry leaves `.socket/vendor/npm/` (and
-        // `.socket/vendor/`) empty: the shared helper prunes them so a
-        // reverted project carries no vendor residue (non-recursive:
-        // siblings keep them).
-        let uuid_dir = project_root.join(&uuid_dir_rel);
-        if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-            return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
-        }
-    }
-    outcome
+    let policy = KeepPolicy::NpmFamily {
+        locks: &[PNPM_LOCK, PACKAGE_JSON, PNPM_WORKSPACE],
+        uuid: &entry.uuid,
+    };
+    revert::finish(outcome, project_root, &uuid_dir_rel, opts, policy).await
 }
 
 /// Undo the pnpm-workspace.yaml override: delete a file we created (when it

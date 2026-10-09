@@ -95,6 +95,7 @@ mod pypi_wheel;
 pub mod redownload;
 pub mod registry_fetch;
 pub(crate) mod reuse;
+pub(crate) mod revert;
 pub(crate) mod service_fetch;
 pub mod source;
 #[cfg(any(test, feature = "test-fixtures"))]
