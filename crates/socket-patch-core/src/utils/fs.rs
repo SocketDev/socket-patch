@@ -465,16 +465,16 @@ pub async fn atomic_write_bytes_preserving_mode(
 /// already exists (`/dev/stdout`, a FIFO, a character device) has no inode to
 /// swap, so it is written in place: on Windows a DOS device name (`NUL`,
 /// `CON`, `COM1`) or a `\\.\` device path such as a named pipe, which std
-/// reports as a file. A path that is, or links through, `/dev/…` or
-/// `/proc/…` (`/dev/stdout`, `/dev/fd/1`, `/proc/self/fd/1`) is a stream
-/// too, even when the descriptor behind it is a regular file
-/// (`--output /dev/stdout > vex.json`): renaming over its target would
-/// detach the caller's open descriptor, and on macOS `/dev/fd` holds no
-/// stage. Never captured by an open group commit: the path is the user's
-/// output, not one of the run's commit points.
+/// reports as a file. A descriptor path, or a link to one (`/dev/stdout`,
+/// `/dev/fd/1`, `/proc/self/fd/1`), is a stream too, even when the
+/// descriptor behind it is a regular file (`--output /dev/stdout >
+/// vex.json`): renaming over its target would detach the caller's open
+/// descriptor, and on macOS `/dev/fd` holds no stage. Never captured by an
+/// open group commit: the path is the user's output, not one of the run's
+/// commit points.
 pub async fn write_user_output(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let special = (cfg!(windows) && is_windows_device_path(path))
-        || links_through_dev_or_proc(path)
+        || links_to_a_descriptor(path)
         || matches!(
             tokio::fs::metadata(path).await,
             Ok(meta) if !meta.is_file() && !meta.is_dir()
@@ -497,16 +497,28 @@ pub async fn write_user_output(path: &Path, content: &[u8]) -> std::io::Result<(
 }
 
 /// Whether `path`, or any hop of the symlink chain its final component
-/// starts, names something under `/dev/` or `/proc/`. The chain is read link
-/// by link, never canonicalized: `/proc/self/fd/1` resolves to the regular
-/// file behind the descriptor, which is exactly what must not be renamed
-/// over.
-fn links_through_dev_or_proc(path: &Path) -> bool {
-    let under = |p: &Path| p.starts_with("/dev") || p.starts_with("/proc");
+/// starts, names a file descriptor: `/dev/stdin`, `/dev/stdout`,
+/// `/dev/stderr`, `/dev/fd/<n>` or `/proc/<pid>/fd/<n>`. Only those: a
+/// regular file elsewhere under `/dev` (`/dev/shm`) or `/proc`
+/// (`/proc/self/cwd/…`) keeps the stage + rename. The chain is read link by
+/// link, never canonicalized: `/proc/self/fd/1` resolves to the regular file
+/// behind the descriptor, which is exactly what must not be renamed over.
+fn links_to_a_descriptor(path: &Path) -> bool {
+    fn is_descriptor(path: &Path) -> bool {
+        let parts: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
+        match parts.as_slice() {
+            [root, dev, name] if *root == "/" && *dev == "dev" => {
+                *name == "stdin" || *name == "stdout" || *name == "stderr"
+            }
+            [root, dev, fd, _] if *root == "/" && *dev == "dev" => *fd == "fd",
+            [root, proc, _, fd, _] if *root == "/" && *proc == "proc" => *fd == "fd",
+            _ => false,
+        }
+    }
     let mut hop = path.to_path_buf();
     // The kernel's own loop limit for symlink resolution.
     for _ in 0..40 {
-        if under(&hop) {
+        if is_descriptor(&hop) {
             return true;
         }
         let Ok(target) = std::fs::read_link(&hop) else {
@@ -1149,7 +1161,7 @@ mod tests {
             .open(&captured)
             .unwrap();
         let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-        assert!(links_through_dev_or_proc(&fd_path));
+        assert!(links_to_a_descriptor(&fd_path));
         write_user_output(&fd_path, b"doc").await.unwrap();
         let mut seen = String::new();
         file.rewind().unwrap();
@@ -1158,7 +1170,7 @@ mod tests {
 
         let link = tmp.path().join("out.vex.json");
         std::os::unix::fs::symlink(&fd_path, &link).unwrap();
-        assert!(links_through_dev_or_proc(&link));
+        assert!(links_to_a_descriptor(&link));
         write_user_output(&link, b"doc2").await.unwrap();
         assert!(std::fs::symlink_metadata(&link)
             .unwrap()
@@ -1174,21 +1186,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dev_and_proc_paths_are_streams() {
+    fn descriptor_paths_are_streams() {
         for stream in ["/dev/stdout", "/dev/stderr", "/dev/fd/1", "/proc/self/fd/1"] {
-            assert!(links_through_dev_or_proc(Path::new(stream)), "{stream}");
+            assert!(links_to_a_descriptor(Path::new(stream)), "{stream}");
+        }
+        for regular in [
+            "/dev/shm/vex.json",
+            "/dev/null",
+            "/proc/self/cwd/vex.json",
+            "/proc/self/fd",
+            "/proc/self/fdinfo/1",
+        ] {
+            assert!(!links_to_a_descriptor(Path::new(regular)), "{regular}");
         }
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("vex.json");
         std::fs::write(&file, b"{}").unwrap();
-        assert!(!links_through_dev_or_proc(&file));
-        assert!(!links_through_dev_or_proc(&tmp.path().join("missing.json")));
+        assert!(!links_to_a_descriptor(&file));
+        assert!(!links_to_a_descriptor(&tmp.path().join("missing.json")));
         let relative = tmp.path().join("rel.json");
         std::os::unix::fs::symlink("vex.json", &relative).unwrap();
-        assert!(!links_through_dev_or_proc(&relative));
+        assert!(!links_to_a_descriptor(&relative));
         let looped = tmp.path().join("loop");
         std::os::unix::fs::symlink("loop", &looped).unwrap();
-        assert!(!links_through_dev_or_proc(&looped));
+        assert!(!links_to_a_descriptor(&looped));
     }
 
     /// Windows device names and the `\\.\` namespace are written in place
