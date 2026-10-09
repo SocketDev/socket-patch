@@ -111,8 +111,11 @@ async fn jars() -> (Vec<u8>, Vec<u8>) {
 
 /// GET `url` from Maven Central, retrying what a CI runner sees as a
 /// transient blip: a transport error (DNS, connect, reset, timeout) or a
-/// 429 / 5xx. Any other status fails at once. Without this, one blip
+/// 404 / 429 / 5xx. Any other status fails at once. Without this, one blip
 /// failed every cell of a leg within milliseconds, before `docker run`.
+/// A 404 counts as a blip because every `url` here is a pinned, released
+/// artifact that Central never deletes: a miss is a CDN edge serving a
+/// stale negative entry (the same signature `sbt-warm-seed.sh` retries).
 async fn fetch_from_central(client: &reqwest::Client, url: &str) -> Vec<u8> {
     const ATTEMPTS: u32 = 5;
     let mut last = String::new();
@@ -129,7 +132,10 @@ async fn fetch_from_central(client: &reqwest::Client, url: &str) -> Vec<u8> {
             }
         };
         let status = resp.status();
-        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if status.is_server_error()
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::NOT_FOUND
+        {
             last = status.to_string();
             continue;
         }
