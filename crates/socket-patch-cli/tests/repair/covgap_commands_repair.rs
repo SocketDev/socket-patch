@@ -510,11 +510,13 @@ fn repair_archive_cleanup_failure_warns_and_continues() {
             .contains("diff cleanup failed"),
         "the skip reason must name the failing archive pass; got {skip}"
     );
-    // The packages pass still swept its orphan: one batched removal event.
+    // The packages pass still swept its orphan: `gc` reports it (the
+    // failed diffs pass counts as empty).
     assert_eq!(
-        v["summary"]["removed"], 1,
+        v["gc"]["removedPackageArchives"], 1,
         "the packages sweep must still be recorded; envelope={v}"
     );
+    assert_eq!(v["gc"]["removedDiffArchives"], 0, "envelope={v}");
     assert!(
         !orphan_pkg_path.exists(),
         "json: the packages orphan must be swept despite the diffs failure"

@@ -1,7 +1,10 @@
 use clap::Args;
+use socket_patch_core::api::blob_fetcher::{DIFF_ARCHIVE, PACKAGE_ARCHIVE};
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::ledgers::hosted_pins_matching;
-use socket_patch_core::manifest::cleanup_blobs::{format_bytes, ArtifactReferences};
+use socket_patch_core::manifest::cleanup_blobs::{
+    format_bytes, format_cleanup_result_for, ArtifactReferences,
+};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
@@ -19,7 +22,9 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::hosted_unwind::{run_hosted_leg, HostedLegOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
-use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
+use crate::json_envelope::{
+    Command, Envelope, EnvelopeError, GcReport, PatchAction, PatchEvent, Status,
+};
 use crate::ui::short_uuid;
 use crate::ui::{plural, sweep_failure};
 
@@ -961,8 +966,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
         &updated_manifest,
         retained_not_installed.iter().copied(),
     );
-    let mut blobs_removed = 0;
-    let mut archives_removed = 0;
+    // `None` under `--preserve-state` (no sweep ran): no `gc` in the JSON.
+    let mut gc: Option<GcReport> = None;
     if !args.preserve_state {
         let sweep = references.sweep(&socket_dir, args.common.dry_run).await;
         // repair's posture: a failed pass (or a pass that could not unlink
@@ -973,9 +978,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 eprintln!("Warning: {detail}");
             }
         }
-        if let Ok(r) = sweep.blobs {
-            blobs_removed = r.blobs_removed;
+        // The GC lines are one block, opened by a blank line.
+        let mut gc_printed = false;
+        if let Ok(r) = &sweep.blobs {
             if loud && r.blobs_removed > 0 {
+                gc_printed = true;
                 println!(
                     "\n{}",
                     format_blob_sweep(
@@ -990,16 +997,35 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // Diff archives use the same manifest-uuid keep rule; legacy
         // package archives are swept whole (parity with repair and scan
         // --prune).
-        for (dir, result) in [("diffs", sweep.diffs), ("packages", sweep.packages)] {
-            if let Some(detail) = sweep_failure(dir, &result) {
+        for (dir, noun, result) in [
+            ("diffs", DIFF_ARCHIVE, &sweep.diffs),
+            ("packages", PACKAGE_ARCHIVE, &sweep.packages),
+        ] {
+            if let Some(detail) = sweep_failure(dir, result) {
                 if loud {
                     eprintln!("Warning: {detail}");
                 }
             }
+            // The archives the sweep took are named like repair names them,
+            // so the human run accounts for everything `gc` reports.
             if let Ok(r) = result {
-                archives_removed += r.blobs_removed;
+                if loud && r.blobs_removed > 0 {
+                    if !gc_printed {
+                        println!();
+                    }
+                    gc_printed = true;
+                    println!(
+                        "{}",
+                        format_cleanup_result_for(r, args.common.dry_run, noun)
+                    );
+                }
             }
         }
+        gc = Some(GcReport::from_passes(
+            sweep.blobs.as_ref().ok(),
+            sweep.diffs.as_ref().ok(),
+            sweep.packages.as_ref().ok(),
+        ));
     }
 
     // The dry-run footer closes the whole preview, the blob-cleanup
@@ -1097,14 +1123,25 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // single-patch removal that happened to sweep an orphan blob.
         // Consumers read the blob/rollback totals from `details`, never
         // from `summary.removed`.
-        if blobs_removed > 0 || rollback_count > 0 || archives_removed > 0 {
-            env.events.push(
+        // The sweep's per-kind totals and byte count are also the
+        // envelope's `gc` (`summary.bytesFreed`), the shape every GC-running
+        // command prints.
+        let report = gc.unwrap_or_default();
+        if report.total_removed() > 0 || rollback_count > 0 {
+            let mut carrier =
                 PatchEvent::artifact(removal_action).with_details(serde_json::json!({
-                    "blobsRemoved": blobs_removed,
+                    "blobsRemoved": report.removed_blobs,
                     "rolledBack": rollback_count,
-                    "archivesRemoved": archives_removed,
-                })),
-            );
+                    "archivesRemoved": report.removed_diff_archives
+                        + report.removed_package_archives,
+                }));
+            if report.total_removed() > 0 {
+                carrier = carrier.with_bytes(report.bytes_freed);
+            }
+            env.events.push(carrier);
+        }
+        if let Some(gc) = gc {
+            env.set_gc(gc);
         }
         // Any drift-kept entry means part of the requested removal did
         // NOT happen: the run is a partialFailure (exit 1) even when

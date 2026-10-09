@@ -534,7 +534,11 @@ async fn drift_keep_exits_partial_failure_and_holds_manifest() {
     //    fixture replays identically through the binary ──
     let (code, env) = rollback_cli(root, &[]);
     assert_eq!(code, 1, "drift-keep exits 1: {env:#}");
-    assert_eq!(env["status"], "partial_failure", "{env:#}");
+    // The drift-keep is the run's only outcome: a total failure, counted
+    // in the top-level `failed` (#1066).
+    assert_eq!(env["status"], "error", "{env:#}");
+    assert_eq!(env["error"]["code"], "rollback_failed", "{env:#}");
+    assert_eq!(env["failed"], 1, "{env:#}");
     let kept = env["vendoredKept"].as_array().expect("vendoredKept array");
     assert_eq!(kept.len(), 1, "{env:#}");
     assert_eq!(kept[0]["purl"], DRIFT_PURL, "{env:#}");

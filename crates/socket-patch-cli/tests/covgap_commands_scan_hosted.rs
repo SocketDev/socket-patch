@@ -1403,7 +1403,10 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
         "a binary bun.lockb pin is refused: {stdout}\n{stderr}"
     );
     let doc: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
-    assert_eq!(doc["status"], "partial_failure", "{doc:#}");
+    // The refused pin is the only outcome: a total failure (#1066).
+    assert_eq!(doc["status"], "error", "{doc:#}");
+    assert_eq!(doc["error"]["code"], "rollback_failed", "{doc:#}");
+    assert_eq!(doc["failed"], 1, "{doc:#}");
     let failed = doc["hosted"]["failed"]
         .as_array()
         .unwrap_or_else(|| panic!("{doc:#}"));

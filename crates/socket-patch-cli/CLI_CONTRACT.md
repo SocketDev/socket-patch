@@ -987,8 +987,10 @@ v5.0 replaces v4's per-purl reverts and whole-ledger reverse replay (`revert_rem
 | `vendoredFailed` | `[{purl, error}]` | Vendored reverts that errored — entry, artifact, and manifest record all survive for a retry; drives exit 1 |
 | `hosted` | `{reverted: [purl], failed: [{purl, error}], unsupported: [purl], editedFiles: N}` | The hosted leg (v5.0: the upstream restore). `reverted` lists the pins restored (would-be on dry-run); `failed` the refused pins with the version-control remedy in `error` (the pseudo-purl `files` for a write failure); `unsupported` is kept for shape and is always empty (every ecosystem has a restore); `editedFiles` counts distinct files rewritten |
 | `manifest` | `{removedEntries: [purl], preserved: bool}` | Entries removed from the manifest (would-be removals on dry-run); `preserved` mirrors `--preserve-state` |
-| `gc` | `{skipped: true}` \| `{removedBlobs, removedDiffArchives, removedPackageArchives, bytesFreed}` | Skipped under `--preserve-state`, after a blob-gate abort, and under a corrupt vendor ledger |
+| `gc` | `{skipped: true}` \| `{removedBlobs, removedDiffArchives, removedPackageArchives, bytesFreed}` | The shared GC shape (see "One GC shape"). Skipped under `--preserve-state`, after a blob-gate abort, and under a corrupt vendor ledger |
 | `paths` | `[string]` | The path-glob targets verbatim (empty when none) |
+
+**Counters (v5.0, #1066)**: `rolledBack` and `failed` span every leg. `rolledBack` counts agent results that restored files, plus `vendoredReverted`, `vendoredPreserved` and `hosted.reverted`; `failed` counts failed agent results, plus `vendoredKept`, `vendoredFailed`, `hosted.failed` and `hosted.unsupported`. A package wired through two legs counts once per leg. `alreadyOriginal` stays agent-only. When something failed and nothing was rolled back or already original, the run failed as a whole: `status: "error"` with `error: {code: "rollback_failed", message}` (exit 1) instead of `partial_failure`.
 
 **Exit rules**: not-installed entries never flip the exit (the documented apply/rollback asymmetry — even an all-not-installed run exits 0 `success`). Everything that leaves the system still patched DOES flip it to `partial_failure` exit 1: agent-leg failures, vendored drift-keeps and revert failures, hosted refusals, a corrupt vendor ledger, and a failed manifest write. GC failures never affect the exit.
 
@@ -1184,7 +1186,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 ```jsonc
 {
-  "command":  "scan" | "apply" | "vex" | "vendor" | "rollback" | "get" | "list" | "remove" | "repair",
+  "command":  "scan" | "apply" | "vex" | "vendor" | "rollback" | "get" | "list" | "remove" | "repair" | "update",
   "status":   "success" | "partialFailure" | "error" | "noManifest" | "paidRequired" | "notFound",
   "dryRun":   false,
   "events": [ <PatchEvent>, ... ],
@@ -1197,20 +1199,28 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
     "failed":          0,
     "removed":         0,
     "verified":        0,
-    "bytesDownloaded": 0,
-    "bytesFreed":      0
+    "rebuilt":         0,   // omitted while zero (repair / vendor only)
+    "bytesFreed":      0    // = gc.bytesFreed; 0 when no GC ran
+  },
+  "gc": {                   // only when the run swept .socket/ (repair, remove)
+    "removedBlobs":           0,
+    "removedDiffArchives":    0,
+    "removedPackageArchives": 0,
+    "bytesFreed":             0
   },
   "error":    { "code": "...", "message": "..." }   // only on status=error
 }
 ```
 
-`events` is the load-bearing payload. `summary` is pre-computed from `events` so consumers don't have to walk the array. `error` is set only on top-level failures (e.g. `manifest_not_found`); per-patch failures appear as `events[*]` with `action: "failed"`.
+`events` is the load-bearing payload. `summary` is pre-computed from `events` so consumers don't have to walk the array; its action counters count patch-level events, so a GC carrier event (the artifact-level `removed`, or `verified` on a dry run, that `repair` and `remove` emit for a sweep) bumps none of them. The sweep itself is reported once, in `gc`. `error` is set only on top-level failures (e.g. `manifest_not_found`); per-patch failures appear as `events[*]` with `action: "failed"`.
+
+**One GC shape (v5.0).** Every command that sweeps orphan artifacts from `.socket/blobs`, `.socket/diffs` and `.socket/packages` reports the pass as the same `gc` object, `{removedBlobs, removedDiffArchives, removedPackageArchives, bytesFreed}`: the envelope's `gc` (`repair`, `remove`), rollback's `gc` and the `gc` of `scan --prune` / `--sync` (which adds its manifest and vendored keys beside them). On a dry run the counts are what the pass would remove (scan's read-only GC preview alone keeps its `orphanBlobs` / `orphanDiffArchives` / `orphanPackageArchives` / `bytesReclaimable` keys). `summary.bytesFreed` mirrors `gc.bytesFreed` on the envelope commands (0 when no GC ran: `repair --download-only`, `remove --preserve-state`, and every command without a GC pass). `gc` is absent when no sweep ran. v5.0 removes `summary.bytesDownloaded`, which no command ever emitted.
 
 ### `PatchEvent` shape
 
 ```jsonc
 {
-  "action":    "discovered" | "downloaded" | "applied" | "updated" | "skipped" | "failed" | "removed" | "verified",
+  "action":    "discovered" | "downloaded" | "applied" | "updated" | "skipped" | "failed" | "removed" | "verified" | "rebuilt",
   "purl":      "pkg:npm/foo@1.2.3",        // omitted on artifact-level events
   "uuid":      "<patch uuid>",              // optional
   "oldUuid":   "<previous uuid>",           // only when action=updated
@@ -1221,7 +1231,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
       "appliedVia":  "diff" | "blob"   // only on action=applied; v5.0 drops "package"
     }
   ],
-  "bytes":      1234,                       // optional (downloaded/removed)
+  "bytes":      1234,                       // only on the GC carrier event and --update's downloaded
   "reason":     "Files match afterHash",    // human-readable explanation (skipped)
   "errorCode":  "already_patched",          // stable snake_case routing tag
   "error":      "<message>",                // only when action=failed
@@ -1237,15 +1247,17 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 | Action       | Emitted by                            | Meaning |
 |--------------|---------------------------------------|---------|
-| `discovered` | `scan`, `list`                        | Patch exists upstream / in the manifest — no work taken. |
-| `downloaded` | `get`, `repair`, `scan --mode agent`  | Patch bytes were fetched from the registry. `bytes` set. |
-| `applied`    | `apply`, `scan --sync`                | Patch was written to disk. `files` enumerates what changed. |
-| `updated`    | `apply`, `scan --sync`, `get`         | A different UUID replaced an older one for this PURL. `oldUuid` set. |
-| `skipped`    | every command                         | No-op — already patched, not in scope, filtered, etc. `errorCode` carries the reason. |
-| `failed`     | every command                         | A specific patch attempt failed. `errorCode` + `error` set. |
-| `removed`    | `repair`, `remove`, `rollback`        | Data was removed from `.socket/` (or files rolled back). `bytes` optional. |
-| `verified`   | `apply --dry-run`, `scan --dry-run`   | The patch *would* apply cleanly. `files` lists previewed changes. |
-| `rebuilt`    | `repair`                              | A missing/corrupt vendored artifact was restored from its exact server download (v5.0: never a lost ledger entry — see `vendor_ledger_missing`). `summary.rebuilt` counts these (the field is omitted while zero). |
+| `discovered` | `list`                                | Patch recorded in the manifest, the vendor ledger or a hosted lockfile pin — no work taken. |
+| `downloaded` | `repair`, `--update`                  | `repair`: artifacts were fetched (one aggregate event, `details.count`). `--update`: the release archive was fetched (`bytes` = archive size). |
+| `applied`    | `apply`, `vendor`                     | Patch was written to disk (`vendor`: vendored). `files` enumerates what changed. |
+| `updated`    | `--update`                            | The binary was replaced (`details.from` / `details.to`). |
+| `skipped`    | every envelope command                | No-op — already patched, not in scope, filtered, etc. `errorCode` carries the reason. |
+| `failed`     | `apply`, `repair`, `vendor`           | A specific attempt failed. `errorCode` + `error` set. |
+| `removed`    | `remove`, `repair`, `vendor`          | A manifest entry or vendored state was removed, or (artifact-level, no `purl`) `.socket/` artifacts were swept — that GC carrier sets `bytes` and is not counted in `summary.removed`; the sweep's totals are the envelope's `gc`. |
+| `verified`   | `apply`, `remove`, `repair`, `vendor` (dry run); `vex`; `--update --dry-run` | The action *would* succeed cleanly (`files` lists previewed changes); `vex`: the patch verified and was attested. |
+| `rebuilt`    | `repair`, `vendor`                    | A missing/corrupt vendored artifact was restored from its exact server download (v5.0: never a lost ledger entry — see `vendor_ledger_missing`). `summary.rebuilt` counts these (the field is omitted while zero). |
+
+`scan`, `get` and `rollback` print their legacy shapes, not events (see [Migration status](#migration-status-v30)).
 
 ### Stable `errorCode` tags
 
@@ -1455,11 +1467,12 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 | Subcommand   | Emits |
 |--------------|---|
-| `apply`      | `Applied` · `Updated` · `Skipped` (already_patched / package_not_installed / vendored) · `Failed` · `Verified` (dry-run) |
-| `vendor`     | `Applied` (= vendored; `command` routes) · `Skipped` (refusals, warnings, unsupported ecosystems) · `Failed` · `Removed` (reconcile + `--revert`) · `Verified` (dry-run) |
+| `apply`      | `Applied` · `Skipped` (already_patched / package_not_installed / vendored) · `Failed` · `Verified` (dry-run) |
+| `vendor`     | `Applied` (= vendored; `command` routes) · `Rebuilt` (a reused artifact restored) · `Skipped` (refusals, warnings, unsupported ecosystems) · `Failed` · `Removed` (reconcile + `--revert`) · `Verified` (dry-run) |
 | `list`       | `Discovered` (with `details.vulnerabilities`, `details.tier`, `details.license`, `details.description`, `details.exportedAt`; hosted pins (v5.0: one per `(purl, uuid)` the lockfiles wire) additionally carry `details.mode: "hosted"` and `details.lockfiles: [<root-relative files wiring it>]` (no `details.ledger` — hosted mode keeps no ledger; the human listing labels them `Mode: hosted (wired in <files>)`), both additive and absent on manifest entries; v5.0: vendor-ledger records carry `details.mode: "vendored"` + `details.ledger: ".socket/vendor/state.json"` the same way, and the human listing labels them `Mode: vendored (recorded in .socket/vendor/state.json)`; a `state.json` that cannot be read or parsed degrades to nothing-to-consult with the stderr line `Warning: unreadable vendor ledger (<error>); its vendored patches are not listed` — muted by `--silent`, exit unchanged) |
-| `repair`    | `Downloaded` (or `Verified` on dry-run; a diff-mode repair adds a second one, `mode: "file"`, for the blobs of files the patches create) · `Rebuilt` (vendored artifacts; `Verified` previews on dry-run) · `Skipped` (vendor_uuid_mismatch) · `Removed` (or `Verified`) · `Failed` events |
-| `remove`     | `Removed` (per purl; `Verified` on dry-run) · artifact-level `Removed`/`Verified` event (with `details.blobsRemoved`, `details.rolledBack`) |
+| `repair`    | `Downloaded` (or `Verified` on dry-run; a diff-mode repair adds a second one, `mode: "file"`, for the blobs of files the patches create) · `Rebuilt` (vendored artifacts; `Verified` previews on dry-run) · `Skipped` (vendor_uuid_mismatch, cleanup_failed) · artifact-level `Removed` (or `Verified`) GC carrier (`details.count`, `details.checked`, `bytes`) · `Failed` events · top-level `gc` (absent under `--download-only`) |
+| `vex`        | `Verified` (one per attested subcomponent) · `Skipped` (omissions) — only under `--json --output` |
+| `remove`     | `Removed` (per purl; `Verified` on dry-run) · artifact-level `Removed`/`Verified` event (with `details.blobsRemoved`, `details.archivesRemoved`, `details.rolledBack`; `bytes` when the sweep removed something) · top-level `gc` (absent under `--preserve-state`) |
 | `--update`   | `Downloaded` → `Updated` (success) · `Skipped` (already_latest) · `Verified` (dry-run check, reason update_check) — see the Self-update contract section for details fields and top-level error codes |
 
 ### Migration status (v3.0)
@@ -1716,13 +1729,14 @@ socket-patch apply --json | jq '
 '
 ```
 
-GC summary (after `repair --json`):
+GC summary (after `repair --json`; `remove --json` prints the same `gc`):
 
 ```bash
 socket-patch repair --json | jq '{
-  removed:     .summary.removed,
-  bytesFreed:  .summary.bytesFreed,
-  failed:      .summary.failed
+  removedBlobs:    .gc.removedBlobs,
+  removedArchives: (.gc.removedDiffArchives + .gc.removedPackageArchives),
+  bytesFreed:      .summary.bytesFreed,
+  failed:          .summary.failed
 }'
 ```
 

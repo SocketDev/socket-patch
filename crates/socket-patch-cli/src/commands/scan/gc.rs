@@ -14,6 +14,7 @@ use std::time::Duration;
 use crate::args::GlobalArgs;
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{run_vendor_gc, VendorGcSummary};
+use crate::json_envelope::GcReport;
 use crate::ui::sweep_failure;
 
 /// Aggregated outcome of a GC pass (or preview). Serialized into the
@@ -97,17 +98,16 @@ impl GcSummary {
     /// `warnings` are additive: present only when the lock could not be
     /// taken / a post-revert rewrite failed.
     fn to_apply_json(&self) -> serde_json::Value {
-        let mut json = serde_json::json!({
-            "prunedManifestEntries": self.pruned,
-            "removedBlobs": self.blobs.blobs_removed,
-            "removedDiffArchives": self.diffs.blobs_removed,
-            "removedPackageArchives": self.packages.blobs_removed,
-            "revertedVendoredEntries": self.vendored_reverted,
-            "keptVendoredEntries": self.vendored_kept,
-            "failedVendoredEntries": self.vendored_failed,
-            "removedVendorOrphanDirs": self.vendor_orphan_dirs,
-            "bytesFreed": self.total_bytes(),
-        });
+        // The artifact half is the `gc` object every GC-running command
+        // prints (`GcReport`); the manifest and vendored halves are scan's.
+        let mut json =
+            GcReport::from_passes(Some(&self.blobs), Some(&self.diffs), Some(&self.packages))
+                .to_value();
+        json["prunedManifestEntries"] = serde_json::json!(self.pruned);
+        json["revertedVendoredEntries"] = serde_json::json!(self.vendored_reverted);
+        json["keptVendoredEntries"] = serde_json::json!(self.vendored_kept);
+        json["failedVendoredEntries"] = serde_json::json!(self.vendored_failed);
+        json["removedVendorOrphanDirs"] = serde_json::json!(self.vendor_orphan_dirs);
         if let Some((code, message)) = &self.skipped {
             json["skipped"] = serde_json::json!({ "code": code, "message": message });
         }

@@ -130,7 +130,10 @@ fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &
         &["rollback", "--yes", "--patch-server-url", &uri],
     );
     assert_eq!(code, 1, "a binary hosted pin cannot be restored: {env}");
-    assert_eq!(env["status"], "partial_failure", "{env}");
+    // The refused pin is the run's only outcome: a total failure (#1066).
+    assert_eq!(env["status"], "error", "{env}");
+    assert_eq!(env["error"]["code"], "rollback_failed", "{env}");
+    assert_eq!(env["failed"], 1, "{env}");
     let failed = env["hosted"]["failed"]
         .as_array()
         .cloned()

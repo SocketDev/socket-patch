@@ -378,11 +378,13 @@ pub async fn run(args: UpdateArgs) -> i32 {
     if args.common.json {
         let mut env = Envelope::new(Command::Update);
         env.record(
-            PatchEvent::artifact(PatchAction::Downloaded).with_details(serde_json::json!({
-                "asset": outcome.asset,
-                "bytes": outcome.archive_bytes,
-                "sha256": outcome.archive_sha256,
-            })),
+            PatchEvent::artifact(PatchAction::Downloaded)
+                .with_bytes(outcome.archive_bytes)
+                .with_details(serde_json::json!({
+                    "asset": outcome.asset,
+                    "bytes": outcome.archive_bytes,
+                    "sha256": outcome.archive_sha256,
+                })),
         );
         env.record(
             PatchEvent::artifact(PatchAction::Updated).with_details(serde_json::json!({
