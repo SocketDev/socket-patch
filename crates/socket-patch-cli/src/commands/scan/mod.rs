@@ -489,7 +489,6 @@ async fn discover_selected(
     // Some queries failed, some succeeded: a `--json` run has no stderr
     // warning (`warn` is human-only), so each failed package becomes a
     // run-level `warnings[]` entry — never a silent drop from the envelope.
-    let fetched = all_search_results.len();
     let offers = select_accessible(all_search_results, can_access_paid_patches, policy);
     if let Some(result) = json_warnings {
         for (purl, e) in &failures {
@@ -503,18 +502,15 @@ async fn discover_selected(
     }
     Ok(Discovered {
         offers,
-        fetched,
         failed: failures,
     })
 }
 
-/// [`discover_selected`]'s result: the offers, how many records came back
-/// (before the tier filter), and each failed detail query as `(purl,
-/// error)` (a failure for a package with no recorded patch makes a capped
-/// run's data incomplete).
+/// [`discover_selected`]'s result: the offers and each failed detail
+/// query as `(purl, error)` (a failure for a package with no recorded
+/// patch makes a capped run's data incomplete).
 struct Discovered {
     offers: rollout::Offers,
-    fetched: usize,
     failed: Vec<(String, String)>,
 }
 
@@ -672,8 +668,9 @@ fn open_paragraph(opened: &mut bool) {
 /// arm treats an empty merged set as a fetch failure). The two output
 /// knobs are human-only: `show_progress` shows the status-line counter on
 /// stderr, `warn` prints a warning per failed package once the loop is
-/// done — only when some query succeeded (when every one failed, the
-/// caller's error line carries the cause instead, so nothing repeats).
+/// done — only when some query succeeded, even with no records (when
+/// every one failed, the caller's error line carries the cause instead,
+/// so nothing repeats).
 async fn fetch_patch_details(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
@@ -715,7 +712,8 @@ async fn fetch_patch_details(
         }
     }
     status.finish();
-    if warn && !results.is_empty() {
+    // Not when every query failed: the caller's error line names it.
+    if warn && failures.len() < packages.len() {
         for (purl, e) in &failures {
             eprintln!("Warning: could not fetch details for {purl}: {e}");
         }
@@ -2543,6 +2541,7 @@ async fn run_scan(
                 batch_error_count > 0,
                 &mut stage,
                 prior_discovery,
+                prune,
             )
             .await;
         }
@@ -2842,10 +2841,11 @@ async fn run_scan(
 
     // The by-package records every arm selects from, fetched before the
     // table so its `[UPDATE]` markers are the same UPGRADE rows the
-    // selection acts on (§5.1). Discovery said these packages HAVE
-    // patches, so an empty merged set is a fetch failure.
-    // A failed discovery still prints the table first; its exit code is
-    // returned below it.
+    // selection acts on (§5.1). Only `discover_selected`'s own `Err`
+    // (every query failed) is a fetch failure: queries that succeed with
+    // no records leave nothing to select, in every arm and in `--json`
+    // alike (#1062). A failed discovery still prints the table first; its
+    // exit code is returned below it.
     let mut discovery_failure: Option<i32> = None;
     let rows: Vec<rollout::Row> = if downloadable_count == 0 {
         Vec::new()
@@ -2863,13 +2863,6 @@ async fn run_scan(
         )
         .await
         {
-            // The agent / vendored / report-only arms need records to show:
-            // an empty merged set is a fetch failure there.
-            Ok(discovered) if !hosted && discovered.fetched == 0 => {
-                eprintln!("{}", render::fetch_details_failed(&discovered.failed));
-                discovery_failure = Some(1);
-                Vec::new()
-            }
             Ok(discovered) => {
                 let rows = classified_rows(
                     &mut stage,
