@@ -1,7 +1,7 @@
 [agent] Bench: progress log for the `socket-patch scan` benchmark suite (`crates/socket-patch-bench`, `.github/workflows/bench.yml`). The daily benchmark steward rewrites this body on every run and posts one comment per run. Machine-readable history is in `history.json` on the [`bench/ledger`](https://github.com/SocketDev/socket-patch/tree/bench/ledger) branch. The first run (2026-10-02) was logged in #580 and backfilled there.
 
 ## Last run
-- **When:** 2026-10-09, about 06:35–09:05 UTC
+- **When:** 2026-10-09, about 06:35–08:45 UTC
 - **main:** `f3c6313a` (Fix open npm issues, #1008). That is 37 first-parent commits since `ea097142`, including #1051 (bun lock re-parse fix), #1008 (npm/bun/vlt lock rework), #1183 (NuGet restore-scoped crawl), #1205 (Cargo.lock-scoped crawl), #1058 (hosted pins decided through lockfile discovery) and #1031 (removes `scan --apply/--vendor`; the suite never used them).
 - **Suite source:** `main`, 45 scenarios. #1250 updates the nuget fixture; it was measured separately and is not in today's numbers.
 - **Runner:** 4 vCPU, Intel(R) Xeon(R) Processor @ 2.80GHz, cloud sandbox. Verdicts come only from same-machine interleaved `compare`. The 3a `run` was noisy today (pnpm/hosted ranged 224–396 ms; npm/hosted's 515 ms median is about 330 ms in every `compare`), so treat today's absolute medians loosely.
