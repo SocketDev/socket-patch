@@ -6,9 +6,15 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
 
 ## Defaults and stored state
 
-- Bare `scan` and `get` now patch in hosted mode. `scan` never prompts;
-  hosted and vendored `get` do not prompt either. Use `scan --dry-run` for a preview
-  or `--mode agent` to retain in-place patching. Global scans and a mode-less
+- Bare `scan` and `get` now patch in hosted mode when the project has no patch
+  state yet. `scan` never prompts; hosted and vendored `get` do not prompt either.
+  Use `scan --dry-run` for a preview or `--mode agent` to retain in-place patching.
+- A bare `scan` or `get` keeps the mode a project already uses: a project with a
+  vendor ledger (`.socket/vendor/state.json`) stays vendored, and one whose
+  `.socket/manifest.json` holds patches stays in agent mode. Switching modes needs an
+  explicit `--mode` (for example `scan --mode hosted` converts a vendored project in
+  place). A project holding both agent and vendored patches must pass `--mode`
+  (`mode_ambiguous`, exit 2). Global scans and a mode-less
   `scan --prune` do not acquire new patches; `--prune` still performs cleanup.
 - Hosted state lives in dependency files. No command writes
   `.socket/vendor/redirect-state.json`. Legacy hosted records can still supply
@@ -72,6 +78,23 @@ Remove the old CLI with the manager that installed it (`pip uninstall socket-pat
 `pipx uninstall socket-patch`, or `gem uninstall socket-patch`). Install through a
 [supported channel](../README.md#installation), update CI bootstrap commands, and
 run `socket-patch --version` to check which binary your shell finds.
+
+## Support tiers
+
+v5 keeps every lockfile format in the support matrix, including the ones the package
+managers have retired. The [v5 support tiers](ecosystems.md#v5-support-tiers) say how
+mature each one is.
+
+- **Beta:** Maven and Gradle in hosted and vendored mode, and sbt / Mill / scala-cli.
+  They work for the documented build shapes. Run the build before you rely on the
+  result or on a `--vex` document.
+- **Legacy:** binary `bun.lockb` (hosted and vendored), vendored pnpm 7/8 locks
+  (lockfileVersion 5.4 / 6.0) and vlt locks from before 1.0.0-rc.15. They keep
+  working in v5, with an upgrade path and an undo path for each. Plan to move to text
+  `bun.lock`, pnpm 9+ or vlt 1.0+; a future major release may stop writing these
+  formats.
+- No v5.x minor or patch release removes a format or makes one refuse that v5.0
+  accepts. See the [support policy](ecosystems.md#support-policy).
 
 ## Retire `setup` hooks
 
@@ -160,10 +183,12 @@ whole root, not a `vendor_jvm_degraded` warning on mixed Maven + Gradle roots.
 | `get --no-apply` | `get --save-only` (`SOCKET_SAVE_ONLY` is unchanged) |
 | `socket-patch download` | `socket-patch get` |
 | `socket-patch gc` | `socket-patch repair` |
+| `--download-mode`, `SOCKET_DOWNLOAD_MODE` | No replacement; patch content is always fetched as per-file blobs |
 | `SOCKET_FORCE` | Pass `--force` to the one command that needs it (`apply`, `vendor`, `--update`); the variable is now ignored |
 
 A removed spelling is a usage error (exit 2). `scan --sync` stays as the
 shorthand for `scan --mode agent --prune`.
 
-Legacy `.socket/packages/` archives are no longer read. Patch data uses diff
-archives or blobs; cleanup commands remove obsolete package archives.
+Legacy `.socket/packages/` and `.socket/diffs/` archives are no longer read.
+Patch data uses per-file blobs (`.socket/blobs/`); cleanup commands remove the
+obsolete archives.

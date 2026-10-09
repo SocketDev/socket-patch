@@ -40,6 +40,11 @@ Empty environment values are treated as unset.
 - `--proxy-url` / `SOCKET_PROXY_URL` selects the public patch API endpoint. It is
   distinct from an HTTP forward proxy: use `HTTP_PROXY`, `HTTPS_PROXY`, and
   `NO_PROXY` for those.
+- HTTPS connections trust the bundled Mozilla (webpki) roots plus the operating
+  system's trust store (macOS keychain, Windows certificate store, the distro
+  bundle on Linux). `SSL_CERT_FILE` / `SSL_CERT_DIR` replace the system store
+  with the named bundle or directory, which is how to trust a TLS-inspecting
+  proxy's private CA. Certificate verification is never disabled.
 - `--offline` prohibits network access. `scan` and `get` require the patch API
   and refuse offline operation. Other commands can use locally available state;
   missing records or artifacts can still prevent completion.
