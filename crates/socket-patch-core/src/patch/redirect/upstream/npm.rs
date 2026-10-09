@@ -1982,7 +1982,7 @@ impl BunRegistrySettings {
                 bun_user_config_paths(&|key| std::env::var_os(key), &|path| path.is_file());
             for (path, kind) in [(npmrc, &mut files.npmrc), (bunfig, &mut files.bunfig)] {
                 let Some(path) = path else { continue };
-                if let Ok(text) = tokio::fs::read_to_string(&path).await {
+                if let Ok(text) = crate::utils::fs::read_regular_to_string(&path).await {
                     kind.push(BunConfigFile { text, users: true });
                 }
             }
