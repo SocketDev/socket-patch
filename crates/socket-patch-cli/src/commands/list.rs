@@ -409,13 +409,14 @@ pub async fn run(args: ListArgs) -> i32 {
     // A hosted `resolutions` selector no lock installs any more (#1203) is
     // no patch either: say how to retire it.
     for pin in &inventory.stale {
+        // Named by file and purl, as the contested refusal names files: a
+        // hosted URL carries its grant token, which output never prints.
         let detail = format!(
-            "{} keeps a hosted `resolutions` entry for {} (patch {}) that no lockfile \
-             installs any more; `socket-patch rollback` or `socket-patch remove {}` removes it",
+            "{} keeps a hosted `resolutions` entry for {} that no lockfile installs any \
+             more; `socket-patch rollback` or `socket-patch remove {}` removes it",
             pin.files.join(", "),
             pin.purl,
-            pin.uuid,
-            pin.uuid
+            pin.purl
         );
         if args.common.json {
             warnings.push(RunWarning {

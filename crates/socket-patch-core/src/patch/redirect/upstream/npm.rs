@@ -888,11 +888,13 @@ pub(crate) async fn retire_stale_selectors(
                 continue;
             }
         }
-        for (selector, url, uuid) in stale {
+        // The detail names the selector, never its URL (which carries the
+        // grant token).
+        for (selector, _url, uuid) in stale {
             result.warnings.push((
                 "hosted_resolution_orphaned",
                 format!(
-                    "{rel}: removed the hosted `resolutions` entry `{selector}` ({url}); no \
+                    "{rel}: removed the hosted `resolutions` entry `{selector}`; no \
                      {lock_rel} entry installs it any more (the package was removed or moved \
                      to another version), so it was leftover wiring"
                 ),
