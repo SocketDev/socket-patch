@@ -42,7 +42,9 @@ name: Gradle patch compatibility
 # the same suites, filters, Gradle lines and JDKs on ubuntu on every PR and
 # in the merge queue. The ubuntu `extras` run on a PR only when it touches
 # Gradle code (`changes` below); every other PR gets them from the nightly
-# (#1177). Windows cells run on every PR that matches `paths:`.
+# (#1177). Windows cells run on every PR that matches `paths:`, except
+# hosted on the middle Gradle lines (7.6.6, 8.14.3), which run nightly: a PR
+# runs hosted on Windows on 6.9.4 and 9.8.0 only (#1300).
 
 on:
   pull_request:
@@ -235,6 +237,16 @@ jobs:
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
           # ci.yml's `e2e` runs these ubuntu cells on every PR (#1177).
           - os: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || '' }}
+          # Windows hosted on a PR: only the oldest (6.9.4) and newest (9.8.0)
+          # lines. The middle two are ~40 min each, 40% of a PR run's Windows
+          # minutes; they run nightly, and ci.yml's `e2e` runs hosted on all
+          # four lines on ubuntu on every PR (#1300).
+          - os: ${{ github.event_name == 'pull_request' && 'windows-latest' || '' }}
+            gradle: '7.6.6'
+            mode: hosted
+          - os: ${{ github.event_name == 'pull_request' && 'windows-latest' || '' }}
+            gradle: '8.14.3'
+            mode: hosted
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     steps: &cell-steps
