@@ -47,6 +47,7 @@ pub mod golang_local;
 mod group_equivalence_tests;
 #[cfg(test)]
 mod lock_index_equivalence_tests;
+mod maven_index;
 pub mod npmrc;
 mod pdm;
 mod pipenv;
@@ -62,7 +63,6 @@ use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
 use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
-use crate::formats::maven::PomScope;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::pnpm::plan_hosted;
@@ -6996,6 +6996,8 @@ pub(crate) fn bare_sha256_hex(hash: &str) -> String {
 /// version — inherited/managed) and its trimmed version/type/classifier text.
 /// Mirrors the TS `MavenDependencyMatch`.
 struct MavenDependencyMatch {
+    /// The dependency's index in the [`maven_index::PomIndex`].
+    idx: usize,
     version_inner: Option<(usize, usize)>,
     version_text: Option<String>,
     type_text: Option<String>,
@@ -7028,35 +7030,36 @@ fn maven_tag_text_in(pom: &str, tag: &str, from: usize, to: usize) -> Option<Str
 
 /// Every `<dependency>` whose `<groupId>` + `<artifactId>` match, with its
 /// literal `<version>` range/text, `<type>` and `<classifier>` (twin of the TS
-/// `findDependencyMatches`). Read through [`PomScope`]: markup inside
-/// comments, CDATA, `<build>` / `<reporting>` (plugin classpaths, which the
-/// project's `<dependencyManagement>` does not reach and the Socket
-/// repository — not a `<pluginRepository>` — cannot serve) is no declaration.
-/// A match inside `<profiles>` is returned flagged: Maven reads it only while
-/// that profile is active. A `<dependency>` inside `<dependencyManagement>`
-/// is matched the same way as a direct one — the suffixing path tells
-/// "managed in an unseen parent" (no literal version → depMgmt pin) from
-/// "pinned here" (rewrite the literal) purely by whether ANY match carries a
-/// literal `<version>`.
+/// `findDependencyMatches`). Read through `PomScope` (see
+/// [`maven_index`]): markup inside comments, CDATA, `<build>` / `<reporting>`
+/// (plugin classpaths, which the project's `<dependencyManagement>` does not
+/// reach and the Socket repository — not a `<pluginRepository>` — cannot
+/// serve) is no declaration. A match inside `<profiles>` is returned flagged:
+/// Maven reads it only while that profile is active. A `<dependency>` inside
+/// `<dependencyManagement>` is matched the same way as a direct one — the
+/// suffixing path tells "managed in an unseen parent" (no literal version →
+/// depMgmt pin) from "pinned here" (rewrite the literal) purely by whether
+/// ANY match carries a literal `<version>`.
 fn find_maven_dependency_matches(
-    scope: &PomScope,
+    index: &maven_index::PomIndex,
     group_id: &str,
     artifact_id: &str,
-) -> Result<Vec<MavenDependencyMatch>, String> {
-    Ok(scope
-        .dependencies()?
+) -> Vec<MavenDependencyMatch> {
+    index
+        .matches(group_id, artifact_id)
         .into_iter()
-        .filter(|d| {
-            d.group.as_deref() == Some(group_id) && d.artifact.as_deref() == Some(artifact_id)
+        .map(|idx| {
+            let d = index.dep(idx);
+            MavenDependencyMatch {
+                idx,
+                version_inner: d.version_inner,
+                version_text: d.version_text.clone(),
+                type_text: d.type_text.clone(),
+                classifier: d.classifier.clone(),
+                in_profile: d.in_profile,
+            }
         })
-        .map(|d| MavenDependencyMatch {
-            version_inner: d.version_inner,
-            version_text: d.version_text,
-            type_text: d.type_text,
-            classifier: d.classifier,
-            in_profile: d.in_profile,
-        })
-        .collect())
+        .collect()
 }
 
 fn rewrite_maven_pom(
@@ -7087,10 +7090,14 @@ fn rewrite_maven_pom(
     // One pass over the pom's repositories: `(id, url)` of each, which also
     // answers the per-dep URL-refresh check below while the pom is still
     // unchanged (a no-op rescan then never re-scans the pom per dep).
-    let original_repos: Vec<(String, Option<String>)> = pom
-        .as_deref()
-        .map(maven_repository_ids_and_urls)
-        .unwrap_or_default();
+    // The hosted rewriter's view of the pom, read once (through `PomScope`)
+    // and kept in step with every edit below.
+    let mut index: Option<Result<maven_index::PomIndex, String>> =
+        pom.as_deref().map(maven_index::PomIndex::build);
+    let original_repos: Vec<(String, Option<String>)> = match (&index, pom.as_deref()) {
+        (Some(Ok(index)), Some(pom)) => index.repository_ids_and_urls(pom),
+        _ => Vec::new(),
+    };
     let hosted_repo_generations: std::collections::BTreeSet<String> = original_repos
         .iter()
         .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
@@ -7150,10 +7157,8 @@ fn rewrite_maven_pom(
         let repo_id = generation::hosted_pin_name(&dep.patch_uuid);
         // Every match and anchor is read through the pom's live scope; a pom
         // that is not readable as one is never edited (fail-closed).
-        let all_matches = match PomScope::new(pom_text)
-            .and_then(|scope| find_maven_dependency_matches(&scope, &group_id, &artifact_id))
-        {
-            Ok(found) => found,
+        let idx = match index.as_mut().expect("a pom has an index") {
+            Ok(idx) => idx,
             Err(e) => {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_pom_unreadable".into(),
@@ -7164,6 +7169,7 @@ fn rewrite_maven_pom(
                 continue;
             }
         };
+        let all_matches = find_maven_dependency_matches(idx, &group_id, &artifact_id);
         // Only the GA's main jar is granted: the served maven2 tail holds
         // `<a>-<suffixed>.jar/.pom` and nothing else. A classifier variant
         // (sources, tests, a native build) is its own artifact — managed and
@@ -7219,7 +7225,7 @@ fn rewrite_maven_pom(
                 continue;
             }
         }
-        let has_live_repo = !live_maven_repositories_with_id(pom_text, &repo_id).is_empty();
+        let has_live_repo = idx.has_repository(&repo_id);
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
         // served under its original GAV. Add the repository (transport checksum
@@ -7280,16 +7286,7 @@ fn rewrite_maven_pom(
             if has_live_repo {
                 continue;
             }
-            match insert_maven_repository(pom_text, &repo_id, &ov.index_url) {
-                Ok(next) => *pom_text = next,
-                Err(e) => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_maven_pom_unreadable".into(),
-                        detail: format!("pom.xml is not readable as a Maven pom ({e}); {group_id}:{artifact_id} skipped"),
-                    });
-                    continue;
-                }
-            }
+            idx.insert_repository(pom_text, &repo_id, &ov.index_url);
             pom_changed = true;
             result.edits.push(FileEdit {
                 path: "pom.xml".into(),
@@ -7340,13 +7337,13 @@ fn rewrite_maven_pom(
         }
 
         let mut pin_landed = false;
-        // Literal versions among the matches, with their inner ranges.
+        // Literal versions among the matches: (index, inner start, text).
         let versioned: Vec<(usize, usize, String)> = matches
             .iter()
             .filter_map(|m| {
                 m.version_inner
                     .zip(m.version_text.clone())
-                    .map(|((s, e), v)| (s, e, v))
+                    .map(|((s, _), v)| (m.idx, s, v))
             })
             .collect();
         // A `<base>-socket.<hex8>` literal for this release that is not the
@@ -7362,17 +7359,17 @@ fn rewrite_maven_pom(
                             .any(|uuid| uuid.starts_with(hex8))
                 })
         };
-        // Rewrite base (or a prior generation) → suffixed. Descending offset
-        // order so earlier edits don't shift later matches' offsets.
+        // Rewrite base (or a prior generation) → suffixed, in descending
+        // offset order (the index keeps every other offset in step).
         let mut to_rewrite: Vec<(usize, usize, String)> = versioned
             .iter()
             .filter(|(_, _, v)| *v == dep.version || prior_generation(v))
-            .map(|(s, e, v)| (*s, *e, v.clone()))
+            .cloned()
             .collect();
-        to_rewrite.sort_by(|a, b| b.0.cmp(&a.0));
+        to_rewrite.sort_by(|a, b| b.1.cmp(&a.1));
         let mut superseded_versions: Vec<String> = vec![];
-        for (start, end, was) in &to_rewrite {
-            pom_text.replace_range(*start..*end, &suffixed_version);
+        for (i, _, was) in &to_rewrite {
+            idx.set_version(pom_text, *i, &suffixed_version);
             pom_changed = true;
             pin_landed = true;
             if *was != dep.version && !superseded_versions.contains(was) {
@@ -7409,21 +7406,7 @@ fn rewrite_maven_pom(
         // as a versioned match, so `versioned` is non-empty and this branch is
         // skipped (idempotent).
         if versioned.is_empty() {
-            match insert_maven_dependency_management(
-                pom_text,
-                &group_id,
-                &artifact_id,
-                &suffixed_version,
-            ) {
-                Ok(next) => *pom_text = next,
-                Err(e) => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_maven_pom_unreadable".into(),
-                        detail: format!("pom.xml is not readable as a Maven pom ({e}); {group_id}:{artifact_id} skipped"),
-                    });
-                    continue;
-                }
-            }
+            idx.insert_dependency_management(pom_text, &group_id, &artifact_id, &suffixed_version);
             pom_changed = true;
             pin_landed = true;
             result.edits.push(FileEdit {
@@ -7475,8 +7458,7 @@ fn rewrite_maven_pom(
                     continue;
                 }
                 let old_id = generation::hosted_pin_name(&old_uuid);
-                if let Some(next) = remove_maven_repository(pom_text, &old_id) {
-                    *pom_text = next;
+                if idx.remove_repository(pom_text, &old_id) {
                     pom_changed = true;
                     result.edits.push(FileEdit {
                         path: "pom.xml".into(),
@@ -7502,31 +7484,18 @@ fn rewrite_maven_pom(
         // A rotated grant token keeps the uuid but changes the repository
         // URL: refresh the existing `socket-patch-<uuid>` repository in place
         // so the pin keeps resolving through the current grant.
-        // While the pom is unchanged, `original_repos` already says whether
-        // the refresh would change anything (exactly one such repository,
-        // with a `<url>` that differs); skip the scan when it would not.
-        let refresh_may_apply = pom_changed || {
-            let mut ours = original_repos.iter().filter(|(id, _)| *id == repo_id);
-            match (ours.next(), ours.next()) {
-                (Some((_, Some(url))), None) => *url != ov.index_url,
-                _ => false,
-            }
-        };
-        if refresh_may_apply
-            && (pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version))
+        if (pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version))
+            && idx.refresh_repository_url(pom_text, &repo_id, &ov.index_url)
         {
-            if let Some(next) = refresh_maven_repository_url(pom_text, &repo_id, &ov.index_url) {
-                *pom_text = next;
-                pom_changed = true;
-                result.edits.push(FileEdit {
-                    path: "pom.xml".into(),
-                    kind: "redirect_maven_repository".into(),
-                    action: "rewritten".into(),
-                    key: Some(repo_id.clone()),
-                    original: None,
-                    new: Some(json!({ "id": repo_id, "url": ov.index_url })),
-                });
-            }
+            pom_changed = true;
+            result.edits.push(FileEdit {
+                path: "pom.xml".into(),
+                kind: "redirect_maven_repository".into(),
+                action: "rewritten".into(),
+                key: Some(repo_id.clone()),
+                original: None,
+                new: Some(json!({ "id": repo_id, "url": ov.index_url })),
+            });
         }
 
         // A pin landed this run: inject the repository (idempotent via the <id>
@@ -7536,20 +7505,8 @@ fn rewrite_maven_pom(
         if !pin_landed {
             continue;
         }
-        if live_maven_repositories_with_id(pom_text, &repo_id).is_empty() {
-            // The pin above already landed in a pom this run read, so the
-            // anchor scan cannot fail here; were it to, the pin would sit
-            // without its repository — say so rather than stay silent.
-            match insert_maven_repository(pom_text, &repo_id, &ov.index_url) {
-                Ok(next) => *pom_text = next,
-                Err(e) => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_maven_pom_unreadable".into(),
-                        detail: format!("pom.xml is not readable as a Maven pom ({e}); the {repo_id} repository was not added"),
-                    });
-                    continue;
-                }
-            }
+        if !idx.has_repository(&repo_id) {
+            idx.insert_repository(pom_text, &repo_id, &ov.index_url);
             pom_changed = true;
             result.edits.push(FileEdit {
                 path: "pom.xml".into(),
@@ -7692,41 +7649,6 @@ static MAVEN_REPOSITORY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)<repository>.*?</repository>").expect("static repository regex is valid")
 });
 
-/// The live `<repository>` elements of `pom` (read through [`PomScope`]: not
-/// commented out, not in `<profiles>`, `<pluginRepositories>` or
-/// `<distributionManagement>`) — the ones Maven always resolves the
-/// project's dependencies from — as byte spans; none when the pom is not
-/// readable.
-fn live_maven_repositories(pom: &str) -> Vec<(usize, usize)> {
-    PomScope::new(pom)
-        .and_then(|scope| scope.live("repository"))
-        .map(|found| found.iter().map(|e| (e.start, e.end)).collect())
-        .unwrap_or_default()
-}
-
-/// The trimmed `<id>` and `<url>` texts of every live `<repository>` element
-/// of `pom` that has an `<id>`, in document order: the same elements, ids and
-/// URLs [`live_maven_repositories_with_id`] and
-/// [`refresh_maven_repository_url`] read, in one pass.
-fn maven_repository_ids_and_urls(pom: &str) -> Vec<(String, Option<String>)> {
-    live_maven_repositories(pom)
-        .into_iter()
-        .filter_map(|(start, end)| {
-            let id = maven_tag_text_in(pom, "id", start, end)?;
-            let url = maven_tag_text_in(pom, "url", start, end);
-            Some((id, url))
-        })
-        .collect()
-}
-
-/// The live `<repository>` elements of `pom` whose `<id>` is `id`.
-fn live_maven_repositories_with_id(pom: &str, id: &str) -> Vec<(usize, usize)> {
-    live_maven_repositories(pom)
-        .into_iter()
-        .filter(|(start, end)| maven_tag_text_in(pom, "id", *start, *end).as_deref() == Some(id))
-        .collect()
-}
-
 /// The `<repository>` elements of `pom` whose `<id>` is `id`, as byte spans.
 pub(crate) fn maven_repositories_with_id(pom: &str, id: &str) -> Vec<(usize, usize)> {
     MAVEN_REPOSITORY_RE
@@ -7741,6 +7663,12 @@ pub(crate) fn maven_repositories_with_id(pom: &str, id: &str) -> Vec<(usize, usi
 /// one such element sits on lines of its own (anything else is not the
 /// rewriter's insertion, and stays).
 pub(crate) fn remove_maven_repository(pom: &str, id: &str) -> Option<String> {
+    let (cut, end) = maven_repository_removal(pom, id)?;
+    Some(format!("{}{}", &pom[..cut], &pom[end..]))
+}
+
+/// The byte range [`remove_maven_repository`] removes.
+pub(crate) fn maven_repository_removal(pom: &str, id: &str) -> Option<(usize, usize)> {
     let [(start, end)] = maven_repositories_with_id(pom, id)[..] else {
         return None;
     };
@@ -7755,105 +7683,7 @@ pub(crate) fn remove_maven_repository(pom: &str, id: &str) -> Option<String> {
     } else {
         line_start
     };
-    Some(format!("{}{}", &pom[..cut], &pom[end..]))
-}
-
-/// `pom` with the `<url>` of its one `<repository>` whose `<id>` is `id` set
-/// to `url`; `None` when there is no such single element or it already
-/// points there.
-fn refresh_maven_repository_url(pom: &str, id: &str, url: &str) -> Option<String> {
-    let [(start, end)] = live_maven_repositories_with_id(pom, id)[..] else {
-        return None;
-    };
-    let (s, e) = maven_tag_inner_range(pom, "url", start, end)?;
-    if pom[s..e].trim() == url {
-        return None;
-    }
-    let mut out = pom.to_string();
-    out.replace_range(s..e, url);
-    Some(out)
-}
-
-/// Insert the socket-patch `<repository>` block: releases enabled with
-/// `<checksumPolicy>fail</checksumPolicy>` (the transport-level check against
-/// the served `.jar.sha1`); snapshots disabled (patched artifacts are always
-/// released versions). Prefer the project's own `<repositories>` element
-/// (inserted first so it's consulted before the project's other
-/// repositories; a self-closed `<repositories/>` is expanded in place);
-/// otherwise author a full `<repositories>` section immediately before the
-/// closing `</project>`. Anchors are read through [`PomScope`], so a
-/// commented-out section, one inside `<profiles>` (read only when that
-/// profile is active) or `<pluginRepositories>` is never the target, and a
-/// second top-level `<repositories>` (which Maven refuses as a duplicated
-/// tag) is never authored. `Err` when the pom is not readable as one.
-fn insert_maven_repository(pom: &str, id: &str, url: &str) -> Result<String, String> {
-    let scope = PomScope::new(pom)?;
-    let block = format!(
-        "    <repository>\n      <id>{id}</id>\n      <url>{url}</url>\n      <releases>\n        <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      </snapshots>\n    </repository>"
-    );
-    let mut out = pom.to_string();
-    match scope.live("repositories")?.first() {
-        Some(repos) if repos.inner_start == repos.end => out.replace_range(
-            repos.start..repos.end,
-            &format!("<repositories>\n{block}\n  </repositories>"),
-        ),
-        Some(repos) => out.insert_str(repos.inner_start, &format!("\n{block}")),
-        None => {
-            let close = scope.project_close().ok_or("no </project> tag")?;
-            out.insert_str(
-                close,
-                &format!("  <repositories>\n{block}\n  </repositories>\n"),
-            );
-        }
-    }
-    Ok(out)
-}
-
-/// Add a `<dependencyManagement>` version pin. Prefer extending the project's
-/// own `<dependencyManagement><dependencies>` (insert right after the opening
-/// `<dependencies>` tag, expanding a self-closed `<dependencyManagement/>` or
-/// `<dependencies/>`, adding `<dependencies>` when the section has none);
-/// otherwise author a full `<dependencyManagement>` section before
-/// `</project>`. Anchors are read through [`PomScope`]: a section inside a
-/// comment or `<profiles>` is never the target, and a comment between the
-/// tags does not hide the section (a second top-level
-/// `<dependencyManagement>` is a duplicated tag Maven refuses). Mirrors the
-/// TS `insertDependencyManagement`. `Err` when the pom is not readable as one.
-fn insert_maven_dependency_management(
-    pom: &str,
-    group_id: &str,
-    artifact_id: &str,
-    version: &str,
-) -> Result<String, String> {
-    let scope = PomScope::new(pom)?;
-    let block = format!(
-        "      <dependency>\n        <groupId>{group_id}</groupId>\n        <artifactId>{artifact_id}</artifactId>\n        <version>{version}</version>\n      </dependency>"
-    );
-    let dependencies = format!("<dependencies>\n{block}\n    </dependencies>");
-    let mut out = pom.to_string();
-    let Some(dm) = scope.live("dependencyManagement")?.first().copied() else {
-        let close = scope.project_close().ok_or("no </project> tag")?;
-        out.insert_str(
-            close,
-            &format!("  <dependencyManagement>\n    {dependencies}\n  </dependencyManagement>\n"),
-        );
-        return Ok(out);
-    };
-    if dm.inner_start == dm.end {
-        out.replace_range(
-            dm.start..dm.end,
-            &format!("<dependencyManagement>\n    {dependencies}\n  </dependencyManagement>"),
-        );
-        return Ok(out);
-    }
-    match crate::formats::xml::children(&scope.masked, &dm, "dependencies")?.first() {
-        Some(deps) if deps.inner_start == deps.end => {
-            out.replace_range(deps.start..deps.end, &dependencies)
-        }
-        Some(deps) => out.insert_str(deps.inner_start, &format!("\n{block}")),
-        None => out.insert_str(dm.inner_start, &format!("\n    {dependencies}")),
-    }
-    Ok(out)
+    Some((cut, end))
 }
 
 /// Merge trusted-checksums resolver args into `.mvn/maven.config` (one arg per
