@@ -179,6 +179,13 @@ pub struct ContestedWiring {
 pub struct HostedInventory {
     pub pins: Vec<HostedPin>,
     pub contested: Vec<ContestedWiring>,
+    /// Leftover hosted wiring no lock installs any more: a yarn berry
+    /// `resolutions` selector `yarn remove` / `yarn up` left behind
+    /// ([`crate::vex::discover::StaleSelector`], #1203), one pin per
+    /// package version and patch, wired in the manifest only. Never listed
+    /// as a patch; `rollback` and `remove` retire it with a
+    /// `hosted_resolution_orphaned` warning ([`HostedInventory::unwindable`]).
+    pub stale: Vec<HostedPin>,
 }
 
 impl HostedInventory {
@@ -243,6 +250,31 @@ impl HostedInventory {
             .filter(|r| r.mode == WiringMode::Hosted)
             .map(|r| (norm(&r.file), r.uuid.as_str()))
             .collect();
+        // A leftover selector's URL (its patch uuid and grant token) is
+        // retired wiring, not contested wiring, in the manifest naming it.
+        let mut stale_excused: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut stale: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        for selector in &discovery.stale_selectors {
+            if pinned.contains(selector.uuid.as_str()) {
+                continue;
+            }
+            let file = norm(&selector.file);
+            for segment in url_uuid_segments(&selector.url) {
+                stale_excused.insert((file.clone(), segment));
+            }
+            stale
+                .entry((selector.purl.clone(), selector.uuid.clone()))
+                .or_default()
+                .insert(file);
+        }
+        let stale: Vec<HostedPin> = stale
+            .into_iter()
+            .map(|((purl, uuid), files)| HostedPin {
+                purl,
+                uuid,
+                files: files.into_iter().collect(),
+            })
+            .collect();
         let is_pin_token = |uuid: &str, file: &str| {
             pin_tokens.get(uuid).is_some_and(|patches| {
                 patches
@@ -258,6 +290,7 @@ impl HostedInventory {
                 && !pinned.contains(r.uuid.as_str())
                 && !is_pin_token(&r.uuid, &file)
                 && (!pinned_files.contains(file.as_str()) || flagged_files.contains(&file))
+                && !stale_excused.contains(&(file.clone(), r.uuid.clone()))
             {
                 contested
                     .entry(r.uuid.clone())
@@ -296,12 +329,23 @@ impl HostedInventory {
                 }
             })
             .collect();
-        HostedInventory { pins, contested }
+        HostedInventory {
+            pins,
+            contested,
+            stale,
+        }
     }
 
     /// Whether the lockfiles wire any hosted patch at all.
     pub fn is_empty(&self) -> bool {
-        self.pins.is_empty() && self.contested.is_empty()
+        self.pins.is_empty() && self.contested.is_empty() && self.stale.is_empty()
+    }
+
+    /// What `rollback` and `remove` unwind: the attributable pins plus the
+    /// leftover selectors ([`HostedInventory::stale`]), which the restore
+    /// retires from the manifest.
+    pub fn unwindable(&self) -> Vec<HostedPin> {
+        self.pins.iter().chain(&self.stale).cloned().collect()
     }
 
     /// The refusal a management command raises while contested wiring
@@ -688,6 +732,10 @@ impl Ctx<'_> {
 enum Format {
     NpmLock,
     YarnLock,
+    /// A yarn berry root `package.json` whose only hosted wiring is a
+    /// leftover `resolutions` selector ([`HostedInventory::stale`]); after
+    /// [`Format::YarnLock`], so it sees the berry restore's own edits.
+    PackageJson,
     PnpmLock,
     BunLock,
     /// Binary bun.lockb (restored only under [`RestoreOptions::bun_lockb`]).
@@ -721,6 +769,7 @@ fn format_of(rel: &str) -> Format {
     match leaf {
         "package-lock.json" | "npm-shrinkwrap.json" => Format::NpmLock,
         "yarn.lock" => Format::YarnLock,
+        "package.json" => Format::PackageJson,
         "pnpm-lock.yaml" | "shrinkwrap.yaml" => Format::PnpmLock,
         "bun.lock" => Format::BunLock,
         "bun.lockb" => Format::BunLockb,
@@ -857,6 +906,7 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
         let result = match format {
             Format::NpmLock => npm::restore_npm_locks(view, &pins, &files, ctx).await,
             Format::YarnLock => npm::restore_yarn_locks(view, &pins, &files, ctx).await,
+            Format::PackageJson => npm::retire_stale_selectors(view, &pins, &files, ctx).await,
             Format::PnpmLock => npm::restore_pnpm_locks(view, &pins, &files, ctx).await,
             Format::BunLock => npm::restore_bun_locks(view, &pins, &files, ctx).await,
             Format::BunLockb if ctx.bun_lockb => bun_lockb::restore(view, &pins, &files, ctx).await,

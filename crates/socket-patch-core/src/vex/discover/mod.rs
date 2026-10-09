@@ -611,6 +611,31 @@ pub struct Discovery {
     /// dropped as [`DIAG_REF_UNATTRIBUTABLE`] needs no record here: the GC
     /// keeps it through the diagnostic itself. Sorted, deduped.
     pub withheld: Vec<Recognized>,
+    /// Hosted `resolutions` selectors a yarn berry project's root
+    /// `package.json` still carries although its lock no longer installs
+    /// them ([`StaleSelector`], #1203). Not refs and not contested wiring:
+    /// the management commands retire them. Sorted, deduped.
+    pub stale_selectors: Vec<StaleSelector>,
+}
+
+/// A Socket-hosted yarn berry `resolutions` selector whose lock entry is
+/// gone: `yarn remove` (or `yarn up` to another version) deletes the
+/// entry the hosted pin keyed by its tarball URL, but yarn never edits
+/// `resolutions`, so the selector is left routing a descriptor nothing
+/// depends on (see
+/// [`crate::vendor::lock_inventory::yarn::berry_selector_routes_nothing`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StaleSelector {
+    /// Root-relative manifest carrying the selector.
+    pub file: PathBuf,
+    /// The `resolutions` key.
+    pub selector: String,
+    /// The hosted tarball URL it routes to.
+    pub url: String,
+    /// The package version the URL's artifact is (canonical base purl).
+    pub purl: String,
+    /// The hosted patch uuid the URL names.
+    pub uuid: String,
 }
 
 /// One file discovery's guarded reads touched ([`Discovery::read`]).
@@ -1101,6 +1126,8 @@ impl Discovery {
         self.read.dedup();
         self.withheld.sort();
         self.withheld.dedup();
+        self.stale_selectors.sort();
+        self.stale_selectors.dedup();
     }
 }
 

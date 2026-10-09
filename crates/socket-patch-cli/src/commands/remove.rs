@@ -365,7 +365,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
     } else {
         Default::default()
     };
-    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
+    // Leftover `resolutions` selectors (#1203) unwind like pins: the
+    // restore retires them from the manifest.
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
     if manifest_missing {
         let vendor_ledger_exists = project_state
             && tokio::fs::metadata(cwd.join(VENDOR_STATE_REL))

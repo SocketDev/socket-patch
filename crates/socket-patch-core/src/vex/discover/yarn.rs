@@ -364,6 +364,72 @@ async fn extract_berry(ctx: &DiscoverCtx<'_>, lock: BerryLock, out: &mut Discove
     record_copies(ctx, copies, out).await;
     confirm_berry_hosted_keyed(ctx, hosted_keyed, out).await;
     confirm_berry_vendored(ctx, vendored, out).await;
+    record_stale_hosted_selectors(ctx, &lock, out).await;
+}
+
+/// Record each hosted `resolutions` selector of the root `package.json`
+/// that the lock no longer installs ([`StaleSelector`], #1203): Socket's
+/// own leftover pin after `yarn remove` / `yarn up`, which the management
+/// commands retire instead of refusing around it as contested wiring. A
+/// selector whose URL does not name its package version's artifact
+/// (`<name>-<version>.tgz`) is left to the contested path.
+///
+/// [`StaleSelector`]: super::StaleSelector
+async fn record_stale_hosted_selectors(
+    ctx: &DiscoverCtx<'_>,
+    lock: &BerryLock,
+    out: &mut Discovery,
+) {
+    use crate::vendor::lock_inventory::yarn::berry_selector_routes_nothing;
+    let Some(bytes) = ctx.read_bytes(PACKAGE_JSON, out).await else {
+        return;
+    };
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    let Ok(doc) = parse_json(PACKAGE_JSON, bytes) else {
+        return;
+    };
+    let Some(res) = doc.get("resolutions").and_then(Value::as_object) else {
+        return;
+    };
+    for (selector, value) in res {
+        let Some(url) = value.as_str() else {
+            continue;
+        };
+        let Some(uuid) = ctx.hosted_uuid(url) else {
+            continue;
+        };
+        let Some(name) = resolution_selector_target(selector) else {
+            continue;
+        };
+        let Some(purl) = hosted_leaf_version(name, url)
+            .and_then(|version| crate::utils::purl::npm_purl(name, version))
+        else {
+            continue;
+        };
+        if !berry_selector_routes_nothing(lock, selector, url) {
+            continue;
+        }
+        out.stale_selectors.push(super::StaleSelector {
+            file: PACKAGE_JSON.into(),
+            selector: selector.clone(),
+            url: url.to_string(),
+            purl: crate::utils::purl_key::canonical_base_purl(&purl),
+            uuid,
+        });
+    }
+}
+
+/// The version a hosted npm artifact URL's leaf `<bare name>-<version>.tgz`
+/// names for package `name`.
+fn hosted_leaf_version<'u>(name: &str, url: &'u str) -> Option<&'u str> {
+    let path = url.split(['?', '#']).next()?;
+    let leaf = path.rsplit('/').next()?;
+    let bare = name.rsplit('/').next()?;
+    let version = leaf
+        .strip_prefix(bare)?
+        .strip_prefix('-')?
+        .strip_suffix(".tgz")?;
+    (!version.is_empty()).then_some(version)
 }
 
 /// Emit each berry hosted entry keyed by its tarball descriptor only when

@@ -406,6 +406,26 @@ pub async fn run(args: ListArgs) -> i32 {
             eprintln!("Warning: {}", crate::ui::sentence_case(detail));
         }
     }
+    // A hosted `resolutions` selector no lock installs any more (#1203) is
+    // no patch either: say how to retire it.
+    for pin in &inventory.stale {
+        let detail = format!(
+            "{} keeps a hosted `resolutions` entry for {} (patch {}) that no lockfile \
+             installs any more; `socket-patch rollback` or `socket-patch remove {}` removes it",
+            pin.files.join(", "),
+            pin.purl,
+            pin.uuid,
+            pin.uuid
+        );
+        if args.common.json {
+            warnings.push(RunWarning {
+                code: "hosted_resolution_orphaned".to_string(),
+                detail,
+            });
+        } else if !args.common.silent {
+            eprintln!("Warning: {}", crate::ui::sentence_case(&detail));
+        }
+    }
     let vendor_state = crate::commands::vendor_state_lenient(&loaded.vendor, args.common.silent);
 
     // `combined_entries` folds only real records in (a record-less legacy
