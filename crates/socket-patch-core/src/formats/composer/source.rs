@@ -352,8 +352,9 @@ pub(super) fn apply_dist_edit(
                             "{composer_name}'s transport-options were removed; they carry \
                              the original repository's download options (auth headers, \
                              client certificates, proxy) and Composer would send them to \
-                             the hosted patch host; rollback cannot restore them, so run \
-                             `composer update {composer_name}` after removing the patch"
+                             the hosted patch host; rollback cannot restore them, so re-lock \
+                             {composer_name} at its locked version after removing the patch \
+                             (a plain `composer update` may also move it and its dependents)"
                         ),
                     });
                 }
