@@ -896,11 +896,9 @@ fn plan_python_lock_rewrite(
             .and_then(|archive| archive.get("url"))
             .and_then(Item::as_str)
     } else {
-        original_source
-            .as_ref()
-            .and_then(source_identity)
-            .filter(|(kind, _)| *kind == "url")
-            .map(|(_, url)| url)
+        // Both spellings: `source = { url = … }` and uv 0.2's string
+        // `source = "direct+…"`.
+        UvSource::of(package).and_then(UvSource::url)
     };
     if let Some(url) = direct_url {
         let ours = match artifact {
@@ -1269,7 +1267,12 @@ wheels = [{ url = "https://pypi.org/urllib3-2.0.0-py3-none-any.whl", hash = "sha
             "lock-version = \"1.0\"\ncreated-by = \"uv\"\n\n[[packages]]\nname = \"urllib3\"\n\
              version = \"1.26.18\"\narchive = {{ url = \"{USER}\", hashes = {{ sha256 = \"aa\" }} }}\n"
         );
-        for lock in [&uv_lock, &pylock] {
+        let legacy = format!(
+            "version = 1\nrequires-python = \">=3.9\"\n\n[[distribution]]\nname = \"urllib3\"\n\
+             version = \"1.26.18\"\nsource = \"direct+{USER}\"\n\
+             sdist = {{ url = \"{USER}\", hash = \"sha256:aa\" }}\n"
+        );
+        for lock in [&uv_lock, &pylock, &legacy] {
             for artifact in [
                 ArtifactSource::Url(URL),
                 ArtifactSource::Path(".socket/vendor/pypi/u/urllib3-1.26.18-py2.py3-none-any.whl"),
