@@ -2002,3 +2002,115 @@ async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
         "the takeover names requirements.txt as an unpatched install source: {env:#}"
     );
 }
+
+/// The `pipenv requirements > requirements.txt` export of [`stage_pipenv`]'s
+/// lock: the file Docker / plain-pip installs read.
+const PIPENV_EXPORT: &str = "-i https://pypi.org/simple\nsix==1.16.0 ; python_version >= '2.7' and python_version not in '3.0, 3.1, 3.2'\n";
+
+/// #612: vendored mode in a Pipenv project with an exported
+/// requirements.txt must keep that install path patched too, the way
+/// hosted mode rewrites both files: `vendor` wires Pipfile.lock AND the
+/// export's pin, `vendor --check` is green, and the revert restores both.
+/// The same holds when the export is added after a first vendor (a re-run
+/// wires it instead of answering `already_vendored`), and for the hosted
+/// → vendored takeover, which used to turn the export's hosted pin back
+/// into a plain PyPI pin.
+#[tokio::test]
+async fn pipenv_vendor_wires_the_exported_requirements_too() {
+    let wheel_dir = format!(".socket/vendor/pypi/{UUID}/");
+    let assert_both_vendored = |root: &Path, label: &str| {
+        for f in ["Pipfile.lock", "requirements.txt"] {
+            let text = std::fs::read_to_string(root.join(f)).unwrap();
+            assert!(
+                text.contains(&wheel_dir),
+                "{label}: {f} is vendored:\n{text}"
+            );
+        }
+        let (code, env) = run_cli(root, &["vendor", "--check"], &[]);
+        assert_eq!(code, 0, "{label}: vendor --check is green: {env:#}");
+    };
+    let assert_reverts = |root: &Path, pipfile_lock: &str, label: &str| {
+        let (code, env) = run_cli(root, &["vendor", "--revert"], &[]);
+        assert_eq!(code, 0, "{label}: revert: {env:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+            PIPENV_EXPORT,
+            "{label}: the export is restored byte for byte"
+        );
+        let lock = |t: &str| serde_json::from_str::<Value>(t).unwrap();
+        assert_eq!(
+            lock(&std::fs::read_to_string(root.join("Pipfile.lock")).unwrap()),
+            lock(pipfile_lock),
+            "{label}: Pipfile.lock is restored"
+        );
+        assert!(
+            !root.join(&wheel_dir).exists(),
+            "{label}: the wheel is reclaimed"
+        );
+    };
+
+    // Fresh vendor.
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    let pristine = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    std::fs::write(root.join("requirements.txt"), PIPENV_EXPORT).unwrap();
+    stage_manifest(&root);
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "vendor: {env:#}");
+    assert!(
+        !env.to_string().contains("UNPATCHED"),
+        "no install path is left unpatched: {env:#}"
+    );
+    assert_both_vendored(&root, "fresh");
+    assert_reverts(&root, &pristine, "fresh");
+
+    // The export reached through an in-root `-r` include is wired too.
+    let (_tmp, root) = project();
+    let files = stage_pipenv(&root);
+    std::fs::write(root.join("requirements.txt"), "-r req/base.txt\n").unwrap();
+    std::fs::create_dir_all(root.join("req")).unwrap();
+    std::fs::write(root.join("req/base.txt"), PIPENV_EXPORT).unwrap();
+    vendor_project(&root, files);
+    let base = std::fs::read_to_string(root.join("req/base.txt")).unwrap();
+    assert!(
+        base.contains(&wheel_dir),
+        "the included export is vendored:\n{base}"
+    );
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 0, "include: vendor --check is green: {env:#}");
+    let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+    assert_eq!(code, 0, "include: revert: {env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("req/base.txt")).unwrap(),
+        PIPENV_EXPORT
+    );
+
+    // The export appears after a first vendor: the re-run wires it.
+    let (_tmp, root) = project();
+    let files = stage_pipenv(&root);
+    vendor_project(&root, files);
+    std::fs::write(root.join("requirements.txt"), PIPENV_EXPORT).unwrap();
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "re-run: {env:#}");
+    assert_both_vendored(&root, "re-run");
+    assert_reverts(&root, &pristine, "re-run");
+
+    // Hosted → vendored takeover keeps both files patched.
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    std::fs::write(root.join("requirements.txt"), PIPENV_EXPORT).unwrap();
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "hosted scan: {env:#}");
+    for f in ["Pipfile.lock", "requirements.txt"] {
+        let text = std::fs::read_to_string(root.join(f)).unwrap();
+        assert!(text.contains(&hosted_url), "hosted first: {f}:\n{text}");
+    }
+    stage_manifest(&root);
+    prebuilt_common::mount_project(&server, &root).await;
+    let (code, env) = run_cli(&root, &["vendor", "--patch-server-url", uri.as_str()], &[]);
+    assert_eq!(code, 0, "takeover: {env:#}");
+    assert_both_vendored(&root, "takeover");
+}
