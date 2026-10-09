@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T06:40Z · main @ f3c6313_
+_Last updated 2026-10-09T07:14Z · main @ f3c6313_
 
 **In flight:**
+- [#1239](https://github.com/SocketDev/socket-patch/pull/1239): NuGet crawler `find_by_purls` looks up the global folder and legacy `<Id>.<Version>/` folders by the normalized version (`1.0.0.0` = `1.0.0`) through `normalize_nuget_version`. #1202 crawler slice (E93). +47/−19 prod, +116/−4 tests. `state: ready`.
 - [#1230](https://github.com/SocketDev/socket-patch/pull/1230): `PurlKey` keys NuGet versions through the one `normalize_nuget_version` (`13.0.3.0` = `13.0.3`), so a vendored 4-part entry stays live for VEX, `vendor --check` and `scan --prune`. #1202 slice (E93). +37/−7 prod, +242/−1 tests. `state: ready`.
 - [#1227](https://github.com/SocketDev/socket-patch/pull/1227): `common::detect_eol`, `pypi_uv::newline_of` and the `.npmrc` splice through `line_endings::terminator`. #815 slice 2 (E16). +25/−44 prod, +93 tests; golang golden re-blessed (mixed go.sum inputs only). `state: ready`.
 - [#1221](https://github.com/SocketDev/socket-patch/pull/1221): hosted `converge_gem_lock_source` reads `formats::gem` section spans, remote lines and DEPENDENCIES entries; `GemLockSection` + `gem_lock_dependency_name` deleted. #780 hosted slice (E19). +213/−140 prod, +325 tests; `CHECKSUMS` digests read lazily (bench gate). `state: ready`.
@@ -11,10 +12,7 @@ _Last updated 2026-10-09T06:40Z · main @ f3c6313_
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - Maintainer drafts (decided issues): #1036 (#973), #1041 (#648), #1049 (#792). #1027 (#704), #1030 (#808), #1031 (#966) and #1051 (#580) merged.
 
-**Merged:**
-- [#1205](https://github.com/SocketDev/socket-patch/pull/1205): cargo crawl scoped to `Cargo.lock` registry packages. #1204 (E05 partly fixed). +144/−49 prod, +226/−11 tests.
-- [#1183](https://github.com/SocketDev/socket-patch/pull/1183): NuGet crawl scoped to the restore's `libraries`. #427 (E05 partly fixed). +130 prod, +220 tests.
-- Earlier: #1191 (E64 slice 3), #1185 (E66), #1103 (E52), #1108 (E16 slice 1), #1163 (C41; `blob_hash_matches` remains), #1160, #1153, #1151, #1145, #1141, #1106, #1110, #1117, #1121, #1124, #1021, #1015 (E61; dead `eco == "maven2"` arm in `commands/vendor.rs` left), #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
+**Merged:** #1205 (E05 cargo crawl, +144/−49 prod), #1183 (E05 NuGet crawl, +130 prod); earlier #1191, #1185, #1103, #1108, #1163, #1160, #1153, #1151, #1145, #1141, #1106, #1110, #1117, #1121, #1124, #1021, #1015, #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk). Since the 2026-10-08 backlog review, standalone refactor issues are closed as `not_planned` and kept as checklist items of their tracker; rank the tracker's next unchecked item.
 
@@ -24,18 +22,18 @@ _Last updated 2026-10-09T06:40Z · main @ f3c6313_
 | 2 | #931 + #998 + #1063 + #1123: one manifest load + error mapper for every command | 4 | 1 | ≈6 | M | ≈24 | skipped: `apply.rs`, `vendor.rs`, `repair.rs`, `remove.rs`, `rollback.rs`, `scan/`, `ledgers.rs`, `args.rs` all in open PRs |
 | 3 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1009, #1026, #1180, #1193, #1211) |
 | 4 | #1220 (C78): bound upstream-restore fan-out through `utils::concurrent::registry_concurrency` | 1 | 0 | ≈4 | L | ≈11 | skipped: `upstream/{npm,pypi,cargo,composer,mod}.rs` and `concurrent.rs` in open PRs |
-| 5 | #1202 (E93): `PurlKey` NuGet identity through `normalize_nuget_version` | 1 | 1 | ≈1 | L | ≈7 | **taken: #1230**; crawler directory lookup (`nuget_crawler.rs`, #1126) and the move to `formats::nuget` (`nuget_feed.rs`, #1041/#1126) remain |
+| 5 | #1202 (E93): NuGet identity through `normalize_nuget_version` | 1 | 1 | ≈1 | L | ≈7 | **taken: #1230** (`PurlKey`), **#1239** (crawler lookup); the move to `formats::nuget` (`nuget_feed.rs`, #1041) remains |
 
-Re-ranked 2026-10-09T06:00Z at `f3c6313` against 25 `arch-refactor/*` / `agent/fix-*` / `arch-fix/*` PRs (and `ci*`) changing 645 files; #914 skipped (`jvm_jar.rs` in #1041), #1144 (`vex.rs` in #1041). Free but lower: #1014 (`.mill-version` needs a decision), #265 Maven crawl (no lockfile to scope by: risk H), E37 (`composer_crawler::normalize_version` ≡ `strip_leading_v`, D 1).
+Re-ranked 2026-10-09T07:00Z at `f3c6313` against 34 open PRs changing 386 files (`nuget_crawler.rs` freed: #1126 no longer touches it). #1098 (E90) needs `ecosystem_dispatch.rs`/`vex_consumed.rs` (#1007, #1009, #1026, #1034); #914 skipped (`jvm_jar.rs` in #1041), #1144 (`vex.rs` in #1041). Free but lower: #1014 (`.mill-version` needs a decision), #265 Maven crawl (no lockfile to scope by: risk H), E37 (`composer_crawler::normalize_version` ≡ `strip_leading_v`, D 1).
 
 **Notes:**
 - `bench.yml` gates +10% per scenario: time a per-dep reader (hosted converge) in release against `main` before pushing.
 - Gem lock edits locate through `formats::gem::parse` since #1221: `Section::lines()` / `end`, `remote_line_nos`, `GemfileLock::dependencies` (entries with one name rule). Whitespace-only lines are blank separators. The vendored slice should read the same fields, not add a fourth walker.
 - Real bundler 4.0.18 is in the sandbox: `e2e_redirect_gem_build -- --ignored`, `e2e_vendor_gem_build -- --include-ignored` run in ~30 s.
 - `golang_rewrite.golden`'s go.sum generator injects a stray CRLF line, so its inputs are mixed even with the `line_endings` mixer off; any terminator-rule change re-blesses it.
-- Deno crawl scope (#1217): only a local project whose `<cwd>/deno.lock` parses and has a `version` is scoped; a lock with no `jsr` section crawls no JSR package. A CLI fixture that needs the crawl to find a cached JSR package must lock it (or omit `deno.lock`). `lock_section` lives in `deno_crawler.rs` until `formats/mod.rs` is free for a `formats::deno` model.
-- Go crawl scope (#1209): only a local project with a readable `<cwd>/go.sum` and no workspace (`go.work` in cwd or an ancestor, or `GOWORK` set to a file; `GOWORK=off` scopes) is scoped. A CLI fixture that needs the crawl to vouch for a cached module must list it in `go.sum` or drop `go.sum`.
-- Cargo crawl scope (#1205): only a local project's registry cache with a parseable `<cwd>/Cargo.lock` is scoped; `vendor/`, global and lockless crawls walk. A CLI test that needs "only the crawl vouches" must put the crate in `vendor/`, not an unlocked `CARGO_HOME`. Narrowing a crawl changes `scan --prune` (an unlocked cached crate's entry becomes prunable): say so in the PR.
+- Deno crawl scope (#1217): only a parseable `<cwd>/deno.lock` with a `version` scopes; no `jsr` section = no JSR package. Fixtures must lock a cached JSR package (or omit `deno.lock`).
+- Go crawl scope (#1209): only a readable `<cwd>/go.sum` with no workspace (`go.work`, or `GOWORK` set to a file) scopes. A CLI fixture that needs the crawl to vouch for a cached module must list it in `go.sum` or drop `go.sum`.
+- Cargo crawl scope (#1205): only a registry cache with a parseable `<cwd>/Cargo.lock` is scoped. "Only the crawl vouches" tests put the crate in `vendor/`. Narrowing a crawl changes `scan --prune`: say so in the PR.
 - `Pipfile.lock` edits go through `formats::pipenv::splice_entry` since #1188: sort the value (`sort_all_objects`) before splicing; never re-serialize the whole lock.
 - NuGet crawl scope (#1183): only a `cwd` with a project file is scoped; a solution root keeps the walk (restores at any depth). Extend through `PackageRoots::scope`, not a second assets reader.
 - Poetry 2.x `files` is written one file per line by the shared engine since #1185; a test or golden that greps `files = [{ file` only sees 1.0/1.1 package-level `files` now.
@@ -50,6 +48,7 @@ Re-ranked 2026-10-09T06:00Z at `f3c6313` against 25 `arch-refactor/*` / `agent/f
 - `lock_inventory/mod.rs` `architecture_tests` forbid `hosted_patch_uuid*` in a format file's model section. Origin-policy helpers go after the `// ── registry view ──` marker.
 - 2026-10-08: ~40 refactor issues were closed `not_planned` into trackers ("Consolidated work"); that is scheduling, not rejection. Claim/`Fixes` the item's issue only if still open, else reference the tracker.
 - NuGet identity (#1230): `PurlKey` folds versions through `vendor::nuget_feed::normalize_nuget_version` (a utils→vendor import until `nuget_feed.rs` frees for the `formats::nuget` move). `test_support::service_fixture` builds its NuGet grant from `<id>.<purl version>.nupkg`, so a test vendoring a non-normalized version needs that file too.
+- NuGet crawl identity (#1239): `find_by_purls` tries `<id>/<normalized>` then `<id>/<as-written>`, then exact legacy, then legacy by identity (`legacy_dir_is`: any `.` boundary, id case-insensitive, version normalized). The `oracle.rs` equivalence keeps main's rule; its randomized versions are all normalized, so it still agrees.
 - Pushes need verified signatures: commit with the session's default git identity, never an overridden `user.email`.
 - Steering (2026-10-02, #569/#571): no size caps on trusted upstream data; stream, don't buffer.
 - `tests/spawn_env_hygiene.rs` allowlists (`PENDING_RAW_SPAWNS` / `PENDING_SCRUB_COPIES`) fail on new **and** stale entries: drop a file when you migrate it.
