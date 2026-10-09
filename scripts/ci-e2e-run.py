@@ -96,7 +96,8 @@ def run_cases(row, root=ROOT, base=None):
                 if case.get("vlt"):
                     checker = subprocess.run([sys.executable, str(root / "scripts/check-vlt-legs.py"),
                                               "--binary", suite, "--manifest",
-                                              str(cli / "tests/vlt-leg-manifest.json"), str(log)], cwd=root)
+                                              str(cli / "tests/vlt-leg-manifest.json"), str(log)],
+                                             cwd=root, env=env)
                     failed |= checker.returncode != 0
                 if failed:
                     print(f"::error::{suite} failed (row {index}, filters: {' '.join(filters)}).")

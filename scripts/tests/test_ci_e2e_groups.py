@@ -101,7 +101,8 @@ class Runner(unittest.TestCase):
     def test_failure_empty_selection_and_vlt_proof_do_not_hide_later_cases(self):
         cases = [{"suite": "broken", "test_filter": "--ignored first"},
                  {"suite": "empty", "test_filter": "--exact missing"},
-                 {"suite": "e2e_vlt", "vlt": "1.2.0", "test_filter": "--include-ignored vlt_pinned_matrix"},
+                 {"suite": "e2e_safety_vlt", "vlt": "1.2.0", "vlt_store_linker": "hardlink",
+                  "test_filter": "--include-ignored vlt_pinned_matrix"},
                  {"suite": "last", "test_filter": "--ignored final"}]
         calls = []
 
@@ -122,7 +123,9 @@ class Runner(unittest.TestCase):
                 self.assertEqual(calls[-1][1:], ["--ignored", "final"])
                 self.assertEqual(checker.call_count, 1)
                 self.assertIn("--binary", checker.call_args.args[0])
-                self.assertIn("e2e_vlt", checker.call_args.args[0])
+                self.assertIn("e2e_safety_vlt", checker.call_args.args[0])
+                self.assertEqual(checker.call_args.kwargs["env"]["SOCKET_PATCH_VLT_E2E_STORE_LINKER"],
+                                 "hardlink")
 
     def test_a_missing_binary_fails_but_other_members_still_run(self):
         cases = {"cases": json.dumps([{"suite": "missing"}, {"suite": "present"}])}
