@@ -22,8 +22,7 @@ use std::process::{Command, Output};
 
 use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 
 // ---------------------------------------------------------------------------
 // Constants

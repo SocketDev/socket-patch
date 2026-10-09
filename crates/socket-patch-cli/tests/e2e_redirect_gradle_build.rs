@@ -22,8 +22,7 @@
 mod common;
 use common::git_sha256;
 
-#[path = "common/hermetic.rs"]
-mod hermetic;
+use common::hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 

@@ -110,8 +110,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/bundler_e2e.rs"]
 mod bundler_e2e;
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 

@@ -20,8 +20,7 @@ use common::{binary, git_sha256};
 use std::path::Path;
 use std::process::{Command, Output};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 
 // ---------------------------------------------------------------------------
 // Constants

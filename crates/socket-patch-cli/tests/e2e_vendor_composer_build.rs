@@ -71,8 +71,7 @@ use std::process::{Command, Output};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 #[path = "composer_e2e_common/mod.rs"]
 mod composer_e2e_common;
 #[path = "vex_e2e_common/mod.rs"]

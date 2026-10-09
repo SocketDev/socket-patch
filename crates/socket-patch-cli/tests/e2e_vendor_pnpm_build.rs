@@ -76,10 +76,8 @@ use sha2::Digest;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
-#[path = "common/hermetic.rs"]
-mod hermetic;
+use common::cache_env;
+use common::hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
