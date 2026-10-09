@@ -617,17 +617,6 @@ pub(crate) fn pep508_name(spec: &str) -> &str {
     &s[..end]
 }
 
-/// Whether a `[[package]]` unit (as its lines) names `canon` — PEP 503
-/// canonical comparison, the form the pypi lock generators record.
-pub(crate) fn unit_has_canon_name(lines: &[&str], canon: &str) -> bool {
-    lines
-        .iter()
-        .find_map(|l| l.strip_prefix("name = "))
-        .map(|r| canonicalize_pypi_name(r.trim().trim_matches('"')))
-        .as_deref()
-        == Some(canon)
-}
-
 /// The lock's `[[package]]` tables whose `name` canonicalizes (PEP 503) to
 /// `canon_name` — the poetry/pdm target-guard probe (uv records names
 /// pre-canonicalized and counts them directly instead).

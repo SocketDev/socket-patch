@@ -741,42 +741,6 @@ fn repair_deletes_lock_file_even_when_repair_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// gc alias parity
-// ---------------------------------------------------------------------------
-
-#[test]
-fn gc_alias_behaves_identically_to_repair() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"patched content");
-    let orphan_hash = "abadcafe".repeat(8);
-    write_blob(&socket, &orphan_hash, b"orphaned content");
-
-    // Run via `gc` instead of `repair`.
-    let out = socket_cmd(tmp.path())
-        .args(["gc", "--json", "--offline"])
-        .output()
-        .expect("run socket-patch");
-    assert_eq!(out.status.code(), Some(0));
-    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    // The envelope's `command` field reports the canonical name, not the alias.
-    assert_eq!(v["command"], "repair");
-    assert_eq!(v["status"], "success");
-    // Full parity with `repair_offline_removes_orphan_blob`: the orphan is
-    // swept, the referenced blob survives, and nothing is downloaded offline.
-    assert_eq!(v["summary"]["removed"], 1);
-    assert_eq!(v["summary"]["downloaded"], 0);
-    assert!(
-        !socket.join("blobs").join(&orphan_hash).exists(),
-        "gc must remove the orphan just like repair"
-    );
-    assert!(
-        socket.join("blobs").join(REFERENCED_HASH).exists(),
-        "gc must keep the referenced blob just like repair"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Manifest-path override
 // ---------------------------------------------------------------------------
 

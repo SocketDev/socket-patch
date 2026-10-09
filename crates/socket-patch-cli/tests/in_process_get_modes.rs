@@ -739,7 +739,7 @@ async fn get_ghsa_hosted_counts_lockfile_resolved_as_present() {
 }
 
 /// The SAME fresh clone in AGENT mode skips the lockfile-only version
-/// (scan parity: `--apply` partitions lockfile-only purls out as
+/// (scan parity: `--mode agent` partitions lockfile-only purls out as
 /// `package_not_installed`) — nothing recorded, nothing fetched.
 #[tokio::test]
 #[serial]

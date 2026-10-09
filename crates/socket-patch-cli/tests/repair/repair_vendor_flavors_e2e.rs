@@ -13,7 +13,7 @@
 //!       reference (`scan_vendor_references` tokenizes the pnpm/yarn/bun
 //!       locks) is reported as `vendor_ledger_missing`, never reconstructed.
 //!
-//! The fixtures run the ACTUAL `scan --vendor` flow in-test the way the
+//! The fixtures run the ACTUAL `scan --mode vendored` flow in-test the way the
 //! capstones stage it — a hand-written flavor lock (the pre-vendor shape each
 //! backend's capstone asserts) plus an installed `node_modules/<dep>` copy,
 //! driven through the built binary against a mock API (no real package
@@ -418,12 +418,12 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
     common::run_with_env(root, &full, &[("SOCKET_TELEMETRY_DISABLED", "1")])
 }
 
-/// `scan --vendor --yes` to establish a vendored flavor project; returns the
+/// `scan --mode vendored --yes` to establish a vendored flavor project; returns the
 /// vendored tarball path (identical layout for every npm flavor). A v0/v1
 /// bun workspace shape gains its workspace member AFTER vendoring — the only
 /// way such a lock arises (a fresh vendor into it is refused by design).
 fn vendor_project(root: &Path, mock_uri: &str, flavor: Flavor) -> PathBuf {
-    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--vendor", "--yes"]);
+    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--mode", "vendored", "--yes"]);
     assert_eq!(
         code,
         0,

@@ -835,7 +835,21 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 #[test]
 #[serial_test::serial]
 fn uv_vendor_revert_keeps_wheel_while_export_references_it() {
-    let Some((uv, python)) = capstone_uv("uv-export") else {
+    uv_vendor_revert_keeps_wheel_while_export_at("uv-export", "requirements.txt");
+}
+
+/// #1167: the same keep when the export lands in a subdirectory the root
+/// `requirements.txt` never includes (`uv export -o requirements/lock.txt`,
+/// the common `requirements/` layout). Before the fix the probe listed only
+/// the project root, so the revert deleted the wheel that file installs.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_keeps_wheel_while_subdir_export_references_it() {
+    uv_vendor_revert_keeps_wheel_while_export_at("uv-export-subdir", "requirements/lock.txt");
+}
+
+fn uv_vendor_revert_keeps_wheel_while_export_at(tag: &str, out: &str) {
+    let Some((uv, python)) = capstone_uv(tag) else {
         return;
     };
     bake_leak_guards();
@@ -847,7 +861,7 @@ fn uv_vendor_revert_keeps_wheel_while_export_references_it() {
     if let Some(py) = python.as_deref() {
         cache_env.push(("UV_PYTHON", py));
     }
-    if !setup_uv_six_project(&uv, &proj, &cache_env, "uv-export") {
+    if !setup_uv_six_project(&uv, &proj, &cache_env, tag) {
         return;
     }
     let installed_six = site_packages(&proj.join(".venv")).join("six.py");
@@ -861,23 +875,20 @@ fn uv_vendor_revert_keeps_wheel_while_export_references_it() {
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let wheel = vendored_wheel(&proj);
+    if let Some(parent) = std::path::Path::new(out).parent() {
+        std::fs::create_dir_all(proj.join(parent)).unwrap();
+    }
 
     // The real `uv export` writes the vendored wheel path into the export.
     let export = |context: &str| {
-        let out = tool(
+        let output = tool(
             &uv,
             &proj,
-            &[
-                "export",
-                "--frozen",
-                "--no-emit-project",
-                "-o",
-                "requirements.txt",
-            ],
+            &["export", "--frozen", "--no-emit-project", "-o", out],
             &cache_env,
         );
-        assert_tool_ok(&out, context);
-        std::fs::read_to_string(proj.join("requirements.txt")).unwrap()
+        assert_tool_ok(&output, context);
+        std::fs::read_to_string(proj.join(out)).unwrap()
     };
     let exported = export("`uv export` of the wired pair");
     assert!(
@@ -903,14 +914,14 @@ fn uv_vendor_revert_keeps_wheel_while_export_references_it() {
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("vendor_revert_residual_reference") && stdout.contains("requirements.txt"),
+        stdout.contains("vendor_revert_residual_reference") && stdout.contains(out),
         "the keep must name the exported file:\n{stdout}"
     );
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["summary"]["removed"], 0, "nothing removed: {renv}");
     assert!(
         wheel.is_file(),
-        "the exported requirements.txt still installs the wheel; it must be kept"
+        "the exported {out} still installs the wheel; it must be kept"
     );
     assert!(
         proj.join(".socket/vendor/state.json").is_file(),
@@ -1065,6 +1076,15 @@ fn uv_vendor_revert_sub_table_sources() {
 /// the pair (#806, #821). Before the fix the pyproject side reverted alone
 /// and `uv sync --locked` failed while revert reported success.
 fn uv_relock_then_revert(tag: &str, pyproject: &str, relock: &[&str]) {
+    uv_relock_then_unwind(tag, pyproject, relock, true);
+}
+
+/// The shared body of [`uv_relock_then_revert`]. `keeps_vendored` is false
+/// for a relock that drops the dependency altogether (`uv remove six`,
+/// #1140): uv deletes every fragment that routed through the wheel, so the
+/// revert has nothing to restore, and must still converge instead of
+/// drift-keeping the entry (which kept `vendor --check` red forever).
+fn uv_relock_then_unwind(tag: &str, pyproject: &str, relock: &[&str], keeps_vendored: bool) {
     let Some((uv, python)) = capstone_uv(tag) else {
         return;
     };
@@ -1111,9 +1131,11 @@ fn uv_relock_then_revert(tag: &str, pyproject: &str, relock: &[&str]) {
         return;
     }
     let relocked = std::fs::read_to_string(proj.join("uv.lock")).unwrap();
-    assert!(
+    assert_eq!(
         relocked.contains(".socket/vendor/pypi/"),
-        "the relock must keep six vendored: {relocked}"
+        keeps_vendored,
+        "the relock must {} six vendored: {relocked}",
+        if keeps_vendored { "keep" } else { "drop" }
     );
 
     let (code, stdout, stderr) = run_socket(
@@ -1148,6 +1170,21 @@ fn uv_relock_then_revert(tag: &str, pyproject: &str, relock: &[&str]) {
     assert!(
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
+    );
+}
+
+/// #1140: `uv remove six` after vendoring drops the dependency, its
+/// `[tool.uv.sources]` line and every uv.lock fragment that pointed at the
+/// wheel. `vendor --revert` must retire the entry and delete the wheel
+/// instead of keeping both as drift.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_after_uv_remove() {
+    uv_relock_then_unwind(
+        "uv-remove",
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\", \"attrs>=20\"]\n",
+        &["remove", "-q", "six"],
+        false,
     );
 }
 

@@ -368,7 +368,11 @@ async fn extract_vendored(
     vendored: &BTreeSet<String>,
     out: &mut Discovery,
 ) {
-    let swept: BTreeMap<String, Vec<String>> = sweep_vendor_dirs(ctx.root)
+    // The vendored repository is a tree of jars: only a disk has one.
+    let Some(root) = ctx.disk_root() else {
+        return;
+    };
+    let swept: BTreeMap<String, Vec<String>> = sweep_vendor_dirs(root)
         .await
         .into_iter()
         .filter(|d| d.eco == "maven")
@@ -398,7 +402,7 @@ async fn extract_vendored(
             "{dir}/{}",
             layout::artifact_path(group, artifact, version, None, "jar")
         );
-        let jar_ok = tokio::fs::symlink_metadata(ctx.root.join(&rel))
+        let jar_ok = tokio::fs::symlink_metadata(root.join(&rel))
             .await
             .is_ok_and(|m| m.is_file());
         let (Some(vref), Some(purl), true) = (
