@@ -26,7 +26,9 @@
 //! from the rubygems.org compact index (`info/<name>`, what bundler itself
 //! records; other upstream remotes are refused: their index may need
 //! credentials and is not the default registry), and the `DEPENDENCIES`
-//! source pin (`name (= v)!`) loses its `!`.
+//! source pin (`name (= v)!`) loses its `!` — unless the declaration comes
+//! back inside the user's own `source … do` block, where bundler writes the
+//! `!` itself ([`in_source_block`], #1056).
 //!
 //! What the rewrite discards is NOT derivable, so the restore picks the
 //! installable reading and documents it:
@@ -277,13 +279,25 @@ struct Gem<'p> {
     version: String,
 }
 
-/// Restore `gem` in the LF lock text (module docs). `transitive`: drop the
-/// `DEPENDENCIES` entry instead of unpinning it.
+/// What the restore does to the gem's `DEPENDENCIES` entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DepEntry {
+    /// Drop the `!` source pin the rewriter added (module docs).
+    Unpin,
+    /// Keep the entry as is: the restored declaration sits in a user
+    /// `source … do` block, which bundler records with a `!` (#1056).
+    Keep,
+    /// Drop the entry: the rewriter added it for a transitive gem.
+    Drop,
+}
+
+/// Restore `gem` in the LF lock text (module docs); `dep` says what becomes
+/// of its `DEPENDENCIES` entry.
 fn lock_edit(
     lock: &str,
     gem: &Gem<'_>,
     globals: &[String],
-    transitive: bool,
+    dep: DepEntry,
     sha: Option<&str>,
     ctx: &Ctx<'_>,
 ) -> Result<LockEdit, String> {
@@ -346,10 +360,16 @@ fn lock_edit(
     };
     if wiring.is_some() {
         if let Some((k, entry)) = dependency_line(&lines, &gem.name) {
-            if transitive {
-                drop.insert(k);
-            } else if let Some(unpinned) = entry.strip_suffix('!') {
-                replace.insert(k, format!("  {unpinned}"));
+            match dep {
+                DepEntry::Drop => {
+                    drop.insert(k);
+                }
+                DepEntry::Unpin => {
+                    if let Some(unpinned) = entry.strip_suffix('!') {
+                        replace.insert(k, format!("  {unpinned}"));
+                    }
+                }
+                DepEntry::Keep => {}
             }
         }
     }
@@ -508,6 +528,32 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
         ""
     };
     format!("{eol}{indent}")
+}
+
+/// Whether byte `at` of the manifest sits inside a `source "<url>" do`
+/// block (at any depth: a `group … do` nested in it keeps the source).
+/// Bundler records a dependency declared there with a `!` source pin in the
+/// lock's `DEPENDENCIES`, whichever URL the block names (#1056). A line-level
+/// `do` / `end` count, like [`declaration_prefix`]'s: a block opened and
+/// closed on one line nets out.
+fn in_source_block(text: &str, at: usize) -> bool {
+    let mut open: Vec<bool> = Vec::new();
+    for line in text[..at].lines() {
+        let code = line.split('#').next().unwrap_or_default().trim();
+        let opens = code == "do"
+            || code.ends_with(" do")
+            || code.ends_with(")do")
+            || (code.ends_with('|') && code.contains(" do |"));
+        if opens {
+            let source = code
+                .strip_prefix("source")
+                .is_some_and(|rest| rest.starts_with([' ', '\t', '(']));
+            open.push(source);
+        } else if code == "end" || code.starts_with("end ") || code.starts_with("end.") {
+            open.pop();
+        }
+    }
+    open.contains(&true)
 }
 
 /// How the gem comes back into the manifest.
@@ -807,32 +853,36 @@ async fn restore_one(
     } else {
         Decl::Direct(format!(", \"{}\"", gem.version))
     };
-    let transitive = matches!(decl, Decl::Transitive);
+    // The restored declaration goes back where the block is: a user
+    // `source … do` block around it keeps the `!` bundler wrote for it.
+    let dep = match (&decl, &block, manifest) {
+        (Decl::Transitive, _, _) => DepEntry::Drop,
+        (Decl::Direct(_), Some(b), Some(text)) if in_source_block(text, b.start) => DepEntry::Keep,
+        (Decl::Direct(_), _, _) => DepEntry::Unpin,
+    };
     let next_lock = match lock {
         None => None,
-        Some(text) => Some(
-            match lock_edit(text, gem, globals, transitive, None, ctx)? {
-                LockEdit::Done(next) => next,
-                LockEdit::NeedsSha { remote } => {
-                    let remote = remote.ok_or("its upstream GEM remote is ambiguous")?;
-                    if !same_remote(&remote, RUBYGEMS_REMOTE) {
-                        return Err(format!(
+        Some(text) => Some(match lock_edit(text, gem, globals, dep, None, ctx)? {
+            LockEdit::Done(next) => next,
+            LockEdit::NeedsSha { remote } => {
+                let remote = remote.ok_or("its upstream GEM remote is ambiguous")?;
+                if !same_remote(&remote, RUBYGEMS_REMOTE) {
+                    return Err(format!(
                         "its upstream GEM remote {remote} is not rubygems.org, so its CHECKSUMS \
                          sha256 cannot be re-derived"
                     ));
-                    }
-                    let sha = ctx
-                        .client
-                        .rubygems_sha256(&gem.name, &gem.version)
-                        .await
-                        .map_err(|why| format!("{} {}: {why}", gem.name, gem.version))?;
-                    match lock_edit(text, gem, globals, transitive, Some(&sha), ctx)? {
-                        LockEdit::Done(next) => next,
-                        LockEdit::NeedsSha { .. } => unreachable!("a sha was supplied"),
-                    }
                 }
-            },
-        ),
+                let sha = ctx
+                    .client
+                    .rubygems_sha256(&gem.name, &gem.version)
+                    .await
+                    .map_err(|why| format!("{} {}: {why}", gem.name, gem.version))?;
+                match lock_edit(text, gem, globals, dep, Some(&sha), ctx)? {
+                    LockEdit::Done(next) => next,
+                    LockEdit::NeedsSha { .. } => unreachable!("a sha was supplied"),
+                }
+            }
+        }),
     };
     let next_manifest = match (manifest, &block) {
         (Some(text), Some(b)) => Some(restore_manifest(text, b, gem, &decl)),
@@ -886,11 +936,11 @@ mod tests {
                     ruby\n\nDEPENDENCIES\n  puma\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.4.0\n";
         // No CHECKSUMS (bundler 2.2–2.5): no registry lookup, offline works.
         assert_eq!(
-            done(lock_edit(&hosted, &gem(), &[], false, None, &ctx).unwrap()),
+            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap()),
             want
         );
         // Transitive: the DEPENDENCIES entry the rewriter added goes.
-        let out = done(lock_edit(&hosted, &gem(), &[], true, None, &ctx).unwrap());
+        let out = done(lock_edit(&hosted, &gem(), &[], DepEntry::Drop, None, &ctx).unwrap());
         assert!(out.contains("DEPENDENCIES\n  puma\n\n"), "{out}");
     }
 
@@ -904,7 +954,7 @@ mod tests {
              sha256={}\n",
             "d".repeat(64)
         );
-        match lock_edit(&hosted, &gem(), &[], false, None, &ctx).unwrap() {
+        match lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap() {
             LockEdit::NeedsSha { remote } => {
                 assert_eq!(remote.as_deref(), Some("https://rubygems.org/"))
             }
@@ -912,7 +962,7 @@ mod tests {
         }
         let sha = "2".repeat(64);
         assert_eq!(
-            done(lock_edit(&hosted, &gem(), &[], false, Some(&sha), &ctx).unwrap()),
+            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, Some(&sha), &ctx).unwrap()),
             format!(
                 "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  \
                  rails (= 7.0.0)\n\nCHECKSUMS\n  rails (7.0.0) sha256={sha}\n"
@@ -921,7 +971,7 @@ mod tests {
         // The rewriter's ADDED entry next to bundler's bare one is dropped.
         let added = hosted.replace("CHECKSUMS\n", "CHECKSUMS\n  rails (7.0.0)\n");
         assert!(
-            done(lock_edit(&added, &gem(), &[], false, None, &ctx).unwrap())
+            done(lock_edit(&added, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap())
                 .ends_with("CHECKSUMS\n  rails (7.0.0)\n")
         );
     }
@@ -935,7 +985,7 @@ mod tests {
              rails (7.0.0)\n\nDEPENDENCIES\n  puma\n  rails (= 7.0.0)!\n\nBUNDLED WITH\n   2.1.4\n"
         );
         assert_eq!(
-            done(lock_edit(&hosted, &gem(), &[], false, None, &ctx).unwrap()),
+            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap()),
             "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    rails (7.0.0)\n\n\
              DEPENDENCIES\n  puma\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.1.4\n"
         );
@@ -949,10 +999,20 @@ mod tests {
             "GEM\n  remote: https://gems.example/\n  specs:\n\nGEM\n  remote: https://mirror.example/\n  \
              specs:\n\nGEM\n  remote: {IDX}\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n"
         );
-        assert!(lock_edit(&two_upstreams, &gem(), &[], false, None, &ctx).is_err());
+        assert!(lock_edit(&two_upstreams, &gem(), &[], DepEntry::Unpin, None, &ctx).is_err());
         // The manifest's global source singles one out.
         let globals = vec!["https://mirror.example".to_string()];
-        let out = done(lock_edit(&two_upstreams, &gem(), &globals, false, None, &ctx).unwrap());
+        let out = done(
+            lock_edit(
+                &two_upstreams,
+                &gem(),
+                &globals,
+                DepEntry::Unpin,
+                None,
+                &ctx,
+            )
+            .unwrap(),
+        );
         assert!(
             out.contains("remote: https://mirror.example/\n  specs:\n    rails (7.0.0)\n"),
             "{out}"
@@ -962,11 +1022,11 @@ mod tests {
             "GEM\n  remote: https://rubygems.org/\n  specs:\n\nGEM\n  remote: {IDX}\n  specs:\n    \
              rack (3.0.0)\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n"
         );
-        assert!(lock_edit(&extra, &gem(), &[], false, None, &ctx).is_err());
+        assert!(lock_edit(&extra, &gem(), &[], DepEntry::Unpin, None, &ctx).is_err());
         let none = format!(
             "GEM\n  remote: {IDX}\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails!\n"
         );
-        assert!(lock_edit(&none, &gem(), &[], false, None, &ctx).is_err());
+        assert!(lock_edit(&none, &gem(), &[], DepEntry::Unpin, None, &ctx).is_err());
     }
 
     #[test]
@@ -1231,6 +1291,96 @@ mod tests {
         .expect("the redirect is found");
         assert_eq!(next_manifest.as_deref(), Some(manifest));
         assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
+    }
+
+    /// #1056: a gem the user declared inside a `source "…" do` block is
+    /// locked with a `!` source pin in `DEPENDENCIES` (bundler writes it
+    /// for any dependency with an explicit source, rubygems.org included).
+    /// The unwind puts the declaration back inside that block, so the `!`
+    /// must stay or every frozen install refuses the restored pair.
+    #[tokio::test]
+    async fn source_block_declaration_keeps_its_bang_through_restore() {
+        let client = super::super::UpstreamClient::new(true);
+        let upstream_sha = "2".repeat(64);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let ctx = ctx_with(&client);
+        for manifest in [
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource \"https://rubygems.org\" do\n  \
+             gem \"rails\", \"7.0.0\"\nend\n",
+            // Nested in a group inside the source block, parenthesized opener.
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource(\"https://rubygems.org\") do\n  \
+             group :web do\n    gem \"rails\", \"7.0.0\"\n  end\nend\n",
+        ] {
+            let lock = format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    \
+                 rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n  \
+                 rails (= 7.0.0)!\n\nCHECKSUMS\n  puma (6.0.0) sha256={}\n  rails (7.0.0) \
+                 sha256={upstream_sha}\n\nBUNDLED WITH\n   4.0.22\n",
+                "a".repeat(64)
+            );
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), manifest.to_string()),
+                ("Gemfile.lock".to_string(), lock.clone()),
+            ]);
+            let r = crate::patch::redirect::rewrite_registry_redirect(
+                &files,
+                &[crate::patch::redirect::DepOverride {
+                    ecosystem: "gem".into(),
+                    name: "rails".into(),
+                    namespace: None,
+                    version: "7.0.0".into(),
+                    token: "tok".into(),
+                    patch_uuid: UUID.into(),
+                    artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                    registry_override: Some(crate::patch::redirect::RegistryOverride {
+                        kind: "rubygems-compact-index".into(),
+                        index_url: IDX.into(),
+                        identifiers: crate::patch::redirect::RegistryOverrideIdentifiers {
+                            name: "rails".into(),
+                            version: "7.0.0".into(),
+                            gem_checksum_sha256: Some("f".repeat(64)),
+                            ..Default::default()
+                        },
+                    }),
+                    integrity: Default::default(),
+                }],
+            );
+            let (hosted_manifest, hosted_lock) = (&r.files["Gemfile"], &r.files["Gemfile.lock"]);
+            assert!(hosted_lock.contains(IDX), "{hosted_lock}");
+            let (next_lock, next_manifest) = restore_one(
+                &gem(),
+                Some(hosted_lock),
+                Some(hosted_manifest),
+                "Gemfile",
+                &global_sources(hosted_manifest),
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .expect("the redirect is found");
+            assert_eq!(next_manifest.as_deref(), Some(manifest));
+            assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
+        }
+    }
+
+    #[test]
+    fn source_block_detection() {
+        let at = |text: &str| in_source_block(text, text.find("gem \"rails\"").unwrap());
+        assert!(!at("source \"https://rubygems.org\"\ngem \"rails\"\n"));
+        assert!(!at("group :test do\n  gem \"rails\"\nend\n"));
+        assert!(at(
+            "source \"https://x\" do # comment\n  gem \"rails\"\nend\n"
+        ));
+        // A closed source block before the declaration does not count.
+        assert!(!at(
+            "source \"https://x\" do\n  gem \"a\"\nend\ngroup :t do |g|\n  gem \"rails\"\nend\n"
+        ));
+        // A one-line block opens and closes on its line.
+        assert!(!at(
+            "source \"https://x\" do gem \"a\" end\ngem \"rails\"\n"
+        ));
     }
 
     /// A hosted Gemfile + lock pair for `rails 7.0.0` (a direct gem), from
