@@ -4417,6 +4417,7 @@ pub(crate) struct VendorGcSummary {
 const GC_FORWARDED_ADVISORIES: &[&str] = &[
     socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED,
     socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED,
+    crate::commands::pypi_reinstall::VENDOR_CODE,
 ];
 
 impl VendorGcSummary {
