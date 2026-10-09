@@ -1439,6 +1439,42 @@ async fn npm_hosted_round_trip_manifest_less_vex() {
     });
 }
 
+/// REGRESSION (#828, yarn classic twin): a hosted registry block beside a
+/// git-sourced block of the same `name@version` (the hosted rewriter skips
+/// the git block, `redirect_yarn_classic_git_skipped`). Discovery withholds
+/// the pin from VEX, but rollback must still restore its upstream entry —
+/// it refused it as `hosted_wiring_contested` / `patched_ref_unattributable`
+/// with a remedy (re-run the hosted scan) that only rewrote the same state.
+/// The git block is left exactly as it was.
+#[tokio::test]
+#[serial]
+async fn yarn_classic_hosted_pin_beside_a_git_copy_rolls_back() {
+    let server = MockServer::start().await;
+    mock_yarn_registry(&server, "left-pad", "1.2.3").await;
+    let git_block = "\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.2.3\":\n  \
+                     version \"1.2.3\"\n  \
+                     resolved \"git+https://github.com/stevemao/left-pad.git#5e5f1a6e23f6fa2bd1e4a3d0c2bb1c0e1bb0f00a\"";
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("yarn.lock"),
+        yarn_lock_content(&format!("{git_block}\n\n{}", yarn_redirected_block())),
+    )
+    .unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "rollback must restore the pin: {envelope}");
+    assert_eq!(
+        envelope["hosted"]["reverted"],
+        serde_json::json!([LP_PURL]),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&format!("{git_block}\n\n{}", yarn_original_block())),
+        "only the hosted block is restored"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Agent record superseded by a hosted pin (#933)
 // ---------------------------------------------------------------------------

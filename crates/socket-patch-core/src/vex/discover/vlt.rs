@@ -283,6 +283,7 @@ async fn contest_bundled_copies(ctx: &DiscoverCtx<'_>, nodes: &[VltLockNode], ou
                 r.purl,
             ),
         );
+        out.shadow(r);
     }
     for purl in copies.into_keys() {
         out.resolved_elsewhere(VLT_LOCK, Some(purl));

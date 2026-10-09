@@ -119,7 +119,7 @@ use super::{
     Discovery, PatchedRef, TomlDiag, UnlockedPin, VendorRef, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::formats::cargo::{CargoLock, CopyClaim, LockedPackage};
+use crate::formats::cargo::{is_registry_source, CargoLock, CopyClaim, LockedPackage};
 use crate::patch::redirect::generation::{hosted_pin_name, PIN_NAME_PREFIX};
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
@@ -427,11 +427,10 @@ fn dependency_entries(doc: &DocumentMut) -> Vec<DepEntry> {
 /// The patch uuid a Cargo.lock `source` routes to, when it is a registry
 /// source on a Socket patch server.
 fn source_uuid(ctx: &DiscoverCtx<'_>, source: &str) -> Option<String> {
-    let s = source.trim();
-    if !(s.starts_with("sparse+") || s.starts_with("registry+")) {
+    if !is_registry_source(source) {
         return None; // git / path / local-registry sources are never ours
     }
-    ctx.hosted_uuid(s)
+    ctx.hosted_uuid(source.trim())
 }
 
 fn hosted_from_lock(

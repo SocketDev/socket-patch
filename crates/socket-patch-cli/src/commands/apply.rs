@@ -85,6 +85,25 @@ fn mismatch_event_detail(file: &str, dry_run: bool) -> String {
     )
 }
 
+/// One `content_mismatch_overwritten` run warning per mismatch-overwritten
+/// file across `results`, in the event detail's words prefixed with the
+/// package purl — what a nested apply hands back to `get` / `scan --mode
+/// agent` (#1004).
+fn mismatch_overwrite_warnings(results: &[ApplyResult], dry_run: bool) -> Vec<RunWarning> {
+    results
+        .iter()
+        .flat_map(|r| {
+            let purl = normalize_purl(&r.package_key);
+            mismatch_overwritten_files(r)
+                .into_iter()
+                .map(move |file| RunWarning {
+                    code: "content_mismatch_overwritten".to_string(),
+                    detail: format!("{purl}: {}", mismatch_event_detail(&file, dry_run)),
+                })
+        })
+        .collect()
+}
+
 /// The mismatch policy this run applies with: `--force` ⊃ default
 /// (adds the missing-file skip), `--strict` restores fail-closed.
 fn mismatch_policy(force: bool, strict: bool) -> MismatchPolicy {
@@ -963,15 +982,20 @@ pub(crate) struct ApplyRunReport {
     /// failed run's caller can count exactly what applied. Filled only
     /// when `code != 0`.
     pub applied: Vec<String>,
+    /// Non-fatal per-file warnings the caller's envelope must carry: one
+    /// `content_mismatch_overwritten` per file the default mismatch policy
+    /// overwrote (#1004). A nested apply never prints JSON and is silent
+    /// for a JSON caller, so this is their only channel. Filled whenever
+    /// the apply loop ran, whatever the exit code.
+    pub warnings: Vec<RunWarning>,
 }
 
 impl ApplyRunReport {
     fn run_failure(code: i32, error_code: &str, error: impl Into<String>) -> Self {
         Self {
             code,
-            failures: Vec::new(),
             run_error: Some((error_code.to_string(), error.into())),
-            applied: Vec::new(),
+            ..Self::default()
         }
     }
 }
@@ -1371,10 +1395,16 @@ pub(crate) async fn run_locked(
                 .await;
             }
 
+            // The mismatch overwrites, for a nested caller's envelope (the
+            // JSON events above are the standalone apply's copy).
+            let warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
             // A requested-but-failed VEX flips an otherwise-successful
             // apply to a non-zero exit (fail-the-command contract).
             if success && !vex_failed {
-                return ApplyRunReport::default();
+                return ApplyRunReport {
+                    warnings,
+                    ..ApplyRunReport::default()
+                };
             }
             let failures = if success {
                 Vec::new()
@@ -1412,6 +1442,7 @@ pub(crate) async fn run_locked(
                 failures,
                 run_error,
                 applied,
+                warnings,
             }
         }
         Err(e) => {

@@ -378,7 +378,7 @@ async fn vendor_under_lock(
                 detached: true,
                 force: false,
                 prior,
-                committed: None,
+                eject: None,
             },
             &mut env,
         )

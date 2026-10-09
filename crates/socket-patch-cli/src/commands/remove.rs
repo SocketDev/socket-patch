@@ -102,6 +102,19 @@ fn print_hosted_leg_warnings(common: &GlobalArgs, warnings: &[(String, String)])
     }
 }
 
+/// `--preserve-state` restored hosted pins anyway (hosted has no
+/// preservable local state): say so on stderr (`Note: …`, never under
+/// `--silent` / `--json`) and return the `hosted_state_not_preservable`
+/// run warning for the envelope's `warnings[]` — the same code
+/// `rollback --preserve-state` reports.
+fn note_hosted_state_not_preservable(common: &GlobalArgs) -> (String, String) {
+    let warning = super::rollback::hosted_state_not_preservable_warning();
+    if !common.silent && !common.json {
+        eprintln!("Note: {}.", warning.1);
+    }
+    warning
+}
+
 /// Emit a `remove` error envelope and return. Used by the many error
 /// paths in `run` so they all share the same JSON shape. `dry_run` rides
 /// the envelope so preview failures report `dryRun: true`.
@@ -785,11 +798,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     return 1;
                 }
             };
-            if args.preserve_state && !leg.reverted.is_empty() && loud {
-                eprintln!(
-                    "Note: hosted wiring has no preservable local state; its lockfile pins \
-                     now resolve upstream."
-                );
+            if args.preserve_state && !leg.reverted.is_empty() {
+                hosted_leg_warnings.push(note_hosted_state_not_preservable(&args.common));
             }
             // `run_hosted_leg` printed one line per restored purl.
             printed_progress |= loud && !leg.reverted.is_empty();
@@ -1431,7 +1441,11 @@ async fn remove_hosted_only(
     } else {
         PatchAction::Removed
     };
-    for (code, detail) in &leg.warnings {
+    let mut warnings = leg.warnings.clone();
+    if args.preserve_state && !leg.reverted.is_empty() {
+        warnings.push(note_hosted_state_not_preservable(&args.common));
+    }
+    for (code, detail) in &warnings {
         env.warnings.push(crate::json_envelope::RunWarning {
             code: code.clone(),
             detail: detail.clone(),

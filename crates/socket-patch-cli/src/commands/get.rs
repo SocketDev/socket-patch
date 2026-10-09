@@ -30,11 +30,12 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 // `commands::get` paths (the in-process tests and embedders call them);
 // the engine itself lives in the shared `agent_download` helper.
 use crate::commands::agent_download::{
-    decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
-    filter_to_installed_releases, fold_apply_failures, max_vuln_severity, merge_metadata,
-    nested_apply_args, patch_event_metadata, report_error, report_lock_failure, run_nested_apply,
-    run_outcome, unwind_new_blobs, warn_on_vendored_uuid_drift, write_all_patch_blobs,
-    DetachedDownload, PatchAction, VendorRefusals,
+    apply_warning_lines, decide_patch_action, download_patch_records_preflighted,
+    download_patch_records_reusing, filter_to_installed_releases, fold_apply_failures,
+    max_vuln_severity, merge_metadata, nested_apply_args, patch_event_metadata, report_error,
+    report_lock_failure, run_nested_apply, run_outcome, unwind_new_blobs,
+    warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload, PatchAction,
+    VendorRefusals,
 };
 pub use crate::commands::agent_download::{
     download_and_apply_patches_with, DownloadParams, DownloadRun,
@@ -2060,6 +2061,7 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
             result_json["applied"] = serde_json::json!(applied);
         }
         // Same contract as `download_and_apply_patches_with`: omitted when clean.
+        warnings.extend(apply_warning_lines(apply_report.as_ref()));
         if !warnings.is_empty() {
             result_json["warnings"] = serde_json::json!(warnings);
         }
@@ -3165,6 +3167,7 @@ mod tests {
             failures,
             run_error: None,
             applied: applied.iter().map(|p| p.to_string()).collect(),
+            warnings: Vec::new(),
         }
     }
 
@@ -3321,6 +3324,7 @@ mod tests {
             failures: Vec::new(),
             run_error: Some(("yarn_pnp_unsupported".to_string(), "pnp".to_string())),
             applied: Vec::new(),
+            warnings: Vec::new(),
         };
         assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 0);
         assert!(env.get("errorCode").is_none(), "{env}");
