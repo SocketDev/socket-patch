@@ -425,26 +425,23 @@ pub async fn run(args: RemoveArgs) -> i32 {
         match read_manifest(&manifest_path).await {
             Ok(Some(m)) => m,
             Ok(None) => {
+                // Present at the existence check above, gone by the read.
                 emit_error_envelope(
                     args.common.json,
                     args.common.dry_run,
-                    "manifest_invalid",
-                    "Invalid manifest".to_string(),
+                    "manifest_not_found",
+                    format!("Manifest not found at {}", manifest_path.display()),
                 );
                 return 1;
             }
             Err(e) => {
-                // A manifest that exists but is unparseable (bad JSON or a
-                // schema violation) surfaces as `ErrorKind::InvalidData` —
-                // the contract's `manifest_invalid`. Everything else is a
-                // genuine I/O failure (`manifest_unreadable`). See the
-                // CLI_CONTRACT.md error-code table; `list` shares the split.
-                let code = if e.kind() == std::io::ErrorKind::InvalidData {
-                    "manifest_invalid"
-                } else {
-                    "manifest_unreadable"
-                };
-                emit_error_envelope(args.common.json, args.common.dry_run, code, e.to_string());
+                let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+                emit_error_envelope(
+                    args.common.json,
+                    args.common.dry_run,
+                    &err.code,
+                    err.message,
+                );
                 return 1;
             }
         }

@@ -1187,7 +1187,8 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 ```jsonc
 {
   "command":  "scan" | "apply" | "vex" | "vendor" | "rollback" | "get" | "list" | "remove" | "repair" | "update",
-  "status":   "success" | "partialFailure" | "error" | "noManifest" | "paidRequired" | "notFound",
+  "status":   "success" | "partialFailure" | "error" | "noManifest" | "paidRequired" | "notFound"
+              | "notInstalled" | "noMatch" | "noPackages" | "selectionRequired",
   "dryRun":   false,
   "events": [ <PatchEvent>, ... ],
   "summary":  {
@@ -1199,7 +1200,8 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
     "failed":          0,
     "removed":         0,
     "verified":        0,
-    "rebuilt":         0,   // omitted while zero (repair / vendor only)
+    "rebuilt":         0,
+    "rolledBack":      0,
     "bytesFreed":      0    // = gc.bytesFreed; 0 when no GC ran
   },
   "gc": {                   // only when the run swept .socket/ (repair, remove)
@@ -1220,7 +1222,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 ```jsonc
 {
-  "action":    "discovered" | "downloaded" | "applied" | "updated" | "skipped" | "failed" | "removed" | "verified" | "rebuilt",
+  "action":    "discovered" | "downloaded" | "applied" | "updated" | "skipped" | "failed" | "removed" | "verified" | "rebuilt" | "rolledBack",
   "purl":      "pkg:npm/foo@1.2.3",        // omitted on artifact-level events
   "uuid":      "<patch uuid>",              // optional
   "oldUuid":   "<previous uuid>",           // only when action=updated
@@ -1255,7 +1257,8 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `failed`     | `apply`, `repair`, `vendor`           | A specific attempt failed. `errorCode` + `error` set. |
 | `removed`    | `remove`, `repair`, `vendor`          | A manifest entry or vendored state was removed, or (artifact-level, no `purl`) `.socket/` artifacts were swept — that GC carrier sets `bytes` and is not counted in `summary.removed`; the sweep's totals are the envelope's `gc`. |
 | `verified`   | `apply`, `remove`, `repair`, `vendor` (dry run); `vex`; `--update --dry-run` | The action *would* succeed cleanly (`files` lists previewed changes); `vex`: the patch verified and was attested. |
-| `rebuilt`    | `repair`, `vendor`                    | A missing/corrupt vendored artifact was restored from its exact server download (v5.0: never a lost ledger entry — see `vendor_ledger_missing`). `summary.rebuilt` counts these (the field is omitted while zero). |
+| `rebuilt`    | `repair`, `vendor`                    | A missing/corrupt vendored artifact was restored from its exact server download (v5.0: never a lost ledger entry — see `vendor_ledger_missing`). `summary.rebuilt` counts these. |
+| `rolledBack` | `rollback`                            | A patched package was restored to its original files (`files` lists them). |
 
 `scan`, `get` and `rollback` print their legacy shapes, not events (see [Migration status](#migration-status-v30)).
 

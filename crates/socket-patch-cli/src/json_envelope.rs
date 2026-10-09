@@ -1,10 +1,10 @@
 //! Unified JSON output envelope shared across every subcommand.
 //!
-//! The `--json` output of `apply`, `list`, `remove`, `repair`/`gc`,
-//! `vendor`, `self-update` and `vex --json --output` (and every command's
-//! lock-contention error) uses this top-level shape; `scan`, `get`,
-//! and `rollback` still emit their legacy shapes (see
-//! CLI_CONTRACT.md's migration status):
+//! Every command's `--json` output uses this top-level shape (v5.0: `scan`,
+//! `get` and `rollback` joined `apply`, `list`, `remove`, `repair`,
+//! `vendor`, `--update` and `vex --json --output`). A command's own
+//! payload (scan's `packages`, rollback's `hosted`, …) rides beside the
+//! shared keys through [`Envelope::extra`]:
 //!
 //! ```json
 //! {
@@ -98,7 +98,20 @@ pub struct Envelope {
     /// --preserve-state`, every command without a GC pass).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gc: Option<GcReport>,
+    /// Command-specific top-level keys, flattened beside the shared ones
+    /// (scan's `packages` / `redirect`, rollback's `hosted` / `manifest`,
+    /// …). A key here must never shadow a shared key; [`Envelope::set_extra`]
+    /// enforces that.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
+
+/// The keys every envelope owns. [`Envelope::set_extra`] refuses them so a
+/// command payload can't shadow the shared vocabulary.
+const SHARED_KEYS: &[&str] = &[
+    "command", "status", "dryRun", "events", "summary", "error", "sidecars", "warnings", "vex",
+    "gc",
+];
 
 /// One artifact GC pass — the orphan sweeps of `.socket/blobs`,
 /// `.socket/diffs` and `.socket/packages` — serialized identically by
@@ -188,7 +201,30 @@ impl Envelope {
             warnings: Vec::new(),
             vex: None,
             gc: None,
+            extra: serde_json::Map::new(),
         }
+    }
+
+    /// Set a command-specific top-level key (see [`Envelope::extra`]).
+    ///
+    /// # Panics
+    /// When `key` is one of the shared envelope keys — a programming error.
+    pub fn set_extra(&mut self, key: &str, value: serde_json::Value) {
+        assert!(
+            !SHARED_KEYS.contains(&key),
+            "`{key}` is a shared envelope key, not a command payload key"
+        );
+        self.extra.insert(key.to_string(), value);
+    }
+
+    /// Append a run-level warning.
+    pub fn warn(&mut self, code: impl Into<String>, detail: impl Into<String>) {
+        self.warnings.push(RunWarning::new(code, detail));
+    }
+
+    /// Serialize to a JSON value.
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("envelope serialize")
     }
 
     /// Attach the run's artifact GC outcome (`gc`) and mirror its byte
@@ -476,6 +512,9 @@ pub enum PatchAction {
     /// from verified sources (lockfiles and the vendor ledger untouched
     /// unless drift was healed).
     Rebuilt,
+    /// `rollback`: a patched package was restored to its original state
+    /// (`files` lists what was restored).
+    RolledBack,
 }
 
 /// Patch-source strategy used to apply a file. Mirrors the existing
@@ -526,15 +565,21 @@ pub enum Status {
     /// there's nothing to apply. Distinct from `Success` because some
     /// consumers want to early-exit on this state.
     NoManifest,
-    /// Reserved: the requested patch requires a paid plan but the caller's
-    /// API token isn't entitled. Nothing emits it yet (`get` reports this
-    /// via its legacy `status: "paid_required"` shape; scan never does).
-    /// Distinct from `Error` so PR bots can post a "upgrade your plan"
-    /// comment instead of failing.
+    /// `get`: the requested patch requires a paid plan but the caller's
+    /// API token isn't entitled. Distinct from `Error` so PR bots can post
+    /// an "upgrade your plan" comment instead of failing.
     PaidRequired,
-    /// `remove` / `rollback`: the patch identifier didn't resolve to
-    /// anything in the local manifest.
+    /// The identifier didn't resolve to a patch (`get`: none published;
+    /// `remove`: nothing in the local manifest).
     NotFound,
+    /// `get`: the identifier matched no installed package.
+    NotInstalled,
+    /// `get`: the search matched no package at all.
+    NoMatch,
+    /// `get`: the project has no packages to search.
+    NoPackages,
+    /// `get`: several patches match and the caller must pick one (exit 1).
+    SelectionRequired,
 }
 
 /// Pre-aggregated counts across all events in this envelope. Field names
@@ -550,18 +595,12 @@ pub struct Summary {
     pub failed: u32,
     pub removed: u32,
     pub verified: u32,
-    /// `repair`-only (vendored artifact rebuilds); omitted while zero so
-    /// every other command's summary shape is unchanged.
-    #[serde(skip_serializing_if = "u32_is_zero")]
     pub rebuilt: u32,
+    pub rolled_back: u32,
     /// Bytes the run's artifact GC freed (would free, on a dry run) — the
     /// envelope's `gc.bytesFreed`, 0 when no GC ran. Not derived from
     /// `events`: GC is reported once, in `gc`.
     pub bytes_freed: u64,
-}
-
-fn u32_is_zero(n: &u32) -> bool {
-    *n == 0
 }
 
 impl Summary {
@@ -576,6 +615,7 @@ impl Summary {
             PatchAction::Removed => self.removed += 1,
             PatchAction::Verified => self.verified += 1,
             PatchAction::Rebuilt => self.rebuilt += 1,
+            PatchAction::RolledBack => self.rolled_back += 1,
         }
     }
 }
@@ -599,6 +639,22 @@ impl EnvelopeError {
             message: message.into(),
         }
     }
+}
+
+/// The top-level error for a manifest that exists but couldn't be loaded.
+/// One mapping for every command (#931): malformed JSON or a schema
+/// violation (`read_manifest`'s `InvalidData`) is `manifest_invalid`; any
+/// other I/O failure is `manifest_unreadable`.
+pub(crate) fn manifest_load_error(
+    manifest_path: &std::path::Path,
+    err: &std::io::Error,
+) -> EnvelopeError {
+    let code = if err.kind() == std::io::ErrorKind::InvalidData {
+        "manifest_invalid"
+    } else {
+        "manifest_unreadable"
+    };
+    EnvelopeError::new(code, crate::ui::manifest_error_message(manifest_path, err))
 }
 
 /// The `{code, message}` object every `--json` failure carries as its
@@ -700,6 +756,15 @@ pub struct RunWarning {
     pub code: String,
     /// Human-readable explanation with the suggested remediation.
     pub detail: String,
+}
+
+impl RunWarning {
+    pub fn new(code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            detail: detail.into(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
