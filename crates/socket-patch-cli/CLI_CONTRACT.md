@@ -833,7 +833,11 @@ worse, lets a warm cache silently serve unpatched bytes):
   that no longer exists at all — the user removed the dependency — is not drift: it warns
   `vendor_lock_entry_removed` and the artifact and entry are kept unless every wired file that exists
   was read and none mentions the uuid in any spelling (an unreadable lock keeps them), so `rollback` / `remove` / `scan --prune` clean up
-  after `npm uninstall` / `yarn remove` / `pnpm remove` / `bun remove`), removes the artifacts, prunes the
+  after `npm uninstall` / `yarn remove` / `pnpm remove` / `bun remove`; in uv projects and PEP 723
+  script locks the same holds after `uv remove` of the package, and after `uv remove` of the parent
+  of a TRANSITIVE vendored package, whose `[tool.uv]` override + source and `[manifest]` records
+  uv leaves in place: those are socket-patch's own records, which the revert restores, so only a
+  reference outside them counts as drift, #1287), removes the artifacts, prunes the
   ledger, sweeps orphan uuid dirs, and (v5.0) prunes the now-empty `.socket/vendor/<eco>/` and
   `.socket/vendor/` levels — `.socket/` itself is removed by the lock guard when nothing else is
   left. It works without a manifest: with no manifest and no ledger it is a clean exit-0 no-op.

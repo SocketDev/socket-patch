@@ -852,6 +852,67 @@ fn uv_remove_script_six(root: &Path) {
 /// `vendor --check` stayed red and its own `scan --prune` remedy looped.
 #[tokio::test]
 async fn script_lock_unwinds_after_uv_remove_script() {
+    assert_script_lock_unwinds(stage_script_lock, uv_remove_script_six).await;
+}
+
+/// A PEP 723 script whose six arrives only TRANSITIVELY (through
+/// python-dateutil), with its `.py.lock`; returns its wiring files.
+fn stage_transitive_script_lock(root: &Path) -> &'static [&'static str] {
+    std::fs::write(
+        root.join("job.py"),
+        "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"python-dateutil==2.8.2\"]\n# ///\nimport six\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("job.py.lock"),
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{{ name = \"python-dateutil\", specifier = \"==2.8.2\" }}]\n\n[[package]]\nname = \"python-dateutil\"\nversion = \"2.8.2\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\ndependencies = [{{ name = \"six\" }}]\nwheels = [{{ url = \"https://files.pythonhosted.org/python_dateutil-2.8.2-py2.py3-none-any.whl\", hash = \"sha256:{}\" }}]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\nwheels = [{{ url = \"https://files.pythonhosted.org/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{WHEEL_SHA}\" }}]\n",
+            "d".repeat(64)
+        ),
+    )
+    .unwrap();
+    &["job.py", "job.py.lock"]
+}
+
+/// What `uv remove --script job.py python-dateutil` leaves of the vendored
+/// [`stage_transitive_script_lock`] (checked against uv 0.11.19): the
+/// dependency and both lock units go, while the script's `[tool.uv]`
+/// override + source and the lock's `[manifest] overrides` socket-patch
+/// wrote stay, still naming the vendored wheel.
+fn uv_remove_script_parent(root: &Path) {
+    let script = std::fs::read_to_string(root.join("job.py")).unwrap();
+    std::fs::write(
+        root.join("job.py"),
+        script.replace("\"python-dateutil==2.8.2\"", ""),
+    )
+    .unwrap();
+    let lock = std::fs::read_to_string(root.join("job.py.lock")).unwrap();
+    let overrides = lock
+        .lines()
+        .find(|line| line.starts_with("overrides = "))
+        .expect("the vendored lock carries the override");
+    std::fs::write(
+        root.join("job.py.lock"),
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\n{overrides}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// #1287: the script lane of a vendored TRANSITIVE package whose parent
+/// `uv remove --script` dropped: every unwind retires the entry instead of
+/// drift-keeping it, and `vendor --check` turns green.
+#[tokio::test]
+async fn transitive_script_lock_unwinds_after_uv_remove_of_its_parent() {
+    assert_script_lock_unwinds(stage_transitive_script_lock, uv_remove_script_parent).await;
+}
+
+/// Vendor the script lock `stage` writes, apply `remove` (a `uv remove
+/// --script`), then every unwind must retire the entry (see
+/// [`script_lock_unwinds_after_uv_remove_script`]). Files the unwind
+/// restores must no longer name the vendored wheel.
+async fn assert_script_lock_unwinds(stage: StageFn, remove: fn(&Path)) {
     let server = MockServer::start().await;
     mount_hosted_api(&server, true).await;
     let uri = server.uri();
@@ -876,13 +937,16 @@ async fn script_lock_unwinds_after_uv_remove_script() {
         hosted_scan_args(&uri),
     ] {
         let (_tmp, root) = project();
-        let files = stage_script_lock(&root);
+        let files = stage(&root);
         vendor_project(&root, files);
-        uv_remove_script_six(&root);
+        remove(&root);
         let removed: Vec<String> = files
             .iter()
             .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
             .collect();
+        // What remains after the unwind: the user's own content, with any
+        // surviving socket-patch wiring gone.
+        let transitive = removed.iter().any(|text| text.contains(UUID));
         let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
         assert_eq!(code, 1, "{unwind:?}: the removal is flagged first: {env:#}");
 
@@ -915,11 +979,15 @@ async fn script_lock_unwinds_after_uv_remove_script() {
             std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap_or_default();
         assert!(!ledger.contains(UUID), "{unwind:?}: {ledger}");
         for (f, text) in files.iter().zip(&removed) {
-            assert_eq!(
-                &std::fs::read_to_string(root.join(f)).unwrap(),
-                text,
-                "{unwind:?}: {f} stays as uv left it"
-            );
+            let after = std::fs::read_to_string(root.join(f)).unwrap();
+            if transitive {
+                assert!(
+                    !after.contains(UUID) && !after.contains("override"),
+                    "{unwind:?}: {f} is unwired:\n{after}"
+                );
+            } else {
+                assert_eq!(&after, text, "{unwind:?}: {f} stays as uv left it");
+            }
         }
         // `vendor --revert` and `rollback` keep the manifest record, so
         // check then reports the patch as not vendored; the unwinds that
