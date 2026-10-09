@@ -22,6 +22,16 @@ and an empty `BUN_INSTALL_CACHE_DIR` to regenerate. Bun 1.2+ fixtures include
   1.0.0, 1.1.45 and 1.3.14, pinning the metadata hash's semver order.
 - `0.8.1-production-complex`: two production patch targets, a transitive
   dependency with a bin, root lifecycle scripts, and development dependencies.
+- `late-dependent/<version>-<member>.lockb`: the lock Bun 1.3.9 / 1.4.2
+  wrote for the `e2e_bun_lockb` workspace (vendored once, uuid
+  `80630680-…`) after a late dependent of minimist@1.2.2 — a new `late`
+  member, or `bun add` in the existing `adder` member — gave it a second,
+  nested registry record (#861). `late-dependent/<version>-deps-<member>.lockb`
+  are the same flow with mkdirp@0.5.6 patched, a package with a dependency
+  (minimist) of its own. The `<version>-ws-*` locks repeat both flows with
+  ws@8.18.0 also at the root, whose optional peers (bufferutil,
+  utf-8-validate) nothing installs: unresolved edges, as most real locks
+  hold.
 
 Other releases capture the stable major/minor eras. `two-versions` covers
 multiple package versions and scoped restoration. The earliest writers include

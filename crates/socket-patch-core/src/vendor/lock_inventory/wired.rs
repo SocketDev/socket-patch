@@ -87,7 +87,7 @@ pub async fn wired_vendor_integrity(
 
     // Read active binary resolution records, never the append-only string
     // pool: it can retain paths and digests from earlier patch generations.
-    if !super::bun::bun_text_lock_present(project_root).await {
+    if !super::bun::bun_text_lock_drives(&super::ProjectView::Disk(project_root)) {
         if let Ok(bytes) = read_regular_to_bytes(&project_root.join(BUN_LOCKB)).await {
             if let Ok(packages) = BunLockb::parse_packages(&bytes) {
                 let mut pinned: Option<String> = None;

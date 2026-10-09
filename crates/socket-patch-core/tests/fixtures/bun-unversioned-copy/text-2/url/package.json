@@ -1,0 +1,1 @@
+{"name":"app","version":"1.0.0","dependencies":{"minimist":"https://codeload.github.com/minimistjs/minimist/tar.gz/refs/tags/v1.2.2","dep":"file:./dep"}}

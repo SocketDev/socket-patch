@@ -8,7 +8,7 @@
 
 use super::patterns::{berry_npm_alias_target, split_berry_key_patterns, split_pattern};
 use crate::formats::text::split_bom;
-use crate::vendor::common::detect_eol;
+use crate::utils::line_endings::terminator;
 
 /// One key-line block of a yarn lockfile (classic or berry).
 pub(crate) struct LockBlock {
@@ -82,16 +82,16 @@ fn is_body_line(s: &str) -> bool {
 }
 
 /// The line terminator `block` is written in: its first line's (`\r\n` or
-/// `\n`), else — a block that is one unterminated last line — the file's
-/// dominant one ([`detect_eol`]). For a uniformly-ended lock this is the
-/// file's own terminator; in a lock whose endings were mixed after the
+/// `\n`), else — a block that is one unterminated last line — the
+/// file's [`terminator`]. For a uniformly-ended lock this is the file's
+/// own terminator; in a lock whose endings were mixed after the
 /// fact it keeps a restored block in the style of the block it replaces.
 pub(crate) fn block_eol(text: &str, block: &LockBlock) -> &'static str {
     let span = &text[block.start..block.end];
     match span.find('\n') {
         Some(i) if span[..i].ends_with('\r') => "\r\n",
         Some(_) => "\n",
-        None => detect_eol(text),
+        None => terminator(text),
     }
 }
 

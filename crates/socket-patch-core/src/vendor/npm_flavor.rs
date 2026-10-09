@@ -396,22 +396,25 @@ async fn detect_vendorable_npm_flavor_with(
     ))
 }
 
-/// #1094: a package-lock project that is a member of an npm workspace
-/// holds a lock npm never reads (members install from the workspace
+/// A workspace member whose own lock its package manager never reads
+/// (npm #1094, Bun #1101, vlt #1134: members install from the workspace
 /// root's lock), so vendoring into it would wire nothing. Refused as a
 /// member without that lock is (`vendor_lockfile_missing`). Shared by
-/// [`vendor_npm_any`] and the hosted→vendored takeover preflight
-/// ([`super::npm_lock::npm_lock_vendor_preflight`]), which must refuse
-/// before the takeover restores the hosted pin.
-pub(crate) async fn npm_member_stray_lock_refusal(
+/// [`vendor_npm_any`] and the hosted→vendored takeover preflights
+/// ([`super::npm_lock::npm_lock_vendor_preflight`],
+/// [`super::bun_lock::preflight_vendor`],
+/// [`super::vlt_lock::vlt_vendor_preflight`]), which must refuse before
+/// the takeover restores the hosted pin.
+pub(crate) async fn member_stray_lock_refusal(
     project_root: &Path,
 ) -> Option<(&'static str, String)> {
-    let (root, detail) = crate::hosted::governing_root::npm_member_stray_lock(project_root).await?;
+    let stray = crate::hosted::governing_root::member_stray_lock(project_root).await?;
     Some((
         "vendor_lockfile_missing",
         format!(
-            "{detail}; vendor from {} (the workspace root)",
-            root.display()
+            "{}; vendor from {} (the workspace root)",
+            stray.detail,
+            stray.root.display()
         ),
     ))
 }
@@ -438,10 +441,8 @@ pub async fn vendor_npm_any<'a>(
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
     };
-    if flavor == NpmLockFlavor::PackageLock {
-        if let Some((code, detail)) = npm_member_stray_lock_refusal(project_root).await {
-            return VendorOutcome::Refused { code, detail };
-        }
+    if let Some((code, detail)) = member_stray_lock_refusal(project_root).await {
+        return VendorOutcome::Refused { code, detail };
     }
     if let Some(detail) = flavor_change_refusal(project_root, purl, flavor).await {
         return VendorOutcome::Refused {
@@ -1847,6 +1848,88 @@ mod tests {
         );
     }
 
+    /// #1101 (Bun), #1134 (vlt): a workspace member's own `bun.lock`,
+    /// `bun.lockb` or `vlt-lock.json` is a lock its manager never reads
+    /// (members install from the workspace root's lock), so vendoring into
+    /// it would wire nothing. The engine and the hosted→vendored takeover
+    /// preflights refuse the member as they do without the stray lock, and
+    /// nothing is written.
+    #[tokio::test]
+    async fn bun_and_vlt_members_with_stray_lock_are_refused() {
+        const BUN_TEXT: &str = "{\n  \"lockfileVersion\": 1\n}\n";
+        const VLT_TEXT: &str = r#"{"lockfileVersion":1,"options":{},"nodes":{},"edges":{}}"#;
+        let pj_workspace = r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#;
+        for (member_lock, member_text, root_files) in [
+            (
+                "bun.lock",
+                BUN_TEXT,
+                vec![("package.json", pj_workspace), ("bun.lock", BUN_TEXT)],
+            ),
+            (
+                "bun.lockb",
+                "binary",
+                vec![("package.json", pj_workspace), ("bun.lock", BUN_TEXT)],
+            ),
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("vlt.json", r#"{"workspaces":"packages/*"}"#),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+        ] {
+            let (tmp, record) = npm_project().await;
+            tokio::fs::remove_file(tmp.path().join("package-lock.json"))
+                .await
+                .unwrap();
+            touch(tmp.path(), member_lock, member_text).await;
+            let ws = tempfile::tempdir().unwrap();
+            let member = ws.path().join("packages/a");
+            tokio::fs::create_dir_all(member.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::rename(tmp.path(), &member).await.unwrap();
+            for (rel, text) in &root_files {
+                touch(ws.path(), rel, text).await;
+            }
+            let lock_before = tokio::fs::read(member.join(member_lock)).await.unwrap();
+
+            let preflight = if member_lock == "vlt-lock.json" {
+                crate::vendor::vlt_lock::vlt_vendor_preflight(
+                    &member,
+                    "pkg:npm/left-pad@1.3.0",
+                    UUID,
+                )
+                .await
+                .expect_err("the vlt takeover preflight refuses the member")
+            } else {
+                crate::vendor::bun_lock::preflight_vendor(&member)
+                    .await
+                    .expect_err("the Bun takeover preflight refuses the member")
+            };
+
+            let outcome = vendor_any(&member, &record).await;
+            let VendorOutcome::Refused { code, detail } = outcome else {
+                panic!("{member_lock}: expected Refused, got {outcome:?}");
+            };
+            assert_eq!(code, "vendor_lockfile_missing", "{member_lock}");
+            assert!(
+                detail.contains("workspace")
+                    && detail.contains("ignores")
+                    && detail.contains(member_lock),
+                "{member_lock}: {detail}"
+            );
+            assert_eq!(preflight, (code, detail), "{member_lock}");
+            assert!(!member.join(".socket/vendor").exists(), "{member_lock}");
+            assert_eq!(
+                tokio::fs::read(member.join(member_lock)).await.unwrap(),
+                lock_before,
+                "{member_lock}"
+            );
+        }
+    }
+
     /// A yarn.lock ROUTES to the yarn-classic backend. With a header-only
     /// lock that has no matching block, the backend's own `vendor_lock_entry_not_found`
     /// proves the dispatch reached it — and nothing is written.
@@ -2235,6 +2318,45 @@ mod tests {
             None,
             "malformed means unknown, never garbage collect"
         );
+    }
+
+    /// REGRESSION (#735): a dangling `bun.lock` link is absent to Bun,
+    /// which installs from `bun.lockb`, so the GC probe resolves through
+    /// the binary lock instead of reading the link and never deciding.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_bun_in_use_sees_through_a_dangling_text_lock_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = include_bytes!("../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+        let mut lock = super::super::bun_lockb::BunLockb::parse(bytes).unwrap();
+        let package = lock
+            .packages()
+            .unwrap()
+            .into_iter()
+            .find(|package| package.name == "minimist")
+            .unwrap();
+        let mut entry = probe_entry(Some("bun"));
+        let target = format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        entry.base_purl = "pkg:npm/minimist@1.2.2".into();
+        entry.artifact.path = target.clone();
+        let sri = format!("sha512-{}", "A".repeat(86) + "==");
+        lock.set_package(package.id, &target, &sri).unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("missing-target", tmp.path().join("bun.lock")).unwrap();
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(true));
+
+        lock.set_package(
+            package.id,
+            "https://registry.example/minimist-1.2.2.tgz",
+            &sri,
+        )
+        .unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+            .await
+            .unwrap();
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(false));
     }
 
     /// An entry stamped `flavor="pnpm-legacy"` must dispatch to the legacy

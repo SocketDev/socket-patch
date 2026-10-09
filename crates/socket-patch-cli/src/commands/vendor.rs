@@ -3996,6 +3996,16 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
     }
 }
 
+/// The install that resyncs an installed tree after a revert: Bun's
+/// hoisted linker keeps the vendored copy through a plain `bun install`
+/// (#764), so Bun's needs `--force`.
+fn flavor_revert_install_command(flavor: &str) -> Option<&'static str> {
+    match flavor {
+        "bun" => Some("bun install --force"),
+        other => flavor_install_command(other),
+    }
+}
+
 /// Drop installed npm copies that resolve into `.socket/vendor/` (or no
 /// longer resolve at all): vlt links a vendored `file:` dependency straight
 /// to its committed dir, which is this tool's own artifact and never a
@@ -4263,7 +4273,25 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
                         .with_error("hosted_restore_failed", why.clone()),
                 );
             }
+            // The vendored revert above already advised a Bun reinstall
+            // per package (#764); the hosted unwind's run-level twin for
+            // the same packages would only repeat it.
+            let bun_advised: HashSet<PurlKey> = env
+                .events
+                .iter()
+                .filter(|e| {
+                    e.error_code.as_deref()
+                        == Some(socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED)
+                })
+                .filter_map(|e| e.purl.as_deref().map(PurlKey::new))
+                .collect();
+            let bun_repeat = rehosted
+                .iter()
+                .all(|pin| bun_advised.contains(&PurlKey::new(&pin.purl)));
             for (code, detail) in &leg.warnings {
+                if bun_repeat && code == "redirect_bun_reinstall_required" {
+                    continue;
+                }
                 env.warnings.push(RunWarning {
                     code: code.clone(),
                     detail: detail.clone(),
@@ -4328,7 +4356,7 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
         if summary.reverted > 0 && !common.dry_run {
             let mut installs: Vec<&str> = reverted_flavors
                 .iter()
-                .filter_map(|f| flavor_install_command(f))
+                .filter_map(|f| flavor_revert_install_command(f))
                 .collect();
             installs.sort_unstable();
             installs.dedup();
@@ -4373,6 +4401,40 @@ pub(crate) struct VendorGcSummary {
     /// "manifest_write_failed", <detail>)`. The reverts themselves already
     /// happened on disk; the stale record is what the caller must report.
     pub write_failures: Vec<(&'static str, String)>,
+    /// The wet reverts' reinstall advisories (`code`, `detail`): Bun's
+    /// `vendor_bun_reinstall_required` (#764) and vlt's
+    /// `vendor_vlt_reinstall_required`. Every other reverting command
+    /// surfaces these, and the GC must not drop them.
+    pub advisories: Vec<(&'static str, String)>,
+}
+
+/// The revert warnings `scan --prune` forwards into `gc.warnings[]`: only
+/// the "the installed tree still holds the vendored copy" advisories. The
+/// revert's other warnings are routine for a prune and stay out:
+/// `vendor_lock_entry_removed` is the normal leg-(b) case (the dependency
+/// was uninstalled), and a drift keep is already reported through
+/// `keptVendoredEntries` and its own `GC: kept …` line.
+const GC_FORWARDED_ADVISORIES: &[&str] = &[
+    socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED,
+    socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED,
+];
+
+impl VendorGcSummary {
+    /// Keep a revert's reinstall advisories. Only a revert that actually
+    /// restored the lock (succeeded, not drift-kept) can leave a stale
+    /// installed copy behind.
+    fn take_advisories(&mut self, outcome: &RevertOutcome) {
+        if !outcome.success || outcome.kept_artifact {
+            return;
+        }
+        self.advisories.extend(
+            outcome
+                .warnings
+                .iter()
+                .filter(|w| GC_FORWARDED_ADVISORIES.contains(&w.code))
+                .map(|w| (w.code, w.detail.clone())),
+        );
+    }
 }
 /// The manifest keys an unused vendored `entry`, stored under ledger key
 /// `purl`, owns: every key with the same [`PurlKey`] as the ledger key OR
@@ -4459,6 +4521,7 @@ pub(crate) async fn run_vendor_gc(
             }
             let entry = state.entries.get(&purl).cloned().expect("listed above");
             let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            out.take_advisories(&outcome);
             if !outcome.success {
                 out.failed.push(purl);
             } else if outcome.kept_artifact {
@@ -4506,6 +4569,7 @@ pub(crate) async fn run_vendor_gc(
             continue;
         }
         let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+        out.take_advisories(&outcome);
         if !outcome.success {
             out.failed.push(purl);
             continue;
@@ -7110,6 +7174,16 @@ mod ui_format_tests {
             "Error: Could not read the vendor ledger (.socket/vendor/state.json): \
              Permission denied (os error 13)"
         );
+    }
+
+    #[test]
+    fn revert_install_hint_forces_bun() {
+        assert_eq!(
+            flavor_revert_install_command("bun"),
+            Some("bun install --force")
+        );
+        assert_eq!(flavor_revert_install_command("pnpm"), Some("pnpm install"));
+        assert_eq!(flavor_revert_install_command("cargo"), None);
     }
 
     #[test]

@@ -3699,6 +3699,110 @@ async fn requirements_index_option_in_an_include_spans_the_tree() {
     );
 }
 
+/// REGRESSION (#735): Bun opens `bun.lock` through symlinks, so a
+/// dangling `bun.lock` link is absent to it and it installs from the
+/// `bun.lockb` beside it (verified with Bun 1.2.23 and 1.3.14:
+/// `bun install --frozen-lockfile` installs from the binary lock). The
+/// inventory, the wired-integrity probe and vendored routing must all pick
+/// `bun.lockb` too, instead of losing every package of the live lock.
+#[cfg(unix)]
+#[tokio::test]
+async fn bun_dangling_text_lock_link_leaves_the_binary_lock_live() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    let mut lock = super::super::bun_lockb::BunLockb::parse(bytes).unwrap();
+    let minimist = lock
+        .packages()
+        .unwrap()
+        .into_iter()
+        .find(|package| package.name == "minimist")
+        .unwrap();
+    let rel = ".socket/vendor/npm/11111111-1111-4111-8111-111111111111/minimist-1.2.2.tgz";
+    let sri = format!("sha512-{}", "A".repeat(86) + "==");
+    lock.set_package(minimist.id, rel, &sri).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink("missing-target", tmp.path().join("bun.lock")).unwrap();
+
+    let (entries, diagnoses) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(diagnoses.is_empty(), "{diagnoses:?}");
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("is-number".into(), "7.0.0".into())],
+        "the binary lock's registry packages (minimist is vendored)"
+    );
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        Some(LockIntegrity::Sri(sri))
+    );
+    assert!(super::super::bun_lock::binary_lock_drives(tmp.path()));
+    // The hosted engine's view-level answer (disk and snapshot) agrees.
+    assert!(!bun_text_lock_drives(&ProjectView::Disk(tmp.path())));
+    let snapshot = DiskSnapshot::new(tmp.path());
+    assert!(!bun_text_lock_drives(&ProjectView::Snapshot(&snapshot)));
+}
+
+/// The #735 control: a `bun.lock` DIRECTORY is not absent to Bun — it
+/// opens it, fails to read it and ignores BOTH locks ("warn: Ignoring
+/// lockfile", Bun 1.2.23 and 1.3.14). The binary lock is therefore not
+/// live; every reader keeps choosing the text lock, whose unreadable read
+/// refuses rather than wiring a `bun.lockb` Bun would not install from.
+#[tokio::test]
+async fn bun_text_lock_directory_still_shadows_the_binary_lock() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("bun.lockb"), bytes)
+        .await
+        .unwrap();
+    tokio::fs::create_dir(tmp.path().join("bun.lock"))
+        .await
+        .unwrap();
+
+    let (entries, _) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(entries.is_empty(), "{entries:?}");
+    assert!(!super::super::bun_lock::binary_lock_drives(tmp.path()));
+    assert!(bun_text_lock_drives(&ProjectView::Disk(tmp.path())));
+}
+
+/// The #735 errno control: Bun falls back to `bun.lockb` only when opening
+/// `bun.lock` fails with ENOENT. A self-referencing link fails with ELOOP
+/// and a link through a regular file with ENOTDIR; Bun then prints
+/// "Ignoring lockfile" and installs from NEITHER lock (Bun 1.2.23 and
+/// 1.3.14). So the text lock keeps shadowing the binary one and nothing is
+/// inventoried from a `bun.lockb` Bun would not install from.
+#[cfg(unix)]
+#[tokio::test]
+async fn bun_text_lock_link_failing_with_other_errno_still_shadows_the_binary_lock() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    for target in ["bun.lock", "package.json/x"] {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package.json"), "{}")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(target, tmp.path().join("bun.lock")).unwrap();
+
+        let (entries, _) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty(), "{target}: {entries:?}");
+        assert!(
+            !super::super::bun_lock::binary_lock_drives(tmp.path()),
+            "{target}"
+        );
+        assert!(
+            bun_text_lock_drives(&ProjectView::Disk(tmp.path())),
+            "{target}"
+        );
+        let snapshot = DiskSnapshot::new(tmp.path());
+        assert!(
+            bun_text_lock_drives(&ProjectView::Snapshot(&snapshot)),
+            "{target}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn lookup_matches_by_purl_identity() {
     let entry = |ecosystem: &'static str, name: &str, version: &str| LockfileEntry {

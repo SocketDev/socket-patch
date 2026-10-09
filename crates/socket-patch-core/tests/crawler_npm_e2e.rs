@@ -6,11 +6,11 @@
 use std::path::Path;
 
 use socket_patch_core::crawlers::npm_crawler::{
-    build_npm_purl, get_bun_global_prefix, get_bun_global_prefix_with, get_npm_global_prefix,
-    get_npm_global_prefix_with, get_pnpm_global_prefix, get_pnpm_global_prefix_with,
-    get_yarn_global_prefix, get_yarn_global_prefix_with, parse_bun_bin_output,
-    parse_npm_root_output, parse_package_name, parse_pnpm_root_output, parse_yarn_dir_output,
-    read_package_json,
+    build_npm_purl, bun_global_dir_from_env, get_bun_global_prefix, get_bun_global_prefix_with,
+    get_npm_global_prefix, get_npm_global_prefix_with, get_pnpm_global_prefix,
+    get_pnpm_global_prefix_with, get_yarn_global_prefix, get_yarn_global_prefix_with,
+    parse_bun_ls_global_output, parse_npm_root_output, parse_package_name, parse_pnpm_root_output,
+    parse_yarn_dir_output, read_package_json, resolve_bun_global_prefix_with,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::NpmCrawler;
@@ -209,41 +209,40 @@ async fn get_node_modules_paths_global_mode_no_prefix() {
     let _paths = crawler.get_node_modules_paths(&opts).await.unwrap();
 }
 
-// ── parse_bun_bin_output ───────────────────────────────────────
+// ── parse_bun_ls_global_output ─────────────────────────────────
 
-/// Bun's global node_modules lives at `<bun-root>/install/global/node_modules`
-/// — the parser strips the trailing `bin` segment and joins the well-known
-/// suffix.
+/// Bun's global node_modules is `<dir>/node_modules`, where `<dir>` heads
+/// the `bun pm ls -g` tree. Both the pre-1.4 `(N)` and the 1.4
+/// `(N installed)` count suffixes parse, and a dir with spaces survives.
 ///
-/// Skipped on Windows: `PathBuf::join` uses `\` there, which produces
-/// `/home/foo/.bun\install\global\node_modules` from Unix-style input.
-/// The pure-parser semantics are still correct (parent stripping +
-/// suffix join), just expressed in the host's path-separator. Real
-/// bun installs on Windows would feed Windows-style paths into the
-/// same parser.
+/// Skipped on Windows: `PathBuf::join` uses `\` there, so the joined
+/// suffix is expressed in the host's separator.
 #[cfg(unix)]
 #[test]
 #[serial_test::parallel]
-fn parse_bun_bin_output_well_formed_unix() {
-    let parsed = parse_bun_bin_output("/home/foo/.bun/bin\n");
-    assert_eq!(
-        parsed.as_deref(),
-        Some("/home/foo/.bun/install/global/node_modules")
-    );
+fn parse_bun_ls_global_output_well_formed_unix() {
+    for (stdout, want) in [
+        (
+            "/home/foo/.bun/install/global node_modules (1)\n\u{2514}\u{2500}\u{2500} is-number@7.0.0\n",
+            "/home/foo/.bun/install/global/node_modules",
+        ),
+        (
+            "/home/foo/g dir \u{fc} node_modules (2 installed)\n",
+            "/home/foo/g dir \u{fc}/node_modules",
+        ),
+    ] {
+        assert_eq!(parse_bun_ls_global_output(stdout).as_deref(), Some(want));
+    }
 }
 
 #[test]
 #[serial_test::parallel]
-fn parse_bun_bin_output_empty_returns_none() {
-    assert_eq!(parse_bun_bin_output(""), None);
-    assert_eq!(parse_bun_bin_output("   \n  "), None);
-}
-
-/// Root-only path has no parent — must yield None instead of panicking.
-#[test]
-#[serial_test::parallel]
-fn parse_bun_bin_output_root_path_returns_none() {
-    assert_eq!(parse_bun_bin_output("/"), None);
+fn parse_bun_ls_global_output_empty_or_unrecognized_returns_none() {
+    assert_eq!(parse_bun_ls_global_output(""), None);
+    assert_eq!(parse_bun_ls_global_output("   \n  "), None);
+    // `bun pm bin -g`'s answer is not a global dir.
+    assert_eq!(parse_bun_ls_global_output("/home/foo/.bun/bin\n"), None);
+    assert_eq!(parse_bun_ls_global_output(" node_modules (1)"), None);
 }
 
 // ── shell-out wrappers via PATH stubbing ──────────────────────
@@ -293,11 +292,16 @@ fn get_pnpm_global_prefix_returns_none_when_pnpm_not_on_path() {
     });
 }
 
+/// #443: with no `bun` to ask, the bun prefix is still Bun's own
+/// resolution of its global dir from the environment.
 #[test]
 #[serial_test::serial]
-fn get_bun_global_prefix_returns_none_when_bun_not_on_path() {
+fn get_bun_global_prefix_falls_back_to_env_when_bun_not_on_path() {
     with_empty_path(|| {
-        assert_eq!(get_bun_global_prefix(), None);
+        let want = bun_global_dir_from_env(&|var| std::env::var_os(var))
+            .ok()
+            .map(|dir| dir.join("node_modules").to_string_lossy().to_string());
+        assert_eq!(get_bun_global_prefix(), want);
     });
 }
 
@@ -327,7 +331,7 @@ fn get_npm_global_prefix_with_mock_runner_empty_stdout_returns_err() {
 }
 
 // Skipped on Windows: same path-separator reason as
-// `parse_bun_bin_output_well_formed_unix` above.
+// `parse_bun_ls_global_output_well_formed_unix` above.
 #[cfg(unix)]
 #[test]
 #[serial_test::parallel]
@@ -358,19 +362,115 @@ fn get_pnpm_global_prefix_with_mock_runner_success() {
 }
 
 // Skipped on Windows: same path-separator reason as
-// `parse_bun_bin_output_well_formed_unix` above.
+// `parse_bun_ls_global_output_well_formed_unix` above.
 #[cfg(unix)]
 #[test]
 #[serial_test::parallel]
 fn get_bun_global_prefix_with_mock_runner_success() {
     let runner = common::MockCommandRunner::new().with_response(
         "bun",
-        &["pm", "bin", "-g"],
-        Some("/Users/foo/.bun/bin\n"),
+        &["pm", "ls", "-g"],
+        Some("/Users/foo/.bun/install/global node_modules (1 installed)\n"),
     );
     assert_eq!(
         get_bun_global_prefix_with(&runner).as_deref(),
         Some("/Users/foo/.bun/install/global/node_modules")
+    );
+}
+
+// ── bun global dir: env resolution and the undetermined case (#443) ──
+
+/// An environment holding exactly `vars`.
+fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+    move |name| {
+        vars.iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| std::ffi::OsString::from(v))
+    }
+}
+
+/// Bun uses the first of `BUN_INSTALL_GLOBAL_DIR`, `BUN_INSTALL`,
+/// `XDG_CACHE_HOME`, home that is SET, as it is: one that is empty or
+/// relative names a dir relative to wherever `bun add -g` ran, so the dir
+/// can't be told, and a later variable is not a stand-in for it.
+#[cfg(unix)]
+#[test]
+#[serial_test::parallel]
+fn bun_global_dir_from_env_follows_the_first_set_variable() {
+    let ok = |vars: &[(&str, &str)], want: &str| {
+        assert_eq!(
+            bun_global_dir_from_env(&env_of(vars)),
+            Ok(std::path::PathBuf::from(want)),
+            "{vars:?}"
+        );
+    };
+    ok(
+        &[
+            ("BUN_INSTALL_GLOBAL_DIR", "/g"),
+            ("BUN_INSTALL", "/b"),
+            ("HOME", "/h"),
+        ],
+        "/g",
+    );
+    ok(
+        &[("BUN_INSTALL", "/b"), ("XDG_CACHE_HOME", "/x")],
+        "/b/install/global",
+    );
+    ok(
+        &[("XDG_CACHE_HOME", "/x"), ("HOME", "/h")],
+        "/x/.bun/install/global",
+    );
+    ok(&[("HOME", "/h")], "/h/.bun/install/global");
+
+    for (vars, named) in [
+        (
+            &[("BUN_INSTALL_GLOBAL_DIR", "rel/g"), ("HOME", "/h")][..],
+            "BUN_INSTALL_GLOBAL_DIR",
+        ),
+        (
+            &[("BUN_INSTALL_GLOBAL_DIR", ""), ("BUN_INSTALL", "/b")][..],
+            "BUN_INSTALL_GLOBAL_DIR",
+        ),
+        (&[("BUN_INSTALL", "rel"), ("HOME", "/h")][..], "BUN_INSTALL"),
+        (
+            &[("XDG_CACHE_HOME", "rel"), ("HOME", "/h")][..],
+            "XDG_CACHE_HOME",
+        ),
+        (&[][..], "HOME"),
+    ] {
+        let why = bun_global_dir_from_env(&env_of(vars)).unwrap_err();
+        assert!(why.contains(named), "{vars:?}: {why}");
+    }
+}
+
+/// #443: when `bun pm ls -g` can't answer and the environment can't name
+/// the dir either, a global scan learns why (to say so) as long as Bun is
+/// in use: `bun` on PATH, or a `BUN_INSTALL*` variable set. Without Bun
+/// there is nothing to report.
+#[test]
+#[serial_test::parallel]
+fn resolve_bun_global_prefix_reports_an_undeterminable_dir() {
+    let silent_bun = common::MockCommandRunner::new();
+    let relative = [("BUN_INSTALL_GLOBAL_DIR", "rel/g"), ("HOME", "/h")];
+    let why = resolve_bun_global_prefix_with(&silent_bun, &env_of(&relative), false).unwrap_err();
+    assert!(why.contains("BUN_INSTALL_GLOBAL_DIR"), "{why}");
+    assert!(resolve_bun_global_prefix_with(&silent_bun, &env_of(&[]), true).is_err());
+    assert_eq!(
+        resolve_bun_global_prefix_with(&silent_bun, &env_of(&[]), false),
+        Ok(None),
+        "no Bun in use: nothing to report"
+    );
+
+    // Bun's own answer wins over an environment we can't read.
+    let answering_bun = common::MockCommandRunner::new().with_response(
+        "bun",
+        &["pm", "ls", "-g"],
+        Some("/g node_modules (1 installed)\n"),
+    );
+    let want = std::path::PathBuf::from("/g").join("node_modules");
+    assert_eq!(
+        resolve_bun_global_prefix_with(&answering_bun, &env_of(&relative), true),
+        Ok(Some(want.to_string_lossy().to_string()))
     );
 }
 
@@ -2369,6 +2469,16 @@ async fn find_by_purls_returns_bundled_copy_of_an_already_found_target() {
                     .unwrap();
                 nm.join("left-pad")
             } else {
+                // Bun counts only linked entries as installed (#599); its
+                // hoist dir links a transitive-only package.
+                if store_name == ".bun" {
+                    std::fs::create_dir_all(store.join("node_modules")).unwrap();
+                    std::os::unix::fs::symlink(
+                        normal_nm.join("left-pad"),
+                        store.join("node_modules/left-pad"),
+                    )
+                    .unwrap();
+                }
                 normal_nm.join("left-pad")
             };
 

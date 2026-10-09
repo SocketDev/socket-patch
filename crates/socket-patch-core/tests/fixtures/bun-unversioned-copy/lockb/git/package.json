@@ -1,0 +1,1 @@
+{"name":"app","version":"1.0.0","dependencies":{"minimist":"github:minimistjs/minimist#v1.2.2","dep":"file:./dep"}}

@@ -42,7 +42,16 @@ struct Candidate {
 pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, String, String)> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut out = Vec::new();
-    if !project_root.join("bun.lock").exists() {
+    // The binary lock is read unless a readable text lock shadows it: a
+    // `bun.lock` that drives Bun but cannot be read here (EACCES, ELOOP)
+    // hides its own references, so the binary lock's are kept rather than
+    // letting the orphan sweep delete a dir it still names.
+    let text_lock_read = socket_patch_core::vendor::lock_inventory::bun_text_lock_drives(
+        &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(project_root),
+    ) && read_regular_to_string(&project_root.join("bun.lock"))
+        .await
+        .is_ok();
+    if !text_lock_read {
         if let Ok(paths) =
             socket_patch_core::vendor::bun_lock::binary_vendor_paths(project_root).await
         {
@@ -860,6 +869,18 @@ mod tests {
         tokio::fs::remove_file(root.path().join("bun.lock"))
             .await
             .unwrap();
+
+        // A text lock Bun stops at but this scan cannot read (here a
+        // symlink loop, ELOOP) hides its own references, so the binary
+        // lock's are still kept from the orphan sweep.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("bun.lock", root.path().join("bun.lock")).unwrap();
+            assert_eq!(scan_vendor_references(root.path()).await.len(), 1);
+            tokio::fs::remove_file(root.path().join("bun.lock"))
+                .await
+                .unwrap();
+        }
         tokio::fs::write(root.path().join("bun.lockb"), b"malformed")
             .await
             .unwrap();

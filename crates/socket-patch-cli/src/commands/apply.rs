@@ -1,7 +1,9 @@
 use clap::Args;
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
-use socket_patch_core::crawlers::{detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler};
+use socket_patch_core::crawlers::{
+    bun_uses_global_store, detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler,
+};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{
@@ -1093,9 +1095,21 @@ pub(crate) async fn run_locked(
         }
         NpmPkgManager::Bun => {
             if !args.common.json && !args.common.silent {
-                eprintln!(
-                    "Note: bun layout detected. Copy-on-write will keep ~/.bun/install/cache/ untouched."
-                );
+                if bun_uses_global_store(&args.common.cwd) {
+                    // #635: the installed package dirs ARE the shared
+                    // store (<cache>/links/...), so copy-on-write cannot
+                    // isolate them; core refuses each such package.
+                    eprintln!(
+                        "Note: bun global store detected (install.globalStore). Packages linked \
+                         from the shared Bun cache are used by other projects and will not be \
+                         patched; set `globalStore = false` under `[install]` in bunfig.toml \
+                         (and unset BUN_INSTALL_GLOBAL_STORE), then reinstall."
+                    );
+                } else {
+                    eprintln!(
+                        "Note: bun layout detected. Copy-on-write will keep ~/.bun/install/cache/ untouched."
+                    );
+                }
             }
             // Same shape as pnpm: bun hard-links from its global
             // install cache by default. The rename-over write handles the

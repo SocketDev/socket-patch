@@ -331,9 +331,24 @@ fn format_gc_freed(bytes: u64, dry_run: bool) -> String {
     )
 }
 
+/// Appended to the generic stale-install advisory when a Bun advisory
+/// fired in the same run: Bun's hoisted linker keeps the patched copy
+/// through a plain `bun install` (#764), so "the next package-manager
+/// install" alone would contradict it.
+const BUN_REINSTALL_QUALIFIER: &str =
+    " (Bun: a plain `bun install` keeps them; run `bun install --force`)";
+
+/// True when the run's leg warnings carry a Bun reinstall advisory.
+fn bun_reinstall_advised<'a>(mut codes: impl Iterator<Item = &'a str>) -> bool {
+    codes.any(|c| {
+        c == socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED
+            || c == "redirect_bun_reinstall_required"
+    })
+}
+
 /// The reinstall note for packages whose wiring was undone but whose
 /// installed tree still holds patched bytes.
-fn format_reinstall_note(still_patched: usize, dry_run: bool) -> String {
+fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool) -> String {
     let keep = match (still_patched == 1, dry_run) {
         (true, false) => "keeps its",
         (true, true) => "would keep its",
@@ -342,8 +357,9 @@ fn format_reinstall_note(still_patched: usize, dry_run: bool) -> String {
     };
     format!(
         "Note: {} {keep} patched bytes in installed trees until the next \
-         package-manager install.",
-        plural(still_patched, "unwired package", "unwired packages")
+         package-manager install{}.",
+        plural(still_patched, "unwired package", "unwired packages"),
+        if bun { BUN_REINSTALL_QUALIFIER } else { "" }
     )
 }
 
@@ -1492,12 +1508,25 @@ pub async fn run(args: RollbackArgs) -> i32 {
             let unwired_any = !vendored_leg.reverted.is_empty()
                 || !vendored_leg.preserved.is_empty()
                 || !hosted_leg.reverted.is_empty();
+            let bun_advised = bun_reinstall_advised(
+                vendored_leg
+                    .warnings
+                    .iter()
+                    .chain(hosted_leg.warnings.iter())
+                    .map(|(code, _)| code.as_str()),
+            );
             if unwired_any {
                 run_warnings.push((
                     "reinstall_required".into(),
-                    "unwired packages keep their patched bytes in installed trees until \
-                     the next package-manager install"
-                        .into(),
+                    format!(
+                        "unwired packages keep their patched bytes in installed trees until \
+                         the next package-manager install{}",
+                        if bun_advised {
+                            BUN_REINSTALL_QUALIFIER
+                        } else {
+                            ""
+                        }
+                    ),
                 ));
             }
             if args.preserve_state && !hosted_leg.reverted.is_empty() {
@@ -1782,7 +1811,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 if still_patched > 0 {
                     println!(
                         "\n{}",
-                        format_reinstall_note(still_patched, args.common.dry_run)
+                        format_reinstall_note(still_patched, args.common.dry_run, bun_advised)
                     );
                 }
             }
@@ -5248,14 +5277,35 @@ mod tests {
     #[test]
     fn reinstall_note_tense_and_number() {
         assert_eq!(
-            format_reinstall_note(1, false),
+            format_reinstall_note(1, false, false),
             "Note: 1 unwired package keeps its patched bytes in installed trees until the \
              next package-manager install."
         );
         assert_eq!(
-            format_reinstall_note(2, true),
+            format_reinstall_note(2, true, false),
             "Note: 2 unwired packages would keep their patched bytes in installed trees \
              until the next package-manager install."
         );
+    }
+
+    /// #764: next to a Bun advisory the generic note must not imply that
+    /// any install refreshes the copy.
+    #[test]
+    fn reinstall_note_defers_to_the_bun_advisory() {
+        assert_eq!(
+            format_reinstall_note(1, false, true),
+            "Note: 1 unwired package keeps its patched bytes in installed trees until the \
+             next package-manager install (Bun: a plain `bun install` keeps them; run \
+             `bun install --force`)."
+        );
+        assert!(bun_reinstall_advised(
+            ["cleanup_failed", "vendor_bun_reinstall_required"].into_iter()
+        ));
+        assert!(bun_reinstall_advised(
+            ["redirect_bun_reinstall_required"].into_iter()
+        ));
+        assert!(!bun_reinstall_advised(
+            ["redirect_vlt_reinstall_required"].into_iter()
+        ));
     }
 }

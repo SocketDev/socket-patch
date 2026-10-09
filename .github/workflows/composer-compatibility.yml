@@ -22,46 +22,22 @@ name: Composer patch compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Only this ecosystem's own files. A change to shared engine code
+    # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
+    # push to main, or on demand via workflow_dispatch on the PR branch;
+    # ci.yml's per-ecosystem blocking slice still runs on every PR and in
+    # the merge queue (#1198).
     paths:
       - '.github/workflows/composer-compatibility.yml'
       - 'tests/docker/Dockerfile.composer'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'crates/*/Cargo.toml'
-      - 'crates/socket-patch-core/src/vendor/**'
-      - 'crates/socket-patch-core/src/patch/**'
-      - 'crates/socket-patch-core/src/formats/composer/**'
-      - 'crates/socket-patch-core/src/formats/registry.rs'
-      - 'crates/socket-patch-core/src/hosted/**'
-      - 'crates/socket-patch-core/src/ledgers.rs'
-      - 'crates/socket-patch-core/src/policy/**'
-      - 'crates/socket-patch-core/src/rollout.rs'
-      - 'crates/socket-patch-core/src/rollout/**'
-      - 'crates/socket-patch-core/src/manifest/**'
+      - 'crates/*/src/**/*composer*'
+      - 'crates/*/src/**/*composer*/**'
       - 'crates/socket-patch-core/tests/fixtures/redirect/composer/**'
       - 'crates/socket-patch-core/tests/fixtures/composer-version-vectors.json'
-      - 'crates/socket-patch-core/src/crawlers/composer_crawler.rs'
-      - 'crates/socket-patch-core/src/crawlers/composer_crawler/**'
-      - 'crates/socket-patch-core/src/utils/composer*.rs'
-      - 'crates/socket-patch-core/src/utils/purl.rs'
-      - 'crates/socket-patch-core/src/utils/group_commit.rs'
-      - 'crates/socket-patch-core/src/utils/durability.rs'
-      - 'crates/socket-patch-core/src/vex/**'
-      - 'crates/socket-patch-cli/src/commands/vendor*'
-      - 'crates/socket-patch-cli/src/commands/vendored_backend/**'
-      - 'crates/socket-patch-cli/src/commands/get*.rs'
-      - 'crates/socket-patch-cli/src/commands/apply.rs'
-      - 'crates/socket-patch-cli/src/commands/rollback.rs'
-      - 'crates/socket-patch-cli/src/commands/remove.rs'
-      - 'crates/socket-patch-cli/src/commands/composer_hints.rs'
-      - 'crates/socket-patch-cli/src/commands/scan/**'
-      - 'crates/socket-patch-cli/src/commands/vex*.rs'
       - 'crates/socket-patch-cli/tests/e2e_*composer*.rs'
       - 'crates/socket-patch-cli/tests/docker_e2e_vendor_composer.rs'
       - 'crates/socket-patch-cli/tests/composer_e2e_common/**'
-      - 'crates/socket-patch-cli/tests/docker_vendor_common/**'
       - 'crates/socket-patch-cli/tests/e2e_vex_lockfile/composer.rs'
-      - 'crates/socket-patch-cli/tests/vex_e2e_common/**'
   push:
     branches: [main]
   workflow_dispatch:
