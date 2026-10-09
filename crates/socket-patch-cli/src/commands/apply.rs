@@ -676,7 +676,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             for (_, _, detail) in &drifts {
                 eprintln!("  {detail}");
             }
-            eprintln!("Run `socket-patch apply` to regenerate them.");
+            eprintln!("{}", check_remedy(&args.common));
         }
         1
     }
@@ -842,6 +842,17 @@ fn record_check_skips(env: &mut Envelope, in_sync: &[String], not_installed: &[S
             ),
         );
     }
+}
+
+/// The last line of the `apply --check` drift report: the `apply` that heals
+/// it, with the check's own scope (`--cwd`, `--manifest-path`, `-g` /
+/// `--global-prefix`, `--ecosystems`). A bare `socket-patch apply` would
+/// act on another tree, exit 0 and leave the drift in place (#1219).
+fn check_remedy(common: &GlobalArgs) -> String {
+    format!(
+        "Run `socket-patch apply{}` to regenerate them.",
+        crate::ui::scope_args(common)
+    )
 }
 
 /// The `apply --check` success line: how many patches were checked, and how
@@ -4474,6 +4485,54 @@ mod tests {
         assert_eq!(
             format_check_in_sync(0, 2),
             "Patches are in sync (0 patches checked; 2 patches not installed, skipped)."
+        );
+    }
+
+    /// #1219: the drift report's remedy keeps the check's scope, so running
+    /// it verbatim heals the tree that was checked.
+    #[test]
+    fn check_remedy_repeats_the_check_scope() {
+        let remedy = |common: GlobalArgs| check_remedy(&common);
+        assert_eq!(
+            remedy(GlobalArgs::default()),
+            "Run `socket-patch apply` to regenerate them."
+        );
+        assert_eq!(
+            remedy(GlobalArgs {
+                cwd: PathBuf::from("app"),
+                ..GlobalArgs::default()
+            }),
+            "Run `socket-patch apply --cwd app` to regenerate them."
+        );
+        assert_eq!(
+            remedy(GlobalArgs {
+                global: true,
+                ..GlobalArgs::default()
+            }),
+            "Run `socket-patch apply -g` to regenerate them."
+        );
+        let quoted = if cfg!(windows) {
+            "\"/opt/my site\""
+        } else {
+            "'/opt/my site'"
+        };
+        assert_eq!(
+            remedy(GlobalArgs {
+                global: true,
+                global_prefix: Some(PathBuf::from("/opt/my site")),
+                ..GlobalArgs::default()
+            }),
+            format!("Run `socket-patch apply --global-prefix {quoted}` to regenerate them.")
+        );
+        assert_eq!(
+            remedy(GlobalArgs {
+                cwd: PathBuf::from("svc"),
+                manifest_path: "../shared/manifest.json".to_string(),
+                ecosystems: Some(vec!["npm".to_string(), "pypi".to_string()]),
+                ..GlobalArgs::default()
+            }),
+            "Run `socket-patch apply --cwd svc --manifest-path ../shared/manifest.json \
+             --ecosystems npm,pypi` to regenerate them."
         );
     }
 
