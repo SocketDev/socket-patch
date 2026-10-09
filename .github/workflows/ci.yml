@@ -2225,7 +2225,10 @@ jobs:
   # Skipped jobs (the nightly `full` tier) pass; failed or cancelled ones fail.
   ci-ok:
     name: ci-ok                 # registered as a required check; do not rename
-    if: always()
+    # A superseded PR must release its concurrency slot without waiting for
+    # an aggregate runner. Keep an unconditional verdict in the merge queue
+    # and on main: a cancelled dependency there must never pass the gate.
+    if: ${{ always() && (github.event_name != 'pull_request' || !cancelled()) }}
     needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, e2e-build-windows, e2e-build-macos, e2e, e2e-gradle-mid, e2e-windows, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-windows, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5

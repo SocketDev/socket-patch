@@ -34,7 +34,10 @@ class Scheduling(unittest.TestCase):
         # A successful aggregate must never hide a failed OS builder/consumer
         # introduced when a matrix is split into independently scheduled jobs.
         self.assertEqual(dependencies("ci-ok"), set(JOBS) - {"ci-ok"})
-        self.assertIn("    if: always()", JOBS["ci-ok"])
+        # Superseded PRs release their workflow concurrency slot. Main and
+        # merge_group still report a failed verdict for cancelled dependencies.
+        self.assertIn("    if: ${{ always() && (github.event_name != 'pull_request' || !cancelled()) }}",
+                      JOBS["ci-ok"])
         self.assertIn('if v["result"] not in ("success", "skipped")', "\n".join(JOBS["ci-ok"]))
         for job in JOBS:
             ancestors(job)  # All dependencies exist and the graph is acyclic.
