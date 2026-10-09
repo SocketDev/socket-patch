@@ -1344,6 +1344,51 @@ impl<'a> DiscoverCtx<'a> {
         }
     }
 
+    /// [`DiscoverCtx::read_text`] for a pip requirements file: the bytes are
+    /// decoded as pip decodes them ([`crate::utils::requirements::decode`]:
+    /// a UTF-16 / UTF-32 byte-order mark, a PEP 263 coding line, else
+    /// UTF-8), so a UTF-16 export pip and uv install from is evidence like
+    /// its UTF-8 twin (#1120). A file those rules cannot decode records
+    /// [`DIAG_LOCKFILE_UNREADABLE`].
+    pub(crate) async fn read_requirements_text(
+        &self,
+        rel: &str,
+        out: &mut Discovery,
+    ) -> Option<String> {
+        let bytes = match self.view.read_bytes(rel).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                self.log_read(rel, false);
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    rel,
+                    format!("cannot read {rel}: {e}"),
+                );
+                return None;
+            }
+        };
+        match crate::utils::requirements::decode(&bytes) {
+            Some(text) => {
+                self.log_read(rel, true);
+                self.recognize_text(rel, &text);
+                Some(text)
+            }
+            None => {
+                self.log_read(rel, false);
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    rel,
+                    format!(
+                        "cannot read {rel}: not text pip's decoding rules can read (a \
+                         byte-order mark, a PEP 263 coding line, or UTF-8)"
+                    ),
+                );
+                None
+            }
+        }
+    }
+
     /// `rel`'s text when it can be read, with no diagnostic and no
     /// recognition: for advisory inputs that never carry wiring (the root
     /// `package.json`'s npm `overrides`).
