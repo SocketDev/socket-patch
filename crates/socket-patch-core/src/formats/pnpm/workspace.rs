@@ -153,13 +153,19 @@ pub(crate) fn is_keyless(text: &str) -> bool {
 /// importers comes from pnpm <= 10.4, and the root-only
 /// [`PACKAGES_SCAFFOLD`] would drop those members.
 pub(crate) fn lock_has_member_importers(lines: &[String]) -> bool {
-    let Some((start, end)) = super::lines::section_bounds(lines, "importers") else {
-        return false;
-    };
-    lines[start + 1..end]
-        .iter()
-        .filter_map(|line| super::lines::parse_key_line(line.strip_suffix('\r').unwrap_or(line), 2))
-        .any(|(key, _, _)| key != ".")
+    // CRLF-blind: a Windows checkout's lock reads like its LF twin.
+    let mut in_importers = false;
+    for line in lines {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !line.is_empty() && !line.starts_with(' ') {
+            in_importers = line == "importers:";
+        } else if in_importers
+            && super::lines::parse_key_line(line, 2).is_some_and(|(key, _, _)| key != ".")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// `text` with the contiguous run of lines `block` removed, when that
@@ -492,6 +498,12 @@ mod tests {
         assert!(!lock_has_member_importers(&lines(
             "lockfileVersion: '9.0'\n"
         )));
+        let crlf: Vec<String> =
+            lock("  .:\n    dependencies: {}\n\n  sub:\n    dependencies: {}\n")
+                .into_iter()
+                .map(|l| format!("{l}\r"))
+                .collect();
+        assert!(lock_has_member_importers(&crlf));
     }
 
     #[test]
