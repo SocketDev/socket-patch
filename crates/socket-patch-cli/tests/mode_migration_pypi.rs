@@ -1954,12 +1954,11 @@ async fn platform_wheel_takeover_is_refused_before_revert() {
 
 /// #612: a Pipenv project with a `requirements.txt` exported beside its
 /// lock (`pipenv requirements`). Hosted mode pins both; the hosted →
-/// vendored takeover (`vendor` over the hosted project) wires only the
-/// governing `Pipfile.lock` and restores the requirements pin to upstream,
-/// so the run must name `requirements.txt` among the install sources left
-/// UNPATCHED instead of passing in silence.
+/// vendored takeover (`vendor` over the hosted project) must leave both
+/// patched too: `Pipfile.lock` and the export's pin both refer to the
+/// vendored wheel, and no install source is left UNPATCHED.
 #[tokio::test]
-async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
+async fn pipenv_hosted_to_vendored_keeps_the_requirements_patched() {
     let (_tmp, root) = project();
     stage_pipenv(&root);
     std::fs::write(
@@ -1994,12 +1993,14 @@ async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
         lock.contains(&format!(".socket/vendor/pypi/{UUID}/")),
         "Pipfile.lock is wired to the vendored wheel:\n{lock}\n{env:#}"
     );
-    let rendered = env.to_string();
+    let reqs = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
     assert!(
-        rendered.contains("\"pypi_multiple_lockfiles\"")
-            && rendered.contains("wiring `Pipfile.lock`")
-            && rendered.contains("requirements.txt will still install the UNPATCHED"),
-        "the takeover names requirements.txt as an unpatched install source: {env:#}"
+        reqs.contains(&format!(".socket/vendor/pypi/{UUID}/")) && !reqs.contains(&hosted_url),
+        "requirements.txt is wired to the vendored wheel too:\n{reqs}\n{env:#}"
+    );
+    assert!(
+        !env.to_string().contains("UNPATCHED"),
+        "no install source is left unpatched: {env:#}"
     );
 }
 
