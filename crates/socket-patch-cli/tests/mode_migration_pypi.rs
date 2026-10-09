@@ -829,6 +829,108 @@ fn stage_script_lock(root: &Path) -> &'static [&'static str] {
     &["job.py", "job.py.lock"]
 }
 
+/// The script lock staged by [`stage_script_lock`] after `uv remove --script
+/// job.py six`: uv drops the dependency, its `[tool.uv.sources]` line and
+/// the lock package, so neither file names the vendored uuid any more.
+fn uv_remove_script_six(root: &Path) {
+    std::fs::write(
+        root.join("job.py"),
+        "# /// script\n# requires-python = \">=3.9\"\n# dependencies = []\n# ///\nimport six\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("job.py.lock"),
+        "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n",
+    )
+    .unwrap();
+}
+
+/// #1214: after `uv remove --script` drops a vendored package from a PEP 723
+/// script and its lock, every unwind must retire the entry: the wheel and
+/// the ledger entry go and `vendor --check` turns green. Before the fix each
+/// one kept the entry as `vendor_lock_entry_drifted` (nothing to undo), so
+/// `vendor --check` stayed red and its own `scan --prune` remedy looped.
+#[tokio::test]
+async fn script_lock_unwinds_after_uv_remove_script() {
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    let prune = vec![
+        "scan",
+        "--mode",
+        "vendored",
+        "--prune",
+        "--yes",
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake-token",
+    ];
+    for unwind in [
+        vec!["vendor", "--revert"],
+        prune.clone(),
+        vec!["remove", PURL, "--yes", "--offline"],
+        vec!["rollback", "--yes", "--offline"],
+        hosted_scan_args(&uri),
+    ] {
+        let (_tmp, root) = project();
+        let files = stage_script_lock(&root);
+        vendor_project(&root, files);
+        uv_remove_script_six(&root);
+        let removed: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+            .collect();
+        let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+        assert_eq!(code, 1, "{unwind:?}: the removal is flagged first: {env:#}");
+
+        let (code, env) = run_cli(&root, &unwind, &[]);
+        assert_eq!(code, 0, "{unwind:?}: {env:#}");
+        let env = if unwind.contains(&"hosted") {
+            // A hosted scan never reverts vendored entries; it names the
+            // vendored prune as the fix, which must now converge.
+            assert!(
+                env.to_string().contains("vendor_ledger_entry_unwired"),
+                "{unwind:?}: {env:#}"
+            );
+            let (code, env) = run_cli(&root, &prune, &[]);
+            assert_eq!(code, 0, "{unwind:?} then prune: {env:#}");
+            env
+        } else {
+            env
+        };
+        let rendered = env.to_string();
+        assert!(
+            !rendered.contains("vendor_lock_entry_drifted")
+                && !rendered.contains("vendor_artifact_kept"),
+            "{unwind:?}: a removed dependency is not drift: {env:#}"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+            "{unwind:?}: the vendored wheel is reclaimed"
+        );
+        let ledger =
+            std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap_or_default();
+        assert!(!ledger.contains(UUID), "{unwind:?}: {ledger}");
+        for (f, text) in files.iter().zip(&removed) {
+            assert_eq!(
+                &std::fs::read_to_string(root.join(f)).unwrap(),
+                text,
+                "{unwind:?}: {f} stays as uv left it"
+            );
+        }
+        // `vendor --revert` and `rollback` keep the manifest record, so
+        // check then reports the patch as not vendored; the unwinds that
+        // retire the record leave check green.
+        if matches!(unwind[0], "scan" | "remove") {
+            let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+            assert_eq!(code, 0, "{unwind:?}: check is green afterwards: {env:#}");
+        }
+    }
+}
+
 /// #742 / #650 / #1136: a vendored uv project, uv script lock, Hatch
 /// project and Poetry project (LF and CRLF) pick up a superseding patch. The manifest moves `six` from patch A to patch B
 /// (different patched bytes); the next `vendor` must wire B's wheel, remove
@@ -1332,9 +1434,18 @@ async fn ledger_update_failure_changes_nothing() {
     set_mode(0o755);
     assert_eq!(code, 1, "{env:#}");
     assert_eq!(env["status"], "error", "{env:#}");
-    assert!(!env.to_string().contains("redirect_takeover_unpatched"), "{env:#}");
-    assert_eq!(std::fs::read(root.join("requirements.txt")).unwrap(), vendored);
-    assert_eq!(std::fs::read(root.join(".socket/vendor/state.json")).unwrap(), state);
+    assert!(
+        !env.to_string().contains("redirect_takeover_unpatched"),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("requirements.txt")).unwrap(),
+        vendored
+    );
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        state
+    );
     assert!(root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
 }
 

@@ -727,6 +727,31 @@ pub(super) async fn revert_python_locks(
 ) -> RevertOutcome {
     let mut warnings = Vec::new();
     let mut edits = Vec::new();
+    // REMOVED, not drift (#1214, the script-lock twin of #1140): `uv remove
+    // --script` drops the dependency together with every fragment that
+    // routed through the wheel. When no wired file names this entry's uuid
+    // any more, a record whose written text carried it has nothing left to
+    // restore; it warns `vendor_lock_entry_removed` so the revert converges.
+    // Probed once, before any record is reverted, so only the user's own
+    // edits count.
+    let uuid_lower = entry.uuid.to_ascii_lowercase();
+    let mut unreferenced = true;
+    for file in entry
+        .wiring
+        .iter()
+        .filter(|record| allowed_file(&record.file, &record.kind))
+        .map(|record| record.file.as_str())
+        .collect::<BTreeSet<_>>()
+    {
+        match read_file(&root.join(file)).await {
+            Ok(live) if live.to_ascii_lowercase().contains(&uuid_lower) => {
+                unreferenced = false;
+                break;
+            }
+            Ok(_) => {}
+            Err((_, error)) => return RevertOutcome::failed(error),
+        }
+    }
     for record in entry.wiring.iter().rev() {
         if !allowed_file(&record.file, &record.kind) {
             warnings.push(VendorWarning::new(
@@ -748,6 +773,17 @@ pub(super) async fn revert_python_locks(
             ));
             continue;
         };
+        if unreferenced && new.to_ascii_lowercase().contains(&uuid_lower) {
+            warnings.push(VendorWarning::new(
+                super::LOCK_ENTRY_REMOVED_CODE,
+                format!(
+                    "{} no longer references .socket/vendor/pypi/{} (the dependency was \
+                     removed); nothing to restore",
+                    record.file, entry.uuid
+                ),
+            ));
+            continue;
+        }
         let live = match read_file(&root.join(&record.file)).await {
             Ok(live) => live,
             Err((_, error)) => return RevertOutcome::failed(error),
@@ -792,7 +828,10 @@ pub(super) async fn revert_python_locks(
             edits.push((record.file.clone(), live, restored));
         }
     }
-    if !dry_run && warnings.is_empty() {
+    let drift_kept = warnings
+        .iter()
+        .any(|w| w.code == "vendor_lock_entry_drifted");
+    if !dry_run && !drift_kept {
         // A refused write fails the revert outright: the artifact and the
         // ledger entry stay so the restore can be retried once the link is
         // a regular file again.
@@ -1630,5 +1669,106 @@ mod tests {
             restore_document(&second_reverted, metadata, &first_metadata).unwrap();
         assert!(!drifted);
         assert_eq!(restored, metadata);
+    }
+
+    /// Vendor `one==1` into a PEP 723 script and its `.py.lock`; returns the
+    /// ledger entry and the wired script and lock texts.
+    async fn vendor_script_pair(root: &Path) -> (VendorEntry, String, String) {
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"one\", specifier = \"==1\"}]\n\n[[package]]\nname = \"one\"\nversion = \"1\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        let script = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"one==1\", \"attrs>=20\"]\n# ///\nimport one\n";
+        write_pylock(root, "job.py.lock", lock).await;
+        tokio::fs::write(root.join("job.py"), script).await.unwrap();
+        let project = load_python_locks(root, "one", "1", UUID).await.unwrap();
+        let wheel =
+            ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/one-1-py3-none-any.whl";
+        let records = wire_python_locks(&project, root, "one", "1", wheel, &"a".repeat(64))
+            .await
+            .unwrap();
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/one@1",
+            "uuid": UUID,
+            "artifact": { "path": wheel, "sha256": "a".repeat(64) },
+            "wiring": serde_json::to_value(&records).unwrap(),
+            "flavor": "python-lock",
+        }))
+        .unwrap();
+        let wired_script = std::fs::read_to_string(root.join("job.py")).unwrap();
+        let wired_lock = std::fs::read_to_string(root.join("job.py.lock")).unwrap();
+        assert!(wired_script.contains(UUID) && wired_lock.contains(UUID));
+        (entry, wired_script, wired_lock)
+    }
+
+    /// The script and its lock after `uv remove --script job.py one`: the
+    /// dependency, its `[tool.uv.sources]` line and the lock package are
+    /// gone, so nothing names the vendored uuid any more.
+    async fn uv_remove_one(root: &Path) -> (String, String) {
+        let script = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"attrs>=20\"]\n# ///\nimport one\n";
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"attrs\", specifier = \">=20\"}]\n\n[[package]]\nname = \"attrs\"\nversion = \"25.3.0\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        tokio::fs::write(root.join("job.py"), script).await.unwrap();
+        write_pylock(root, "job.py.lock", lock).await;
+        (script.to_string(), lock.to_string())
+    }
+
+    /// #1214: after `uv remove --script` drops the vendored dependency from a
+    /// PEP 723 script and its lock, the revert has nothing left to restore.
+    /// It must warn `vendor_lock_entry_removed` and finish (the caller then
+    /// deletes the wheel and the ledger entry), not drift-keep the entry so
+    /// `vendor --check` stays red for good. The user's files stay as uv left
+    /// them.
+    #[tokio::test]
+    async fn script_revert_after_uv_remove_is_removed_not_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (entry, ..) = vendor_script_pair(root).await;
+        let (script, lock) = uv_remove_one(root).await;
+
+        for dry_run in [true, false] {
+            let outcome = revert_python_locks(&entry, root, dry_run).await;
+            assert!(outcome.success, "{outcome:?}");
+            assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+            assert!(outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .all(|w| w.code == super::super::LOCK_ENTRY_REMOVED_CODE),
+                "{:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("job.py")).unwrap(),
+                script
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("job.py.lock")).unwrap(),
+                lock
+            );
+        }
+    }
+
+    /// The removed arm only fires when NO wired file names the uuid. A user
+    /// who dropped the dependency from the lock by hand while the script
+    /// still routes through the vendored wheel left real drift: the entry
+    /// stays kept so the wheel the script installs from survives.
+    #[tokio::test]
+    async fn script_revert_keeps_drift_while_any_wired_file_names_the_uuid() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (entry, wired_script, _) = vendor_script_pair(root).await;
+        uv_remove_one(root).await;
+        tokio::fs::write(root.join("job.py"), &wired_script)
+            .await
+            .unwrap();
+
+        let outcome = revert_python_locks(&entry, root, false).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        assert_eq!(
+            std::fs::read_to_string(root.join("job.py")).unwrap(),
+            wired_script,
+            "drift writes nothing"
+        );
     }
 }
