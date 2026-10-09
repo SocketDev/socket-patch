@@ -117,7 +117,10 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   the repointed entry under `--locked`, 0.5.5 accepts it — the effective
   boundary is 0.5.5; the advisory keeps its `0_5_6` name.
 - Transitive targets are wired through `[tool.uv] override-dependencies` plus
-  a `[tool.uv.sources]` entry. uv applies sources to overrides only from
+  a `[tool.uv.sources]` entry. Hosted mode puts a `# socket-patch hosted: …`
+  comment line above the override entry it adds; rollback / remove remove
+  only a marked entry, so a user's own `<name>==<version>` override survives
+  the round trip (#411). uv applies sources to overrides only from
   0.5.6: on 0.2.35–0.5.3 `--frozen` installs the patched wheel from the lock,
   but a plain `uv sync` re-resolves the override against the registry and
   reinstalls the pristine wheel (and rewrites the lock). The CLI cannot tell
