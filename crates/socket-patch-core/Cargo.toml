@@ -28,6 +28,7 @@ hex = { workspace = true }
 reqwest = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls = { workspace = true }
+webpki-roots = { workspace = true }
 tokio = { workspace = true }
 # CancellationToken for the in-memory hosted engine (`hosted::memory`).
 tokio-util = { workspace = true }

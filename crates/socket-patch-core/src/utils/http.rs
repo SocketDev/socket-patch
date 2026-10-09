@@ -1,64 +1,180 @@
 //! Small shared HTTP primitives.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{CertificateError, DigitallySignedStruct, RootCertStore, SignatureScheme};
 
 /// The one constructor behind every production `reqwest::Client`.
 ///
-/// Trust roots are reqwest's bundled webpki (Mozilla) roots **plus** the
-/// configured platform roots ([`configured_roots`]): the OS trust store, or
-/// the bundle that `SSL_CERT_FILE` / `SSL_CERT_DIR` name. That is the rule
+/// Trust roots are the bundled webpki (Mozilla) roots **plus** the
+/// platform roots ([`load_configured_roots`]): the OS trust store, or the
+/// bundle that `SSL_CERT_FILE` / `SSL_CERT_DIR` name. That is the rule
 /// curl, npm, pip and cargo already follow, so a TLS-inspecting corporate
 /// proxy whose CA the OS (or `SSL_CERT_FILE`) trusts works here too.
 /// Certificate verification is never relaxed: an issuer neither set
-/// trusts still fails the handshake.
+/// trusts still fails the handshake ([`BundledThenPlatform`]).
 ///
-/// Callers add their own headers, timeouts and redirect policy. A text
-/// ratchet test (`no_client_is_built_outside_client_builder`) fails if
-/// production code builds a client any other way.
+/// The TLS config is built once per process and shared, so a client costs
+/// no more to build than reqwest's own default. Callers add their own
+/// headers, timeouts and redirect policy. A text ratchet test
+/// (`no_client_is_built_outside_client_builder`) fails if production code
+/// builds a client any other way.
 pub fn client_builder() -> reqwest::ClientBuilder {
-    with_roots(reqwest::Client::builder(), configured_roots())
+    static CONFIG: OnceLock<rustls::ClientConfig> = OnceLock::new();
+    let config = CONFIG.get_or_init(|| tls_config(Box::new(load_configured_roots)));
+    reqwest::Client::builder().use_preconfigured_tls(config.clone())
 }
 
-fn with_roots(
-    mut builder: reqwest::ClientBuilder,
-    roots: &[reqwest::Certificate],
-) -> reqwest::ClientBuilder {
-    for cert in roots {
-        builder = builder.add_root_certificate(cert.clone());
+type RootLoader = Box<dyn Fn() -> Vec<CertificateDer<'static>> + Send + Sync>;
+
+/// The rustls config every client shares: ring (the provider reqwest's
+/// `rustls-tls` already builds), TLS 1.2 and 1.3, HTTP/1.1 ALPN (reqwest is
+/// built without HTTP/2), and the [`BundledThenPlatform`] verifier.
+fn tls_config(platform_roots: RootLoader) -> rustls::ClientConfig {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = BundledThenPlatform::new(provider.clone(), platform_roots);
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports TLS 1.2 and 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config
+}
+
+/// Full webpki verification against the bundled roots first and, only
+/// when that fails with `UnknownIssuer`, against the platform roots. The
+/// result is the union of both trust sets, while the platform store (a
+/// keychain query, or a few hundred PEM files on Linux) is read only by a
+/// run that actually meets a certificate the bundled roots don't know, and
+/// then once per process. Every other verification failure (expiry, wrong
+/// host, bad signature) is returned unchanged.
+struct BundledThenPlatform {
+    provider: Arc<CryptoProvider>,
+    bundled: Arc<WebPkiServerVerifier>,
+    platform: OnceLock<Option<Arc<WebPkiServerVerifier>>>,
+    platform_roots: RootLoader,
+}
+
+impl std::fmt::Debug for BundledThenPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BundledThenPlatform")
+            .field("platform_loaded", &self.platform.get().is_some())
+            .finish_non_exhaustive()
     }
-    builder
 }
 
-/// The platform roots, loaded once per process: the native store is read
-/// from disk / the keychain, which is too slow to repeat for every client.
-fn configured_roots() -> &'static [reqwest::Certificate] {
-    static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
-    ROOTS.get_or_init(load_configured_roots)
+impl BundledThenPlatform {
+    fn new(provider: Arc<CryptoProvider>, platform_roots: RootLoader) -> Self {
+        let bundled = RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        BundledThenPlatform {
+            bundled: verifier_for(bundled, &provider)
+                .expect("the bundled webpki roots form a valid verifier"),
+            provider,
+            platform: OnceLock::new(),
+            platform_roots,
+        }
+    }
+
+    /// The platform-root verifier, loaded on first use. Native stores often
+    /// carry a few certificates rustls can't parse; those are skipped. An
+    /// empty or unreadable store yields `None` (bundled roots only).
+    fn platform(&self) -> Option<&WebPkiServerVerifier> {
+        self.platform
+            .get_or_init(|| {
+                let mut store = RootCertStore::empty();
+                store.add_parsable_certificates((self.platform_roots)());
+                if store.is_empty() {
+                    return None;
+                }
+                verifier_for(store, &self.provider)
+            })
+            .as_deref()
+    }
+}
+
+fn verifier_for(
+    roots: RootCertStore,
+    provider: &Arc<CryptoProvider>,
+) -> Option<Arc<WebPkiServerVerifier>> {
+    WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+        .build()
+        .ok()
+}
+
+impl ServerCertVerifier for BundledThenPlatform {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let verify = |v: &WebPkiServerVerifier| {
+            v.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        };
+        match verify(&self.bundled) {
+            Err(rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)) => {
+                match self.platform() {
+                    Some(platform) => verify(platform),
+                    None => Err(rustls::Error::InvalidCertificate(
+                        CertificateError::UnknownIssuer,
+                    )),
+                }
+            }
+            verdict => verdict,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// Read the platform trust store through `rustls-native-certs`, which uses
 /// `SSL_CERT_FILE` / `SSL_CERT_DIR` when set and the OS store (keychain on
 /// macOS, the system store on Windows, the distro bundle on Linux)
-/// otherwise. Native stores often carry a few certificates rustls can't
-/// parse; each root is screened on its own and an unusable one is skipped,
-/// since reqwest would otherwise refuse to build the whole client. A store
-/// that can't be read at all leaves only the bundled webpki roots.
-fn load_configured_roots() -> Vec<reqwest::Certificate> {
-    let loaded = rustls_native_certs::load_native_certs();
-    if crate::utils::env_compat::is_debug_enabled() {
-        for err in &loaded.errors {
-            eprintln!("[socket-patch] could not read platform trust roots: {err}");
-        }
-    }
-    loaded
-        .certs
-        .into_iter()
-        .filter(|der| {
-            let mut probe = rustls::RootCertStore::empty();
-            probe.add(der.clone()).is_ok()
-        })
-        .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok())
-        .collect()
+/// otherwise. A store that can't be read leaves the bundled roots only.
+fn load_configured_roots() -> Vec<CertificateDer<'static>> {
+    rustls_native_certs::load_native_certs().certs
 }
 
 /// Why [`read_capped_typed`] gave up — typed so a caller can tell a body cut
@@ -283,9 +399,19 @@ mod tests {
         out
     }
 
-    fn client_with(roots: &[reqwest::Certificate]) -> reqwest::Client {
+    /// A client using the shared verifier design with `roots` standing in
+    /// for the platform store; `loads` counts platform-store reads.
+    fn client_with(
+        roots: Vec<CertificateDer<'static>>,
+        loads: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> reqwest::Client {
+        let config = tls_config(Box::new(move || {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            roots.clone()
+        }));
         // `no_proxy`: a sandbox HTTPS_PROXY must not intercept loopback.
-        with_roots(reqwest::Client::builder(), roots)
+        reqwest::Client::builder()
+            .use_preconfigured_tls(config)
             .no_proxy()
             .build()
             .unwrap()
@@ -298,9 +424,18 @@ mod tests {
         let ca = std::path::Path::new(TLS_FIXTURES).join("ca.pem");
         let roots = with_cert_env(&ca, load_configured_roots);
         assert_eq!(roots.len(), 1, "SSL_CERT_FILE's one CA is loaded");
-        let resp = client_with(&roots).get(&url).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), "ok");
+        let loads = Arc::default();
+        let client = client_with(roots, Arc::clone(&loads));
+        for _ in 0..2 {
+            let resp = client.get(&url).send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+            assert_eq!(resp.text().await.unwrap(), "ok");
+        }
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the platform store is read once, on the first unknown issuer"
+        );
     }
 
     #[tokio::test]
@@ -312,16 +447,21 @@ mod tests {
         std::fs::write(&empty, "").unwrap();
         let roots = with_cert_env(&empty, load_configured_roots);
         assert!(roots.is_empty());
-        let err = client_with(&roots).get(&url).send().await.unwrap_err();
+        let err = client_with(roots, Arc::default())
+            .get(&url)
+            .send()
+            .await
+            .unwrap_err();
         assert!(
             format!("{err:?}").contains("UnknownIssuer"),
             "verification must stay on: {err:?}"
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn unparsable_platform_roots_are_skipped_not_fatal() {
+    async fn unparsable_platform_roots_are_skipped_not_fatal() {
+        let url = spawn_tls_server().await;
         let tmp = tempfile::tempdir().unwrap();
         let bundle = tmp.path().join("bundle.pem");
         let ca = std::fs::read_to_string(format!("{TLS_FIXTURES}/ca.pem")).unwrap();
@@ -332,8 +472,21 @@ mod tests {
         )
         .unwrap();
         let roots = with_cert_env(&bundle, load_configured_roots);
-        assert_eq!(roots.len(), 1, "only the usable root survives");
-        client_with(&roots);
+        let resp = client_with(roots, Arc::default())
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "the usable root still verifies");
+    }
+
+    /// The production builder accepts the shared rustls config (reqwest
+    /// refuses a config from a different rustls build at `build()`), and
+    /// building clients never reads the platform store.
+    #[test]
+    fn production_builder_builds() {
+        client_builder().build().unwrap();
+        client_builder().build().unwrap();
     }
 
     /// Ratchet: production code builds every `reqwest::Client` through

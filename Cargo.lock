@@ -2030,6 +2030,7 @@ dependencies = [
  "toml_edit",
  "uuid",
  "walkdir",
+ "webpki-roots",
  "windows-sys 0.59.0",
  "wiremock",
  "zip",

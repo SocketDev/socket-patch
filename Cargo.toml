@@ -29,11 +29,13 @@ sha1 = "=0.10.6"
 hex = "=0.4.3"
 reqwest = { version = "=0.12.28", features = ["rustls-tls", "json"], default-features = false }
 # Platform trust store (+ SSL_CERT_FILE / SSL_CERT_DIR) for every HTTPS
-# client, alongside reqwest's bundled webpki roots. `rustls` (already in
-# the graph through reqwest) only screens each native root before it is
-# handed to reqwest; no crypto provider feature is needed for that.
+# client, alongside the bundled webpki roots (utils::http::client_builder).
+# `rustls` and `webpki-roots` are the exact builds reqwest's `rustls-tls`
+# already pulls in (ring provider); the shared client config is built
+# from them directly.
 rustls-native-certs = "=0.8.4"
-rustls = { version = "=0.23.45", default-features = false, features = ["std"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "=1.0.6"
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio = { version = "=1.50.0", features = ["full"] }
 tokio-util = "=0.7.18"
