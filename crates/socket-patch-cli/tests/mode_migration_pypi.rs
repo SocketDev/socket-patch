@@ -531,6 +531,93 @@ async fn pipenv_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, files).await;
 }
 
+/// A vendored Pipenv project beside a requirements `-r` include the hosted
+/// rewriter does not reach (the #567 shape). The attribution gate would
+/// veto the Pipfile.lock pin as contested, but a wet takeover has already
+/// reverted the vendored wiring by then: dropping it would strand the
+/// package on the unpatched registry release (exit 1) while the dry run
+/// reported success. A takeover keeps the rewriters' verdict, so the dry
+/// run and the wet run agree and the package is never left unpatched.
+#[tokio::test]
+async fn pipenv_takeover_beside_an_unreached_include_is_never_stranded() {
+    let (_tmp, root) = project();
+    let files = stage_pipenv(&root);
+    vendor_project(&root, files);
+    std::fs::write(root.join("requirements.txt"), "-r req/base.txt\n").unwrap();
+    std::fs::create_dir_all(root.join("req")).unwrap();
+    std::fs::write(root.join("req/base.txt"), "six==1.16.0\n").unwrap();
+    let vendored_lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+
+    let mut dry = hosted_scan_args(&uri);
+    dry.push("--dry-run");
+    let (dry_code, dry_env) = run_cli(&root, &dry, &[]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
+        vendored_lock,
+        "a dry run writes nothing"
+    );
+
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "the takeover is not stranded: {env:#}");
+    assert!(
+        !env.to_string().contains("redirect_takeover_unpatched"),
+        "{env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    assert!(
+        lock.contains(&hosted_url),
+        "six is pinned to the patch:\n{lock}"
+    );
+    assert!(!lock.contains(".socket/vendor/"), "{lock}");
+    assert_eq!(
+        (dry_code, &dry_env["redirect"]["redirected"]),
+        (code, &env["redirect"]["redirected"]),
+        "the dry run predicts the wet run: {dry_env:#}"
+    );
+}
+
+/// #567 without a takeover: the Pipfile.lock pin the hosted rewriter would
+/// land is contested by an `-r` include it does not reach, so the patch is
+/// left out — reported in `redirect.skipped[]` as `redirect_unattributable`
+/// with discovery's finding — nothing is written and the exit code is 0.
+#[tokio::test]
+async fn pipenv_redirect_beside_an_unreached_include_is_skipped_unattributable() {
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    std::fs::write(root.join("requirements.txt"), "-r req/base.txt\n").unwrap();
+    std::fs::create_dir_all(root.join("req")).unwrap();
+    std::fs::write(root.join("req/base.txt"), "six==1.16.0\n").unwrap();
+    let pristine = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(
+        code, 0,
+        "an unattributable pin is a skip, not a failure: {env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    let skipped = env["redirect"]["skipped"].as_array().expect("skipped[]");
+    assert_eq!(skipped.len(), 1, "{env:#}");
+    assert_eq!(skipped[0]["purl"], PURL, "{env:#}");
+    assert_eq!(skipped[0]["reason"], "redirect_unattributable", "{env:#}");
+    assert!(
+        skipped[0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("req/base.txt")),
+        "the detail names the contesting file: {env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
+        pristine,
+        "nothing is written for it"
+    );
+}
+
 /// A superseding patch for the same release (a fixed patch, or one
 /// covering more CVEs).
 const UUID_B: &str = "6d4f2b3c-8e5a-4f7b-9c9d-2e3f4a5b6c7d";

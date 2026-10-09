@@ -554,7 +554,7 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if ctx.exists("rush.json").await {
         // The common lock, then each subspace's, sorted for deterministic
         // diagnostics (stat / list only — the reads below stay on the ctx).
-        for rel in rush_lock_rels(ctx.root).await {
+        for rel in rush_lock_rels(ctx.view).await {
             extract_pnpm_lock(ctx, &rel, out).await;
         }
     } else if let crate::utils::pnpm_workspace::MemberLocks::PerMember(rels) =

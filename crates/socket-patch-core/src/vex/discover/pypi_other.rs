@@ -219,20 +219,21 @@ async fn extract_pipfile_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 // ── requirements files ───────────────────────────────────────────────────
 
 async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
-    let files = match crate::vendor::requirements_include_names(ctx.root).await {
-        Ok(files) => files,
-        Err(e) => {
-            // A reached include exists but cannot be read: the tree is
-            // unknowable past it. Still read the root file (its own read
-            // diagnoses if IT is the unreadable one).
-            out.diag(
-                DIAG_LOCKFILE_UNREADABLE,
-                ROOT_REQUIREMENTS,
-                format!("cannot read the -r include tree of {ROOT_REQUIREMENTS}: {e}"),
-            );
-            vec![ROOT_REQUIREMENTS.to_string()]
-        }
-    };
+    let files =
+        match crate::vendor::pypi_requirements::requirements_include_names_in(ctx.view).await {
+            Ok(files) => files,
+            Err(e) => {
+                // A reached include exists but cannot be read: the tree is
+                // unknowable past it. Still read the root file (its own read
+                // diagnoses if IT is the unreadable one).
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    ROOT_REQUIREMENTS,
+                    format!("cannot read the -r include tree of {ROOT_REQUIREMENTS}: {e}"),
+                );
+                vec![ROOT_REQUIREMENTS.to_string()]
+            }
+        };
     for file in files.iter().take(MAX_REQUIREMENTS_FILES) {
         // pip installs the root and every include it reaches as ONE
         // requirement set, so they contest other locks as one (#1086).

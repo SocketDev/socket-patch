@@ -43,11 +43,46 @@ pub(super) fn upgrades(rows: &[Row], package_purls: &[String]) -> Vec<UpdateInfo
 pub(crate) struct Gate<'a> {
     pub(crate) stage: &'a mut Stage,
     pub(crate) rows: Vec<Row>,
+    /// Scan's lockfile discovery of `--cwd`, made before the redirect
+    /// (with the configured patch-server origins): the rewrite's
+    /// attribution gate reuses it when nothing changed the project since.
+    pub(crate) prior: Option<Prior<'a>>,
+}
+
+/// Scan's discovery, made BEFORE the apply lock, with the paths it read.
+#[derive(Clone, Copy)]
+pub(crate) struct Prior<'a> {
+    pub(crate) discovery: &'a socket_patch_core::vex::discover::Discovery,
+    /// `None` when the read set cannot cover what discovery read (it read
+    /// the disk around the snapshot): never reusable.
+    pub(crate) read_set: Option<&'a socket_patch_core::vendor::lock_inventory::ReadSet>,
+}
+
+impl<'a> Prior<'a> {
+    /// The discovery, when every path it read still has the fingerprint it
+    /// had then (stats only). Called under the apply lock, so nothing that
+    /// takes it can change the project between this check and the gate; a
+    /// change since the unlocked read sends the gate to a fresh discovery.
+    pub(crate) fn still_current(&self) -> Option<&'a socket_patch_core::vex::discover::Discovery> {
+        self.read_set
+            .filter(|read| read.unchanged())
+            .map(|_| self.discovery)
+    }
 }
 
 impl<'a> Gate<'a> {
     pub(crate) fn new(stage: &'a mut Stage, rows: Vec<Row>) -> Self {
-        Gate { stage, rows }
+        Gate {
+            stage,
+            rows,
+            prior: None,
+        }
+    }
+
+    /// This gate carrying scan's pre-redirect discovery (see [`Self::prior`]).
+    pub(crate) fn with_prior(mut self, prior: Option<Prior<'a>>) -> Self {
+        self.prior = prior;
+        self
     }
 
     /// `(purl, uuid)` of every NEW row, for O(1) [`Self::is_new`] checks.
@@ -207,6 +242,52 @@ pub(crate) fn human_lines(
 
 #[cfg(test)]
 mod tests {
+    /// Scan's discovery is taken before the apply lock: the gate reuses it
+    /// only while every path it read is unchanged, so a lockfile written
+    /// between scan's discovery and the gate (a concurrent run that held the
+    /// lock first) sends the gate to a fresh discovery.
+    #[tokio::test]
+    async fn the_prior_discovery_is_reused_only_while_the_project_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let lock = r#"{"name":"app","lockfileVersion":3,"requires":true,"packages":{"":{"name":"app","dependencies":{"left-pad":"1.3.0"}},"node_modules/left-pad":{"version":"1.3.0","resolved":"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz","integrity":"sha512-UPSTREAM=="}}}"#;
+        std::fs::write(root.join("package-lock.json"), lock).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            json: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let ctx = crate::commands::context::ProjectContext::new(&common);
+        let (discovery, read_set) = ctx.recorded_discovery().await;
+        let prior = super::Prior {
+            discovery,
+            read_set: read_set.as_ref(),
+        };
+        let read = read_set
+            .as_ref()
+            .expect("an npm project's discovery is recorded");
+        assert!(!read.is_empty());
+        // Unchanged (taking the apply lock creates `.socket/`): reused.
+        std::fs::create_dir_all(root.join(".socket")).unwrap();
+        std::fs::write(root.join(".socket/apply.lock"), "").unwrap();
+        assert!(std::ptr::eq(prior.still_current().unwrap(), discovery));
+        // A concurrent writer rewrote the lockfile: never reused.
+        std::fs::write(
+            root.join("package-lock.json"),
+            lock.replace("1.3.0.tgz", "1.3.0.tgz?x"),
+        )
+        .unwrap();
+        assert!(prior.still_current().is_none());
+        // Without a read set (discovery read the disk around the snapshot):
+        // never reused either.
+        let unrecorded = super::Prior {
+            discovery,
+            read_set: None,
+        };
+        assert!(unrecorded.still_current().is_none());
+    }
+
     use super::*;
     use socket_patch_core::api::types::PatchSearchResult;
     use socket_patch_core::api::types::VulnerabilityResponse;
@@ -429,27 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn mentioned_uuids_finds_every_canonical_shape_once() {
-        let mut out = HashSet::new();
-        mentioned_uuids(
-            "https://h/p/22222222-2222-4222-8222-222222222222/AAAAAAAA-1111-4111-8111-00000000000A/x.tgz \
-             not-a-uuid 1234 socket-patch-bbbbbbbb-1111-4111-8111-00000000000b",
-            &mut out,
-        );
-        let mut got: Vec<&str> = out.iter().map(String::as_str).collect();
-        got.sort();
-        assert_eq!(
-            got,
-            [
-                "22222222-2222-4222-8222-222222222222",
-                "aaaaaaaa-1111-4111-8111-00000000000a",
-                "bbbbbbbb-1111-4111-8111-00000000000b",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_lock_naming_the_selected_uuid_marks_the_row_already() {
+    fn a_discovered_pin_of_the_selected_uuid_marks_the_row_already() {
         let results = vec![
             offer(
                 "pkg:npm/a@1",
@@ -468,10 +529,43 @@ mod tests {
         let mut rows = classify(&offers, &RecordedIndex::default(), "");
         mark_pinned(
             &mut rows,
-            &["resolved: https://x/AAAAAAAA-1111-4111-8111-00000000000A/a.tgz"],
+            &[socket_patch_core::patch::redirect::upstream::HostedPin {
+                purl: "pkg:npm/a@1".into(),
+                uuid: "aaaaaaaa-1111-4111-8111-00000000000a".into(),
+                files: vec!["package-lock.json".into()],
+            }],
         );
         assert_eq!(rows[0].candidate.recorded, Recorded::Same);
         assert_eq!(rows[1].candidate.recorded, Recorded::None);
+    }
+
+    #[test]
+    fn a_discovered_pin_of_another_uuid_marks_the_row_an_upgrade() {
+        // A pin on a patch server only this run's references name is found
+        // by the second discovery pass: an older patch pinned there is an
+        // UPGRADE, not a NEW row spending a cap slot.
+        let results = vec![offer(
+            "pkg:npm/a@1",
+            "aaaaaaaa-1111-4111-8111-00000000000a",
+            "",
+            &["high"],
+        )];
+        let offers = offers_from_results(&results, true);
+        let mut rows = classify(&offers, &RecordedIndex::default(), "");
+        mark_pinned(
+            &mut rows,
+            &[socket_patch_core::patch::redirect::upstream::HostedPin {
+                purl: "pkg:npm/a@1".into(),
+                uuid: "AAAAAAAA-2222-4222-8222-00000000000A".into(),
+                files: vec!["package-lock.json".into()],
+            }],
+        );
+        assert_eq!(
+            rows[0].candidate.recorded,
+            Recorded::Superseded {
+                old_uuid: "aaaaaaaa-2222-4222-8222-00000000000a".into()
+            }
+        );
     }
 
     #[test]
@@ -675,5 +769,78 @@ mod tests {
         assert!(unlimited.may_admit_new());
         unlimited.plan(&classify(&offers, &RecordedIndex::default(), ""), |_| true);
         assert!(unlimited.warnings().is_empty());
+    }
+
+    /// REGRESSION: a lockless NuGet / Cargo pin (the hosted rewriter's own
+    /// output when the project has no lockfile) is never a discovery ref,
+    /// so `HostedPin::all` drops it. Re-scanned under `--max-new-patches 1`
+    /// it must read as ALREADY through the recorded view (as `scan` builds
+    /// it), not as NEW: otherwise every re-scan spends the one slot on the
+    /// pin it already wrote and the genuinely new patch is deferred forever.
+    #[tokio::test]
+    async fn a_rescanned_lockless_pin_is_already_not_new_under_a_cap() {
+        use socket_patch_core::patch::redirect::upstream::HostedPin;
+        const NUGET: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        const CARGO: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        const GRANT: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+        let tmp = tempfile::tempdir().unwrap();
+        let nuget_key = format!("socket-patch-{NUGET}");
+        std::fs::write(
+            tmp.path().join("nuget.config"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+                 <add key=\"{nuget_key}\" value=\"https://patch.socket.dev/patch-registry/nuget/{GRANT}/{NUGET}/index.json\" />\n  \
+                 </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"{nuget_key}\">\n      \
+                 <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
+                 </packageSourceMapping>\n</configuration>\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 serde = {{ version = \"1\", registry = \"socket-patch-{CARGO}\" }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join(".cargo")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cargo/config.toml"),
+            format!(
+                "[registries.socket-patch-{CARGO}]\nindex = \
+                 \"sparse+https://patch.socket.dev/patch-registry/cargo/{GRANT}/{CARGO}/index/\"\n"
+            ),
+        )
+        .unwrap();
+        let discovery = socket_patch_core::vex::discover::discover_patched_refs(tmp.path()).await;
+        assert_eq!(discovery.unlocked_pins.len(), 2, "{discovery:#?}");
+        let pins: Vec<(String, String)> = HostedPin::all(&discovery)
+            .into_iter()
+            .map(|p| (p.purl, p.uuid))
+            .collect();
+        assert!(pins.is_empty(), "lockless pins are never refs: {pins:?}");
+
+        let results = vec![
+            offer("pkg:nuget/Newtonsoft.Json@13.0.3", NUGET, "", &["critical"]),
+            offer("pkg:cargo/serde@1.0.200", CARGO, "", &["critical"]),
+            offer("pkg:npm/fresh@1.0.0", "fresh", "", &["low"]),
+        ];
+        let offers = offers_from_results(&results, true);
+        let index = RecordedIndex::new(None, &pins).with_unlocked_pins(discovery.unlocked_pins);
+        let one = MaxNew {
+            value: Some(1),
+            source: MaxNewSource::Flag,
+        };
+        let mut stage = Stage::new(one, None, Path::new("/repo"));
+        stage.plan(&classify(&offers, &index, ""), |_| true);
+        let counts = &stage.json()["counts"];
+        assert_eq!(counts["already"], 2, "{counts}");
+        assert_eq!(counts["new"], 1, "{counts}");
+        assert_eq!(counts["deferred"], 0, "{counts}");
+
+        // A version outside the cargo pin's requirement is not routed by it.
+        assert!(index.uuids("pkg:cargo/serde@2.0.0").is_empty());
+        assert!(!index.records_package("pkg:cargo/serde@2.0.0"));
     }
 }

@@ -1,4 +1,4 @@
-//! End-to-end tests for `scan --sync` (and `scan --apply` non-dry-run)
+//! End-to-end tests for `scan --sync` (and `scan --mode agent` non-dry-run)
 //! — the canonical bot workflow that combines discovery, download,
 //! manifest write, file patch, and optional pruning. Exercises the
 //! full `scan -> get -> apply` pipeline against a mock API + a real
@@ -77,7 +77,7 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
         })))
         .mount(&mock)
         .await;
-    // Per-package search (scan --apply uses it)
+    // Per-package search (scan --mode agent uses it)
     Mock::given(method("GET"))
         .and(path(format!(
             "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
@@ -257,7 +257,7 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
 
 #[tokio::test]
 async fn scan_apply_with_existing_blob_uses_local_cache() {
-    // When the after-hash blob is already in .socket/blobs, scan --apply
+    // When the after-hash blob is already in .socket/blobs, scan --mode agent
     // should skip the blob download and use the cached one.
     let before = b"before\n";
     let after = b"after\n";
@@ -327,7 +327,7 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     write_root(tmp.path());
     write_npm_package(tmp.path(), "cached-sync", "1.0.0", before);
 
-    // Pre-stage the manifest WITH the same UUID — scan --apply should
+    // Pre-stage the manifest WITH the same UUID — scan --mode agent should
     // emit `action: skipped` because UUID matches the manifest entry.
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
@@ -361,7 +361,8 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
         .args([
             "scan",
             "--json",
-            "--apply",
+            "--mode",
+            "agent",
             "--yes",
             "--api-url",
             &mock.uri(),
@@ -378,7 +379,7 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert_eq!(
         code, 0,
-        "scan --apply with cached UUID must succeed; stdout={stdout}; stderr={stderr}"
+        "scan --mode agent with cached UUID must succeed; stdout={stdout}; stderr={stderr}"
     );
 
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
@@ -391,7 +392,7 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     // left unpatched with exit 0).
     let apply = v["apply"]
         .as_object()
-        .unwrap_or_else(|| panic!("scan --apply must emit an apply sub-object; envelope={v}"));
+        .unwrap_or_else(|| panic!("scan --mode agent must emit an apply sub-object; envelope={v}"));
     assert_eq!(apply["found"], 1, "apply.found; apply={apply:?}");
     assert_eq!(
         apply["skipped"], 1,
@@ -464,7 +465,7 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
 
 #[tokio::test]
 async fn scan_apply_with_no_patches_emits_empty_apply_object() {
-    // Discovery returns zero patches — scan --apply still emits the
+    // Discovery returns zero patches — scan --mode agent still emits the
     // apply sub-object so downstream consumers always see it.
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
@@ -484,7 +485,8 @@ async fn scan_apply_with_no_patches_emits_empty_apply_object() {
         .args([
             "scan",
             "--json",
-            "--apply",
+            "--mode",
+            "agent",
             "--yes",
             "--api-url",
             &mock.uri(),
@@ -530,7 +532,7 @@ async fn scan_apply_skips_vendored_purl_without_downloading() {
     // the vendored uuid (moving past it would break VEX verification with
     // `vendor_uuid_mismatch`), the patch view must never be fetched, and
     // the newer uuid still surfaces in `updates[]` as the operator's
-    // signal to run `scan --vendor` / `vendor`.
+    // signal to run `scan --mode vendored` / `vendor`.
     const NEW_UUID: &str = "22222222-2222-4222-8222-222222222222";
     let before = b"before\n";
     let before_hash = git_sha256(before);
@@ -628,7 +630,8 @@ async fn scan_apply_skips_vendored_purl_without_downloading() {
         .args([
             "scan",
             "--json",
-            "--apply",
+            "--mode",
+            "agent",
             "--yes",
             "--api-url",
             &mock.uri(),

@@ -77,7 +77,7 @@ pub(crate) use self::npm::{
 pub(crate) use self::npm_family::inventory_npm_lock;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
-pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView};
+pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView, ReadSet};
 pub use self::wired::wired_vendor_integrity;
 
 // The per-format views `inventory_project_diagnosed` unions (and the test

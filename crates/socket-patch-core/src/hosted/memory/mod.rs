@@ -75,7 +75,7 @@ use crate::policy::{
     PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
 };
 use crate::rollout::stage::{
-    classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, RecordedIndex, Row,
+    classify, lookup_incomplete, mark_pinned, offers_from_results, Offers, RecordedIndex, Row,
     Stage, ROLLOUT_DEFERRED,
 };
 use discover::Provider;
@@ -553,17 +553,22 @@ fn unrooted_unsupported_warnings<'a>(
 }
 
 /// One root's recorded view (§5.1) in memory: its `.socket/manifest.json`,
-/// the hosted pins its lockfiles name, and its vendor ledger — the disk
-/// merge's precedence. A pin is a mention of an offered uuid for the purl
-/// in one of the root's own files (a nested root's files are its own); a
-/// pin to a patch the API no longer offers reads as NEW, which costs one
-/// slot once instead of stalling.
-fn memory_recorded(
-    project: &MemoryProject,
-    root: &str,
-    roots: &[String],
-    offers: &Offers,
-) -> RecordedIndex {
+/// the hosted pins its lockfiles carry, and its vendor ledger — the disk
+/// merge's precedence. The pins are discovery's over the root's files
+/// ([`HostedPin::discover`], the one "is this pinned" answer the disk scan
+/// uses too), so a uuid a stale or inactive file merely mentions pins
+/// nothing. Pins on a patch server other than Socket's are recognized once
+/// the run's references name it ([`stage::mark_pinned`]).
+///
+/// Unlike the mention scan this replaced, a pin counts whether or not the
+/// API still offers its patch (as on disk): a re-scan re-confirms it as
+/// ALREADY instead of spending a NEW slot. A pin wired only by files under
+/// a nested root (one discovery reaches through a requirements include or
+/// a rush subspace) is that root's own and does not count here.
+///
+/// [`HostedPin::discover`]: crate::patch::redirect::upstream::HostedPin::discover
+/// [`stage::mark_pinned`]: crate::rollout::stage::mark_pinned
+async fn memory_recorded(project: &MemoryProject, root: &str, roots: &[String]) -> RecordedIndex {
     let manifest = project
         .text(select::MANIFEST_REL)
         .and_then(|text| serde_json::from_str(text).ok());
@@ -574,29 +579,26 @@ fn memory_recorded(
         .filter_map(|other| roots::strip_root(root, other).map(|rel| format!("{rel}/")))
         .filter(|rel| rel != "/")
         .collect();
-    let mut mentioned = std::collections::HashSet::new();
-    for (path, entry) in project.entries() {
-        if path.starts_with(".socket/") || nested.iter().any(|n| path.starts_with(n.as_str())) {
-            continue;
-        }
-        if let MemoryEntry::Text(text) = entry {
-            mentioned_uuids(text, &mut mentioned);
-        }
-    }
-    let pins: Vec<(String, String)> = offers
-        .selected
-        .iter()
-        .filter_map(|(purl, selected)| {
-            let offered = offers.unfiltered.get(purl)?;
-            std::iter::once(selected)
-                .chain(offered.iter())
-                .find(|p| mentioned.contains(&p.uuid.to_ascii_lowercase()))
-                .map(|p| (purl.clone(), p.uuid.clone()))
-        })
+    let own = |file: &String| !nested.iter().any(|n| file.starts_with(n.as_str()));
+    // The same discovery `HostedPin::discover` runs, kept whole so its
+    // lockless pins (never refs) count as recorded too.
+    let discovery = crate::vex::discover::discover_patched_refs_view(
+        ProjectView::Memory(project),
+        &crate::vex::DiscoverOptions::default(),
+    )
+    .await;
+    let pins: Vec<(String, String)> = crate::patch::redirect::upstream::HostedPin::all(&discovery)
+        .into_iter()
+        .filter(|pin| pin.files.iter().any(own))
+        .map(|pin| (pin.purl, pin.uuid))
         .collect();
+    let unlocked = discovery
+        .unlocked_pins
+        .into_iter()
+        .filter(|pin| own(&pin.file.to_string_lossy().replace('\\', "/")));
     let merged =
         crate::ledgers::merge_ledger_records_for_updates(manifest.as_ref(), vendor.as_ref(), &pins);
-    RecordedIndex::new(merged.as_deref(), &pins)
+    RecordedIndex::new(merged.as_deref(), &pins).with_unlocked_pins(unlocked)
 }
 
 async fn engine(
@@ -980,11 +982,14 @@ async fn engine(
             .is_some_and(|e| e.code == "patch_lookup_failed")
     });
     let roots_by_path: Vec<String> = states.iter().map(|s| s.root.clone()).collect();
-    for state in states.iter_mut().filter(|s| s.error.is_none()) {
+    for state in states.iter_mut() {
+        if state.error.is_some() {
+            continue;
+        }
         let Some(project) = state.project.as_ref() else {
             continue;
         };
-        let recorded = memory_recorded(project, &state.root, &roots_by_path, &state.offers);
+        let recorded = memory_recorded(project, &state.root, &roots_by_path).await;
         stage.incomplete |= lookup_incomplete(&recorded, &state.failed_details, batch_failed);
         let mut rows = classify(&state.offers, &recorded, &state.root);
         for row in &mut rows {
@@ -1048,6 +1053,26 @@ async fn engine(
             Ok(plan) => planned.push((index, plan)),
             Err(refusal) => state.error = Some(ProjectError::from(refusal)),
         }
+    }
+    // A pin on the patch server these references name, when that is not
+    // Socket's own, is recognized only now (see `mark_pinned`).
+    for (index, plan) in &planned {
+        if !crate::rollout::stage::any_new(&states[*index].rows) {
+            continue;
+        }
+        let origins = crate::patch::redirect::upstream::foreign_dep_origins(
+            plan.candidates.iter().map(|c| &c.dep),
+            &[],
+        );
+        if origins.is_empty() {
+            continue;
+        }
+        let pins = crate::patch::redirect::upstream::HostedPin::discover(
+            ProjectView::Memory(&plan.project),
+            &origins,
+        )
+        .await;
+        mark_pinned(&mut states[*index].rows, &pins);
     }
     let wheels: BTreeSet<(String, String)> = planned
         .iter()
@@ -1594,12 +1619,14 @@ mod tests {
                 rewrite,
                 rewritten: files.iter().map(|(rel, _)| (*rel).to_string()).collect(),
                 confirmed: vec![("pkg:cargo/serde@1.0.190".into(), "u".into())],
+                unattributed: Vec::new(),
                 binary_bun: false,
                 rush_warnings: Vec::new(),
                 pnpm_warnings: Vec::new(),
                 npm_warnings: Vec::new(),
                 pnpm_rerun_only: false,
                 workspace_symlinked: false,
+                final_discovery: None,
             },
         }
     }
@@ -1881,5 +1908,47 @@ mod tests {
             &mut filtered,
         );
         assert!(filtered.is_empty());
+    }
+
+    /// REGRESSION: the in-memory recorded view counts a lockless NuGet /
+    /// Cargo pin (never a discovery ref) as recorded, so a re-scan under a
+    /// cap reads the pin it wrote as ALREADY instead of spending a NEW slot.
+    #[tokio::test]
+    async fn memory_recorded_counts_lockless_nuget_and_cargo_pins() {
+        const NUGET: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        const CARGO: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        const GRANT: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+        let key = format!("socket-patch-{NUGET}");
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "nuget.config",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+                 <add key=\"{key}\" value=\"https://patch.socket.dev/patch-registry/nuget/{GRANT}/{NUGET}/index.json\" />\n  \
+                 </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"{key}\">\n      \
+                 <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
+                 </packageSourceMapping>\n</configuration>\n"
+            ),
+        );
+        p.insert_text(
+            "Cargo.toml",
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 serde = {{ version = \"1\", registry = \"socket-patch-{CARGO}\" }}\n"
+            ),
+        );
+        p.insert_text(
+            ".cargo/config.toml",
+            format!(
+                "[registries.socket-patch-{CARGO}]\nindex = \
+                 \"sparse+https://patch.socket.dev/patch-registry/cargo/{GRANT}/{CARGO}/index/\"\n"
+            ),
+        );
+        let index = memory_recorded(&p, "", &[String::new()]).await;
+        assert_eq!(index.uuids("pkg:nuget/Newtonsoft.Json@13.0.3"), [NUGET]);
+        assert_eq!(index.uuids("pkg:cargo/serde@1.0.200"), [CARGO]);
+        assert!(index.records_package("pkg:cargo/serde@1.0.200"));
+        assert!(index.uuids("pkg:cargo/serde@2.0.0").is_empty());
+        assert!(index.uuids("pkg:nuget/Other@1.0.0").is_empty());
     }
 }

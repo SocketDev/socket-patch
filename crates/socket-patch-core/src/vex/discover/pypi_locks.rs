@@ -124,7 +124,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // `uv.lock` is tried explicitly so a non-regular file squatting the name
     // (which the directory listing skips) still diagnoses as unreadable.
     let mut python_locks = vec![UV_LOCK.to_string()];
-    for path in crate::utils::python_lock::python_lock_paths(ctx.root).unwrap_or_default() {
+    for path in ctx.view.python_lock_paths() {
         if !python_locks.contains(&path) {
             python_locks.push(path);
         }

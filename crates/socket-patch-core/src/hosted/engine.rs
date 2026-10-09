@@ -310,10 +310,10 @@ pub fn build_candidates(
 /// Bun's precedence when both lock spellings are present.
 pub fn bun_lock_present(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join("bun.lock").exists(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join("bun.lock").exists()
+        }
         ProjectView::Memory(project) => project.contains("bun.lock"),
     }
 }
@@ -441,31 +441,13 @@ impl CandidateFiles {
     }
 }
 
-/// The root-level Python lock names (sorted).
-async fn python_lock_paths(view: &ProjectView<'_>) -> Vec<String> {
-    match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default(),
-        ProjectView::Memory(project) => project
-            .children("")
-            .into_iter()
-            .filter(|(name, is_dir)| {
-                !is_dir && crate::utils::python_lock::is_python_lock_name(name)
-            })
-            .map(|(name, _)| name)
-            .collect(),
-    }
-}
-
 /// Whether the project is a Rush monorepo (disk: `rush.json` is a file).
 fn rush_repo(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join("rush.json").is_file(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join("rush.json").is_file()
+        }
         ProjectView::Memory(project) => project.contains("rush.json"),
     }
 }
@@ -633,7 +615,7 @@ pub async fn read_candidate_files(
         }
     }
 
-    for path in python_lock_paths(view).await {
+    for path in view.python_lock_paths() {
         if let Some(script) = crate::utils::python_lock::script_of_lock(&path) {
             out.read(view, unreadable, script).await;
         }
@@ -938,8 +920,8 @@ async fn keep_bundler_loaded_gem_files(
         .collect();
     let loaded = crate::crawlers::ruby_crawler::bundler_loaded_manifest_in(view).await;
     let mirror = match view {
-        ProjectView::Disk(root)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let root = view.disk_root().expect("a disk view has a root");
             crate::crawlers::ruby_crawler::bundler_source_mirror(root, &sources).await
         }
         ProjectView::Memory(_) => {
@@ -1136,6 +1118,7 @@ pub fn pipenv_lock_targets(files: &BTreeMap<String, String>, candidates: &[Candi
 }
 
 /// The host-dependent inputs of [`rewrite`].
+#[derive(Clone)]
 pub struct RewriteOptions<'a> {
     pub dry_run: bool,
     /// Whether a pypi candidate targets `Pipfile.lock`
@@ -1160,6 +1143,28 @@ pub struct RewriteOptions<'a> {
     /// Run the rewriters on the blocking pool (the disk flow: pure CPU over
     /// every lock text).
     pub blocking: bool,
+    /// Uuids of the run's staged vendored→hosted takeovers (wet and dry
+    /// runs alike): the caller reverted their vendored wiring in the group
+    /// overlay before the rewrite, so the attribution gate never drops
+    /// them, and their pin keeps the rewriters' verdict (a takeover the
+    /// rewriters do not pin is retracted by the caller and stays vendored).
+    /// Empty for the in-memory engine, which takes nothing over.
+    pub takeover_uuids: BTreeSet<String>,
+    /// The operator's extra patch-server origins (`--patch-server-url`):
+    /// the allowlist `vex`, `list`, `rollback`, `remove` and `vendor`
+    /// discover with, so the attribution gate sees an existing pin on a
+    /// configured server even when this run's grants live on another host.
+    /// Empty for the in-memory engine, which has no such knob.
+    pub patch_server_origins: Vec<String>,
+    /// Lockfile discovery of the project exactly as this rewrite reads it,
+    /// made with exactly `patch_server_origins` (the caller's pre-rewrite
+    /// discovery, `None` when nothing was discovered or the project may
+    /// have changed since). The attribution gate reuses it instead of
+    /// discovering again when a pass writes nothing and this run's grants
+    /// name no origin that `patch_server_origins` does not already count
+    /// (see [`reusable_prior`]): the project it would discover is then the
+    /// same, read the same way.
+    pub prior_discovery: Option<&'a crate::vex::discover::Discovery>,
 }
 
 /// One project's rewrite, ready for the guard, the record fetch and the
@@ -1179,6 +1184,10 @@ pub struct Rewritten {
     /// `(purl, uuid)` of each candidate whose redirect is pinned by the
     /// project's final files, in candidate order.
     pub confirmed: Vec<(String, String)>,
+    /// Candidates left out of the rewrite because lockfile discovery could
+    /// not attribute the pin they would land (see [`rewrite`]): reported as
+    /// skipped, written nowhere.
+    pub unattributed: Vec<SkippedPatch>,
     /// A `bun.lockb` without a text `bun.lock` drives npm.
     pub binary_bun: bool,
     pub rush_warnings: Vec<RewriteWarning>,
@@ -1191,6 +1200,46 @@ pub struct Rewritten {
     /// In memory only: the trust auto-config would write through a
     /// symlinked `pnpm-workspace.yaml`.
     pub(crate) workspace_symlinked: bool,
+    /// The attribution gate's discovery of the project as this rewrite
+    /// leaves it, when it equals a discovery made with exactly
+    /// [`RewriteOptions::patch_server_origins`] (this run's grants name no
+    /// other origin). `None` when the gate discovered nothing (no
+    /// confirmed candidate) or counted another origin. A caller that
+    /// writes exactly [`RewriteResult::files`] and
+    /// [`RewriteResult::binary_files`] and nothing else may use it in place
+    /// of discovering the written project again (see [`FinalDiscovery`]).
+    pub final_discovery: Option<FinalDiscovery>,
+}
+
+/// Where [`Rewritten::final_discovery`] lives.
+#[derive(Debug)]
+pub enum FinalDiscovery {
+    /// The pass wrote nothing, and the gate reused the caller's
+    /// [`RewriteOptions::prior_discovery`]: still the caller's to read.
+    Prior,
+    /// A discovery of the project with the pass's writes overlaid (the
+    /// project read when the gate ran). Every read the view mediates sees
+    /// the overlay, created files included (see
+    /// [`DiskSnapshot::overlay`](crate::vendor::lock_inventory::DiskSnapshot::overlay)),
+    /// so it equals a discovery of the written disk when every written file
+    /// already existed, or when discovery read nothing around the view
+    /// (`view_only`), or when each created file is one no such read can
+    /// see ([`overlay_creation_is_invisible`]).
+    Overlaid {
+        discovery: Box<crate::vex::discover::Discovery>,
+        /// Discovery read the project only through the overlaid view (no
+        /// raw disk read: the vlt store, sbt evidence, a vendored feed).
+        view_only: bool,
+    },
+}
+
+/// Whether CREATING `rel` (a write over no existing regular file) leaves a
+/// discovery over the overlaid project equal to one over the written disk:
+/// the root config files the install-policy auto-configs create
+/// ([`NPMRC_REL`], [`PNPM_WORKSPACE_REL`]), which discovery reads, if at
+/// all, by path and never finds by listing a directory.
+pub fn overlay_creation_is_invisible(rel: &str) -> bool {
+    rel == NPMRC_REL || rel == PNPM_WORKSPACE_REL
 }
 
 /// The pnpm-workspace.yaml read, classified for the trust auto-config
@@ -1198,13 +1247,13 @@ pub struct Rewritten {
 /// symbolic link (absent to the planner, refused by [`guard`]).
 fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, bool) {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => (
-            read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)),
-            false,
-        ),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            (
+                read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)),
+                false,
+            )
+        }
         ProjectView::Memory(project) => match project.get(PNPM_WORKSPACE_REL) {
             None => (Ok(None), false),
             Some(MemoryEntry::Text(text)) => (Ok(Some(text.to_string())), false),
@@ -1231,10 +1280,10 @@ fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, b
 /// [`read_npmrc_for_allow_remote`]).
 fn read_npmrc(view: &ProjectView<'_>) -> Result<Option<String>, String> {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => read_npmrc_for_allow_remote(&cwd.join(NPMRC_REL)),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            read_npmrc_for_allow_remote(&cwd.join(NPMRC_REL))
+        }
         ProjectView::Memory(project) => match project.get(NPMRC_REL) {
             None => Ok(None),
             Some(MemoryEntry::Symlink) => {
@@ -1265,10 +1314,10 @@ fn rush_repo_state_for_lock(lock_key: &str) -> String {
 /// Whether the Rush repo-state file `rel` is present (disk: a regular file).
 fn rush_repo_state_present(view: &ProjectView<'_>, rel: &str) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join(rel).is_file(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join(rel).is_file()
+        }
         ProjectView::Memory(project) => project.contains(rel),
     }
 }
@@ -1318,6 +1367,304 @@ pub fn candidate_presence_needles(dep: &DepOverride) -> Vec<String> {
 /// `withheld_from_vlt` are the uuids the vlt preflight kept out of the vlt
 /// rewrite.
 pub async fn rewrite(
+    view: &ProjectView<'_>,
+    read: CandidateFiles,
+    candidates: &[Candidate],
+    python_metadata: BTreeMap<String, String>,
+    withheld_from_vlt: &BTreeSet<String>,
+    options: RewriteOptions<'_>,
+) -> Rewritten {
+    // The run must never leave wiring that lockfile discovery — what `vex`,
+    // `list`, `rollback`, `remove` and `vendor` read — calls contested. A
+    // candidate the rewriters confirm but discovery cannot attribute to one
+    // package version (another lock resolving the same version elsewhere, a
+    // pin Maven never consumes) would be refused by every later command, so
+    // it is dropped and the rest rewritten without it. Each pass drops at
+    // least one candidate, so this ends. A staged takeover is never dropped
+    // (see [`RewriteOptions::takeover_uuids`]): its vendored wiring is
+    // reverted in the overlay, and its pin keeps the rewriters' verdict.
+    let exempt: BTreeSet<String> = withheld_from_vlt
+        .union(&options.takeover_uuids)
+        .cloned()
+        .collect();
+    let mut kept: Vec<Candidate> = candidates.to_vec();
+    let mut unattributed: Vec<SkippedPatch> = Vec::new();
+    loop {
+        let mut done = rewrite_once(
+            view,
+            read.clone(),
+            &kept,
+            python_metadata.clone(),
+            withheld_from_vlt,
+            options.clone(),
+        )
+        .await;
+        let Gated {
+            vetoed,
+            lockless,
+            discovery,
+        } = unattributed_pins(
+            view,
+            &done,
+            &kept,
+            &exempt,
+            &options.patch_server_origins,
+            options.prior_discovery,
+        )
+        .await;
+        if vetoed.is_empty() {
+            done.unattributed = unattributed;
+            done.rewrite.warnings.extend(lockless);
+            done.final_discovery = discovery;
+            return done;
+        }
+        kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
+        unattributed.extend(vetoed);
+    }
+}
+
+/// Lockfile discovery over the project as `done` would leave it, read as
+/// the management commands read it ([`HostedInventory`]): the skips for
+/// the confirmed candidates whose pin would be contested wiring, and a
+/// [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin. A lockless NuGet /
+/// Cargo pin ([`UnlockedPin`]) is written as before — whether such a pin
+/// may be written at all is the open hosted-rollback decision (E45) — but
+/// the run says that nothing can manage it until a lockfile exists.
+///
+/// A deliberate partial redirect keeps its behavior too: a dep whose
+/// bundled or user-patched copy the rewriters knowingly left on the
+/// registry (`bundled_skipped_uuids`, or a bundled copy in vlt's store;
+/// both are warned and kept out of the in-run VEX), or one withheld from
+/// the vlt rewrite while a sibling lock takes it, and a wet vendored→hosted
+/// takeover whose vendored wiring the caller already reverted (both in
+/// `exempt`). Which unreachable copies should block a redirect is the
+/// copy-source policy (audit B16), not decided here.
+///
+/// [`HostedInventory`]: crate::patch::redirect::upstream::HostedInventory
+/// [`UnlockedPin`]: crate::vex::discover::UnlockedPin
+async fn unattributed_pins(
+    view: &ProjectView<'_>,
+    done: &Rewritten,
+    candidates: &[Candidate],
+    exempt: &BTreeSet<String>,
+    configured: &[String],
+    prior: Option<&crate::vex::discover::Discovery>,
+) -> Gated {
+    if done.confirmed.is_empty() {
+        return Gated::default();
+    }
+    // The management commands' allowlist plus the hosts this run's grants
+    // name: a pin on either counts, as it will for them. A grant on
+    // Socket's own server or a configured one adds nothing discovery does
+    // not already count, so the discovery is then the one `configured`
+    // alone makes.
+    let foreign = crate::patch::redirect::upstream::foreign_dep_origins(
+        candidates.iter().map(|c| &c.dep),
+        configured,
+    );
+    let same_origins = foreign.is_empty();
+    let mut origins = configured.to_vec();
+    for origin in foreign {
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    let opts = crate::vex::DiscoverOptions {
+        patch_server_origins: origins,
+    };
+    let mut written: Vec<(&str, &[u8])> = Vec::new();
+    for (rel, text) in &done.rewrite.files {
+        if !crate::patch::redirect::sbt::is_synthetic_key(rel) {
+            written.push((rel.as_str(), text.as_bytes()));
+        }
+    }
+    for (rel, bytes) in &done.rewrite.binary_files {
+        written.push((rel.as_str(), bytes.as_slice()));
+    }
+    let reused = reusable_prior(prior, written.is_empty(), same_origins);
+    let fresh = if reused.is_some() {
+        None
+    } else {
+        Some(match view.disk_root() {
+            None => {
+                let ProjectView::Memory(project) = *view else {
+                    unreachable!("only a memory view has no disk root")
+                };
+                let mut after = project.clone();
+                for (rel, bytes) in written {
+                    let entry = match std::str::from_utf8(bytes) {
+                        Ok(text) => crate::vendor::lock_inventory::MemoryEntry::Text(text.into()),
+                        Err(_) => crate::vendor::lock_inventory::MemoryEntry::Binary(bytes.into()),
+                    };
+                    after.insert(rel, entry);
+                }
+                let discovery = crate::vex::discover::discover_patched_refs_view(
+                    ProjectView::Memory(&after),
+                    &opts,
+                )
+                .await;
+                (discovery, true)
+            }
+            Some(root) => {
+                // Tracked only to learn whether discovery read around the
+                // overlay (see `FinalDiscovery::Overlaid::view_only`).
+                let after = crate::vendor::lock_inventory::DiskSnapshot::tracked(root);
+                for (rel, bytes) in written {
+                    after.overlay(rel, bytes);
+                }
+                after.begin_recording();
+                let discovery = crate::vex::discover::discover_patched_refs_view(
+                    ProjectView::Snapshot(&after),
+                    &opts,
+                )
+                .await;
+                (discovery, after.end_recording().is_some())
+            }
+        })
+    };
+    let discovery = match (reused, &fresh) {
+        (Some(prior), _) => prior,
+        (None, Some((fresh, _))) => fresh,
+        (None, None) => unreachable!("a pass reuses the prior discovery or discovers afresh"),
+    };
+    // The management commands' own view of the result: an attributable
+    // pin, or contested wiring they would refuse around.
+    let inventory = crate::patch::redirect::upstream::HostedInventory::of(discovery);
+    let attributed: BTreeSet<&str> = inventory.pins.iter().map(|p| p.uuid.as_str()).collect();
+    let lockless: Vec<RewriteWarning> = discovery
+        .unlocked_pins
+        .iter()
+        .filter(|pin| {
+            !attributed.contains(pin.uuid.as_str())
+                && done.confirmed.iter().any(|(_, uuid)| *uuid == pin.uuid)
+        })
+        .map(|pin| {
+            let create = match pin.ecosystem.as_str() {
+                "nuget" => "create packages.lock.json (`dotnet restore --use-lock-file`)",
+                "cargo" => "create Cargo.lock (`cargo generate-lockfile`)",
+                _ => "create the lockfile",
+            };
+            warning(
+                REDIRECT_PIN_LOCKLESS,
+                format!(
+                    "{}: {} is pinned to patch {} without a lockfile that records its version, \
+                     so `vex` cannot attest it and `rollback`, `remove` and `vendor` refuse it \
+                     as unattributable; {create} and re-run `socket-patch scan --mode hosted` \
+                     to make it manageable",
+                    pin.file.display(),
+                    pin.name,
+                    pin.uuid
+                ),
+            )
+        })
+        .collect();
+    // Contested wiring (not a lockless pin, see above) is what the run must
+    // never leave behind. A pin discovery does not see at all (a file it
+    // does not read, such as a pre-2.6 bundler Gemfile the next `bundle
+    // install` locks) is no such wiring and keeps the rewriters' verdict.
+    let contested: BTreeSet<&str> = inventory
+        .contested
+        .iter()
+        .filter(|c| c.lockless.is_empty())
+        .map(|c| c.uuid.as_str())
+        .collect();
+    // vlt's bundled copies live only in its installed store, which the
+    // rewriters never read (the scan warns about them after the writes).
+    let vlt_bundled: BTreeSet<String> = match view.disk_root() {
+        Some(root) if !contested.is_empty() => crate::vendor::vlt_bundled::bundled_copies(root)
+            .await
+            .into_keys()
+            .collect(),
+        _ => BTreeSet::new(),
+    };
+    let vetoed = done
+        .confirmed
+        .iter()
+        .filter(|(purl, uuid)| {
+            !attributed.contains(uuid.as_str())
+                && contested.contains(uuid.as_str())
+                && !done.rewrite.bundled_skipped_uuids.contains(uuid)
+                && !exempt.contains(uuid)
+                && !vlt_bundled.contains(&crate::utils::purl_key::canonical_base_purl(purl))
+        })
+        .map(|(purl, uuid)| {
+            let findings: Vec<&str> = discovery
+                .diagnostics
+                .iter()
+                .filter(|d| d.detail.contains(uuid.as_str()) || d.detail.contains(purl.as_str()))
+                .map(|d| d.detail.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let why = if findings.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", findings.join("; "))
+            };
+            SkippedPatch {
+                purl: purl.clone(),
+                uuid: uuid.clone(),
+                reason: REDIRECT_UNATTRIBUTABLE.to_string(),
+                detail: Some(format!(
+                    "the rewrite would wire patch {uuid} for {purl}, but lockfile discovery (what \
+                     `vex`, `list`, `rollback` and `vendor` read) cannot attribute that pin to \
+                     one package version{why}, so nothing was changed for it; reconcile the \
+                     project's lockfiles and re-run"
+                )),
+            }
+        })
+        .collect();
+    let discovery = match (same_origins, fresh) {
+        (false, _) => None,
+        (true, None) => Some(FinalDiscovery::Prior),
+        (true, Some((fresh, view_only))) => Some(FinalDiscovery::Overlaid {
+            discovery: Box::new(fresh),
+            view_only,
+        }),
+    };
+    Gated {
+        vetoed,
+        lockless,
+        discovery,
+    }
+}
+
+/// What [`unattributed_pins`] decided for one pass.
+#[derive(Default)]
+struct Gated {
+    /// The confirmed candidates whose pin would be contested wiring.
+    vetoed: Vec<SkippedPatch>,
+    /// A [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin.
+    lockless: Vec<RewriteWarning>,
+    /// The discovery the verdict read, for [`Rewritten::final_discovery`].
+    discovery: Option<FinalDiscovery>,
+}
+
+/// The caller's pre-rewrite discovery, when it is exactly what the gate
+/// would discover: the pass writes nothing (so the project is the one the
+/// caller discovered) and the gate's origins (`configured` plus the
+/// grants' hosts) count exactly the pins the caller's (`configured` alone)
+/// did: `same_origins`, no grant on a host outside Socket's own server and
+/// `configured` ([`foreign_dep_origins`]).
+///
+/// [`foreign_dep_origins`]: crate::patch::redirect::upstream::foreign_dep_origins
+fn reusable_prior(
+    prior: Option<&crate::vex::discover::Discovery>,
+    nothing_written: bool,
+    same_origins: bool,
+) -> Option<&crate::vex::discover::Discovery> {
+    prior.filter(|_| nothing_written && same_origins)
+}
+
+/// Warning: a confirmed pin no lockfile records a version for (a lockless
+/// NuGet / Cargo redirect), which no later command can attribute.
+pub const REDIRECT_PIN_LOCKLESS: &str = "redirect_pin_lockless";
+
+/// `skipped[].reason` of a candidate whose pin lockfile discovery would not
+/// attribute (see [`rewrite`]).
+pub const REDIRECT_UNATTRIBUTABLE: &str = "redirect_unattributable";
+
+async fn rewrite_once(
     view: &ProjectView<'_>,
     read: CandidateFiles,
     candidates: &[Candidate],
@@ -1532,12 +1879,14 @@ pub async fn rewrite(
         rewrite,
         rewritten,
         confirmed,
+        unattributed: Vec::new(),
         binary_bun,
         rush_warnings,
         pnpm_warnings,
         npm_warnings,
         pnpm_rerun_only,
         workspace_symlinked,
+        final_discovery: None,
     }
 }
 
@@ -1895,10 +2244,10 @@ fn root_only_workspace_breaks_add(view: &ProjectView<'_>) -> Option<String> {
 /// no ancestors.
 fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => governing_workspace_file(cwd),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            governing_workspace_file(cwd)
+        }
         ProjectView::Memory(_) => None,
     }
 }
@@ -2464,6 +2813,9 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let mut skipped = Vec::new();
         let candidates = build_candidates(&selected, &refs, &mut skipped);
@@ -2532,6 +2884,9 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2765,6 +3120,16 @@ mod tests {
         assert!(confirmed.is_empty(), "{confirmed:?}");
     }
 
+    /// The grant token and patch uuid of the engine fixtures' hosted urls:
+    /// real uuids, so lockfile discovery recognizes the pins the rewrite
+    /// lands (the engine keeps only the ones it attributes).
+    const FIXTURE_TOKEN: &str = "11111111-1111-4111-8111-111111111111";
+    const FIXTURE_UUID: &str = "77777777-7777-4777-8777-777777777777";
+
+    fn left_pad_url() -> String {
+        format!("https://patch.test/{FIXTURE_TOKEN}/{FIXTURE_UUID}/left-pad-1.3.0.tgz")
+    }
+
     fn left_pad_candidate() -> Candidate {
         use crate::patch::redirect::Integrity;
         Candidate {
@@ -2774,9 +3139,9 @@ mod tests {
                 name: "left-pad".into(),
                 namespace: None,
                 version: "1.3.0".into(),
-                token: "tok".into(),
-                patch_uuid: "uuid".into(),
-                artifact_url: "https://patch.test/left-pad-1.3.0.tgz".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: left_pad_url(),
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some("sha512-PATCHED==".into()),
@@ -2823,6 +3188,9 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![left_pad_candidate()];
         let read = read_candidate_files(view, unreadable, &candidates).await;
@@ -2844,7 +3212,7 @@ mod tests {
             done.rewrite
                 .files
                 .get("package-lock.json")
-                .is_some_and(|lock| lock.contains("https://patch.test/left-pad-1.3.0.tgz"))
+                .is_some_and(|lock| lock.contains(&left_pad_url()))
         };
         // In memory.
         let mut p = MemoryProject::new();
@@ -3012,9 +3380,11 @@ snapshots:
                 name: "is-number".into(),
                 namespace: None,
                 version: "7.0.0".into(),
-                token: "tok".into(),
-                patch_uuid: "uuid".into(),
-                artifact_url: "https://patch.test/is-number-7.0.0.tgz".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: format!(
+                    "https://patch.test/{FIXTURE_TOKEN}/{FIXTURE_UUID}/is-number-7.0.0.tgz"
+                ),
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some(format!("sha512-{}==", "A".repeat(86))),
@@ -3052,6 +3422,9 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 blocking: false,
+                takeover_uuids: Default::default(),
+                patch_server_origins: Vec::new(),
+                prior_discovery: None,
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
             assert!(read.files.contains_key("package.json"));
@@ -3080,7 +3453,7 @@ snapshots:
                     "{}",
                     skipped.detail
                 );
-                assert!(done.rewrite.bundled_skipped_uuids.contains("uuid"));
+                assert!(done.rewrite.bundled_skipped_uuids.contains(FIXTURE_UUID));
             } else {
                 assert!(
                     done.rewrite.binary_files.contains_key("bun.lockb"),
@@ -3152,12 +3525,14 @@ snapshots:
                 name: "rails".into(),
                 namespace: None,
                 version: "7.0.0".into(),
-                token: "tok".into(),
-                patch_uuid: "uuid".into(),
-                artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: format!(
+                    "https://patch.test/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/gems/rails-7.0.0.gem"
+                ),
                 registry_override: Some(RegistryOverride {
                     kind: "rubygems-compact-index".into(),
-                    index_url: "https://patch.test/gem/tok/uuid/".into(),
+                    index_url: format!("https://patch.test/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"),
                     identifiers: RegistryOverrideIdentifiers {
                         name: "rails".into(),
                         version: "7.0.0".into(),
@@ -3226,6 +3601,9 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![gradle_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
@@ -3516,6 +3894,299 @@ snapshots:
         assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
     }
 
+    /// The gate reuses the caller's discovery only for a pass that writes
+    /// nothing and counts exactly the origins it was made with.
+    #[test]
+    fn the_prior_discovery_is_reused_only_unwritten_with_the_same_origins() {
+        let prior = crate::vex::discover::Discovery::default();
+        assert!(reusable_prior(Some(&prior), true, true).is_some());
+        assert!(reusable_prior(Some(&prior), false, true).is_none());
+        assert!(reusable_prior(Some(&prior), true, false).is_none());
+        assert!(reusable_prior(None, true, true).is_none());
+    }
+
+    /// A registry-resolved left-pad: the hosted rewrite redirects it.
+    const LEFT_PAD_LOCK: &str = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "dependencies": { "left-pad": "1.3.0" } },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+
+    /// The left-pad rewrite of the project on disk at `root`, counting
+    /// `configured` patch servers and handed `prior` as the caller's
+    /// pre-rewrite discovery.
+    async fn gated_left_pad_rewrite(
+        root: &std::path::Path,
+        configured: &[&str],
+        prior: Option<&crate::vex::discover::Discovery>,
+    ) -> Rewritten {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
+            prior_discovery: prior,
+        };
+        let view = ProjectView::Disk(root);
+        let candidates = vec![left_pad_candidate()];
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        rewrite(
+            &view,
+            read,
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            options,
+        )
+        .await
+    }
+
+    /// Lockfile discovery of `root` as the management commands make it.
+    async fn discover_configured(
+        root: &std::path::Path,
+        configured: &[&str],
+    ) -> crate::vex::discover::Discovery {
+        crate::vex::discover_patched_refs_with(
+            root,
+            &crate::vex::DiscoverOptions {
+                patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
+            },
+        )
+        .await
+    }
+
+    /// Write `done`'s files under `root`, as the disk flow does.
+    fn write_rewrite(root: &std::path::Path, done: &Rewritten) {
+        for (rel, text) in &done.rewrite.files {
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        for (rel, bytes) in &done.rewrite.binary_files {
+            std::fs::write(root.join(rel), bytes).unwrap();
+        }
+    }
+
+    /// A writing pass hands back the gate's discovery over its overlaid
+    /// writes, and it is the discovery of the written disk; the caller's
+    /// prior discovery is never reused for a pass that writes.
+    #[tokio::test]
+    async fn a_writing_pass_hands_back_the_discovery_of_its_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
+        let configured = ["https://patch.test"];
+        let before = discover_configured(tmp.path(), &configured).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &configured, Some(&before)).await;
+        assert!(done.rewrite.files.contains_key("package-lock.json"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+        let Some(FinalDiscovery::Overlaid {
+            discovery: overlaid,
+            view_only,
+        }) = &done.final_discovery
+        else {
+            panic!(
+                "expected the overlaid discovery: {:?}",
+                done.final_discovery
+            );
+        };
+        assert!(*view_only, "npm discovery reads only through the view");
+        write_rewrite(tmp.path(), &done);
+        let after = discover_configured(tmp.path(), &configured).await;
+        assert_eq!(format!("{overlaid:?}"), format!("{after:?}"));
+        assert_ne!(format!("{before:?}"), format!("{after:?}"));
+        assert_eq!(
+            crate::patch::redirect::upstream::HostedPin::all(overlaid).len(),
+            1
+        );
+    }
+
+    /// A pass that writes nothing (an already-redirected project) reuses
+    /// the caller's discovery and says so.
+    #[tokio::test]
+    async fn an_unwritten_pass_hands_back_the_prior_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
+        let configured = ["https://patch.test"];
+        let first = gated_left_pad_rewrite(tmp.path(), &configured, None).await;
+        write_rewrite(tmp.path(), &first);
+        let prior = discover_configured(tmp.path(), &configured).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &configured, Some(&prior)).await;
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        assert_eq!(done.confirmed.len(), 1);
+        assert!(matches!(done.final_discovery, Some(FinalDiscovery::Prior)));
+        // Without a prior discovery, the gate discovers the (unwritten)
+        // project itself and hands that back.
+        let done = gated_left_pad_rewrite(tmp.path(), &configured, None).await;
+        let Some(FinalDiscovery::Overlaid {
+            discovery: fresh, ..
+        }) = &done.final_discovery
+        else {
+            panic!("expected a fresh discovery: {:?}", done.final_discovery);
+        };
+        assert_eq!(format!("{fresh:?}"), format!("{prior:?}"));
+    }
+
+    /// A grant on a server the caller did not configure makes the gate count
+    /// another origin: its discovery is not the caller's, so the gate never
+    /// reuses the prior one and hands back none.
+    #[tokio::test]
+    async fn a_foreign_grant_origin_hands_back_no_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
+        let done = gated_left_pad_rewrite(tmp.path(), &[], None).await;
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+        assert!(done.final_discovery.is_none());
+        write_rewrite(tmp.path(), &done);
+        // Unwritten now, with a prior discovery made without the grant's
+        // origin: still not reused.
+        let prior = discover_configured(tmp.path(), &[]).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &[], Some(&prior)).await;
+        assert!(done.rewrite.files.is_empty());
+        assert_eq!(done.confirmed.len(), 1);
+        assert!(done.final_discovery.is_none());
+    }
+
+    /// Nothing confirmed: the gate discovers nothing and hands back none.
+    #[tokio::test]
+    async fn an_unconfirmed_rewrite_hands_back_no_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            LEFT_PAD_LOCK.replace("left-pad", "right-pad"),
+        )
+        .unwrap();
+        let prior = discover_configured(tmp.path(), &["https://patch.test"]).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &["https://patch.test"], Some(&prior)).await;
+        assert!(done.confirmed.is_empty());
+        assert!(done.final_discovery.is_none());
+    }
+
+    /// Only the install-policy auto-configs' root config files may be
+    /// created under an overlaid discovery.
+    #[test]
+    fn only_root_config_files_are_invisible_overlay_creations() {
+        assert!(overlay_creation_is_invisible(".npmrc"));
+        assert!(overlay_creation_is_invisible("pnpm-workspace.yaml"));
+        for rel in [
+            "package-lock.json",
+            "pylock.toml",
+            "pylock.dev.toml",
+            "packages/a/.npmrc",
+            "common/config/subspaces/a/pnpm-lock.yaml",
+            "settings.gradle",
+            "NuGet.Config",
+        ] {
+            assert!(!overlay_creation_is_invisible(rel), "{rel}");
+        }
+    }
+
+    /// A lockless NuGet pin (a Socket source mapping, no
+    /// `packages.lock.json`) is still written, but the run says no later
+    /// command can manage it and names the lockfile that fixes that.
+    #[tokio::test]
+    async fn a_lockless_nuget_pin_is_written_with_the_lockless_warning() {
+        use crate::patch::redirect::{Integrity, RegistryOverride, RegistryOverrideIdentifiers};
+        let base =
+            format!("https://patch.test/patch-registry/nuget/{FIXTURE_TOKEN}/{FIXTURE_UUID}");
+        let candidate = Candidate {
+            purl: "pkg:nuget/Newtonsoft.Json@13.0.3".into(),
+            dep: DepOverride {
+                ecosystem: "nuget".into(),
+                name: "Newtonsoft.Json".into(),
+                namespace: None,
+                version: "13.0.3".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: format!(
+                    "{base}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+                ),
+                registry_override: Some(RegistryOverride {
+                    kind: "nuget-v3".into(),
+                    index_url: format!("{base}/index.json"),
+                    identifiers: RegistryOverrideIdentifiers {
+                        name: "Newtonsoft.Json".into(),
+                        version: "13.0.3".into(),
+                        nuget_id_lower: Some("newtonsoft.json".into()),
+                        nuget_version_norm: Some("13.0.3".into()),
+                        ..Default::default()
+                    },
+                }),
+                integrity: Integrity {
+                    sha512: Some("sha512-NUGETPATCHED==".into()),
+                    ..Default::default()
+                },
+            },
+        };
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "nuget.config",
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+             <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+             </packageSources>\n</configuration>\n",
+        );
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
+        };
+        let candidates = vec![candidate];
+        let view = ProjectView::Memory(&p);
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let done = rewrite(
+            &view,
+            read,
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            options,
+        )
+        .await;
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+        assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
+        let lockless: Vec<&RewriteWarning> = done
+            .rewrite
+            .warnings
+            .iter()
+            .filter(|w| w.code == REDIRECT_PIN_LOCKLESS)
+            .collect();
+        assert_eq!(lockless.len(), 1, "{:?}", done.rewrite.warnings);
+        let detail = &lockless[0].detail;
+        assert!(detail.contains("Newtonsoft.Json"), "{detail}");
+        assert!(
+            detail.contains("dotnet restore --use-lock-file"),
+            "{detail}"
+        );
+    }
+
     const GEMFILE: &str = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
     const GEM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.22\n";
@@ -3536,6 +4207,9 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![gem_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
@@ -3803,9 +4477,9 @@ snapshots:
     #[tokio::test]
     async fn bundler_mirror_for_the_patch_source_redirects_nothing() {
         for key in [
-            "BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/TOK/UUID/",
-            "BUNDLE_MIRROR__PATCH__TEST",
-            "BUNDLE_MIRROR__PATCH__TEST/",
+            format!("BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"),
+            "BUNDLE_MIRROR__PATCH__TEST".to_string(),
+            "BUNDLE_MIRROR__PATCH__TEST/".to_string(),
         ] {
             let mut p = MemoryProject::new();
             p.insert_text("Gemfile", GEMFILE);
