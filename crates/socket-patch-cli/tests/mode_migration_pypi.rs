@@ -2071,6 +2071,59 @@ async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
     );
 }
 
+// ── #604: PEP 440-equivalent lock-only pins ──────────────────────────────
+
+/// #604: on a fresh checkout (no venv), `six==1.16` (or `==1.16.0.0`,
+/// `==01.16.0`) is the release the patch API keys as `six@1.16.0`. Hosted
+/// mode must find the patch and rewrite the pin, as it does when a venv
+/// holds six 1.16.0, and report the package as not installed.
+#[tokio::test]
+async fn lock_only_pep440_equivalent_pin_is_patched() {
+    use wiremock::matchers::body_string_contains;
+    for pin in ["1.16", "1.16.0.0", "01.16.0"] {
+        let server = MockServer::start().await;
+        // The API matches purls exactly: only `@1.16.0` has the patch.
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .and(body_string_contains(PURL))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [{ "purl": PURL, "patches": [{
+                    "uuid": UUID, "purl": PURL, "tier": "free", "cveIds": [], "ghsaIds": [],
+                    "severity": "high", "title": "pep440 fixture"
+                }]}],
+                "canAccessPaidPatches": false,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [], "canAccessPaidPatches": false,
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let hosted_url = mount_hosted_api(&server, true).await;
+        let (_tmp, root) = project();
+        std::fs::write(
+            root.join("requirements.txt"),
+            format!("idna==3.7\nsix=={pin}\n"),
+        )
+        .unwrap();
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "{pin}: {env:#}");
+        assert_eq!(env["redirect"]["redirected"], 1, "{pin}: {env:#}");
+        assert_eq!(env["packages"][0]["purl"], PURL, "{pin}: {env:#}");
+        assert_eq!(env["packages"][0]["notInstalled"], true, "{pin}: {env:#}");
+        let requirements = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        assert!(
+            requirements.contains(&format!("six @ {hosted_url}")),
+            "{pin}: the pin is rewritten:\n{requirements}"
+        );
+    }
+}
+
 // ── #1138: a uv workspace member ─────────────────────────────────────────
 
 /// A uv workspace (root `pyproject.toml` with `[tool.uv.workspace]` and its

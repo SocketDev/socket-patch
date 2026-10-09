@@ -165,6 +165,11 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   those cases requires marker-specific source mappings. Standalone PEP 751
   rewriting selects the exact package version; duplicate entries for the same
   name and version are refused when source selection is ambiguous.
+- Lock-only discovery (a fresh checkout, no venv) queries the patch API with
+  every PEP 440 spelling of an exact pure-release pin as well as the one
+  written (`six==1.16` asks for `@1.16` and `@1.16.0`; `==1.16.0` also asks for
+  `@1.16`), so it finds the patch the registry keys under its own spelling, as a
+  venv-backed run does, and reports the package as not installed (#604).
 - Hosted requirements select exact `==`/`===` pins or socket-patch's own
   hosted archive URLs. A user-authored direct reference to the patched release
   (`name @ <url>` on any other origin, `files.pythonhosted.org` and `file://`
