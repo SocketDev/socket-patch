@@ -18,7 +18,7 @@ vlt project, and the caveats users meet, are in
 | C | 1.0.0-rc.15 … 1.0.0-rc.32 | `1` | `~` / `+` + `_x` escapes (`~npm~name@ver`), `peer.N` | absent |
 | D | 1.0.0-rc.33 … 1.0.7 | `1` | as C | the registry URL |
 | E | 1.0.8 … 1.1.1 | `1` | as C, `peer.<16 hex>` | the registry URL |
-| F | 1.2.0 … 1.3.7 | `1` | as E; the global store (`store-linker`) | the registry URL |
+| F | 1.2.0 … 1.3.8 | `1` | as E; the global store (`store-linker`) | the registry URL |
 
 On every release that writes slot [3], it is omitted when the project
 configures `registry` and the node's tarball URL starts with it (vlt's
@@ -203,7 +203,7 @@ toolchain problem a failure, and so does `CI=true` with `_JS` unset.
 | supported | `1.0.0-rc.1`, `1.0.0-rc.2`, `1.0.0-rc.3`, `1.0.0-rc.4`, `1.0.0-rc.5`, `1.0.0-rc.6`, `1.0.0-rc.7`, `1.0.0-rc.8`, `1.0.0-rc.9`, `1.0.0-rc.10`, `1.0.0-rc.11`, `1.0.0-rc.12`, `1.0.0-rc.13`, `1.0.0-rc.14`, `1.0.0-rc.15`, `1.0.0-rc.16`, `1.0.0-rc.17`, `1.0.0-rc.18` |
 | supported | `1.0.0-rc.22`, `1.0.0-rc.23`, `1.0.0-rc.24`, `1.0.0-rc.25`, `1.0.0-rc.26`, `1.0.0-rc.27`, `1.0.0-rc.28`, `1.0.0-rc.29`, `1.0.0-rc.30`, `1.0.0-rc.31`, `1.0.0-rc.32`, `1.0.0-rc.33`, `1.0.0-rc.34` |
 | supported | `1.0.1`, `1.0.2`, `1.0.3`, `1.0.4`, `1.0.5`, `1.0.6`, `1.0.7`, `1.0.8`, `1.0.9`, `1.0.10`, `1.1.0`, `1.1.1`, `1.2.0` |
-| supported | `1.3.0`, `1.3.1`, `1.3.2`, `1.3.3`, `1.3.4`, `1.3.5`, `1.3.6`, `1.3.7` |
+| supported | `1.3.0`, `1.3.1`, `1.3.2`, `1.3.3`, `1.3.4`, `1.3.5`, `1.3.6`, `1.3.7`, `1.3.8` |
 | excluded (broken install) | `0.0.0-0` |
 | excluded (Deno-compiled wrappers) | `0.0.0-2`, `0.0.0-3`, `0.0.0-4`, `0.0.0-5`, `0.0.0-6`, `0.0.0-7`, `0.0.0-8`, `0.0.0-9`, `0.0.0-10` |
 | excluded (`vlt install` exits 13 on Node 24 after "Done") | `0.0.0-22` |
@@ -212,7 +212,7 @@ toolchain problem a failure, and so does `CI=true` with `_JS` unset.
 
 `0.0.0-0.<timestamp>` builds are excluded too. Every supported release
 through 1.2.0 was run through all five capstones on macOS during SP-9;
-1.3.0 … 1.3.7 were run through them on Linux, and the nightly canary ran
+1.3.0 … 1.3.8 were run through them on Linux, and the nightly canary ran
 1.3.x `vlt@latest` through them on Linux, macOS and Windows (the CI matrix
 samples them per OS).
 
