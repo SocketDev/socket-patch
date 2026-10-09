@@ -163,6 +163,17 @@ impl Target {
             .collect();
         packages.sort();
         packages.dedup();
+        // The full name typed is never ambiguous with packages it only
+        // reaches by last segment: `lodash` beside `@types/lodash` names
+        // `lodash`.
+        let full: Vec<String> = packages
+            .iter()
+            .filter(|identity| self.is_full_name_of(identity))
+            .cloned()
+            .collect();
+        if !full.is_empty() {
+            packages = full;
+        }
         (packages.len() > 1).then(|| {
             format!(
                 "\"{}\" is ambiguous: it names {}; use the full name or a purl",
@@ -170,6 +181,22 @@ impl Target {
                 packages.join(", ")
             )
         })
+    }
+
+    /// Is this name the full name of the package `identity` (as
+    /// [`package_identity`] returns it), not just its last segment?
+    fn is_full_name_of(&self, identity: &str) -> bool {
+        let Some((ty, name)) = identity
+            .strip_prefix("pkg:")
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            return false;
+        };
+        let spec = self.text.trim().to_lowercase();
+        if ty == "pypi" {
+            return name == canonicalize_pypi_name(&spec);
+        }
+        name == spec.replace(':', "/")
     }
 
     /// Does this target select the recorded patch `(purl, uuid)` — a
@@ -473,6 +500,18 @@ mod tests {
         // Same name in two ecosystems: ambiguous.
         assert!(Target::parse("six")
             .ambiguity(["pkg:pypi/six@1", "pkg:npm/six@1"])
+            .is_some());
+        // A full-name match wins over last-segment ones (#1034 review):
+        // `lodash` beside `@types/lodash`, `core` beside `@x/core`.
+        let typed = ["pkg:npm/lodash@4.17.21", "pkg:npm/@types/lodash@4.17.0"];
+        assert_eq!(Target::parse("lodash").ambiguity(typed), None);
+        assert_eq!(
+            core.ambiguity(["pkg:npm/core@1.0.0", "pkg:npm/@x/core@2.0.0"]),
+            None
+        );
+        // ...but two last-segment-only matches stay ambiguous.
+        assert!(Target::parse("lodash")
+            .ambiguity(["pkg:npm/@types/lodash@4", "pkg:npm/@x/lodash@1"])
             .is_some());
     }
 
