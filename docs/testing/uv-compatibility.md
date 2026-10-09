@@ -149,6 +149,16 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 - A script lock requires its paired script and a valid PEP 723 metadata block.
   Missing metadata or an incompatible existing source is reported before either
   file is rewritten.
+- A PEP 508 direct reference to the patched package (`six @ https://…whl`,
+  `six @ git+…`) in `[project]` dependencies, an extra, a `[dependency-groups]`
+  group, the legacy `[tool.uv] dev-dependencies` or a PEP 723 script, or a
+  lock entry resolved from a direct URL (uv.lock `source = { url }`, pylock
+  `archive = { url }`), is the user's own source. Both modes refuse it before
+  any file is written: vendored with `pypi_uv_source_already_exists`, hosted
+  with `redirect_uv_project_unsupported` / `redirect_uv_script_unsupported` /
+  `redirect_uv_lock_unsupported` (#767). Before, vendored left a lock that
+  `uv sync --locked` rejects, and hosted replaced the user's URL with one its
+  own rollback then refused to restore.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751
