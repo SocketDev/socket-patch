@@ -150,11 +150,18 @@ pub struct VendorWarning {
 }
 
 impl VendorWarning {
+    /// Every URL quoted in `detail` is redacted
+    /// ([`crate::utils::redact::redact_urls_in`]): a vendor warning lands in
+    /// `--json` events and CI logs, and the URLs it quotes (service grant
+    /// URLs, GOPROXY / `.npmrc` / private-index registries) carry
+    /// credentials.
     pub fn new(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            code,
-            detail: detail.into(),
-        }
+        let detail = detail.into();
+        let detail = match crate::utils::redact::redact_urls_in(&detail) {
+            std::borrow::Cow::Borrowed(_) => detail,
+            std::borrow::Cow::Owned(redacted) => redacted,
+        };
+        Self { code, detail }
     }
 }
 
@@ -1912,6 +1919,28 @@ mod harvest_tests {
             vendored_purl_keys(tmp.path()).await.is_empty(),
             "a corrupt ledger degrades fail-open to the empty set"
         );
+    }
+}
+
+#[cfg(test)]
+mod vendor_warning_redaction_tests {
+    use super::*;
+
+    /// A vendor warning lands in `--json` events and CI logs: every URL its
+    /// detail quotes is redacted at construction, whoever builds it.
+    #[test]
+    fn a_vendor_warning_never_carries_a_credential() {
+        let w = VendorWarning::new(
+            "vendor_registry_fetch_failed",
+            "GET https://u:p@h.example/patch/npm/a/1.0.0/TOK/7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d/a.tgz: \
+             HTTP 404 (GOPROXY=https://proxy.golang.org,https://bot:ghp_X@goproxy.corp,direct)",
+        );
+        for needle in ["TOK", "u:p", "bot:ghp_X"] {
+            assert!(!w.detail.contains(needle), "{needle}: {}", w.detail);
+        }
+        assert!(w.detail.contains("HTTP 404"), "{}", w.detail);
+        let plain = VendorWarning::new("c", "no url here");
+        assert_eq!(plain.detail, "no url here");
     }
 }
 

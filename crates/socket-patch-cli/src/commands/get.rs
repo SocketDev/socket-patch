@@ -1117,7 +1117,6 @@ pub async fn run(args: GetArgs) -> i32 {
         )],
         _ => Vec::new(),
     };
-    let download_mode = args.common.download_mode.clone();
     // Set to `true` after the first 401/403 from the authenticated
     // endpoint triggered a rebuild against the public proxy. Plumbed
     // through to every subsequent telemetry event so we can track the
@@ -1211,7 +1210,6 @@ pub async fn run(args: GetArgs) -> i32 {
                     &patch.uuid,
                     &patch.tier,
                     &ecosystem_from_purl(&patch.purl),
-                    &download_mode,
                     fallback_to_proxy,
                     &telemetry,
                 )
@@ -1468,19 +1466,18 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if accessible.is_empty() {
         if args.common.json {
-            let mut result = serde_json::json!({
-                "status": "paid_required",
-                "found": search_response.patches.len(),
-                "downloaded": 0,
-                "applied": 0,
-                "patches": search_response.patches.iter().map(|p| serde_json::json!({
-                    "purl": p.purl,
-                    "uuid": p.uuid,
-                    "tier": p.tier,
-                })).collect::<Vec<_>>(),
-            });
-            fold_narrowing_into_result(&mut result, &[], &org_warnings);
-            print_json(&result);
+            let records = search_response
+                .patches
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "purl": p.purl,
+                        "uuid": p.uuid,
+                        "tier": p.tier,
+                    })
+                })
+                .collect();
+            print_json(&paid_required_json(records, &org_warnings));
         } else if !args.common.silent {
             let all: Vec<&PatchSearchResult> = search_response.patches.iter().collect();
             if id_type == TargetKind::Name && !quiet {
@@ -1751,6 +1748,25 @@ pub async fn run(args: GetArgs) -> i32 {
     code
 }
 
+/// `get --json`'s one paid-plan shape (CLI_CONTRACT.md, `paid_required`):
+/// the legacy top-level `status: "paid_required"` with the refused
+/// `patches` records and nothing downloaded or applied. No `events`, no
+/// `error`: it is a clean outcome (exit 0).
+fn paid_required_json(
+    records: Vec<serde_json::Value>,
+    org_warnings: &[(String, String)],
+) -> serde_json::Value {
+    let mut result = serde_json::json!({
+        "status": "paid_required",
+        "found": records.len(),
+        "downloaded": 0,
+        "applied": 0,
+        "patches": records,
+    });
+    fold_narrowing_into_result(&mut result, &[], org_warnings);
+    result
+}
+
 /// `paid_required` for the uuid path: the patch exists but the caller
 /// (on the public proxy) cannot download it. A clean outcome, exit 0.
 /// `purl` is `None` when the proxy refused with 403 before naming it.
@@ -1768,15 +1784,7 @@ async fn report_paid_required_uuid(
         if let Some(purl) = purl {
             record["purl"] = serde_json::json!(purl);
         }
-        let mut result = serde_json::json!({
-            "status": "paid_required",
-            "found": 1,
-            "downloaded": 0,
-            "applied": 0,
-            "patches": [record],
-        });
-        fold_narrowing_into_result(&mut result, &[], org_warnings);
-        print_json(&result);
+        print_json(&paid_required_json(vec![record], org_warnings));
     } else if !args.common.silent {
         let name = purl.map(|p| normalize_purl(p).into_owned());
         println!(
@@ -2176,7 +2184,6 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         global_prefix: args.common.global_prefix.clone(),
         json: args.common.json,
         silent: args.common.silent,
-        download_mode: args.common.download_mode.clone(),
         all_releases: args.all_releases,
         strict: args.common.strict,
         ecosystems: args.common.ecosystems.clone(),
@@ -3875,7 +3882,6 @@ mod tests {
             global_prefix: None,
             json: true,
             silent: true,
-            download_mode: "diff".to_string(),
             all_releases: false,
             strict: false,
             ecosystems: None,
@@ -4571,7 +4577,6 @@ mod tests {
             global_prefix: None,
             json: true,
             silent: true,
-            download_mode: "diff".to_string(),
             all_releases: false,
             strict: false,
             ecosystems: None,
@@ -5676,7 +5681,6 @@ mod tests {
             nested.org.is_none() && nested.api_token.is_none(),
             "API fields are never threaded through params: the nested apply runs on the run's client"
         );
-        assert_eq!(nested.download_mode, "diff");
         assert!(nested.silent, "json || silent params run a quiet apply");
         assert!(!nested.json && !nested.dry_run);
     }

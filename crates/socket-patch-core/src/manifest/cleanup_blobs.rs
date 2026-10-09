@@ -18,25 +18,22 @@ pub struct CleanupResult {
     pub failed: Vec<String>,
 }
 
-/// The blob hashes and patch archives a cleanup pass must preserve.
+/// The blob hashes a cleanup pass must preserve.
 /// These are references, not synthetic patch records: filenames and patch
 /// metadata cannot change which original or patched bytes remain reachable.
 pub struct ArtifactReferences {
     blobs: HashSet<String>,
-    patch_uuids: HashSet<String>,
 }
 
 impl ArtifactReferences {
     /// The one retention policy for a manifest's patches: the afterHash and
-    /// beforeHash blobs and the diff archive of every patch in it. `repair`
-    /// and `scan --prune` keep exactly this. The beforeHash blobs are the
-    /// only local restore data: an offline rollback needs them, and
-    /// `repair` downloads afterHash blobs only, so it can never restore an
-    /// original it swept.
+    /// beforeHash blobs of every patch in it. `repair` and `scan --prune`
+    /// keep exactly this. The beforeHash blobs are the only local restore
+    /// data: an offline rollback needs them, and `repair` downloads afterHash
+    /// blobs only, so it can never restore an original it swept.
     pub fn active(manifest: &PatchManifest) -> Self {
         let mut references = Self {
             blobs: HashSet::new(),
-            patch_uuids: HashSet::new(),
         };
         for record in manifest.patches.values() {
             references.retain(record);
@@ -58,15 +55,10 @@ impl ArtifactReferences {
             .into_iter()
             .filter_map(|purl| previous.patches.get(purl))
         {
-            let mut has_original = false;
             for file in record.files.values() {
                 if !file.before_hash.is_empty() {
                     references.blobs.insert(file.before_hash.clone());
-                    has_original = true;
                 }
-            }
-            if has_original {
-                references.patch_uuids.insert(record.uuid.clone());
             }
         }
         references
@@ -81,7 +73,6 @@ impl ArtifactReferences {
                 }
             }
         }
-        self.patch_uuids.insert(record.uuid.clone());
     }
 
     /// Sweep each artifact directory independently so a failed pass does not
@@ -92,14 +83,16 @@ impl ArtifactReferences {
                 self.blobs.contains(name)
             })
             .await,
-            diffs: cleanup_archives(&self.patch_uuids, &socket_dir.join("diffs"), dry_run).await,
-            // Nothing writes or reads legacy package archives any more.
+            // Nothing writes or reads legacy diff or package archives any
+            // more (v5 fetches patch content as per-file blobs only), so
+            // every file in either directory is an orphan.
+            diffs: cleanup_dir(&socket_dir.join("diffs"), dry_run, |_| false).await,
             packages: cleanup_dir(&socket_dir.join("packages"), dry_run, |_| false).await,
         }
     }
 }
 
-/// Results from the independent blob, diff and legacy package sweeps.
+/// Results from the independent blob and legacy diff/package sweeps.
 pub struct ArtifactSweep {
     pub blobs: std::io::Result<CleanupResult>,
     pub diffs: std::io::Result<CleanupResult>,
@@ -186,26 +179,6 @@ async fn cleanup_dir<F: Fn(&str) -> bool>(
         let _ = tokio::fs::remove_dir(dir).await;
     }
     Ok(result)
-}
-
-async fn cleanup_archives(
-    used_uuids: &HashSet<String>,
-    archives_dir: &Path,
-    dry_run: bool,
-) -> Result<CleanupResult, std::io::Error> {
-    cleanup_dir(archives_dir, dry_run, |name| {
-        // Strip the .tar.gz suffix to recover the UUID. A file that does
-        // not end in .tar.gz is never a valid archive, so it is always an
-        // orphan -- even if its bare name happens to equal a manifest UUID
-        // (e.g. a stray `<uuid>` file with no extension). Returning false
-        // here keeps that contract: only well-formed `<uuid>.tar.gz` files
-        // whose UUID is referenced are kept.
-        match name.strip_suffix(".tar.gz") {
-            Some(uuid_part) => used_uuids.contains(uuid_part),
-            None => false,
-        }
-    })
-    .await
 }
 
 /// Formats a cleanup result counting `noun`s: "Removed 2 unused diff
@@ -306,16 +279,6 @@ mod tests {
         cleanup_dir(dir, dry_run, |name| references.blobs.contains(name)).await
     }
 
-    /// The diff-archive pass of [`ArtifactReferences::active`]'s sweep alone.
-    async fn sweep_archives(
-        manifest: &PatchManifest,
-        dir: &Path,
-        dry_run: bool,
-    ) -> std::io::Result<CleanupResult> {
-        let references = ArtifactReferences::active(manifest);
-        cleanup_archives(&references.patch_uuids, dir, dry_run).await
-    }
-
     fn create_test_manifest() -> PatchManifest {
         let mut files = HashMap::new();
         files.insert(
@@ -411,7 +374,6 @@ mod tests {
             let keep_original = matches!(policy, "active" | "remaining" | "not-installed");
             let keep_patched = matches!(policy, "active" | "remaining");
             let kept = 2 * usize::from(keep_original) + 3 * usize::from(keep_patched);
-            let keep_archive = keep_original || keep_patched;
 
             let preview = references.sweep(dir.path(), true).await;
             assert_eq!(
@@ -419,10 +381,8 @@ mod tests {
                 hashes.len() - kept,
                 "{policy}"
             );
-            assert_eq!(
-                preview.diffs.unwrap().blobs_removed,
-                2 - usize::from(keep_archive)
-            );
+            // Diff archives are obsolete: even a referenced UUID's goes.
+            assert_eq!(preview.diffs.unwrap().blobs_removed, 2, "{policy}");
             assert_eq!(preview.packages.unwrap().blobs_removed, 1);
             assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), hashes.len());
             assert_eq!(std::fs::read_dir(&diffs).unwrap().count(), 2);
@@ -434,10 +394,7 @@ mod tests {
                 hashes.len() - kept,
                 "{policy}"
             );
-            assert_eq!(
-                swept.diffs.unwrap().blobs_removed,
-                2 - usize::from(keep_archive)
-            );
+            assert_eq!(swept.diffs.unwrap().blobs_removed, 2, "{policy}");
             assert_eq!(swept.packages.unwrap().blobs_removed, 1);
             for hash in [BEFORE_HASH_1, BEFORE_HASH_2] {
                 assert_eq!(blobs.join(hash).exists(), keep_original, "{policy}");
@@ -446,7 +403,7 @@ mod tests {
                 assert_eq!(blobs.join(hash).exists(), keep_patched, "{policy}");
             }
             assert!(!blobs.join(ORPHAN_HASH).exists());
-            assert_eq!(diffs.join(archive).exists(), keep_archive, "{policy}");
+            assert!(!diffs.exists(), "{policy}");
             assert!(!packages.exists());
         }
     }
@@ -715,151 +672,6 @@ mod tests {
             format_cleanup_result_for(&result, false, BLOB),
             "Removed 2 unused blobs (2.00 KB freed)"
         );
-    }
-
-    // ── cleanup_unused_archives tests ──────────────────────────────
-
-    const SECOND_UUID: &str = "22222222-2222-4222-8222-222222222222";
-
-    #[tokio::test]
-    async fn test_cleanup_archives_keeps_referenced_uuid() {
-        let dir = tempfile::tempdir().unwrap();
-        let archives = dir.path().join("packages");
-        tokio::fs::create_dir_all(&archives).await.unwrap();
-
-        let manifest = create_test_manifest();
-        tokio::fs::write(archives.join(format!("{TEST_UUID}.tar.gz")), b"keep")
-            .await
-            .unwrap();
-        tokio::fs::write(archives.join(format!("{SECOND_UUID}.tar.gz")), b"orphan")
-            .await
-            .unwrap();
-
-        let result = sweep_archives(&manifest, &archives, false).await.unwrap();
-
-        assert_eq!(result.blobs_removed, 1);
-        assert!(result
-            .removed_blobs
-            .contains(&format!("{SECOND_UUID}.tar.gz")));
-        assert!(
-            tokio::fs::metadata(archives.join(format!("{TEST_UUID}.tar.gz")))
-                .await
-                .is_ok()
-        );
-        assert!(
-            tokio::fs::metadata(archives.join(format!("{SECOND_UUID}.tar.gz")))
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_archives_dry_run_does_not_delete() {
-        let dir = tempfile::tempdir().unwrap();
-        let archives = dir.path().join("packages");
-        tokio::fs::create_dir_all(&archives).await.unwrap();
-
-        let manifest = create_test_manifest();
-        tokio::fs::write(archives.join(format!("{SECOND_UUID}.tar.gz")), b"orphan")
-            .await
-            .unwrap();
-
-        let result = sweep_archives(&manifest, &archives, true).await.unwrap();
-
-        assert_eq!(result.blobs_removed, 1);
-        assert!(
-            tokio::fs::metadata(archives.join(format!("{SECOND_UUID}.tar.gz")))
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_archives_removes_non_archive_files() {
-        // Stray files (no .tar.gz suffix, or wrong UUID) are treated as
-        // orphans. This keeps the directory tidy when the on-disk format
-        // changes in the future.
-        let dir = tempfile::tempdir().unwrap();
-        let archives = dir.path().join("packages");
-        tokio::fs::create_dir_all(&archives).await.unwrap();
-
-        let manifest = create_test_manifest();
-        tokio::fs::write(archives.join("stray.txt"), b"junk")
-            .await
-            .unwrap();
-        tokio::fs::write(archives.join(format!("{TEST_UUID}.tar.gz")), b"keep")
-            .await
-            .unwrap();
-
-        let result = sweep_archives(&manifest, &archives, false).await.unwrap();
-
-        assert_eq!(result.blobs_removed, 1);
-        assert!(result.removed_blobs.contains(&"stray.txt".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_archives_removes_bare_uuid_without_extension() {
-        // Regression: a stray file whose *bare* name equals a referenced
-        // manifest UUID but lacks the `.tar.gz` extension is NOT a valid
-        // archive and must be removed as an orphan. The previous
-        // `strip_suffix(..).unwrap_or(name)` form fell back to matching the
-        // whole filename against the UUID set and incorrectly KEPT it.
-        let dir = tempfile::tempdir().unwrap();
-        let archives = dir.path().join("packages");
-        tokio::fs::create_dir_all(&archives).await.unwrap();
-
-        let manifest = create_test_manifest();
-        // Bare UUID, no extension -- must be treated as an orphan.
-        tokio::fs::write(archives.join(TEST_UUID), b"not an archive")
-            .await
-            .unwrap();
-        // The legitimate archive for the same UUID must survive.
-        tokio::fs::write(archives.join(format!("{TEST_UUID}.tar.gz")), b"keep")
-            .await
-            .unwrap();
-
-        let result = sweep_archives(&manifest, &archives, false).await.unwrap();
-
-        assert_eq!(result.blobs_removed, 1);
-        assert!(result.removed_blobs.contains(&TEST_UUID.to_string()));
-        assert!(tokio::fs::metadata(archives.join(TEST_UUID)).await.is_err());
-        assert!(
-            tokio::fs::metadata(archives.join(format!("{TEST_UUID}.tar.gz")))
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_archives_removes_wrong_suffix_with_uuid_stem() {
-        // A file named `<uuid>.tar.gz.bak` (or any non-`.tar.gz` suffix) does
-        // not end in `.tar.gz`, so it is an orphan regardless of its stem.
-        let dir = tempfile::tempdir().unwrap();
-        let archives = dir.path().join("packages");
-        tokio::fs::create_dir_all(&archives).await.unwrap();
-
-        let manifest = create_test_manifest();
-        tokio::fs::write(archives.join(format!("{TEST_UUID}.tar.gz.bak")), b"junk")
-            .await
-            .unwrap();
-
-        let result = sweep_archives(&manifest, &archives, false).await.unwrap();
-
-        assert_eq!(result.blobs_removed, 1);
-        assert!(result
-            .removed_blobs
-            .contains(&format!("{TEST_UUID}.tar.gz.bak")));
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_archives_nonexistent_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let archives = dir.path().join("does-not-exist");
-        let manifest = create_test_manifest();
-
-        let result = sweep_archives(&manifest, &archives, false).await.unwrap();
-        assert_eq!(result.blobs_checked, 0);
-        assert_eq!(result.blobs_removed, 0);
     }
 
     #[tokio::test]

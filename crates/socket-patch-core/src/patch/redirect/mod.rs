@@ -75,8 +75,8 @@ use crate::formats::yarn::blocks::{
     classic_line_endings_supported, repin_classic_block, scan_blocks, LockBlock,
 };
 use crate::formats::yarn::patterns::{
-    berry_npm_alias_target, classic_key_real_name, split_berry_key_patterns, split_key_patterns,
-    split_pattern,
+    berry_npm_alias_target, classic_key_real_name, split_berry_key_patterns, split_classic_pattern,
+    split_key_patterns, split_pattern,
 };
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
@@ -3927,7 +3927,7 @@ fn rewrite_yarn_classic_with(
             // unpatched artifact.
             if !patterns
                 .iter()
-                .any(|p| split_pattern(p).is_some_and(|(n, _)| n == fname))
+                .any(|p| split_classic_pattern(p).is_some_and(|(n, _)| n == fname))
             {
                 alias_skipped = true;
                 result
@@ -6115,27 +6115,6 @@ pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
         .or_else(|| path.strip_suffix(&format!("/{patch_uuid}")))?;
     let token = before.rsplit('/').next().unwrap_or("");
     (!token.is_empty()).then(|| token.to_string())
-}
-
-/// What [`redact_grant_token`] puts where a hosted URL's grant token was.
-pub const REDACTED_GRANT_TOKEN: &str = "<redacted>";
-
-/// `text` with every `/<token>/<patch_uuid>` pair of `url` spelled
-/// `/<redacted>/<patch_uuid>`: the grant token is the path level just
-/// before the patch-uuid level ([`grant_token_path_segment`]), and it
-/// authorizes the org's download, so a warning, detail or log line that
-/// quotes a hosted artifact URL (the URL itself, or an error that echoes
-/// it) keeps the host, every other path level, the uuid, the leaf and any
-/// query, and loses only the token. `text` comes back unchanged when `url`
-/// has no uuid level or nothing precedes it.
-pub fn redact_grant_token(text: &str, url: &str, patch_uuid: &str) -> String {
-    match grant_token_path_segment(url, patch_uuid) {
-        Some(token) => text.replace(
-            &format!("/{token}/{patch_uuid}"),
-            &format!("/{REDACTED_GRANT_TOKEN}/{patch_uuid}"),
-        ),
-        None => text.to_string(),
-    }
 }
 
 /// Public host of Socket's patch server: the origin every production hosted
@@ -10552,6 +10531,47 @@ mod tests {
 
     fn berry_risk_count(r: &RewriteResult) -> usize {
         r.warnings.iter().filter(|w| w.code == BERRY_RISK).count()
+    }
+
+    /// #1271: a classic block keyed by an empty range (`left-pad@:` from
+    /// `"left-pad": ""`), alone or merged ahead of another member's range,
+    /// is the registry copy: hosted pins it, keeping the key line, and
+    /// names no alias skip or missing entry.
+    #[test]
+    fn yarn_classic_empty_range_key_is_pinned() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        for key in ["left-pad@:", "left-pad@, left-pad@^1.3.0:"] {
+            let lock = format!(
+                "# yarn lockfile v1\n\n\n{key}\n  version \"1.3.0\"\n  \
+                 resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e\"\n  \
+                 integrity sha512-ORIG==\n"
+            );
+            let mut files = BTreeMap::new();
+            files.insert("yarn.lock".to_string(), lock);
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            let out = r
+                .files
+                .get("yarn.lock")
+                .unwrap_or_else(|| panic!("{key}: the block must be pinned: {:?}", r.warnings));
+            assert!(out.contains(&format!("\n{key}\n")), "{key}: {out}");
+            assert!(
+                out.contains("resolved \"http://p.test/lp.tgz\"")
+                    && out.contains("integrity sha512-PATCHED=="),
+                "{key}: {out}"
+            );
+            assert!(
+                !r.warnings.iter().any(|w| w.code.contains("not_found")
+                    || w.code == "redirect_yarn_classic_alias_skipped"),
+                "{key}: {:?}",
+                r.warnings
+            );
+        }
     }
 
     /// #907: a hosted pin in a classic lock is dropped by a yarn 2+ install
@@ -15319,56 +15339,6 @@ mod tests {
             !warning.detail.contains("vendor --revert"),
             "a user path: dep is not socket wiring: {}",
             warning.detail
-        );
-    }
-
-    /// `redact_grant_token` replaces only the token level before the patch
-    /// uuid, in the URL and in any text quoting it (an error echoing the
-    /// URL included), keeping host, uuid, leaf and query; a URL with no
-    /// token level leaves the text as it was.
-    #[test]
-    fn redact_grant_token_hides_only_the_token_level() {
-        let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
-        let token = "0f1e2d3c-4b5a-4968-8776-655443322110";
-        let url = format!(
-            "https://patch.socket.dev/patch/npm/left-pad/1.3.0/{token}/{uuid}/left-pad-1.3.0.tgz?x=1"
-        );
-        let redacted = format!(
-            "https://patch.socket.dev/patch/npm/left-pad/1.3.0/<redacted>/{uuid}/left-pad-1.3.0.tgz?x=1"
-        );
-        assert_eq!(
-            redact_grant_token(&url, &url, uuid),
-            redacted,
-            "the URL alone"
-        );
-        let text = format!("vlt would fail to verify {url}: fetch error GET {url}: reset");
-        let want =
-            format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
-        assert_eq!(redact_grant_token(&text, &url, uuid), want, "every quote");
-        assert!(
-            !redact_grant_token(&text, &url, uuid).contains(token),
-            "no token left"
-        );
-        let registry = format!("https://patch.socket.dev/patch-registry/npm/{token}/{uuid}");
-        assert_eq!(
-            redact_grant_token(&registry, &registry, uuid),
-            format!("https://patch.socket.dev/patch-registry/npm/<redacted>/{uuid}"),
-            "a trailing uuid level"
-        );
-        for untouched in [
-            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz".to_string(),
-            format!("https://patch.socket.dev/{uuid}/left-pad-1.3.0.tgz"),
-        ] {
-            assert_eq!(
-                redact_grant_token(&untouched, &untouched, uuid),
-                untouched,
-                "no token level"
-            );
-        }
-        assert_eq!(
-            redact_grant_token(&url, &url, ""),
-            url,
-            "no uuid, nothing to anchor on"
         );
     }
 
