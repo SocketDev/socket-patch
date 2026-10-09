@@ -204,17 +204,50 @@ impl BinaryBody {
     }
 }
 
+/// Where a run's patch API calls go — decided once, when the run's
+/// [`ApiClient`] is built ([`get_api_client_with_overrides`]), and fixed
+/// for the whole run. Every JSON call, blob/diff download, vendor package
+/// reference and telemetry event reads this one value, so a run can never
+/// query the org API for one call and the public proxy for another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiRoute {
+    /// The authenticated org API: `/v0/orgs/{slug}/...` with the bearer.
+    Org { slug: String },
+    /// The public patch proxy: `/patch/...`, anonymous, free patches only.
+    Proxy,
+}
+
+impl ApiRoute {
+    /// An [`ApiRoute::Org`] for `slug`.
+    pub fn org(slug: impl Into<String>) -> Self {
+        Self::Org { slug: slug.into() }
+    }
+
+    /// The org slug, for [`ApiRoute::Org`] only.
+    pub fn slug(&self) -> Option<&str> {
+        match self {
+            Self::Org { slug } => Some(slug),
+            Self::Proxy => None,
+        }
+    }
+
+    /// Whether this is the public proxy.
+    pub fn is_proxy(&self) -> bool {
+        matches!(self, Self::Proxy)
+    }
+}
+
 /// Options for constructing an [`ApiClient`].
 #[derive(Debug, Clone)]
 pub struct ApiClientOptions {
+    /// Base URL: the org API host for [`ApiRoute::Org`], the proxy host
+    /// for [`ApiRoute::Proxy`].
     pub api_url: String,
+    /// Bearer token. Kept only for [`ApiRoute::Org`]: a proxy client is
+    /// anonymous, so a token passed with [`ApiRoute::Proxy`] is dropped.
     pub api_token: Option<String>,
-    /// When true, the client will use the public patch API proxy
-    /// which only provides access to free patches without authentication.
-    pub use_public_proxy: bool,
-    /// Organization slug for authenticated API access.
-    /// Required when using authenticated API (not public proxy).
-    pub org_slug: Option<String>,
+    /// Org API or public proxy, fixed for the client's lifetime.
+    pub route: ApiRoute,
 }
 
 /// HTTP client for the Socket Patch API.
@@ -232,9 +265,13 @@ pub struct ApiClient {
     /// instead of paying a fresh TLS-config build + handshake per request.
     plain: reqwest::Client,
     api_url: String,
+    /// Bearer token; always `None` on an [`ApiRoute::Proxy`] client.
     api_token: Option<String>,
-    use_public_proxy: bool,
-    org_slug: Option<String>,
+    route: ApiRoute,
+    /// Set when a token was configured but its org could not be resolved,
+    /// so this client was built on [`ApiRoute::Proxy`] instead: the warning
+    /// text, for `--json` `warnings[]` ([`Self::org_unresolved`]).
+    org_unresolved: Option<Arc<str>>,
     /// Retry policy for the vendoring service's two round trips.
     vendor_retry: VendorRetryPolicy,
     /// Consecutive [`Self::fetch_vendor_package`] calls that ended in a
@@ -402,14 +439,20 @@ impl ApiClient {
     pub fn new(options: ApiClientOptions) -> Self {
         let api_url = options.api_url.trim_end_matches('/').to_string();
         let timeouts = ApiTimeouts::default();
+        // A proxy client never carries the bearer, so no request it makes
+        // can leak the token to the proxy host.
+        let api_token = match options.route {
+            ApiRoute::Org { .. } => options.api_token,
+            ApiRoute::Proxy => None,
+        };
 
         Self {
-            client: api_client(options.api_token.as_deref(), &timeouts),
+            client: api_client(api_token.as_deref(), &timeouts),
             plain: plain_client(&timeouts),
             api_url,
-            api_token: options.api_token,
-            use_public_proxy: options.use_public_proxy,
-            org_slug: options.org_slug,
+            api_token,
+            route: options.route,
+            org_unresolved: None,
             vendor_retry: VendorRetryPolicy::default(),
             vendor_outage: Arc::new(AtomicU32::new(0)),
             proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(PROXY_BATCH_PATH_CONCURRENCY)),
@@ -469,16 +512,35 @@ impl ApiClient {
         self.api_token.as_ref()
     }
 
-    /// Returns the org slug, if set.
+    /// The run's route (see [`ApiRoute`]).
+    pub fn route(&self) -> &ApiRoute {
+        &self.route
+    }
+
+    /// When a token was configured but its org could not be resolved (so
+    /// this client is on the public proxy), the warning text saying so.
+    pub fn org_unresolved(&self) -> Option<&str> {
+        self.org_unresolved.as_deref()
+    }
+
+    /// The base URL: the org API host, or the proxy host.
+    pub fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    /// The org slug; `Some` only for an [`ApiRoute::Org`] client.
     pub fn org_slug(&self) -> Option<&String> {
-        self.org_slug.as_ref()
+        match &self.route {
+            ApiRoute::Org { slug } => Some(slug),
+            ApiRoute::Proxy => None,
+        }
     }
 
     /// Whether this client talks to the public patch proxy (vs. the
     /// authenticated org API) — picks the concurrency cap
     /// ([`crate::utils::concurrent::api_concurrency`]).
     pub fn uses_public_proxy(&self) -> bool {
-        self.use_public_proxy
+        self.route.is_proxy()
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -615,7 +677,7 @@ impl ApiClient {
                 |status, text| !is_patch_api_unconfigured(status, text),
             )
             .await?;
-        Self::handle_json_response(sent, self.use_public_proxy).await
+        Self::handle_json_response(sent, self.uses_public_proxy()).await
     }
 
     /// Internal POST that deserialises JSON. Returns `Ok(None)` on 404.
@@ -639,7 +701,7 @@ impl ApiClient {
                 |status, text| !is_patch_api_unconfigured(status, text),
             )
             .await?;
-        Self::handle_json_response(sent, self.use_public_proxy).await
+        Self::handle_json_response(sent, self.uses_public_proxy()).await
     }
 
     /// Map an HTTP response to `Ok(Some(T))`, `Ok(None)` (404), or `Err`.
@@ -678,24 +740,14 @@ impl ApiClient {
         )))
     }
 
-    /// The org slug an authenticated `/v0/orgs/{slug}/...` route uses: the
-    /// per-call override, else the client's configured slug, else `default`.
-    fn org_slug_or_default<'a>(&'a self, org_slug: Option<&'a str>) -> &'a str {
-        org_slug.or(self.org_slug.as_deref()).unwrap_or("default")
-    }
-
     /// Path of a patches JSON endpoint: `/patch/{suffix}` on the public
-    /// proxy, `/v0/orgs/{slug}/patches/{suffix}` on the authenticated API.
-    /// The one place the proxy-vs-org switch and the slug fallback live for
-    /// the JSON family (`get_json`/`post_json` prefix `api_url`).
-    fn patches_path(&self, org_slug: Option<&str>, suffix: &str) -> String {
-        if self.use_public_proxy {
-            format!("/patch/{suffix}")
-        } else {
-            format!(
-                "/v0/orgs/{}/patches/{suffix}",
-                self.org_slug_or_default(org_slug)
-            )
+    /// proxy, `/v0/orgs/{slug}/patches/{suffix}` on the org API. The one
+    /// place the route picks the path for the JSON family
+    /// (`get_json`/`post_json` prefix `api_url`).
+    fn patches_path(&self, suffix: &str) -> String {
+        match &self.route {
+            ApiRoute::Org { slug } => format!("/v0/orgs/{slug}/patches/{suffix}"),
+            ApiRoute::Proxy => format!("/patch/{suffix}"),
         }
     }
 
@@ -705,7 +757,7 @@ impl ApiClient {
     ///
     /// Returns `Ok(None)` when the patch is not found (404).
     pub async fn fetch_patch(&self, uuid: &str) -> Result<Option<PatchResponse>, ApiError> {
-        let path = self.patches_path(None, &format!("view/{uuid}"));
+        let path = self.patches_path(&format!("view/{uuid}"));
         self.get_json(&path).await
     }
 
@@ -718,7 +770,7 @@ impl ApiClient {
         identifier: &str,
     ) -> Result<SearchResponse, ApiError> {
         let encoded = urlencoding_encode(identifier);
-        let path = self.patches_path(None, &format!("{route}/{encoded}"));
+        let path = self.patches_path(&format!("{route}/{encoded}"));
         let mut result = self
             .get_json::<SearchResponse>(&path)
             .await?
@@ -764,9 +816,8 @@ impl ApiClient {
         &self,
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
-        if !self.use_public_proxy {
-            let slug = self.org_slug_or_default(None);
-            let path = self.patches_path(None, "batch");
+        if let ApiRoute::Org { slug } = &self.route {
+            let path = self.patches_path("batch");
             let body = BatchSearchBody::new(purls);
             let result = self
                 .post_json::<BatchSearchResponse, _>(&path, &body)
@@ -808,29 +859,14 @@ impl ApiClient {
     /// public proxy `POST /patch/package` (free patches only), in requests
     /// of at most [`MAX_REFERENCE_BATCH`] UUIDs (the endpoint rejects more).
     /// Returns a UUID → reference map (missing/404 → empty).
-    ///
-    /// Uses the client's configured org slug; see
-    /// [`Self::fetch_registry_references_for_org`] for a per-call override.
     pub async fn fetch_registry_references(
         &self,
-        uuids: &[String],
-    ) -> Result<std::collections::HashMap<String, PackageVendorResult>, ApiError> {
-        self.fetch_registry_references_for_org(None, uuids).await
-    }
-
-    /// [`Self::fetch_registry_references`] with a per-call `org_slug`
-    /// override: `Some(slug)` wins over the client's configured slug. The
-    /// only patches route that takes one — `fetch_patch` / `search_patches_*`
-    /// always use the client's configured slug.
-    pub async fn fetch_registry_references_for_org(
-        &self,
-        org_slug: Option<&str>,
         uuids: &[String],
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, ApiError> {
         if uuids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let path = self.patches_path(org_slug, "package");
+        let path = self.patches_path("package");
         let mut results = std::collections::HashMap::new();
         for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
             let body = PackageVendorRequest {
@@ -1035,8 +1071,7 @@ impl ApiClient {
     /// Fetch a blob by its SHA-256 hash.
     ///
     /// Returns the response body as a [`BinaryBody`] stream, or `Ok(None)`
-    /// if not found. Uses the authenticated endpoint when token and org
-    /// slug are available, otherwise falls back to the public proxy.
+    /// if not found. Follows the client's [`ApiRoute`].
     pub async fn fetch_blob(&self, hash: &str) -> Result<Option<BinaryBody>, ApiError> {
         // Validate hash format: SHA-256 = 64 hex characters
         if !is_hex(hash, 64) {
@@ -1067,40 +1102,24 @@ impl ApiClient {
     /// Build the URL (and an `is_authenticated` flag) for a binary fetch of
     /// `kind` (`blob` / `diff`) identified by `identifier`.
     ///
-    /// Uses the authenticated `/v0/orgs/<slug>/patches/...` endpoint when a
-    /// token and org slug are configured (and we're not pinned to the public
-    /// proxy). Otherwise it targets the public proxy.
-    ///
-    /// In public-proxy mode the base is the client's own configured `api_url`
-    /// — the same value the JSON endpoints (`get_json`/`post_json`) use — so an
-    /// explicit `--proxy-url` / `SOCKET_PROXY_URL` override is honored for
-    /// binary downloads too. Only when falling back from an *authenticated*
-    /// client that lacks an org slug (so `api_url` is the auth host, not a
-    /// proxy) do we re-derive the proxy base from the environment.
+    /// Follows the client's [`ApiRoute`], like the JSON endpoints: the org
+    /// API's `/v0/orgs/<slug>/patches/...` with the bearer, or the proxy's
+    /// `/patch/...` without it. The base is always the client's own
+    /// `api_url` — for a proxy client that is the proxy host, so an explicit
+    /// `--proxy-url` / `SOCKET_PROXY_URL` override is honored here too.
     fn binary_url(&self, kind: &str, identifier: &str) -> (String, bool) {
-        if self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy {
-            let slug = self
-                .org_slug
-                .as_deref()
-                .expect("org_slug is_some checked in this branch's condition");
-            let u = format!(
-                "{}/v0/orgs/{}/patches/{}/{}",
-                self.api_url, slug, kind, identifier
-            );
-            (u, true)
-        } else {
-            let base = if self.use_public_proxy {
-                self.api_url.clone()
-            } else {
-                proxy_url_from_env()
-            };
-            let u = format!(
-                "{}/patch/{}/{}",
-                base.trim_end_matches('/'),
-                kind,
-                identifier
-            );
-            (u, false)
+        match &self.route {
+            ApiRoute::Org { slug } => (
+                format!(
+                    "{}/v0/orgs/{}/patches/{}/{}",
+                    self.api_url, slug, kind, identifier
+                ),
+                true,
+            ),
+            ApiRoute::Proxy => (
+                format!("{}/patch/{}/{}", self.api_url, kind, identifier),
+                false,
+            ),
         }
     }
 
@@ -1442,32 +1461,18 @@ impl ApiClient {
     /// Build the URL (and an `is_authenticated` flag) for the vendor
     /// package-reference POST of [`Self::request_vendor_package`].
     ///
-    /// Authenticated `/v0/orgs/<slug>/patches/package` when a token + org
-    /// slug are configured and we're not pinned to the public proxy —
-    /// mirrors [`Self::binary_url`]'s decision so a bearer is never sent to
-    /// the proxy. Otherwise it targets the proxy's `/patch/package`.
-    /// `vendor_url` (staging / local-dev) overrides the base in every case.
-    ///
-    /// The base mirrors [`Self::binary_url`] too: in public-proxy mode the
-    /// client's own `api_url` IS the proxy, but an authenticated client that
-    /// lacks an org slug must re-derive the proxy base from the environment
-    /// — its `api_url` is the auth host, which has no `/patch/*` routes.
+    /// Follows the client's [`ApiRoute`], like [`Self::binary_url`]: the org
+    /// API's `/v0/orgs/<slug>/patches/package` with the bearer, or the
+    /// proxy's `/patch/package` without it. The base is the client's
+    /// `api_url`; `vendor_url` (staging / local-dev) overrides it.
     fn vendor_package_url(&self, vendor_url: Option<&str>) -> (String, bool) {
-        let use_auth =
-            self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy;
         let base = match vendor_url {
-            Some(v) => v.trim_end_matches('/').to_string(),
-            None if use_auth || self.use_public_proxy => self.api_url.clone(),
-            None => proxy_url_from_env().trim_end_matches('/').to_string(),
+            Some(v) => v.trim_end_matches('/'),
+            None => self.api_url.as_str(),
         };
-        if use_auth {
-            let slug = self
-                .org_slug
-                .as_deref()
-                .expect("use_auth requires org_slug.is_some()");
-            (format!("{base}/v0/orgs/{slug}/patches/package"), true)
-        } else {
-            (format!("{base}/patch/package"), false)
+        match &self.route {
+            ApiRoute::Org { slug } => (format!("{base}/v0/orgs/{slug}/patches/package"), true),
+            ApiRoute::Proxy => (format!("{base}/patch/package"), false),
         }
     }
 
@@ -2059,8 +2064,13 @@ pub struct ApiClientEnvOverrides {
 ///
 /// When a token is set but no org slug is provided (argument,
 /// `SOCKET_ORG_SLUG` env var, or socket-cli config `defaultOrg`), the
-/// function will attempt to auto-resolve the org slug by querying
-/// `GET /v0/organizations`.
+/// function resolves the org slug by querying `GET /v0/organizations`. If
+/// that fails, the client is an anonymous public-proxy client (free patches
+/// only) and a warning says to pass `--org` / set `SOCKET_ORG_SLUG`.
+///
+/// This is the run's one org resolution: the returned client's
+/// [`ApiRoute`] is fixed, and every API call and telemetry event in the run
+/// reads it. Build one client per run and pass it down.
 ///
 /// # Environment variables
 ///
@@ -2073,7 +2083,8 @@ pub struct ApiClientEnvOverrides {
 /// | `SOCKET_NO_API_TOKEN` | Truthy: ignore ambient tokens (env + config); only an explicit override authenticates |
 /// | `SOCKET_NO_CONFIG` | Truthy: disable the socket-cli config fallback layer entirely |
 ///
-/// Returns `(client, use_public_proxy)`.
+/// Returns `(client, use_public_proxy)`; `use_public_proxy` is
+/// `client.uses_public_proxy()`.
 pub async fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool) {
     get_api_client_with_overrides(ApiClientEnvOverrides {
         org_slug: org_slug.map(String::from),
@@ -2165,15 +2176,24 @@ fn resolve_credentials_with_origin(
 /// corresponding env var. Used by CLI commands that expose `--api-url`,
 /// `--api-token`, `--org`, `--proxy-url` flags via [`crate::utils`] in the
 /// CLI crate.
+///
+/// Resolves the run's [`ApiRoute`] exactly once:
+///
+/// | Token | Org slug | Result |
+/// |---|---|---|
+/// | none | any | [`ApiRoute::Proxy`] |
+/// | set | given | [`ApiRoute::Org`] |
+/// | set | none, online | `GET /v0/organizations`: Org on success, else Proxy + warning |
+/// | set | none, offline | [`ApiRoute::Proxy`], no network, no warning |
 pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> (ApiClient, bool) {
     let (api_token, origin, resolved_org_slug) =
         resolve_credentials_with_origin(overrides.api_token, overrides.org_slug);
+    let proxy_url = overrides
+        .proxy_url
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(proxy_url_from_env);
 
-    if api_token.is_none() {
-        let proxy_url = overrides
-            .proxy_url
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(proxy_url_from_env);
+    let Some(api_token) = api_token else {
         // Offline runs still construct this client (commands build it up
         // front for telemetry/staging plumbing) but never contact it — under
         // the strict-airgap contract "using the public patch API proxy"
@@ -2189,21 +2209,13 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
                     .to_string()
             });
         }
-        let client = ApiClient::new(ApiClientOptions {
-            api_url: proxy_url,
-            api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
-        });
-        return (client, true);
-    }
+        return (proxy_client_at(proxy_url), true);
+    };
 
     // Shape check the configured token before the network round-trip so
     // a "you set the hash, not the token" mistake is loud and immediate.
-    if let Some(ref t) = api_token {
-        if let Some(msg) = validate_token_shape(t, origin) {
-            notice_once(Notice::Warning, &TOKEN_SHAPE_SHOWN, || msg);
-        }
+    if let Some(msg) = validate_token_shape(&api_token, origin) {
+        notice_once(Notice::Warning, &TOKEN_SHAPE_SHOWN, || msg);
     }
 
     let api_url = overrides
@@ -2213,45 +2225,80 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
         // telemetry endpoint resolver so the two can't disagree.
         .unwrap_or_else(socket_cli_config::resolve_api_base_url);
 
-    // Build the client once; the org-slug round-trip below runs on it and
-    // fills in `org_slug` in place (it only needs the token + base URL).
-    let mut client = ApiClient::new(ApiClientOptions {
-        api_url,
-        api_token,
-        use_public_proxy: false,
-        org_slug: resolved_org_slug,
-    });
+    if let Some(slug) = resolved_org_slug {
+        let client = ApiClient::new(ApiClientOptions {
+            api_url,
+            api_token: Some(api_token),
+            route: ApiRoute::org(slug),
+        });
+        return (client, false);
+    }
 
-    // Auto-resolve the org slug if not provided. Strict airgap: `--offline`
-    // (mirrored into `SOCKET_OFFLINE` by the CLI before any client is built
-    // — same vocabulary the telemetry kill-switch matches) means zero
-    // network contact, so the round-trip must not fire. The slug only labels
-    // org-scoped fetches and telemetry, both already gated off offline.
-    if client.org_slug.is_none() && !is_offline_env() {
-        match client.resolve_org_slug().await {
-            Ok(slug) => client.org_slug = Some(slug),
-            Err(e) => {
-                notice_once(Notice::Warning, &ORG_DETECT_SHOWN, || {
-                    let mut msg = format!("Warning: Could not auto-detect organization: {e}");
-                    if matches!(e, ApiError::Unauthorized(_)) {
-                        if let Some(t) = client.api_token.as_deref() {
-                            if looks_like_token_hash(t) {
-                                msg.push_str(&format!(
-                                    "\n  Hint: {} starts with `{}-`, which is the \
-                                     stored hash format. Set it to the raw \
-                                     `sktsec_..._api` value instead.",
-                                    origin.label(),
-                                    t.split('-').next().unwrap_or("sha512")
-                                ));
-                            }
-                        }
-                    }
-                    msg
-                });
-            }
+    // No org slug given. Strict airgap: `--offline` (mirrored into
+    // `SOCKET_OFFLINE` by the CLI before any client is built — same
+    // vocabulary the telemetry kill-switch matches) means zero network
+    // contact, so the `/v0/organizations` round-trip must not fire. An
+    // offline client never contacts the API, so the proxy route only
+    // records that no org is known; it is not worth a warning.
+    if is_offline_env() {
+        return (proxy_client_at(proxy_url), true);
+    }
+
+    // The run's one org resolution, on a short-lived client that carries
+    // the bearer. Its answer fixes the route for the whole run.
+    let resolver = ApiClient::new(ApiClientOptions {
+        api_url: api_url.clone(),
+        api_token: Some(api_token.clone()),
+        route: ApiRoute::org(String::new()),
+    });
+    match resolver.resolve_org_slug().await {
+        Ok(slug) => {
+            let client = ApiClient::new(ApiClientOptions {
+                api_url,
+                api_token: Some(api_token),
+                route: ApiRoute::org(slug),
+            });
+            (client, false)
+        }
+        Err(e) => {
+            let message = unresolved_org_message(&e, &api_token, origin);
+            notice_once(Notice::Warning, &ORG_DETECT_SHOWN, || message.clone());
+            let mut client = proxy_client_at(proxy_url);
+            client.org_unresolved = Some(Arc::from(
+                message.strip_prefix("Warning: ").unwrap_or(&message),
+            ));
+            (client, true)
         }
     }
-    (client, false)
+}
+
+/// The warning for a token whose org could not be resolved, so the run
+/// uses the public proxy. Keeps the "you set the stored hash" hint for a
+/// 401 on a hash-shaped token.
+fn unresolved_org_message(e: &ApiError, api_token: &str, origin: TokenSource) -> String {
+    let mut msg = format!(
+        "Warning: Could not determine your organization ({e}); using the public patch API \
+         proxy (free patches only). Pass --org or set SOCKET_ORG_SLUG."
+    );
+    if matches!(e, ApiError::Unauthorized(_)) && looks_like_token_hash(api_token) {
+        msg.push_str(&format!(
+            "\n  Hint: {} starts with `{}-`, which is the \
+             stored hash format. Set it to the raw \
+             `sktsec_..._api` value instead.",
+            origin.label(),
+            api_token.split('-').next().unwrap_or("sha512")
+        ));
+    }
+    msg
+}
+
+/// An anonymous public-proxy client at `proxy_url`.
+fn proxy_client_at(proxy_url: String) -> ApiClient {
+    ApiClient::new(ApiClientOptions {
+        api_url: proxy_url,
+        api_token: None,
+        route: ApiRoute::Proxy,
+    })
 }
 
 /// Build a public-proxy `ApiClient` from the same overrides used by
@@ -2266,12 +2313,7 @@ pub fn build_proxy_fallback_client(overrides: &ApiClientEnvOverrides) -> ApiClie
         .proxy_url
         .clone()
         .unwrap_or_else(proxy_url_from_env);
-    ApiClient::new(ApiClientOptions {
-        api_url: proxy_url,
-        api_token: None,
-        use_public_proxy: true,
-        org_slug: None,
-    })
+    proxy_client_at(proxy_url)
 }
 
 /// Return `true` when the configured token value looks like an
@@ -2755,7 +2797,7 @@ pub trait PatchApi: Send + Sync {
 
 impl PatchApi for ApiClient {
     fn uses_public_proxy(&self) -> bool {
-        self.use_public_proxy
+        self.route.is_proxy()
     }
 
     fn search_patches_batch<'a>(
@@ -2905,8 +2947,7 @@ impl std::fmt::Debug for ApiClient {
         f.debug_struct("ApiClient")
             .field("api_url", &self.api_url)
             .field("api_token", &self.api_token.as_ref().map(|_| "<redacted>"))
-            .field("use_public_proxy", &self.use_public_proxy)
-            .field("org_slug", &self.org_slug)
+            .field("route", &self.route)
             .field("vendor_retry", &self.vendor_retry)
             .finish_non_exhaustive()
     }
@@ -2921,8 +2962,7 @@ mod patch_api_seam_tests {
         let client = ApiClient::new(ApiClientOptions {
             api_url: "https://api.example".into(),
             api_token: Some("sktsec_secret_value_api".into()),
-            use_public_proxy: false,
-            org_slug: Some("org".into()),
+            route: ApiRoute::org("org"),
         });
         let rendered = format!("{client:?}");
         assert!(!rendered.contains("sktsec_secret_value_api"), "{rendered}");
@@ -2934,8 +2974,7 @@ mod patch_api_seam_tests {
         let client = ApiClient::new(ApiClientOptions {
             api_url: "https://api.example".into(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: ApiRoute::Proxy,
         });
         let api: &dyn PatchApi = &client;
         assert!(api.uses_public_proxy());
@@ -2960,8 +2999,7 @@ mod patch_api_seam_tests {
         let client = ApiClient::new(ApiClientOptions {
             api_url: server.uri(),
             api_token: Some("t".into()),
-            use_public_proxy: false,
-            org_slug: Some("org".into()),
+            route: ApiRoute::org("org"),
         });
         let api: &dyn PatchApi = &client;
         let purls = vec!["pkg:npm/a@1".to_string(), "pkg:npm/b@1".to_string()];
@@ -2989,8 +3027,7 @@ mod patch_api_seam_tests {
         let client = ApiClient::new(ApiClientOptions {
             api_url: server.uri(),
             api_token: Some("t".into()),
-            use_public_proxy: false,
-            org_slug: Some("org".into()),
+            route: ApiRoute::org("org"),
         });
         let api: &dyn PatchApi = &client;
         let url = format!("{}/a.whl", server.uri());
@@ -3194,7 +3231,7 @@ mod tests {
         std::env::remove_var("SOCKET_API_TOKEN");
         let (client, is_public) = get_api_client_from_env(None).await;
         assert!(is_public);
-        assert!(client.use_public_proxy);
+        assert!(client.uses_public_proxy());
     }
 
     #[tokio::test]
@@ -3203,8 +3240,9 @@ mod tests {
         // must be treated as "not provided" and trigger auto-resolution —
         // not be taken verbatim as an explicit slug, which would build broken
         // `/v0/orgs//patches/...` URLs. Auto-resolution here targets an
-        // unreachable URL, so it fails and leaves the slug `None` (never
-        // `Some("")`). The buggy code skipped resolution and yielded `Some("")`.
+        // unreachable URL, so it fails and the run uses the public proxy
+        // (never `Some("")`). The buggy code skipped resolution and yielded
+        // `Some("")`.
         std::env::remove_var("SOCKET_ORG_SLUG");
         std::env::remove_var("SOCKET_API_URL");
         let (client, is_public) = get_api_client_with_overrides(ApiClientEnvOverrides {
@@ -3214,7 +3252,11 @@ mod tests {
             proxy_url: None,
         })
         .await;
-        assert!(!is_public, "a token was provided, so not public-proxy mode");
+        assert!(
+            is_public,
+            "failed resolution must route the run to the proxy"
+        );
+        assert_eq!(client.route(), &ApiRoute::Proxy);
         assert_ne!(
             client.org_slug().map(String::as_str),
             Some(""),
@@ -3222,7 +3264,7 @@ mod tests {
         );
         assert!(
             client.org_slug().is_none(),
-            "failed auto-resolution should leave the slug unset, got {:?}",
+            "failed auto-resolution has no slug, got {:?}",
             client.org_slug()
         );
     }
@@ -3237,8 +3279,7 @@ mod tests {
         let client = ApiClient::new(ApiClientOptions {
             api_url: "http://127.0.0.1:1".into(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: ApiRoute::Proxy,
         });
         let err = client.fetch_blob("not-a-hash").await.unwrap_err();
         assert!(
@@ -3250,51 +3291,39 @@ mod tests {
         assert!(msg.contains("64 hex"), "got: {msg}");
     }
 
-    /// The documented corner of `binary_url`: an *authenticated* client
-    /// (token set) that lacks an org slug cannot build `/v0/orgs/...` URLs,
-    /// so it re-derives the public-proxy base from `SOCKET_PROXY_URL` —
-    /// with `use_auth == false` so `fetch_binary` uses the plain client and
-    /// the bearer is never sent to the proxy. Serialized: SOCKET_* env is
-    /// process-global.
-    #[test]
+    /// A token whose org resolution fails yields a proxy client whose
+    /// `api_url` is the proxy base (`SOCKET_PROXY_URL` here, trailing slash
+    /// trimmed), so `binary_url` targets the proxy with `use_auth == false`
+    /// and the bearer is never sent. Nothing re-derives the base later.
+    #[tokio::test]
     #[serial_test::serial]
-    fn binary_url_rederives_proxy_from_env_when_org_slug_missing() {
+    async fn binary_url_uses_the_resolved_proxy_when_org_resolution_fails() {
         const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let _env = OrgResolutionEnvGuard::isolate();
         let saved_proxy = std::env::var("SOCKET_PROXY_URL").ok();
         std::env::set_var("SOCKET_PROXY_URL", "http://env-proxy.test:9999/");
 
-        let client = ApiClient::new(ApiClientOptions {
-            api_url: "https://api.socket.dev".into(),
+        let (client, use_public_proxy) = get_api_client_with_overrides(ApiClientEnvOverrides {
+            api_url: Some("http://127.0.0.1:1".into()),
             api_token: Some(format!("sktsec_{}_api", "x".repeat(44))),
-            use_public_proxy: false,
-            org_slug: None,
-        });
-        let (env_url, env_use_auth) = client.binary_url("blob", HASH);
+            ..ApiClientEnvOverrides::default()
+        })
+        .await;
 
-        // With the var unset the base falls back to the built-in default.
+        // The base is fixed at construction: changing the env afterwards
+        // must not move it.
         std::env::remove_var("SOCKET_PROXY_URL");
-        let (default_url, default_use_auth) = client.binary_url("blob", HASH);
+        let (url, use_auth) = client.binary_url("blob", HASH);
 
         match saved_proxy {
             Some(v) => std::env::set_var("SOCKET_PROXY_URL", v),
             None => std::env::remove_var("SOCKET_PROXY_URL"),
         }
 
-        assert_eq!(
-            env_url,
-            format!("http://env-proxy.test:9999/patch/blob/{HASH}"),
-            "proxy base from SOCKET_PROXY_URL, trailing slash trimmed"
-        );
-        assert!(!env_use_auth, "the bearer must never target the proxy");
-        assert_eq!(
-            default_url,
-            format!(
-                "{}/patch/blob/{HASH}",
-                crate::constants::DEFAULT_PATCH_API_PROXY_URL
-            ),
-            "with no env override the base is the built-in proxy default"
-        );
-        assert!(!default_use_auth);
+        assert!(use_public_proxy);
+        assert!(client.api_token().is_none(), "a proxy client has no bearer");
+        assert_eq!(url, format!("http://env-proxy.test:9999/patch/blob/{HASH}"));
+        assert!(!use_auth, "the bearer must never target the proxy");
     }
 
     /// Guard that snapshots the env vars that can short-circuit org
@@ -3328,13 +3357,12 @@ mod tests {
 
     /// The network half of `resolve_org_slug`: `GET /v0/organizations`
     /// answering 404 (e.g. `--api-url` pointed at the wrong host) yields an
-    /// empty org list → `select_org_slug` errors → the warning arm leaves
-    /// the slug unset while keeping the client authenticated (never a
-    /// silent downgrade to proxy mode). The mock's `.expect(1)` proves
-    /// auto-resolution actually fired exactly once.
+    /// empty org list → `select_org_slug` errors → the run's route is the
+    /// public proxy, anonymous, with the reason recorded for `--json`. The
+    /// mock's `.expect(1)` proves resolution fired exactly once.
     #[tokio::test]
     #[serial_test::serial]
-    async fn org_auto_resolution_404_leaves_slug_unset_but_stays_authenticated() {
+    async fn org_auto_resolution_404_routes_the_run_to_the_proxy() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3355,24 +3383,26 @@ mod tests {
         })
         .await;
 
+        assert!(use_public_proxy, "failed resolution → public proxy");
+        assert_eq!(client.route(), &ApiRoute::Proxy);
+        assert!(client.org_slug().is_none());
         assert!(
-            !use_public_proxy,
-            "a token was provided → authenticated mode"
+            client.api_token().is_none(),
+            "the proxy client is anonymous"
         );
+        let reason = client.org_unresolved().expect("downgrade reason recorded");
         assert!(
-            client.org_slug().is_none(),
-            "failed auto-resolution must leave the slug unset, got {:?}",
-            client.org_slug()
+            reason.contains("Pass --org or set SOCKET_ORG_SLUG"),
+            "{reason}"
         );
-        assert_eq!(client.api_token(), Some(&token), "token must be retained");
+        assert!(!reason.starts_with("Warning:"), "{reason}");
     }
 
     /// A 401 on the org auto-resolution round-trip with a hash-shaped token
     /// exercises the `Unauthorized` + `looks_like_token_hash` hint arm (the
     /// "you configured the sha512- storage hash, not the token" UX path).
-    /// Client construction must still succeed: slug unset, token retained,
-    /// NOT downgraded to proxy mode. (The hint's stderr text is pinned by
-    /// the process-level twin in the CLI covgap suite.)
+    /// The run's route is the public proxy, anonymous. (The hint's stderr
+    /// text is pinned by the process-level twin in the CLI covgap suite.)
     #[tokio::test]
     #[serial_test::serial]
     async fn org_auto_resolution_401_with_hash_shaped_token_hint_arm() {
@@ -3396,20 +3426,149 @@ mod tests {
         })
         .await;
 
+        assert!(use_public_proxy, "a 401 during resolution → public proxy");
+        assert_eq!(client.route(), &ApiRoute::Proxy);
+        assert!(client.org_slug().is_none());
         assert!(
-            !use_public_proxy,
-            "a 401 during resolution must not silently downgrade to the proxy"
+            client.api_token().is_none(),
+            "the (mis)configured token is never sent to the proxy"
         );
-        assert!(
-            client.org_slug().is_none(),
-            "unauthorized resolution must leave the slug unset, got {:?}",
-            client.org_slug()
-        );
-        assert_eq!(
-            client.api_token(),
-            Some(&hash_token),
-            "the (mis)configured token is kept — the hint is advisory"
-        );
+        let reason = client.org_unresolved().expect("downgrade reason recorded");
+        assert!(reason.contains("stored hash format"), "{reason}");
+    }
+
+    /// Every URL a run builds — patch view, batch search, blob, diff,
+    /// vendor package reference and telemetry — follows the one route the
+    /// client was built with: all org-scoped with the bearer, or all
+    /// `/patch/*` on the proxy without it. Covers a given slug, a failed
+    /// org resolution (500 and 401), an offline run, and no token.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn route_decides_every_url() {
+        use crate::telemetry::TelemetryAuth;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        const UUID: &str = "11111111-2222-4333-8444-555555555555";
+        let _env = OrgResolutionEnvGuard::isolate();
+        let token = format!("sktsec_{}_api", "x".repeat(44));
+        let proxy = "http://proxy.example.test";
+
+        /// Assert every URL of `client` sits on one route.
+        fn assert_one_route(case: &str, client: &ApiClient, org: Option<&str>) {
+            let urls = [
+                client.patches_path(&format!("view/{UUID}")),
+                client.patches_path("batch"),
+                client.binary_url("blob", HASH).0,
+                client.binary_url("diff", UUID).0,
+                client.vendor_package_url(None).0,
+                TelemetryAuth::for_client(client).url().to_string(),
+            ];
+            let auth = [
+                client.binary_url("blob", HASH).1,
+                client.binary_url("diff", UUID).1,
+                client.vendor_package_url(None).1,
+                TelemetryAuth::for_client(client).is_authenticated(),
+            ];
+            match org {
+                Some(slug) => {
+                    let scope = format!("/v0/orgs/{slug}/");
+                    for url in &urls {
+                        assert!(url.contains(&scope), "{case}: {url} is not org-scoped");
+                    }
+                    assert!(
+                        auth.iter().all(|a| *a),
+                        "{case}: org calls carry the bearer"
+                    );
+                    assert!(client.api_token().is_some(), "{case}");
+                    assert_eq!(client.route(), &ApiRoute::org(slug), "{case}");
+                }
+                None => {
+                    for url in &urls {
+                        assert!(
+                            url.contains("/patch/") && !url.contains("/v0/orgs/"),
+                            "{case}: {url} is not a proxy route"
+                        );
+                    }
+                    assert!(
+                        auth.iter().all(|a| !*a),
+                        "{case}: proxy calls are anonymous"
+                    );
+                    assert!(client.api_token().is_none(), "{case}");
+                    assert!(client.uses_public_proxy(), "{case}");
+                }
+            }
+        }
+
+        // Token + slug: org route, no resolution round-trip.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v0/organizations"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (client, public) = get_api_client_with_overrides(ApiClientEnvOverrides {
+            api_url: Some(server.uri()),
+            api_token: Some(token.clone()),
+            org_slug: Some("acme".into()),
+            proxy_url: Some(proxy.into()),
+        })
+        .await;
+        assert!(!public);
+        assert_one_route("token + slug", &client, Some("acme"));
+        drop(server);
+
+        // Token, resolution fails (500, then 401): proxy route for everything.
+        for status in [500, 401] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v0/organizations"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (client, public) = get_api_client_with_overrides(ApiClientEnvOverrides {
+                api_url: Some(server.uri()),
+                api_token: Some(token.clone()),
+                proxy_url: Some(proxy.into()),
+                ..ApiClientEnvOverrides::default()
+            })
+            .await;
+            assert!(public, "resolve {status}");
+            assert!(client.org_unresolved().is_some(), "resolve {status}");
+            assert_one_route(&format!("resolve {status}"), &client, None);
+            assert!(
+                client.binary_url("blob", HASH).0.starts_with(proxy),
+                "the proxy override is the base"
+            );
+        }
+
+        // Token, no slug, offline: proxy route, no network, no warning text.
+        std::env::set_var("SOCKET_OFFLINE", "1");
+        let (client, public) = get_api_client_with_overrides(ApiClientEnvOverrides {
+            api_url: Some("http://127.0.0.1:1".into()),
+            api_token: Some(token.clone()),
+            proxy_url: Some(proxy.into()),
+            ..ApiClientEnvOverrides::default()
+        })
+        .await;
+        std::env::remove_var("SOCKET_OFFLINE");
+        assert!(public);
+        assert!(client.org_unresolved().is_none());
+        assert_one_route("offline", &client, None);
+
+        // No token: proxy route on the override.
+        std::env::set_var("SOCKET_NO_API_TOKEN", "1");
+        let (client, public) = get_api_client_with_overrides(ApiClientEnvOverrides {
+            proxy_url: Some(proxy.into()),
+            ..ApiClientEnvOverrides::default()
+        })
+        .await;
+        std::env::remove_var("SOCKET_NO_API_TOKEN");
+        assert!(public);
+        assert_one_route("no token", &client, None);
     }
 
     // ── Group 6: convert_search_result_to_batch_info edge cases ──────
@@ -4021,8 +4180,7 @@ mod tests {
         ApiClient::new(ApiClientOptions {
             api_url: api_url.into(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: ApiRoute::Proxy,
         })
     }
 
@@ -4059,8 +4217,7 @@ mod tests {
         let client = ApiClient::new(ApiClientOptions {
             api_url: "https://api.socket.dev".into(),
             api_token: Some("sktsec_x_api".into()),
-            use_public_proxy: false,
-            org_slug: Some("my-org".into()),
+            route: ApiRoute::org("my-org"),
         });
         let (url, use_auth) = client.binary_url("diff", "uuid-123");
         assert!(use_auth);
@@ -4072,36 +4229,25 @@ mod tests {
 
     // ── vendor_package_url: package-reference POST target ───────────────
     //
-    // Regression: an authenticated client *without* an org slug (auto-
-    // resolution failed, or `SOCKET_OFFLINE` skipped it) built the proxy
-    // route on its own `api_url` — `https://api.socket.dev/patch/package` —
-    // a path the auth host does not serve, so every vendor-service fetch
-    // failed with a 404-shaped `Other` error. `binary_url` re-derives the
-    // proxy base from the environment for exactly this client state; the
-    // vendor POST must do the same.
+    // Regression (pre-route): an authenticated client *without* an org slug
+    // built the proxy route on the auth host's `api_url`, a path that host
+    // does not serve. A token whose org cannot be resolved now yields a
+    // proxy client whose `api_url` is the proxy host.
 
-    #[test]
-    fn vendor_package_url_auth_without_org_slug_targets_proxy_host() {
-        let client = ApiClient::new(ApiClientOptions {
-            api_url: "https://api.socket.dev".into(),
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn vendor_package_url_after_failed_org_resolution_targets_proxy_host() {
+        let _env = OrgResolutionEnvGuard::isolate();
+        let (client, _) = get_api_client_with_overrides(ApiClientEnvOverrides {
+            api_url: Some("http://127.0.0.1:1".into()),
             api_token: Some("sktsec_x_api".into()),
-            use_public_proxy: false,
-            org_slug: None,
-        });
+            proxy_url: Some("https://proxy.example.test/".into()),
+            ..ApiClientEnvOverrides::default()
+        })
+        .await;
         let (url, use_auth) = client.vendor_package_url(None);
-        assert!(!use_auth, "no org slug → unauthenticated proxy request");
-        assert!(
-            !url.starts_with("https://api.socket.dev"),
-            "must not target the auth host (it has no /patch/* routes); got: {url}"
-        );
-        assert_eq!(
-            url,
-            format!(
-                "{}/patch/package",
-                proxy_url_from_env().trim_end_matches('/')
-            ),
-            "base must be the env-derived proxy host, like binary_url"
-        );
+        assert!(!use_auth, "no org → unauthenticated proxy request");
+        assert_eq!(url, "https://proxy.example.test/patch/package");
     }
 
     #[test]
@@ -4119,8 +4265,7 @@ mod tests {
         let client = ApiClient::new(ApiClientOptions {
             api_url: "https://api.socket.dev".into(),
             api_token: Some("sktsec_x_api".into()),
-            use_public_proxy: false,
-            org_slug: Some("my-org".into()),
+            route: ApiRoute::org("my-org"),
         });
         let (url, use_auth) = client.vendor_package_url(None);
         assert!(use_auth);
@@ -4129,24 +4274,17 @@ mod tests {
 
     #[test]
     fn vendor_package_url_vendor_url_overrides_base() {
-        // The staging override wins for every client state, including the
-        // no-org-slug fallback (it must not be clobbered by the env proxy).
+        // The staging override wins for both routes.
         let auth = ApiClient::new(ApiClientOptions {
             api_url: "https://api.socket.dev".into(),
             api_token: Some("sktsec_x_api".into()),
-            use_public_proxy: false,
-            org_slug: Some("my-org".into()),
+            route: ApiRoute::org("my-org"),
         });
         assert_eq!(
             auth.vendor_package_url(Some("http://localhost:9099/")).0,
             "http://localhost:9099/v0/orgs/my-org/patches/package"
         );
-        let no_org = ApiClient::new(ApiClientOptions {
-            api_url: "https://api.socket.dev".into(),
-            api_token: Some("sktsec_x_api".into()),
-            use_public_proxy: false,
-            org_slug: None,
-        });
+        let no_org = proxy_client("https://patches-api.socket.dev");
         assert_eq!(
             no_org.vendor_package_url(Some("http://localhost:9099")).0,
             "http://localhost:9099/patch/package"
@@ -4345,8 +4483,7 @@ mod vendor_package_tests {
         ApiClient::new(ApiClientOptions {
             api_url: uri,
             api_token: Some("sktsec_token_placeholder_value_api".into()),
-            use_public_proxy: false,
-            org_slug: Some("acme".into()),
+            route: ApiRoute::org("acme"),
         })
     }
 
@@ -4354,8 +4491,7 @@ mod vendor_package_tests {
         ApiClient::new(ApiClientOptions {
             api_url: uri,
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: ApiRoute::Proxy,
         })
     }
 
@@ -4762,42 +4898,6 @@ mod vendor_package_tests {
         assert_eq!(map.len(), uuids.len());
     }
 
-    /// The package-reference route honors a per-call org override:
-    /// `Some(slug)` beats the client's configured `acme`, and the one-arg
-    /// wrapper keeps using `acme`.
-    #[tokio::test]
-    async fn fetch_registry_references_for_org_overrides_client_slug() {
-        let server = MockServer::start().await;
-        let body = json!({
-            "results": { UUID: { "status": "granted", "url": null, "artifacts": [] } }
-        });
-        Mock::given(method("POST"))
-            .and(path("/v0/orgs/other-org/patches/package"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = auth_client(server.uri());
-        let uuids = [UUID.to_string()];
-        let overridden = client
-            .fetch_registry_references_for_org(Some("other-org"), &uuids)
-            .await
-            .expect("override route must succeed");
-        assert_eq!(overridden[UUID].status, "granted");
-        let configured = client
-            .fetch_registry_references(&uuids)
-            .await
-            .expect("configured-slug route must succeed");
-        assert_eq!(configured[UUID].status, "granted");
-    }
-
     // ── fetch_vendor_package grant / artifact edge arms ───────────────
 
     /// Forward-compat contract: an unrecognized vendor status must degrade
@@ -5117,8 +5217,7 @@ mod vendor_retry_tests {
         ApiClient::new(ApiClientOptions {
             api_url: uri.to_string(),
             api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-            use_public_proxy: false,
-            org_slug: Some("acme".into()),
+            route: ApiRoute::org("acme"),
         })
         .with_vendor_retry(policy)
     }
@@ -5583,8 +5682,11 @@ mod vendor_retry_tests {
             let api = ApiClient::new(ApiClientOptions {
                 api_url: uri.clone(),
                 api_token: (!proxy).then(|| "tok".into()),
-                use_public_proxy: proxy,
-                org_slug: Some("org".into()),
+                route: if proxy {
+                    ApiRoute::Proxy
+                } else {
+                    ApiRoute::org("org")
+                },
             })
             .with_vendor_retry(VendorRetryPolicy {
                 attempts: 2,
@@ -5606,6 +5708,17 @@ mod vendor_retry_tests {
                 "{error:?}"
             );
             assert!(retryable, "body timeout keeps the retry hint");
+            // The client can give up on an attempt before this
+            // single-threaded runtime polls the server task that reads and
+            // counts its request (a starved runner fires the 100 ms timer
+            // first). The request bytes are already in the socket buffer,
+            // so wait for the server to count both attempts.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while requests.load(Ordering::Relaxed) - before < 2
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert_eq!(requests.load(Ordering::Relaxed) - before, 2);
         }
     }
@@ -6031,8 +6144,7 @@ mod authenticated_batch_tests {
         ApiClient::new(ApiClientOptions {
             api_url: uri,
             api_token: Some("sktsec_token_placeholder_value_api".into()),
-            use_public_proxy: false,
-            org_slug: Some(slug.into()),
+            route: ApiRoute::org(slug),
         })
     }
 
@@ -6165,8 +6277,7 @@ mod proxy_batch_path_cap_tests {
         let client = ApiClient::new(ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: ApiRoute::Proxy,
         });
         // Four windows of 10 PURLs, as scan's proxy batch windows run them.
         let chunks: Vec<Vec<String>> = (0..4)

@@ -464,6 +464,11 @@ pub enum UnattestedKind {
     /// a `package.json` project's npm deps from it, never from the
     /// npm-family lock that carries the wiring.
     DenoLock,
+    /// The wiring is in a root `npm-shrinkwrap.json` with no
+    /// `package-lock.json` twin (#899): npm >= 12 never reads the
+    /// shrinkwrap, resolves the package from the registry and writes a
+    /// fresh package-lock.json, so only npm <= 11 installs the patch.
+    NpmShrinkwrapOnly,
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,
@@ -555,6 +560,15 @@ pub struct Discovery {
     pub unwired_copies: Vec<UnwiredCopy>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
+    /// Refs withheld from `refs` only because the build ALSO installs an
+    /// unpatched copy of the same `name@version` that no rewire can reach
+    /// (a bundled copy unpacked from its parent's tarball, or a same-lock
+    /// [`Discovery::unpatched_copy`]), each diagnosed
+    /// [`DIAG_REF_UNATTRIBUTABLE`]. Never attested, but the wiring itself
+    /// is the rewriters' own output and names exactly one package version,
+    /// so the management commands (rollback, remove, list, the vendored
+    /// takeover) still see and unwind it (#828). Validated like `refs`.
+    pub shadowed: Vec<PatchedRef>,
     /// The bundled copies (purl → root-relative directory) the vlt
     /// extractor found in the installed store for the lock's nodes, exactly
     /// as [`crate::vendor::vlt_bundled::bundled_copies`] reports them: the
@@ -609,7 +623,28 @@ impl Discovery {
     /// * the purl is `pkg:<known type>/<name>@<version>` (then canonicalized);
     /// * a vendored ref names a root-anchored artifact under its OWN uuid dir
     ///   and its purl's ecosystem dir.
-    pub fn push(&mut self, mut r: PatchedRef) {
+    pub fn push(&mut self, r: PatchedRef) {
+        if let Some(r) = self.validated(r) {
+            if !self.refs.contains(&r) {
+                self.refs.push(r);
+            }
+        }
+    }
+
+    /// Withhold the wired `r` from attestation because an unpatched copy of
+    /// its `name@version` installs beside it ([`Discovery::shadowed`]). The
+    /// caller diagnoses why. Validated exactly like [`Discovery::push`].
+    pub(crate) fn shadow(&mut self, r: PatchedRef) {
+        if let Some(r) = self.validated(r) {
+            if !self.shadowed.contains(&r) {
+                self.shadowed.push(r);
+            }
+        }
+    }
+
+    /// [`Discovery::push`]'s gate: the canonicalized ref, or `None` after
+    /// diagnosing why it is invalid.
+    fn validated(&mut self, mut r: PatchedRef) -> Option<PatchedRef> {
         let file = r.source_file.to_string_lossy().into_owned();
         if !is_canonical_uuid(&r.uuid) {
             self.diag(
@@ -620,7 +655,7 @@ impl Discovery {
                     r.purl, r.uuid
                 ),
             );
-            return;
+            return None;
         }
         // Every identity an extractor builds a ref from is recognized — the
         // valid ref and the one rejected below alike (rule 11). This is also
@@ -634,7 +669,7 @@ impl Discovery {
                 &file,
                 format!("{file}: {:?} is not a usable package purl", r.purl),
             );
-            return;
+            return None;
         };
         r.purl = purl;
         match r.mode {
@@ -658,7 +693,7 @@ impl Discovery {
                             r.purl, r.artifact_rel, r.uuid
                         ),
                     );
-                    return;
+                    return None;
                 }
                 r.integrity_required = false;
                 r.url = None;
@@ -668,9 +703,7 @@ impl Discovery {
         if matches!(r.locked_integrity, Some(LockIntegrity::None)) {
             r.locked_integrity = None;
         }
-        if !self.refs.contains(&r) {
-            self.refs.push(r);
-        }
+        Some(r)
     }
 
     /// Record a diagnostic for root-relative `file`. `detail` is shown to
@@ -723,16 +756,17 @@ impl Discovery {
     /// package managers that keep several lockfiles side by side (npm,
     /// pnpm, yarn, bun; uv, pylock, poetry, pdm, Pipfile, requirements)
     /// call it for every such entry with exact coordinates.
+    ///
+    /// Duplicates are kept until [`Discovery::finalize`] sorts and dedups
+    /// the list: a membership check here made recording quadratic in the
+    /// lock's size (#993), and every reader before then only asks whether
+    /// some entry matches.
     pub(crate) fn resolved_elsewhere(&mut self, file: &str, purl: Option<String>) {
         let Some(purl) = purl else { return };
-        let entry = ResolvedElsewhere {
+        self.elsewhere.push(ResolvedElsewhere {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
-        };
-        // Deduplicated once, in `finalize` (a per-push scan is quadratic in
-        // the lock's size); an earlier duplicate is identical, so the first
-        // match `contest_across_locks` finds is the same either way.
-        self.elsewhere.push(entry);
+        });
     }
 
     /// Record that lock `file`'s entry `key` installs its own copy of `purl`
@@ -767,8 +801,8 @@ impl Discovery {
     /// Drop every ref whose OWN lock also installs an unpatched copy of the
     /// same `name@version` ([`Discovery::unpatched_copy`]): the build ships
     /// that copy whatever the wiring does, so the ref is diagnosed
-    /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted. Its
-    /// uuid stays recognized (rule 11).
+    /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted, but
+    /// [`Discovery::shadowed`]. Its uuid stays recognized (rule 11).
     fn contest_within_locks(&mut self) {
         if self.unpatched_copies.is_empty() {
             return;
@@ -792,6 +826,9 @@ impl Discovery {
                             r.purl, r.uuid, c.key, c.how
                         ),
                     );
+                    // Withheld, not lost: rollback / remove / the takeover
+                    // still unwind the wiring (#828).
+                    self.shadow(r);
                 }
                 None => self.refs.push(r),
             }
@@ -1018,15 +1055,17 @@ impl Discovery {
         self.unattested.dedup();
         self.contested.sort();
         self.contested.dedup();
-        self.refs.sort_by(|a, b| {
-            (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
-                &b.source_file,
-                &b.purl,
-                &b.uuid,
-                b.mode,
-            ))
-        });
-        self.refs.dedup();
+        for refs in [&mut self.refs, &mut self.shadowed] {
+            refs.sort_by(|a, b| {
+                (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
+                    &b.source_file,
+                    &b.purl,
+                    &b.uuid,
+                    b.mode,
+                ))
+            });
+            refs.dedup();
+        }
         self.diagnostics
             .sort_by(|a, b| (&a.file, a.code, &a.detail).cmp(&(&b.file, b.code, &b.detail)));
         self.recognized.sort();
@@ -1396,6 +1435,51 @@ impl<'a> DiscoverCtx<'a> {
                     DIAG_LOCKFILE_UNREADABLE,
                     rel,
                     format!("cannot read {rel}: {e}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// [`DiscoverCtx::read_text`] for a pip requirements file: the bytes are
+    /// decoded as pip decodes them ([`crate::utils::requirements::decode`]:
+    /// a UTF-16 / UTF-32 byte-order mark, a PEP 263 coding line, else
+    /// UTF-8), so a UTF-16 export pip and uv install from is evidence like
+    /// its UTF-8 twin (#1120). A file those rules cannot decode records
+    /// [`DIAG_LOCKFILE_UNREADABLE`].
+    pub(crate) async fn read_requirements_text(
+        &self,
+        rel: &str,
+        out: &mut Discovery,
+    ) -> Option<String> {
+        let bytes = match self.view.read_bytes(rel).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                self.log_read(rel, false);
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    rel,
+                    format!("cannot read {rel}: {e}"),
+                );
+                return None;
+            }
+        };
+        match crate::utils::requirements::decode(&bytes) {
+            Some(text) => {
+                self.log_read(rel, true);
+                self.recognize_text(rel, &text);
+                Some(text)
+            }
+            None => {
+                self.log_read(rel, false);
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    rel,
+                    format!(
+                        "cannot read {rel}: not text pip's decoding rules can read (a \
+                         byte-order mark, a PEP 263 coding line, or UTF-8)"
+                    ),
                 );
                 None
             }

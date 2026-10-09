@@ -73,7 +73,7 @@ use futures_util::StreamExt;
 
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
-    is_fallback_candidate,
+    is_fallback_candidate, ApiClient,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::RedirectState;
@@ -187,9 +187,26 @@ pub(crate) const NOTE_RECORD_OFFLINE: &str = "vex_record_offline";
 pub(crate) const NOTE_RECORD_NOT_FOUND: &str = "vex_record_not_found";
 /// A record fetch failed (transport, server, paid-only, ...).
 pub(crate) const NOTE_RECORD_FETCH_FAILED: &str = "vex_record_fetch_failed";
-/// The authenticated API refused the credentials; the public proxy served
-/// the retry (free patches only) — `get` / `scan`'s fallback.
+/// The public proxy served free patches only: the authenticated API refused
+/// the credentials (`get` / `scan`'s fallback), or a token was set but its
+/// org could not be resolved, so the run's client is on the proxy.
 pub(crate) const NOTE_API_AUTH_FALLBACK: &str = "api_auth_fallback";
+
+/// The run-level `--json` warning for a client whose org could not be
+/// resolved (the run is on the public proxy; construction already warned on
+/// stderr). A host that seeds embedded `--vex` with its client suppresses
+/// the VEX plan's own `api_auth_fallback` note, so the host's envelope must
+/// carry this instead (`scan` / `get` / `apply` / `vendor`).
+pub(crate) fn api_auth_fallback_warning(
+    client: &ApiClient,
+) -> Option<crate::json_envelope::RunWarning> {
+    client
+        .org_unresolved()
+        .map(|reason| crate::json_envelope::RunWarning {
+            code: NOTE_API_AUTH_FALLBACK.to_string(),
+            detail: reason.to_string(),
+        })
+}
 
 /// Omission tag and note: a hosted Gradle pin is wired, but a lock file
 /// records a release above its base, which that build resolves instead
@@ -225,8 +242,17 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              intact, so re-running `scan` / `vendor` does not change this (drop the entry from \
              deno.lock if Deno does not install this project's npm dependencies)",
         ),
+        UnattestedKind::NpmShrinkwrapOnly => (
+            NOTE_NPM_SHRINKWRAP_ONLY,
+            "not attested until a package-lock.json wires it",
+        ),
     }
 }
+
+/// Omission tag and note: the patch is wired only in a root
+/// `npm-shrinkwrap.json` with no `package-lock.json` twin, which npm >= 12
+/// never reads (`vex::Unattested`, #899).
+pub(crate) const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
 
 fn note(code: &'static str, detail: String) -> PlanNote {
     PlanNote { code, detail }
@@ -297,10 +323,22 @@ impl Cand {
     }
 }
 
+/// The run's API client, built at most once: a host command (`scan`,
+/// `apply`, `vendor`) seeds it with the client it already built, so
+/// embedded `--vex` reuses the run's one org resolution; standalone `vex`
+/// leaves it empty and [`fetch_records`] builds it on first need.
+pub(crate) type RunApiClient = tokio::sync::OnceCell<ApiClient>;
+
 /// Merge `sources` into a verified-input [`Plan`]. `assume_live` is the
 /// in-run `scan --mode hosted --vex` confirmed set (qualifier-insensitive):
 /// those ledger records were just proven wired by the run itself.
-pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[String]) -> Plan {
+/// `api_client` is the run's client (see [`RunApiClient`]).
+pub(crate) async fn plan(
+    common: &GlobalArgs,
+    sources: Sources,
+    assume_live: &[String],
+    api_client: &RunApiClient,
+) -> Plan {
     let root = common.cwd.as_path();
     let Sources {
         manifest,
@@ -363,8 +401,10 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
     let superseded = attach_discovered(&mut cands, &discovery, &vendor, &conflicts);
     // Wired, but a build bypasses the pin (`Unattested`: a Gradle lock
     // above the hosted base resolves the newer upstream release, a pnpm
-    // bundled copy, a deno.lock copy): the ref keeps rollback, remove,
-    // list and the ledgers' liveness working, and the patch is omitted.
+    // bundled copy, a deno.lock copy, an npm shrinkwrap with no
+    // package-lock.json twin, which npm >= 12 ignores): the ref keeps
+    // rollback, remove, list and the ledgers' liveness working, and the
+    // patch is omitted.
     cands.retain(|c| {
         let pkg = canonical_base_purl(&c.key);
         let Some(u) = discovery
@@ -516,7 +556,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
         u.dedup();
         u
     };
-    let fetched = fetch_records(common, &uuids, &mut notes).await;
+    let fetched = fetch_records(common, api_client, &uuids, &mut notes).await;
     let mut mismatched: HashSet<usize> = HashSet::new();
     for &i in &need_api {
         let cand = &mut based[i].0;
@@ -925,6 +965,7 @@ fn local_record_by_uuid(
 /// (the caller omits those references as `record_unavailable`) and noted.
 async fn fetch_records(
     common: &GlobalArgs,
+    api_client: &RunApiClient,
     uuids: &[String],
     notes: &mut Vec<PlanNote>,
 ) -> HashMap<String, (String, PatchRecord)> {
@@ -946,7 +987,22 @@ async fn fetch_records(
         return out;
     }
     let overrides = common.api_client_overrides();
-    let (mut client, mut use_public_proxy) = get_api_client_with_overrides(overrides.clone()).await;
+    // The run's client: the host's, or built here once (standalone `vex`).
+    let built_here = !api_client.initialized();
+    let mut client = api_client
+        .get_or_init(|| async { get_api_client_with_overrides(overrides.clone()).await.0 })
+        .await
+        .clone();
+    // A client built here whose org could not be resolved put the run on
+    // the proxy. Its construction already warned on stderr, so only the
+    // `--json` envelope needs the note (a host that seeded its client
+    // reports this itself).
+    if built_here && common.json {
+        if let Some(reason) = client.org_unresolved() {
+            notes.push(note(NOTE_API_AUTH_FALLBACK, reason.to_string()));
+        }
+    }
+    let mut use_public_proxy = client.uses_public_proxy();
     let mut pending: Vec<String> = uuids.to_vec();
     // Each view is a heavy response: say what the run is waiting on (a live
     // line only on a terminal, never under --json / --silent; the VEX
@@ -1163,7 +1219,13 @@ mod tests {
             ..GlobalArgs::default()
         };
         let mut notes: Vec<PlanNote> = Vec::new();
-        let out = fetch_records(&common, &[U1.to_string(), U2.to_string()], &mut notes).await;
+        let out = fetch_records(
+            &common,
+            &RunApiClient::new(),
+            &[U1.to_string(), U2.to_string()],
+            &mut notes,
+        )
+        .await;
 
         let fallback = notes
             .iter()
@@ -1175,6 +1237,91 @@ mod tests {
             fallback.detail
         );
         assert!(out.contains_key(U1) && out.contains_key(U2), "{out:?}");
+    }
+
+    /// Standalone `vex --json` (no host client): a token whose org cannot
+    /// be resolved builds a proxy client here, the records come from the
+    /// proxy, and the envelope gets one `api_auth_fallback` note. A client
+    /// seeded by a host adds no note (the host reports it).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unresolved_org_client_built_here_notes_the_fallback_once() {
+        use wiremock::matchers::{method, path as wm_path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let keys = ["SOCKET_ORG_SLUG", "SOCKET_OFFLINE", "SOCKET_NO_CONFIG"];
+        let saved: Vec<(&str, Option<String>)> = keys
+            .into_iter()
+            .map(|k| (k, std::env::var(k).ok()))
+            .collect();
+        std::env::remove_var("SOCKET_ORG_SLUG");
+        std::env::remove_var("SOCKET_OFFLINE");
+        std::env::set_var("SOCKET_NO_CONFIG", "1");
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v0/organizations"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(path_regex("^/v0/orgs/"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/patch/view/{U1}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": U1,
+                "purl": "pkg:npm/vexorg@1.0.0",
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": {},
+                "vulnerabilities": {},
+                "description": "",
+                "license": "MIT",
+                "tier": "free",
+            })))
+            .mount(&mock)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            silent: true,
+            api_url: Some(mock.uri()),
+            api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+            proxy_url: Some(mock.uri()),
+            ..GlobalArgs::default()
+        };
+        let run_client = RunApiClient::new();
+        let mut notes: Vec<PlanNote> = Vec::new();
+        let out = fetch_records(&common, &run_client, &[U1.to_string()], &mut notes).await;
+        // A second fetch on the same run reuses the client: no second
+        // resolution (the mock's `.expect(1)`) and no second note.
+        let _ = fetch_records(&common, &run_client, &[U1.to_string()], &mut notes).await;
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        assert!(out.contains_key(U1), "{out:?}");
+        let fallbacks: Vec<_> = notes
+            .iter()
+            .filter(|n| n.code == NOTE_API_AUTH_FALLBACK)
+            .collect();
+        assert_eq!(fallbacks.len(), 1, "{notes:?}");
+        assert!(
+            fallbacks[0]
+                .detail
+                .contains("Pass --org or set SOCKET_ORG_SLUG"),
+            "{}",
+            fallbacks[0].detail
+        );
     }
 
     fn discovery(refs: Vec<PatchedRef>) -> Discovery {
@@ -1233,7 +1380,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U2, true)]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.view.patches["pkg:npm/x@1.0.0"].uuid, U2);
         assert_eq!(plan.redirected, vec!["pkg:npm/x@1.0.0".to_string()]);
         assert!(plan.lockfile_basis.contains("pkg:npm/x@1.0.0"));
@@ -1256,7 +1403,7 @@ mod tests {
             redirect: None,
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U2, true)]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert!(
             plan.view.patches.is_empty(),
             "{:?}",
@@ -1291,7 +1438,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U1, true)]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert!(plan
             .gated
             .contains(&failed("pkg:npm/x@1.0.0", RECORD_MISMATCH)));
@@ -1333,7 +1480,7 @@ mod tests {
                 hosted_ref("pkg:npm/y@1.0.0", U2, true),
             ]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.gated, vec![failed("pkg:npm/x@1.0.0", WIRING_CONFLICT)]);
         assert!(!plan.view.patches.contains_key("pkg:npm/x@1.0.0"));
         assert!(!plan.redirected.contains(&"pkg:npm/x@1.0.0".to_string()));
@@ -1387,13 +1534,19 @@ mod tests {
             redirect: Some(redirect.clone()),
             discovery: Discovery::default(),
         };
-        let live = plan(&common(tmp.path()), mk(), &[key.to_string()]).await;
+        let live = plan(
+            &common(tmp.path()),
+            mk(),
+            &[key.to_string()],
+            &RunApiClient::new(),
+        )
+        .await;
         assert_eq!(live.view.patches[key].uuid, U2);
         assert_eq!(live.redirected, vec![key.to_string()]);
         assert!(live.vendor_entries.is_empty());
         assert!(live.gated.is_empty(), "{:?}", live.gated);
 
-        let dead = plan(&common(tmp.path()), mk(), &[]).await;
+        let dead = plan(&common(tmp.path()), mk(), &[], &RunApiClient::new()).await;
         assert!(dead.view.patches.is_empty());
         assert_eq!(dead.gated, vec![failed(key, VENDOR_UNWIRED)]);
     }
@@ -1483,7 +1636,13 @@ mod tests {
 
         // Control — nothing recognized: the ledgers' own recorded files
         // decide, and both claims are live.
-        let live = plan(&common(root), sources(Discovery::default()), &[]).await;
+        let live = plan(
+            &common(root),
+            sources(Discovery::default()),
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
         assert!(live.gated.is_empty(), "{:?}", live.gated);
         assert!(live.view.patches.contains_key("pkg:npm/x@1.0.0"));
         assert_eq!(live.redirected, vec!["pkg:cargo/y@1.0.0".to_string()]);
@@ -1511,7 +1670,7 @@ mod tests {
             }],
             ..Discovery::default()
         };
-        let dead = plan(&common(root), sources(rejected), &[]).await;
+        let dead = plan(&common(root), sources(rejected), &[], &RunApiClient::new()).await;
         assert!(
             dead.view.patches.is_empty(),
             "{:?}",
@@ -1559,7 +1718,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U1, true)]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         let wiring = &plan.hosted["pkg:npm/x@1.0.0"];
         assert_eq!(wiring.uuid, U1);
         assert_eq!(wiring.refs.len(), 1);
@@ -1590,7 +1749,13 @@ mod tests {
             redirect: Some(redirect.clone()),
             discovery,
         };
-        let gated = plan(&common(tmp.path()), sources(found), &[]).await;
+        let gated = plan(
+            &common(tmp.path()),
+            sources(found),
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
         assert!(gated.view.patches.is_empty() && gated.hosted.is_empty());
         assert_eq!(gated.gated, vec![failed(PURL, NOTE_LOCK_ABOVE_BASE)]);
         assert!(
@@ -1603,6 +1768,7 @@ mod tests {
             &common(tmp.path()),
             sources(discovery(vec![hosted_ref(PURL, U1, true)])),
             &[],
+            &RunApiClient::new(),
         )
         .await;
         assert!(live.gated.is_empty(), "{:?}", live.gated);
@@ -1639,6 +1805,7 @@ mod tests {
             &common(tmp.path()),
             sources,
             &["pkg:pypi/confirmed@1.0".to_string()],
+            &RunApiClient::new(),
         )
         .await;
         assert!(plan.view.patches.contains_key("pkg:npm/owned@1.0.0"));
@@ -1710,7 +1877,7 @@ mod tests {
                     // not a discovery input: the ledger fallback decides.
                     discovery: Discovery::default(),
                 };
-                let plan = plan(&common(root), sources, &[]).await;
+                let plan = plan(&common(root), sources, &[], &RunApiClient::new()).await;
                 if gemfile_wired {
                     assert_eq!(plan.redirected, vec![purl.to_string()], "{gemfile}");
                     assert!(plan.gated.is_empty(), "{gemfile}: {:?}", plan.gated);

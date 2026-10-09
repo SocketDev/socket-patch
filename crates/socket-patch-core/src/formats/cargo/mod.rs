@@ -63,6 +63,23 @@ pub(crate) struct LockedPackage {
     pub(crate) dependencies: Vec<String>,
 }
 
+impl LockedPackage {
+    /// Whether the package comes from a registry index (`registry+…` or
+    /// `sparse+…`), the only sources cargo extracts under
+    /// `$CARGO_HOME/registry/src/` (git, path and local-registry sources
+    /// never are).
+    pub(crate) fn is_from_registry(&self) -> bool {
+        self.source.as_deref().is_some_and(is_registry_source)
+    }
+}
+
+/// Whether a `Cargo.lock` `source` names a registry index (`registry+…` or
+/// `sparse+…`).
+pub(crate) fn is_registry_source(source: &str) -> bool {
+    let s = source.trim();
+    s.starts_with("sparse+") || s.starts_with("registry+")
+}
+
 /// Every `[[package]]` of `doc` (lock formats v1–v4), in lock order; an
 /// entry without a string `name` and `version` is skipped. A lock with no
 /// packages has no `package` key and yields nothing.

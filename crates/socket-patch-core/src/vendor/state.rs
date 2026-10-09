@@ -80,6 +80,35 @@ pub struct VendorArtifact {
     pub file_inventory: Option<BTreeMap<String, String>>,
 }
 
+impl VendorArtifact {
+    /// The packed npm tarball at `rel_tgz`, pinned by its sha256 and size.
+    /// `yarn_berry10c0` stays `None`: only the yarn-berry flavor records
+    /// the checksum, and only when it is the service's own.
+    pub(crate) fn tarball(rel_tgz: String, packed: &super::npm_pack::PackedTarball) -> Self {
+        Self {
+            yarn_berry10c0: None,
+            path: rel_tgz,
+            sha256: packed.sha256_hex.clone(),
+            size: Some(packed.size),
+            platform_locked: None,
+            file_inventory: None,
+        }
+    }
+
+    /// A vendored package DIRECTORY at `rel_dir` (vlt): no file hash or
+    /// size, its whole-tree `inventory` instead.
+    pub(crate) fn dir(rel_dir: String, inventory: BTreeMap<String, String>) -> Self {
+        Self {
+            yarn_berry10c0: None,
+            path: rel_dir,
+            sha256: String::new(),
+            size: None,
+            platform_locked: None,
+            file_inventory: Some(inventory),
+        }
+    }
+}
+
 /// How a wiring edit changed a file.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -283,6 +312,36 @@ pub struct VendorEntry {
 }
 
 impl VendorEntry {
+    /// The ledger entry every npm-family vendor backend records: ecosystem
+    /// `npm`, the wiring flavor (`None` is package-lock's pre-flavor
+    /// spelling) and no other ecosystem's extras. A flavor sets its one
+    /// meta field afterwards (`pnpm`, `artifact.yarn_berry10c0`).
+    pub(crate) fn npm(
+        base_purl: String,
+        uuid: String,
+        artifact: VendorArtifact,
+        wiring: Vec<WiringRecord>,
+        flavor: Option<&str>,
+    ) -> Self {
+        Self {
+            ecosystem: "npm".to_string(),
+            base_purl,
+            uuid,
+            artifact,
+            wiring,
+            lock: None,
+            took_over_go_patches: false,
+            flavor: flavor.map(str::to_string),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+            detached: false,
+            record: None,
+        }
+    }
+
     /// Whether this entry's committed artifact is on disk under
     /// `project_root` — for a FILE artifact (wheel, tarball: a recorded
     /// `sha256`), only when its bytes still hash to that pin; a copy dir
@@ -2136,5 +2195,100 @@ mod tests {
             assert!(!a.join(VENDOR_STATE_REL).exists(), "grouped {grouped}");
             assert!(!b.join(VENDOR_STATE_REL).exists(), "grouped {grouped}");
         }
+    }
+
+    /// #922: the npm-family constructor serializes to exactly the ledger
+    /// JSON the yarn-classic backend's literal entry did.
+    #[test]
+    fn npm_constructor_matches_the_yarn_classic_literal() {
+        let packed = super::super::npm_pack::PackedTarball::from_bytes(b"tarball bytes");
+        let rel = ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+        let wiring = vec![WiringRecord {
+            file: "yarn.lock".to_string(),
+            kind: "yarn_lock_block".to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("left-pad@^1.3.0".to_string()),
+            original: Some(serde_json::json!(["left-pad@^1.3.0:"])),
+            new: Some(serde_json::json!([
+                "left-pad@^1.3.0:",
+                "  version \"1.3.0\""
+            ])),
+        }];
+        let literal = VendorEntry {
+            ecosystem: "npm".to_string(),
+            base_purl: "pkg:npm/left-pad@1.3.0".to_string(),
+            uuid: "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f".to_string(),
+            artifact: VendorArtifact {
+                yarn_berry10c0: None,
+                path: rel.to_string(),
+                sha256: packed.sha256_hex.clone(),
+                size: Some(packed.size),
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: wiring.clone(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: Some("yarn-classic".to_string()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        };
+        let built = VendorEntry::npm(
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f".to_string(),
+            VendorArtifact::tarball(rel.to_string(), &packed),
+            wiring,
+            Some("yarn-classic"),
+        );
+        assert_eq!(built, literal);
+        assert_eq!(
+            serde_json::to_string_pretty(&built).unwrap(),
+            serde_json::to_string_pretty(&literal).unwrap()
+        );
+        // The pinned JSON: no other ecosystem's extras, no
+        // `yarnBerry10c0`, no `fileInventory`.
+        assert_eq!(
+            serde_json::to_value(&built).unwrap(),
+            serde_json::json!({
+                "ecosystem": "npm",
+                "basePurl": "pkg:npm/left-pad@1.3.0",
+                "uuid": "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
+                "artifact": {"path": rel, "sha256": packed.sha256_hex, "size": packed.size},
+                "wiring": [{
+                    "file": "yarn.lock",
+                    "kind": "yarn_lock_block",
+                    "action": "rewritten",
+                    "key": "left-pad@^1.3.0",
+                    "original": ["left-pad@^1.3.0:"],
+                    "new": ["left-pad@^1.3.0:", "  version \"1.3.0\""],
+                }],
+                "flavor": "yarn-classic",
+            })
+        );
+
+        // package-lock keeps the pre-flavor spelling; vlt's dir artifact
+        // carries its inventory and no file hash.
+        assert_eq!(
+            VendorEntry::npm(
+                String::new(),
+                String::new(),
+                built.artifact.clone(),
+                vec![],
+                None
+            )
+            .flavor,
+            None
+        );
+        let inventory = BTreeMap::from([("index.js".to_string(), "ab".repeat(32))]);
+        let dir = VendorArtifact::dir("dir".to_string(), inventory.clone());
+        assert_eq!(
+            serde_json::to_value(&dir).unwrap(),
+            serde_json::json!({"path": "dir", "fileInventory": inventory})
+        );
     }
 }

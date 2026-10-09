@@ -24,6 +24,11 @@ For the token, organization, and authenticated API URL, precedence is:
 | Organization | `--org` | `SOCKET_ORG_SLUG` | `SOCKET_CLI_ORG_SLUG` | `defaultOrg` (also accepts `org`) |
 | Authenticated API | `--api-url` | `SOCKET_API_URL` | `SOCKET_CLI_API_BASE_URL` | `apiBaseUrl` |
 
+With a token but no organization from any of these sources, Socket Patch asks
+the API for it (`GET /v0/organizations`) once per run. If that fails, the whole
+run uses the public patch API without the token (free patches only) and warns;
+set `--org` or `SOCKET_ORG_SLUG` to use your organization's patches.
+
 The separate Socket CLI writes that file through `socket login` or `socket config`.
 Socket Patch only reads it. Missing configuration is silent; an unreadable or
 invalid login file produces a warning and falls back to the other sources.
@@ -124,6 +129,13 @@ socket-patch scan 'apps/*' --mode hosted
 
 Each PATH in hosted or vendored mode is a project directory. Paths outside the
 repository are rejected. For JSON output, scan one project per invocation.
+
+An agent-mode scan from the repository root also patches nested projects'
+`node_modules`. Each installed copy follows its own project root (the nearest
+directory with a lockfile), so these filters skip nested projects too. A package
+an included project also installs is patched in every copy, because patches are
+recorded per package version; the scan warns `policy_shared_copy` when that reaches
+a skipped project.
 
 ### Gradual rollout
 

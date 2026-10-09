@@ -220,8 +220,7 @@ pub fn client(server: &MockServer) -> Arc<dyn PatchApi> {
     Arc::new(ApiClient::new(ApiClientOptions {
         api_url: server.uri(),
         api_token: Some("fake-token".to_string()),
-        use_public_proxy: false,
-        org_slug: Some(ORG.to_string()),
+        route: socket_patch_core::api::client::ApiRoute::org(ORG),
     }))
 }
 

@@ -28,6 +28,12 @@
 //!   — a stale mirror entry must not outvote the `packages` entry npm
 //!   installs.
 //!
+//! Entries npm installs from somewhere other than their `resolved` — a git /
+//! url / `file:` spec, or a dependency's own npm-shrinkwrap.json (an entry
+//! beneath a `hasShrinkwrap: true` package, #753) — are never attested and
+//! contest every ref for the same `name@version`
+//! ([`drop_non_registry_installs`]).
+//!
 //! An entry is a ref when its `resolved` is
 //!
 //! * a Socket-HOSTED url ([`DiscoverCtx::hosted_uuid`]) → [`WiringMode::Hosted`].
@@ -61,26 +67,36 @@ use crate::vendor::lock_inventory::{
     npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes, npm_lock_located_nodes, LockIntegrity,
     NpmLockNode,
 };
-use crate::vendor::npm_origin::{npm_non_registry_entries, NpmOverrides};
+use crate::vendor::npm_origin::{
+    npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+};
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let mut locks: Vec<NpmLockRefs> = Vec::new();
+    let mut twin_present = false;
     for lock in NPM_LOCKS {
         if let Some(read) = extract_package_lock(ctx, lock, out).await {
             locks.push(read);
+        } else if lock == NPM_LOCKS[1] {
+            // Present but unreadable / unparseable (already diagnosed):
+            // npm 12 cannot install from it either, but the shrinkwrap-only
+            // detail must not claim it is missing.
+            twin_present = ctx.exists(lock).await;
         }
     }
-    push_uncontested(locks, out);
+    push_uncontested(locks, twin_present, out);
     extract_pnpm(ctx, out).await;
 }
 
 /// What one parsed npm lock wires, plus the packages it resolves ELSEWHERE
 /// (an entry whose `resolved` is not a Socket reference), the packages it
 /// installs BUNDLED (each purl → the first such entry's lock location) and
-/// every `name@version` it has any entry for, at any path.
+/// every `name@version` it has any entry for, at any path. `ref_locations`
+/// names the lock entry each ref was read from (purl, location).
 struct NpmLockRefs {
     file: &'static str,
     refs: Vec<PatchedRef>,
+    ref_locations: Vec<(String, String)>,
     unwired: BTreeMap<String, String>,
     bundled: BTreeMap<String, String>,
     mentioned: BTreeSet<String>,
@@ -102,9 +118,9 @@ impl NpmLockRefs {
 }
 
 /// Push every ref no OTHER npm lock contests. npm <= 11 installs from
-/// npm-shrinkwrap.json when both exist; npm 12 auto-creates a
-/// package-lock.json beside it and installs from THAT (verified against real
-/// npm 12.0.0 / 12.1.0). A package one lock wires to a Socket patch while the
+/// npm-shrinkwrap.json when both exist; npm 12 never reads the shrinkwrap,
+/// writes a package-lock.json (from the registry) beside it and installs from
+/// THAT (verified against real npm 12.0.0 / 12.1.0). A package one lock wires to a Socket patch while the
 /// other resolves it only elsewhere (the registry) is therefore installed
 /// patched by some npm majors and unpatched by others — not decidable from
 /// the files, so it is diagnosed and not attested (the same call as the v2
@@ -127,7 +143,13 @@ impl NpmLockRefs {
 /// `name@version` elsewhere (#588 — e.g. a workspace member added after
 /// the rewire, then `npm install`): npm installs every entry, and that one
 /// fetches the unpatched registry bytes.
-fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
+///
+/// A ref in a lone `npm-shrinkwrap.json` (no usable package-lock.json
+/// twin) is pushed but marked [`UnattestedKind::NpmShrinkwrapOnly`] (#899):
+/// npm 12 never reads the shrinkwrap and installs from the registry
+/// instead. `twin_present`: a package-lock.json exists but could not be
+/// read or parsed (the detail says so instead of calling it missing).
+fn push_uncontested(locks: Vec<NpmLockRefs>, twin_present: bool, out: &mut Discovery) {
     let wired: Vec<BTreeSet<String>> = locks
         .iter()
         .map(|l| l.refs.iter().map(|r| r.purl.clone()).collect())
@@ -153,6 +175,9 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid,
                     ),
                 );
+                // Still the hosted rewriter's own output for exactly this
+                // version, so rollback / remove / the takeover unwind it.
+                out.shadow(r.clone());
                 continue;
             }
             if let Some(location) = lock.unwired.get(&r.purl) {
@@ -206,6 +231,39 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                     ),
                 );
             } else {
+                if locks.len() == 1 && lock.file == NPM_LOCKS[0] {
+                    // A shrinkwrap with no package-lock.json twin (#899):
+                    // npm 12 no longer reads npm-shrinkwrap.json at all — it
+                    // resolves the tree fresh from the registry and writes
+                    // its own package-lock.json — so the wiring reaches npm
+                    // <= 11 only. The ref stays (rollback, remove and list
+                    // still manage it); VEX omits it.
+                    let detail = if twin_present {
+                        format!(
+                            "its {} twin cannot be read or parsed — npm >= 12 never reads \
+                             {}, so only npm <= 11 installs the patched bytes; repair {} \
+                             (e.g. `npm install --package-lock-only`) and re-run the scan \
+                             (`scan --mode hosted` / `scan --mode vendored`)",
+                            NPM_LOCKS[1], NPM_LOCKS[0], NPM_LOCKS[1],
+                        )
+                    } else {
+                        format!(
+                            "{} has no {} twin — npm >= 12 never reads {}, resolves the \
+                             package from the registry and writes a fresh {}, so only npm \
+                             <= 11 installs the patched bytes; rename the lock to {} (or \
+                             commit a copy under that name) and re-run the scan (`scan \
+                             --mode hosted` / `scan --mode vendored`)",
+                            lock.file, NPM_LOCKS[1], NPM_LOCKS[0], NPM_LOCKS[1], NPM_LOCKS[1],
+                        )
+                    };
+                    out.unattested(
+                        &r.purl,
+                        &r.uuid,
+                        lock.file,
+                        detail,
+                        UnattestedKind::NpmShrinkwrapOnly,
+                    );
+                }
                 out.push(r.clone());
             }
         }
@@ -224,6 +282,7 @@ async fn extract_package_lock(
     let mut read = NpmLockRefs {
         file,
         refs: Vec::new(),
+        ref_locations: Vec::new(),
         unwired: BTreeMap::new(),
         bundled: BTreeMap::new(),
         mentioned: BTreeSet::new(),
@@ -278,6 +337,14 @@ async fn extract_package_lock(
 /// mirror node that agrees, or a mirror that does not mention the package,
 /// contests nothing; a mirror node wired while `packages` is not is never a
 /// ref (see [`npm_lock_nodes`]).
+///
+/// A mirror node with NO `resolved` but the wired ref's (patched)
+/// `integrity` agrees too (#879): npm 7-12's serializer never writes
+/// `resolved` for a `file:` resolution in the mirror, so every `npm install`
+/// on a vendored v2 lock leaves exactly that shape. npm 6 cannot install
+/// unpatched bytes from it: it fetches `name@version` from the registry and
+/// fails closed on the patched pin (EINTEGRITY), the same outcome accepted
+/// for a hosted alias mirror node.
 fn drop_mirror_unwired(
     ctx: &DiscoverCtx<'_>,
     file: &str,
@@ -290,6 +357,9 @@ fn drop_mirror_unwired(
         let Some(purl) = node.version.and_then(|v| npm_purl(node.name, v)) else {
             continue;
         };
+        if node.resolved.is_none() && pins_a_wired_ref(read, &purl, node.sri_pin()) {
+            continue;
+        }
         let located = node.resolved.map_or_else(Located::default, |r| {
             ctx.locate(r, LocateOpts::LITERAL_CHECKED)
         });
@@ -327,12 +397,31 @@ fn drop_mirror_unwired(
     });
 }
 
+/// Whether `pin` is the integrity a `packages` ref of this lock pins `purl`
+/// to — the patched bytes, so nothing installs unpatched against it.
+fn pins_a_wired_ref(read: &NpmLockRefs, purl: &str, pin: Option<&str>) -> bool {
+    let Some(pin) = pin else {
+        return false;
+    };
+    read.refs.iter().any(|r| {
+        r.purl == purl && matches!(&r.locked_integrity, Some(LockIntegrity::Sri(sri)) if sri == pin)
+    })
+}
+
 /// npm installs a git / url / `file:` dependency from the dependent's spec
-/// and ignores the entry's `resolved` (`vendor::npm_origin`, #326), so such
-/// an entry stays unpatched whatever its `resolved` says. Every ref for the
-/// same `name@version` is dropped (that copy is live beside it), and the
-/// copy counts as resolved elsewhere, so other locks' wiring for it is
-/// contested too.
+/// and ignores the entry's `resolved` (`vendor::npm_origin`, #326), and npm
+/// 7–11 install everything beneath a `hasShrinkwrap` package from that
+/// package's own npm-shrinkwrap.json (#753), so such an entry stays
+/// unpatched whatever its `resolved` says. Every ref for the same
+/// `name@version` is dropped from attestation (that copy is live beside
+/// it), and the copy counts as resolved elsewhere, so other locks' wiring
+/// for it is contested too.
+///
+/// A dropped ref wired at a REGISTRY entry (the rewriters' own output
+/// beside a copy they skip) or beneath a `hasShrinkwrap` package (a
+/// pre-#753 run's wiring) is still shadowed, so rollback / remove / the
+/// takeover unwind it (#828). Only a wiring of the git / url / `file:`
+/// entry itself — which no Socket rewriter writes — is not.
 fn drop_non_registry_installs(
     file: &str,
     doc: &Value,
@@ -341,11 +430,34 @@ fn drop_non_registry_installs(
     out: &mut Discovery,
 ) {
     let non_registry = npm_non_registry_entries(doc, overrides);
-    if non_registry.is_empty() {
+    // Locations a wiring of which is not the rewriters' own output.
+    let foreign: BTreeSet<String> = non_registry.keys().cloned().collect();
+    // (lock key, why that copy installs from elsewhere)
+    let elsewhere: Vec<(String, String)> = non_registry
+        .into_iter()
+        .map(|(key, reason)| {
+            let why = format!(
+                "is not installed from the registry ({reason}); npm installs it from that spec"
+            );
+            (key, why)
+        })
+        .chain(
+            npm_shrinkwrapped_entries(doc)
+                .into_iter()
+                .map(|(key, ancestor)| {
+                    let why = format!(
+                        "is installed from `{ancestor}`'s own npm-shrinkwrap.json \
+                         (hasShrinkwrap), which npm 7–11 read instead of this lock"
+                    );
+                    (key, why)
+                }),
+        )
+        .collect();
+    if elsewhere.is_empty() {
         return;
     }
     let mut unpatched: Vec<(String, &str, &str)> = Vec::new();
-    for (key, reason) in &non_registry {
+    for (key, why) in &elsewhere {
         let entry = &doc["packages"][key.as_str()];
         let key_name = key.rsplit_once("node_modules/").map_or("", |(_, n)| n);
         let name = entry
@@ -364,22 +476,28 @@ fn drop_non_registry_installs(
         read.unwired
             .entry(purl.clone())
             .or_insert_with(|| key.clone());
-        unpatched.push((purl, key, reason));
+        unpatched.push((purl, key, why));
     }
+    let ref_locations = &read.ref_locations;
     read.refs.retain(|r| {
-        let Some((_, key, reason)) = unpatched.iter().find(|(p, _, _)| *p == r.purl) else {
+        let Some((_, key, why)) = unpatched.iter().find(|(p, _, _)| *p == r.purl) else {
             return true;
         };
         out.diag(
             DIAG_REF_UNATTRIBUTABLE,
             file,
             format!(
-                "{file}: {} is wired to a Socket patch but lock entry `{key}` is not \
-                 installed from the registry ({reason}); npm installs it from that spec, so \
-                 that copy stays UNPATCHED and nothing is attested",
+                "{file}: {} is wired to a Socket patch but lock entry `{key}` {why}, so that \
+                 copy stays UNPATCHED and nothing is attested",
                 r.purl
             ),
         );
+        let ours = ref_locations
+            .iter()
+            .any(|(purl, location)| *purl == r.purl && !foreign.contains(location));
+        if ours {
+            out.shadow(r.clone());
+        }
         false
     });
 }
@@ -395,7 +513,12 @@ fn entry_ref(
     out: &mut Discovery,
 ) {
     let name = node.name;
-    read.mention(name, node.version);
+    // Built once: every entry is mentioned, and a registry entry (nearly
+    // all of them) is also recorded as resolved elsewhere.
+    let purl = node.version.and_then(|v| npm_purl(name, v));
+    if let Some(purl) = &purl {
+        read.mentioned.insert(purl.clone());
+    }
     let resolved = node.resolved;
     let Located {
         vendored,
@@ -422,7 +545,7 @@ fn entry_ref(
         // A registry / git / tarball dependency: not ours. Remembered so a
         // sibling lock's Socket wiring for the same package is contested
         // (the npm pair here, any other lock by the orchestrator).
-        if let Some(purl) = node.version.and_then(|v| npm_purl(name, v)) {
+        if let Some(purl) = purl {
             out.resolved_elsewhere(file, Some(purl.clone()));
             read.unwired
                 .entry(purl)
@@ -462,9 +585,13 @@ fn entry_ref(
             );
             return;
         }
+        read.ref_locations
+            .push((purl.clone(), location.to_string()));
         read.refs
             .push(PatchedRef::vendored(purl, &vref, file, integrity));
     } else if let Some(uuid) = hosted_uuid {
+        read.ref_locations
+            .push((purl.clone(), location.to_string()));
         read.refs.push(PatchedRef::hosted(
             purl,
             uuid,
@@ -555,6 +682,17 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         // The common lock, then each subspace's, sorted for deterministic
         // diagnostics (stat / list only — the reads below stay on the ctx).
         for rel in rush_lock_rels(ctx.view).await {
+            extract_pnpm_lock(ctx, &rel, out).await;
+        }
+    } else if let crate::utils::pnpm_workspace::MemberLocks::PerMember(rels) =
+        crate::utils::pnpm_workspace::member_locks(&ctx.view).await
+    {
+        // `sharedWorkspaceLockfile: false`: each workspace member installs
+        // from its own lock, which hosted mode pins beside the root's
+        // (#492). A member lock beside a shared root lock (one listing
+        // member importers) is a stale leftover pnpm never reads, and is
+        // not among `rels`.
+        for rel in rels {
             extract_pnpm_lock(ctx, &rel, out).await;
         }
     }
@@ -1218,6 +1356,77 @@ mod tests {
         }
     }
 
+    /// REGRESSION (#899): a shrinkwrap with NO package-lock.json twin is
+    /// not attested. npm 12 never reads npm-shrinkwrap.json: it resolves the
+    /// tree from the registry and writes a fresh package-lock.json, so the
+    /// wiring reaches npm <= 11 only — hosted or vendored. The refs stay
+    /// (rollback, remove and list manage them) and are marked
+    /// [`UnattestedKind::NpmShrinkwrapOnly`]. A package-lock.json alone, and
+    /// a shrinkwrap with a wired twin, still attest.
+    #[tokio::test]
+    async fn a_shrinkwrap_without_a_package_lock_twin_is_not_attested() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/minimist-1.2.5.tgz");
+        let wired = || {
+            lock_with_packages(serde_json::json!({
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+                "node_modules/minimist": { "version": "1.2.5", "resolved": vendored, "integrity": SRI },
+            }))
+        };
+        let p = Project::new();
+        p.write("npm-shrinkwrap.json", wired());
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 2, "the wiring stays managed: {:#?}", out);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.unattested.len(), 2, "{:#?}", out.unattested);
+        for (purl, uuid) in [
+            ("pkg:npm/left-pad@1.3.0", UUID_A),
+            ("pkg:npm/minimist@1.2.5", UUID_B),
+        ] {
+            assert!(
+                out.unattested.iter().any(|u| u.purl == purl
+                    && u.uuid == uuid
+                    && u.kind == UnattestedKind::NpmShrinkwrapOnly
+                    && u.file == std::path::Path::new("npm-shrinkwrap.json")
+                    && u.detail.contains("no package-lock.json")
+                    && u.detail.contains("npm >= 12")
+                    && u.detail.contains("re-run the scan")),
+                "{purl}: {:#?}",
+                out.unattested
+            );
+        }
+
+        // A twin that exists but does not parse is unusable to npm 12 too,
+        // but the detail must not call it missing (or say to create it).
+        p.write("package-lock.json", "{ not json");
+        let out = run(&p).await;
+        assert_eq!(out.unattested.len(), 2, "{:#?}", out.unattested);
+        for u in &out.unattested {
+            assert!(
+                u.kind == UnattestedKind::NpmShrinkwrapOnly
+                    && u.detail.contains("cannot be read or parsed")
+                    && !u.detail.contains("no package-lock.json")
+                    && !u.detail.contains("rename the lock"),
+                "{u:#?}"
+            );
+        }
+
+        // The twin npm 12 reads makes both attestable again.
+        p.write("package-lock.json", wired());
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 4, "{:#?}", out.diagnostics);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+
+        // package-lock.json alone is what every npm >= 7 reads.
+        let p = Project::new();
+        p.write("package-lock.json", wired());
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 2, "{:#?}", out.diagnostics);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+    }
+
     /// REGRESSION (#798 review): a sibling npm lock holding the wired
     /// package only at ANOTHER version contests it as well. npm keeps that
     /// entry only while it satisfies `package.json` (`^1.3.0` here rejects
@@ -1532,6 +1741,82 @@ mod tests {
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
+    /// #879: npm 7-12 `npm install` on a vendored lockfileVersion 2 lock (or
+    /// shrinkwrap) re-saves the legacy mirror node without `resolved` (npm
+    /// never writes one for a `file:` resolution there), keeping the patched
+    /// `integrity`. npm 6 fails closed on that pin, so the mirror agrees and
+    /// the `packages` ref is attested — for a plain dep and an alias alike.
+    #[tokio::test]
+    async fn v2_mirror_without_resolved_but_the_patched_pin_attests() {
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        for lock in ["package-lock.json", "npm-shrinkwrap.json"] {
+            for (key, mirror_version) in [("left-pad", "1.3.0"), ("lp", "npm:left-pad@1.3.0")] {
+                let p = Project::new();
+                p.write(
+                    lock,
+                    serde_json::json!({
+                        "lockfileVersion": 2,
+                        "packages": {
+                            "": { "name": "app", "version": "1.0.0" },
+                            format!("node_modules/{key}"): {
+                                "name": "left-pad", "version": "1.3.0",
+                                "resolved": vendored, "integrity": SRI
+                            }
+                        },
+                        "dependencies": {
+                            key: { "version": mirror_version, "integrity": SRI }
+                        }
+                    })
+                    .to_string(),
+                );
+                let out = run(&p).await;
+                assert_refs(
+                    &out,
+                    &[("pkg:npm/left-pad@1.3.0", UUID_B, WiringMode::Vendored)],
+                );
+                assert!(
+                    out.diagnostics.is_empty(),
+                    "{lock} {key}: {:?}",
+                    out.diagnostics
+                );
+            }
+        }
+    }
+
+    /// #879's boundary: a `resolved`-less mirror node pinned to OTHER bytes
+    /// (the registry tarball's integrity) is what npm 6 installs unpatched,
+    /// so it still contests the ref (#432).
+    #[tokio::test]
+    async fn v2_mirror_without_resolved_on_another_pin_contests_the_ref() {
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            serde_json::json!({
+                "lockfileVersion": 2,
+                "packages": {
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/left-pad": {
+                        "version": "1.3.0", "resolved": vendored, "integrity": SRI
+                    }
+                },
+                "dependencies": {
+                    "left-pad": { "version": "1.3.0", "integrity": "sha512-ORIG" }
+                }
+            })
+            .to_string(),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("npm <= 6")),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
     /// link / inBundle / bundled entries install from somewhere else, so a
     /// Socket URL written there wires nothing.
     #[tokio::test]
@@ -1606,6 +1891,18 @@ mod tests {
             );
             let out = run(&p).await;
             assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+            // Withheld from attestation, but still the wiring of exactly
+            // this version, so rollback / remove / the takeover see it (#828).
+            let shadowed: Vec<_> = out
+                .shadowed
+                .iter()
+                .map(|r| (r.purl.as_str(), r.uuid.as_str(), r.mode))
+                .collect();
+            assert_eq!(
+                shadowed,
+                vec![("pkg:npm/left-pad@1.3.0", uuid, mode)],
+                "{label}"
+            );
             let contested = bundled_contests(&out);
             assert_eq!(contested.len(), 1, "{label}: {:#?}", out.diagnostics);
             assert!(
@@ -1639,6 +1936,100 @@ mod tests {
             &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
         );
         assert!(bundled_contests(&out).is_empty(), "{:#?}", out.diagnostics);
+    }
+
+    /// REGRESSION (#753): npm 7–11 install a copy beneath a `hasShrinkwrap`
+    /// package from that package's own npm-shrinkwrap.json and ignore the
+    /// root lock's entry, so a Socket url written there (by a pre-fix scan)
+    /// is never a ref, and a registry copy there contests the hoisted
+    /// wired entry of the same version, in either mode.
+    #[tokio::test]
+    async fn shrinkwrapped_copy_is_never_attested_and_contests_the_wired_entry() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let sw = serde_json::json!({
+            "version": "1.0.0",
+            "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+            "integrity": "sha512-SW",
+            "hasShrinkwrap": true,
+        });
+        for (label, resolved) in [("hosted", &hosted), ("vendored", &vendored)] {
+            // The only copy is the shrinkwrapped one, rewired in the root lock.
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                lock_with_packages(serde_json::json!({
+                    "node_modules/@bh/sw": sw,
+                    "node_modules/@bh/sw/node_modules/left-pad": {
+                        "version": "1.3.0", "resolved": resolved, "integrity": SRI
+                    },
+                })),
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("hasShrinkwrap")
+                        && d.detail
+                            .contains("node_modules/@bh/sw/node_modules/left-pad")),
+                "{label}: {:#?}",
+                out.diagnostics
+            );
+            // A pre-#753 run's wiring of that copy: still the rewriters'
+            // own output, so rollback / remove / the takeover unwind it.
+            assert!(
+                out.shadowed
+                    .iter()
+                    .any(|r| r.purl == "pkg:npm/left-pad@1.3.0"),
+                "{label}: {:#?}",
+                out.shadowed
+            );
+
+            // A wired hoisted copy beside a registry shrinkwrapped copy.
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                lock_with_packages(serde_json::json!({
+                    "node_modules/left-pad": { "version": "1.3.0", "resolved": resolved, "integrity": SRI },
+                    "node_modules/@bh/sw": sw,
+                    "node_modules/@bh/sw/node_modules/left-pad": {
+                        "version": "1.3.0", "resolved": registry, "integrity": "sha512-ORIG"
+                    },
+                })),
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+            // The rewriter's own wiring beside the copy it skips
+            // (`redirect_npm_shrinkwrapped_instance_skipped`) is withheld
+            // from VEX but not lost (#828).
+            assert!(
+                out.shadowed
+                    .iter()
+                    .any(|r| r.purl == "pkg:npm/left-pad@1.3.0"),
+                "{label}: {:#?}",
+                out.shadowed
+            );
+        }
+
+        // Without `hasShrinkwrap` the nested wired copy is an ordinary ref.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "node_modules/@bh/sw": { "version": "1.0.0", "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz" },
+                "node_modules/@bh/sw/node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": hosted, "integrity": SRI
+                },
+            })),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
     }
 
     /// REGRESSION (#325), lockfileVersion 1: a `bundled: true` copy nested in
@@ -1860,6 +2251,13 @@ mod tests {
                     "{spec} / {wiring}: {:?}",
                     diag_codes(&out)
                 );
+                // The non-registry entry itself carries the wiring: no
+                // Socket rewriter writes that, so it is not shadowed either.
+                assert!(
+                    out.shadowed.is_empty(),
+                    "{spec} / {wiring}: {:#?}",
+                    out.shadowed
+                );
             }
         }
         // Transitive: the hoisted copy is wired, a nested git copy of the
@@ -1893,6 +2291,18 @@ mod tests {
             diag.detail.contains("node_modules/a/node_modules/left-pad"),
             "{}",
             diag.detail
+        );
+        // The hoisted wiring is the hosted rewriter's own output beside a
+        // copy it skips: withheld from VEX, still unwound by rollback /
+        // remove / the takeover (#828).
+        assert_eq!(
+            out.shadowed
+                .iter()
+                .map(|r| (r.purl.as_str(), r.uuid.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("pkg:npm/left-pad@1.3.0", UUID_A)],
+            "{:#?}",
+            out.shadowed
         );
         // Control: a registry spec keeps the ref.
         let p = Project::new();
@@ -2498,6 +2908,37 @@ mod tests {
         assert!(files.contains(&"common/config/rush/pnpm-lock.yaml".into()));
         assert!(files.contains(&"common/config/subspaces/frontend/pnpm-lock.yaml".into()));
         assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    }
+
+    /// #492: under `sharedWorkspaceLockfile: false` each member's own lock
+    /// is read (pnpm 7 writes no root lock at all); beside a shared root
+    /// lock (one listing member importers) or without the setting, a
+    /// member lock is a stale leftover and never attests.
+    #[tokio::test]
+    async fn pnpm_member_locks_under_an_unshared_workspace() {
+        let lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      ms:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  ms@1.3.0:\n    resolution: {integrity: sha512-UP==}\n";
+        let wired = hosted_rewrite("pnpm-lock.yaml", lock, &[pnpm_override("ms", UUID_B, None)]);
+        let p = Project::new();
+        p.write("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+        p.write("packages/a/package.json", "{}");
+        p.write("packages/a/pnpm-lock.yaml", &wired);
+        assert!(run(&p).await.refs.is_empty(), "shared default: not read");
+        p.write(".npmrc", "shared-workspace-lockfile=false\n");
+        let out = run(&p).await;
+        assert_refs(&out, &[("pkg:npm/ms@1.3.0", UUID_B, WiringMode::Hosted)]);
+        assert_eq!(
+            out.refs[0].source_file,
+            std::path::PathBuf::from("packages/a/pnpm-lock.yaml")
+        );
+        assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+        p.write(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  packages/a: {}\n",
+        );
+        assert!(
+            run(&p).await.refs.is_empty(),
+            "shared root lock: stale member"
+        );
     }
 
     /// `shrinkwrap.yaml` (pnpm <= 2) is read only when there is no

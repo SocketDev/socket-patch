@@ -1,12 +1,14 @@
 """Run CI's real archive commands and check binary/permission round trips."""
 
 import importlib.util
+import io
 import os
 from pathlib import Path
 import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -85,6 +87,28 @@ class E2eArchive(unittest.TestCase):
                 work = Path(directory)
                 (work / "target").mkdir()
                 self.assertNotEqual(run(compressor, work).returncode, 0)
+
+    def test_consumer_survives_a_tar_that_stops_at_the_end_marker(self):
+        # Some tars (macOS's; GNU tar too) exit at the end-of-archive marker
+        # without reading the rest of stdin. Bytes after the marker made a
+        # `zstd -d -c | tar -xf -` consumer fail with "Broken pipe".
+        payload = b"\x7fELF\x00cli fixture\xff"
+        for consumer in commands("Unpack the e2e binaries"):
+            with tempfile.TemporaryDirectory(prefix="e2e-trailing-") as directory:
+                work = Path(directory)
+                tar = work / "bundle.tar"
+                with tarfile.open(tar, "w") as bundle:
+                    info = tarfile.TarInfo("socket-patch")
+                    info.size, info.mode = len(payload), 0o755
+                    bundle.addfile(info, io.BytesIO(payload))
+                with tar.open("ab") as f:
+                    f.write(bytes(2 * 1024 * 1024))
+                archive_dir = work / "target/e2e-archive"
+                archive_dir.mkdir(parents=True)
+                subprocess.run(["zstd", "-q", str(tar), "-o", str(archive_dir / "e2e-bin.tar.zst")], check=True)
+                result = run(consumer, work)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((work / "target/e2e-bin/socket-patch").read_bytes(), payload)
 
     def test_corrupt_archive_fails_the_consumer_step(self):
         for consumer in commands("Unpack the e2e binaries"):

@@ -1335,3 +1335,199 @@ async fn yarn_berry_pin_takes_bin_from_the_served_tarball() {
         }
     }
 }
+
+/// #734 in memory: with no node_modules in the view, package.json's
+/// `packageManager` is the only pin. pnpm 9.15.9 gets its lock pinned and
+/// no root-only pnpm-workspace.yaml; pnpm 11 still gets the trust scaffold.
+#[tokio::test]
+async fn pnpm_9_pin_gets_no_root_only_workspace_in_memory() {
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    mount_api(
+        &server,
+        &patches_from_overrides(&dir.join("overrides.json"), None),
+    )
+    .await;
+    for (pin, scaffold) in [("9.15.9", false), ("11.0.0", true)] {
+        let mut files = fixture_files(&dir.join("input"));
+        files.insert(
+            "package.json".into(),
+            format!(r#"{{"name":"app","packageManager":"pnpm@{pin}"}}"#).into_bytes(),
+        );
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        let paths: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(paths.contains(&"pnpm-lock.yaml"), "{paths:?}");
+        assert_eq!(
+            paths.contains(&"pnpm-workspace.yaml"),
+            scaffold,
+            "{pin}: {paths:?}"
+        );
+        let warnings = project.redirect["warnings"].to_string();
+        assert_eq!(
+            warnings.contains("ERR_PNPM_ADDING_TO_ROOT"),
+            !scaffold,
+            "{warnings}"
+        );
+    }
+}
+
+/// #492 in memory: the lock of a `sharedWorkspaceLockfile: false` pnpm
+/// workspace member is demoted into the workspace root, which pins it and
+/// trusts it in its own pnpm-workspace.yaml (the only one pnpm reads),
+/// never in a nested scaffold. A project the root file does not list
+/// stays a standalone root. A member named alone as a project root is not
+/// pinned on its own; a warning names the workspace root to scan.
+#[tokio::test]
+async fn a_pnpm_workspace_member_lock_is_demoted_into_the_workspace_root_in_memory() {
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    mount_api(
+        &server,
+        &patches_from_overrides(&dir.join("overrides.json"), None),
+    )
+    .await;
+    let mut member = prefixed("packages/a", &fixture_files(&dir.join("input")));
+    member.insert("packages/a/package.json".into(), b"{}".to_vec());
+    for (globs, listed) in [("packages/*", true), ("tools/*", false)] {
+        let mut files = member.clone();
+        files.insert(
+            "pnpm-workspace.yaml".into(),
+            format!("packages:\n  - {globs}\nsharedWorkspaceLockfile: false\n").into_bytes(),
+        );
+        files.insert(
+            "pnpm-lock.yaml".into(),
+            b"lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n".to_vec(),
+        );
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let roots: Vec<&str> = output.projects.iter().map(|p| p.root.as_str()).collect();
+        let paths: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(
+            output.projects.iter().all(|p| p.error.is_none()),
+            "{:?}",
+            output.projects
+        );
+        assert!(paths.contains(&"packages/a/pnpm-lock.yaml"), "{paths:?}");
+        if listed {
+            assert_eq!(roots, [""]);
+            assert!(paths.contains(&"pnpm-workspace.yaml"), "{paths:?}");
+            assert!(
+                !paths.contains(&"packages/a/pnpm-workspace.yaml"),
+                "{paths:?}"
+            );
+        } else {
+            assert_eq!(roots, ["", "packages/a"]);
+            assert!(
+                paths.contains(&"packages/a/pnpm-workspace.yaml"),
+                "a standalone project gets its own file: {paths:?}"
+            );
+        }
+        // The trust auto-config off pins the lock without any scaffold.
+        let mut opts = options(false);
+        opts.trust_lockfile_config = Some(false);
+        let output = run_engine(&server, build_input(&files, &[], opts)).await;
+        let paths: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(paths, ["packages/a/pnpm-lock.yaml"]);
+
+        // The member named alone: its lock is the workspace root's.
+        let mut opts = options(false);
+        opts.project_roots = Some(vec!["packages/a".into()]);
+        let output = run_engine(&server, build_input(&files, &[], opts)).await;
+        let ignored = output
+            .warnings
+            .iter()
+            .any(|w| w.code == "pnpm_member_lock_ignored");
+        assert_eq!(ignored, listed, "{:?}", output.warnings);
+        assert_eq!(output.changed_files.is_empty(), listed);
+    }
+}
+
+/// Path selection fetches the nearest ancestor pnpm-workspace.yaml of a
+/// pnpm root that has none of its own, so the session can tell a member
+/// from a standalone project.
+#[test]
+fn selection_fetches_the_governing_pnpm_workspace_file() {
+    let blob = |path: &str| TreeEntryInput {
+        path: path.into(),
+        mode: "100644".into(),
+        kind: "blob".into(),
+        size: Some(10),
+    };
+    let entries = vec![
+        blob("pnpm-workspace.yaml"),
+        blob("packages/pnpm-workspace.yaml"),
+        blob("packages/a/pnpm-lock.yaml"),
+        blob("packages/a/package.json"),
+        blob("tools/b/pnpm-lock.yaml"),
+    ];
+    let s = select_paths(&entries, &SelectOptions::default());
+    assert!(
+        s.fetch_text
+            .iter()
+            .any(|p| p == "packages/pnpm-workspace.yaml"),
+        "{:?}",
+        s.fetch_text
+    );
+    assert!(
+        s.fetch_text.iter().any(|p| p == "pnpm-workspace.yaml"),
+        "{:?}",
+        s.fetch_text
+    );
+}
+
+/// #734 re-scan: a project pinned to pnpm 9.0–10.4 that still carries the
+/// root-only scaffold an earlier run created is told to delete it; a
+/// workspace file the user wrote (or one in a pnpm 11 project) is not.
+#[tokio::test]
+async fn a_leftover_root_only_scaffold_on_pnpm_9_is_flagged() {
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    mount_api(
+        &server,
+        &patches_from_overrides(&dir.join("overrides.json"), None),
+    )
+    .await;
+    let scaffold = "packages:\n  - '.'\ntrustLockfile: true\n";
+    let user = "packages:\n  - '.'\ncatalog: {}\ntrustLockfile: true\n";
+    for (pin, workspace, flagged) in [
+        ("9.15.9", scaffold, true),
+        ("9.15.9", user, false),
+        ("11.0.0", scaffold, false),
+    ] {
+        let mut files = fixture_files(&dir.join("input"));
+        files.insert(
+            "package.json".into(),
+            format!(r#"{{"name":"app","packageManager":"pnpm@{pin}"}}"#).into_bytes(),
+        );
+        files.insert("pnpm-workspace.yaml".into(), workspace.as_bytes().to_vec());
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        let warnings = project.redirect["warnings"].to_string();
+        assert_eq!(
+            warnings.contains("ERR_PNPM_ADDING_TO_ROOT"),
+            flagged,
+            "{pin} {workspace:?}: {warnings}"
+        );
+        assert!(
+            !output
+                .changed_files
+                .iter()
+                .any(|f| f.path == "pnpm-workspace.yaml"),
+            "the file is never rewritten or removed"
+        );
+    }
+}

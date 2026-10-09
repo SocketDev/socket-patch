@@ -13,7 +13,9 @@ use socket_patch_core::patch::rollback::{
     cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
     VerifyRollbackResult, VerifyRollbackStatus,
 };
-use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
+use socket_patch_core::telemetry::{
+    track_patch_rollback_failed, track_patch_rolled_back, TelemetryAuth,
+};
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
@@ -25,7 +27,9 @@ use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs};
 use crate::commands::hosted_unwind::run_hosted_leg;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
-use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls, JvmScope};
+use crate::ecosystem_dispatch::{
+    distinct_npm_copies, find_all_packages_for_rollback, partition_purls, JvmScope,
+};
 use crate::json_envelope::Command as EnvelopeCommand;
 use crate::looks_like_uuid;
 use crate::ui::{plural, StatusLine};
@@ -74,6 +78,19 @@ pub(crate) fn join_clauses(clauses: &[String]) -> String {
         [a, b] => format!("{a} and {b}"),
         [init @ .., last] => format!("{}, and {last}", init.join(", ")),
     }
+}
+
+/// The `hosted_state_not_preservable` run warning: a `--preserve-state`
+/// run (rollback or remove) restored hosted pins to upstream anyway — the
+/// lockfile pins are hosted mode's only record, so there is no local
+/// state to keep.
+pub(crate) fn hosted_state_not_preservable_warning() -> (String, String) {
+    (
+        "hosted_state_not_preservable".into(),
+        "hosted wiring has no preservable local state: the lockfile pins are the only \
+         record, and they now resolve upstream; re-run `scan --mode hosted` to re-wire"
+            .into(),
+    )
 }
 
 /// Capitalize the first character and end with `?`.
@@ -863,8 +880,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     let (telemetry_client, _) =
         get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let api_token = telemetry_client.api_token().cloned();
-    let org_slug = telemetry_client.org_slug().cloned();
+    let telemetry = TelemetryAuth::for_client(&telemetry_client);
 
     let manifest_path = args.common.resolved_manifest_path();
     let cwd = args.common.cwd.clone();
@@ -1037,18 +1053,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
         match read_manifest(&manifest_path).await {
             Ok(Some(m)) => m,
             Ok(None) => {
-                track_patch_rollback_failed(
-                    "Invalid manifest",
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_rollback_failed("Invalid manifest", &telemetry).await;
                 emit_rollback_error(args.common.json, "manifest_invalid", "Invalid manifest");
                 return 1;
             }
             Err(e) => {
                 let msg = e.to_string();
-                track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_rollback_failed(&msg, &telemetry).await;
                 emit_rollback_error(args.common.json, "manifest_unreadable", &msg);
                 return 1;
             }
@@ -1106,7 +1117,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 format!(" (to target a directory instead, use ./{id} or {id}/**)")
             };
             let msg = format!("No patch found matching identifier: {id}{hint}");
-            track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_rollback_failed(&msg, &telemetry).await;
             if args.common.json {
                 println!(
                     "{}",
@@ -1185,7 +1196,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                  identifier or an unscoped rollback)",
                 unmatched.1
             );
-            track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_rollback_failed(&msg, &telemetry).await;
             emit_rollback_error(args.common.json, "path_glob_no_match", &msg);
             return 1;
         }
@@ -1490,13 +1501,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 ));
             }
             if args.preserve_state && !hosted_leg.reverted.is_empty() {
-                run_warnings.push((
-                    "hosted_state_not_preservable".into(),
-                    "hosted wiring has no preservable local state: the lockfile pins are \
-                     the only record, and they now resolve upstream; re-run \
-                     `scan --mode hosted` to re-wire"
-                        .into(),
-                ));
+                run_warnings.push(hosted_state_not_preservable_warning());
             }
             if !path_scope.is_empty() {
                 let scope = path_scope.bind(&cwd);
@@ -1807,19 +1812,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             if success {
-                track_patch_rolled_back(
-                    rolled_back_count,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_rolled_back(rolled_back_count, &telemetry).await;
             } else {
-                track_patch_rollback_failed(
-                    "One or more rollbacks failed",
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_rollback_failed("One or more rollbacks failed", &telemetry).await;
             }
 
             if success {
@@ -1829,7 +1824,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_rollback_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_rollback_failed(&e, &telemetry).await;
             if args.common.json {
                 println!(
                     "{}",
@@ -2001,12 +1996,14 @@ pub(crate) async fn rollback_patches_inner(
     // one would leave the other copy still patched (silently divergent from
     // the manifest's rolled-back state). The rollback loop below restores
     // every copy.
-    let all_packages_multi = find_all_packages_for_rollback(
+    let mut all_packages_multi = find_all_packages_for_rollback(
         &partitioned,
         &crawler_options,
         common.silent || common.json,
     )
     .await;
+    // One restore per physical copy, as apply patches them (#633).
+    distinct_npm_copies(&mut all_packages_multi).await;
 
     // One representative path per PURL for the "is it installed" checks and
     // the abort envelope's path display. The before-blob gate and the
