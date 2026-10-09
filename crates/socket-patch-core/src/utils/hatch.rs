@@ -30,31 +30,35 @@ pub fn is_hatch(files: &BTreeMap<String, String>) -> bool {
 
 /// Whether the project's Hatch configuration locks environments (Hatch
 /// 1.17+: `lock-envs = true`, or an environment with `locked = true` or a
-/// `lock-filename`), in pyproject's `[tool.hatch]` or hatch.toml.
+/// `lock-filename`). Read the way Hatch merges its configuration: a
+/// hatch.toml TOP-LEVEL key replaces pyproject's `[tool.hatch]` key of the
+/// same name, so a hatch.toml `envs` table hides every pyproject
+/// environment and a hatch.toml `lock-envs` overrides pyproject's (the rule
+/// [`environment_specs`] applies to dependencies).
 fn locks_environments(files: &BTreeMap<String, String>) -> bool {
-    HATCH_FILES.into_iter().any(|file| {
-        let Some(document) = parsed(files, file) else {
-            return false;
-        };
-        let hatch = if file == HATCH_FILES[1] {
-            Some(document.as_item())
-        } else {
-            document.get("tool").and_then(|tool| tool.get("hatch"))
-        };
-        let Some(hatch) = hatch else {
-            return false;
-        };
-        hatch.get("lock-envs").and_then(Item::as_bool) == Some(true)
-            || hatch
-                .get("envs")
-                .and_then(Item::as_table_like)
-                .is_some_and(|envs| {
-                    envs.iter().any(|(_, env)| {
-                        env.get("locked").and_then(Item::as_bool) == Some(true)
-                            || env.get("lock-filename").is_some()
-                    })
+    let external = parsed(files, HATCH_FILES[1]);
+    let project = parsed(files, HATCH_FILES[0]);
+    let key = |name: &str| -> Option<Item> {
+        if let Some(item) = external.as_ref().and_then(|doc| doc.get(name)) {
+            return Some(item.clone());
+        }
+        project
+            .as_ref()
+            .and_then(|doc| doc.get("tool"))
+            .and_then(|tool| tool.get("hatch"))
+            .and_then(|hatch| hatch.get(name))
+            .cloned()
+    };
+    key("lock-envs").and_then(|item| item.as_bool()) == Some(true)
+        || key("envs")
+            .as_ref()
+            .and_then(Item::as_table_like)
+            .is_some_and(|envs| {
+                envs.iter().any(|(_, env)| {
+                    env.get("locked").and_then(Item::as_bool) == Some(true)
+                        || env.get("lock-filename").is_some()
                 })
-    })
+            })
 }
 
 /// Whether `path` is a PEP 751 lock Hatch derives from pyproject (#479):
@@ -558,6 +562,42 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #479 (Bugbot): Hatch merges hatch.toml over `[tool.hatch]` by
+    /// top-level key, so a shadowed `locked` / `lock-envs` does not make a
+    /// pylock Hatch-derived, and one set in hatch.toml does.
+    #[test]
+    fn hatch_lock_detection_follows_the_config_merge() {
+        let head = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\n";
+        let files = |pyproject: &str, hatch: Option<&str>| -> BTreeMap<String, String> {
+            let mut files =
+                BTreeMap::from([("pyproject.toml".to_string(), format!("{head}{pyproject}"))]);
+            if let Some(hatch) = hatch {
+                files.insert("hatch.toml".to_string(), hatch.to_string());
+            }
+            files
+        };
+        let locked = "\n[tool.hatch.envs.default]\nlocked = true\n";
+        assert!(is_hatch_lock(&files(locked, None), "pylock.toml"));
+        assert!(!is_hatch_lock(&files(locked, None), "uv.lock"));
+        // A hatch.toml `envs` table replaces pyproject's environments.
+        assert!(!is_hatch_lock(
+            &files(locked, Some("[envs.default]\ninstaller = \"uv\"\n")),
+            "pylock.toml"
+        ));
+        assert!(is_hatch_lock(
+            &files("", Some("[envs.test]\nlocked = true\n")),
+            "pylock.test.toml"
+        ));
+        // A hatch.toml `lock-envs` overrides pyproject's.
+        let lock_envs = "\n[tool.hatch]\nlock-envs = true\n";
+        assert!(is_hatch_lock(&files(lock_envs, None), "pylock.toml"));
+        assert!(!is_hatch_lock(
+            &files(lock_envs, Some("lock-envs = false\n")),
+            "pylock.toml"
+        ));
+        assert!(!is_hatch_lock(&files("", None), "pylock.toml"));
+    }
 
     fn files(text: &str) -> BTreeMap<String, String> {
         [("pyproject.toml".into(), text.into())]
