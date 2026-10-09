@@ -292,8 +292,9 @@ async fn keep_patched_cargo_copies(
                 "cargo_cache_patch_kept",
                 format!(
                     "kept {purl}: the project no longer resolves it, but its copy in the \
-                     shared Cargo registry cache is still patched; run `socket-patch \
-                     rollback {purl}` to restore that copy and drop the entry"
+                     shared Cargo registry cache is still patched (or could not be \
+                     read to tell); run `socket-patch rollback {purl}` to restore that \
+                     copy and drop the entry"
                 ),
             )
         })

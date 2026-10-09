@@ -30,9 +30,9 @@ pub fn crawl_covers_purl(purl: &str) -> bool {
 }
 
 /// Of `purls` (manifest keys), the Cargo ones whose agent-mode in-place
-/// patch is still on disk: a copy [`find_all_packages_for_rollback`]
-/// locates (`$CARGO_HOME/registry/src`, or a `cargo vendor` dir) with at
-/// least one patched file at its record's afterHash. Sorted.
+/// patch may still be on disk: a copy [`find_cargo_copies`] locates with at
+/// least one file at its record's afterHash, or one that cannot be read to
+/// tell (an I/O error, an unsafe key: kept fail-closed). Sorted.
 ///
 /// Cargo is the one ecosystem whose patched copy outlives the project's
 /// use of it: the registry cache is shared machine-wide and nothing
@@ -40,10 +40,8 @@ pub fn crawl_covers_purl(purl: &str) -> bool {
 /// stops locking it (#1278). Its manifest record holds the only
 /// before-blobs that can restore that copy, so callers about to drop the
 /// record must first restore the copy (`rollback`) or keep the record
-/// (`scan --prune`). Located the way rollback restores, not by the
-/// lock-scoped crawl, so a crate the lock no longer resolves is found.
-/// A vendored crate's committed copy under `.socket/vendor/` is never one
-/// of these locations.
+/// (`scan --prune`). A vendored crate's committed copy under
+/// `.socket/vendor/` is never one of these locations.
 pub async fn cargo_copies_still_patched<'a>(
     manifest: &socket_patch_core::manifest::schema::PatchManifest,
     purls: impl IntoIterator<Item = &'a String>,
@@ -60,8 +58,7 @@ pub async fn cargo_copies_still_patched<'a>(
     if cargo.is_empty() {
         return Vec::new();
     }
-    let partitioned = HashMap::from([(Ecosystem::Cargo, cargo)]);
-    let found = find_all_packages_for_rollback(&partitioned, options, true).await;
+    let found = find_cargo_copies(cargo, options).await;
     let mut patched = Vec::new();
     for (purl, paths) in &found {
         let Some(record) = manifest.patches.get(purl) else {
@@ -70,10 +67,14 @@ pub async fn cargo_copies_still_patched<'a>(
         'copies: for path in paths {
             for (file, info) in &record.files {
                 let v = verify_file_rollback(path, file, info, blobs_path).await;
-                if matches!(
-                    v.status,
-                    VerifyRollbackStatus::Ready | VerifyRollbackStatus::MissingBlob
-                ) {
+                let still = match v.status {
+                    VerifyRollbackStatus::Ready | VerifyRollbackStatus::MissingBlob => true,
+                    VerifyRollbackStatus::NotFound => !v.is_absent(),
+                    VerifyRollbackStatus::AlreadyOriginal | VerifyRollbackStatus::HashMismatch => {
+                        false
+                    }
+                };
+                if still {
                     patched.push(purl.clone());
                     break 'copies;
                 }
@@ -82,6 +83,36 @@ pub async fn cargo_copies_still_patched<'a>(
     }
     patched.sort();
     patched
+}
+
+/// Every copy of the Cargo `purls` that agent mode may have patched: the
+/// copies [`find_all_packages_for_rollback`] locates, plus — for a local
+/// project with a `cargo vendor` dir, whose crawl searches only that dir —
+/// the shared `$CARGO_HOME/registry/src` copies an earlier apply (before
+/// `cargo vendor`) may have patched.
+pub async fn find_cargo_copies(
+    purls: Vec<String>,
+    options: &CrawlerOptions,
+) -> HashMap<String, Vec<PathBuf>> {
+    let partitioned = HashMap::from([(Ecosystem::Cargo, purls)]);
+    let mut found = find_all_packages_for_rollback(&partitioned, options, true).await;
+    let local = !options.global && options.global_prefix.is_none();
+    if local && options.cwd.join("vendor").is_dir() {
+        let registry = CrawlerOptions {
+            cwd: options.cwd.clone(),
+            global: true,
+            global_prefix: None,
+        };
+        for (purl, paths) in find_all_packages_for_rollback(&partitioned, &registry, true).await {
+            let copies = found.entry(purl).or_default();
+            for path in paths {
+                if !copies.contains(&path) {
+                    copies.push(path);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Partition PURLs by ecosystem, filtering by the `--ecosystems` flag if set.

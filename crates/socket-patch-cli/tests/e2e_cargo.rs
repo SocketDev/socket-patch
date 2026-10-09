@@ -455,3 +455,67 @@ async fn sync_keeps_entry_whose_shared_cache_copy_is_still_patched() {
         "rolled-back entry kept: {m:#}"
     );
 }
+
+/// #1278 with a `cargo vendor` dir: the crawl then searches only
+/// `vendor/`, but an apply from before `cargo vendor` patched the shared
+/// registry copy, which must still keep its record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_keeps_shared_cache_entry_behind_a_cargo_vendor_dir() {
+    let server = start_proxy().await;
+    let proxy_url = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cwd = root.to_str().unwrap();
+
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let orig: &[u8] = b"pub fn fmt() {}\n";
+    let patched: &[u8] = b"pub fn fmt() {}\npub fn socket_patched() {}\n";
+    // The vendored (crawled) crate keeps the crawl non-empty.
+    let vendored = root.join("vendor/itoa");
+    std::fs::create_dir_all(&vendored).unwrap();
+    std::fs::write(
+        vendored.join("Cargo.toml"),
+        "[package]\nname = \"itoa\"\nversion = \"1.0.17\"\n",
+    )
+    .unwrap();
+    let registry = root.join(".cargo/registry/src/index.crates.io-test");
+    let itoa_old = fake_registry_crate(&registry, "itoa", "1.0.11", patched);
+
+    let socket = root.join(".socket");
+    let itoa = "pkg:cargo/itoa@1.0.11";
+    let manifest = serde_json::json!({ "patches": {
+        itoa: manifest_record(&socket, "12780000-0000-4000-8000-000000000003", orig, patched),
+    }});
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let out = run(
+        &["scan", "--json", "--sync", "--yes", "--cwd", cwd],
+        root,
+        &proxy_url,
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "scan --sync must exit 0:\n{stdout}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["gc"]["prunedManifestEntries"],
+        serde_json::json!([]),
+        "{json:#}"
+    );
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
+            .unwrap();
+    assert!(
+        m["patches"].get(itoa).is_some(),
+        "itoa entry dropped: {m:#}"
+    );
+    assert_eq!(std::fs::read(itoa_old.join("src/lib.rs")).unwrap(), patched);
+}
