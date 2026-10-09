@@ -1587,6 +1587,10 @@ fn failed_output_write_leaves_no_partial_document() {
             "pkg:npm/app@1.0.0",
         ]);
         if let Some(limit) = limit {
+            // The limit also caps a coverage build's exit-time `.profraw`
+            // write, and a truncated profile fails the coverage merge: send
+            // this run's profile to a device, which the limit does not cover.
+            cmd.env("LLVM_PROFILE_FILE", "/dev/null");
             // SAFETY: only async-signal-safe libc calls between fork and exec.
             unsafe {
                 cmd.pre_exec(move || {
