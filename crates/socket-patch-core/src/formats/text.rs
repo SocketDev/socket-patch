@@ -10,10 +10,13 @@
 //! rewrites the file must put it back. Exactly one BOM is encoding; a
 //! second one is content, as for every tool above.
 
+/// U+FEFF, the character a UTF-8 BOM decodes to.
+pub const BOM: char = '\u{feff}';
+
 /// `(bom, rest)`: a leading UTF-8 BOM split off (`""` when there is none),
 /// so an edit can read `rest` and restore `bom` byte-exact on write.
 pub fn split_bom(text: &str) -> (&'static str, &str) {
-    match text.strip_prefix('\u{feff}') {
+    match text.strip_prefix(BOM) {
         Some(rest) => ("\u{feff}", rest),
         None => ("", text),
     }
@@ -66,16 +69,9 @@ mod tests {
     /// on #905 step 3 (they are changed by open PRs). Drop a file when you
     /// move it onto the helpers above.
     const PENDING_INLINE_BOMS: &[&str] = &[
-        "crawlers/npm_crawler.rs",
-        "formats/pnpm/lines.rs",
-        "hosted/governing_root.rs",
         "patch/redirect/mod.rs",
-        "patch/redirect/npmrc.rs",
-        "patch/redirect/upstream/npm.rs",
         "patch/redirect/upstream/pypi.rs",
         "vendor/yarn_classic_lock.rs",
-        "vex/discover/npm.rs",
-        "vex/discover/pypi_other.rs",
         "vex/discover/yarn.rs",
     ];
 

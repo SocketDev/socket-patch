@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::npm_family::VLT_LOCK;
 use crate::formats::governing_locks::{npm_lock_files, NpmLockFamily};
+use crate::formats::text::strip_bom;
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
 use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
 use crate::utils::pnpm_workspace::governing_workspace_file;
@@ -611,7 +612,7 @@ fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<String>> {
             _ => {}
         }
     }
-    let text = vlt_json.strip_prefix('\u{feff}').unwrap_or(vlt_json);
+    let text = strip_bom(vlt_json);
     let doc: serde_json::Value = serde_json::from_str(text).ok()?;
     let field = doc.get("workspaces")?;
     let mut out = Vec::new();
@@ -627,9 +628,7 @@ fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<String>> {
 /// `nohoist` shape, Bun's catalogs shape). `None` when the field is absent
 /// or the manifest does not parse.
 fn workspace_patterns(package_json: &str) -> Option<Vec<String>> {
-    let text = package_json
-        .strip_prefix('\u{feff}')
-        .unwrap_or(package_json);
+    let text = strip_bom(package_json);
     let doc: serde_json::Value = serde_json::from_str(text).ok()?;
     let field = doc.get("workspaces")?;
     let list = match field {
@@ -1348,6 +1347,21 @@ mod tests {
             code(&tmp.path().join("apps/web"), "npm").await.as_deref(),
             Some(PNPM_LOCKFILE_ELSEWHERE)
         );
+    }
+
+    /// Both workspace readers skip one leading BOM (`formats::text`); a
+    /// second one is content, so the JSON does not parse.
+    #[test]
+    fn workspace_readers_read_past_one_bom_only() {
+        let json = r#"{"workspaces":["a/*"]}"#;
+        for bom in ["", "\u{feff}"] {
+            let text = format!("{bom}{json}");
+            assert_eq!(vlt_workspace_patterns(&text), Some(vec!["a/*".to_string()]));
+            assert_eq!(workspace_patterns(&text), Some(vec!["a/*".to_string()]));
+        }
+        let text = format!("\u{feff}\u{feff}{json}");
+        assert_eq!(vlt_workspace_patterns(&text), None);
+        assert_eq!(workspace_patterns(&text), None);
     }
 
     /// #942: vlt's `workspaces` in `vlt.json` is a string, an array or an
