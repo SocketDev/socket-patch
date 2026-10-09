@@ -1335,10 +1335,7 @@ mod tests {
             (".socket/vendor/.gitattributes", true),
             (".socket/vendor/gradle/g/a/maven-metadata.xml", true),
             (".socket/vendor/gradle/g/a/1/a-1.jar", false),
-            (
-                ".socket/vendor/gradle/g/a/1/socket-patch.vendor.json",
-                false,
-            ),
+            (".socket/vendor/gradle/g/a/1/socket-patch.vendor.json", false),
             (".socket/vendor/npm/u/left-pad-1.3.0.tgz", false),
             (".socket/manifest.json", false),
             ("packages/a/.socket/vendor/npm/u/a.tgz", false),
@@ -1440,16 +1437,10 @@ mod tests {
             if keep {
                 group.rollback_to(savepoint);
                 group.commit().await.unwrap();
-                assert!(
-                    unit.join("a.tgz").exists(),
-                    "a rolled-back removal is forgotten"
-                );
+                assert!(unit.join("a.tgz").exists(), "a rolled-back removal is forgotten");
             } else {
                 drop(group);
-                assert!(
-                    unit.join("a.tgz").exists(),
-                    "a dropped group deletes nothing"
-                );
+                assert!(unit.join("a.tgz").exists(), "a dropped group deletes nothing");
             }
         }
 
@@ -1458,14 +1449,8 @@ mod tests {
         remove_tree_and_prune(&unit, &socket).await.unwrap();
         group.commit().await.unwrap();
         assert!(!unit.exists());
-        assert!(
-            !socket.join("vendor").exists(),
-            "the emptied levels are pruned"
-        );
-        assert!(
-            socket.join("apply.lock").exists(),
-            "`.socket/` itself stays"
-        );
+        assert!(!socket.join("vendor").exists(), "the emptied levels are pruned");
+        assert!(socket.join("apply.lock").exists(), "`.socket/` itself stays");
     }
 
     /// A journal the commit had to create `.socket/vendor/` for (a hosted

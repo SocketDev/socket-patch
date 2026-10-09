@@ -1425,9 +1425,7 @@ mod tests {
     async fn detect_git_remote_handles_non_existent_start_path() {
         let dir = tempfile::tempdir().unwrap();
         let nonexistent = dir.path().join("does/not/exist");
-        assert!(detect_git_remote(&nonexistent, &mut Vec::new())
-            .await
-            .is_none());
+        assert!(detect_git_remote(&nonexistent, &mut Vec::new()).await.is_none());
     }
 
     /// B22: inside a submodule (`.git` is a `gitdir:` FILE), the product is

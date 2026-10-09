@@ -78,9 +78,9 @@ use crate::rollout::stage::{
     classify, lookup_incomplete, mark_pinned, offers_from_results, Offers, RecordedIndex, Row,
     Stage, ROLLOUT_DEFERRED,
 };
-use crate::utils::purl_key::PurlKey;
 use discover::Provider;
 use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
+use crate::utils::purl_key::PurlKey;
 
 /// `"<crate version>+<git sha or 'unknown'>"`; the sha comes from the
 /// `SOCKET_PATCH_GIT_SHA` build-time variable.
@@ -711,9 +711,8 @@ async fn engine(
     let candidates =
         roots::pnpm_member_candidates(&root_list, |path| files.contains_key(path), ecosystems);
     let pnpm_members = confirm_pnpm_members(&files, candidates.clone(), admitted).await;
-    let other_marker = |root: &str| {
-        roots::has_other_root_marker(root, files.keys().map(String::as_str), ecosystems)
-    };
+    let other_marker =
+        |root: &str| roots::has_other_root_marker(root, files.keys().map(String::as_str), ecosystems);
     if !explicit_roots {
         root_list.retain(|root| {
             !pnpm_members.iter().any(|(member, _)| member == root) || other_marker(root)

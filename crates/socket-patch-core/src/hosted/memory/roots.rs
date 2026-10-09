@@ -295,23 +295,11 @@ mod tests {
         );
         let mut own = paths.to_vec();
         own.push("packages/a/yarn.lock");
-        assert!(has_other_root_marker(
-            "packages/a",
-            own.iter().copied(),
-            None
-        ));
+        assert!(has_other_root_marker("packages/a", own.iter().copied(), None));
         let cargo = ["cargo".to_string()];
-        assert!(!has_other_root_marker(
-            "packages/a",
-            own.iter().copied(),
-            Some(&cargo)
-        ));
+        assert!(!has_other_root_marker("packages/a", own.iter().copied(), Some(&cargo)));
         own.push("packages/a/Cargo.lock");
-        assert!(has_other_root_marker(
-            "packages/a",
-            own.iter().copied(),
-            Some(&cargo)
-        ));
+        assert!(has_other_root_marker("packages/a", own.iter().copied(), Some(&cargo)));
     }
 
     fn roots(paths: &[&str]) -> Vec<String> {
