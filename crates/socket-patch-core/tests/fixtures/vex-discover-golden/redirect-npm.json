@@ -6075,6 +6075,14 @@
         "file": "package-lock.json",
         "other": "vlt-lock.json"
       }
+    ],
+    "shadowed": [
+      {
+        "purl": "pkg:npm/ms@2.1.3",
+        "uuid": "22222222-2222-4222-8222-222222222222",
+        "mode": "hosted",
+        "source_file": "package-lock.json"
+      }
     ]
   },
   "redirect/npm/vlt/sibling-package-lock-vlt-installed/input": {

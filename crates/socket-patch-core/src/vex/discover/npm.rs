@@ -153,6 +153,7 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid,
                     ),
                 );
+                out.shadow(r.clone());
                 continue;
             }
             if let Some(location) = lock.unwired.get(&r.purl) {
@@ -168,6 +169,7 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid,
                     ),
                 );
+                out.shadow(r.clone());
                 continue;
             }
             let contested_by = locks.iter().enumerate().find(|(j, other)| {
@@ -186,6 +188,7 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid, other.file, NPM_LOCKS[0], NPM_LOCKS[1],
                     ),
                 );
+                out.shadow(r.clone());
             } else if let Some(other) = locks
                 .iter()
                 .enumerate()
@@ -205,6 +208,7 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid, other.file, NPM_LOCKS[0], NPM_LOCKS[1],
                     ),
                 );
+                out.shadow(r.clone());
             } else {
                 out.push(r.clone());
             }
@@ -323,6 +327,7 @@ fn drop_mirror_unwired(
                 r.purl, r.uuid
             ),
         );
+        out.shadow(r.clone());
         false
     });
 }
@@ -380,6 +385,7 @@ fn drop_non_registry_installs(
                 r.purl
             ),
         );
+        out.shadow(r.clone());
         false
     });
 }
@@ -1774,6 +1780,124 @@ mod tests {
             "{:#?}",
             out.diagnostics
         );
+    }
+
+    /// REGRESSION (#1195): every rule that withholds a ref over an unpatched
+    /// copy beside it (another entry of the same lock, a bundled copy, the
+    /// npm twin lock resolving it elsewhere or not at all, a pnpm `file:`
+    /// copy; another manager's lock is the vlt golden's
+    /// `sibling-package-lock-vlt` case) keeps the ref in `shadowed`, so the
+    /// rollout's recorded view (`HostedPin::recorded`) still reads the
+    /// patch as the project's while the attributable pins
+    /// (`HostedPin::all`) and attestation do not. A wired lock with no
+    /// stray copy shadows nothing.
+    #[tokio::test]
+    async fn issue_1195_withheld_refs_stay_recorded_pins() {
+        use crate::patch::redirect::upstream::HostedPin;
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let wired = serde_json::json!({ "version": "1.3.0", "resolved": hosted, "integrity": SRI });
+        let upstream = serde_json::json!({ "version": "1.3.0", "resolved": registry, "integrity": "sha512-ORIG" });
+        let pnpm_wired = format!(
+            "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@1.3.0:\n    \
+             resolution: {{integrity: {SRI}, tarball: {hosted}}}\n\n"
+        );
+        let pnpm_file = "  left-pad@file:forks/left-pad:\n    \
+                         resolution: {directory: forks/left-pad, type: directory}\n\n";
+        let pinned_lock = lock_with_packages(serde_json::json!({ "node_modules/left-pad": wired }));
+        let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+            (
+                "npm: alias of the same version in the same lock",
+                vec![(
+                    "package-lock.json",
+                    lock_with_packages(serde_json::json!({
+                        "node_modules/left-pad": wired,
+                        "node_modules/lp": {
+                            "name": "left-pad", "version": "1.3.0",
+                            "resolved": registry, "integrity": "sha512-ORIG"
+                        },
+                    })),
+                )],
+            ),
+            (
+                "bundled copy",
+                vec![(
+                    "package-lock.json",
+                    lock_with_packages(serde_json::json!({
+                        "node_modules/left-pad": wired,
+                        "node_modules/bund/node_modules/left-pad": {
+                            "version": "1.3.0", "inBundle": true,
+                        },
+                    })),
+                )],
+            ),
+            (
+                "twin lock resolving it from the registry",
+                vec![
+                    ("package-lock.json", pinned_lock.clone()),
+                    (
+                        "npm-shrinkwrap.json",
+                        lock_with_packages(
+                            serde_json::json!({ "node_modules/left-pad": upstream }),
+                        ),
+                    ),
+                ],
+            ),
+            (
+                "twin lock without the package",
+                vec![
+                    ("package-lock.json", pinned_lock.clone()),
+                    (
+                        "npm-shrinkwrap.json",
+                        lock_with_packages(serde_json::json!({})),
+                    ),
+                ],
+            ),
+            (
+                "pnpm file: copy in the same lock",
+                vec![
+                    ("pnpm-lock.yaml", format!("{pnpm_wired}{pnpm_file}")),
+                    (
+                        "forks/left-pad/package.json",
+                        r#"{"name":"left-pad","version":"1.3.0"}"#.to_string(),
+                    ),
+                ],
+            ),
+        ];
+        let pin = HostedPin {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            uuid: UUID_A.into(),
+            files: Vec::new(),
+        };
+        let pairs = |pins: Vec<HostedPin>| -> Vec<(String, String)> {
+            pins.into_iter().map(|p| (p.purl, p.uuid)).collect()
+        };
+        for (case, files) in cases {
+            let p = Project::new();
+            for (file, text) in &files {
+                p.write(file, text);
+            }
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            assert!(HostedPin::all(&out).is_empty(), "{case}");
+            assert_eq!(
+                pairs(HostedPin::recorded(&out)),
+                [(pin.purl.clone(), pin.uuid.clone())],
+                "{case}: {:#?}",
+                out.diagnostics
+            );
+        }
+
+        // Control: the pin alone is attributable and shadows nothing.
+        let p = Project::new();
+        p.write("package-lock.json", pinned_lock);
+        let out = run(&p).await;
+        assert!(out.shadowed.is_empty(), "{:#?}", out.shadowed);
+        assert_eq!(
+            pairs(HostedPin::all(&out)),
+            pairs(HostedPin::recorded(&out))
+        );
+        assert_eq!(pairs(HostedPin::all(&out)), [(pin.purl, pin.uuid)]);
     }
 
     /// #490: a git edge the project's `overrides` send to the registry is

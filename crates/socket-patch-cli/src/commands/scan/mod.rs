@@ -1917,10 +1917,18 @@ async fn run_scan(
     let hosted_state = (!args.common.is_global())
         .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
     let redirect_state = hosted_state.as_ref();
-    let hosted_pins: Vec<(String, String)> = hosted_pin_list
-        .iter()
-        .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
-        .collect();
+    // The recorded view also counts the pins discovery withheld over an
+    // unpatched copy beside them (`HostedPin::recorded`): still this
+    // project's patch, so a capped re-scan reads ALREADY and rewires the
+    // copy instead of deferring it as NEW (#1195).
+    let hosted_pins: Vec<(String, String)> = if args.common.is_global() {
+        Vec::new()
+    } else {
+        socket_patch_core::patch::redirect::upstream::HostedPin::recorded(ctx.discovery().await)
+            .into_iter()
+            .map(|pin| (pin.purl, pin.uuid))
+            .collect()
+    };
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest,
         vendor_state.as_ref().ok().filter(|_| project_state),

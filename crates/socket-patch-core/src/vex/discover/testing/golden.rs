@@ -130,6 +130,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
         install_trees,
         read: _,
         withheld: _,
+        shadowed,
         // Already folded into `unattested` by the time a run returns.
         unwired_copies: _,
     } = out;
@@ -297,6 +298,20 @@ fn render(out: &Discovery, root: &Path) -> Value {
                     "mode": mode(*m),
                     "file": path_str(file),
                     "other": path_str(other),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    if !shadowed.is_empty() {
+        rendered["shadowed"] = shadowed
+            .iter()
+            .map(|r| {
+                json!({
+                    "purl": r.purl,
+                    "uuid": r.uuid,
+                    "mode": mode(r.mode),
+                    "source_file": path_str(&r.source_file),
                 })
             })
             .collect::<Vec<_>>()

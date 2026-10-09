@@ -555,6 +555,16 @@ pub struct Discovery {
     pub unwired_copies: Vec<UnwiredCopy>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
+    /// Every ref dropped from `refs` because an unpatched copy of the same
+    /// `name@version` installs beside it (the npm pair, same-lock and
+    /// bundled rules, [`Discovery::contest_within_locks`],
+    /// [`Discovery::contest_across_locks`]). Never attested, but still a
+    /// pin a live lock records: the rollout's recorded view counts it
+    /// ([`HostedPin::recorded`]), so a re-scan that rewires the stray copy
+    /// is not capped as NEW (#1195). Sorted like `refs`.
+    ///
+    /// [`HostedPin::recorded`]: crate::patch::redirect::upstream::HostedPin::recorded
+    pub shadowed: Vec<PatchedRef>,
     /// The bundled copies (purl → root-relative directory) the vlt
     /// extractor found in the installed store for the lock's nodes, exactly
     /// as [`crate::vendor::vlt_bundled::bundled_copies`] reports them: the
@@ -792,10 +802,17 @@ impl Discovery {
                             r.purl, r.uuid, c.key, c.how
                         ),
                     );
+                    self.shadow(r);
                 }
                 None => self.refs.push(r),
             }
         }
+    }
+
+    /// Record a ref dropped from `refs` over an unpatched copy beside it
+    /// ([`Discovery::shadowed`]).
+    pub(crate) fn shadow(&mut self, r: PatchedRef) {
+        self.shadowed.push(r);
     }
 
     /// Drop every ref that ANOTHER lock contests: a lock that resolves the
@@ -863,6 +880,7 @@ impl Discovery {
                     other.display()
                 ),
             );
+            self.shadow(r);
         }
     }
 
@@ -1018,15 +1036,17 @@ impl Discovery {
         self.unattested.dedup();
         self.contested.sort();
         self.contested.dedup();
-        self.refs.sort_by(|a, b| {
-            (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
-                &b.source_file,
-                &b.purl,
-                &b.uuid,
-                b.mode,
-            ))
-        });
-        self.refs.dedup();
+        for refs in [&mut self.refs, &mut self.shadowed] {
+            refs.sort_by(|a, b| {
+                (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
+                    &b.source_file,
+                    &b.purl,
+                    &b.uuid,
+                    b.mode,
+                ))
+            });
+            refs.dedup();
+        }
         self.diagnostics
             .sort_by(|a, b| (&a.file, a.code, &a.detail).cmp(&(&b.file, b.code, &b.detail)));
         self.recognized.sort();
