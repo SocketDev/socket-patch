@@ -257,15 +257,39 @@ pub fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) 
         (true, true) => "`trustLockfile: true` would be written to a new",
         (false, true) => "`trustLockfile: true` would be merged into the existing",
     };
+    let undo = format!("delete {PNPM_WORKSPACE_REL}");
+    trust_configured_detail(server, how, created.then_some(undo.as_str()), dry_run)
+}
+
+/// The auto-config variant for an existing pnpm-workspace.yaml with no keys
+/// ([`TrustPlan::Scaffold`]): the trust key went in with the root-only
+/// `packages` field, which makes the project a root-only workspace just as
+/// a created file does.
+pub fn pnpm_trust_scaffolded_detail(server: &str, dry_run: bool) -> String {
+    let how = if dry_run {
+        "`trustLockfile: true` (with the root-only `packages: ['.']` that pnpm \
+         8–10.4 require once the file holds a key) would be merged into the existing"
+    } else {
+        "`trustLockfile: true` (with the root-only `packages: ['.']` that pnpm \
+         8–10.4 require once the file holds a key) was merged into the existing"
+    };
+    let undo =
+        format!("remove the added `packages` and `trustLockfile` lines from {PNPM_WORKSPACE_REL}");
+    trust_configured_detail(server, how, Some(&undo), dry_run)
+}
+
+/// `undo` (set when the edit made the project a root-only workspace) names
+/// how to take the edit back.
+fn trust_configured_detail(server: &str, how: &str, undo: Option<&str>, dry_run: bool) -> String {
     // A created file makes the project a root-only workspace, where pnpm
     // 9.0–10.4 refuse `pnpm add` without `-w` (#734); a project pinned to
     // those releases never gets one, so the note names the pin as the way
     // out for an unpinned project with no install record.
-    let root_only = if created {
+    let root_only = if let Some(undo) = undo {
         let then = if dry_run {
             "before the real run".to_string()
         } else {
-            format!("then delete {PNPM_WORKSPACE_REL} and re-run")
+            format!("then {undo} and re-run")
         };
         format!(
             " On pnpm 9.0–10.4 a root-only workspace needs `pnpm add -w <pkg>` \
@@ -318,6 +342,13 @@ pub enum TrustPlan {
     /// Workspace file exists without a `trustLockfile:` key: append exactly
     /// one line after the last non-empty line, every other byte preserved.
     Append(String),
+    /// Workspace file exists but holds no key at all (empty, comments only,
+    /// bare document markers — "no workspace" to pnpm): the root-only
+    /// `packages` scaffold goes in with the trust key, since pnpm 8.x–10.4
+    /// refuse a workspace file holding a key but no `packages` (#1096).
+    /// Every user byte is preserved, so rollback can take both back out
+    /// ([`TRUST_SCAFFOLD_LINES`]).
+    Scaffold(String),
     /// Already `trustLockfile: true` — nothing to write.
     AlreadyTrue,
     /// The user explicitly set `trustLockfile: <value>` (non-true). Their
@@ -330,6 +361,15 @@ pub enum TrustPlan {
     Unsupported(String),
 }
 
+/// The lines the trust auto-config writes into a file with no keys (and,
+/// newline-terminated, the whole file it creates): the root-only `packages`
+/// scaffold and the trust key.
+pub const TRUST_SCAFFOLD_LINES: [&str; 3] = [
+    crate::formats::pnpm::workspace::PACKAGES_SCAFFOLD[0],
+    crate::formats::pnpm::workspace::PACKAGES_SCAFFOLD[1],
+    "trustLockfile: true",
+];
+
 /// Decide how to ensure `trustLockfile: true` in pnpm-workspace.yaml.
 /// Line splices only (never a YAML library), mirroring the vendor backend's
 /// workspace surgery: untouched lines stay byte-identical, so a revert can
@@ -340,6 +380,11 @@ pub fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
         return TrustPlan::Create("packages:\n  - '.'\ntrustLockfile: true\n".to_string());
     };
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    if crate::formats::pnpm::workspace::is_keyless(text) {
+        let anchor = block_insert_point(&lines).unwrap_or(lines.len());
+        lines.splice(anchor..anchor, TRUST_SCAFFOLD_LINES.map(str::to_string));
+        return TrustPlan::Scaffold(lines.join("\n"));
+    }
     // Where the key would go — refused when the document is not a single
     // block mapping, so the scan for an existing key below is meaningful.
     let anchor = match block_insert_point(&lines) {

@@ -116,8 +116,46 @@ pub(crate) fn block_insert_point(lines: &[String]) -> Result<usize, String> {
     Ok(match (last, end_marker) {
         (Some(i), _) => i + 1,
         (None, Some(end)) => end,
-        (None, None) => lines.len(),
+        // Blank lines only: the new key opens the file, so its trailing
+        // newlines stay where they are.
+        (None, None) => 0,
     })
+}
+
+/// The root-only `packages:` list a splice writes into a workspace file
+/// that has none (pnpm 8.x–10.4 refuse a workspace file holding any key but
+/// no `packages`), in the vendor and hosted scaffold spelling.
+pub(crate) const PACKAGES_SCAFFOLD: [&str; 2] = ["packages:", "  - '.'"];
+
+/// Whether a pnpm-workspace.yaml holds no key at all: every line is blank,
+/// a comment, a `%` directive or a bare `---` / `...` marker. pnpm parses
+/// such a file to an empty document and installs as if it did not exist,
+/// but pnpm 8.x–10.4 refuse every command once it holds a key without a
+/// `packages` field ("packages field missing or empty", #1096), so a splice
+/// that gives it its first key must give it [`PACKAGES_SCAFFOLD`] too.
+pub(crate) fn is_keyless(text: &str) -> bool {
+    strip_bom(text).split('\n').all(|raw| {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let trimmed = line.trim();
+        trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || line.starts_with('%')
+            || ((is_marker(line, "---") || is_marker(line, "..."))
+                && strip_comment(&line[3..]).trim().is_empty())
+    })
+}
+
+/// `text` with the contiguous run of lines `block` removed, when that
+/// leaves a [`is_keyless`] document: the inverse of a splice that gave a
+/// keyless file its first keys. `None` when the run is absent or the rest
+/// of the file holds keys (the lines are then not provably the splice).
+pub(crate) fn strip_keyless_splice(text: &str, block: &[&str]) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let at = lines.windows(block.len()).position(|w| w == block)?;
+    let mut rest = lines;
+    rest.drain(at..at + block.len());
+    let rest = rest.join("\n");
+    is_keyless(&rest).then_some(rest)
 }
 
 /// The top-level `name:` section holding a block mapping: `(header, end)`,
@@ -422,6 +460,46 @@ mod tests {
     }
 
     #[test]
+    fn keyless_documents_and_their_splices() {
+        for text in [
+            "",
+            "\n",
+            "# c\n\n  # indented\n",
+            "---\n",
+            "--- # start\n",
+            "%YAML 1.2\n---\n",
+            "---\n...\n",
+            "\u{feff}# bom\r\n",
+        ] {
+            assert!(is_keyless(text), "{text:?}");
+        }
+        for text in ["a: 1\n", "# c\npackages: []\n", "--- {}\n", "- a\n", "~\n"] {
+            assert!(!is_keyless(text), "{text:?}");
+        }
+        let block = ["packages:", "  - '.'", "trustLockfile: true"];
+        assert_eq!(
+            strip_keyless_splice("# c\npackages:\n  - '.'\ntrustLockfile: true\n", &block),
+            Some("# c\n".to_string())
+        );
+        assert_eq!(
+            strip_keyless_splice(
+                "---\npackages:\n  - '.'\ntrustLockfile: true\n...\n",
+                &block
+            ),
+            Some("---\n...\n".to_string())
+        );
+        assert_eq!(
+            strip_keyless_splice(
+                "packages:\n  - '.'\ntrustLockfile: true\ncatalog: {}\n",
+                &block
+            ),
+            None,
+            "other keys: not provably the splice"
+        );
+        assert_eq!(strip_keyless_splice("# c\n", &block), None);
+    }
+
+    #[test]
     fn block_insert_point_follows_the_document() {
         assert_eq!(block_insert_point(&lines("a: 1\nb:\n  - c\n")), Ok(3));
         assert_eq!(block_insert_point(&lines("a: 1\n\n# tail\n\n")), Ok(3));
@@ -429,7 +507,8 @@ mod tests {
         assert_eq!(block_insert_point(&lines("a: 1\n\n...\n# done\n")), Ok(1));
         assert_eq!(block_insert_point(&lines("%YAML 1.2\n---\na: 1\n")), Ok(3));
         assert_eq!(block_insert_point(&lines("# only a comment\n")), Ok(1));
-        assert_eq!(block_insert_point(&lines("")), Ok(1));
+        assert_eq!(block_insert_point(&lines("")), Ok(0));
+        assert_eq!(block_insert_point(&lines("\n\n")), Ok(0));
         for text in [
             "{a: 1}\n",
             "[a]\n",

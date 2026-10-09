@@ -310,12 +310,13 @@ impl NpmLockBackend for PnpmBackend {
 
         // Only modern locks mirror overrides into pnpm-workspace.yaml.
         // Legacy pnpm reads package.json alone; creating a workspace changes
-        // its mode. So does a project with no workspace file pinned to pnpm
-        // 9.0–10.4: those read package.json `pnpm.overrides` (wired above)
+        // its mode. So does a project with no workspace file (or one with no
+        // keys, which pnpm reads the same, #1096) pinned to pnpm 9.0–10.4: those read package.json `pnpm.overrides` (wired above)
         // and refuse `pnpm add` in the root-only workspace a created file
         // would make (#734). A later run on pnpm >= 10.5 adds the mirror.
         let ws_edit = if dialect == PnpmDialect::V9
-            && !(ws_text.is_none() && pinned_pre_10_5(project_root, &pkg_bytes).await)
+            && !(ws_text.as_deref().is_none_or(workspace::is_keyless)
+                && pinned_pre_10_5(project_root, &pkg_bytes).await)
         {
             apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring)
                 .map_err(|e| format!("{PNPM_WORKSPACE} surgery failed: {e}"))?
@@ -371,6 +372,7 @@ impl NpmLockBackend for PnpmBackend {
                 created_pnpm_table,
                 created_workspace_file: ws_edit.created_file,
                 created_workspace_overrides: ws_edit.created_overrides,
+                created_workspace_packages: ws_edit.created_packages,
             }),
             ..NpmCommit::default()
         }))
@@ -1101,18 +1103,20 @@ pub(super) async fn revert_pnpm_dialect(
     if let Some(rec) = entry.wiring.iter().find(|r| {
         dialect == PnpmDialect::V9 && r.file == PNPM_WORKSPACE && r.kind == KIND_WS_OVERRIDE
     }) {
-        let (created_file, created_overrides) = match &entry.pnpm {
+        let (created_file, created_overrides, created_packages) = match &entry.pnpm {
             Some(meta) => (
                 meta.created_workspace_file,
                 meta.created_workspace_overrides,
+                meta.created_workspace_packages,
             ),
-            None => (false, false),
+            None => (false, false, false),
         };
         if let Err(e) = revert_workspace(
             project_root,
             rec,
             created_file,
             created_overrides,
+            created_packages,
             &entry.uuid,
             &mut outcome.warnings,
         )
@@ -1144,6 +1148,7 @@ async fn revert_workspace(
     rec: &WiringRecord,
     created_file: bool,
     created_overrides: bool,
+    created_packages: bool,
     entry_uuid: &str,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(), String> {
@@ -1198,6 +1203,15 @@ async fn revert_workspace(
     revert_ws_record(&mut lines, rec, entry_uuid, &mut dirty, warnings);
     if dirty && created_overrides {
         remove_empty_ws_overrides_section(&mut lines);
+        // The `packages` scaffold added to a file with no keys (#1096)
+        // goes once it is the file's only key again.
+        if created_packages && ws_overrides_section(&lines).is_none() {
+            if let Some(original) =
+                workspace::strip_keyless_splice(&lines.join("\n"), &workspace::PACKAGES_SCAFFOLD)
+            {
+                lines = split_lines(&original);
+            }
+        }
     }
     if dirty {
         atomic_write_bytes_preserving_mode(&path, lines.join("\n").as_bytes())
@@ -1985,6 +1999,9 @@ struct WorkspaceEdit {
     /// We created the `overrides:` section in a pre-existing file (revert
     /// removes just that section once emptied).
     created_overrides: bool,
+    /// We added the root-only `packages:` scaffold to a pre-existing file
+    /// that had no keys (#1096; revert removes it with the section).
+    created_packages: bool,
 }
 
 /// Locate the top-level `overrides:` block (any key spelling pnpm reads:
@@ -2082,6 +2099,7 @@ fn apply_workspace_override(
             new_text: Some(ws_scaffold_text(our_key, spec)),
             created_file: true,
             created_overrides: false,
+            created_packages: false,
         });
     };
     let mut lines = split_lines(text);
@@ -2107,6 +2125,7 @@ fn apply_workspace_override(
                     new_text: None,
                     created_file: false,
                     created_overrides: false,
+                    created_packages: false,
                 });
             }
             // Ours (stale uuid, no original) or the user's exact-version pin
@@ -2126,6 +2145,7 @@ fn apply_workspace_override(
             new_text: Some(lines.join("\n")),
             created_file: false,
             created_overrides: false,
+            created_packages: false,
         });
     }
 
@@ -2135,18 +2155,27 @@ fn apply_workspace_override(
     // bytes stay put).
     let anchor = workspace::block_insert_point(&lines)
         .map_err(|why| format!("{PNPM_WORKSPACE} {why}; the overrides section cannot be added"))?;
+    // A file with no keys is "no workspace" to pnpm, but pnpm 8.x–10.4
+    // refuse one holding a key without `packages` (#1096): the root-only
+    // scaffold goes in first, as in a created file.
+    let created_packages = workspace::is_keyless(text);
+    let scaffold = created_packages
+        .then_some(workspace::PACKAGES_SCAFFOLD.map(str::to_string))
+        .into_iter()
+        .flatten();
     lines.splice(
         anchor..anchor,
-        [
+        scaffold.chain([
             "overrides:".to_string(),
             format!("  {}: {spec}", yaml_key(our_key)),
-        ],
+        ]),
     );
     wiring.push(ws_record(our_key, spec, WiringAction::Added, None));
     Ok(WorkspaceEdit {
         new_text: Some(lines.join("\n")),
         created_file: false,
         created_overrides: true,
+        created_packages,
     })
 }
 
@@ -6432,6 +6461,62 @@ snapshots:
         assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
         assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
         assert!(!ws_exists(&fx).await);
+    }
+
+    /// #1096: a pnpm-workspace.yaml with no keys (empty, comments only,
+    /// bare document markers) is "no workspace" to pnpm, but pnpm 8.x–10.4
+    /// refuse every command once it holds a key without `packages`. The
+    /// override mirror therefore brings the root-only `packages` scaffold
+    /// with it, and revert takes both back out byte for byte. A project
+    /// pinned to pnpm 9.0–10.4 gets no workspace edit at all (#734).
+    #[tokio::test]
+    async fn keyless_workspace_file_gains_the_packages_scaffold_with_the_override() {
+        for user_ws in [
+            "",
+            "\n",
+            "# pnpm settings go here\n",
+            "---\n",
+            "%YAML 1.2\n---\n",
+            "---\n...\n",
+        ] {
+            let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+            write_ws(&fx, user_ws).await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            let spec = format!("file:{}", fx.rel_tgz());
+            let ws = fx.read(PNPM_WORKSPACE).await;
+            assert_eq!(
+                workspace::read_package_globs(&ws),
+                Ok(Some(vec![".".to_string()])),
+                "{user_ws:?} -> {ws:?}"
+            );
+            assert!(
+                ws.contains(&format!("overrides:\n  left-pad@1.3.0: {spec}\n")),
+                "{ws:?}"
+            );
+            let meta = entry.pnpm.as_ref().unwrap();
+            assert!(meta.created_workspace_packages && !meta.created_workspace_file);
+
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(fx.read(PNPM_WORKSPACE).await, user_ws, "byte-exact revert");
+        }
+
+        // Pinned to pnpm 10.4.1: the keyless file is left alone (#734).
+        let pinned_pkg =
+            P1_BEFORE_PKG.replacen("{\n", "{\n  \"packageManager\": \"pnpm@10.4.1\",\n", 1);
+        let fx = fixture_with(&pinned_pkg, P1_BEFORE_LOCK).await;
+        write_ws(&fx, "# pnpm settings go here\n").await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry
+            .unwrap()
+            .wiring
+            .iter()
+            .all(|r| r.file != PNPM_WORKSPACE));
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, "# pnpm settings go here\n");
     }
 
     /// The #734 gate stays closed on pnpm >= 10.5, and on any pin that does

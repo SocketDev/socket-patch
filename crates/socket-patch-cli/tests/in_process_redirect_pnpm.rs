@@ -406,6 +406,90 @@ async fn hosted_trust_edit_reads_the_workspace_yaml_shape() {
     }
 }
 
+/// #1096: a pnpm-workspace.yaml with no keys at all (empty, comments only,
+/// bare document markers) is a "no workspace" file to pnpm, but pnpm
+/// 8.x–10.4 refuse every command once it holds a key without `packages`
+/// ("packages field missing or empty"). The trust edit therefore splices in
+/// the root-only `packages` scaffold with the trust key, and `rollback`
+/// takes both back out, restoring the user's file byte for byte. A project
+/// pinned to pnpm 9.0–10.4 gets no edit at all, as with no file (#734).
+#[tokio::test]
+#[serial]
+async fn hosted_trust_edit_scaffolds_packages_in_a_keyless_workspace_yaml() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    const ADDED: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+    for (user_ws, want) in [
+        (
+            "# pnpm settings go here\n",
+            format!("# pnpm settings go here\n{ADDED}"),
+        ),
+        ("\n", format!("{ADDED}\n")),
+        ("---\n", format!("---\n{ADDED}")),
+        ("%YAML 1.2\n---\n", format!("%YAML 1.2\n---\n{ADDED}")),
+        ("---\n...\n", format!("---\n{ADDED}...\n")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        let ws_path = tmp.path().join("pnpm-workspace.yaml");
+        std::fs::write(&ws_path, user_ws).unwrap();
+
+        let code = run(hosted_args(tmp.path(), server.uri())).await;
+        assert_eq!(code, 0, "scan --mode hosted should succeed for {user_ws:?}");
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            want,
+            "a keyless workspace file gains the packages scaffold too ({user_ws:?})"
+        );
+
+        let code = rollback_hosted(tmp.path(), &server).await;
+        assert_eq!(
+            code, 0,
+            "rollback must restore the pnpm pin for {user_ws:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            user_ws,
+            "rollback restores the keyless workspace file byte for byte"
+        );
+    }
+
+    // An empty file reads as the created scaffold, which rollback deletes
+    // (pnpm reads an empty file and no file alike).
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(&ws_path, "").unwrap();
+    assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(std::fs::read_to_string(&ws_path).unwrap(), ADDED);
+    assert_eq!(rollback_hosted(tmp.path(), &server).await, 0);
+    assert!(
+        !ws_path.exists(),
+        "the scaffold-only file goes with the pin"
+    );
+
+    // Pinned to pnpm 9.15.9: the keyless file stays untouched (#734).
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@9.15.9", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(&ws_path, "# pnpm settings go here\n").unwrap();
+    assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).unwrap(),
+        "# pnpm settings go here\n",
+        "a pnpm 9 project's keyless workspace file is left alone"
+    );
+}
+
 /// #903 / #904: a `pnpm-lock.yaml` and `pnpm-workspace.yaml` saved with a
 /// UTF-8 BOM read like their plain twins. The BOM lock gets the
 /// `trustLockfile: true` auto-config (it used to read as unversioned and

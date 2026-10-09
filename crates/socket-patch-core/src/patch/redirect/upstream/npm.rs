@@ -2081,8 +2081,15 @@ pub(crate) async fn cleanup_side_config(
     if restored_pnpm && !still_hosted(view, &["pnpm-lock.yaml"], ctx).await {
         const WORKSPACE: &str = "pnpm-workspace.yaml";
         if let Ok(Some(ws)) = view.read(WORKSPACE).await {
-            if ws == "packages:\n  - '.'\ntrustLockfile: true\n" {
+            let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;
+            if ws == format!("{}\n", lines.join("\n")) {
                 view.remove(WORKSPACE);
+            } else if let Some(original) =
+                crate::formats::pnpm::workspace::strip_keyless_splice(&ws, &lines)
+            {
+                // The scaffold hosted mode splices into a file with no keys
+                // (#1096): taking it back out restores the user's file.
+                view.write(WORKSPACE, original);
             } else if ws.lines().any(|l| {
                 crate::formats::pnpm::workspace::top_level_key(l).is_some_and(|(key, value)| {
                     key == "trustLockfile" && value.trim_matches(['\'', '"']) == "true"

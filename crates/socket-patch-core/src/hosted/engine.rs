@@ -49,10 +49,11 @@ use super::guidance::{
     plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
     pnpm_lock_version_major, pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
     pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_not_needed_detail,
-    pnpm_trust_policy_preamble, pnpm_trust_rush_detail, pnpm_trust_workspace_unreadable_detail,
-    pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    url_host, TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
-    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    pnpm_trust_policy_preamble, pnpm_trust_rush_detail, pnpm_trust_scaffolded_detail,
+    pnpm_trust_workspace_unreadable_detail, pnpm_trust_workspace_unsupported_detail,
+    read_npmrc_for_allow_remote, read_workspace_for_trust, url_host, TrustPlan, NPM_LOCKS,
+    NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE, PNPM_TRUST_TRADEOFF_AND_CAUTION,
+    PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -2116,15 +2117,23 @@ fn pnpm_trust(
             original: None,
             new: Some(serde_json::json!("true")),
         };
-        // No workspace file and a project pinned to pnpm 9.0–10.4: creating
-        // one would make it a root-only workspace those releases refuse
-        // `pnpm add` in, for a key they never read (#734).
+        // No workspace file (or one with no keys, which pnpm reads the
+        // same) and a project pinned to pnpm 9.0–10.4: creating one would
+        // make it a root-only workspace those releases refuse `pnpm add`
+        // in, for a key they never read (#734, #1096).
         let pinned_pre_10_5 = match &workspace {
-            Ok(None) if !symlinked => root_only_workspace_breaks_add(view),
+            Ok(text)
+                if !symlinked
+                    && text
+                        .as_deref()
+                        .is_none_or(crate::formats::pnpm::workspace::is_keyless) =>
+            {
+                root_only_workspace_breaks_add(view)
+            }
             _ => None,
         };
         match workspace {
-            Ok(None) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
+            Ok(_) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
                 &server,
                 pinned_pre_10_5.as_deref().unwrap_or_default(),
                 options.dry_run,
@@ -2141,6 +2150,10 @@ fn pnpm_trust(
                 TrustPlan::Append(text) => {
                     trust_config_write = Some((text, trust_edit("added")));
                     pnpm_trust_configured_detail(&server, false, options.dry_run)
+                }
+                TrustPlan::Scaffold(text) => {
+                    trust_config_write = Some((text, trust_edit("added")));
+                    pnpm_trust_scaffolded_detail(&server, options.dry_run)
                 }
                 TrustPlan::AlreadyTrue => {
                     pnpm_rerun_only = spliced_pnpm_locks == 0;
