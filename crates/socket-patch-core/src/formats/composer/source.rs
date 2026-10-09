@@ -301,7 +301,10 @@ pub(super) struct DistSpan {
 /// ([`super::ORIGIN_BOUND_ENTRY_KEYS`]: `source`, `transport-options`),
 /// each warned about when the lock had it, whether or not `rewritten_dist`
 /// still does. The recorded edit spans the dist block AND every removed
-/// member, so the ledger's fragment revert restores them byte-for-byte.
+/// member, so a ledger fragment revert restores them byte-for-byte. The
+/// upstream restore (`rollback`/`remove` without a ledger) rebuilds only
+/// `dist` and `source` from packagist: `transport-options` do not come back,
+/// which the warning says and the restore warns about again.
 /// `None` — no edit, no ledger growth — when nothing changes (an idempotent
 /// re-run over a healed lock).
 pub(super) fn apply_dist_edit(
@@ -349,7 +352,8 @@ pub(super) fn apply_dist_edit(
                             "{composer_name}'s transport-options were removed; they carry \
                              the original repository's download options (auth headers, \
                              client certificates, proxy) and Composer would send them to \
-                             the hosted patch host"
+                             the hosted patch host; rollback cannot restore them, so run \
+                             `composer update {composer_name}` after removing the patch"
                         ),
                     });
                 }

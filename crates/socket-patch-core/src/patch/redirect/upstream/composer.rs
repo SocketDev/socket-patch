@@ -127,6 +127,22 @@ fn declares_custom_repositories(composer_json: Option<&str>) -> Result<bool, Str
     })
 }
 
+/// Whether any `composer.json` repository declares `options`. Composer
+/// copies those into the `transport-options` of every lock entry it
+/// resolves from that repository; the hosted rewrite drops them (they would
+/// go to the patch host) and packagist's metadata cannot give them back.
+fn declares_repository_options(composer_json: Option<&str>) -> bool {
+    let Some(doc) = composer_json.and_then(|t| serde_json::from_str::<Value>(t).ok()) else {
+        return false;
+    };
+    let has_options = |r: &Value| r.get("options").is_some_and(|o| !o.is_null());
+    match doc.get("repositories") {
+        Some(Value::Array(a)) => a.iter().any(has_options),
+        Some(Value::Object(o)) => o.values().any(has_options),
+        _ => false,
+    }
+}
+
 /// The packagist version entry that locked `locked` (exact pretty version
 /// first, then composer's leading-`v` normalization).
 fn pick_version<'v>(versions: &'v [Value], locked: &str) -> Result<&'v Value, String> {
@@ -176,6 +192,7 @@ pub(crate) async fn restore(
     };
     let composer_json = view.read("composer.json").await.ok().flatten();
     let custom_repos = declares_custom_repositories(composer_json.as_deref());
+    let repo_options = declares_repository_options(composer_json.as_deref());
 
     let mut hits: Vec<Hit> = Vec::new();
     for pin in pins {
@@ -362,6 +379,17 @@ pub(crate) async fn restore(
         content.replace_range(d_start..=d_end, &format!("{source_text}{dist_text}"));
         changed = true;
         result.handled.insert(hit.uuid.clone());
+        if repo_options {
+            result.warnings.push((
+                "upstream_composer_transport_options_not_restored",
+                format!(
+                    "{label}: composer.json declares repository options, but the \
+                     transport-options the hosted rewrite removed from this lock entry \
+                     cannot be restored; run `composer update {}` to re-record them",
+                    hit.name
+                ),
+            ));
+        }
     }
     if changed {
         view.write(COMPOSER_LOCK, content);
@@ -456,6 +484,23 @@ mod tests {
             Ok(true)
         );
         assert!(declares_custom_repositories(Some("{")).is_err());
+    }
+
+    #[test]
+    fn repository_options_gate() {
+        assert!(!declares_repository_options(None));
+        assert!(!declares_repository_options(Some("{")));
+        assert!(!declares_repository_options(Some(
+            r#"{"repositories": [{"type": "vcs", "url": "https://git.example/x"}]}"#
+        )));
+        assert!(declares_repository_options(Some(
+            r#"{"repositories": [{"type": "composer", "url": "https://repo.packagist.org",
+                "options": {"http": {"proxy": "http://proxy:3128"}}}]}"#
+        )));
+        assert!(declares_repository_options(Some(
+            r#"{"repositories": {"private": {"type": "composer", "url": "https://r.example",
+                "options": {"http": {"header": ["X-Token: t"]}}}}}"#
+        )));
     }
 
     #[test]
