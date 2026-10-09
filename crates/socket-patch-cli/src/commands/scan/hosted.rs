@@ -554,6 +554,9 @@ pub(super) async fn run_redirect(
     stage: &mut super::rollout::Stage,
     // Scan's pre-redirect lockfile discovery (see `rollout::Gate::prior`).
     prior: Option<super::rollout::Prior<'_>>,
+    // `--prune` / `--sync`, gated by the policy exactly as the human arm
+    // gates it (`patches.enabled: false` writes nothing, the GC included).
+    prune: bool,
 ) -> i32 {
     // Same discovery/selection as agent and vendored mode.
     let discovered = match discover_selected(
@@ -606,7 +609,7 @@ pub(super) async fn run_redirect(
     run_redirect_selected(
         &args.common,
         &args.vex,
-        args.prune || args.sync,
+        prune,
         api_client,
         &pairs,
         scan_result,
