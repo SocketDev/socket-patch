@@ -12,6 +12,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::common;
+use common::envelope::events;
 use common::{git_sha256, parse_json_envelope, run_with_env};
 
 const PURL: &str = "pkg:npm/check-target@1.0.0";
@@ -66,10 +67,6 @@ fn project(installed: Option<&[u8]>) -> tempfile::TempDir {
     tmp
 }
 
-fn events(env: &Value) -> Vec<Value> {
-    env["events"].as_array().cloned().unwrap_or_default()
-}
-
 /// The regression: an unpatched installed copy is drift (exit 1), in both
 /// output modes, and `--check` writes nothing.
 #[test]
@@ -97,8 +94,8 @@ fn check_fails_on_an_unpatched_npm_package() {
     assert_eq!(code, 1, "stderr={stderr}");
     let env = parse_json_envelope(stdout.trim());
     assert_eq!(env["status"], "partialFailure", "{env}");
-    let failed: Vec<Value> = events(&env)
-        .into_iter()
+    let failed: Vec<&Value> = events(&env)
+        .iter()
         .filter(|e| e["action"] == "failed")
         .collect();
     assert_eq!(failed.len(), 1, "{env}");

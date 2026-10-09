@@ -21,9 +21,10 @@
 //! lockfile, so vendoring proceeds offline from the installed copy + the
 //! view-fetched patch content.
 
+use crate::common::git_sha256;
+
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -41,14 +42,6 @@ const ENCODED: &str = "pkg%3Anpm%2Fleft-pad%401.3.0";
 const BEFORE: &[u8] = b"before\n";
 const AFTER: &[u8] = b"after\n";
 const AFTER_B64: &str = "YWZ0ZXIK";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// The three npm flavors this file parameterizes over. Each knows how to lay
 /// down its pre-vendor lockfile and how to prove the vendor lock rewrite

@@ -58,18 +58,20 @@
 //! assertion after that is hard. `SOCKET_PATCH_COMPOSER_E2E_VERSION` pins
 //! the release a CI leg expects.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 #[path = "composer_e2e_common/mod.rs"]
 mod composer_e2e_common;
 #[path = "vex_e2e_common/mod.rs"]
@@ -93,10 +95,6 @@ const DEP: &str = "psr/log";
 const FIXTURE_VERSION: &str = "3.0.2";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run the socket-patch binary with a scrubbed environment: every ambient
 /// `SOCKET_*` var is removed (so a developer's `SOCKET_DRY_RUN=1` etc. can't
@@ -123,15 +121,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// composer state must neither leak in nor be polluted).
 fn composer(cwd: &Path, args: &[&str], home: &Path, cache: &Path) -> Output {
     composer_e2e_common::composer(cwd, args, home, cache)
-}
-
-/// Git-blob SHA-256 (`sha256("blob <len>\0" ++ bytes)`) — the hash format
-/// socket-patch records in manifests.
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Write `.socket/manifest.json` + the after-hash blob (with a vulnerability

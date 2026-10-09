@@ -16,7 +16,6 @@ use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
-use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{
@@ -24,14 +23,14 @@ use crate::utils::fs::{
     read_regular_to_string,
 };
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
-use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::jvm::layout;
 
 use super::common::{
-    already_patched_result, any_live_file_references, done, failed_result, refused,
-    synthesized_result, zip_bytes_match_after_hashes,
+    already_patched_result, done, failed_result, refused, synthesized_result,
+    zip_bytes_match_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
+use super::revert::{self, KeepPolicy};
 use super::service_fetch::{service_archive_copy, ServiceCopy};
 use super::state::{VendorArtifact, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
@@ -222,10 +221,7 @@ pub async fn revert_maven_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
-    let RevertOpts {
-        dry_run,
-        keep_artifact,
-    } = opts;
+    let dry_run = opts.dry_run;
     // Routed only when EVERY record is a JVM kind; the JVM revert validates
     // the uuid, the coordinates and each recorded path before any disk
     // access (state.json is tamper-able).
@@ -241,7 +237,6 @@ pub async fn revert_maven_opts(
             entry.uuid
         ));
     };
-    let uuid_dir = project_root.join(&uuid_dir_rel);
     let mut warnings = Vec::new();
 
     // One wiring record today; reverse-order iteration keeps parity with the
@@ -280,38 +275,16 @@ pub async fn revert_maven_opts(
         }
     }
 
-    let mut outcome = RevertOutcome {
+    let outcome = RevertOutcome {
         kept_artifact: false,
         success: true,
         warnings,
         error: None,
     };
-    if dry_run {
-        return outcome;
-    }
     // Drift-keep (see the fn doc): never delete a uuid dir the live pom
     // still routes Maven at.
-    if outcome.drift_skipped()
-        && any_live_file_references(project_root, &[PROJECT_POM], &uuid_dir_rel).await
-    {
-        outcome.keep_artifact(&uuid_dir_rel);
-        return outcome;
-    }
-    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
-    // (and the caller keeps the ledger entry), so only the deletion is
-    // skipped.
-    if keep_artifact {
-        return outcome;
-    }
-    // The last maven entry leaves `.socket/vendor/maven/` (and
-    // `.socket/vendor/`) empty: the shared helper prunes them so a
-    // reverted project carries no vendor residue (non-recursive:
-    // siblings keep them).
-    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-        outcome.success = false;
-        outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
-    }
-    outcome
+    let policy = KeepPolicy::OnDriftWhileReferenced(&[PROJECT_POM]);
+    revert::finish(outcome, project_root, &uuid_dir_rel, opts, policy).await
 }
 
 // ── v5 JVM backend ─────────────────────────────────────────────────

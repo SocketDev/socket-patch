@@ -710,24 +710,18 @@ jobs:
           tags: socket-patch-test-${{ matrix.ecosystem }}:latest
           load: true
 
-      - name: Build instrumented socket-patch binary
-        # Source `cargo llvm-cov show-env` into the current shell so this
-        # `cargo build` picks up RUSTC_WRAPPER=cargo-llvm-cov and the
-        # same RUSTFLAGS that the subsequent `cargo llvm-cov` test step
-        # will use. The bin we build ends up byte-compatible with the
-        # test binaries — same source hashes → unified coverage map at
-        # report time. Env stays scoped to this step (intentional;
-        # cargo llvm-cov manages its own env in the test step).
-        run: |
-          eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null)"
-          cargo build --bin socket-patch
-
       - name: Configure docker-e2e coverage hooks
+        # Mount the instrumented socket-patch that the test step's own
+        # `cargo llvm-cov` builds for the integration tests (cargo builds
+        # a package's bins before running its integration tests), and
+        # write the in-container profraws next to the test processes'
+        # ones. `cargo llvm-cov report` reads only
+        # target/llvm-cov-target/*.profraw and objects built there, so a
+        # separately built binary or profraws elsewhere in target/ never
+        # reach the lcov.
         run: |
-          echo "SOCKET_PATCH_COV_BIN=$PWD/target/debug/socket-patch" >> "$GITHUB_ENV"
-          # Profraw files from the in-container binary land here.
-          # cargo-llvm-cov scans target/ for *.profraw at report time.
-          echo "SOCKET_PATCH_COV_PROFRAW_DIR=$PWD/target" >> "$GITHUB_ENV"
+          echo "SOCKET_PATCH_COV_BIN=$PWD/target/llvm-cov-target/debug/socket-patch" >> "$GITHUB_ENV"
+          echo "SOCKET_PATCH_COV_PROFRAW_DIR=$PWD/target/llvm-cov-target" >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.ecosystem }} Docker e2e test with coverage
         run: |
@@ -1360,14 +1354,15 @@ jobs:
         env:
           UV_TEST_VERSION: ${{ matrix.uv }}
         run: |
-          python -m pip install --disable-pip-version-check --upgrade pip "uv==$UV_TEST_VERSION"
+          scripts/pip-install-retry.sh --upgrade pip "uv==$UV_TEST_VERSION"
           uv --version
 
       - name: Install uv (PDM / Hatch legs)
         if: matrix.pdm != '' || matrix.hatch != ''
         # The suites bootstrap the pinned PDM / Hatch into their own venv
         # with uv; this uv is tooling, not the release under test.
-        run: python -m pip install uv==0.11.19
+        shell: bash
+        run: scripts/pip-install-retry.sh uv==0.11.19
 
       - name: Install pinned Poetry
         if: matrix.poetry != ''
@@ -1379,7 +1374,7 @@ jobs:
         env:
           POETRY_TEST_VERSION: ${{ matrix.poetry }}
         run: |
-          python -m pip install uv==0.11.19
+          scripts/pip-install-retry.sh uv==0.11.19
           case "$POETRY_TEST_VERSION" in 1.0.*|1.1.*) py=3.8.20 ;; *) py=3.12 ;; esac
           uv venv "$RUNNER_TEMP/poetry" --python "$py"
           extra=""; [ "$POETRY_TEST_VERSION" = "1.2.2" ] && extra="cleo==1.0.0a5"
@@ -2465,7 +2460,7 @@ jobs:
 
       - name: Install uv
         if: steps.gate.outputs.run == 'true'
-        run: python -m pip install --disable-pip-version-check uv && uv --version
+        run: scripts/pip-install-retry.sh uv && uv --version
 
       - name: Setup Ruby
         if: steps.gate.outputs.run == 'true'

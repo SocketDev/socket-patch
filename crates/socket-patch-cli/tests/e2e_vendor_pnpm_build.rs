@@ -62,20 +62,22 @@
 //! wiring reverted with ledger + tarball kept (`vendor_unwired`,
 //! `--no-verify` too), and a lock-only revert that pnpm itself re-wires.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
-#[path = "common/hermetic.rs"]
-mod hermetic;
+use common::cache_env;
+use common::hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
@@ -99,7 +101,7 @@ const PNPM_TERTIARY: &str = "pnpm@11";
 
 /// The binary under test; the pinned-matrix workflow runs a prebuilt copy
 /// (`SOCKET_PATCH_PNPM_E2E_SOCKET_BIN`, shared with the hosted suite).
-fn binary() -> PathBuf {
+fn socket_bin() -> PathBuf {
     std::env::var_os("SOCKET_PATCH_PNPM_E2E_SOCKET_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_socket-patch")))
@@ -214,7 +216,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = hermetic::command(&binary());
+    let mut cmd = hermetic::command(&socket_bin());
     cmd.current_dir(cwd);
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pnpm]);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
@@ -224,13 +226,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[u8]) {
@@ -900,7 +895,7 @@ fn assert_manifestless_vendored_vex(
     tag: &str,
 ) {
     off_runtime(|| {
-        let bin = binary();
+        let bin = socket_bin();
         let api = PatchApi::start(vec![(
             UUID.to_string(),
             patch_view(
@@ -1197,10 +1192,14 @@ fn run_unsupported_lock_refusal(pm: &str) {
 
     let api = PatchApi::empty();
     strip_manifest(&proj);
-    let out = run_vex(&binary(), &proj, &VexRun::online(&api));
+    let out = run_vex(&socket_bin(), &proj, &VexRun::online(&api));
     assert_ne!(out.code, Some(0), "{pm}: nothing is wired: {out}");
     assert_absent(out.doc.as_ref(), &purl);
-    let out = run_vex(&binary(), &proj, &VexRun::online(&api).via(VexVia::Vendor));
+    let out = run_vex(
+        &socket_bin(),
+        &proj,
+        &VexRun::online(&api).via(VexVia::Vendor),
+    );
     assert_absent(out.doc.as_ref(), &purl);
     api.assert_no_requests();
     eprintln!("VEX-CELL vendored [{pm}] refused: not attested");

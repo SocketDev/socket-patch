@@ -1559,6 +1559,183 @@ fn compact_flag_emits_single_line_json() {
 // vexctl integration (run only when the binary is on PATH)
 // ──────────────────────────────────────────────────────────────────────
 
+/// `vex --output /dev/stdout > vex.json`: the document reaches the file the
+/// shell redirected stdout to, through the caller's own descriptor.
+/// `/dev/stdout` is written in place, never staged and renamed over the
+/// descriptor's target, which would leave the caller's open file without
+/// the document (review on #1262). Read through a kept handle, not the
+/// path, so a rename shows. The human summary line also goes to fd 1 and
+/// overwrites the head of the document, as on `main`; only the body is
+/// asserted.
+#[cfg(unix)]
+#[test]
+fn output_to_dev_stdout_reaches_the_redirected_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/x@1.0.0".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            "a".repeat(64).as_str(),
+            "b".repeat(64).as_str(),
+            "GHSA-zzzz",
+            &["CVE-9999"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+    use std::io::{Read as _, Seek as _};
+    let captured = cwd.join("captured.vex.json");
+    let stdout = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&captured)
+        .unwrap();
+    let mut kept = stdout.try_clone().unwrap();
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--no-verify",
+            "--output",
+            "/dev/stdout",
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut text = String::new();
+    kept.rewind().unwrap();
+    kept.read_to_string(&mut text).unwrap();
+    assert!(
+        text.contains("\"author\": \"Socket\"") && text.contains("GHSA-zzzz"),
+        "the redirected file must hold the document; got {text:?}"
+    );
+    let stages = std::fs::read_dir(cwd)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".socket-stage-")
+        })
+        .count();
+    assert_eq!(stages, 0);
+}
+
+/// A write that fails part-way (here `EFBIG` from `RLIMIT_FSIZE`, the
+/// same short write a full disk gives) never leaves a prefix of the new
+/// document at `--output`. The document is staged beside the destination
+/// and renamed into place, so the previous document survives the failed
+/// write and the failure cleanup then removes it: the path holds no file,
+/// never a truncated OpenVEX header (#1144). On `main` the in-place write
+/// left the first 512 bytes, which the cleanup cannot parse and kept.
+#[cfg(unix)]
+#[test]
+fn failed_output_write_leaves_no_partial_document() {
+    use std::os::unix::process::CommandExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let vex_path = cwd.join("out.vex.json");
+    let run = |limit: Option<u64>| {
+        let mut cmd = cli();
+        cmd.args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--no-verify",
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ]);
+        if let Some(limit) = limit {
+            // The limit also caps a coverage build's exit-time `.profraw`
+            // write, and a truncated profile fails the coverage merge: send
+            // this run's profile to a device, which the limit does not cover.
+            cmd.env("LLVM_PROFILE_FILE", "/dev/null");
+            // SAFETY: only async-signal-safe libc calls between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                    let lim = libc::rlimit {
+                        rlim_cur: limit as libc::rlim_t,
+                        rlim_max: limit as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        cmd.output().expect("invoke vex")
+    };
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/x@1.0.0".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            "a".repeat(64).as_str(),
+            "b".repeat(64).as_str(),
+            "GHSA-zzzz",
+            &["CVE-9999"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+    assert!(run(None).status.success());
+    let first: Value = serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
+    assert_eq!(first["statements"].as_array().unwrap().len(), 1);
+
+    for i in 0..30 {
+        manifest.patches.insert(
+            format!("pkg:npm/dep{i}@1.0.0"),
+            make_record(
+                &format!("22222222-2222-4222-8222-{i:012}"),
+                "package/index.js",
+                "c".repeat(64).as_str(),
+                "d".repeat(64).as_str(),
+                &format!("GHSA-dep{i}"),
+                &["CVE-2024-0001"],
+            ),
+        );
+    }
+    write_manifest(cwd, &manifest);
+    let out = run(Some(512));
+    assert!(!out.status.success(), "the write must fail under the limit");
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON");
+    assert_eq!(env["error"]["code"], "write_failed", "{env}");
+
+    match std::fs::read(&vex_path) {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        Ok(bytes) => panic!(
+            "a failed write left {} bytes at --output: {:?}",
+            bytes.len(),
+            String::from_utf8_lossy(&bytes[..bytes.len().min(80)])
+        ),
+    }
+    let names: Vec<String> = std::fs::read_dir(cwd)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".socket-stage-"))
+        .collect();
+    assert!(names.is_empty(), "stage litter {names:?}");
+}
+
 /// Pipe the VEX text through `vexctl` if it's on `PATH`. CI installs
 /// vexctl before the test step so the validation actually runs there;
 /// local devs without Go see a skip message instead of a failure.

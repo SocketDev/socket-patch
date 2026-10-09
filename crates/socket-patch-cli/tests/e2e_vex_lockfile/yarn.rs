@@ -43,6 +43,8 @@
 //!
 //! Runs on every OS; no toolchain, no network.
 
+use crate::common::binary;
+
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -513,10 +515,6 @@ fn write_vendor_ledger(cwd: &Path, flavor: Flavor, rel: &str, rec: PatchRecord) 
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// The CLI with the ambient `SOCKET_*` environment scrubbed (explicit flags
 /// are the sole source of truth), no token, no socket-cli config, telemetry

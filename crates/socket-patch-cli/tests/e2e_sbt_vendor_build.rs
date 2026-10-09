@@ -33,6 +33,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
+use common::envelope::event_triples;
 use common::git_sha256;
 
 #[path = "common/hermetic.rs"]
@@ -337,18 +338,6 @@ fn fresh_checkout(proj: &Path, dst: &Path) {
     }
 }
 
-fn events(env: &serde_json::Value) -> Vec<(String, String, String)> {
-    env["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| {
-            let s = |k: &str| e[k].as_str().unwrap_or_default().to_string();
-            (s("purl"), s("action"), s("errorCode"))
-        })
-        .collect()
-}
-
 #[test]
 #[ignore = "real sbt + network (SOCKET_PATCH_SBT_E2E_*)"]
 fn sbt_vendor_offline_fresh_checkout() {
@@ -446,7 +435,7 @@ fn sbt_vendor_declared_bump_fails_closed() {
     let (code, env) = ctx.socket(&ctx.proj, &["vendor"]);
     assert_eq!(code, Some(1), "{env}");
     assert!(
-        events(&env)
+        event_triples(&env)
             .iter()
             .any(|(_, action, code)| action == "failed" && code == "vendor_sbt_pin_declared_newer"),
         "{env}"
@@ -538,7 +527,7 @@ fn sbt_vendor_rerun_noop() {
     let before = snapshot(&ctx.proj);
     let env = ctx.ok(&["vendor"]);
     assert_eq!(
-        events(&env),
+        event_triples(&env),
         [(
             purl(TEXT),
             "skipped".to_string(),
