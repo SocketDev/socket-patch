@@ -253,7 +253,7 @@ async fn gc_scan_crawls_the_unselected_ecosystems() {
     ] {
         let (v, _) = scan(tmp.path(), extra).await;
         assert_eq!(
-            v["gc"]["prunableManifestEntries"],
+            v["gc"]["prunedManifestEntries"],
             serde_json::json!(["pkg:npm/orphan-npm@9.9.9"]),
             "{extra:?}: the installed crate must not read as uninstalled: {v}"
         );

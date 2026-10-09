@@ -5799,7 +5799,7 @@ mod gc_tests {
     /// listed exactly once. The wet pass removes it from the ledger in (a)
     /// before (b) runs; the dry-run preview leaves the ledger untouched, so
     /// without excluding (a)-handled purls from (b) the same purl lands in
-    /// both lists and `scan --prune`'s `revertableVendoredEntries` preview
+    /// both lists and `scan --prune --dry-run`'s `revertedVendoredEntries` preview
     /// duplicates it (breaking preview/wet parity).
     #[tokio::test]
     async fn vendor_gc_dry_run_lists_dropped_and_unused_entry_once() {
