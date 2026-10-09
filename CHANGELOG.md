@@ -583,13 +583,15 @@ limits, and required install commands.
     GEM sections in Bundler's sorted order, so frozen installs on Bundler
     4.0.19+ no longer fail with "Your lockfile needs to be updated"; locks
     left out of order by earlier runs are healed on the next scan (#1186).
-- Project-mode crawls of a Cargo project with a `Cargo.lock`, or a restored
-  .NET project (`obj/project.assets.json`), look up only the packages that
-  project resolves instead of walking the whole shared `$CARGO_HOME`
-  registry or `~/.nuget/packages` cache, so agent mode no longer patches,
-  and VEX no longer attests, packages other projects downloaded. Projects
-  without a readable lock or restore, `vendor/` trees, solution roots and
-  global mode keep the full walk (#1204, #427).
+- Project-mode crawls of a Cargo project with a `Cargo.lock`, a Go module
+  with a `go.sum` (and no `go.work` in effect), or a restored .NET project
+  (`obj/project.assets.json`) look up only the packages that project
+  resolves instead of walking the whole shared `$CARGO_HOME` registry,
+  `GOMODCACHE` or `~/.nuget/packages` cache, so agent mode no longer
+  patches, and VEX no longer attests, packages other projects downloaded.
+  Projects without a readable lock or restore, Go workspaces, `vendor/`
+  trees, solution roots and global mode keep the full walk (#1204, #1207,
+  #427).
 - `scan --mode agent --json` and `get --json` report files whose contents
   matched neither patch hash and were overwritten, as
   `content_mismatch_overwritten` entries in `warnings[]`, as `apply --json`
