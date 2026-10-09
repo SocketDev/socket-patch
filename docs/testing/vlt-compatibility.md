@@ -128,7 +128,7 @@ The capstones serve npmjs bytes from a local wiremock registry `R` and write
 
 | Era window | vlt.json | Hermetic | Notes |
 |---|---|---|---|
-| ≤ 0.0.0-13 | flat `{"registry": R}` | yes | `vlt-workspaces.json` for workspaces ≤ 0.0.0-12 |
+| ≤ 0.0.0-13 | flat `{"registry": R}` | no: vlt ignores the configured registry (and `--registry`), so every install resolves from public npm | `vlt-workspaces.json` for workspaces ≤ 0.0.0-12; legs pass because R serves npmjs bytes, except the launcher leg (its package exists only in R), which logs `skip:non-hermetic-registry` |
 | 0.0.0-14 … rc.6 | `{"config":{"registry": R}}` (+ `"modifiers":{}` for 0.0.0-16 … 24, except the ignored-lock leg) | yes | URL-segment DepIDs carry R's port |
 | rc.7 … rc.29 | `{"config":{"registry": "https://registry.npmjs.org/"}}` | no: lock-driven installs reach public npm | the dead-registry assertions log `skip:non-hermetic-registry`; the patch service stays local |
 | rc.30 … rc.32 | `{"config":{"registry": R}}` | yes | URL-segment DepIDs |
@@ -285,6 +285,7 @@ store-linker knob, `unset` when not given), `cache_root` and `upgrade`
 | a cache on another filesystem falls back to copies | `all` | `cache_root=set` | safety | `private_copies` | `store-linker-hardlinks` |
 | as above | `all` | `cache_root=unset` | safety | `cross_device_cache` | `no-cache-root` |
 | a scalar `registry` makes lock-driven installs re-resolve from public npm | `1.0.0-rc.7 … 1.0.0-rc.29` | — | agent | `scan_apply_rollback_list`, `launcher` | `non-hermetic-registry` |
+| the configured registry is ignored: every install resolves from public npm | `<= 0.0.0-13` | — | agent | `launcher` | `non-hermetic-registry` |
 | `npm:` alias specs resolve against public npm even with `registries.npm` | `1.0.0-rc.30 … 1.0.0-rc.32` | — | agent | `scan_apply_rollback_list` | `non-hermetic-registry` |
 | `lockfileVersion` 0 with legacy (`·`/`§`) DepIDs | `0.0.0-19 … 1.0.0-rc.14` | — | — | — | — |
 | `lockfileVersion` 1, tilde DepIDs | `>= 1.0.0-rc.15` | — | — | — | — |

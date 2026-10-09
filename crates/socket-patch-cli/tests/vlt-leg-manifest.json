@@ -881,6 +881,20 @@
       "reason": "non-hermetic-registry"
     },
     {
+      "boundary": "the configured registry is ignored: every install resolves from public npm",
+      "suite": "agent",
+      "legs": [
+        "launcher"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<=",
+        "a": "0.0.0-13"
+      },
+      "conditions": [],
+      "reason": "non-hermetic-registry"
+    },
+    {
       "boundary": "`npm:` alias specs resolve against public npm even with `registries.npm`",
       "suite": "agent",
       "legs": [
