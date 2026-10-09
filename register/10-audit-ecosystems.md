@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-09T06:49Z · main @ f3c6313_
+_Last updated 2026-10-09T12:58Z · main @ a80b89e_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -12,12 +12,12 @@ _Last updated 2026-10-09T06:49Z · main @ f3c6313_
 | E07 | 2 | package-lock had four entry walks (inventory, vendored, hosted, restore) with copied identity/skip rules. | 4.4; 4.7 E | #663 | fixed (#1008); one `npm_lock_entries` walk |
 | E08 | 2 | yarn.lock had seven writer grammars beside `scan_blocks`. | 3.7 #3; 4.7 D |  | fixed (#1057) |
 | E09 | 2 | Yarn berry gates were written twice with different codes. | 4.4; new finding | #629, #628 | fixed (#657) |
-| E10 | 2 | XML has eight hand-rolled scanners and four attribute extractors; the writers (`nuget_feed.rs`, `maven_repo.rs`) never use the shared readers. Merged E11, E55. | 5.4; 3.7 #3 | #715, #716, #717, #594 | filed #715, #716, #717, #594; NuGet hosted reader fixed (#597); Gradle verification fixed (#1145) |
-| E12 | 2 | pnpm v9 and legacy 5.4/6.0 were near-copies; v9 still has two lookup paths (a linear scan and `LockIndex`, `pnpm_lock.rs:1524-1538`). | 4.4; 4.5 #4; 4.7 B/G | | partly fixed (#583); copies merged, v9 dual lookup remains (pnpm workstream, #1007) |
+| E10 | 2 | XML has eight hand-rolled scanners and four attribute extractors; the writers (`nuget_feed.rs`, `maven_repo.rs`) never use the shared readers. Merged E11, E55. | 5.4; 3.7 #3 | #715, #716, #717, #594 | filed #715, #717, #594; #716 fixed (#1036); NuGet hosted reader fixed (#597); Gradle verification fixed (#1145) |
+| E12 | 2 | pnpm v9 and legacy 5.4/6.0 were near-copies; v9 still has two lookup paths (a linear scan and `LockIndex`, `pnpm_lock.rs:1524-1538`). | 4.4; 4.5 #4; 4.7 B/G | | partly fixed (#583); copies merged; v9 dual lookup (`check_rewritable_refs_with`'s `Option<&LockIndex>`) survives #1007 |
 | E13 | 2 | `poetry_lock.rs` ≈ `pdm_lock.rs`. | 5.4 | #694 | fixed (#703) |
 | E14 | 2 | Pipfile.lock is written two ways: vendored mode re-serializes the whole lock (loses `\uXXXX` escapes, refuses a BOM), while hosted mode splices spans (executed twice). | 5.4 | #1128 | in PR #1188 (one `formats::pipenv` entry splicer for hosted, upstream restore and vendored) |
 | E15 | 2 | Cargo.toml `[package]` is read five ways and has drifted on BOM, `[project]` and dotted keys; hosted `plan_cargo_toml` refuses a multi-line `features` array (merged E57). | 5.4; 3.7 #3 | #693, #757 | partly fixed (#1110); `vendor/cargo.rs` `path_crate_version` and hosted `plan_cargo_toml` (#757) remain |
-| E16 | 2 | CRLF has five npm-family policies and three for `toml_edit` output; the "any `\r\n` → CRLF" rule is written 14 times (merged E60). | 4.4; new finding | #814, #815 | partly fixed (#1108, 7 sites; #1227, slice 2); slice 3 in PR #1264 (Gradle first-line rule, `gradle/eol.rs`, `maven_reactor.rs` ×2); upstream gem and hosted Gemfile remain; tracking #814 |
+| E16 | 2 | CRLF has five npm-family policies and three for `toml_edit` output; the "any `\r\n` → CRLF" rule is written 14 times (merged E60). | 4.4; new finding | #814, #815 | partly fixed (#1108, #1227); slice 3 in PR #1264 (JVM); upstream gem and hosted Gemfile remain; tracking #814 |
 | E17 | 2 | "Is a bun lock present" is asked at seven sites with three semantics (lstat, `exists`, `is_file`). With a dangling `bun.lock` symlink, Bun and the writers use `bun.lockb`, but the inventory returns nothing. | 4.4 | #735 | in PR #1009 |
 | E18 | 3 | JS helper copies: JSON-pointer escape ×2, wiring lines↔JSON ×3, `name@spec` split ×2, `KIND_*` re-spelled, uneven recursion bounds, regexes compiled per dependency. | 4.4 | #835 | rejected; closed not planned 2026-10-08 (maintenance-only) |
 | E19 | 3 | Gem has three section models and three DEPENDENCIES-name parsers (vendored sees only the first `GEM` section, #779). Go's `module` readers fixed (#870). | 5.4 | #780, #781 | filed #780; partly fixed (#1221, hosted slice); vendored `vendor/gem.rs` models open |
@@ -27,7 +27,7 @@ _Last updated 2026-10-09T06:49Z · main @ f3c6313_
 | E23 | 2 | The `pypi_{poetry,pdm,pipenv}.rs` backends repeat one skeleton: `load_*_project`, `classify_dependency`, `check_target_guards`, `wire_*`, `revert_*`. | 5.4 | #937 | rejected; closed not planned 2026-10-08 (no behavior change) |
 | E24 | 2 | There are nine revert mechanisms (~3.5K lines). Target: one splice-record revert engine, with legacy ledger kinds adapted at load. | 2.1; 5.3; 5.8 | #989 | in PR #1245 (item 1 slice: gem, composer, Maven legacy, NuGet, pnpm finish through `vendor::revert::finish`); #990 folded into #989 |
 | E25 | 3 | Per-backend copies: `cleanup_failed_stage` and `<eco>_service_copy` (cargo, composer, gem, golang). | 5.4; 5.8 | #906 | rejected; closed not planned 2026-10-08 (no failing behavior) |
-| E26 | 3 | JVM has two Maven backends. Target: merge `maven_repo.rs` into `jvm/` as `Shape::Single`; its three artifact roots don't follow `<eco>/<uuid>`. | 5.7 | #971, #972, #973 | partly fixed (#1036): single poms go through the `jvm/` planner, legacy entries are revert-only; #971 children 4–5 open |
+| E26 | 3 | JVM has two Maven backends. Target: merge `maven_repo.rs` into `jvm/` as `Shape::Single`; its three artifact roots don't follow `<eco>/<uuid>`. | 5.7 | #971, #972, #973 | partly fixed (#1036): single poms use the `jvm/` planner; #971 children 4–5 open |
 | E27 | 3 | ~3K lines of per-package compensating machinery (`group_commit`, `prestage`, 22 `ParseMemo`s). Target: batched planners. | 2.4; 5.7 | | rejected; deferred under the 2026-10-08 backlog bar (no behavior defect); revisit with #959/#989 |
 | E28 | 2 | Dead vendored scaffolding: one-variant `VendorSource`/`PackageSource`, an unreachable `SERVICE_ECOSYSTEMS` refusal, `ServicePolicy::new` ignoring its config, an unused `vend_installed!`. | 5.6; R11 | #782 | filed #782; #800, #746 folded into #782 |
 | E29 | 3 | `registry_fetch.rs` (1.5K lines) is really archive extraction, integrity checks and the hosted-restore HTTP client, so it is misnamed and in the wrong place. | 5.6 | #959, #833 | filed #959, #833; #1012 folded into them |
@@ -55,7 +55,7 @@ _Last updated 2026-10-09T06:49Z · main @ f3c6313_
 | E53 | 2 | Vendored pnpm wrote the root `package.json` with `serialize_json`. | new finding | #662 | fixed (#810) |
 | E54 | 3 | Poetry and PDM restored line endings with two rules. | new finding | #695 | fixed (#703) |
 | E56 | 2 | Lock inventory ignored `gems.locked`. | new finding | #736 | fixed (#750) |
-| E58 | 3 | Production `pub fn`s with no production caller, orphaned by #277 (`committed_artifact_intact`, `go_sum_edit::remove_lines`, hosted-vlt ledger helpers, three test-only helpers). | new finding; 3.6 | #782 | partly fixed (#1141: hosted-vlt ledger helpers, `read_project_file` gated); `committed_artifact_intact`, `remove_lines`, `seed_rubygems_sha256`, `copy_manifest_tag` remain in open-PR files |
+| E58 | 3 | Production `pub fn`s with no production caller, orphaned by #277 (`committed_artifact_intact`, `go_sum_edit::remove_lines`, hosted-vlt ledger helpers, three test-only helpers). | new finding; 3.6 | #782 | partly fixed (#1141); `committed_artifact_intact`, `remove_lines`, `seed_rubygems_sha256`, `copy_manifest_tag` remain |
 | E59 | 2 | Vendored gem `edit_lock` searched only the first `GEM` section. | new finding | #779 | fixed (#805) |
 | E61 | 2 | Vendored-reference scan missed NuGet/Maven/hatch wiring. | new finding | #832, #958 | fixed (#1015) |
 | E63 | 2 | Hosted Maven splices the API `maven_suffixed_version` into `pom.xml` unchecked, while hosted Gradle refuses a malformed suffix; four suffix builders (executed twice). | new finding | #882 | filed #882 |
@@ -64,7 +64,7 @@ _Last updated 2026-10-09T06:49Z · main @ f3c6313_
 | E66 | 2 | Vendored Poetry picks its forward splicer by line ending (`utils::poetry_lock` vs the `toml_surgery` scanner), with different `files` shapes and checks (executed twice). | new finding; 5.4 | #936 | fixed (#1185) |
 | E68 | 2 | Vendored gem forward treats any Gemfile containing the copy path as wired, revert needs the exact line: a trailing comment leaves the lock restored and the Gemfile on `path:` (executed 3×). | new finding; 5.3 | #988 | filed #988 |
 | E69 | 2 | "Is this an sbt/Mill/scala-cli build" is six marker lists (#690); some roots get no Coursier roots (executed twice). | new finding | #1014 | partly fixed (#1032); `.mill-version` rule remains (#1014) |
-| E70 | 1 | The vendored→hosted takeover reverted before it planned (B03, B14, B15, B37). | audit B03, B14, B15, B37 | #945, #723 | fixed (#1039); dry-run residuals #668, #891 open |
+| E70 | 1 | The vendored→hosted takeover reverted before it planned (B03, B14, B15, B37). | audit B03, B14, B15, B37 | #945, #723 | fixed (#1039); residuals #668, #891 |
 | E71 | 1 | The supersede/re-pin lifecycle had no owned-pin generation model: older generations' wiring survived a re-pin or remove. | audit B07 | #999, #864, #682, #266 | partly fixed (#1035, #943, #1008); non-npm vendored unserved supersede is E94 |
 | E72 | 1 | VEX attests `not_affected` from wiring the package manager doesn't consume: yarn Plug'n'Play loaders, pnpm bundled copies and deno.lock npm copies. | audit B04, B05 | #519, #406 | partly fixed (#1033); #406 in-run `scan --vex` path open, Maven `integrity_required` waits on E46 |
 | E73 | 2 | "Is this hosted patch pinned" was decided four ways. | audit B13, B58 | #567, #260 | fixed (#1058); lockless NuGet/Cargo pins are still written, now warned (`redirect_pin_lockless`) |
@@ -72,7 +72,7 @@ _Last updated 2026-10-09T06:49Z · main @ f3c6313_
 | E75 | 2 | Which lockfile governs installs is decided in ≥8 places; vendored and hosted patch different PyPI locks and a takeover restores the losers unpatched. | audit B31 | #612 | partly fixed (#1044); #612 takeover restore scope, `pdm_drives` vs pylock and the inventory PyPI order (E91) remain |
 | E76 | 2 | Hosted yarn classic replaced `file:`/URL copies with the Socket artifact. | audit B16 |  | fixed (#1057) |
 | E77 | 2 | JVM layout spelled in ~13 places; `--ecosystems maven` skipped `jvm` entries (B17); over-wide service preflight (B18); sbt roots got no crawl (B65). | audit B17, B18, B65 | #1014 | fixed (#1032); mirrors are E86 |
-| E78 | 1 | pnpm readers and writers ignore `---`, so a two-document pnpm 11+ lock gets the wrong document edited and success reported. | audit B06 | #466 | in PR #1007 (pnpm workstream) |
+| E78 | 1 | pnpm readers and writers ignored `---`, so a two-document pnpm 11+ lock got the wrong document edited and success reported. | audit B06 | #466 | fixed (#1007); one `grammar::main_document` |
 | E79 | 2 | Hosted mode meeting a vendored package has 4+ outcomes per ecosystem. Target: one pre-rewrite decision. Depends on C34. | audit B30 | #536 | filed #536 |
 | E80 | 3 | The gitignore guard for vendored artifacts covers npm and sbt/Coursier only; Maven `.jar` and NuGet `.nupkg` are dropped by stock templates. | audit B32 | #1061, #620 | filed #1061, #620 |
 | E81 | 2 | Go writers ignore `go.work` and `go env -w`, and leave a read-only module-cache copy on Windows. | audit B34 | #458 (+9 symptoms) | filed #458; 9 symptom issues |
@@ -89,6 +89,7 @@ _Last updated 2026-10-09T06:49Z · main @ f3c6313_
 | E92 | 3 | pnpm `modulesDir` is honored by the crawler but not by `pkg_managers`: `node-linker=pnp` + `modulesDir` is classified yarn PnP, so apply refuses (`yarn_pnp_unsupported`), vendored gives the yarn remedy and VEX reads the wrong loader (real pnpm 10.28, executed twice). | new finding | #1129 | filed #1129 |
 | E93 | 3 | NuGet version identity: vendor normalizes (`normalize_nuget_version`), `PurlKey`/crawler only lowercase; a vendored `@13.0.3.0` is judged unused, so `scan --prune` reverts it (executed 3×). | new finding | #1202 | partly fixed (#1230, `PurlKey`); in PR #1239 (crawler lookup); the move to `formats::nuget` remains |
 | E94 | 2 | "Keep the older vendored patch while the superseding one is unserved" (#954) is npm-only: `ServicePolicy::unserved` carries the code only under `ServiceTerminal::Failure`; other backends refuse `vendor_prebuilt_required`, so re-runs exit 1 (Composer, executed twice). | new finding | #1235 | filed #1235 |
+| E95 | 3 | sbt evidence fails closed on an unreadable record; `scala_evidence::discover` skips one, so a truncated `-test` twin hides a `test.dep` conflict and the scala-cli gate passes (executed twice). | new finding | #1270 | filed #1270 |
 
 **Handed off:** none yet.
 

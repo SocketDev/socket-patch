@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against main @ f3c6313 on 2026-10-09 by audit-ecosystems (the package-lock walk and the vendor driver after #1008). Earlier: `cf8b164` on 2026-10-08 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
+_Last checked against main @ a80b89e on 2026-10-09 by audit-ecosystems (the E78 bullet after #1007; the pnpm v9 dual lookup is unchanged). Earlier: `f3c6313` on 2026-10-09 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -168,7 +168,7 @@ Each format exposes `parse(&[u8]) -> Model`, `entries()`, `wired_refs()`, `plan_
 - Vendored pnpm wrote the root `package.json` with `serialize_json` instead of `JsonLayout`, losing CRLF and refusing a BOM; it now uses `JsonLayout` like npm and berry (#810). {{E53}}
 - {{E16}}: the "any `\r\n` → CRLF" terminator rule was written 14 times; #1108 moved 7 inserted-line sites onto `utils::line_endings::terminator`, and the rest sit mostly outside the npm family (gem, Maven, composer and Cargo restore, Pipenv, `.npmrc`, uv, PEP 723 scripts), and hosted Cargo refuses a mixed `Cargo.lock` that upstream restore re-expands wholesale to CRLF; folded into the line-ending tracking issue.
 - {{E76}} October 7: hosted yarn classic replaced `file:`, URL and codeload copies with the Socket artifact; one copy-source classifier (`formats::yarn::source`) now leaves them unpinned (#1057).
-- {{E78}} October 7: pnpm readers and writers ignore `---`, so a two-document pnpm lock gets the wrong document edited (#466, pnpm workstream).
+- {{E78}} October 7: pnpm readers and writers ignored `---`, so a two-document pnpm lock got the wrong document edited; they now read the main document through one `formats::pnpm::grammar::main_document` helper (#1007).
 - {{E64}}: BOM handling has one helper, `formats::text` (`split_bom`, `strip_bom`, `strip_bom_bytes`); the named `strip_bom` copies are gone and `formats::pnpm`'s `lockfileVersion` readers skip a BOM (#909). #1117, #1160 and #1191 moved 24 inline strips (yarn blocks/stanzas, Gradle DSL, npm manifest, requirements, `socket.yml`, manifest operations, the vlt.json probe, go.mod reads, the vendored Gradle settings editor, the shared Pipfile.lock parser and 11 more files) onto it, and a one-sided guard in `formats::text` rejects new inline strips. Inline `\u{feff}` handling still sits in 11 files on the guard's pending list (#905).
 
 ---

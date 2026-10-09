@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ f3c6313 on 2026-10-09 by audit-ecosystems (the superseding-patch service policy across backends for E94; the E71 bullet after #1008). Earlier: `cf8b164` on 2026-10-08 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
+_Last checked against main @ a80b89e on 2026-10-09 by audit-ecosystems (the scala-cli and sbt evidence policies for E95; the E10 reactor bullet after #1036). Earlier: `f3c6313` on 2026-10-09 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -254,6 +254,7 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E95}} October 9: the two JVM evidence readers keep opposite policies for a record they can't read. sbt evidence fails closed (`formats::sbt::evidence::resolution` returns `None`), but `crawlers::scala_evidence::discover` skips an oversized or unparseable Bloop file. A truncated `-test` twin therefore hides a `//> using test.dep` conflict, and the vendored scala-cli gate passes.
 - {{E74}} October 7: "is this vendored entry still in use" had four answers; it is now one discovery verdict (`Discovery::vendor_entry_in_use`), so every ecosystem's dead entries are pruned and JVM orphans are reported (#1050).
 - {{E71}} October 7: a re-pin or remove left the older patch generation's wiring behind. `patch::redirect::generation` now owns the pin-name grammar and the hosted re-pin sweep (Cargo registry block, go.sum pair, Maven `-socket.<hex8>` repository, `remove`/`rollback` by generation; #1035), and vendored uv/Hatch re-vendor was fixed by #943. #1008 fixed #954 for the npm family: while the superseding patch is unbuilt, the run keeps the older vendored patch and reports a skip. Every other vendored backend still fails that run (E94 below), and the Go and Maven restores still leave older generations' residue.
 - {{E94}} October 9: "keep the older vendored patch while the superseding one is unserved" (#954) is decided only for the npm family. `ServicePolicy::unserved` carries the unserved code only under the npm backends' `ServiceTerminal::Failure`; Composer, Cargo, Go, gem, PyPI, Maven and NuGet refuse `vendor_prebuilt_required`, so a re-run exits 1 with the older wiring intact until the service builds the patch (executed twice on Composer).
@@ -266,7 +267,7 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 - {{E61}}: `nuget.config` and `pom.xml` carry the `VENDORED` role, and the scan parses wiring through `vendor::path::parse_vendor_reference`, which accepts the bare uuid directory that NuGet feeds and Maven repositories name, so a still-wired feed or repository is no longer swept (#1015). The `eco == "maven2"` arm of the stranded-reference gate in `commands/vendor.rs` is still dead (the directory is `maven`).
 - {{E59}}: vendored gem `edit_lock` searched only the first `GEM` section of `Gemfile.lock`, so a gem from a later source was refused; fixed by #805; see 5.4.
 - {{E58}}: production `pub fn`s with no production caller, orphaned by #277: `VendorEntry::committed_artifact_intact` and `go_sum_edit::remove_lines` (no reference at all), plus test-only helpers compiled into production (`cargo_tag::copy_manifest_tag`, `jvm::apply::read_project_file`). The hosted-vlt half is in Part 3.
-- {{E10}}: vendored Maven decides "is this a reactor?" twice. `jvm::detect` uses the reactor's `Doc`-based `declares_modules`, which ignores plugin `<configuration><modules>`, then the legacy single-pom path re-checks with its own comment-stripping `declares_modules` and refuses `vendor_maven_multimodule_unsupported`. That refusal fires only on the disagreement, so every `maven-ear-plugin` project is refused; see 5.4.
+- {{E10}}: vendored Maven decided "is this a reactor?" twice, so every `maven-ear-plugin` project was refused `vendor_maven_multimodule_unsupported` (#716). Single poms now go through the `jvm/` planner, and `jvm::maven_reactor::declares_modules` is the only check (#1036).
 - {{E54}}: the Poetry and PDM lock rewriters restored line endings with different rules; they now share `lock_fragments` and its majority rule (#703); see 5.4.
 - {{E04}}: hosted Pipenv used to reject its own pins on path-prefixed `--patch-server-url` origins and sdists. Both private grammars (`owned_url`'s segment count, `is_socket_hosted_reference`) are deleted; Pipenv now uses `hosted_pypi_reference` (#572); see 5.4.
 
