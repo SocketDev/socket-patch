@@ -513,6 +513,36 @@ limits, and required install commands.
     (`"lp": "npm:left-pad@…"`) and VEX checks them (#852).
   - The npm wrapper runs the musl binary on musl hosts (yarn classic on
     Alpine) and prints the spawn error instead of exiting silently (#974).
+  - Hosted npm warns when npm would not install the pin as written:
+    `redirect_npm_replace_registry_host` when `replace-registry-host`
+    rewrites the hosted URL so installs fail E404 (#812), and
+    `redirect_npm_shrinkwrap_only` when `npm-shrinkwrap.json` is the only
+    lock, which npm 12 ignores; VEX then omits the patch
+    (`vex_npm_shrinkwrap_only`) (#899). Vendored mode warns
+    `vendor_npm_allow_file` when npm's `allow-file` setting would refuse the
+    vendored `file:` tarball, and `vendor --check` fails it (#969).
+  - Packages carrying the project's own npm 12 `npm patch`
+    (`patchedDependencies`, or a `patched` lock record) stay on the
+    registry with `redirect_npm_patched_dependency_skipped` instead of
+    being pinned into an install that fails `EPATCHFAILED`; an entry an
+    earlier release already pinned names the `rollback` that restores it.
+    The vendored lockfileVersion 4 refusal names `npm patch` and the real
+    remedies (#711).
+  - Lock entries beneath a dependency that ships its own
+    `npm-shrinkwrap.json` (`hasShrinkwrap`), which npm installs from that
+    shrinkwrap, are skipped with a warning in hosted and vendored mode and
+    never attested; `vendor --check` names the shrinkwrapping dependency
+    (#753).
+  - Vendored npm no longer refuses a registry package because a `file:`
+    dependency or workspace member has the same `name@version` (#688), no
+    longer fails `vex` and `vendor --check` after npm 7–12 drops `resolved`
+    from a v2 lock's `dependencies` mirror (#879), and keeps the vendored
+    patch with a `vendor_prebuilt_pending` / `vendor_prebuilt_unavailable`
+    skip instead of failing the run while a superseding patch's artifact
+    is not yet built (#954).
+  - Agent scans apply `socket.yml` path filters and the built-in
+    test/fixture exclusions to nested npm projects; a package shared with
+    a skipped project warns `policy_shared_copy` (#554).
 - pnpm:
   - BOM-prefixed `pnpm-lock.yaml` and `pnpm-workspace.yaml` are read
     correctly, so hosted mode no longer skips `trustLockfile` or duplicates
@@ -549,6 +579,24 @@ limits, and required install commands.
     `<root>/.bundle` install root (#915, #967).
   - Trailing `#` comments in `.bundle/config` values are stripped as Bundler
     2.5.6+ does (#951).
+  - A hosted re-scan that moves a patched gem to a new URL keeps the lock's
+    GEM sections in Bundler's sorted order, so frozen installs on Bundler
+    4.0.19+ no longer fail with "Your lockfile needs to be updated"; locks
+    left out of order by earlier runs are healed on the next scan (#1186).
+- Project-mode crawls of a Cargo project with a `Cargo.lock`, or a restored
+  .NET project (`obj/project.assets.json`), look up only the packages that
+  project resolves instead of walking the whole shared `$CARGO_HOME`
+  registry or `~/.nuget/packages` cache, so agent mode no longer patches,
+  and VEX no longer attests, packages other projects downloaded. Projects
+  without a readable lock or restore, `vendor/` trees, solution roots and
+  global mode keep the full walk (#1204, #427).
+- `scan --mode agent --json` and `get --json` report files whose contents
+  matched neither patch hash and were overwritten, as
+  `content_mismatch_overwritten` entries in `warnings[]`, as `apply --json`
+  already did (#1004).
+- `remove --preserve-state` on a hosted patch prints the "no preservable
+  local state" note and carries `hosted_state_not_preservable` in `--json`
+  `warnings[]`, like `rollback --preserve-state` (#433).
 - Registry downloads for hosted restore and vendored Maven use the 10 s connect
   / 60 s idle timeouts instead of a 60 s total deadline, so slow large downloads
   no longer fail (#872). Vendor-service retries honor HTTP-date `Retry-After`
