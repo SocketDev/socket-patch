@@ -403,40 +403,29 @@ fn write_redirect_ledger(cwd: &Path, key: &str, rec: PatchRecord) {
 /// embedded), with the composer backend's lock wiring record.
 fn write_vendor_ledger(cwd: &Path, key: &str, rec: PatchRecord) {
     let mut state = VendorState::new();
-    state.entries.insert(
+    let mut entry = VendorEntry::new(
+        "composer".to_string(),
         key.to_string(),
-        VendorEntry {
-            ecosystem: "composer".to_string(),
-            base_purl: key.to_string(),
-            uuid: rec.uuid.clone(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: artifact_rel(&rec.uuid),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: vec![WiringRecord {
-                file: "composer.lock".to_string(),
-                kind: "composer_lock_package".to_string(),
-                action: WiringAction::Rewritten,
-                key: Some("acme/vexprobe".to_string()),
-                original: None,
-                new: None,
-            }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: Some(rec),
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+        rec.uuid.clone(),
+        VendorArtifact {
+            yarn_berry10c0: None,
+            path: artifact_rel(&rec.uuid),
+            sha256: String::new(),
+            size: None,
+            platform_locked: None,
+            file_inventory: None,
         },
+        vec![WiringRecord {
+            file: "composer.lock".to_string(),
+            kind: "composer_lock_package".to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("acme/vexprobe".to_string()),
+            original: None,
+            new: None,
+        }],
     );
+    entry.record = Some(rec);
+    state.entries.insert(key.to_string(), entry);
     let dir = cwd.join(".socket/vendor");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(

@@ -122,36 +122,23 @@ async fn python_document_recovery_canonicalizes_the_purl_name() {
         "lock-version = '1.0'\n[[packages]]\nname = 'pyyaml'\nversion = '6.0.1'\narchive = {{ url = 'https://pypi.org/PyYAML-6.0.1-py3-none-any.whl', hashes = {{ sha256 = '{WHEEL_SHA}' }} }}\n"
     );
     let entry = crate::vendor::state::VendorEntry {
-        ecosystem: "pypi".into(),
-        base_purl: "pkg:pypi/PyYAML@6.0.1".into(),
-        uuid: "11111111-1111-4111-8111-111111111111".into(),
-        artifact: crate::vendor::state::VendorArtifact {
+flavor: Some("python-lock".into()),
+..crate::vendor::state::VendorEntry::new("pypi".into(), "pkg:pypi/PyYAML@6.0.1".into(), "11111111-1111-4111-8111-111111111111".into(), crate::vendor::state::VendorArtifact {
             yarn_berry10c0: None,
             path: ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/PyYAML-6.0.1-py3-none-any.whl".into(),
             sha256: String::new(),
             size: None,
             platform_locked: None,
             file_inventory: None,
-        },
-        wiring: vec![crate::vendor::state::WiringRecord {
+        }, vec![crate::vendor::state::WiringRecord {
             file: "pylock.toml".into(),
             kind: "python_lock_document".into(),
             action: crate::vendor::state::WiringAction::Rewritten,
             key: Some("pyyaml".into()),
             original: Some(serde_json::Value::String(lock)),
             new: None,
-        }],
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: Some("python-lock".into()),
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    };
+        }])
+};
     let recovered = recover_lock_entry(tmp.path(), &entry).await.unwrap();
     assert_eq!(
         recovered.resolved.as_deref(),

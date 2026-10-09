@@ -675,7 +675,6 @@ mod tests {
                 &pkg,
                 files,
                 &PatchSources::blobs_only(&blobs),
-                None,
                 false,
                 MismatchPolicy::Strict,
             )

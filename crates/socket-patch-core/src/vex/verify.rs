@@ -1340,11 +1340,11 @@ mod tests {
     const VUUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
     fn vendor_entry(purl: &str, rel_path: &str) -> VendorEntry {
-        VendorEntry {
-            ecosystem: "cargo".to_string(),
-            base_purl: purl.to_string(),
-            uuid: VUUID.to_string(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "cargo".to_string(),
+            purl.to_string(),
+            VUUID.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
@@ -1352,18 +1352,8 @@ mod tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+            Vec::new(),
+        )
     }
 
     /// `applied_patches` must be exactly `applied_patches_with_vendor(.., None)`
