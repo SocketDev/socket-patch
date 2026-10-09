@@ -236,9 +236,15 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   remedy (then `bun install --force`: a plain install keeps the patched copy), while the hosted → vendored takeover rebuilds its npm registry record natively
   and vendors over it. Each restore reads the package's version document from the
   registry Bun resolves it against (`.npmrc` / `bunfig.toml` scope and default
-  registries, `BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), sending the credentials
+  registries, `BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), read from the project's
+  files and the user's own: `$XDG_CONFIG_HOME/.npmrc` or `~/.npmrc`, and the global
+  `$XDG_CONFIG_HOME/.bunfig.toml` or `~/.bunfig.toml` (#1276). Bun ≥ 1.4 takes a bunfig
+  key over an `.npmrc` one and Bun ≤ 1.3 the reverse, so when they disagree on a package
+  of a lockfileVersion-0/1 `bun.lock` or a `bun.lockb` (either Bun may install it) the
+  restore refuses that pin with the checkout remedy. It sends the credentials
   those settings give it — a bunfig `token` or `username` / `password` (`$VAR`
-  expanded only for `NPM_TOKEN`, `NODE_AUTH_TOKEN` and `BUN_AUTH_TOKEN`; any other
+  expanded only for `NPM_TOKEN`, `NODE_AUTH_TOKEN` and `BUN_AUTH_TOKEN` in the project's
+  files, any variable in the user's own; any other
   variable expands to nothing, so a project's config cannot send other secrets; in a
   registry URL only its `user:password@` part expands, which is sent as the
   `Authorization` header and never printed or written into the lock), else the `.npmrc` `//host/path/:_authToken` / `_auth` / `username` +
