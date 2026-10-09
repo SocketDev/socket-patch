@@ -59,6 +59,57 @@ async fn npm_project_local_refuses_with_local_hint() {
     );
 }
 
+/// #1111: a pnpm project install refuses with pnpm's own command. Running
+/// `npm install …` there writes a stray package-lock.json and leaves
+/// pnpm-lock.yaml stale, so the next `pnpm install --frozen-lockfile`
+/// fails.
+#[tokio::test]
+async fn pnpm_project_refuses_with_pnpm_hint() {
+    let install = staged_install_at(
+        "app/node_modules/.pnpm/@socketsecurity+socket-patch-x@4.0.0/node_modules/@socketsecurity/socket-patch-x/bin",
+    );
+    std::fs::write(install.root.path().join("app/package.json"), "{}").unwrap();
+    std::fs::write(install.root.path().join("app/pnpm-lock.yaml"), "").unwrap();
+    let (code, _stdout, stderr) = run_installed(
+        &install,
+        &["--update", "--yes"],
+        &[("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL)],
+    );
+    assert_eq!(code, 1, "managed install must refuse.\nstderr:\n{stderr}");
+    assert!(stderr.contains("managed by pnpm"), "{stderr}");
+    assert!(
+        stderr.contains("`pnpm add @socketsecurity/socket-patch@latest`"),
+        "a pnpm project must get pnpm's upgrade command: {stderr}"
+    );
+    assert!(!stderr.contains("npm install"), "{stderr}");
+    install.assert_binary_intact();
+}
+
+/// #1111: pnpm's global store is invisible to `npm update -g`, so a pnpm
+/// global install must be told to use `pnpm add -g`.
+#[tokio::test]
+async fn pnpm_global_refuses_with_pnpm_hint() {
+    let install = staged_install_at(
+        "pnpm/global/5/node_modules/.pnpm/@socketsecurity+socket-patch-x@4.0.0/node_modules/@socketsecurity/socket-patch-x/bin",
+    );
+    let (code, stdout, _stderr) = run_installed(
+        &install,
+        &["--update", "--yes", "--json"],
+        &[("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL)],
+    );
+    assert_eq!(code, 1, "managed install must refuse.\nstdout:\n{stdout}");
+    let env = common::parse_json_envelope(&stdout);
+    let message = env["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(env["error"]["code"], "managed_install", "{stdout}");
+    assert!(message.contains("managed by pnpm"), "{stdout}");
+    assert!(
+        message.contains("`pnpm add -g @socketsecurity/socket-patch@latest`"),
+        "{stdout}"
+    );
+    assert!(!message.contains("npm update -g"), "{stdout}");
+    install.assert_binary_intact();
+}
+
 /// An npm-bundled binary (any `node_modules` component) refuses with the
 /// npm upgrade command — and the refusal happens before ANY release
 /// traffic: a fully valid, newer release is mounted and its routes must
