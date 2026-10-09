@@ -207,7 +207,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   that copy. Hosted and vendored modes leave the entry untouched
   (`redirect_yarn_classic_directory_skipped` / `vendor_link_entry_skipped`, naming it) and
   that copy stays unpatched; `vex` never attests the package from that lock while the
-  copy is there. When every entry of the package is such a copy (git, `file:` directory,
+  copy is there. This holds whatever dependency name the project gives the copy: yarn 1
+  locks `"lp2": "file:./lpdir"` as `lp2@file:./lpdir`, so which package it is comes from
+  the directory's `package.json` (and, for `vex`, a `file:` tarball's manifest or a
+  registry tarball URL's path; hosted and vendored scans name a URL copy with
+  `redirect_yarn_classic_non_registry_entry_skipped` /
+  `vendor_yarn_classic_non_registry_entry_skipped`). A git copy under another name
+  records no package name in the lock and is not detected. When every entry of the package is such a copy (git, `file:` directory,
   non-registry tarball or `link:`), vendoring refuses with `vendor_lock_entry_not_rewritable` naming them,
   since `yarn install` can't help.
 - **bun** — text `bun.lock` lockfileVersion 0, 1 or 2: 0 is the `--save-text-lockfile`
