@@ -778,8 +778,6 @@ async fn repair_json_reports_unresolved_org_fallback_in_warnings() {
         .args([
             "repair",
             "--json",
-            "--download-mode",
-            "file",
             "--download-only",
             "--api-url",
             &mock.uri(),
