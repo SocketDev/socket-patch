@@ -62,7 +62,7 @@ async fn vlt_pinned_matrix_hosted_scan_fresh_ci() {
     let fx = Fixture::build(leg, Shape::left_pad()).await;
     let out = fx.scan_vex(&[]);
     let doc = out.json();
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     fx.assert_lock_warnings(&doc);
     fx.assert_in_run_vex(&out, fx.t(), fx.in_run_vex_attests());
     assert_pinned(&fx.proj, &fx.svc, fx.t());
@@ -410,7 +410,7 @@ async fn vlt_pinned_matrix_hosted_scoped() {
     };
     let fx = Fixture::build(leg, shape).await;
     let doc = fx.scan(&[]);
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     assert_pinned(&fx.proj, &fx.svc, fx.t());
     fx.assert_fresh_locked_install("fresh-scoped");
     fx.leg.ran();
@@ -465,7 +465,7 @@ async fn vlt_pinned_matrix_hosted_peer_workspace_instances() {
         String::from_utf8_lossy(&fx.lock_before)
     );
     let doc = fx.scan(&[]);
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     assert_pinned(&fx.proj, &fx.svc, &t);
     let co = fx.checkout("fresh-peers");
     fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "fresh-peers");
@@ -509,7 +509,7 @@ async fn vlt_pinned_matrix_hosted_peer_rekey_rollback() {
     let pinned_id = node_id(&before, &t.name, &t.version);
     assert!(pinned_id.contains("~peer."), "{before:#}");
     let doc = fx.scan(&[]);
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     fx.vlt_ok(&fx.proj, &["install", "react@18.3.1"]);
     let rekeyed_id = node_id(&read_lock(&fx.proj), &t.name, &t.version);
     assert_ne!(rekeyed_id, pinned_id, "vlt re-keys the peer context");
@@ -1044,7 +1044,7 @@ async fn vlt_pinned_matrix_hosted_default_registry_alias() {
     let id = node_id(&lock, LP.0, LP.1);
     assert!(id.starts_with("~acme~"), "{id}");
     let doc = fx.scan(&[]);
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     assert_pinned(&fx.proj, &fx.svc, fx.t());
     fx.assert_fresh_locked_install("fresh-alias");
     fx.leg.ran();
@@ -1070,7 +1070,7 @@ async fn vlt_pinned_matrix_hosted_registry_from_env() {
     };
     let fx = Fixture::build(leg, shape).await;
     let doc = fx.scan(&[]);
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     assert_pinned(&fx.proj, &fx.svc, fx.t());
     fx.assert_fresh_locked_install("fresh-env");
     fx.leg.ran();
@@ -1088,7 +1088,7 @@ async fn vlt_pinned_matrix_hosted_registry_from_user_config() {
     shape.user_config = vec!["default", "fresh-user"];
     let fx = Fixture::build(leg, shape).await;
     let doc = fx.scan(&[]);
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     assert_pinned(&fx.proj, &fx.svc, fx.t());
     fx.assert_fresh_locked_install("fresh-user");
     fx.leg.ran();

@@ -319,8 +319,12 @@ fn vendored_extras_pin_is_refused_and_nothing_is_attested() {
     let api = ScanApi::start(VENDORED_UUID);
     let (code, env, stderr) = run_scan(&cwd, &api, &extras, Mode::Vendored, &[]);
     assert_ne!(code, Some(0), "{env}\n{stderr}");
-    assert_eq!(
-        env["vendor"]["events"][0]["errorCode"], "pypi_extras_unsupported",
+    // v5.0: the vendor engine's events are merged into scan's envelope,
+    // after the download phase's `downloaded` event.
+    assert!(
+        env["events"].as_array().is_some_and(|e| e
+            .iter()
+            .any(|e| e["action"] == "failed" && e["errorCode"] == "pypi_extras_unsupported")),
         "{env}"
     );
     for (rel, native) in &extras.native {

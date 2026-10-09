@@ -107,7 +107,7 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON envelope");
     assert_eq!(
-        v["status"], "selection_required",
+        v["status"], "selectionRequired",
         "must surface selection_required; got {}",
         v["status"]
     );
@@ -142,9 +142,9 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
             o["tier"]
         );
         assert!(
-            o["published_at"].as_str().is_some_and(|s| !s.is_empty()),
+            o["publishedAt"].as_str().is_some_and(|s| !s.is_empty()),
             "each option must carry a non-empty published_at; got {}",
-            o["published_at"]
+            o["publishedAt"]
         );
     }
 
@@ -237,13 +237,13 @@ async fn get_uuid_returning_404_emits_not_found() {
     // 404 means "patch absent", which is a clean no-op: exit 0.
     assert_eq!(code, 0, "404 (patch absent) must exit 0; stdout={stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "not_found", "404 must surface as not_found");
+    assert_eq!(v["status"], "notFound", "404 must surface as not_found");
     // The empty-result envelope shape is part of the contract.
-    assert_eq!(v["found"], 0);
-    assert_eq!(v["downloaded"], 0);
-    assert_eq!(v["applied"], 0);
+    assert_eq!(v["events"], serde_json::json!([]));
+    assert_eq!(v["summary"]["downloaded"], 0);
+    assert_eq!(v["summary"]["applied"], 0);
     assert!(
-        v["patches"].as_array().expect("patches array").is_empty(),
+        v["events"].as_array().expect("patches array").is_empty(),
         "not_found must carry an empty patches list"
     );
 }
@@ -333,15 +333,21 @@ async fn get_by_cve_with_no_patches_emits_no_match() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
-        v["status"], "not_found",
+        v["status"], "notFound",
         "empty CVE search must emit not_found (NOT no_match, which is the \
          fuzzy package-name path); got {}",
         v["status"]
     );
-    assert_eq!(v["found"], 0);
-    assert_eq!(v["downloaded"], 0, "no patches downloaded on empty search");
-    assert_eq!(v["applied"], 0, "no patches applied on empty search");
-    assert!(v["patches"].as_array().expect("patches array").is_empty());
+    assert_eq!(v["events"], serde_json::json!([]));
+    assert_eq!(
+        v["summary"]["downloaded"], 0,
+        "no patches downloaded on empty search"
+    );
+    assert_eq!(
+        v["summary"]["applied"], 0,
+        "no patches applied on empty search"
+    );
+    assert!(v["events"].as_array().expect("patches array").is_empty());
 }
 
 /// GHSA search returning empty patch list → `not_found` envelope, exit 0.
@@ -368,13 +374,19 @@ async fn get_by_ghsa_with_no_patches_emits_no_match() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
-        v["status"], "not_found",
+        v["status"], "notFound",
         "empty GHSA search must emit not_found (NOT no_match, which is the \
          fuzzy package-name path); got {}",
         v["status"]
     );
-    assert_eq!(v["found"], 0);
-    assert_eq!(v["downloaded"], 0, "no patches downloaded on empty search");
-    assert_eq!(v["applied"], 0, "no patches applied on empty search");
-    assert!(v["patches"].as_array().expect("patches array").is_empty());
+    assert_eq!(v["events"], serde_json::json!([]));
+    assert_eq!(
+        v["summary"]["downloaded"], 0,
+        "no patches downloaded on empty search"
+    );
+    assert_eq!(
+        v["summary"]["applied"], 0,
+        "no patches applied on empty search"
+    );
+    assert!(v["events"].as_array().expect("patches array").is_empty());
 }

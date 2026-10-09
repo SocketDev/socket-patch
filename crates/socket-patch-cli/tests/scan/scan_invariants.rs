@@ -144,8 +144,8 @@ async fn scan_with_no_installed_packages_reports_zero() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
     assert_eq!(v["scannedPackages"], 0);
-    assert_eq!(v["packagesWithPatches"], 0);
-    assert_eq!(v["totalPatches"], 0);
+    assert_eq!(v["packages"], serde_json::json!([]));
+    crate::common::envelope::assert_envelope_invariants(&v, "scan");
 
     // A project with no installed dependencies crawls zero packages, so
     // scan must never query the batch API. The zeroed counters above are
@@ -199,10 +199,11 @@ async fn scan_reports_available_patch_for_installed_package() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
-    assert_eq!(v["packagesWithPatches"], 1);
-    assert_eq!(v["totalPatches"], 1);
-    assert_eq!(v["freePatches"], 1);
-    assert_eq!(v["paidPatches"], 0);
+    crate::common::envelope::assert_envelope_invariants(&v, "scan");
+    // v5.0: the tier counts derive from `packages[].patches[].tier`.
+    assert_eq!(v["packages"].as_array().unwrap().len(), 1);
+    assert_eq!(v["packages"][0]["patches"].as_array().unwrap().len(), 1);
+    assert_eq!(v["packages"][0]["patches"][0]["tier"], "free");
 
     // The packages array carries per-package patch metadata.
     let packages = v["packages"].as_array().expect("packages array");
@@ -511,7 +512,7 @@ async fn scan_with_no_manifest_emits_empty_updates() {
         Some(0),
         "updates should be empty when no manifest exists; got: {v}"
     );
-    assert_eq!(v["packagesWithPatches"], 1);
+    assert_eq!(v["packages"].as_array().unwrap().len(), 1);
 
     let reqs = recorded(&mock).await;
     assert_single_batch_carries_purl(&reqs, purl);
@@ -617,17 +618,15 @@ async fn scan_apply_dry_run_with_empty_manifest_emits_added_action() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
-    let apply = v["apply"]
-        .as_object()
-        .expect("apply object present in --mode agent mode");
-    assert_eq!(apply["dryRun"], true);
-    assert_eq!(apply["found"], 1);
-    assert_eq!(apply["added"], 1);
-    assert_eq!(apply["updated"], 0);
-    assert_eq!(apply["skipped"], 0);
-    let patches = apply["patches"].as_array().expect("patches array");
+    crate::common::envelope::assert_envelope_invariants(&v, "scan");
+    assert_eq!(v["dryRun"], true);
+    assert_eq!(v["summary"]["verified"], 1);
+    assert_eq!(v["summary"]["skipped"], 0);
+    let patches = v["events"].as_array().expect("events array");
     assert_eq!(patches.len(), 1);
-    assert_eq!(patches[0]["action"], "added");
+    // A would-be new record: `verified`, no `oldUuid`.
+    assert_eq!(patches[0]["action"], "verified");
+    assert!(patches[0].get("oldUuid").is_none(), "{v}");
     assert_eq!(patches[0]["uuid"], new_uuid);
     assert_eq!(patches[0]["purl"], purl);
 
@@ -727,12 +726,11 @@ async fn scan_apply_dry_run_with_existing_uuid_emits_skipped_action() {
     );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let apply = &v["apply"];
-    assert_eq!(apply["skipped"], 1);
-    assert_eq!(apply["added"], 0);
-    assert_eq!(apply["updated"], 0);
-    let patches = apply["patches"].as_array().unwrap();
+    assert_eq!(v["summary"]["skipped"], 1);
+    assert_eq!(v["summary"]["verified"], 0);
+    let patches = v["events"].as_array().unwrap();
     assert_eq!(patches[0]["action"], "skipped");
+    assert_eq!(patches[0]["errorCode"], "already_in_manifest");
 
     let reqs = recorded(&mock).await;
     assert_single_batch_carries_purl(&reqs, purl);
@@ -820,12 +818,11 @@ async fn scan_apply_dry_run_with_different_uuid_emits_updated_action() {
     );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let apply = &v["apply"];
-    assert_eq!(apply["updated"], 1);
-    assert_eq!(apply["added"], 0);
-    assert_eq!(apply["skipped"], 0);
-    let patches = apply["patches"].as_array().unwrap();
-    assert_eq!(patches[0]["action"], "updated");
+    assert_eq!(v["summary"]["verified"], 1);
+    assert_eq!(v["summary"]["skipped"], 0);
+    let patches = v["events"].as_array().unwrap();
+    // A would-be replacement: `verified` naming the uuid it replaces.
+    assert_eq!(patches[0]["action"], "verified");
     assert_eq!(patches[0]["oldUuid"], old_uuid);
     assert_eq!(patches[0]["uuid"], new_uuid);
 
@@ -888,12 +885,16 @@ async fn scan_prune_dry_run_reports_prunable_manifest_entries() {
     let gc = v["gc"]
         .as_object()
         .unwrap_or_else(|| panic!("--prune must emit gc field; full envelope was: {v}"));
-    // Dry-run reports the would-be removals under the one `gc` shape.
-    let prunable = gc["prunedManifestEntries"]
+    assert!(gc.contains_key("bytesFreed"), "{v}");
+    // Dry-run reports the would-be removals as `verified` manifest events.
+    let prunable: Vec<&serde_json::Value> = v["events"]
         .as_array()
-        .expect("prunedManifestEntries present in dry-run gc");
-    assert_eq!(prunable.len(), 1);
-    assert_eq!(prunable[0], "pkg:npm/uninstalled@1.0.0");
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "verified" && e["details"]["manifest"] == true)
+        .collect();
+    assert_eq!(prunable.len(), 1, "{v}");
+    assert_eq!(prunable[0]["purl"], "pkg:npm/uninstalled@1.0.0");
 
     // Manifest must not have been mutated.
     let body = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
@@ -951,11 +952,15 @@ async fn scan_prune_removes_stale_manifest_entries() {
     let (code, stdout, _) = run_scan(tmp.path(), &mock.uri(), &["--prune", "--yes"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let gc = &v["gc"];
-    let pruned = gc["prunedManifestEntries"]
+    assert!(v["gc"].is_object(), "{v}");
+    let pruned: Vec<&serde_json::Value> = v["events"]
         .as_array()
-        .expect("prunedManifestEntries present in apply-mode gc");
-    assert_eq!(pruned.len(), 1);
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "removed" && e["details"]["manifest"] == true)
+        .collect();
+    assert_eq!(pruned.len(), 1, "{v}");
+    assert_eq!(v["summary"]["removed"], 1, "{v}");
 
     let body = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1461,10 +1466,8 @@ async fn scan_agent_over_vendored_purl_surfaces_run_level_warning() {
         "additive warning must NOT change status; envelope={v}"
     );
 
-    // The per-patch skip record is unchanged (contract-pinned elsewhere)…
-    let patches = v["apply"]["patches"]
-        .as_array()
-        .expect("apply.patches array");
+    // The per-patch skip event (contract-pinned elsewhere)…
+    let patches = v["events"].as_array().expect("events array");
     assert_eq!(patches.len(), 1, "envelope={v}");
     assert_eq!(patches[0]["errorCode"], "vendored", "envelope={v}");
 
@@ -2028,8 +2031,12 @@ async fn vendored_mode_envelopes_omit_redirect_state() {
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert!(
-        v["vendor"].is_object(),
-        "vendored dry-run envelope carries its vendor block; envelope={v}"
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["details"]["mode"] == "vendored"),
+        "vendored dry-run envelope carries its vendored preview events; envelope={v}"
     );
     assert!(
         v.get("redirectState").is_none(),
@@ -2162,7 +2169,7 @@ async fn scan_agent_over_vlt_vendored_purl_surfaces_run_level_warning() {
         &[],
     );
     assert_eq!(code, 0, "{v:#}\n{stderr}");
-    let patches = v["apply"]["patches"].as_array().expect("apply.patches");
+    let patches = v["events"].as_array().expect("events");
     assert_eq!(patches[0]["errorCode"], "vendored", "{v:#}");
     let w = find_warning(&v, "vendored_ownership_retained").unwrap_or_else(|| panic!("{v:#}"));
     assert!(w["detail"].as_str().unwrap().contains(hosted::PURL), "{w}");

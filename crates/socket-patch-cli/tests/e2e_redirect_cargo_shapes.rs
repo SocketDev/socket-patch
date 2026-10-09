@@ -529,11 +529,11 @@ async fn run_shape(shape: Shape) -> Option<()> {
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     if let Some(code) = shape.refused {
-        assert_eq!(env["redirect"]["redirected"], 0, "{}: {env}", shape.tag);
-        let codes: Vec<&str> = env["redirect"]["warnings"]
+        assert_eq!(hosted_pinned(&env), 0, "{}: {env}", shape.tag);
+        let codes: Vec<&str> = env["warnings"]
             .as_array()
-            .unwrap()
-            .iter()
+            .into_iter()
+            .flatten()
             .filter_map(|w| w["code"].as_str())
             .collect();
         assert_eq!(
@@ -561,15 +561,14 @@ async fn run_shape(shape: Shape) -> Option<()> {
         return Some(());
     }
     assert_eq!(
-        env["redirect"]["redirected"],
-        shape.patches.len(),
+        hosted_pinned(&env),
+        shape.patches.len() as u64,
         "{}: every patch redirected: {env}",
         shape.tag
     );
-    assert_eq!(
-        env["redirect"]["warnings"],
-        serde_json::json!([]),
-        "{}: {env}",
+    assert!(
+        env.get("warnings").is_none(),
+        "{}: no warning: {env}",
         shape.tag
     );
 
@@ -1022,4 +1021,18 @@ async fn cargo_hosted_refuses_a_lockless_project_with_other_dependencies() {
         refused: Some("redirect_cargo_lockless_dependents"),
     };
     let _ = run_shape(shape).await;
+}
+
+/// How many hosted pins the run wrote (v5.0: the `applied` / `verified`
+/// events with `details.mode: "hosted"`, formerly `redirect.redirected`).
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

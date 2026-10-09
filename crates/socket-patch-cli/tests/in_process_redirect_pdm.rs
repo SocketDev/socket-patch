@@ -651,13 +651,11 @@ async fn scan_json(
 }
 
 fn stale_warning(json: &serde_json::Value) -> bool {
-    json["redirect"]["warnings"]
-        .as_array()
-        .is_some_and(|warnings| {
-            warnings
-                .iter()
-                .any(|warning| warning["code"] == "redirect_pypi_stale_install")
-        })
+    json["warnings"].as_array().is_some_and(|warnings| {
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "redirect_pypi_stale_install")
+    })
 }
 
 /// Lay `urllib3 1.26.18` with `bytes` as its `response.py` into `site`.

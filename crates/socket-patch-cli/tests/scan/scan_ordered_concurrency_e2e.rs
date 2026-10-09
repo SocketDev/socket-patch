@@ -878,7 +878,7 @@ async fn hosted_record_fetch_failures_keep_order_and_lock_bytes() {
 
     let (stdout, lock) = &outcomes[0];
     let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
-    let warnings: Vec<&str> = v["redirect"]["warnings"]
+    let warnings: Vec<&str> = v["warnings"]
         .as_array()
         .unwrap()
         .iter()

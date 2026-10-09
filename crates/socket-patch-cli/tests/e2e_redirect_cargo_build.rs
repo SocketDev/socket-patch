@@ -566,27 +566,30 @@ async fn redirect_scanned_project(
     // confirmed_cargo_uuids — a grant only counts once the three-file
     // rewrite actually landed.
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        env["summary"]["applied"], 1,
         "exactly one dep redirected: {env}"
     );
     match driver {
         Driver::ScanVex => {
             assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
-            assert_eq!(
-                env["vex"]["verified"], false,
+            assert!(
+                env["vex"]["warnings"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|w| w["code"] == "vex_hosted_unverified")),
                 "in-run hosted VEX is attested from the fetched record, not hash-verified: {env}"
             );
         }
         Driver::GetUuid => {
-            // Get's base envelope wraps the nested redirect block: found
-            // counts the resolved patch; downloaded/applied are ABSENT
-            // (nothing lands in .socket/) and get has no --vex.
-            assert_eq!(env["found"], 1, "get envelope: {env}");
+            // Get records the resolved patch's hosted pin as its one
+            // event; nothing is downloaded into .socket/ and get has no
+            // --vex.
+            assert_eq!(env["command"], "get", "get envelope: {env}");
+            assert_eq!(env["events"].as_array().map(Vec::len), Some(1), "{env}");
             assert!(env["vex"].is_null(), "get has no --vex: {env}");
-            assert!(
-                env["downloaded"].is_null() && env["applied"].is_null(),
-                "hosted get must not report downloaded/applied — nothing \
+            assert_eq!(
+                env["summary"]["downloaded"], 0,
+                "hosted get must not report a download — nothing \
                  is persisted under .socket/: {env}"
             );
         }

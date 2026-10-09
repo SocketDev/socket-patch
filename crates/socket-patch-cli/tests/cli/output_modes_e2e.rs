@@ -626,7 +626,7 @@ fn get_with_explicit_package_flag_works() {
     );
     // `--package` forces a package-name search. With no installed packages
     // it short-circuits locally (never reaching the dead API), exits 0, and
-    // emits the structured "no_packages" JSON. The old `0 || 1` would have
+    // emits the structured `noPackages` envelope. The old `0 || 1` would have
     // accepted a crash or a misrouted vuln lookup.
     assert_eq!(
         code, 0,
@@ -634,8 +634,8 @@ fn get_with_explicit_package_flag_works() {
     );
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("must emit parseable JSON");
-    assert_eq!(v["status"], "no_packages", "got: {stdout}");
-    assert_eq!(v["found"], 0, "got: {stdout}");
+    assert_eq!(v["status"], "noPackages", "got: {stdout}");
+    assert_eq!(v["events"], serde_json::json!([]), "got: {stdout}");
 }
 
 // ---------------------------------------------------------------------------

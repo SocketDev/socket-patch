@@ -104,6 +104,38 @@ fn run_cli(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, Value) {
     (code, env)
 }
 
+/// How many hosted pins a `scan --mode hosted --json` run wrote (or would
+/// write, on a dry run): its `applied` / `verified` hosted events.
+fn hosted_pinned(env: &Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
+}
+
+/// A hosted run's skips as `{purl, uuid, reason, detail}` rows: its
+/// `skipped` hosted events (`reason` = the `errorCode`, `detail` = the
+/// event's `reason`).
+fn hosted_skipped(env: &Value) -> Vec<Value> {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "skipped")
+        .map(|e| {
+            serde_json::json!({
+                "purl": e["purl"], "uuid": e["uuid"],
+                "reason": e["errorCode"], "detail": e["reason"],
+            })
+        })
+        .collect()
+}
+
 /// [`run_cli`] without `--json`: `(exit code, stdout, stderr)`.
 fn run_raw(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, String) {
     let venv = root.join("../empty-venv");
@@ -257,7 +289,7 @@ async fn assert_vendored_to_hosted(root: &Path, files: &[&str]) {
     let hosted_url = mount_hosted_api(&server, true).await;
     let (code, env) = hosted_scan(root, &server);
     assert_eq!(code, 0, "hosted scan over the vendored project: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     assert!(
         env.to_string()
             .contains("redirect_takeover_reverted_vendored"),
@@ -425,7 +457,7 @@ async fn assert_all_hosted_requirements_unwind(pristine: &str) {
         std::fs::write(root.join("requirements.txt"), pristine).unwrap();
         let (code, env) = hosted_scan(&root, &server);
         assert_eq!(code, 0, "hosted scan: {env:#}");
-        assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+        assert_eq!(hosted_pinned(&env), 1, "{env:#}");
         let wired = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
         assert!(wired.contains(&hosted_url), "hosted first:\n{wired}");
 
@@ -566,7 +598,7 @@ async fn pipenv_takeover_beside_an_unreached_include_is_never_stranded() {
         !env.to_string().contains("redirect_takeover_unpatched"),
         "{env:#}"
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
     assert!(
         lock.contains(&hosted_url),
@@ -574,15 +606,15 @@ async fn pipenv_takeover_beside_an_unreached_include_is_never_stranded() {
     );
     assert!(!lock.contains(".socket/vendor/"), "{lock}");
     assert_eq!(
-        (dry_code, &dry_env["redirect"]["redirected"]),
-        (code, &env["redirect"]["redirected"]),
+        (dry_code, hosted_pinned(&dry_env)),
+        (code, hosted_pinned(&env)),
         "the dry run predicts the wet run: {dry_env:#}"
     );
 }
 
 /// #567 without a takeover: the Pipfile.lock pin the hosted rewriter would
 /// land is contested by an `-r` include it does not reach, so the patch is
-/// left out — reported in `redirect.skipped[]` as `redirect_unattributable`
+/// left out — reported as a hosted `skipped` event with `errorCode` `redirect_unattributable`
 /// with discovery's finding — nothing is written and the exit code is 0.
 #[tokio::test]
 async fn pipenv_redirect_beside_an_unreached_include_is_skipped_unattributable() {
@@ -600,8 +632,8 @@ async fn pipenv_redirect_beside_an_unreached_include_is_skipped_unattributable()
         code, 0,
         "an unattributable pin is a skip, not a failure: {env:#}"
     );
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
-    let skipped = env["redirect"]["skipped"].as_array().expect("skipped[]");
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
+    let skipped = hosted_skipped(&env);
     assert_eq!(skipped.len(), 1, "{env:#}");
     assert_eq!(skipped[0]["purl"], PURL, "{env:#}");
     assert_eq!(skipped[0]["reason"], "redirect_unattributable", "{env:#}");
@@ -1168,7 +1200,7 @@ async fn uv_takeover_without_wheel_metadata_keeps_the_package_vendored() {
         let (code, env) = run_cli(&root, &args, &[]);
         let ctx = format!("dry_run={dry_run}: {env:#}");
         assert_eq!(code, 0, "a retracted takeover is not a failure: {ctx}");
-        assert_eq!(env["redirect"]["redirected"], 0, "{ctx}");
+        assert_eq!(hosted_pinned(&env), 0, "{ctx}");
         let text = env.to_string();
         assert!(!text.contains("redirect_takeover_unpatched"), "{ctx}");
         assert!(
@@ -1178,9 +1210,7 @@ async fn uv_takeover_without_wheel_metadata_keeps_the_package_vendored() {
         );
         assert!(text.contains("redirect_takeover_kept_vendored"), "{ctx}");
         assert!(
-            env["redirect"]["skipped"]
-                .as_array()
-                .is_some_and(|s| s.iter().any(|s| s["uuid"] == UUID)),
+            hosted_skipped(&env).iter().any(|s| s["uuid"] == UUID),
             "the purl is skipped with its cause: {ctx}"
         );
         assert_eq!(
@@ -1349,7 +1379,7 @@ async fn drifted_vendored_line_refuses_takeover() {
         "no takeover is announced over drifted wiring: {env:#}"
     );
     assert!(text.contains("redirect_vendored_revert_failed"), "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
     assert_eq!(
         code, 0,
         "a refused takeover keeps the package vendored: {env:#}"
@@ -1392,7 +1422,7 @@ async fn dry_run_predicts_drifted_takeover_refusal() {
         "no takeover is previewed over drifted wiring: {env:#}"
     );
     assert!(text.contains("redirect_vendored_revert_failed"), "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
     assert_eq!(
         std::fs::read_to_string(&reqs).unwrap(),
         drifted,
@@ -1646,7 +1676,7 @@ async fn assert_takeover_refused_serving(
         "the package is never stranded: {env:#}"
     );
     assert!(text.contains(code_name), "the refusal is named: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
     assert_eq!(
         code, 0,
         "a refused takeover keeps the package vendored: {env:#}"
@@ -1732,7 +1762,7 @@ async fn dry_run_previews_root_pin_takeover() {
         env.to_string().contains("redirect_would_revert_vendored"),
         "{env:#}"
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
 }
 
 /// uv.lock resolving `six` 1.17.0, either as a direct `six>=1.15` or

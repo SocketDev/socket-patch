@@ -932,17 +932,14 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
     );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["found"], 1, "envelope: {env}");
-    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert_eq!(env["command"], "get", "envelope: {env}");
+    assert_eq!(env["summary"]["downloaded"], 1, "envelope: {env}");
     assert!(
         env.get("applied").is_none(),
         "vendored get drops `applied` — nothing is applied in place: {env}"
     );
-    assert_eq!(
-        env["vendor"]["summary"]["applied"], 1,
-        "one package vendored: {env}"
-    );
-    assert_eq!(env["vendor"]["summary"]["failed"], 0, "no failures: {env}");
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+    assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
 
     // Committed state: artifact + ledger (a detached entry carrying the
     // record), NO manifest, NO blobs — vendored mode is manifest-free.

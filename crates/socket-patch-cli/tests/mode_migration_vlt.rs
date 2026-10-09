@@ -362,12 +362,15 @@ async fn vlt_pinned_matrix_migration_dry_run_parity() {
     let out = vendored_scan(&fx, &fx.proj, &["--dry-run"]);
     assert_eq!(out.code, 0, "{out}");
     let doc = out.json();
-    let preview = doc["vendor"]["patches"]
+    let preview = doc["events"]
         .as_array()
-        .and_then(|p| p.iter().find(|p| p["purl"] == fx.t().purl()))
+        .and_then(|p| {
+            p.iter()
+                .find(|p| p["purl"] == fx.t().purl() && p["details"]["mode"] == "vendored")
+        })
         .cloned()
         .unwrap_or_else(|| panic!("a preview for {}: {doc:#}", fx.t().purl()));
-    assert_eq!(preview["action"], "would_vendor", "{doc:#}");
+    assert_eq!(preview["action"], "verified", "{doc:#}");
     assert!(!out.stdout.contains("would_refuse"), "{out}");
     assert_eq!(
         project_bytes(&fx.proj),
@@ -790,7 +793,7 @@ async fn vlt_pinned_matrix_migration_upgrade_hosted() {
     let relocked = lock_bytes(&fx.proj);
     remove_tree(&fx.proj);
     let doc = fx.scan(&["--vex", "out.vex.json", "--vex-product", PRODUCT]);
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
     assert_pinned(&fx.proj, &fx.svc, fx.t());
     assert!(
         fx.vex_attested(fx.t()),
@@ -848,4 +851,19 @@ async fn vlt_pinned_matrix_migration_upgrade_vendored() {
     assert_eq!(out.code, 0, "{out}");
     assert!(!fx.proj.join(".socket/vendor/npm").exists(), "{out}");
     fx.leg.ran();
+}
+
+/// How many hosted pins a `scan --mode hosted --json` run wrote (or would
+/// write, on a dry run): its `applied` / `verified` events with
+/// `details.mode: "hosted"`.
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

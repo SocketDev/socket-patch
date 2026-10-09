@@ -504,13 +504,17 @@ fn scan_json_empty_cwd_emits_updates_key() {
     // object that must NOT appear when neither was requested, since both
     // default to false here).
     let expected = serde_json::json!({
+        "command": "scan",
         "status": "success",
+        "dryRun": false,
+        "events": [],
+        "summary": {
+            "discovered": 0, "downloaded": 0, "applied": 0, "updated": 0,
+            "skipped": 0, "failed": 0, "removed": 0, "verified": 0,
+            "rebuilt": 0, "rolledBack": 0, "bytesFreed": 0
+        },
         "scannedPackages": 0,
         "lockfileOnlyPackages": 0,
-        "packagesWithPatches": 0,
-        "totalPatches": 0,
-        "freePatches": 0,
-        "paidPatches": 0,
         "canAccessPaidPatches": false,
         "packages": [],
         "updates": [],
@@ -522,16 +526,9 @@ fn scan_json_empty_cwd_emits_updates_key() {
             "counts": { "new": 0, "deferred": 0, "upgrade": 0, "already": 0 },
             "deferred": [],
         },
-        // v5: a bare scan runs hosted mode, so its result nests here.
-        "redirect": {
-            "mode": "hosted",
-            "redirected": 0,
-            "rewrittenFiles": [],
-            "skipped": [],
-            "patches": [],
-            "warnings": [],
-            "dryRun": false
-        },
+        // v5: a bare scan runs hosted mode: its payload (events would
+        // carry `details.mode: "hosted"`).
+        "redirect": { "mode": "hosted", "rewrittenFiles": [] },
         // v5: the socket.yml patch policy block rides every successful
         // scan (no file here: the built-in defaults).
         "policy": {

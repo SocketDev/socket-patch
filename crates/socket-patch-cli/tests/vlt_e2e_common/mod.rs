@@ -1894,7 +1894,7 @@ pub fn rollback_upstream(
 
 pub fn redirect_warnings(doc: &Value) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for w in [&doc["redirect"]["warnings"], &doc["warnings"]] {
+    for w in [&doc["warnings"]] {
         for w in w.as_array().into_iter().flatten() {
             if let Some(code) = w["code"].as_str() {
                 out.push((

@@ -256,9 +256,9 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     );
     assert_eq!(code, Some(0), "scan --mode hosted: {env}\n{stderr}");
     assert_eq!(env["redirect"]["mode"], "hosted", "{env}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
     assert_eq!(env["vex"]["statements"], 1, "{env}");
-    let unenforced = env["redirect"]["warnings"]
+    let unenforced = env["warnings"]
         .as_array()
         .into_iter()
         .flatten()

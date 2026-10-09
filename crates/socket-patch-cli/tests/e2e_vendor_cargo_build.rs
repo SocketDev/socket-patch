@@ -1038,14 +1038,14 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
     );
     let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["found"], 1, "envelope: {env}");
-    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert_eq!(env["command"], "get", "envelope: {env}");
+    assert_eq!(env["summary"]["downloaded"], 1, "envelope: {env}");
     assert!(
         env["applied"].is_null(),
         "vendored get drops `applied` — nothing applies in place: {env}"
     );
     assert_eq!(
-        env["vendor"]["summary"]["failed"], 0,
+        env["summary"]["failed"], 0,
         "nested vendor envelope must report no failures: {env}"
     );
 

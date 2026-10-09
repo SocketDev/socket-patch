@@ -306,7 +306,7 @@ fn hosted_project(tmp: &Path, version: &str, lock_name: &str) -> (PathBuf, Strin
     );
     drop(scan_api);
     assert_eq!(code, Some(0), "[{version}] scan: {env}\n{stderr}");
-    assert_eq!(env["redirect"]["redirected"], 1, "[{version}] scan: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "[{version}] scan: {env}");
     let lock = std::fs::read_to_string(root.join(lock_name)).unwrap();
     assert!(
         lock.contains(&url) && lock.contains(&pin),
@@ -534,4 +534,18 @@ fn hand_wired_legacy_pnpm_locks_attest_the_committed_tarball() {
         assert!(out.doc.is_none(), "[{version}] unwired leftover: {out}");
         eprintln!("hand-wired pnpm {version}: OK");
     }
+}
+
+/// How many hosted pins the run wrote (v5.0: the `applied` / `verified`
+/// events with `details.mode: "hosted"`, formerly `redirect.redirected`).
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

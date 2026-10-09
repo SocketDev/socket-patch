@@ -432,17 +432,20 @@ async fn run_berry_capstone(driver: VendorDriver, yarnrc_extra: &str) {
     );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    // The vendor envelope is get's nested `vendor` sub-object; `vendor --json`
-    // prints it at the top level.
+    // get merges the vendor engine's events into its own envelope (v5.0);
+    // `vendor --json` prints the engine's envelope directly.
     let venv = match driver {
         VendorDriver::VendorCli => env.clone(),
         VendorDriver::GetUuid => {
-            assert_eq!(env["downloaded"], 1, "one record downloaded: {env}");
+            assert_eq!(
+                env["summary"]["downloaded"], 1,
+                "one record downloaded: {env}"
+            );
             assert!(
                 !env.as_object().unwrap().contains_key("applied"),
                 "vendored get drops `applied` (the nested apply never runs): {env}"
             );
-            env["vendor"].clone()
+            env.clone()
         }
     };
     assert_eq!(

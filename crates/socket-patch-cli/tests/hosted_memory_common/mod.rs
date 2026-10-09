@@ -295,6 +295,9 @@ pub async fn run_engine(
 /// (new or byte-changed, relative to the input).
 pub struct DiskRun {
     pub envelope: Value,
+    /// The hosted outcome rebuilt in the in-memory engine's `redirect`
+    /// shape ([`legacy_redirect`]; `{mode: "hosted"}` for an error run).
+    pub redirect: Value,
     pub changed: BTreeMap<String, Vec<u8>>,
     pub stderr: String,
 }
@@ -371,8 +374,14 @@ fn run_disk_in_with(
         .into_iter()
         .filter(|(rel, bytes)| files.get(rel) != Some(bytes))
         .collect();
+    let redirect = if envelope["status"] == "error" {
+        serde_json::json!({ "mode": "hosted" })
+    } else {
+        legacy_redirect(&envelope)
+    };
     DiskRun {
         envelope,
+        redirect,
         changed,
         stderr,
     }

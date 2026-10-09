@@ -11,12 +11,16 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::vlt_hosted_common::*;
 
+/// The codes of the hosted `skipped` events (v5.0: replaces
+/// `redirect.skipped[].reason`).
 fn skipped_reasons(doc: &Value) -> Vec<String> {
-    doc["redirect"]["skipped"]
+    doc["events"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|s| s["reason"].as_str().map(str::to_string))
+        .filter(|e| e["action"] == "skipped" && e["details"]["mode"] == "hosted")
+        .filter(|e| e["errorCode"] != "redirect_unconfirmed")
+        .filter_map(|e| e["errorCode"].as_str().map(str::to_string))
         .collect()
 }
 

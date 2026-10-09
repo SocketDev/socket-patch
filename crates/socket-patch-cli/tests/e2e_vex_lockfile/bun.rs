@@ -843,7 +843,7 @@ fn scan_hosted(cwd: &Path, flavor: Flavor, api: &Api) -> Vec<u8> {
     );
     let what = format!("{flavor:?} scan --mode hosted --vex");
     assert_eq!(code, Some(0), "{what}: {env}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{what}: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "{what}: {env}");
     assert_eq!(env["vex"]["statements"], 1, "{what}: {env}");
     let stmt = &doc(cwd)["statements"][0];
     assert_eq!(stmt["vulnerability"]["name"], GHSA, "{what}");
@@ -890,7 +890,7 @@ fn scan_vendored(cwd: &Path, flavor: Flavor, api: &Api) -> Vec<u8> {
     let (code, env) = socket_json(cwd, api, &args);
     let what = format!("{flavor:?} scan --mode vendored --vex");
     assert_eq!(code, Some(0), "{what}: {env}");
-    assert_eq!(env["vendor"]["summary"]["applied"], 1, "{what}: {env}");
+    assert_eq!(env["summary"]["applied"], 1, "{what}: {env}");
     assert_eq!(env["vex"]["statements"], 1, "{what}: {env}");
     let stmt = &doc(cwd)["statements"][0];
     assert_eq!(
@@ -1670,4 +1670,18 @@ fn apply_vex_attests_lockfile_patches_without_a_manifest() {
 /// A previous run's (recognizably OpenVEX) document.
 fn doc_placeholder() -> String {
     json!({ "@context": "https://openvex.dev/ns/v0.2.0", "statements": [] }).to_string()
+}
+
+/// How many hosted pins the run wrote (v5.0: the `applied` / `verified`
+/// events with `details.mode: "hosted"`, formerly `redirect.redirected`).
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

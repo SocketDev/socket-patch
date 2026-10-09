@@ -239,7 +239,7 @@ fn scan_hosted_env(
 }
 
 fn allow_remote_warning(doc: &Value) -> Option<&str> {
-    doc["redirect"]["warnings"]
+    doc["warnings"]
         .as_array()
         .into_iter()
         .flatten()
@@ -303,7 +303,7 @@ async fn package_lock_redirect_writes_npmrc_warns_and_rollback_removes_it() {
 
     let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     let detail = allow_remote_warning(&doc).unwrap_or_else(|| panic!("no {CODE}: {doc:#}"));
     for needle in [
         "patch.test",
@@ -528,7 +528,7 @@ async fn opt_out_dry_run_and_unredirected_projects() {
         let (code, stdout, stderr) = run_isolated(tmp.path(), &args, &env);
         assert_eq!(code, 0, "{stdout}\n{stderr}");
         let doc: Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+        assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
         let detail = allow_remote_warning(&doc).unwrap_or_else(|| panic!("no {CODE}: {doc:#}"));
         assert!(
             detail.contains("Commit `allow-remote=all` in the project .npmrc")
@@ -589,7 +589,7 @@ async fn symlinked_npmrc_is_left_alone() {
     std::os::unix::fs::symlink("shared.npmrc", tmp.path().join(".npmrc")).unwrap();
     let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     let detail = allow_remote_warning(&doc).unwrap_or_else(|| panic!("no {CODE}: {doc:#}"));
     assert!(detail.contains("symbolic link") && detail.contains("npm ci --allow-remote=all"));
     assert_eq!(
@@ -703,7 +703,7 @@ async fn outer_npm_config_layers_are_respected() {
         ],
     );
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     let detail = allow_remote_warning(&doc).unwrap_or_else(|| panic!("no {CODE}: {doc:#}"));
     assert!(
         detail.contains("The user npm config")
@@ -793,7 +793,7 @@ async fn outer_npm_config_layers_are_respected() {
 }
 
 fn replace_host_warning(doc: &Value) -> Option<&str> {
-    doc["redirect"]["warnings"]
+    doc["warnings"]
         .as_array()
         .into_iter()
         .flatten()

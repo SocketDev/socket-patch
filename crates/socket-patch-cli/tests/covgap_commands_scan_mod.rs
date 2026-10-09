@@ -463,10 +463,9 @@ async fn scan_hosted_prune_zero_package_json_carries_the_warning() {
         "classic keys stay schema-consistent"
     );
     assert_eq!(v["redirect"]["mode"], "hosted");
-    assert_eq!(v["redirect"]["redirected"], 0);
-    let warnings = v["redirect"]["warnings"]
-        .as_array()
-        .expect("redirect.warnings array");
+    assert_eq!(v["summary"]["applied"], 0, "nothing pinned: {v}");
+    // v5.0: warnings ride the envelope's top-level `warnings[]`.
+    let warnings = v["warnings"].as_array().expect("warnings array");
     let prune_warning = warnings
         .iter()
         .find(|w| w["code"] == "redirect_prune_ignored")
@@ -594,9 +593,15 @@ async fn scan_json_counts_paid_patches_separately() {
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["totalPatches"], 1);
-    assert_eq!(v["freePatches"], 0);
-    assert_eq!(v["paidPatches"], 1, "{v}");
+    // v5.0: the tier counts derive from the discovery payload.
+    let tiers: Vec<&str> = v["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|p| p["patches"].as_array().unwrap())
+        .map(|p| p["tier"].as_str().unwrap())
+        .collect();
+    assert_eq!(tiers, ["paid"], "{v}");
     assert_eq!(v["canAccessPaidPatches"], false);
 }
 
@@ -1811,9 +1816,9 @@ mod pty {
         let json: serde_json::Value = serde_json::from_str(json_text)
             .unwrap_or_else(|e| panic!("envelope must parse ({e}); got:\n{output}"));
         assert_eq!(json["status"], "success", "{json}");
-        let planned = json["apply"]["patches"]
+        let planned = json["events"]
             .as_array()
-            .unwrap_or_else(|| panic!("apply.patches must be an array: {json}"));
+            .unwrap_or_else(|| panic!("events must be an array: {json}"));
         assert_eq!(planned.len(), 1, "exactly one patch selected: {json}");
         assert_eq!(
             planned[0]["uuid"], second,
@@ -2696,9 +2701,9 @@ async fn scan_vendored_ignores_a_degraded_pre_v5_vlt_ledger_edit() {
 
 /// `scan --mode agent --json` whose nested apply fails (the installed copy
 /// is a symlink to a first-party `packages/` directory, which apply refuses
-/// to patch): the `apply` block must carry
-/// the per-patch failure — `action: "failed"`, `errorCode`, `error` — and
-/// count it in `failed`, not report the patch as a clean `added` (#424).
+/// to patch): the envelope must carry the per-patch failure — a `failed`
+/// event with `errorCode` and `error` — and count it in `summary.failed`,
+/// not report the patch as cleanly applied (#424).
 #[cfg(unix)]
 #[tokio::test]
 async fn scan_agent_json_nested_apply_failure_reaches_the_apply_block() {
@@ -2721,11 +2726,13 @@ async fn scan_agent_json_nested_apply_failure_reaches_the_apply_block() {
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON envelope");
-    assert_eq!(v["status"], "partial_failure", "{v}");
-    let apply = &v["apply"];
-    assert_eq!(apply["failed"], 1, "the apply failure must be counted: {v}");
-    assert_eq!(apply["applied"], 0, "{v}");
-    let rec = &apply["patches"][0];
+    assert_eq!(v["status"], "partialFailure", "{v}");
+    assert_eq!(
+        v["summary"]["failed"], 1,
+        "the apply failure must be counted: {v}"
+    );
+    assert_eq!(v["summary"]["applied"], 0, "{v}");
+    let rec = common::envelope::find_event(&v, "failed", None);
     assert_eq!(rec["purl"], purl, "{v}");
     assert_eq!(rec["action"], "failed", "{v}");
     assert_eq!(rec["errorCode"], "apply_failed", "{v}");
@@ -2738,7 +2745,7 @@ async fn scan_agent_json_nested_apply_failure_reaches_the_apply_block() {
 
 /// `scan --mode agent --json` over an installed file a local edit changed
 /// (neither beforeHash nor afterHash): the default policy overwrites it,
-/// and the `apply` block's `warnings[]` must report that overwrite — the
+/// and the envelope's `warnings[]` must report that overwrite — the
 /// same `content_mismatch_overwritten` warning `apply --json` and the human
 /// scan print — instead of dropping it (#1004).
 #[tokio::test]
@@ -2759,13 +2766,13 @@ async fn scan_agent_json_mismatch_overwrite_reaches_the_apply_block() {
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON envelope");
-    let apply = &v["apply"];
-    assert_eq!(apply["applied"], 1, "{v}");
-    let warned = apply["warnings"].as_array().is_some_and(|ws| {
-        ws.iter().filter_map(|w| w.as_str()).any(|w| {
-            w.starts_with("(content_mismatch_overwritten) ")
-                && w.contains(purl)
-                && w.contains("package/index.js")
+    assert_eq!(v["summary"]["applied"], 1, "{v}");
+    let warned = v["warnings"].as_array().is_some_and(|ws| {
+        ws.iter().any(|w| {
+            let d = w["detail"].as_str().unwrap_or_default();
+            w["code"] == "content_mismatch_overwritten"
+                && d.contains(purl)
+                && d.contains("package/index.js")
         })
     });
     assert!(warned, "the overwrite must be reported: {v}");

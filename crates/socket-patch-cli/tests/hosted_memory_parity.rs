@@ -59,15 +59,15 @@ async fn assert_parity(case: Case) -> Value {
         case.fixture,
         project.error
     );
-    let disk_redirect = disk
-        .envelope
-        .get("redirect")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let disk_redirect = disk.redirect.clone();
     assert_eq!(
-        project.redirect, disk_redirect,
+        sorted_redirect(&project.redirect),
+        disk_redirect,
         "{}: redirect block differs\nmemory: {:#}\ndisk: {:#}\nstderr: {}",
-        case.fixture, project.redirect, disk_redirect, disk.stderr
+        case.fixture,
+        project.redirect,
+        disk_redirect,
+        disk.stderr
     );
     let memory_changed = engine_changed(&memory);
     let expected_changed = if case.dry_run {
@@ -260,8 +260,8 @@ async fn assert_native_parity(
     let project = &memory.projects[0];
     assert!(project.error.is_none(), "{:?}", project.error);
     assert_eq!(
-        without_pipenv_advice(&project.redirect),
-        without_pipenv_advice(&disk.envelope["redirect"]),
+        without_pipenv_advice(&sorted_redirect(&project.redirect)),
+        without_pipenv_advice(&disk.redirect),
         "{}",
         disk.stderr
     );
@@ -396,7 +396,7 @@ async fn parity_nested_monorepo_roots_match_their_own_disk_runs() {
     for (root, files) in [("apps/web", &web), ("services/api", &svc)] {
         let disk = run_disk(&server, files, false);
         let project = memory.projects.iter().find(|p| p.root == root).unwrap();
-        assert_eq!(project.redirect, disk.envelope["redirect"], "{root}");
+        assert_eq!(sorted_redirect(&project.redirect), disk.redirect, "{root}");
         let prefixed: BTreeMap<String, Vec<u8>> = changed
             .iter()
             .filter_map(|(k, v)| {
@@ -451,7 +451,8 @@ async fn parity_uv_with_hosted_wheel_metadata() {
     let memory = run_engine(&server, build_input(&files, &[], options(false))).await;
     let project = &memory.projects[0];
     assert_eq!(
-        project.redirect, disk.envelope["redirect"],
+        sorted_redirect(&project.redirect),
+        disk.redirect,
         "{}",
         disk.stderr
     );
@@ -528,7 +529,8 @@ async fn parity_cargo_patch_path_under_vendor_through_selection() {
     let project = &memory.projects[0];
     assert!(project.error.is_none(), "{:?}", project.error);
     assert_eq!(
-        project.redirect, disk.envelope["redirect"],
+        sorted_redirect(&project.redirect),
+        disk.redirect,
         "{}",
         disk.stderr
     );
@@ -607,7 +609,8 @@ async fn parity_cargo_vendor_tree_is_not_fetched() {
     let project = &memory.projects[0];
     assert!(project.error.is_none(), "{:?}", project.error);
     assert_eq!(
-        project.redirect, disk.envelope["redirect"],
+        sorted_redirect(&project.redirect),
+        disk.redirect,
         "{}",
         disk.stderr
     );
@@ -750,7 +753,7 @@ async fn excluded_nested_cargo_project_is_its_own_root_through_selection() {
         .find(|p| p.root == "tools/fuzz")
         .unwrap();
     assert!(fuzz_project.error.is_none(), "{:?}", fuzz_project.error);
-    assert_eq!(fuzz_project.redirect, disk.envelope["redirect"]);
+    assert_eq!(sorted_redirect(&fuzz_project.redirect), disk.redirect);
     let fuzz_changed: BTreeMap<String, Vec<u8>> = changed
         .iter()
         .filter_map(|(k, v)| {
@@ -943,7 +946,7 @@ async fn parity_socket_yml_filters_the_same_roots_and_packages() {
         );
         disk_filtered.extend(filtered_set(&disk.envelope["policy"]));
         if let Some(project) = memory.projects.iter().find(|p| p.root == root) {
-            assert_eq!(project.redirect, disk.envelope["redirect"], "{root}");
+            assert_eq!(sorted_redirect(&project.redirect), disk.redirect, "{root}");
             let prefix = format!("{root}/");
             let memory_changed: BTreeMap<String, Vec<u8>> = engine_changed(&memory)
                 .into_iter()
@@ -996,7 +999,7 @@ async fn parity_socket_yml_severity_floor() {
     assert!(engine_changed(&memory).is_empty());
     let disk = run_disk_in(&server, &repo, "apps/web", false);
     assert!(disk.changed.is_empty());
-    assert_eq!(disk.envelope["redirect"], web.redirect);
+    assert_eq!(disk.redirect, sorted_redirect(&web.redirect));
     let memory_web: std::collections::BTreeSet<_> = filtered_set(memory.policy.as_ref().unwrap())
         .into_iter()
         .filter(|(project, _, _)| project == "apps/web")
@@ -1252,7 +1255,7 @@ async fn memory_negation_reincludes_a_default_ignored_root() {
     // Disk patches the same root the same way.
     let disk = run_disk_in(&server, &repo, "e2e/tests", false);
     assert_eq!(disk.envelope["status"], "success", "{}", disk.stderr);
-    assert_eq!(memory.projects[0].redirect, disk.envelope["redirect"]);
+    assert_eq!(sorted_redirect(&memory.projects[0].redirect), disk.redirect);
     let memory_changed = engine_changed(&memory);
     assert_eq!(
         memory_changed,
@@ -1355,7 +1358,8 @@ async fn assert_pnpm_workspace_parity_with_roots(
             .unwrap_or_else(|| panic!("{how}: no workspace root project"));
         assert!(project.error.is_none(), "{how}: {:?}", project.error);
         assert_eq!(
-            project.redirect, disk.envelope["redirect"],
+            sorted_redirect(&project.redirect),
+            disk.redirect,
             "{how}: redirect block differs\nstderr: {}",
             disk.stderr
         );
@@ -1371,7 +1375,7 @@ async fn assert_pnpm_workspace_parity_with_roots(
             describe(&disk.changed)
         );
     }
-    (disk.envelope["redirect"].clone(), disk.changed)
+    (disk.redirect.clone(), disk.changed)
 }
 
 /// #492: under `sharedWorkspaceLockfile: false` (or pnpm 7's `.npmrc`

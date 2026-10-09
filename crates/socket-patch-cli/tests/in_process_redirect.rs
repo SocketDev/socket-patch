@@ -793,7 +793,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             &server.uri(),
             &["--patch-server-url", &server.uri()],
         );
-        assert_eq!(env["redirect"]["redirected"], 1, "{label}: {env:#}");
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{label}: {env:#}");
         assert!(
             warning_codes(&env).is_empty(),
             "{label}: no line-ending refusal (or any other warning): {env:#}"
@@ -819,7 +819,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             &server.uri(),
             &["--patch-server-url", &server.uri()],
         );
-        assert_eq!(env["redirect"]["redirected"], 1, "{label}: {env:#}");
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{label}: {env:#}");
         assert_eq!(
             std::fs::read_to_string(&lock_path).unwrap(),
             lock,
@@ -907,7 +907,7 @@ async fn yarn_berry_catalog_dependency_is_pinned_and_rolled_back() {
         &server.uri(),
         &["--patch-server-url", &server.uri()],
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
     assert!(warning_codes(&env).is_empty(), "{env:#}");
     let pkg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
@@ -1011,7 +1011,7 @@ async fn yarn_berry_legacy_archive_url_pin_is_rolled_back_and_repinned() {
         &server.uri(),
         &["--patch-server-url", &server.uri()],
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
     let lock = std::fs::read_to_string(&lock_path).unwrap();
     assert!(
         lock.contains(&format!("\n  resolution: \"{NAME}@{hosted_url}\"\n"))
@@ -1043,7 +1043,7 @@ async fn scan_redirect_refuses_a_mixed_line_ending_yarn_berry_lock() {
     let before = std::fs::read(&lock_path).unwrap();
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 0, "{env:#}");
     assert!(
         warning_codes(&env).contains(&"redirect_yarn_berry_mixed_line_endings".to_string()),
         "{env:#}"
@@ -1091,7 +1091,7 @@ async fn scan_redirect_refuses_a_mixed_line_ending_yarn_berry_manifest() {
     );
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 0, "{env:#}");
     let detail = redirect_warning_detail(&env, "redirect_yarn_berry_mixed_line_endings");
     assert!(detail.contains("package.json"), "names the file: {detail}");
     assert!(detail.contains("yarn install"), "remedy named: {detail}");
@@ -1538,7 +1538,8 @@ async fn scan_redirect_refuses_bun_lock_v3() {
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(
-        env["redirect"]["redirected"], 0,
+        vlt_hosted_common::redirected(&env),
+        0,
         "an unsupported lock version must redirect nothing: {env}"
     );
     assert!(
@@ -1606,7 +1607,7 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
 
     for drop_again_before_rollback in [false, true] {
         let env = run_redirect_subprocess(tmp.path(), &server.uri());
-        assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
         let wired = std::fs::read_to_string(&lock_path).unwrap();
         let wired_line = bun_packages_line(&wired, NAME);
         assert!(
@@ -1624,7 +1625,8 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
         let env = run_redirect_subprocess(tmp.path(), &server.uri());
         assert_eq!(env["status"], "success", "{env:#}");
         assert_eq!(
-            env["redirect"]["redirected"], 1,
+            vlt_hosted_common::redirected(&env),
+            1,
             "the wired dep still counts as redirected: {env:#}"
         );
         let codes = warning_codes(&env);
@@ -1641,7 +1643,7 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
 
         // A third run over the healed lock is a no-op.
         let env = run_redirect_subprocess(tmp.path(), &server.uri());
-        assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
         assert!(warning_codes(&env).is_empty(), "{env:#}");
         assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), wired);
 
@@ -1712,7 +1714,7 @@ async fn bun_rollback_keeps_the_bunfig_registry_tarball_url() {
         .unwrap();
 
         let env = run_redirect_subprocess(tmp.path(), &server.uri());
-        assert_eq!(env["redirect"]["redirected"], 1, "{mirror}: {env:#}");
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{mirror}: {env:#}");
         assert!(
             std::fs::read_to_string(&lock_path)
                 .unwrap()
@@ -1920,7 +1922,7 @@ fn scan_redirect_json_with_path(
 
 /// The `detail` of the first redirect warning carrying `code`.
 fn redirect_warning_detail(env: &serde_json::Value, code: &str) -> String {
-    env["redirect"]["warnings"]
+    env["warnings"]
         .as_array()
         .into_iter()
         .flatten()
@@ -2033,7 +2035,7 @@ async fn malformed_binary_lock_never_spawns_bun_or_changes_format() {
         let (code, env, stderr) =
             scan_redirect_json_with_path(tmp.path(), &server.uri(), &path_with_first(&bin));
         assert_eq!(code, Some(0), "{env:#}\n{stderr}");
-        assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+        assert_eq!(vlt_hosted_common::redirected(&env), 0, "{env:#}");
         assert!(!redirect_warning_detail(&env, "redirect_bun_lockb_invalid").is_empty());
         assert!(!warning_codes(&env).contains(&"redirect_npm_no_lockfile".to_string()));
         assert_eq!(std::fs::read(tmp.path().join("bun.lockb")).unwrap(), bytes);
@@ -2059,7 +2061,7 @@ async fn native_binary_no_matching_version_preserves_exact_bytes() {
     let (code, env, stderr) =
         scan_redirect_json_with_path(tmp.path(), &server.uri(), std::ffi::OsStr::new(""));
     assert_eq!(code, Some(0), "{env:#}\n{stderr}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 0, "{env:#}");
     assert_eq!(std::fs::read(tmp.path().join("bun.lockb")).unwrap(), bytes);
     assert!(!tmp.path().join("bun.lock").exists());
     assert!(!tmp
@@ -2487,7 +2489,7 @@ fn run_redirect_subprocess_with(cwd: &Path, api_url: &str, extra: &[&str]) -> se
 
 /// Collect the `code` field of every warning in the redirect envelope.
 fn warning_codes(env: &serde_json::Value) -> Vec<String> {
-    env["redirect"]["warnings"]
+    env["warnings"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -2560,7 +2562,8 @@ async fn redirect_inbundle_only_dep_is_skipped_not_confirmed() {
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(
-        env["redirect"]["redirected"], 0,
+        vlt_hosted_common::redirected(&env),
+        0,
         "a bundled-only dep must NOT be counted redirected: {env}"
     );
     let codes = warning_codes(&env);
@@ -2632,7 +2635,8 @@ packages:
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(
-        env["redirect"]["redirected"], 0,
+        vlt_hosted_common::redirected(&env),
+        0,
         "a residual-instance dep must NOT be counted redirected: {env}"
     );
     let codes = warning_codes(&env);
@@ -2987,7 +2991,7 @@ async fn rush_pnpm_trust_warning_gives_rush_remedy() {
     write_rush_project(tmp.path(), false);
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(env["status"], "success", "envelope: {env}");
-    let detail = env["redirect"]["warnings"]
+    let detail = env["warnings"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
@@ -3053,7 +3057,7 @@ async fn rush_rerun_on_redirected_locks_reissues_the_rush_remedy() {
         redirected,
         "the re-run must leave the redirected Rush lock byte-identical"
     );
-    let detail = env["redirect"]["warnings"]
+    let detail = env["warnings"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
@@ -3117,7 +3121,8 @@ async fn rush_stale_warning_requires_an_actual_lock_edit() {
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 0,
+        vlt_hosted_common::redirected(&env),
+        0,
         "nothing pins the patch, so nothing may count as redirected: {env}"
     );
     assert!(
@@ -3179,7 +3184,8 @@ async fn pnpm_lock_redirect_autoconfigures_trust_lockfile_and_says_so() {
     let env = run_redirect_subprocess(pnpm.path(), &server.uri());
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        vlt_hosted_common::redirected(&env),
+        1,
         "anchor: the pnpm lock must have been redirected: {env}"
     );
     // The zero-touch write itself: a fresh pnpm-workspace.yaml with the
@@ -3204,7 +3210,7 @@ async fn pnpm_lock_redirect_autoconfigures_trust_lockfile_and_says_so() {
         "a rewritten pnpm-lock.yaml must warn about the pnpm >=11 policy; got warnings {:?}",
         warning_codes(&env)
     );
-    let detail = env["redirect"]["warnings"]
+    let detail = env["warnings"]
         .as_array()
         .unwrap()
         .iter()
@@ -3295,7 +3301,8 @@ async fn pnpm_trust_opt_out_writes_nothing_and_keeps_manual_guidance() {
         run_redirect_subprocess_with(tmp.path(), &server.uri(), &["--no-trust-lockfile-config"]);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        vlt_hosted_common::redirected(&env),
+        1,
         "the opt-out must not stop the redirect itself: {env}"
     );
     assert!(
@@ -3308,7 +3315,7 @@ async fn pnpm_trust_opt_out_writes_nothing_and_keeps_manual_guidance() {
         "only the lock may be rewritten under the opt-out: {env}"
     );
     vlt_hosted_common::assert_no_ledger(tmp.path());
-    let detail = env["redirect"]["warnings"]
+    let detail = env["warnings"]
         .as_array()
         .unwrap()
         .iter()
@@ -3351,7 +3358,8 @@ async fn pnpm_trust_respects_an_explicit_user_false() {
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        vlt_hosted_common::redirected(&env),
+        1,
         "the redirect itself must still land: {env}"
     );
     assert_eq!(
@@ -3359,7 +3367,7 @@ async fn pnpm_trust_respects_an_explicit_user_false() {
         user_ws,
         "an explicit trustLockfile: false must be left byte-identical"
     );
-    let detail = env["redirect"]["warnings"]
+    let detail = env["warnings"]
         .as_array()
         .unwrap()
         .iter()
@@ -3554,7 +3562,8 @@ async fn pnpm_warning_strips_userinfo_and_names_only_spliced_hosts() {
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 2,
+        vlt_hosted_common::redirected(&env),
+        2,
         "anchor: both locks must have been redirected: {env}"
     );
     // Anchors: the credentialed URL really was spliced into the pnpm lock
@@ -3572,7 +3581,7 @@ async fn pnpm_warning_strips_userinfo_and_names_only_spliced_hosts() {
         "package-lock.json must carry the sibling URL; got:\n{npm_lock}"
     );
 
-    let detail = env["redirect"]["warnings"]
+    let detail = env["warnings"]
         .as_array()
         .unwrap()
         .iter()
@@ -3625,7 +3634,8 @@ async fn clean_success_warning_set_is_exact_for_npm_and_pnpm() {
     let env = run_redirect_subprocess(npm.path(), &server.uri());
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        vlt_hosted_common::redirected(&env),
+        1,
         "anchor: the npm lock must have been redirected: {env}"
     );
     assert_eq!(
@@ -3645,7 +3655,7 @@ async fn clean_success_warning_set_is_exact_for_npm_and_pnpm() {
     std::fs::write(npm.path().join(".npmrc"), "allow-remote=all\n").unwrap();
     let env = run_redirect_subprocess(npm.path(), &server.uri());
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["redirect"]["redirected"], 1, "anchor: {env}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "anchor: {env}");
     assert_eq!(
         warning_codes(&env),
         vec!["redirect_npm_allow_remote".to_string()],
@@ -3659,7 +3669,8 @@ async fn clean_success_warning_set_is_exact_for_npm_and_pnpm() {
     let env = run_redirect_subprocess(pnpm.path(), &server.uri());
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        vlt_hosted_common::redirected(&env),
+        1,
         "anchor: the pnpm lock must have been redirected: {env}"
     );
     assert_eq!(
@@ -3830,8 +3841,12 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
             "{leg}: envelope must carry the error message; stdout=\n{stdout}"
         );
         assert_eq!(
-            v["redirect"]["mode"], "hosted",
-            "{leg}: envelope must identify the mode; stdout=\n{stdout}"
+            v["command"], "scan",
+            "{leg}: envelope must identify the command; stdout=\n{stdout}"
+        );
+        assert!(
+            v.get("redirect").is_none(),
+            "{leg}: nothing was rewritten, so no redirect payload; stdout=\n{stdout}"
         );
     };
 
@@ -3936,8 +3951,12 @@ fn assert_write_failure_envelope(out: &std::process::Output, leg: &str) {
         "{leg}: envelope must carry the error message; stdout=\n{stdout}"
     );
     assert_eq!(
-        v["redirect"]["mode"], "hosted",
-        "{leg}: envelope must identify the mode; stdout=\n{stdout}"
+        v["command"], "scan",
+        "{leg}: envelope must identify the command; stdout=\n{stdout}"
+    );
+    assert!(
+        v.get("redirect").is_none(),
+        "{leg}: nothing was rewritten, so no redirect payload; stdout=\n{stdout}"
     );
 }
 
@@ -4030,7 +4049,7 @@ async fn readonly_socket_vendor_does_not_block_a_hosted_run() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("parseable envelope");
-    assert_eq!(v["redirect"]["redirected"], 1, "{v:#}");
+    assert_eq!(vlt_hosted_common::redirected(&v), 1, "{v:#}");
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(lock.contains(HOSTED_URL), "{lock}");
     vlt_hosted_common::assert_no_ledger(tmp.path());
@@ -4065,7 +4084,7 @@ async fn corrupt_pre_v5_ledger_is_ignored_and_left_untouched() {
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("parseable envelope");
     assert_eq!(v["status"], "success", "{v:#}");
-    assert_eq!(v["redirect"]["redirected"], 1, "{v:#}");
+    assert_eq!(vlt_hosted_common::redirected(&v), 1, "{v:#}");
     assert!(
         !stdout.contains("redirect-state.json") && !stderr.contains("malformed"),
         "the legacy ledger is never mentioned; stdout=\n{stdout}\nstderr=\n{stderr}"
@@ -4253,7 +4272,7 @@ async fn hosted_prune_emits_explicit_ignored_warning() {
         "hosted mode must not run (or claim to run) GC: {env_json}"
     );
     // The redirect itself is unaffected by the ignored flag.
-    assert_eq!(env_json["redirect"]["redirected"], 1, "{env_json}");
+    assert_eq!(vlt_hosted_common::redirected(&env_json), 1, "{env_json}");
 }
 
 // ── composer ─────────────────────────────────────────────────────────────
@@ -4403,7 +4422,8 @@ async fn composer_redirect_is_confirmed_and_recorded() {
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        vlt_hosted_common::redirected(&env),
+        1,
         "the composer redirect must be CONFIRMED, not silently unconfirmed: {env}"
     );
     assert_eq!(
@@ -4714,8 +4734,8 @@ async fn cargo_transitive_only_crate_is_refused_loudly_and_not_attested() {
     // Without --vex the run succeeds, reporting nothing redirected and the
     // transitive-only warning in the envelope.
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
-    assert_eq!(env["redirect"]["redirected"], 0, "{env}");
-    let warning = env["redirect"]["warnings"]
+    assert_eq!(vlt_hosted_common::redirected(&env), 0, "{env}");
+    let warning = env["warnings"]
         .as_array()
         .unwrap()
         .iter()
@@ -4798,8 +4818,8 @@ async fn cargo_member_outside_the_project_or_behind_a_symlink_refuses_the_crate(
         write_vendored_crate(&app, "cfg-if", "1.0.0");
 
         let env = run_redirect_subprocess(&app, &server.uri());
-        assert_eq!(env["redirect"]["redirected"], 0, "{shape}: {env}");
-        let warning = env["redirect"]["warnings"]
+        assert_eq!(vlt_hosted_common::redirected(&env), 0, "{shape}: {env}");
+        let warning = env["warnings"]
             .as_array()
             .unwrap()
             .iter()
@@ -5031,7 +5051,7 @@ async fn yarn_berry_rollback_restores_the_registry_archive_url_binding() {
         &server.uri(),
         &["--patch-server-url", &server.uri()],
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
     let pinned = std::fs::read_to_string(&lock_path).unwrap();
     assert!(
         pinned.contains(&format!("\n  resolution: \"{NAME}@{hosted_url}\"\n")),
@@ -5087,7 +5107,7 @@ async fn yarn_berry_rollback_keeps_a_bare_locator_for_conventional_urls() {
         &server.uri(),
         &["--patch-server-url", &server.uri()],
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
     let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
     assert_eq!(code, Some(0), "rollback: {env:#}");
     let restored = std::fs::read_to_string(&lock_path).unwrap();
@@ -5164,7 +5184,7 @@ async fn yarn_berry_rollback_reads_the_tarball_from_the_project_registry() {
         &server.uri(),
         &["--patch-server-url", &server.uri()],
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
 
     let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
     assert_eq!(code, Some(0), "rollback: {env:#}");
@@ -5208,7 +5228,7 @@ fn pnpm_pin_and_rollback(root: &Path, server: &MockServer) -> String {
 /// envelope.
 fn pnpm_pin_and_rollback_env(root: &Path, server: &MockServer) -> (String, serde_json::Value) {
     let env = run_redirect_subprocess(root, &server.uri());
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
     let pinned = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
     assert!(pinned.contains("patch.test"), "{pinned}");
     let (code, env) = rollback_json(root, server);
@@ -5489,7 +5509,7 @@ async fn pnpm_rollback_falls_back_from_an_unreadable_mirror_and_warns() {
     .unwrap();
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
     let (code, env) = rollback_json(tmp.path(), &server);
     assert_eq!(code, Some(0), "rollback: {env:#}");
     assert_eq!(
@@ -5573,7 +5593,7 @@ async fn pnpm_remove_stays_bare_when_pnpm12_ignores_npmrc_include_tarball_url() 
     let lock_path = tmp.path().join("pnpm-lock.yaml");
     let pristine = std::fs::read_to_string(&lock_path).unwrap();
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
     assert!(std::fs::read_to_string(&lock_path)
         .unwrap()
         .contains("patch.test"));
@@ -5996,9 +6016,8 @@ async fn cargo_hosted_scan_from_workspace_member_refuses() {
     assert!(!member.join(".socket").exists());
 }
 
-/// `redirect.patches[]` reports every selected patch per purl (audit B12):
-/// a pinned dep is a `pinned` row, so a consumer no longer has to infer
-/// which patches the `redirected` count covers.
+/// Every selected patch is an event (audit B12; v5.0 envelope): a pinned
+/// dep is an `applied` event tagged `details.mode: "hosted"`.
 #[tokio::test]
 #[serial]
 async fn hosted_json_reports_a_pinned_row_per_patch() {
@@ -6010,18 +6029,20 @@ async fn hosted_json_reports_a_pinned_row_per_patch() {
     write_project(tmp.path());
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
     assert_eq!(
-        env["redirect"]["patches"],
-        serde_json::json!([{ "purl": PURL, "uuid": UUID, "action": "pinned" }]),
+        env["events"],
+        serde_json::json!([{
+            "action": "applied", "purl": PURL, "uuid": UUID, "details": {"mode": "hosted"},
+        }]),
         "{env:#}"
     );
 }
 
 /// A granted patch that no lockfile entry pins (here: no lockfile at all)
 /// used to vanish from `--json` — it is neither redirected nor skipped, and
-/// only the human output named it ("Not hosted"). It is now an `unpinned`
-/// row with `errorCode: redirect_unconfirmed`. The exit code is unchanged
+/// only the human output named it ("Not hosted"). It is now a `skipped`
+/// event with `errorCode: redirect_unconfirmed`. The exit code is unchanged
 /// (0): the hosted exit policy is an open maintainer decision (#704).
 #[tokio::test]
 #[serial]
@@ -6047,11 +6068,12 @@ async fn hosted_json_reports_an_unpinned_row_for_a_granted_patch_nothing_pins() 
     .unwrap();
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
-    let rows = env["redirect"]["patches"].as_array().expect("patches[]");
+    assert_eq!(vlt_hosted_common::redirected(&env), 0, "{env:#}");
+    let rows = env["events"].as_array().expect("events[]");
     assert_eq!(rows.len(), 1, "{env:#}");
     assert_eq!(rows[0]["purl"], PURL, "{env:#}");
     assert_eq!(rows[0]["uuid"], UUID, "{env:#}");
-    assert_eq!(rows[0]["action"], "unpinned", "{env:#}");
+    assert_eq!(rows[0]["action"], "skipped", "{env:#}");
     assert_eq!(rows[0]["errorCode"], "redirect_unconfirmed", "{env:#}");
+    assert_eq!(rows[0]["details"]["mode"], "hosted", "{env:#}");
 }

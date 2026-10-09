@@ -1029,7 +1029,8 @@ specifiers:
     assert_eq!(code, Some(0), "fail-closed diagnostics still exit 0: {doc}");
 
     assert_eq!(
-        doc["redirect"]["redirected"], 1,
+        hosted_pin_count(&doc),
+        1,
         "legacy package must redirect: {doc}"
     );
     assert!(!doc.to_string().contains("redirect_npm_no_lockfile"));
@@ -1119,7 +1120,7 @@ snapshots:
     let (code, doc) = run_hosted_json(root, &server.uri());
     assert_eq!(code, Some(0), "fail-closed diagnostics still exit 0: {doc}");
 
-    let warnings = doc["redirect"]["warnings"].as_array().unwrap();
+    let warnings = doc["warnings"].as_array().unwrap();
     assert!(
         warnings
             .iter()
@@ -1139,7 +1140,7 @@ snapshots:
         !doc.to_string().contains("redirect_pnpm_entry_not_found"),
         "the not-locked wording must be gone for a vendored dep: {doc}"
     );
-    assert_eq!(doc["redirect"]["redirected"], 0, "nothing redirects: {doc}");
+    assert_eq!(hosted_pin_count(&doc), 0, "nothing redirects: {doc}");
     assert_eq!(
         std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
         lock,
@@ -1167,10 +1168,11 @@ async fn hosted_partial_pnpm_redirect_is_not_confirmed_by_url_presence() {
     let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
     assert_eq!(code, Some(0), "{doc}");
     assert_eq!(
-        doc["redirect"]["redirected"], 0,
+        hosted_pin_count(&doc),
+        0,
         "incomplete package must not be confirmed: {doc}"
     );
-    assert!(doc["redirect"]["warnings"]
+    assert!(doc["warnings"]
         .as_array()
         .unwrap()
         .iter()
@@ -1323,7 +1325,7 @@ async fn hosted_scan_from_pnpm_workspace_member_refuses() {
     // From the workspace root the same patch is pinned.
     let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
     assert_eq!(code, Some(0), "{doc}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert_eq!(hosted_pin_count(&doc), 1, "{doc}");
     assert!(std::fs::read_to_string(&lock).unwrap().contains(HOSTED_URL));
 }
 
@@ -1429,7 +1431,7 @@ fn member_root(tmp: &tempfile::TempDir) -> std::path::PathBuf {
 /// Windows `\`, so a path would never match.
 fn warning_texts(doc: &serde_json::Value) -> String {
     let mut out = String::new();
-    for warning in doc["redirect"]["warnings"].as_array().into_iter().flatten() {
+    for warning in doc["warnings"].as_array().into_iter().flatten() {
         for value in warning.as_object().into_iter().flat_map(|o| o.values()) {
             if let Some(text) = value.as_str() {
                 out.push_str(text);
@@ -1499,7 +1501,7 @@ async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
     std::fs::write(&root_ws, &ws_trusted).unwrap();
     let (code, doc) = run_hosted_json(&member, &server.uri());
     assert_eq!(code, Some(0), "{doc}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert_eq!(hosted_pin_count(&doc), 1, "{doc}");
     assert!(std::fs::read_to_string(&lock).unwrap().contains(HOSTED_URL));
     assert!(
         !member.join("pnpm-workspace.yaml").exists(),
@@ -1542,7 +1544,7 @@ async fn hosted_scan_from_pnpm_project_outside_workspace_globs_pins_and_nests_tr
 
     let (code, doc) = run_hosted_json(&demo, &server.uri());
     assert_eq!(code, Some(0), "{doc}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert_eq!(hosted_pin_count(&doc), 1, "{doc}");
     let lock = std::fs::read_to_string(demo.join("pnpm-lock.yaml")).unwrap();
     assert!(lock.contains(HOSTED_URL), "{lock}");
     let nested = std::fs::read_to_string(demo.join("pnpm-workspace.yaml")).unwrap();
@@ -1571,7 +1573,7 @@ async fn hosted_scan_from_pnpm_member_respects_root_trust_opt_out() {
 
     let (code, doc) = run_hosted_json(&member, &server.uri());
     assert_eq!(code, Some(0), "{doc}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert_eq!(hosted_pin_count(&doc), 1, "{doc}");
     assert!(!member.join("pnpm-workspace.yaml").exists());
     assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws);
     let warnings = warning_texts(&doc);
@@ -2069,7 +2071,7 @@ async fn hosted_scan_pins_every_member_lock_with_shared_workspace_lockfile_false
     let (code, doc) = run_hosted_json(root, &server.uri());
     assert_eq!(code, Some(0), "{doc}");
     assert_eq!(doc["status"], "success", "{doc}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert_eq!(hosted_pin_count(&doc), 1, "{doc}");
     for lock in &locks {
         let text = std::fs::read_to_string(lock).unwrap();
         assert!(
@@ -2203,13 +2205,13 @@ async fn hosted_scan_pins_pnpm7_member_locks_without_a_root_lock() {
     );
     let (code, doc) = run_hosted_json(root, &server.uri());
     assert_eq!(code, Some(0), "{doc}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert_eq!(hosted_pin_count(&doc), 1, "{doc}");
     for member in ["a", "b"] {
         let text = std::fs::read_to_string(root.join(format!("packages/{member}/pnpm-lock.yaml")))
             .unwrap();
         assert!(text.contains(HOSTED_URL), "{member}:\n{text}");
     }
-    let codes: Vec<&str> = doc["redirect"]["warnings"]
+    let codes: Vec<&str> = doc["warnings"]
         .as_array()
         .into_iter()
         .flatten()
@@ -2274,13 +2276,13 @@ async fn hosted_scan_refuses_a_git_branch_lockfile_project() {
 
         let (code, doc) = run_hosted_json(root, &server.uri());
         assert_eq!(code, Some(0), "{case}: {doc}");
-        assert_eq!(doc["redirect"]["redirected"], 0, "{case}: {doc}");
+        assert_eq!(hosted_pin_count(&doc), 0, "{case}: {doc}");
         assert_eq!(
             doc["redirect"]["rewrittenFiles"],
             serde_json::json!([]),
             "{case}"
         );
-        let codes: Vec<&str> = doc["redirect"]["warnings"]
+        let codes: Vec<&str> = doc["warnings"]
             .as_array()
             .into_iter()
             .flatten()
@@ -2500,4 +2502,19 @@ async fn hosted_scan_from_bun_or_vlt_member_with_stray_lock_refuses() {
             );
         }
     }
+}
+
+/// How many hosted pins the run wrote (would write, on a dry run): the
+/// envelope's `applied` / `verified` events tagged `details.mode: "hosted"`
+/// (v5.0: replaces `redirect.redirected`).
+fn hosted_pin_count(doc: &serde_json::Value) -> u64 {
+    doc["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events: {doc:#}"))
+        .iter()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

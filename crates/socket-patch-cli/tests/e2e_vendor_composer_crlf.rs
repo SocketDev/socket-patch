@@ -310,7 +310,7 @@ async fn scan_vendor_keeps_a_crlf_lock_and_reverts_it_byte_identically() {
 
     let (code, env) = run_json(root, &args);
     assert_eq!(code, 0, "scan --mode vendored must succeed: {env:#}");
-    assert_eq!(env["vendor"]["summary"]["applied"], 1, "{env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
     let vendored = assert_wired_crlf(root);
     assert_rerun_and_revert(root, &args, &vendored);
 }
