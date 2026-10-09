@@ -7091,7 +7091,7 @@ fn rewrite_maven_pom(
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_multimodule_unsupported".into(),
             detail: format!(
-                "pom.xml declares <modules>/<subprojects>; hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. Nothing was written; use `scan --mode vendored`, which pins each module's declaration",
+                "pom.xml declares <modules>/<subprojects>; hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. pom.xml and .mvn/ were left as they are and the dep is not counted as redirected; use `scan --mode vendored`, which pins each module's declaration",
                 gas.join(", ")
             ),
         });

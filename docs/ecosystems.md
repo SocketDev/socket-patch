@@ -561,8 +561,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   the root `pom.xml`, and a module's own literal `<version>` always beats a root
   `<dependencyManagement>` pin, so a root pin would leave that module on the unpatched
   upstream jar. A root that declares `<modules>` or `<subprojects>` (directly or in a
-  profile) is therefore refused with `redirect_maven_multimodule_unsupported` and left
-  untouched; use `scan --mode vendored`, whose reactor planner rewrites each module's
+  profile) is therefore refused with `redirect_maven_multimodule_unsupported` (`pom.xml` and
+  `.mvn/` are left untouched and the dep is not counted as redirected); use `scan --mode vendored`, whose reactor planner rewrites each module's
   declaration. `vex` likewise does not attest a hosted pin found in a reactor root.
 * **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
