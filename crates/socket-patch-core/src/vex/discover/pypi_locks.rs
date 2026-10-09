@@ -106,7 +106,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::digest::{sha256_hex, sha256_prefixed};
 use crate::utils::python_lock::{
     is_script_lock_name, lock_package_collection, package_artifacts, paired_metadata_rel,
-    script_of_lock, uv_source_location, LockArtifact, UvSource,
+    pipenv_reads_pylock, script_of_lock, uv_source_location, LockArtifact, UvSource,
 };
 use crate::utils::requirements::url_sha256_fragment;
 use crate::vendor::lock_inventory::LockIntegrity;
@@ -115,6 +115,8 @@ const UV_LOCK: &str = "uv.lock";
 const POETRY_LOCK: &str = "poetry.lock";
 const PDM_LOCK: &str = "pdm.lock";
 const PYPROJECT: &str = "pyproject.toml";
+const PIPFILE: &str = "Pipfile";
+const PIPFILE_LOCK: &str = "Pipfile.lock";
 
 /// pdm.lock formats whose installers drop url/path candidate identity (see
 /// the module docs; `pdm-native/README.md`).
@@ -368,7 +370,7 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
         return;
     }
     let pairing = if pep751 {
-        Pairing::LockOnly
+        pylock_pairing(ctx, file).await
     } else {
         load_pairing(ctx, file, out).await
     };
@@ -608,6 +610,29 @@ async fn load_pairing(ctx: &DiscoverCtx<'_>, lock: &str, out: &mut Discovery) ->
             Err(e) => unusable(script, &format!("has invalid PEP 723 metadata ({e})")),
         },
         Err(e) => unusable(script, &format!("has no usable PEP 723 metadata ({e})")),
+    }
+}
+
+/// A PEP 751 lock stands alone — unless Pipenv is its installer (#912):
+/// with a `Pipfile` beside it and no `Pipfile.lock`, Pipenv reads the
+/// pylock but keeps only each entry's version and hashes, so no Socket
+/// `archive` it carries is what gets installed.
+async fn pylock_pairing(ctx: &DiscoverCtx<'_>, lock: &str) -> Pairing {
+    let pipfile = ctx.exists(PIPFILE).await;
+    let pipfile_lock = ctx.exists(PIPFILE_LOCK).await;
+    let exists = |rel: &str| match rel {
+        PIPFILE => pipfile,
+        PIPFILE_LOCK => pipfile_lock,
+        _ => false,
+    };
+    if pipenv_reads_pylock(lock, exists) {
+        unusable(
+            PIPFILE,
+            "makes Pipenv the installer, and with no Pipfile.lock Pipenv installs from this \
+             pylock keeping only each entry's version and hashes (never its archive)",
+        )
+    } else {
+        Pairing::LockOnly
     }
 }
 
@@ -1278,6 +1303,51 @@ mod tests {
             assert_refs(&out, &[(CLICK, uuid, mode)]);
             assert_eq!(out.refs[0].locked_integrity, sha_pin(), "{lock}");
             assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        }
+    }
+
+    /// #912: Pipenv installs a pylock-only project (a `Pipfile` beside the
+    /// pylock, no `Pipfile.lock`) without the entry's `archive`, so a
+    /// hosted or vendored pylock reference there is diagnosed, not
+    /// discovered — vex must not attest the upstream release `pipenv sync`
+    /// installs. With a `Pipfile.lock` beside it the pylock is read as before.
+    #[tokio::test]
+    async fn pylock_read_by_pipenv_is_not_trusted() {
+        let url = click_url(UUID_A);
+        let rel = click_vendored(UUID_B);
+        for (name, artifact, uuid, mode) in [
+            (
+                "pylock.toml",
+                ArtifactSource::Url(&url),
+                UUID_A,
+                WiringMode::Hosted,
+            ),
+            (
+                "pylock.dev.toml",
+                ArtifactSource::Path(&rel),
+                UUID_B,
+                WiringMode::Vendored,
+            ),
+        ] {
+            let lock = rewrite_python_lock(&pylock_registry(), "click", "8.1.7", artifact, SHA)
+                .unwrap()
+                .unwrap();
+            let p = Project::new();
+            p.write(name, &lock)
+                .write("Pipfile", "[packages]\nclick = \"==8.1.7\"\n");
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{name}: {:?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_INVALID && d.detail.contains("Pipenv")),
+                "{name}: {:?}",
+                out.diagnostics
+            );
+
+            p.write("Pipfile.lock", "{}");
+            let out = run(&p).await;
+            assert_refs(&out, &[(CLICK, uuid, mode)]);
         }
     }
 

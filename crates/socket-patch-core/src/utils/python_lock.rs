@@ -175,10 +175,29 @@ pub(crate) fn uv_source_location(package: &dyn TableLike) -> Option<&str> {
 }
 
 pub fn is_python_lock_name(name: &str) -> bool {
-    name == "uv.lock"
-        || name.ends_with(".py.lock")
-        || name == "pylock.toml"
-        || (name.starts_with("pylock.") && name.ends_with(".toml"))
+    name == "uv.lock" || name.ends_with(".py.lock") || is_pep751_lock_name(name)
+}
+
+/// A PEP 751 lock name: `pylock.toml` or `pylock.<name>.toml`.
+pub fn is_pep751_lock_name(name: &str) -> bool {
+    name == "pylock.toml" || (name.starts_with("pylock.") && name.ends_with(".toml"))
+}
+
+/// #912 / #1122: whether Pipenv installs from the PEP 751 lock `rel` (a
+/// project-relative path). A `Pipfile` beside the lock makes Pipenv the
+/// installer, and Pipenv reads a pylock only when that directory has no
+/// `Pipfile.lock`. Its reader (`PylockFile.convert_to_pipenv_lockfile`)
+/// keeps a package's version, marker and wheel / sdist hashes and nothing
+/// else, so no hosted or vendored `archive` entry survives it: such a lock
+/// can't carry a patch. `exists` answers for project-relative paths.
+pub fn pipenv_reads_pylock(rel: &str, exists: impl Fn(&str) -> bool) -> bool {
+    let (dir, name) = match rel.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name),
+        None => (String::new(), rel),
+    };
+    is_pep751_lock_name(name)
+        && exists(&format!("{dir}Pipfile"))
+        && !exists(&format!("{dir}Pipfile.lock"))
 }
 
 pub fn python_lock_paths(root: &Path) -> std::io::Result<Vec<String>> {
