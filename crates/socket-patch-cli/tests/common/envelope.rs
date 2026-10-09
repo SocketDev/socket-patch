@@ -107,3 +107,133 @@ pub fn all_codes(doc: &Value) -> Vec<String> {
     walk(doc, &mut out);
     out
 }
+
+/// The top-level `warnings[]` codes (every command, v5.0: warnings are only
+/// ever top level).
+pub fn warning_codes(envelope: &Value) -> Vec<String> {
+    codes_in(&envelope["warnings"])
+}
+
+/// The events of one leg: those whose `details.mode` is `mode`
+/// (`"hosted"` / `"vendored"`; agent-mode events carry no mode).
+pub fn mode_events<'a>(envelope: &'a Value, mode: &str) -> Vec<&'a Value> {
+    events(envelope)
+        .iter()
+        .filter(|e| e["details"]["mode"] == mode)
+        .collect()
+}
+
+/// `(purl, uuid)` of every hosted pin the run wrote — or, on a dry run,
+/// would write: the `applied` / `verified` events with
+/// `details.mode: "hosted"` (v5.0's `redirect.patches[]` `pinned` /
+/// `would_pin` rows).
+pub fn hosted_pins(envelope: &Value) -> Vec<(String, String)> {
+    mode_events(envelope, "hosted")
+        .into_iter()
+        .filter(|e| e["action"] == "applied" || e["action"] == "verified")
+        .map(|e| {
+            (
+                e["purl"].as_str().unwrap_or_default().to_string(),
+                e["uuid"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The `{purl, uuid, reason, detail}` rows of the hosted `skipped` events
+/// (v5.0's `redirect.skipped[]`: `reason` is the event's `errorCode`).
+pub fn hosted_skips(envelope: &Value) -> Vec<(String, String)> {
+    mode_events(envelope, "hosted")
+        .into_iter()
+        .filter(|e| e["action"] == "skipped")
+        .map(|e| {
+            (
+                e["purl"].as_str().unwrap_or_default().to_string(),
+                e["errorCode"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The shared envelope invariants every `--json` document holds: `command`
+/// is `command`, `status` is a camelCase `Status`, `dryRun` a bool,
+/// `events` an array, every counted `summary` field equals its event count
+/// (`uncounted` skipped events — the vendor engine's advisories — are
+/// allowed on top of `summary.skipped`), `error` is `{code, message}` iff
+/// `status` is `error` or `selectionRequired`, and no top-level key or event
+/// action is snake_case.
+pub fn assert_envelope_invariants(envelope: &Value, command: &str) {
+    assert_eq!(envelope["command"], command, "{envelope:#}");
+    let status = envelope["status"].as_str().expect("status");
+    assert!(
+        [
+            "success",
+            "partialFailure",
+            "error",
+            "noManifest",
+            "paidRequired",
+            "notFound",
+            "notInstalled",
+            "noMatch",
+            "noPackages",
+            "selectionRequired",
+        ]
+        .contains(&status),
+        "status {status:?} is not a Status: {envelope:#}"
+    );
+    assert!(envelope["dryRun"].is_boolean(), "{envelope:#}");
+    let evs = events(envelope);
+    let summary = &envelope["summary"];
+    for (field, action) in [
+        ("discovered", "discovered"),
+        ("downloaded", "downloaded"),
+        ("applied", "applied"),
+        ("updated", "updated"),
+        ("failed", "failed"),
+        ("removed", "removed"),
+        ("verified", "verified"),
+        ("rebuilt", "rebuilt"),
+        ("rolledBack", "rolledBack"),
+    ] {
+        let n = evs.iter().filter(|e| e["action"] == action).count() as u64;
+        assert_eq!(summary[field], n, "summary.{field} vs events: {envelope:#}");
+    }
+    let skipped = evs.iter().filter(|e| e["action"] == "skipped").count() as u64;
+    assert!(
+        summary["skipped"].as_u64().unwrap() <= skipped,
+        "summary.skipped exceeds the skipped events: {envelope:#}"
+    );
+    if summary["failed"].as_u64().unwrap() > 0 {
+        assert!(
+            matches!(status, "partialFailure" | "error"),
+            "a failed event must not leave {status:?}: {envelope:#}"
+        );
+    }
+    let has_error = envelope.get("error").is_some();
+    assert_eq!(
+        has_error,
+        matches!(status, "error" | "selectionRequired"),
+        "`error` iff status error/selectionRequired: {envelope:#}"
+    );
+    if has_error {
+        assert!(envelope["error"]["code"].is_string(), "{envelope:#}");
+        assert!(envelope["error"]["message"].is_string(), "{envelope:#}");
+    }
+    for key in envelope.as_object().unwrap().keys() {
+        assert!(
+            !key.contains('_'),
+            "snake_case top-level key {key:?}: {envelope:#}"
+        );
+    }
+    for e in evs {
+        let action = e["action"].as_str().expect("action");
+        assert!(!action.contains('_'), "snake_case action {action:?}");
+        assert!(e.get("dryRun").is_none(), "nested dryRun in an event: {e}");
+    }
+    for w in envelope["warnings"].as_array().into_iter().flatten() {
+        assert!(
+            w["code"].is_string() && w["detail"].is_string() && w.as_object().unwrap().len() == 2,
+            "a warning is exactly {{code, detail}}: {w}"
+        );
+    }
+}

@@ -470,3 +470,110 @@ pub fn describe(map: &BTreeMap<String, Vec<u8>>) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Warning codes `scan` itself raises (discovery, policy, rollout, VEX,
+/// the API) rather than the hosted engine: v5.0 puts every warning on the
+/// envelope's top-level `warnings[]`, so [`legacy_redirect`] leaves these
+/// out to rebuild the engine's own list.
+const SCAN_LEVEL_WARNING_PREFIXES: &[&str] = &[
+    "policy_",
+    "rollout_",
+    "api_batch_failed",
+    "patch_details_failed",
+    "gradle_",
+    "path_scope_",
+    "vendor_ledger_entry_unwired",
+    "manifest_",
+    "api_auth_fallback",
+    "yarn_pnp_unsupported",
+    "pnpm_pnp_unsupported",
+    "gem_lock_unsupported",
+    "bun_lockb_invalid",
+    "vex_",
+    "lockfile_",
+];
+
+/// The disk run's hosted outcome in the in-memory engine's `redirect`
+/// shape (`{mode, redirected, rewrittenFiles, skipped, patches, warnings,
+/// dryRun}`, the library API the depscan pipeline consumes), rebuilt from
+/// the v5.0 `scan --json` envelope — its `details.mode: "hosted"` events,
+/// its `redirect.rewrittenFiles` and its non-scan-level warnings — so a
+/// parity test stays one comparison. `skipped[]` comes back purl-sorted;
+/// compare against [`sorted_redirect`] of the engine's block.
+pub fn legacy_redirect(envelope: &Value) -> Value {
+    let dry_run = envelope["dryRun"].as_bool().unwrap_or(false);
+    let events: Vec<&Value> = envelope["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted")
+        .collect();
+    let s = |e: &Value, k: &str| e[k].as_str().unwrap_or_default().to_string();
+    let mut patches = Vec::new();
+    let mut skipped = Vec::new();
+    let mut redirected = 0;
+    for e in &events {
+        let (purl, uuid) = (s(e, "purl"), s(e, "uuid"));
+        match e["action"].as_str() {
+            Some("applied") | Some("verified") => {
+                redirected += 1;
+                let action = if dry_run { "would_pin" } else { "pinned" };
+                patches.push(serde_json::json!({"purl": purl, "uuid": uuid, "action": action}));
+            }
+            Some("skipped") if e["errorCode"] == "redirect_unconfirmed" => {
+                patches.push(serde_json::json!({
+                    "purl": purl, "uuid": uuid, "action": "unpinned",
+                    "errorCode": "redirect_unconfirmed",
+                    "error": "no lockfile entry pinning it could be rewritten",
+                }));
+            }
+            Some("skipped") => {
+                let mut row = serde_json::json!({
+                    "purl": purl, "uuid": uuid, "action": "skipped", "errorCode": e["errorCode"],
+                });
+                let mut skip =
+                    serde_json::json!({"purl": purl, "uuid": uuid, "reason": e["errorCode"]});
+                if let Some(detail) = e["reason"].as_str() {
+                    row["error"] = Value::from(detail);
+                    skip["detail"] = Value::from(detail);
+                }
+                patches.push(row);
+                skipped.push(skip);
+            }
+            _ => {}
+        }
+    }
+    let warnings: Vec<Value> = envelope["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| {
+            let code = w["code"].as_str().unwrap_or_default();
+            !SCAN_LEVEL_WARNING_PREFIXES
+                .iter()
+                .any(|p| code.starts_with(p))
+        })
+        .cloned()
+        .collect();
+    sorted_redirect(&serde_json::json!({
+        "mode": "hosted",
+        "redirected": redirected,
+        "rewrittenFiles": envelope["redirect"]["rewrittenFiles"].clone(),
+        "skipped": skipped,
+        "patches": patches,
+        "warnings": warnings,
+        "dryRun": dry_run,
+    }))
+}
+
+/// An engine `redirect` block with `skipped[]` sorted by purl then uuid
+/// (the envelope's events are purl-sorted; the engine keeps its own order).
+pub fn sorted_redirect(redirect: &Value) -> Value {
+    let mut redirect = redirect.clone();
+    if let Some(skipped) = redirect.get_mut("skipped").and_then(Value::as_array_mut) {
+        skipped.sort_by(|a, b| {
+            (a["purl"].as_str(), a["uuid"].as_str()).cmp(&(b["purl"].as_str(), b["uuid"].as_str()))
+        });
+    }
+    redirect
+}

@@ -40,7 +40,8 @@ async fn download_and_apply_patches(
         lock_timeout: None,
         verbose: false,
     };
-    download_and_apply_patches_with(selected, params, &run).await
+    let (code, env) = download_and_apply_patches_with(selected, params, &run).await;
+    (code, env.to_value())
 }
 
 const ORG: &str = "test-org";

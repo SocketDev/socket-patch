@@ -102,8 +102,8 @@ pub(super) const VEX_HOSTED_UNVERIFIED: &str = "vex_hosted_unverified";
 /// Record a hosted run's per-patch outcomes into `env`, each event
 /// carrying `details.mode: "hosted"` and sorted by purl then uuid: `applied`
 /// (`verified` on a dry run) for each pin the rewrite confirmed, `skipped`
-/// with the skip's reason as `errorCode`, and `skipped` /
-/// `redirect_unconfirmed` for each granted patch no lockfile entry pins
+/// with the skip's reason as `errorCode` (its detail, when it has one, as
+/// `reason`), and `skipped` / `redirect_unconfirmed` for each granted patch no lockfile entry pins
 /// (status and exit unchanged, pending #704).
 pub(super) fn record_hosted_events(
     env: &mut Envelope,
@@ -121,13 +121,13 @@ pub(super) fn record_hosted_events(
         .iter()
         .map(|(purl, uuid)| PatchEvent::new(pinned, purl.as_str()).with_uuid(uuid.as_str()))
         .chain(skipped.iter().map(|s| {
-            let reason = s
-                .detail
-                .clone()
-                .unwrap_or_else(|| describe_skip_reason(&s.reason));
-            PatchEvent::new(PatchAction::Skipped, s.purl.as_str())
-                .with_uuid(s.uuid.as_str())
-                .with_reason(s.reason.as_str(), reason)
+            // The skip's code is its `errorCode`; its detail (when the
+            // engine gave one) the `reason`.
+            let mut event =
+                PatchEvent::new(PatchAction::Skipped, s.purl.as_str()).with_uuid(s.uuid.as_str());
+            event.error_code = Some(s.reason.clone());
+            event.reason = s.detail.clone();
+            event
         }))
         .chain(unconfirmed.iter().map(|(purl, uuid)| {
             PatchEvent::new(PatchAction::Skipped, purl.as_str())
