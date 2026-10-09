@@ -711,9 +711,9 @@ pub fn stale_global_package_detail(id: &str, version: &str, dir: &Path, how: &st
         "{id} {version} is now served by {how}, but NuGet's global packages folder already holds \
          the UNPATCHED copy at {} — NuGet restores from that folder before asking any source, so \
          `dotnet restore` keeps the upstream bytes (or fails NU1403 against the re-pinned lock). \
-         Delete that directory (NuGet downloads the patched package again on the next restore), \
-         or clear the folder with `dotnet nuget locals global-packages --clear`, then run \
-         `dotnet restore`. Other machines and CI runners that restore a cached global packages \
+         Delete that directory (NuGet downloads the patched package again on the next restore) \
+         and run `dotnet restore`; `dotnet nuget locals global-packages --clear` works too, but \
+         empties the WHOLE folder, every package of every project on this machine. Other machines and CI runners that restore a cached global packages \
          folder must drop that entry too (key the CI cache on packages.lock.json with no \
          fallback restore key)",
         dir.display()
