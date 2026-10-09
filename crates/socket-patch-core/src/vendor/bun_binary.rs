@@ -644,10 +644,14 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             if let RevertLock::Migrated(lines) = &mut lock {
                 if rec.file == TEXT_LOCK && rec.kind == super::bun_lock::KIND_LOCK_PACKAGE {
                     let mut dirty = false;
+                    // `false`: bun.lockb migrations stay outside the #1155
+                    // upgrade path, so a moved default-registry tuple keeps
+                    // its drift verdict here.
                     super::bun_lock::revert_one_record(
                         lines,
                         rec,
                         &entry.uuid,
+                        false,
                         &mut dirty,
                         &mut outcome.warnings,
                     );

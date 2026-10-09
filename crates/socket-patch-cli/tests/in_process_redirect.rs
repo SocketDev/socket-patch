@@ -631,6 +631,11 @@ async fn mock_reference_with_berry(server: &MockServer) {
 }
 
 async fn mock_reference_with_berry_url(server: &MockServer, hosted_url: &str) {
+    mock_reference_with_berry_sha512(server, hosted_url, PATCHED_SHA512).await;
+}
+
+/// [`mock_reference_with_berry_url`] granting a tarball of `sha512`.
+async fn mock_reference_with_berry_sha512(server: &MockServer, hosted_url: &str, sha512: &str) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -641,7 +646,7 @@ async fn mock_reference_with_berry_url(server: &MockServer, hosted_url: &str) {
                     "purl": PURL,
                     "artifacts": [
                         { "kind": "tarball", "url": hosted_url,
-                          "integrity": { "sha512": PATCHED_SHA512 } },
+                          "integrity": { "sha512": sha512 } },
                         { "kind": "yarn-berry-zip", "url": "http://patch.test/berry.zip",
                           "integrity": { "yarnBerry10c0": BERRY_CHECKSUM } }
                     ],
@@ -858,6 +863,129 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             "{label}: rollback drops the resolutions pin: {pkg}"
         );
         vlt_hosted_common::assert_no_ledger(tmp.path());
+    }
+}
+
+/// #737: yarn's npm resolver gives a registry entry whose scripts run
+/// node-gyp (the registry injects `install: node-gyp rebuild` for any
+/// package with a `binding.gyp`) an implicit `node-gyp: "npm:latest"`
+/// dependency, which the tarball-locator pin never gets: the pin drops it,
+/// and with it every entry only node-gyp reached. Rollback re-resolves the
+/// registry entry and puts the dependency back while the lock still
+/// resolves node-gyp; once it does not, it warns that `yarn install` must
+/// re-add it.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_pin_drops_the_implicit_node_gyp_and_rollback_restores_it() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let tarball = upstream_tarball();
+    mock_reference_with_berry_sha512(
+        &server,
+        &hosted_url,
+        &vlt_hosted_common::sha512_sri(&tarball),
+    )
+    .await;
+    mock_view(&server).await;
+    // The served tarball's own manifest (the pin reads it): no node-gyp.
+    Mock::given(method("GET"))
+        .and(path(hosted_url.trim_start_matches(&server.uri())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+        .mount(&server)
+        .await;
+    mock_npm_registry_scripts(
+        &server,
+        &vlt_hosted_common::sha512_sri(&tarball),
+        Some(tarball),
+        serde_json::json!({ "install": "node-gyp rebuild" }),
+    )
+    .await;
+
+    let node_gyp = "\"node-gyp@npm:latest\":\n  version: 13.1.0\n  \
+                    resolution: \"node-gyp@npm:13.1.0\"\n  dependencies:\n    \
+                    nopt: \"npm:^10.0.0\"\n  checksum: 10c0/aa\n  languageName: node\n  \
+                    linkType: hard\n\n\"nopt@npm:^10.0.0\":\n  version: 10.0.1\n  \
+                    resolution: \"nopt@npm:10.0.1\"\n  checksum: 10c0/bb\n  \
+                    languageName: node\n  linkType: hard\n";
+    let other_gyp = "\n\"other-gyp@npm:1.0.0\":\n  version: 1.0.0\n  \
+                     resolution: \"other-gyp@npm:1.0.0\"\n  dependencies:\n    \
+                     node-gyp: \"npm:latest\"\n  checksum: 10c0/cc\n  \
+                     languageName: node\n  linkType: hard\n";
+    for shared in [true, false] {
+        let label = if shared { "shared" } else { "sole" };
+        let tmp = tempfile::tempdir().unwrap();
+        write_berry_project_spelled(tmp.path(), |t| {
+            let mut t = t
+                .replace(
+                    &format!("resolution: \"{NAME}@npm:{VERSION}\"\n"),
+                    &format!(
+                        "resolution: \"{NAME}@npm:{VERSION}\"\n  dependencies:\n    \
+                         node-gyp: \"npm:latest\"\n"
+                    ),
+                )
+                .replace(
+                    "\n\"consumer@workspace:.\"",
+                    &format!("\n{node_gyp}\n\"consumer@workspace:.\""),
+                );
+            if shared {
+                t = t.replace(
+                    &format!("    {NAME}: \"npm:^{VERSION}\"\n"),
+                    &format!("    {NAME}: \"npm:^{VERSION}\"\n    other-gyp: \"npm:1.0.0\"\n"),
+                );
+                t.push_str(other_gyp);
+            }
+            t
+        });
+        let lock_path = tmp.path().join("yarn.lock");
+        let pristine = std::fs::read_to_string(&lock_path).unwrap();
+
+        let env = run_redirect_subprocess_with(
+            tmp.path(),
+            &server.uri(),
+            &["--patch-server-url", &server.uri()],
+        );
+        assert_eq!(env["redirect"]["redirected"], 1, "{label}: {env:#}");
+        assert!(warning_codes(&env).is_empty(), "{label}: {env:#}");
+        let lock = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            lock.contains(&format!(
+                "\"{NAME}@{hosted_url}\":\n  version: {VERSION}\n  \
+                 resolution: \"{NAME}@{hosted_url}\"\n  checksum: {BERRY_CHECKSUM}\n"
+            )),
+            "{label}: the pin has no node-gyp dependency: {lock}"
+        );
+        assert_eq!(
+            lock.contains("\"node-gyp@npm:latest\":") && lock.contains("\"nopt@npm:^10.0.0\":"),
+            shared,
+            "{label}: node-gyp's subtree stays only while another entry reaches it: {lock}"
+        );
+
+        let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
+        assert_eq!(code, Some(0), "{label}: rollback: {env:#}");
+        let restored = std::fs::read_to_string(&lock_path).unwrap();
+        let checksum = berry_checksum_of(&restored);
+        let pristine = pristine.replace(
+            &format!("10c0/{}", "3".repeat(128)),
+            &format!("10c0/{checksum}"),
+        );
+        let warned = env.to_string().contains("yarn_berry_node_gyp_unresolved");
+        if shared {
+            assert_eq!(restored, pristine, "{label}: byte-exact rollback");
+            assert!(!warned, "{label}: {env:#}");
+        } else {
+            assert_eq!(
+                restored,
+                pristine
+                    .replace(
+                        "  dependencies:\n    node-gyp: \"npm:latest\"\n  checksum: 10c0/",
+                        "  checksum: 10c0/"
+                    )
+                    .replace(&format!("{node_gyp}\n"), ""),
+                "{label}: the registry entry, minus the dependency the lock cannot resolve"
+            );
+            assert!(warned, "{label}: {env:#}");
+        }
     }
 }
 
@@ -1802,12 +1930,23 @@ fn hosted_unwind_json(
 /// `tarball` served at the document's `dist.tarball` (a yarn berry restore
 /// downloads it to recompute the zip checksum).
 async fn mock_npm_registry(server: &MockServer, integrity: &str, tarball: Option<Vec<u8>>) {
+    mock_npm_registry_scripts(server, integrity, tarball, serde_json::json!({})).await;
+}
+
+/// [`mock_npm_registry`] whose version document carries `scripts`.
+async fn mock_npm_registry_scripts(
+    server: &MockServer,
+    integrity: &str,
+    tarball: Option<Vec<u8>>,
+    scripts: serde_json::Value,
+) {
     let tarball_path = format!("/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz");
     Mock::given(method("GET"))
         .and(path(format!("/npm-registry/{NAME}/{VERSION}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "name": NAME,
             "version": VERSION,
+            "scripts": scripts,
             "dist": {
                 "tarball": format!("{}{tarball_path}", server.uri()),
                 "integrity": integrity,
