@@ -3158,7 +3158,6 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
     )]);
     let sources = socket_patch_core::patch::apply::PatchSources {
         blobs_path: fx.root(),
-        diffs_path: None,
         mem_blobs: Some(&blobs),
     };
     prebuilt_common::mount_record(

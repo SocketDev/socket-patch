@@ -1033,7 +1033,6 @@ mod tests {
             GO_PATCHES_DIR,
             &record.files,
             &sources,
-            Some(UUID),
             false,
             MismatchPolicy::Warn,
         )
@@ -1095,7 +1094,6 @@ mod tests {
                 GO_PATCHES_DIR,
                 &record.files,
                 &sources,
-                Some(UUID),
                 false,
                 MismatchPolicy::Warn,
             )
@@ -1404,7 +1402,6 @@ mod tests {
             GO_PATCHES_DIR,
             &record.files,
             &sources,
-            Some(UUID),
             false,
             MismatchPolicy::Warn,
         )
@@ -2160,7 +2157,6 @@ mod tests {
             GO_PATCHES_DIR,
             &record.files,
             &sources,
-            Some(UUID),
             false,
             MismatchPolicy::Warn,
         )

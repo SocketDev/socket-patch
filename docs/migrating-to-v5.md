@@ -160,10 +160,12 @@ whole root, not a `vendor_jvm_degraded` warning on mixed Maven + Gradle roots.
 | `get --no-apply` | `get --save-only` (`SOCKET_SAVE_ONLY` is unchanged) |
 | `socket-patch download` | `socket-patch get` |
 | `socket-patch gc` | `socket-patch repair` |
+| `--download-mode`, `SOCKET_DOWNLOAD_MODE` | No replacement; patch content is always fetched as per-file blobs |
 | `SOCKET_FORCE` | Pass `--force` to the one command that needs it (`apply`, `vendor`, `--update`); the variable is now ignored |
 
 A removed spelling is a usage error (exit 2). `scan --sync` stays as the
 shorthand for `scan --mode agent --prune`.
 
-Legacy `.socket/packages/` archives are no longer read. Patch data uses diff
-archives or blobs; cleanup commands remove obsolete package archives.
+Legacy `.socket/packages/` and `.socket/diffs/` archives are no longer read.
+Patch data uses per-file blobs (`.socket/blobs/`); cleanup commands remove the
+obsolete archives.

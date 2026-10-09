@@ -1117,7 +1117,6 @@ pub async fn run(args: GetArgs) -> i32 {
         )],
         _ => Vec::new(),
     };
-    let download_mode = args.common.download_mode.clone();
     // Set to `true` after the first 401/403 from the authenticated
     // endpoint triggered a rebuild against the public proxy. Plumbed
     // through to every subsequent telemetry event so we can track the
@@ -1211,7 +1210,6 @@ pub async fn run(args: GetArgs) -> i32 {
                     &patch.uuid,
                     &patch.tier,
                     &ecosystem_from_purl(&patch.purl),
-                    &download_mode,
                     fallback_to_proxy,
                     &telemetry,
                 )
@@ -2176,7 +2174,6 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         global_prefix: args.common.global_prefix.clone(),
         json: args.common.json,
         silent: args.common.silent,
-        download_mode: args.common.download_mode.clone(),
         all_releases: args.all_releases,
         strict: args.common.strict,
         ecosystems: args.common.ecosystems.clone(),
@@ -3875,7 +3872,6 @@ mod tests {
             global_prefix: None,
             json: true,
             silent: true,
-            download_mode: "diff".to_string(),
             all_releases: false,
             strict: false,
             ecosystems: None,
@@ -4571,7 +4567,6 @@ mod tests {
             global_prefix: None,
             json: true,
             silent: true,
-            download_mode: "diff".to_string(),
             all_releases: false,
             strict: false,
             ecosystems: None,
@@ -5676,7 +5671,6 @@ mod tests {
             nested.org.is_none() && nested.api_token.is_none(),
             "API fields are never threaded through params: the nested apply runs on the run's client"
         );
-        assert_eq!(nested.download_mode, "diff");
         assert!(nested.silent, "json || silent params run a quiet apply");
         assert!(!nested.json && !nested.dry_run);
     }
