@@ -2005,9 +2005,10 @@ async fn guard_unwired_pypi_revert(
 /// named project files, the root `requirements.txt` plus every `-r` include
 /// the planner may have written a pin into, every Python lock the root
 /// directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock` with its paired
-/// script), and every other root-level `*.txt` (a `uv export -o` target, or
-/// a `requirements-dev.txt` the user moved a vendor line into), plus every
-/// `*.txt` or Python lock in a project subdirectory
+/// script), and every other root-level `*.txt` or `*.lock` (a `uv export -o`
+/// target such as Rye's `requirements.lock`, #1252, or a
+/// `requirements-dev.txt` the user moved a vendor line into), plus every
+/// `*.txt`, `*.lock` or Python lock in a project subdirectory
 /// ([`subdir_probe_names`]: a `requirements/dev.txt` the root never
 /// includes, #1167, or a `deploy/pylock.toml` export, #1213). `skip`
 /// names files left out of the probe (a dry run's not-yet-restored wiring).
@@ -2067,7 +2068,7 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
             continue;
         };
         let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
-        if !is_lock && !name.ends_with(".txt") {
+        if !is_lock && !is_export_name(&name) {
             continue;
         }
         // lstat only: a regular file or ANY symlink is probed (the read
@@ -2120,6 +2121,16 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
     None
 }
 
+/// Whether a file that is not a Python lock name may still be a
+/// requirements-format export [`pypi_reference_clause`] must read: any
+/// `*.txt` (`pip freeze >`, `uv export -o requirements.txt`) and any
+/// `*.lock` (#1252: Rye's `requirements.lock` / `requirements-dev.lock`,
+/// which `uv export -o` and `uv pip compile -o` keep writing after a
+/// Rye -> uv move; both accept any output name).
+fn is_export_name(name: &str) -> bool {
+    name.ends_with(".txt") || name.ends_with(".lock")
+}
+
 /// Directory names [`subdir_probe_names`] never descends into: VCS metadata,
 /// socket-patch's own state, and tool or cache trees whose `*.txt` files
 /// are package payloads, not requirements files anyone installs from.
@@ -2139,8 +2150,8 @@ const PROBE_SKIPPED_DIRS: &[&str] = &[
     "site-packages",
 ];
 
-/// Every `*.txt` and every Python lock (with a script lock's paired
-/// script) below the project root's subdirectories, as `/`-joined
+/// Every `*.txt`, every `*.lock` and every Python lock (with a script
+/// lock's paired script) below the project root's subdirectories, as `/`-joined
 /// root-relative names in a stable order (#1167, #1213): `pip install -r
 /// requirements/dev.txt` installs from a file the root `-r` tree never
 /// reaches, `pip freeze > requirements/lock.txt` or `uv export -o
@@ -2193,7 +2204,7 @@ fn subdir_probe_names(project_root: &Path) -> Vec<String> {
             } else if !rel.is_empty() && (ft.is_file() || ft.is_symlink()) {
                 // Root-level files are the caller's own listing.
                 let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
-                if !is_lock && !name.ends_with(".txt") {
+                if !is_lock && !is_export_name(&name) {
                     continue;
                 }
                 if is_lock {
