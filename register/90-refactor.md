@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T16:18Z · main @ a8e9397_
+_Last updated 2026-10-09T17:45Z · main @ a8e9397_
 
 **In flight:**
+- [#1347](https://github.com/SocketDev/socket-patch/pull/1347): one `crawlers::pnpm_layout` answers where pnpm installs (crawler roots, `detect_npm_pkg_manager`, PnP carve-out over disk/snapshot/memory); `node_modules`-only probes deleted. Fixes #1129 (E92). +191/−92 prod, +213 tests. `state: ready`.
 - [#1294](https://github.com/SocketDev/socket-patch/pull/1294): `utils::target` keys packages by `package_identity` (`PurlKey` base); versionless purls and the ambiguity guard stop lowercasing npm/Go/Maven/cargo/gem. Fixes #1292 (C80). +78/−34 prod, +168 tests. `state: ready`.
 - [#1288](https://github.com/SocketDev/socket-patch/pull/1288): vendored `nuget.config` writer takes keys and anchors from `formats::nuget::parse_config`; `blank_comments`, `parse_config_source_keys`, `attr_value`, `self_closing_package_sources`, `insert_at_line` deleted. #594 vendored slice (E10), fixes #685. +128/−150 prod, +207/−58 tests. `state: ready`.
 - [#1188](https://github.com/SocketDev/socket-patch/pull/1188): one `Pipfile.lock` writer (`formats::pipenv::splice_entry`). #1128 (E14). +303/−235 prod. `state: ready`.
@@ -16,13 +17,14 @@ _Last updated 2026-10-09T16:18Z · main @ a8e9397_
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | 1 | #1292 (C80): `Target` onto `PurlKey` identity | 1 | 0 | 1 | M | 3 (P2) | **taken: #1294** |
 | 2 | #931 + #998 + #1063 + #1123: one manifest load + error mapper | 4 | 1 | ≈6 | M | ≈24 | skipped: `apply.rs`, `vendor.rs`, `scan/mod.rs`, `rollback.rs`, `remove.rs`, `repair.rs` (#1049, #1273) |
-| 3 | #1129 (E92): one pnpm modules-dir helper for crawler + `pkg_managers` | 1 | 0 | 1 | M | 3 (P3) | free (`crawlers/pkg_managers.rs`, `npm_crawler.rs`); next |
+| 3 | #1129 (E92): one pnpm modules-dir helper for crawler + `pkg_managers` | 1 | 0 | 1 | M | 3 (P2) | **taken: #1347** |
 | 4 | #782 E41: delete dead `lock_inventory/wired.rs` (260 prod lines) | 0 | 0 | ≈2.3 | L | ≈4.6 | skipped: its tests live in `lock_inventory/tests.rs` (#1274) |
 | 5 | #1220 (C78): upstream restore through `utils::concurrency` | 1 | 0 | ≈5 | M | ≈11 | skipped: upstream files (#1279 maintainer draft, #1188, #1283, #1026) |
 
-Re-ranked 2026-10-09T16:00Z at `a8e9397` against 16 open PRs. Still skipped by file overlap: #914 rest (`vendor/common.rs`, #1279), #1202 rest (`nuget_feed.rs`, #1279/#1288), #705 (`apply.rs`), #675/#647 (`scan`, `api/client.rs`), #823 (`spawn_env_hygiene.rs`, #1049), #782 leftovers (`commands/vendor.rs`, `vendor/state.rs`). Free but low: E37 composer `normalize_version`, C17 digests in `group_commit.rs` + `jvm/mod.rs`, #1270 (E95, fixer-sized).
+Re-ranked 2026-10-09T16:56Z at `a8e9397` against 60 open PRs (about 40 new `agent/v5-*` fixer drafts, mostly the NuGet, PyPI, cargo, berry and gem backends). Still skipped by file overlap: #914 rest (`vendor/common.rs`, #1279), #1202 rest (`nuget_feed.rs`, #1279/#1288), #705 (`apply.rs`), #675/#647 (`scan`, `api/client.rs`), #823 (`spawn_env_hygiene.rs`, #1049), #782 leftovers (`commands/vendor.rs`, `vendor/state.rs`). Free but low: E37 composer `normalize_version`, C17 digests in `group_commit.rs` + `jvm/mod.rs`, #1270 (E95, fixer-sized).
 
 **Notes:**
+- pnpm layout (#1347): ask `crawlers::pnpm_layout` (`configured_modules_dirs`, `installed_store_in`) for where pnpm installs; never probe a literal `node_modules/.pnpm` again. A snapshot read through it goes through `root()` (recording not reused), only when `node_modules` holds no store.
 - Target identity (#1294): `utils::target::package_identity` is the `PurlKey` base without version; a lowercase name over case-distinct packages is ambiguous, an uppercase-bearing name settles on its exact case. `package_spec_matches` stays lenient for `scan --package`/socket.yml only.
 - NuGet config (#1288): vendored writes anchor on `parse_config`'s `ConfigSection` (`close_start`, `open`); malformed XML or `repeated_sections` is refused. Hosted `add_nuget_source` inserts at `insert_at` (section start), vendored before the close line (revert excises its exact bytes): don't merge the two writers without moving the revert. `formats::nuget::xml_attribute` duplicates hosted `nuget_xml_attribute` until `redirect/mod.rs` frees.
 - #1279 (maintainer draft, `refactor/crate-bloat-cleanup`) changes `vendor/common.rs`, `vendor/{cargo,gem,registry_fetch}.rs` and most of `redirect/upstream/`: treat as busy.
