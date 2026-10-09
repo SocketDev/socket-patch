@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-09T16:20Z · main @ 31383f5_
+_Last updated 2026-10-09T15:55Z · main @ 31383f5_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
