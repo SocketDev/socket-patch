@@ -25,6 +25,23 @@ use crate::commands::vendor::{dispatch_revert_one_opts, vendor_records_reusing, 
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::Envelope;
 
+/// Stamp `details.mode` (`"vendored"` / `"hosted"`) on `events`: the
+/// convention every envelope uses to tell a vendored- or hosted-leg event
+/// from an agent-mode (manifest) one, which carries no mode. Existing
+/// `details` keys are kept; an event with no `details` gets
+/// `{"mode": ...}`.
+pub(crate) fn tag_event_mode(events: &mut [crate::json_envelope::PatchEvent], mode: &str) {
+    for event in events {
+        match event.details.as_mut() {
+            Some(serde_json::Value::Object(map)) => {
+                map.insert("mode".to_string(), serde_json::json!(mode));
+            }
+            Some(_) => {}
+            None => event.details = Some(serde_json::json!({ "mode": mode })),
+        }
+    }
+}
+
 /// The vendored-mode backend for one run: the run's global args and its
 /// patch-service config (`--revert` does not need one).
 pub(crate) struct VendoredBackend<'a> {

@@ -1221,7 +1221,10 @@ async fn run_check(args: &VendorArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
     let manifest = match read_manifest(&manifest_path).await {
         Ok(m) => m.unwrap_or_default(),
-        Err(e) => return emit_eject_refusal(&args.common, "manifest_unreadable", &e.to_string()),
+        Err(e) => {
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            return emit_eject_refusal(&args.common, &err.code, &err.message);
+        }
     };
     let mut entries: Vec<_> = state.entries.iter().collect();
     entries.sort_by_key(|(key, _)| *key);
@@ -1347,7 +1350,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
 
 /// A refused eject: the JSON error envelope (`status: error`) or an
 /// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
-fn emit_eject_refusal(common: &GlobalArgs, code: &'static str, message: &str) -> i32 {
+fn emit_eject_refusal(common: &GlobalArgs, code: &str, message: &str) -> i32 {
     if common.json {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = common.dry_run;
@@ -2130,7 +2133,13 @@ async fn run_vendor(
         Ok(Some(m)) => m,
         Ok(None) => return 0, // vanished since the existence check (TOCTOU)
         Err(e) => {
-            env.mark_error(EnvelopeError::new("invalid_manifest", e.to_string()));
+            // The shared manifest-load mapping (#931): `manifest_invalid`
+            // for unparseable JSON / a schema violation, else
+            // `manifest_unreadable`.
+            env.mark_error(crate::json_envelope::manifest_load_error(
+                manifest_path,
+                &e,
+            ));
             if !common.json {
                 eprintln!("Error: Could not read manifest: {e}");
             }

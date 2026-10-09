@@ -175,9 +175,10 @@ fn apply_check_silent_unreadable_manifest_keeps_error_output() {
     );
 }
 
-/// `apply --check --json` on an unreadable manifest must emit the unified
+/// `apply --check --json` on a corrupt manifest must emit the unified
 /// envelope (CLI_CONTRACT.md: every `--json` invocation emits a single
-/// JSON object) — not exit 1 with empty stdout.
+/// JSON object) — not exit 1 with empty stdout. The code is the shared
+/// manifest-load mapping (#931): unparseable JSON is `manifest_invalid`.
 #[test]
 fn apply_check_json_unreadable_manifest_emits_error_envelope() {
     let tmp = tempfile::tempdir().unwrap();
@@ -189,7 +190,7 @@ fn apply_check_json_unreadable_manifest_emits_error_envelope() {
         .unwrap_or_else(|e| panic!("--json must emit an envelope ({e}); stdout was: {stdout:?}"));
     assert_eq!(env["command"], "apply");
     assert_eq!(env["status"], "error");
-    assert_eq!(env["error"]["code"], "manifest_unreadable");
+    assert_eq!(env["error"]["code"], "manifest_invalid");
 }
 
 /// `apply --check --silent` with real redirect drift must still print the

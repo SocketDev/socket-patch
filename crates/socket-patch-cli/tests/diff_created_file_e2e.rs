@@ -277,6 +277,6 @@ async fn repair_json_reports_the_created_blob_download_once_as_file_mode() {
         .filter(|e| e["action"] == "downloaded")
         .collect();
     assert_eq!(downloads.len(), 1, "{v:#}");
-    assert_eq!(downloads[0]["details"]["mode"], "file", "{v:#}");
+    assert_eq!(downloads[0]["details"]["downloadMode"], "file", "{v:#}");
     assert_eq!(downloads[0]["details"]["count"], 1, "{v:#}");
 }

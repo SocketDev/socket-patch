@@ -395,10 +395,10 @@ fn remove_without_skip_rollback_fails_closed_and_keeps_manifest() {
 // Blob-sweep artifact event must not inflate the removed count
 // ---------------------------------------------------------------------------
 
-/// When `remove` sweeps an orphaned blob (or rolls files back) it appends a
-/// purl-less, artifact-level `Removed` event carrying `details.blobsRemoved` /
-/// `details.rolledBack`. That carrier is metadata — NOT a removed manifest
-/// entry — so it must never bump `summary.removed`.
+/// When `remove` sweeps an orphaned blob it appends a purl-less,
+/// artifact-level `Removed` event carrying `details.count` (artifacts swept),
+/// the same carrier `repair` prints. That carrier is metadata — NOT a
+/// removed manifest entry — so it must never bump `summary.removed`.
 ///
 /// The `run_remove` helper passes `--skip-rollback` against a manifest whose afterHash
 /// blobs aren't present on disk, so the cleanup phase sweeps nothing and the
@@ -408,7 +408,7 @@ fn remove_without_skip_rollback_fails_closed_and_keeps_manifest() {
 ///
 /// The contract: exactly ONE manifest entry was deleted, so `summary.removed`
 /// must be 1 — matching the single per-purl `removed` event — even though the
-/// event stream also carries the artifact carrier reporting `blobsRemoved: 1`.
+/// event stream also carries the artifact carrier reporting `count: 1`.
 /// A regression that routes the carrier through the summary-bumping `record`
 /// path would report `removed: 2` and flip this test red.
 #[test]
@@ -450,9 +450,20 @@ fn remove_blob_sweep_does_not_inflate_removed_count() {
         .find(|e| e["action"] == "removed" && e["purl"].is_null())
         .expect("artifact-level Removed carrier event must be present");
     assert_eq!(
-        carrier["details"]["blobsRemoved"], 1,
+        carrier["details"]["count"], 1,
         "exactly A's orphaned afterHash blob should be swept; carrier={carrier}"
     );
+    assert_eq!(v["gc"]["removedBlobs"], 1, "envelope={v}");
+    assert!(
+        carrier["details"]["checked"].is_u64(),
+        "repair's carrier shape: `count` + `checked`; carrier={carrier}"
+    );
+    for legacy in ["blobsRemoved", "archivesRemoved", "rolledBack"] {
+        assert!(
+            carrier["details"].get(legacy).is_none(),
+            "`{legacy}` left the carrier (per-kind totals are `gc`); carrier={carrier}"
+        );
+    }
 
     // B's afterHash blob is still referenced, so it must survive on disk;
     // A's must be gone.
@@ -737,7 +748,7 @@ fn remove_dry_run_keeps_manifest_and_emits_verified_previews() {
 
 /// The blob sweep runs in preview mode on `--dry-run`: the artifact-level
 /// carrier event reports how many blobs WOULD be swept (as `Verified`,
-/// with `details.blobsRemoved`), but the blob files stay on disk.
+/// with `details.count`), but the blob files stay on disk.
 #[test]
 fn remove_dry_run_previews_blob_sweep_without_deleting() {
     let tmp = tempfile::tempdir().unwrap();
@@ -762,10 +773,10 @@ fn remove_dry_run_previews_blob_sweep_without_deleting() {
     let events = v["events"].as_array().expect("events array");
     let carrier = events
         .iter()
-        .find(|e| e["action"] == "verified" && e["details"]["blobsRemoved"].is_number())
+        .find(|e| e["action"] == "verified" && e["purl"].is_null())
         .unwrap_or_else(|| panic!("expected a Verified blob-sweep carrier event: {events:?}"));
     assert_eq!(
-        carrier["details"]["blobsRemoved"], 1,
+        carrier["details"]["count"], 1,
         "the preview must count A's now-unreferenced blob"
     );
 

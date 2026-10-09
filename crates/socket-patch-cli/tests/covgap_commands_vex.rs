@@ -123,7 +123,8 @@ fn write_ghost_npm_manifest(cwd: &Path, purl: &str) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// corrupt manifest → `manifest_unreadable`, exit 2 (read_manifest Err arm)
+// corrupt manifest → `manifest_invalid`, exit 2 (read_manifest Err arm;
+// the shared manifest-load mapping, #931)
 //
 // A PRESENT-but-corrupt `.socket/manifest.json` is the hard exit-2 error
 // (`read_manifest` → Err), distinct from the missing-manifest exit-2
@@ -203,13 +204,13 @@ fn corrupt_manifest_json_envelope_carries_code_and_removes_stale_doc() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "manifest_unreadable is a hard error in --json mode too. stdout:\n{}",
+        "manifest_invalid is a hard error in --json mode too. stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
     let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
     assert_eq!(env["command"], "vex", "{env}");
     assert_eq!(env["status"], "error", "{env}");
-    assert_eq!(env["error"]["code"], "manifest_unreadable", "{env}");
+    assert_eq!(env["error"]["code"], "manifest_invalid", "{env}");
     assert!(
         env["error"]["message"]
             .as_str()
@@ -275,7 +276,7 @@ fn failed_run_does_not_block_on_a_fifo_at_output() {
         String::from_utf8_lossy(&out.stdout)
     );
     let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
-    assert_eq!(env["error"]["code"], "manifest_unreadable", "{env}");
+    assert_eq!(env["error"]["code"], "manifest_invalid", "{env}");
     assert!(
         std::fs::symlink_metadata(&fifo)
             .unwrap()

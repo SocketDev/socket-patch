@@ -1305,8 +1305,10 @@ async fn generate_vex_from_manifest_path_inner(
         Err(e) => {
             // Core's text ("Failed to parse manifest JSON: ...") does not
             // say which file; in a workspace that matters.
+            // The shared manifest-load mapping (#931); exit 2 stays vex's.
             let message = format!("{e} (in {})", manifest_path.display());
-            return Err(fail(common, params, "manifest_unreadable", message).await);
+            let code = crate::json_envelope::manifest_load_error_code(&e);
+            return Err(fail(common, params, code, message).await);
         }
     };
     let had_manifest_file = manifest_file.is_some();

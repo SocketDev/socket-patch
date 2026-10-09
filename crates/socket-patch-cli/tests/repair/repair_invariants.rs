@@ -257,7 +257,7 @@ fn repair_redirect_only_project_human_mode_prints_note() {
 }
 
 #[test]
-fn repair_with_invalid_manifest_emits_repair_failed_envelope() {
+fn repair_with_invalid_manifest_emits_manifest_invalid_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
@@ -268,14 +268,15 @@ fn repair_with_invalid_manifest_emits_repair_failed_envelope() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
     assert_eq!(v["command"], "repair");
     assert_eq!(v["status"], "error");
-    // A malformed manifest must surface as a deterministic `repair_failed`
-    // envelope whose message names the manifest-parse failure. (A bare
+    // A malformed manifest must surface as a deterministic `manifest_invalid`
+    // envelope (the shared manifest-load mapping, #931 — not the generic
+    // `repair_failed`) whose message names the manifest-parse failure. (A bare
     // `manifest_not_found` here would mean the invalid file was silently
     // ignored — exactly the regression this test guards against.)
     let code_str = v["error"]["code"].as_str().expect("error.code");
     assert_eq!(
-        code_str, "repair_failed",
-        "invalid manifest must report repair_failed, got {code_str}"
+        code_str, "manifest_invalid",
+        "invalid manifest must report manifest_invalid, got {code_str}"
     );
     let msg = v["error"]["message"].as_str().expect("error.message");
     assert!(
@@ -750,7 +751,7 @@ fn repair_refuses_and_keeps_lock_when_live_holder() {
 
 /// The lock-file cleanup runs on every completion path, not as a success
 /// reward: a repair that fails past the lock (here: an unparseable
-/// manifest → `repair_failed`) still drops its guard and the file with it.
+/// manifest → `manifest_invalid`) still drops its guard and the file with it.
 #[test]
 fn repair_deletes_lock_file_even_when_repair_fails() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -760,9 +761,9 @@ fn repair_deletes_lock_file_even_when_repair_fails() {
     std::fs::write(socket.join("apply.lock"), b"leftover").expect("stage stale lock");
 
     let (code, stdout) = run_repair(tmp.path(), &[]);
-    assert_eq!(code, 1, "expected repair_failed exit 1; stdout=\n{stdout}");
+    assert_eq!(code, 1, "expected manifest_invalid exit 1; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
-    assert_eq!(v["error"]["code"], "repair_failed");
+    assert_eq!(v["error"]["code"], "manifest_invalid");
     assert!(
         !socket.join("apply.lock").exists(),
         "the lock-file cleanup must run on the failure path too"

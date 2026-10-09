@@ -649,12 +649,20 @@ pub(crate) fn manifest_load_error(
     manifest_path: &std::path::Path,
     err: &std::io::Error,
 ) -> EnvelopeError {
-    let code = if err.kind() == std::io::ErrorKind::InvalidData {
+    EnvelopeError::new(
+        manifest_load_error_code(err),
+        crate::ui::manifest_error_message(manifest_path, err),
+    )
+}
+
+/// The code half of [`manifest_load_error`], for callers that carry a
+/// `&'static str` code (`vex`'s `VexGenError`).
+pub(crate) fn manifest_load_error_code(err: &std::io::Error) -> &'static str {
+    if err.kind() == std::io::ErrorKind::InvalidData {
         "manifest_invalid"
     } else {
         "manifest_unreadable"
-    };
-    EnvelopeError::new(code, crate::ui::manifest_error_message(manifest_path, err))
+    }
 }
 
 /// The `{code, message}` object every `--json` failure carries as its

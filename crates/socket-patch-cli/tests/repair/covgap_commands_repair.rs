@@ -181,7 +181,7 @@ fn repair_manifest_not_found_human_mode_prints_to_stderr() {
     );
 }
 
-/// Loud twin of `repair_with_invalid_manifest_emits_repair_failed_envelope`:
+/// Loud twin of `repair_with_invalid_manifest_emits_manifest_invalid_envelope`:
 /// a `repair_inner` failure (unparseable manifest) prints "Error: {e}" to
 /// STDERR in human mode and exits 1, with nothing on stdout.
 #[test]
