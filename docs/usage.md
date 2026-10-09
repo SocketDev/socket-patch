@@ -43,9 +43,12 @@ Replace the example identifiers with the advisory or package you need. `get` als
 accepts a patch UUID or an exact package name, which covers every installed version
 of that package. `remove` and `rollback` take the same names. A short name that
 names several packages (`core` for `@angular/core` and `@babel/core`) is refused:
-use the full name or a purl. `get` defaults to hosted mode; `--save-only` and
-global targeting default to agent mode instead. Hosted and vendored `get` do not
-prompt. Agent-mode searches can offer an interactive choice.
+use the full name or a purl. Near names are only suggestions, and `--ecosystems`
+scopes both `get` searches and UUID selection. See the
+[v5 targeting changes](migrating-to-v5.md#package-targeting) for target forms,
+ambiguity rules, and no-match statuses. `get` defaults to hosted mode; `--save-only`
+and global targeting default to agent mode instead. Hosted and vendored `get` do
+not prompt. Agent-mode searches can offer an interactive choice.
 
 For each package version, automatic selection prefers the highest severity among
 downloadable patches, then the most distinct advisories fixed, then the newest
@@ -228,8 +231,8 @@ The removed `setup` command is covered in the [migration guide](migrating-to-v5.
 | Command | Effect |
 | --- | --- |
 | `list` | Show agent records, vendor records, and hosted pins; an empty project succeeds |
-| `rollback [PURL\|UUID\|PATH]...` | Restore selected patches, or all patches when no target is given, and remove their local state |
-| `remove <PURL\|UUID>` | Restore and remove one patch |
+| `rollback [NAME\|PURL\|UUID\|PATH]...` | Restore selected patches, or all patches when no target is given, and remove their local state |
+| `remove <NAME\|PURL\|UUID>` | Restore and remove matching patches; a name or versionless PURL selects every recorded version |
 | `vendor --revert` | Undo vendoring from its recorded edits and remove the vendored artifacts |
 | `repair` | Restore missing agent patch data or missing/corrupt vendored artifacts using existing records, and clean unused data |
 | `scan --mode agent --prune` | Patch discovered packages and remove records for dependencies that left the project |
