@@ -131,7 +131,7 @@ class ReleaseWorkflow(unittest.TestCase):
         verdict = workflow.split("\n  ci-ok:\n")[1]
         needs = re.search(r"^    needs: \[(.*)\]$", verdict, re.M)[1].split(", ")
         self.assertIn("test-release", needs)
-        self.assertIn("if: always()", verdict)
+        self.assertIn("if: ${{ always() && (github.event_name != 'pull_request' || !cancelled()) }}", verdict)
         self.assertIn('if v["result"] not in ("success", "skipped")', verdict)
 
 
