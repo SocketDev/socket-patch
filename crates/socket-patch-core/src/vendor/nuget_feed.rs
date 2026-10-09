@@ -221,6 +221,14 @@ async fn nuget_prelude(
     let nupkg_path = project_root.join(&copy_rel);
     let source_key = crate::patch::redirect::generation::hosted_pin_name(&record.uuid);
 
+    // The nupkg must survive the commit the vendored workflow ends with: a
+    // rule ignoring the uuid dir itself can't be undone from inside it.
+    if let Some((code, detail)) =
+        super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await
+    {
+        return Err(refused(code, detail));
+    }
+
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
         return Err(done(
@@ -228,12 +236,6 @@ async fn nuget_prelude(
             None,
             Vec::new(),
         ));
-    }
-
-    // The nupkg must survive the commit the vendored workflow ends with: a
-    // rule ignoring the uuid dir itself can't be undone from inside it.
-    if let Some(refusal) = super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await {
-        return Err(refusal);
     }
 
     let config_path = existing_config_path(project_root).await;
@@ -2501,6 +2503,12 @@ mod tests {
                     tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
                     lock_before
                 );
+                // An empty patch is refused too, never a calm success.
+                let mut empty = record.clone();
+                empty.files.clear();
+                let (code, _) =
+                    unwrap_refused(run_vendor(root, &blobs, &installed, &empty, dry_run).await);
+                assert_eq!(code, "vendor_artifact_gitignored", "{rule}: empty patch");
             }
         }
     }

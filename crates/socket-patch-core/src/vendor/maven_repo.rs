@@ -562,8 +562,29 @@ pub async fn jvm_gate_preflight(
     }
     let shape = detect_shape(project_root);
     super::jvm::sbt_gate::for_shape(shape, project_root, &g, &a, &v)
-        .map(|_| ())
-        .map_err(|stop| stop.code_and_detail(purl))
+        .map_err(|stop| stop.code_and_detail(purl))?;
+    // Checked here too, so a hosted->vendored takeover keeps its pin
+    // instead of restoring upstream and then refusing (#1061).
+    match ignored_tree_root(shape, project_root).await {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// The `vendor_artifact_gitignored` refusal when git ignores a tree root
+/// `shape` writes into. Each tree root owns a `!*` `.gitignore` that
+/// re-includes file rules such as Java.gitignore's `*.jar` (#1061), but a
+/// rule ignoring the root itself (`.socket/`) can't be undone from inside.
+async fn ignored_tree_root(
+    shape: super::jvm::Shape,
+    project_root: &Path,
+) -> Option<(&'static str, String)> {
+    for tree in super::jvm::shape_trees(shape) {
+        if let Some(refusal) = super::npm_dir::ignored_root_refusal(project_root, tree).await {
+            return Some(refusal);
+        }
+    }
+    None
 }
 
 /// The committed tree bytes for `record` (jar, upstream pom, module, and
@@ -697,13 +718,8 @@ async fn jvm_prelude(
         super::jvm::sbt_gate::for_shape(shape, project_root, &group_id, &artifact_id, &version)
             .map_err(|stop| stop.into_outcome(purl))?;
     // The tree must survive the commit the vendored workflow ends with.
-    // Each tree root owns a `!*` `.gitignore` that re-includes file rules
-    // such as Java.gitignore's `*.jar` (#1061), but a rule ignoring the
-    // root itself (`.socket/`) can't be undone from inside it.
-    for tree in super::jvm::shape_trees(shape) {
-        if let Some(refusal) = super::npm_dir::ignored_root_refusal(project_root, tree).await {
-            return Err(refusal);
-        }
+    if let Some((code, detail)) = ignored_tree_root(shape, project_root).await {
+        return Err(refused(code, detail));
     }
     Ok(JvmPrelude {
         group_id,
@@ -2031,6 +2047,12 @@ mod tests {
                         crate::vendor::test_support::tree_snapshot(root),
                         before,
                         "{shape} {rule}: nothing written"
+                    );
+                    // The takeover gate refuses too, before any restore.
+                    assert_eq!(
+                        jvm_gate_preflight(root, PURL).await.map_err(|(c, _)| c),
+                        Err("vendor_artifact_gitignored"),
+                        "{shape} {rule}"
                     );
                 }
             }
