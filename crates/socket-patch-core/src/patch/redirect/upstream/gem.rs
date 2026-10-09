@@ -730,8 +730,8 @@ async fn stale_cache_warning(
         Some(sha) => Ok(sha),
         None => ctx.client.rubygems_sha256(&name, &version).await,
     };
-    let fix = "delete it and run `bundle install` (then `bundle cache` again if the \
-               project commits its cache)";
+    let fix = "delete it, then run `bundle cache` to cache the upstream gem in its place \
+               (or `bundle install` if the project does not commit its cache)";
     let detail = match (got, upstream) {
         (Some(got), Ok(want)) if got.eq_ignore_ascii_case(&want) => return None,
         (Some(_), Ok(_)) => format!(

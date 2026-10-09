@@ -3413,19 +3413,32 @@ fn unwind_names_the_patched_cached_archive(fx: &RedirectFixture, command: &str) 
         fx.bundler.version
     );
 
-    // The remedy the warning prescribes: delete the archive, and a fresh
-    // frozen checkout installs the upstream gem.
-    let fixed = checkout_with_cache(fx, &dir, &format!("cache-{command}-fixed"));
+    // The remedy the warning prescribes: delete the archive and re-cache
+    // (a frozen install with a committed cache dir reads only the cache
+    // on some bundlers), and a fresh frozen checkout installs upstream.
+    let recached = checkout_with_cache(fx, &dir, &format!("cache-{command}-recached"));
     std::fs::remove_file(
-        fixed
+        recached
             .join("vendor/cache")
             .join(format!("{DEP}-{DEP_VERSION}.gem")),
     )
     .unwrap();
+    let cache = bundle(&recached, &[cache_cmd]);
+    assert!(
+        cache.status.success(),
+        "{command}: bundle {cache_cmd} after deleting the archive:\n{}",
+        String::from_utf8_lossy(&cache.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(recached.join(fx.lock_name)).unwrap(),
+        lock,
+        "{command}: re-caching leaves the restored lock alone"
+    );
+    let fixed = checkout_with_cache(fx, &recached, &format!("cache-{command}-fixed"));
     let install = bundle_env(&fixed, &["install"], &[("BUNDLE_FROZEN", "true")]);
     assert!(
         install.status.success(),
-        "{command}: frozen install after deleting the archive:\n{}",
+        "{command}: frozen install from the re-cached checkout:\n{}",
         String::from_utf8_lossy(&install.stderr)
     );
     let lib = fresh_installed_lib(&fixed, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
