@@ -1129,9 +1129,32 @@ pub fn yarn_classic_sha1_targets<'a>(
         .map(|c| &c.dep)
         .filter(|dep| dep.ecosystem == "npm")
         .filter(|dep| dep.integrity.sha1.is_none() && dep.integrity.sha512.is_some())
-        .filter(|dep| lock.contains(crate::patch::redirect::full_name(dep).as_str()))
+        .filter(|dep| {
+            classic_locks_registry_copy(lock, &crate::patch::redirect::full_name(dep), &dep.version)
+        })
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
+}
+
+/// Whether a classic `lock` has a registry block of `name@version`: the
+/// only copy a hosted pin rewrites (a git, `file:`, `link:` or remote
+/// tarball copy is skipped by name, so it needs no served tarball). Read
+/// by the blocks' real names, as the rewriter does, so `lodash` never
+/// matches a `lodash.debounce` block.
+fn classic_locks_registry_copy(lock: &str, name: &str, version: &str) -> bool {
+    use crate::formats::yarn::blocks::{classic_field, scan_blocks};
+    use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
+    use crate::formats::yarn::source::{classic_copy_source, CopySource};
+    if !lock.contains(name) {
+        return false;
+    }
+    scan_blocks(lock).iter().any(|block| {
+        let patterns = split_key_patterns(&block.key);
+        classic_key_real_name(&patterns) == Some(name)
+            && classic_field(&block.lines, "version") == Some(version)
+            && classic_copy_source(&patterns, classic_field(&block.lines, "resolved"))
+                == CopySource::Registry
+    })
 }
 
 /// Record the sha1 derived from the served tarball at `url` on every
@@ -2845,6 +2868,30 @@ mod tests {
 
     fn reference(value: serde_json::Value) -> PackageVendorResult {
         serde_json::from_value(value).unwrap()
+    }
+
+    /// #558 review: the served tarball is fetched only for a lock that
+    /// really locks a registry copy of the package, read by block names
+    /// (`lodash` is not `lodash.debounce`) and copy source (a git or
+    /// `file:` copy is never pinned).
+    #[test]
+    fn classic_registry_copy_is_matched_by_block_name_and_source() {
+        let lock = "# yarn lockfile v1\n\n\
+                    lodash.debounce@^4.0.8:\n  version \"4.17.21\"\n  \
+                    resolved \"https://registry.yarnpkg.com/lodash.debounce/-/x.tgz#aa\"\n\n\
+                    left-pad@git+https://github.com/x/left-pad.git:\n  version \"1.3.0\"\n  \
+                    resolved \"git+https://github.com/x/left-pad.git#abc\"\n\n\
+                    is-odd@^3.0.0:\n  version \"3.0.1\"\n  \
+                    resolved \"https://registry.yarnpkg.com/is-odd/-/is-odd-3.0.1.tgz#bb\"\n";
+        assert!(!classic_locks_registry_copy(lock, "lodash", "4.17.21"));
+        assert!(!classic_locks_registry_copy(lock, "left-pad", "1.3.0"));
+        assert!(!classic_locks_registry_copy(lock, "is-odd", "3.0.0"));
+        assert!(classic_locks_registry_copy(lock, "is-odd", "3.0.1"));
+        assert!(classic_locks_registry_copy(
+            lock,
+            "lodash.debounce",
+            "4.17.21"
+        ));
     }
 
     #[test]
