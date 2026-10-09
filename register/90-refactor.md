@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T11:20Z · main @ a80b89e_
+_Last updated 2026-10-09T12:45Z · main @ a80b89e_
 
 **In flight:**
+- [#1264](https://github.com/SocketDev/socket-patch/pull/1264): Gradle (vendored + hosted) and the Maven reactor pick inserted-line terminators through `line_endings::terminator`; `gradle/eol.rs` deleted (`eol_eq` and `respell` in `line_endings`). #815 slice 3 (E16). +67/−97 prod, +67/−37 tests. `state: ready`.
 - [#1262](https://github.com/SocketDev/socket-patch/pull/1262): the OpenVEX document is written through `utils::fs::write_user_output` (stage + rename, mode kept, links written through, devices/FIFOs in place, never captured). #1144 (C77). +34/−1 prod, +148 tests. `state: ready`.
 - [#1258](https://github.com/SocketDev/socket-patch/pull/1258): 40 more CLI test files import `tests/common`'s `binary()` / `git_sha256` (31 + 25 copies deleted). #824 children 2–3 slice 2 (C30). +142/−401 tests, 0 prod. `state: ready`.
 - [#1253](https://github.com/SocketDev/socket-patch/pull/1253): agent-mode `jvm_jar::verify_member_bytes` streams members through `hash::git_sha256::zip_member_git_sha256` (302 → 30 MiB peak on a 256 MiB member). #914 slice (C51); `vendor/common.rs` caller is free since #1227 merged; it needs #1253's helper. +17/−11 prod, +85 tests. `state: ready`.
@@ -17,15 +18,16 @@ _Last updated 2026-10-09T11:20Z · main @ a80b89e_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #989 item 1: one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | **taken: #1245**; bun ×2 (#1009), npm (#1161, #1187), vlt (#1161), pypi (#1026), yarn classic (#1242) and berry remain |
+| 1 | #815 slice 3 (E16): Gradle first-line rule + `maven_reactor.rs` ×2 through `line_endings::terminator` | 0 | 1 | ≈4 | L | ≈10 | **taken: #1264**; hosted Gemfile in `redirect/mod.rs` remains |
 | 2 | #931 + #998 + #1063 + #1123: one manifest load + error mapper for every command | 4 | 1 | ≈6 | M | ≈24 | skipped: `apply.rs`, `vendor.rs` (#1009, #1049), `rollback.rs`, `remove.rs` (#1034, #1049), `repair.rs` (#1049) |
-| 3 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1009, #1026, #1180, #1242, #1254, #1259) |
-| 4 | #1220 (C78): bound upstream-restore fan-out through `utils::concurrent::registry_concurrency` | 1 | 0 | ≈4 | L | ≈11 | skipped: `join_all` sites in upstream `cargo.rs` (#1254, #1259), `pypi.rs` (#1188), `composer.rs` (#1026), `npm.rs` (#1009) |
-| 5 | #1144 (C77): VEX document through the shared stage + rename writer | 1 | 0 | 1 | L | ≈5 | **taken: #1262** |
+| 3 | #705 (C18): one `utils::uuid` grammar | 0 | 0 | ≈5 | L | ≈10 | skipped: `cli/lib.rs` (#1034), `api/client.rs` (#1026, #1034, #1049), core `apply.rs` (#1049) |
+| 4 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1009, #1026, #1180, #1242, #1254, #1259) |
+| 5 | #823 (C47): last 5 free `scrub_socket_env` copies onto `hermetic::command` | 0 | 0 | ≈5 | L | ≈10 | skipped: `spawn_env_hygiene.rs` (#1049) |
 
-Re-ranked 2026-10-09T11:00Z at `a80b89e` against 30 open PRs (131 production files changed). Also skipped by file overlap: #1114/E91 (`vendor/pypi.rs` #1026, `lock_inventory/tests.rs`), #1129/E92 (`npm_crawler.rs` #1009), #1098/E90 (`ecosystem_dispatch.rs`, `vex_consumed.rs`), E12 (`pnpm_lock.rs` #1245) and the earlier #675/#705/#794/#594/#757/#782 set. Free but low: #905 slice 4 (`npmrc.rs`, `pypi_other.rs`; `pnpm/lines.rs` entry is stale), E37 composer `normalize_version`, E16 `maven_reactor.rs`, C17 digests in `vendor/jvm/mod.rs`, `redownload.rs`, `yarn_berry_lock.rs`.
+Re-ranked 2026-10-09T12:00Z at `a80b89e` against 32 open PRs (131 production files changed). #989's remaining backends, #1220 and #675 (`scan/mod.rs` #1211, #1049) stay skipped. Also skipped by file overlap: #1114/E91 (`vendor/pypi.rs` #1026, `lock_inventory/tests.rs`), #1129/E92 (`npm_crawler.rs` #1009), #1098/E90 (`ecosystem_dispatch.rs`, `vex_consumed.rs`), E12 (`pnpm_lock.rs` #1245) and the earlier #675/#705/#794/#594/#757/#782 set. Free but low: #905 slice 4 (`npmrc.rs`, `pypi_other.rs`; `pnpm/lines.rs` entry is stale), E37 composer `normalize_version`, E16 `maven_reactor.rs`, C17 digests in `vendor/jvm/mod.rs`, `redownload.rs`, `yarn_berry_lock.rs`.
 
 **Notes:**
+- Gradle line endings (#1264): `gradle::eol` is gone; Gradle writers insert with `line_endings::terminator` and find what they wrote with `line_endings::respell(text, terminator(current))`, compare owned files with `line_endings::eol_eq`. Keep forward and revert on the same rule.
 - User-named output paths (`--output`, `--vex <path>`) go through `utils::fs::write_user_output` since #1262; do not stage-and-rename over `/dev/stdout` or a FIFO with the commit-point writers. `RLIMIT_FSIZE` + ignored `SIGXFSZ` in a `pre_exec` gives a root-proof part-way write failure for red→green tests.
 - Revert finish (#1245): new backends end their revert with `revert::finish(outcome, root, rel, opts, KeepPolicy::…)`; the npm family keeps its bare `cannot remove <rel>` failure (warnings dropped), the rest keep warnings with `failed to remove <abs>`. Yarn berry/classic and npm add a still-wired refusal before the delete: extend the policy, do not re-copy the sequence.
 - `bench.yml` gates +10% per scenario: time a per-dep reader (hosted converge) in release against `main` before pushing.
