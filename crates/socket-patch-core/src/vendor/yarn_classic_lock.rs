@@ -120,12 +120,14 @@ impl NpmLockBackend for YarnClassicBackend {
 
         // ── 3. Find the rewritable blocks (pre-flight, BEFORE staging) ────
         let blocks = scan_blocks_shared(&text);
+        let other_name =
+            other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version).await;
         let (candidate_keys, skipped) =
-            rewritable_candidates(&blocks, &coords.name, &coords.version)?;
+            rewritable_candidates(&blocks, &coords.name, &coords.version).map_err(|o| {
+                only_other_name_copies(o, &coords.name, &coords.version, &other_name)
+            })?;
         warnings.extend(skipped);
-        warnings.extend(
-            other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version).await,
-        );
+        warnings.extend(other_name);
         Ok(YarnClassicPlan {
             text,
             candidate_keys,
@@ -402,6 +404,34 @@ async fn other_name_copy_warnings(
     out
 }
 
+/// A `vendor_lock_entry_not_found` refusal of a package whose only copies
+/// are locked under ANOTHER dependency name ([`other_name_copy_warnings`])
+/// becomes `vendor_lock_entry_not_rewritable` naming them: the package IS
+/// installed, and `yarn install` can't re-lock those copies to it (#1236).
+/// Any other refusal passes through.
+fn only_other_name_copies(
+    refusal: Box<VendorOutcome>,
+    name: &str,
+    version: &str,
+    other_name: &[VendorWarning],
+) -> Box<VendorOutcome> {
+    if other_name.is_empty()
+        || super::npm_common::refusal_code(&refusal) != "vendor_lock_entry_not_found"
+    {
+        return refusal;
+    }
+    let details: Vec<&str> = other_name.iter().map(|w| w.detail.as_str()).collect();
+    Box::new(refused(
+        "vendor_lock_entry_not_rewritable",
+        format!(
+            "every {YARN_LOCK} block for {name}@{version} is a copy locked under another \
+             dependency name, which vendoring can't rewire — those copies stay UNPATCHED and \
+             `yarn install` will not help: {}",
+            details.join("; ")
+        ),
+    ))
+}
+
 /// The lock as [`vendor_yarn_classic`]'s step 2 leaves it: read, re-sniffed
 /// and scanned into blocks. Read once for the vendor loop's download plan
 /// ([`preflight_packages`]); the loop itself runs the same steps inline,
@@ -432,16 +462,33 @@ pub(crate) async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Result<(), &'static str>> {
-    super::npm_common::gate_packages(
-        read_project(project_root).await,
-        packages,
-        |project, coords| {
-            let (name, version) = (coords.name.as_str(), coords.version.as_str());
-            rewritable_candidates(&project.blocks, name, version)
-                .map(drop)
-                .map_err(|o| super::npm_common::refusal_code(&o))
-        },
-    )
+    let project = read_project(project_root).await;
+    let blocks = project.as_ref().ok().map(|p| Arc::clone(&p.blocks));
+    let mut gated = super::npm_common::gate_packages(project, packages, |project, coords| {
+        let (name, version) = (coords.name.as_str(), coords.version.as_str());
+        rewritable_candidates(&project.blocks, name, version)
+            .map(drop)
+            .map_err(|o| super::npm_common::refusal_code(&o))
+    });
+    // The loop's step 3 turns "not found" into "not rewritable" when the
+    // package's only copies are locked under another name; so does the plan.
+    if let Some(blocks) = blocks {
+        for ((purl, record), gate) in packages.iter().zip(gated.iter_mut()) {
+            if *gate != Err("vendor_lock_entry_not_found") {
+                continue;
+            }
+            let Ok(coords) = super::npm_common::guard_coordinates(purl, record) else {
+                continue;
+            };
+            if !other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version)
+                .await
+                .is_empty()
+            {
+                *gate = Err("vendor_lock_entry_not_rewritable");
+            }
+        }
+    }
+    gated
 }
 
 /// Undo one yarn-classic vendored package: restore the recorded lock blocks
@@ -1678,6 +1725,41 @@ left-pad@^1.3.0:
             assert_eq!(url.len(), 1, "{fork}: {warnings:?}");
             let text = fx.lock_text().await;
             assert!(text.contains("\"lp2@file:./lpdir\":\n  version \"1.3.0\""));
+        }
+    }
+
+    /// #1236 (review): when left-pad@1.3.0 is locked ONLY under another
+    /// dependency name, vendoring refuses `vendor_lock_entry_not_rewritable`
+    /// naming that copy, in the loop and in the download plan alike, not
+    /// `vendor_lock_entry_not_found` with a `yarn install` remedy that
+    /// can't help. Control: a directory holding another package is still
+    /// "not found".
+    #[tokio::test]
+    async fn issue_1236_only_other_name_copies_are_refused_as_not_rewritable() {
+        let lock = "# yarn lockfile v1\n\n\n\"lp2@file:./lpdir\":\n  version \"1.3.0\"\n";
+        for (fork, code) in [
+            ("left-pad", "vendor_lock_entry_not_rewritable"),
+            ("other-pkg", "vendor_lock_entry_not_found"),
+        ] {
+            let fx = fixture_with_lock(lock).await;
+            tokio::fs::create_dir_all(fx.root().join("lpdir"))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                fx.root().join("lpdir/package.json"),
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            )
+            .await
+            .unwrap();
+            let detail = expect_refused(fx.vendor(false).await, code);
+            if fork == "left-pad" {
+                assert!(detail.contains("lp2@file:./lpdir"), "{detail}");
+                assert!(detail.contains("yarn install` will not help"), "{detail}");
+            }
+            assert_eq!(fx.lock_text().await, lock);
+            let pre =
+                preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+            assert_eq!(pre, vec![Err(code)], "{fork}");
         }
     }
 
