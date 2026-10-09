@@ -6,6 +6,8 @@
 //! itself works on the lock's `split_inclusive('\n')` lines, which the
 //! model's line numbers index.
 
+use std::borrow::Cow;
+
 use regex::Regex;
 use serde_json::Value;
 
@@ -23,12 +25,12 @@ fn gem_lock_line_content(line: &str) -> &str {
 /// identifier sorts after `index_url`, else after the last one. The section
 /// moves whole, its lines keeping their own endings. Returns false (nothing
 /// touched) when it already sits there.
-fn place_gem_section_sorted(
-    lines: &mut Vec<String>,
+fn place_gem_section_sorted<'a>(
+    lines: &mut Vec<Cow<'a, str>>,
     sections: &[&Section<'_>],
     sec_idx: usize,
     index_url: &str,
-    eol: &str,
+    eol: &'a str,
 ) -> bool {
     let others = || (0..sections.len()).filter(|&k| k != sec_idx);
     let before = others().find(|&k| sections[k].identifier().as_str() > index_url);
@@ -37,16 +39,16 @@ fn place_gem_section_sorted(
     }
     let range = sections[sec_idx].lines();
     let (start, end) = (range.start, range.end);
-    let mut block: Vec<String> = lines.drain(start..end).collect();
+    let mut block: Vec<Cow<'a, str>> = lines.drain(start..end).collect();
     let n = block.len();
     // The moved section needs its own blank separator (and a final newline
     // if it was the file's last line).
     if let Some(last) = block.last_mut() {
         if !last.ends_with('\n') {
-            last.push_str(eol);
+            last.to_mut().push_str(eol);
         }
         if !gem_lock_line_content(last).is_empty() {
-            block.push(eol.to_string());
+            block.push(Cow::Borrowed(eol));
         }
     }
     let shifted = |at: usize| if at > start { at - n } else { at };
@@ -96,7 +98,8 @@ pub(crate) fn converge_gem_lock_source(
     result: &mut RewriteResult,
 ) -> bool {
     let eol = crate::utils::line_endings::terminator(lk);
-    let mut lines: Vec<String> = lk.split_inclusive('\n').map(str::to_string).collect();
+    // Borrowed until edited: most of a large lock's lines are only moved.
+    let mut lines: Vec<Cow<'_, str>> = lk.split_inclusive('\n').map(Cow::Borrowed).collect();
     // Locate: GEM sections, the dep's 4-space spec entry, DEPENDENCIES.
     let model = super::parse(lk);
     let sections: Vec<&Section<'_>> = model.gem_sections().collect();
@@ -148,7 +151,7 @@ pub(crate) fn converge_gem_lock_source(
         Some(k) => {
             let old = gem_lock_line_content(&lines[k]).trim_start().to_string();
             let ending = lines[k][gem_lock_line_content(&lines[k]).len()..].to_string();
-            lines[k] = format!("{target}{ending}");
+            lines[k] = Cow::Owned(format!("{target}{ending}"));
             result.edits.push(FileEdit {
                 path: lock_name.into(),
                 kind: "redirect_gemfile_lock_dependency_pin".into(),
@@ -175,7 +178,7 @@ pub(crate) fn converge_gem_lock_source(
                 .chain(separator)
                 .min()
                 .unwrap_or(deps_end);
-            lines.insert(at, format!("{target}{eol}"));
+            lines.insert(at, Cow::Owned(format!("{target}{eol}")));
             result.edits.push(FileEdit {
                 path: lock_name.into(),
                 kind: "redirect_gemfile_lock_dependency_pin".into(),
@@ -194,7 +197,7 @@ pub(crate) fn converge_gem_lock_source(
         if remote_url != index_url {
             let ending =
                 lines[remote_idx][gem_lock_line_content(&lines[remote_idx]).len()..].to_string();
-            lines[remote_idx] = format!("  remote: {index_url}{ending}");
+            lines[remote_idx] = Cow::Owned(format!("  remote: {index_url}{ending}"));
             result.edits.push(FileEdit {
                 path: lock_name.into(),
                 kind: "redirect_gemfile_lock_source_url".into(),
@@ -242,7 +245,7 @@ pub(crate) fn converge_gem_lock_source(
         {
             last += 1;
         }
-        let moved: Vec<String> = lines.drain(spec_idx..=last).collect();
+        let moved: Vec<Cow<'_, str>> = lines.drain(spec_idx..=last).collect();
         let n = moved.len();
         // Section bounds after the drain (every drained line sat inside
         // section `sec_idx`, which keeps its start).
@@ -258,20 +261,20 @@ pub(crate) fn converge_gem_lock_source(
             .find(|&k| sections[k].identifier().as_str() > index_url)
             .map(|k| bounds(k).0)
             .unwrap_or_else(|| bounds(sections.len() - 1).1);
-        let mut block: Vec<String> = Vec::with_capacity(moved.len() + 4);
-        block.push(format!("GEM{eol}"));
-        block.push(format!("  remote: {index_url}{eol}"));
-        block.push(format!("  specs:{eol}"));
+        let mut block: Vec<Cow<'_, str>> = Vec::with_capacity(moved.len() + 4);
+        block.push(Cow::Owned(format!("GEM{eol}")));
+        block.push(Cow::Owned(format!("  remote: {index_url}{eol}")));
+        block.push(Cow::Owned(format!("  specs:{eol}")));
         for line in moved {
             // Moved lines keep their own bytes; only a final line that lacked
             // a newline (EOF) gains the file's ending.
             if line.ends_with('\n') {
                 block.push(line);
             } else {
-                block.push(format!("{line}{eol}"));
+                block.push(Cow::Owned(format!("{line}{eol}")));
             }
         }
-        block.push(eol.to_string());
+        block.push(Cow::Borrowed(eol));
         lines.splice(insert_at..insert_at, block);
         result.edits.push(FileEdit {
             path: lock_name.into(),
@@ -285,7 +288,9 @@ pub(crate) fn converge_gem_lock_source(
     }
 
     if changed {
-        *lk = lines.concat();
+        let text = lines.concat();
+        drop(lines);
+        *lk = text;
         *lock_changed = true;
     }
     true

@@ -24,6 +24,7 @@ pub(crate) mod manifest;
 pub(crate) mod mirror;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::utils::digest::sha256_hex;
 use crate::utils::purl::simple_purl;
@@ -67,6 +68,9 @@ const BUNDLER_HEADERS: [&str; 9] = [
 
 /// Git merge-conflict markers (bundler refuses a lock carrying them).
 const CONFLICT_MARKERS: [&str; 4] = ["<<<<<<<", "=======", ">>>>>>>", "|||||||"];
+
+/// `CHECKSUMS` digests by gem name, then by parenthesized token.
+type ChecksumMap = HashMap<String, Vec<(String, Option<String>)>>;
 
 /// A parsed `name (version[-platform])` spec entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,10 +157,17 @@ pub(crate) struct GemfileLock<'t> {
     pub(crate) sections: Vec<Section<'t>>,
     /// The (last) `DEPENDENCIES` section; `None` when the lock has none.
     pub(crate) dependencies: Option<Dependencies<'t>>,
-    /// `None` when the lock has no `CHECKSUMS` section (bundler < 2.6).
-    /// Keyed by `(name, parenthesized token)`; the value is the entry's
-    /// lowercase sha256, or `None` for a bare / malformed / conflicting one.
-    pub(crate) checksums: Option<HashMap<(&'t str, &'t str), Option<String>>>,
+    /// The `CHECKSUMS` section's 2-space entries, trimmed; `None` when the
+    /// lock has no `CHECKSUMS` section (bundler < 2.6). Their digests are
+    /// read only when a reader asks for one ([`Self::checksum`]): the
+    /// hosted lock writer parses the lock once per converged gem and never
+    /// does, and validating every digest dominates the parse.
+    checksum_entries: Option<Vec<&'t str>>,
+    /// [`Self::checksum_entries`] by name, then parenthesized token; the
+    /// value is the entry's lowercase sha256, or `None` for a bare /
+    /// malformed / conflicting one. Built on first use, with owned keys so
+    /// the lock stays covariant in `'t`.
+    checksums: OnceLock<ChecksumMap>,
     /// `DEPENDENCIES` entries bundler marks source-pinned (`name …!`).
     pub(crate) pinned: BTreeSet<&'t str>,
     /// Every `DEPENDENCIES` entry: the gems bundler treats as DIRECT
@@ -202,7 +213,30 @@ impl<'t> GemfileLock<'t> {
     /// The sha256 `CHECKSUMS` pins `name (token)`, if the lock records a
     /// valid, unambiguous one.
     pub(crate) fn checksum(&self, name: &'t str, token: &'t str) -> Option<&str> {
-        self.checksums.as_ref()?.get(&(name, token))?.as_deref()
+        let entries = self.checksum_entries.as_ref()?;
+        let checksums = self.checksums.get_or_init(|| {
+            let mut map = ChecksumMap::new();
+            for ((name, token), sha) in entries.iter().filter_map(|entry| parse_checksum(entry)) {
+                let tokens = map.entry(name.to_string()).or_default();
+                match tokens.iter_mut().find(|(t, _)| t == token) {
+                    Some((_, prev)) if *prev != sha => *prev = None,
+                    Some(_) => {}
+                    None => tokens.push((token.to_string(), sha)),
+                }
+            }
+            map
+        });
+        checksums
+            .get(name)?
+            .iter()
+            .find(|(t, _)| t == token)?
+            .1
+            .as_deref()
+    }
+
+    /// Whether the lock has a `CHECKSUMS` section (bundler >= 2.6).
+    pub(crate) fn has_checksums(&self) -> bool {
+        self.checksum_entries.is_some()
     }
 
     /// [`Self::checksum`] as the lock pin readers record: the valid sha256
@@ -277,7 +311,7 @@ pub(crate) fn gem_download_url(base: &str, name: &str, version: &str) -> Option<
 /// Parse a Bundler lock (see the module docs).
 pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
     let mut sections: Vec<Section<'_>> = Vec::new();
-    let mut checksums: Option<HashMap<(&str, &str), Option<String>>> = None;
+    let mut checksum_entries: Option<Vec<&str>> = None;
     let mut problems: Vec<String> = Vec::new();
     let mut current: Option<usize> = None;
     let mut in_specs = false;
@@ -324,8 +358,8 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
             in_specs = false;
             in_checksums = header == "CHECKSUMS";
             in_dependencies = header == "DEPENDENCIES";
-            if in_checksums && checksums.is_none() {
-                checksums = Some(HashMap::new());
+            if in_checksums && checksum_entries.is_none() {
+                checksum_entries = Some(Vec::new());
             }
             if in_dependencies {
                 dependencies = Some(Dependencies {
@@ -390,14 +424,8 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
                 }
             }
         } else if in_checksums && indent == 2 {
-            if let (Some(map), Some((key, sha))) = (checksums.as_mut(), parse_checksum(trimmed)) {
-                map.entry(key)
-                    .and_modify(|prev| {
-                        if *prev != sha {
-                            *prev = None;
-                        }
-                    })
-                    .or_insert(sha);
+            if let Some(entries) = checksum_entries.as_mut() {
+                entries.push(trimmed);
             }
         }
     }
@@ -415,7 +443,8 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
     GemfileLock {
         sections,
         dependencies,
-        checksums,
+        checksum_entries,
+        checksums: OnceLock::new(),
         pinned,
         direct,
         problems,
