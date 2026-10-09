@@ -157,7 +157,16 @@ EOF
 echo 'fn main() {{}}' > src/main.rs
 
 # cargo fetch populates $CARGO_HOME/registry/src/<index>/cfg-if-1.0.0/.
-cargo fetch > /tmp/fetch.log 2>&1 || {{ cat /tmp/fetch.log >&2; exit 1; }}
+# cfg-if arrives over the real network (static.crates.io). Cargo's own
+# spurious-network retries span only seconds, which a runner's
+# connect timeouts outlast, so retry with backoff before declaring the
+# fixture broken (as docker_e2e_composer does for packagist).
+for attempt in 1 2 3; do
+  cargo fetch > /tmp/fetch.log 2>&1 && break
+  if [ "$attempt" = 3 ]; then cat /tmp/fetch.log >&2; exit 1; fi
+  echo "cargo fetch attempt $attempt failed; retrying" >&2
+  sleep $((attempt * 10))
+done
 
 LIB_RS=$(ls "$CARGO_HOME/registry/src/"*/cfg-if-1.0.0/src/lib.rs 2>/dev/null | head -1)
 [ -f "$LIB_RS" ] || {{ echo "FAIL: cfg-if lib.rs not in registry/src" >&2; exit 1; }}
