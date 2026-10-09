@@ -76,7 +76,7 @@ _Last updated 2026-10-09T15:55Z · main @ 31383f5_
 | C77 | 3 | The VEX document was written with `tokio::fs::write`, not stage + rename. | new finding | #1144 | fixed (#1262) |
 | C78 | 3 | The hosted upstream restore sends every public-registry lookup at once (`join_all` in 5 formats); `utils::concurrent::registry_concurrency()` (cap 4, fd-tight 1) has no caller: 40 pins → 40 in flight. | new finding | #1220 | filed #1220 |
 | C79 | 3 | GC is reported in four `--json` shapes (repair, remove, rollback, `scan --prune`); the contract's `summary.bytesFreed`/`bytesDownloaded` and `events[].bytes` are emitted by no command, so its GC jq recipe prints `null`. | new finding | #1257 | in PR #1273 |
-| C80 | 2 | `utils::target` matches versionless purls and names case-insensitively in every ecosystem but versioned purls through case-preserving `PurlKey`, and its ambiguity guard lowercases identities: `remove pkg:npm/jsonstream` or `remove jsonstream` also removes `JSONStream`'s patch (Go `Sirupsen`/`sirupsen` likewise). | new finding | #1292 | filed #1292 |
+| C80 | 2 | `utils::target` matches versionless purls and names case-insensitively in every ecosystem but versioned purls through case-preserving `PurlKey`, and its ambiguity guard lowercases identities: `remove pkg:npm/jsonstream` or `remove jsonstream` also removes `JSONStream`'s patch (Go `Sirupsen`/`sirupsen` likewise). | new finding | #1292 | in PR #1294 |
 
 **Handed off** (to the CI janitor): coverage de-instrumentation, the LTO `docker-base` build, a reusable compat workflow, per-leg compiles and dead CI path filters (review 8.2, 8.5 B/C/E).
 
