@@ -251,6 +251,17 @@ enum HostedDriver {
     GetUuid,
 }
 
+/// The project the fixture installs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Layout {
+    /// One manifest depending on `left-pad@1.3.0`.
+    Single,
+    /// #1271: a yarn workspace whose member `a` declares `"left-pad": ""`
+    /// (an empty range, the same as `*`) and member `b` `"^1.3.0"`, so yarn
+    /// locks both under one `left-pad@, left-pad@^1.3.0:` block.
+    EmptyRangeWorkspace,
+}
+
 /// Where the fixture configures `yarn-offline-mirror`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mirror {
@@ -278,6 +289,7 @@ async fn classic_hosted_project(
     tamper_served_tarball: bool,
     mirror: Mirror,
     driver: HostedDriver,
+    layout: Layout,
 ) -> Option<ClassicRedirectFixture> {
     let offline_mirror = mirror != Mirror::None;
     if !require_yarn_classic(&format!("e2e_redirect_yarn_classic_build ({tag})"), |c| {
@@ -288,13 +300,32 @@ async fn classic_hosted_project(
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("package.json"),
-        format!(
-            r#"{{"name":"redirect-classic-capstone","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
-        ),
-    )
-    .unwrap();
+    match layout {
+        Layout::Single => std::fs::write(
+            proj.join("package.json"),
+            format!(
+                r#"{{"name":"redirect-classic-capstone","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+            ),
+        )
+        .unwrap(),
+        Layout::EmptyRangeWorkspace => {
+            std::fs::write(
+                proj.join("package.json"),
+                r#"{"name":"redirect-classic-capstone","version":"0.0.0","private":true,"workspaces":["a","b"]}"#,
+            )
+            .unwrap();
+            for (member, range) in [("a", ""), ("b", "^1.3.0")] {
+                std::fs::create_dir_all(proj.join(member)).unwrap();
+                std::fs::write(
+                    proj.join(member).join("package.json"),
+                    format!(
+                        r#"{{"name":"{member}","version":"1.0.0","dependencies":{{"{DEP}":"{range}"}}}}"#
+                    ),
+                )
+                .unwrap();
+            }
+        }
+    }
     let mirror_dir = proj.join("mirror");
     let mirror_dir = mirror_dir.to_str().unwrap();
     // Where yarn reads the mirror from; the env leg sets it for yarn AND
@@ -356,6 +387,12 @@ async fn classic_hosted_project(
         lock_pristine.contains("# yarn lockfile v1"),
         "fixture must be a yarn classic v1 lock:\n{lock_pristine}"
     );
+    if layout == Layout::EmptyRangeWorkspace {
+        assert!(
+            lock_pristine.contains(&format!("\n{DEP}@, {DEP}@^1.3.0:\n")),
+            "yarn must merge the empty range into one block:\n{lock_pristine}"
+        );
+    }
 
     // 2. Patched tarball + the exact hashes classic will verify at install.
     let tgz_path = tmp.path().join(format!("{DEP}-{DEP_VERSION}.tgz"));
@@ -588,6 +625,14 @@ fn fresh_checkout_yarn_install(fx: &ClassicRedirectFixture) -> (PathBuf, Output)
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(fx.proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
+    // Workspace members' manifests (Layout::EmptyRangeWorkspace).
+    for member in ["a", "b"] {
+        let manifest = fx.proj.join(member).join("package.json");
+        if manifest.is_file() {
+            std::fs::create_dir_all(fresh.join(member)).unwrap();
+            std::fs::copy(manifest, fresh.join(member).join("package.json")).unwrap();
+        }
+    }
     // v5 hosted mode writes nothing under `.socket/`; carry it when present.
     if fx.proj.join(".socket").is_dir() {
         copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
@@ -770,7 +815,14 @@ fn hosted_dev_resave_vex(fx: &ClassicRedirectFixture) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
-    let Some(fx) = classic_hosted_project("main", false, Mirror::None, HostedDriver::Scan).await
+    let Some(fx) = classic_hosted_project(
+        "main",
+        false,
+        Mirror::None,
+        HostedDriver::Scan,
+        Layout::Single,
+    )
+    .await
     else {
         return;
     };
@@ -799,6 +851,41 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
     tokio::task::block_in_place(|| hosted_dev_resave_vex(&fx));
 }
 
+/// #1271: yarn 1 locks a member's `"left-pad": ""` (an empty range) under
+/// one `left-pad@, left-pad@^1.3.0:` block with the other member's range.
+/// That block is the installed registry copy: the hosted scan pins it (the
+/// fixture asserts one redirect and the lock pin), and a fresh checkout
+/// installs the patched bytes for both members.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_empty_range_workspace_key_is_pinned() {
+    let Some(fx) = classic_hosted_project(
+        "empty-range",
+        false,
+        Mirror::None,
+        HostedDriver::Scan,
+        Layout::EmptyRangeWorkspace,
+    )
+    .await
+    else {
+        return;
+    };
+    let lock = std::fs::read_to_string(fx.proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("\n{DEP}@, {DEP}@^1.3.0:\n")),
+        "the pin keeps the key line:\n{lock}"
+    );
+    let (fresh, ci) = fresh_checkout_yarn_install(&fx);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout install must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert_eq!(installed, fx.patched, "both members load the patched bytes");
+}
+
 /// get-driven hosted twin (v4.0): `get <uuid> --mode hosted --json --yes`
 /// routes through the SAME hosted engine as `scan --mode hosted`, so the
 /// classic chain must hold unchanged — the fixture's lock pin (hosted URL +
@@ -810,8 +897,14 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_get_uuid_hosted_fresh_checkout_installs() {
-    let Some(fx) =
-        classic_hosted_project("get-uuid", false, Mirror::None, HostedDriver::GetUuid).await
+    let Some(fx) = classic_hosted_project(
+        "get-uuid",
+        false,
+        Mirror::None,
+        HostedDriver::GetUuid,
+        Layout::Single,
+    )
+    .await
     else {
         return;
     };
@@ -844,7 +937,14 @@ async fn classic_get_uuid_hosted_fresh_checkout_installs() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_tampered_hosted_tarball_fails_integrity() {
-    let Some(fx) = classic_hosted_project("tampered", true, Mirror::None, HostedDriver::Scan).await
+    let Some(fx) = classic_hosted_project(
+        "tampered",
+        true,
+        Mirror::None,
+        HostedDriver::Scan,
+        Layout::Single,
+    )
+    .await
     else {
         return;
     };
@@ -891,6 +991,7 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
         false,
         Mirror::ProjectRc,
         HostedDriver::Scan,
+        Layout::Single,
     )
     .await
     else {
@@ -972,7 +1073,9 @@ async fn classic_offline_mirror_outside_project_rc_refuses_hosted() {
         ("offline-mirror-parent", Mirror::ParentRc),
         ("offline-mirror-env", Mirror::Env),
     ] {
-        let Some(fx) = classic_hosted_project(tag, false, mirror, HostedDriver::Scan).await else {
+        let Some(fx) =
+            classic_hosted_project(tag, false, mirror, HostedDriver::Scan, Layout::Single).await
+        else {
             continue;
         };
         assert!(
