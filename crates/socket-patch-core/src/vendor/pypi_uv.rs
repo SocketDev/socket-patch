@@ -32,6 +32,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 // the first opens.
 use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::terminator;
 use crate::utils::python_lock::preserve_line_endings;
 
 use super::common::{
@@ -940,7 +941,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                     // A created [manifest] section was inserted with a blank
                     // separator line; a created overrides key is one line.
                     // Both were terminated with the lock's own newline.
-                    let nl = newline_of(&lock_text);
+                    let nl = terminator(&lock_text);
                     let removed = if new.starts_with("[manifest]") {
                         remove_substring(&lock_text, &format!("{new}{nl}{nl}"))
                     } else {
@@ -1319,7 +1320,7 @@ fn revert_array_elements(
     if !changed {
         return ArrayRevert::Converged;
     }
-    let nl = newline_of(lock_text);
+    let nl = terminator(lock_text);
     let rendered = match live.len() {
         0 => "[]".to_string(),
         1 => format!("[{}]", live[0]),
@@ -1427,18 +1428,6 @@ fn locate_lock_array(
 /// any write (uv itself writes through a link; the atomic rename would
 /// replace it) and re-verified against the pre-flight snapshot.
 const UV_PAIR: [&str; 2] = ["pyproject.toml", "uv.lock"];
-
-/// The lock's line terminator. uv writes LF, but git autocrlf on Windows
-/// hands us a CRLF file; every fragment we splice, append or remove must be
-/// built with the file's own terminator or the lock comes back with mixed
-/// endings and revert's exact-text removals miss.
-fn newline_of(text: &str) -> &'static str {
-    if text.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
 
 /// Whether a header for this `[tool.uv…]` table would be socket-patch's own
 /// bytes once a key is added: the table is absent, or exists only
@@ -1559,7 +1548,7 @@ fn rewrite_target_package_unit(
     wheel_sha256_hex: &str,
     metadata_block: Option<&str>,
 ) -> Result<(String, String), (&'static str, String)> {
-    let nl = newline_of(lock_text);
+    let nl = terminator(lock_text);
     let span = find_unit_span(lock_text, |lines| unit_has_name(lines, canon)).ok_or_else(|| {
         (
             "pypi_uv_lock_package_missing",
@@ -1923,7 +1912,7 @@ fn add_manifest_override(
     let element = format!("{{ name = \"{canon}\", path = \"{rel_wheel}\" }}");
     // Every created/spliced fragment is built with the lock's own terminator
     // (revert removes `{new}{nl}` / `{new}{nl}{nl}` with the same detection).
-    let nl = newline_of(lock_text);
+    let nl = terminator(lock_text);
     let index = line_index(lock_text);
     let manifest_line = index.iter().position(|(_, l)| l.trim_end() == "[manifest]");
 
@@ -5807,6 +5796,29 @@ wheels = [
             add_manifest_override("version = 1\nrevision = 3\n", "six", REL_WHEEL).unwrap_err();
         assert_eq!(err.0, "pypi_uv_lock_parse_failed");
         assert!(err.1.contains("no [[package]] entries"), "{}", err.1);
+    }
+
+    /// A created `[manifest]` section is spelled in the lock's
+    /// `line_endings::terminator` style: the majority of a mixed lock's
+    /// breaks, LF on a tie.
+    #[test]
+    fn manifest_override_section_takes_the_majority_terminator() {
+        for (lock, nl) in [
+            (
+                "version = 1\r\nrevision = 3\n\n[[package]]\nname = \"proj\"\n",
+                "\n",
+            ),
+            (
+                "version = 1\r\nrevision = 3\n\n[[package]]\r\nname = \"proj\"\r\n",
+                "\r\n",
+            ),
+        ] {
+            let (_, text) = add_manifest_override(lock, "six", REL_WHEEL).unwrap();
+            let section = format!(
+                "[manifest]{nl}overrides = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]{nl}{nl}"
+            );
+            assert!(text.contains(&section), "{lock:?} -> {text:?}");
+        }
     }
 
     /// A truncated (unbalanced) existing `[manifest] overrides` array refuses

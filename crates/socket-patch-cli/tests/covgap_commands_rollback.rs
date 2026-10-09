@@ -2090,6 +2090,103 @@ fn bun_lock_pin_restores_to_the_registry_tuple() {
     assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
 }
 
+/// #764: Bun's hoisted linker keeps an installed copy whose lock entry
+/// returns to the registry record (a plain `bun install` reports "no
+/// changes"), so a rollback over a hoisted `node_modules/left-pad` warns
+/// `redirect_bun_reinstall_required` and names `bun install --force`, in
+/// the JSON `warnings[]` and on stderr. An isolated install (the copy a
+/// link into `node_modules/.bun/`) relinks, so it stays silent.
+#[test]
+fn bun_lock_rollback_warns_that_a_hoisted_copy_is_kept() {
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
+    let project = |installed: bool| {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("bun.lock"),
+            bun_lock(&bun_redirected_line()),
+        )
+        .unwrap();
+        if installed {
+            let pkg = tmp.path().join("node_modules/left-pad");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(pkg.join("index.js"), "// PATCHED\n").unwrap();
+        }
+        tmp
+    };
+    let has_code = |v: &serde_json::Value| {
+        v["warnings"].as_array().is_some_and(|ws| {
+            ws.iter().any(|w| {
+                w["code"] == "redirect_bun_reinstall_required"
+                    && w["detail"].as_str().is_some_and(|d| {
+                        d.contains("left-pad@1.2.3") && d.contains("`bun install --force`")
+                    })
+            })
+        })
+    };
+
+    let hoisted = project(true);
+    let (code, stdout, stderr) = run_hosted(
+        hoisted.path(),
+        &["rollback", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        has_code(&parse_envelope(&stdout, &stderr)),
+        "stdout=\n{stdout}"
+    );
+
+    let hoisted = project(true);
+    let (code, stdout, stderr) =
+        run_hosted(hoisted.path(), &["rollback", "--yes"], Some(&registry));
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("`bun install --force`"),
+        "the human run names the forcing install; stderr=\n{stderr}"
+    );
+
+    // The preview warns the same way: its run-level `reinstall_required`
+    // note would otherwise promise that the next plain install refreshes
+    // the tree, which is the #764 failure.
+    let hoisted = project(true);
+    let (code, stdout, stderr) = run_hosted(
+        hoisted.path(),
+        &["rollback", "--dry-run", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let env = parse_envelope(&stdout, &stderr);
+    assert!(has_code(&env), "stdout=\n{stdout}");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| {
+                w["code"] == "reinstall_required"
+                    && w["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("`bun install --force`"))
+            })),
+        "the preview's reinstall note names the forcing install; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hoisted.path().join("bun.lock")).unwrap(),
+        bun_lock(&bun_redirected_line()),
+        "a dry run writes nothing"
+    );
+
+    let fresh = project(false);
+    let (code, stdout, stderr) = run_hosted(
+        fresh.path(),
+        &["rollback", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        !has_code(&parse_envelope(&stdout, &stderr)),
+        "nothing installed, nothing kept; stdout=\n{stdout}"
+    );
+}
+
 /// Dry-run twin of `bun_lock_pin_restores_to_the_registry_tuple`: "Would
 /// restore …", bun.lock byte-identical afterwards.
 #[test]
@@ -3405,4 +3502,77 @@ fn vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals() {
     );
     assert!(!store.exists());
     assert!(!root.join("node_modules/.vlt-lock.json").exists());
+}
+
+/// #599: Bun never prunes `node_modules/.bun`. A patched `is-number@6.0.0`
+/// entry the project has since moved off (an in-place `bun install` of
+/// 7.0.0 re-linked the importer and hoist dir to the new entry) is an
+/// orphan nothing loads now, but a later install that resolves back to
+/// 6.0.0 re-links it as it is ("no changes"). Rollback must still restore
+/// it, or the rolled-back patch silently returns: the orphan filter that
+/// keeps `vex` from judging the install by such an entry is for checks of
+/// the live install only.
+#[cfg(unix)]
+#[test]
+fn bun_orphaned_store_entry_is_still_rolled_back() {
+    let before: &[u8] = b"module.exports = 'original'\n";
+    let after: &[u8] = b"module.exports = 'original' // PATCHED-599\n";
+    let (before_hash, after_hash) = (git_sha256(before), git_sha256(after));
+    let purl = "pkg:npm/is-number@6.0.0";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "app", "version": "0.0.0", "dependencies": { "is-number": "7.0.0" } }"#,
+    )
+    .expect("write root package.json");
+    let orphan = install_npm_pkg(
+        root,
+        "node_modules/.bun/is-number@6.0.0/node_modules",
+        "is-number",
+        "6.0.0",
+        after,
+    );
+    install_npm_pkg(
+        root,
+        "node_modules/.bun/is-number@7.0.0/node_modules",
+        "is-number",
+        "7.0.0",
+        b"module.exports = 7\n",
+    );
+    std::fs::create_dir_all(root.join("node_modules/.bun/node_modules")).expect("hoist dir");
+    std::os::unix::fs::symlink(
+        "../is-number@7.0.0/node_modules/is-number",
+        root.join("node_modules/.bun/node_modules/is-number"),
+    )
+    .expect("hoist link");
+    std::os::unix::fs::symlink(
+        ".bun/is-number@7.0.0/node_modules/is-number",
+        root.join("node_modules/is-number"),
+    )
+    .expect("importer link");
+    let socket = write_socket_manifest(
+        root,
+        &[manifest_entry(
+            purl,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            &before_hash,
+            &after_hash,
+        )],
+    );
+    stage_blob(&socket, &before_hash, before);
+    stage_blob(&socket, &after_hash, after);
+
+    let (code, stdout, stderr) = run(root, &["rollback", "--offline", "--yes"]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        !stderr.contains("no matching installed package"),
+        "the orphaned entry must be found; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(orphan.join("index.js")).expect("read orphan index.js"),
+        before,
+        "the orphaned entry keeps its patched bytes; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
 }

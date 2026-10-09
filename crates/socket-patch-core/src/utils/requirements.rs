@@ -242,9 +242,12 @@ pub(crate) fn logical_lines(content: &str) -> Vec<LogicalLine> {
             i += 1;
             physical.push(lines[i].to_string());
         }
+        // A continued line with nothing after it is complete at EOF, and
+        // pip's join strips its backslash too (#1249).
+        let dangling = lines[i].trim_end().ends_with('\\') && !comment(i);
         let mut text = String::new();
         for (k, pl) in physical.iter().enumerate() {
-            if k + 1 < physical.len() {
+            if k + 1 < physical.len() || dangling {
                 // pip's join: the backslash and the newline vanish.
                 text.push_str(pl.trim_end().strip_suffix('\\').unwrap_or(pl));
             } else {
@@ -755,6 +758,31 @@ mod tests {
             hash_options("x --hash=sha256:aa --hash sha256:bb --hash=md5:cc"),
             vec!["aa".to_string(), "bb".to_string()]
         );
+    }
+
+    /// #1249: a continued last line with nothing after it is complete at
+    /// EOF, and pip's `join_lines` strips its backslash like any other.
+    #[test]
+    fn lexer_strips_a_dangling_continuation_at_eof() {
+        for content in ["six==1.16.0 \\", "six==1.16.0 \\\n", "six==1.16.0 \\\r\n"] {
+            let lines = logical_lines(content);
+            assert_eq!(lines.len(), 1, "{content:?}");
+            assert_eq!(lines[0].text, "six==1.16.0 ", "{content:?}");
+            assert_eq!(
+                lines[0].physical,
+                vec!["six==1.16.0 \\".to_string()],
+                "physical stays raw"
+            );
+            assert_eq!(
+                exact_pin(strip_comment(&lines[0].text)),
+                Some(("six", "1.16.0"))
+            );
+        }
+        let lines = logical_lines("six==1.16.0 \\\n    --hash=sha256:abc \\\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "six==1.16.0     --hash=sha256:abc ");
+        // A comment's backslash is the comment's text, at EOF too.
+        assert_eq!(logical_lines("# note \\")[0].text, "# note \\");
     }
 
     #[test]

@@ -848,10 +848,30 @@ fn uv_vendor_revert_keeps_wheel_while_subdir_export_references_it() {
     uv_vendor_revert_keeps_wheel_while_export_at("uv-export-subdir", "requirements/lock.txt");
 }
 
+/// #1213: the same keep for a PEP 751 lock exported into a subdirectory
+/// (`uv export --format pylock.toml -o deploy/pylock.toml`, the deploy or
+/// Docker context shape). Before the fix the subdirectory walk read only
+/// `*.txt`, so the revert deleted the wheel that pylock installs.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_keeps_wheel_while_subdir_pylock_references_it() {
+    uv_vendor_revert_keeps_wheel_while_export_at("uv-export-subdir-pylock", "deploy/pylock.toml");
+}
+
 fn uv_vendor_revert_keeps_wheel_while_export_at(tag: &str, out: &str) {
     let Some((uv, python)) = capstone_uv(tag) else {
         return;
     };
+    // A `.toml` target is a PEP 751 export, which uv only writes from
+    // 0.6.15 on.
+    let pylock = out.ends_with(".toml");
+    if pylock {
+        let help = Command::new(&uv).args(["export", "--help"]).output();
+        if !help.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("pylock.toml")) {
+            println!("SKIP e2e_vendor_pypi_build({tag}): this uv cannot export pylock.toml");
+            return;
+        }
+    }
     bake_leak_guards();
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
@@ -881,12 +901,11 @@ fn uv_vendor_revert_keeps_wheel_while_export_at(tag: &str, out: &str) {
 
     // The real `uv export` writes the vendored wheel path into the export.
     let export = |context: &str| {
-        let output = tool(
-            &uv,
-            &proj,
-            &["export", "--frozen", "--no-emit-project", "-o", out],
-            &cache_env,
-        );
+        let mut args = vec!["export", "--frozen", "--no-emit-project", "-o", out];
+        if pylock {
+            args.extend(["--format", "pylock.toml"]);
+        }
+        let output = tool(&uv, &proj, &args, &cache_env);
         assert_tool_ok(&output, context);
         std::fs::read_to_string(proj.join(out)).unwrap()
     };

@@ -55,7 +55,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::constants::SOCKET_DIR;
 use crate::formats::gem::gemfile;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
@@ -64,7 +63,6 @@ use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_tail_blocks_edit;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
-use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
     already_patched_result, copy_matches_after_hashes, done, failed_result, inventory_or_warn,
@@ -73,6 +71,7 @@ use super::common::{
 };
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_gem_data, extract_on_blocking_pool};
+use super::revert::{self, KeepPolicy};
 use super::service_fetch::{
     claim_prestaged, fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult,
     ServiceAttempt, ServicePolicy, ServiceTerminal,
@@ -1207,10 +1206,7 @@ pub async fn revert_gem_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
-    let RevertOpts {
-        dry_run,
-        keep_artifact,
-    } = opts;
+    let dry_run = opts.dry_run;
     // SECURITY: state.json is committed and tamper-able; the uuid keys the
     // directory we are about to delete. Anything but the canonical uuid
     // grammar is rejected fail-closed before any disk access.
@@ -1220,7 +1216,6 @@ pub async fn revert_gem_opts(
             entry.uuid
         ));
     };
-    let uuid_dir = project_root.join(&uuid_dir_rel);
     let mut warnings = Vec::new();
 
     // Fail-closed guard: an entry with NO wiring records (one an older
@@ -1297,36 +1292,22 @@ pub async fn revert_gem_opts(
         }
     }
 
-    let mut outcome = RevertOutcome {
+    let outcome = RevertOutcome {
         kept_artifact: false,
         success: true,
         warnings,
         error: None,
     };
-    if dry_run {
-        return outcome;
-    }
     // Drift-keep (see the fn doc): never delete a copy dir a left-alone
     // record may still reference.
-    if outcome.drift_skipped() {
-        outcome.keep_artifact(&uuid_dir_rel);
-        return outcome;
-    }
-    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
-    // (and the caller keeps the ledger entry), so only the deletion is
-    // skipped.
-    if keep_artifact {
-        return outcome;
-    }
-    // The last gem entry leaves `.socket/vendor/gem/` (and `.socket/vendor/`)
-    // empty: the shared helper prunes them so a reverted project carries no
-    // vendor residue (non-recursive: siblings keep them).
-    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-        outcome.success = false;
-        outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
-        return outcome;
-    }
-    outcome
+    revert::finish(
+        outcome,
+        project_root,
+        &uuid_dir_rel,
+        opts,
+        KeepPolicy::OnDrift,
+    )
+    .await
 }
 
 // ── Gemfile editing ──────────────────────────────────────────────────────────

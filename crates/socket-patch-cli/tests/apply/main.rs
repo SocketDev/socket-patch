@@ -11,6 +11,7 @@ mod vlt_vendored;
 
 mod apply_invariants;
 mod apply_network;
+mod bun_global_store;
 mod check_verifies_installed_tree;
 mod cli_gem_variant_mismatch_policy;
 mod covgap_commands_apply;

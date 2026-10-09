@@ -303,9 +303,13 @@ class CompatibilityWorkflow(unittest.TestCase):
         self.assertIn("schedule:", text)
         self.assertIn("workflow_dispatch:", text)
         for path in ("'scripts/backtest-vlt.py'", "'scripts/check-vlt-legs.py'",
-                     "'crates/socket-patch-core/src/vendor/**'", "'Cargo.lock'",
-                     "'rust-toolchain.toml'", "'.github/workflows/vlt-compatibility.yml'"):
+                     "'.github/workflows/vlt-compatibility.yml'"):
             self.assertEqual(text.count(path), 2, f"{path} in both pull_request and push filters")
+        # Shared engine code runs the matrix on push to main (and nightly),
+        # not on every PR (#1198).
+        for path in ("'crates/socket-patch-core/src/vendor/**'", "'Cargo.lock'",
+                     "'rust-toolchain.toml'"):
+            self.assertEqual(text.count(path), 1, f"{path} only in the push filter")
         self.assertIn("continue-on-error: true", "\n".join(self.compat["downgrade"]))
         self.assertIn("--canary-checks", "\n".join(self.compat["canary"]))
         self.assertIn("--diff-locks", "\n".join(self.compat["lock-diff"]))

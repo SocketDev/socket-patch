@@ -24,6 +24,7 @@ pub(crate) mod manifest;
 pub(crate) mod mirror;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::utils::digest::sha256_hex;
 use crate::utils::purl::simple_purl;
@@ -68,6 +69,9 @@ const BUNDLER_HEADERS: [&str; 9] = [
 /// Git merge-conflict markers (bundler refuses a lock carrying them).
 const CONFLICT_MARKERS: [&str; 4] = ["<<<<<<<", "=======", ">>>>>>>", "|||||||"];
 
+/// `CHECKSUMS` digests by gem name, then by parenthesized token.
+type ChecksumMap = HashMap<String, Vec<(String, Option<String>)>>;
+
 /// A parsed `name (version[-platform])` spec entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Spec<'t> {
@@ -90,12 +94,32 @@ pub(crate) struct SpecLine<'t> {
 pub(crate) struct Section<'t> {
     pub(crate) header: &'t str,
     pub(crate) line_no: usize,
+    /// The number of the section's last line: the line before the next
+    /// column-0 header, or the file's last line (blank separators belong to
+    /// the section they follow). As a 0-based index it is the exclusive end
+    /// of [`Self::lines`].
+    pub(crate) end: usize,
     /// The section's `remote:` values, trimmed, as written.
     pub(crate) remotes: Vec<&'t str>,
+    /// The line number of each of [`Self::remotes`], in the same order.
+    pub(crate) remote_line_nos: Vec<usize>,
     pub(crate) specs: Vec<SpecLine<'t>>,
 }
 
 impl<'t> Section<'t> {
+    /// The section's lines as 0-based indices into the lock's
+    /// `split_inclusive('\n')` lines: its header through its last line.
+    pub(crate) fn lines(&self) -> std::ops::Range<usize> {
+        self.line_no - 1..self.end
+    }
+
+    /// Bundler's source identifier for the section: its remotes joined by
+    /// `", "`, the key `SourceList#lock_rubygems_sources` sorts `GEM`
+    /// sections by.
+    pub(crate) fn identifier(&self) -> String {
+        self.remotes.join(", ")
+    }
+
     /// The section's remotes as download bases: trailing `/` trimmed, empty
     /// ones dropped, in lock order (duplicates kept).
     pub(crate) fn remote_bases(&self) -> impl Iterator<Item = &'t str> + '_ {
@@ -106,13 +130,44 @@ impl<'t> Section<'t> {
     }
 }
 
+/// One 2-space `DEPENDENCIES` entry (`rack`, `rack!`, `rack (~> 3.1)`,
+/// `rack (= 3.2.6)!`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Dependency<'t> {
+    pub(crate) line_no: usize,
+    /// The gem name: the text before any space, `(` or `!`.
+    pub(crate) name: &'t str,
+    /// Whether bundler marks the entry source-pinned (a trailing `!`).
+    pub(crate) pinned: bool,
+}
+
+/// The `DEPENDENCIES` section.
+#[derive(Debug)]
+pub(crate) struct Dependencies<'t> {
+    /// The header's line number.
+    pub(crate) line_no: usize,
+    /// The section's last line number, as [`Section::end`].
+    pub(crate) end: usize,
+    /// Its entries, in lock order.
+    pub(crate) entries: Vec<Dependency<'t>>,
+}
+
 #[derive(Debug)]
 pub(crate) struct GemfileLock<'t> {
     pub(crate) sections: Vec<Section<'t>>,
-    /// `None` when the lock has no `CHECKSUMS` section (bundler < 2.6).
-    /// Keyed by `(name, parenthesized token)`; the value is the entry's
-    /// lowercase sha256, or `None` for a bare / malformed / conflicting one.
-    pub(crate) checksums: Option<HashMap<(&'t str, &'t str), Option<String>>>,
+    /// The (last) `DEPENDENCIES` section; `None` when the lock has none.
+    pub(crate) dependencies: Option<Dependencies<'t>>,
+    /// The `CHECKSUMS` section's 2-space entries, trimmed; `None` when the
+    /// lock has no `CHECKSUMS` section (bundler < 2.6). Their digests are
+    /// read only when a reader asks for one ([`Self::checksum`]): the
+    /// hosted lock writer parses the lock once per converged gem and never
+    /// does, and validating every digest dominates the parse.
+    checksum_entries: Option<Vec<&'t str>>,
+    /// [`Self::checksum_entries`] by name, then parenthesized token; the
+    /// value is the entry's lowercase sha256, or `None` for a bare /
+    /// malformed / conflicting one. Built on first use, with owned keys so
+    /// the lock stays covariant in `'t`.
+    checksums: OnceLock<ChecksumMap>,
     /// `DEPENDENCIES` entries bundler marks source-pinned (`name …!`).
     pub(crate) pinned: BTreeSet<&'t str>,
     /// Every `DEPENDENCIES` entry: the gems bundler treats as DIRECT
@@ -158,7 +213,30 @@ impl<'t> GemfileLock<'t> {
     /// The sha256 `CHECKSUMS` pins `name (token)`, if the lock records a
     /// valid, unambiguous one.
     pub(crate) fn checksum(&self, name: &'t str, token: &'t str) -> Option<&str> {
-        self.checksums.as_ref()?.get(&(name, token))?.as_deref()
+        let entries = self.checksum_entries.as_ref()?;
+        let checksums = self.checksums.get_or_init(|| {
+            let mut map = ChecksumMap::new();
+            for ((name, token), sha) in entries.iter().filter_map(|entry| parse_checksum(entry)) {
+                let tokens = map.entry(name.to_string()).or_default();
+                match tokens.iter_mut().find(|(t, _)| t == token) {
+                    Some((_, prev)) if *prev != sha => *prev = None,
+                    Some(_) => {}
+                    None => tokens.push((token.to_string(), sha)),
+                }
+            }
+            map
+        });
+        checksums
+            .get(name)?
+            .iter()
+            .find(|(t, _)| t == token)?
+            .1
+            .as_deref()
+    }
+
+    /// Whether the lock has a `CHECKSUMS` section (bundler >= 2.6).
+    pub(crate) fn has_checksums(&self) -> bool {
+        self.checksum_entries.is_some()
     }
 
     /// [`Self::checksum`] as the lock pin readers record: the valid sha256
@@ -233,7 +311,7 @@ pub(crate) fn gem_download_url(base: &str, name: &str, version: &str) -> Option<
 /// Parse a Bundler lock (see the module docs).
 pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
     let mut sections: Vec<Section<'_>> = Vec::new();
-    let mut checksums: Option<HashMap<(&str, &str), Option<String>>> = None;
+    let mut checksum_entries: Option<Vec<&str>> = None;
     let mut problems: Vec<String> = Vec::new();
     let mut current: Option<usize> = None;
     let mut in_specs = false;
@@ -241,8 +319,21 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
     let mut in_dependencies = false;
     let mut pinned: BTreeSet<&str> = BTreeSet::new();
     let mut direct: BTreeSet<&str> = BTreeSet::new();
+    let mut dependencies: Option<Dependencies<'_>> = None;
     let mut seen_header = false;
     let mut bundler_shaped = false;
+    // The section or DEPENDENCIES block a column-0 header closes.
+    let close = |sections: &mut Vec<Section<'_>>,
+                 dependencies: &mut Option<Dependencies<'_>>,
+                 current: Option<usize>,
+                 in_dependencies: bool,
+                 end: usize| {
+        if let Some(i) = current {
+            sections[i].end = end;
+        } else if let Some(deps) = dependencies.as_mut().filter(|_| in_dependencies) {
+            deps.end = end;
+        }
+    };
 
     for (idx, raw) in text.split('\n').enumerate() {
         let line_no = idx + 1;
@@ -256,18 +347,34 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
                 problems.push(format!("line {line_no} is a merge-conflict marker"));
             }
             seen_header = true;
+            close(
+                &mut sections,
+                &mut dependencies,
+                current,
+                in_dependencies,
+                idx,
+            );
             bundler_shaped |= BUNDLER_HEADERS.contains(&header);
             in_specs = false;
             in_checksums = header == "CHECKSUMS";
             in_dependencies = header == "DEPENDENCIES";
-            if in_checksums && checksums.is_none() {
-                checksums = Some(HashMap::new());
+            if in_checksums && checksum_entries.is_none() {
+                checksum_entries = Some(Vec::new());
+            }
+            if in_dependencies {
+                dependencies = Some(Dependencies {
+                    line_no,
+                    end: line_no,
+                    entries: Vec::new(),
+                });
             }
             current = if SOURCE_HEADERS.contains(&header) {
                 sections.push(Section {
                     header,
                     line_no,
+                    end: line_no,
                     remotes: Vec::new(),
+                    remote_line_nos: Vec::new(),
                     specs: Vec::new(),
                 });
                 Some(sections.len() - 1)
@@ -289,6 +396,7 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
                 2 => {
                     if let Some(remote) = trimmed.strip_prefix("remote:") {
                         sec.remotes.push(remote.trim());
+                        sec.remote_line_nos.push(line_no);
                     }
                     in_specs = trimmed == "specs:";
                 }
@@ -302,32 +410,41 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
         } else if in_dependencies && indent == 2 {
             let name = trimmed.split([' ', '(', '!']).next().unwrap_or_default();
             if !name.is_empty() {
+                let entry = Dependency {
+                    line_no,
+                    name,
+                    pinned: trimmed.ends_with('!'),
+                };
                 direct.insert(name);
-            }
-            if let Some(entry) = trimmed.strip_suffix('!') {
-                let name = entry.split([' ', '(']).next().unwrap_or_default();
-                if !name.is_empty() {
+                if entry.pinned {
                     pinned.insert(name);
+                }
+                if let Some(deps) = dependencies.as_mut() {
+                    deps.entries.push(entry);
                 }
             }
         } else if in_checksums && indent == 2 {
-            if let (Some(map), Some((key, sha))) = (checksums.as_mut(), parse_checksum(trimmed)) {
-                map.entry(key)
-                    .and_modify(|prev| {
-                        if *prev != sha {
-                            *prev = None;
-                        }
-                    })
-                    .or_insert(sha);
+            if let Some(entries) = checksum_entries.as_mut() {
+                entries.push(trimmed);
             }
         }
     }
+    let last_line = text.split_inclusive('\n').count();
+    close(
+        &mut sections,
+        &mut dependencies,
+        current,
+        in_dependencies,
+        last_line,
+    );
     if !bundler_shaped {
         problems.push("it has no Bundler lockfile sections".to_string());
     }
     GemfileLock {
         sections,
-        checksums,
+        dependencies,
+        checksum_entries,
+        checksums: OnceLock::new(),
         pinned,
         direct,
         problems,
@@ -426,6 +543,76 @@ fn parse_checksum(entry: &str) -> Option<((&str, &str), Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Section spans, remote line numbers and DEPENDENCIES entries: what the
+    /// hosted lock writer splices by. Blank (and whitespace-only) separator
+    /// lines belong to the section they follow; a CRLF lock gives the same
+    /// numbers as its LF spelling, and the last section runs to the last
+    /// line whether or not the file ends with a newline.
+    #[test]
+    fn section_spans_remote_lines_and_dependency_entries() {
+        let lf = "GEM\n  remote: https://a.example/\n  specs:\n    rack (3.1.0)\n\nGEM\n  remote: https://b.example/\n  specs:\n    rails (7.0.0)\n      rack\n \n\nPATH\n  remote: .\n  specs:\n    app (0.1.0)\n\nDEPENDENCIES\n  app!\n  rack\n  rack (~> 3.1)\n  rails (= 7.0.0)!\n   nested (1.0)\n\nBUNDLED WITH\n   2.6.2\n\n";
+        for text in [
+            lf.to_string(),
+            lf.replace('\n', "\r\n"),
+            lf.trim_end().to_string(),
+        ] {
+            let lock = parse(&text);
+            let spans: Vec<_> = lock
+                .sections
+                .iter()
+                .map(|s| {
+                    (
+                        s.header,
+                        s.lines(),
+                        s.remote_line_nos.clone(),
+                        s.identifier(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                spans,
+                [
+                    ("GEM", 0..5, vec![2], "https://a.example/".to_string()),
+                    ("GEM", 5..12, vec![7], "https://b.example/".to_string()),
+                    ("PATH", 12..17, vec![14], ".".to_string()),
+                ]
+            );
+            let deps = lock.dependencies.as_ref().expect("DEPENDENCIES");
+            assert_eq!((deps.line_no, deps.end), (18, 24));
+            let entries: Vec<_> = deps
+                .entries
+                .iter()
+                .map(|e| (e.line_no, e.name, e.pinned))
+                .collect();
+            assert_eq!(
+                entries,
+                [
+                    (19, "app", true),
+                    (20, "rack", false),
+                    (21, "rack", false),
+                    (22, "rails", true)
+                ]
+            );
+            assert_eq!(
+                lock.direct.iter().copied().collect::<Vec<_>>(),
+                ["app", "rack", "rails"]
+            );
+            assert_eq!(
+                lock.pinned.iter().copied().collect::<Vec<_>>(),
+                ["app", "rails"]
+            );
+            let lines = text.split_inclusive('\n').count();
+            assert_eq!(lines, if text.ends_with('\n') { 27 } else { 26 });
+        }
+        // The last section runs to the last line.
+        let lock = parse("GEM\n  remote: https://a.example/\n  specs:\n    rack (3.1.0)\n\n");
+        assert_eq!(lock.sections[0].lines(), 0..5);
+        assert!(lock.dependencies.is_none());
+        let lock = parse("DEPENDENCIES\n  rack");
+        let deps = lock.dependencies.expect("DEPENDENCIES");
+        assert_eq!((deps.line_no, deps.end, deps.entries.len()), (1, 2, 1));
+    }
 
     #[test]
     fn spec_and_checksum_grammar() {

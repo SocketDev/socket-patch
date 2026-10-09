@@ -1,0 +1,8 @@
+{
+  "bun": "1.4.2",
+  "os": "darwin",
+  "arch": "aarch64",
+  "command": "bun install",
+  "note": "the root depends on minimist by github:minimistjs/minimist#v1.2.2; the folder dependency dep (file:./dep) depends on minimist@1.2.2, a nested registry copy. Bun records no version for the root copy",
+  "sha256": "05009e304b2d84819797c873e0b0444e297bdd45ee1e3d0d04843fc8efe49cf2"
+}

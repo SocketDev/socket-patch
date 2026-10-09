@@ -15,7 +15,9 @@ fn required_mirrors(
 ) -> Result<Vec<(String, String, PathBuf)>, String> {
     if entry.ecosystem != "npm"
         || entry.flavor.as_deref() != Some("bun")
-        || root.join("bun.lock").exists()
+        || super::lock_inventory::bun_text_lock_drives(&super::lock_inventory::ProjectView::Disk(
+            root,
+        ))
     {
         return Ok(Vec::new());
     }
