@@ -119,6 +119,9 @@ pub(crate) fn parse_config(text: &str) -> Option<NugetConfig> {
     let mut open_mapping: Option<usize> = None;
     // Index into `cfg.mapping_spans` of the open `<packageSource>` element.
     let mut open_span: Option<usize> = None;
+    // `(span, pattern)` of an open (not self-closing) `<package>` element:
+    // its span runs through its close tag.
+    let mut open_pattern: Option<(usize, usize)> = None;
     let mut i = 0;
     while let Some(rel) = text[i..].find('<') {
         let at = i + rel;
@@ -144,6 +147,13 @@ pub(crate) fn parse_config(text: &str) -> Option<NugetConfig> {
             }
             if name == "clear" {
                 record_clear(&mut cfg, &stack, i);
+            }
+            if name == "package"
+                && stack[..] == ["configuration", "packageSourceMapping", "packageSource"]
+            {
+                if let Some((span, pattern)) = open_pattern.take() {
+                    cfg.mapping_spans[span].patterns[pattern].end = i;
+                }
             }
             if name == "packageSource" && stack[..] == ["configuration", "packageSourceMapping"] {
                 if let Some(idx) = open_span.take() {
@@ -180,6 +190,9 @@ pub(crate) fn parse_config(text: &str) -> Option<NugetConfig> {
             } else if let (Some(idx), Some(before)) = (open_mapping, patterns) {
                 if cfg.mappings[idx].1.len() > before {
                     cfg.mapping_spans[idx].patterns.push(at..i);
+                    if !tag.self_closing {
+                        open_pattern = Some((idx, cfg.mapping_spans[idx].patterns.len() - 1));
+                    }
                 }
             }
             if !tag.self_closing {
@@ -519,6 +532,30 @@ mod tests {
                 .unwrap();
         assert!(keys.is_empty());
         assert_eq!(again, out);
+        // A `<package>` written with a close tag is set aside whole.
+        let open_close = COMPETING
+            .replace(
+                "<package pattern=\"newtonsoft.json\" />",
+                "<package pattern=\"newtonsoft.json\"></package>",
+            )
+            .replacen(
+                "<package pattern=\"Newtonsoft.Json\" />",
+                "<package pattern=\"Newtonsoft.Json\">\n      </package>",
+                1,
+            );
+        let cfg2 = super::parse_config(&open_close).unwrap();
+        let (out2, _) = super::set_aside_competing_patterns(
+            &open_close,
+            &cfg2,
+            "socket-patch-u",
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        assert!(super::parse_config(&out2).is_some(), "{out2}");
+        assert_eq!(
+            super::restore_set_aside(&out2, "socket-patch-u"),
+            open_close
+        );
         // Another key's markers are not ours to restore.
         assert_eq!(super::restore_set_aside(&out, "socket-patch-v"), out);
     }
