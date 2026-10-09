@@ -1,16 +1,17 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T03:29Z · main @ b76d7ab_
+_Last updated 2026-10-09T04:25Z · main @ f3c6313_
 
 **In flight:**
+- [#1221](https://github.com/SocketDev/socket-patch/pull/1221): hosted `converge_gem_lock_source` reads `formats::gem` section spans, remote lines and DEPENDENCIES entries; `GemLockSection` + `gem_lock_dependency_name` deleted. #780 hosted slice (E19). +143/−104 prod, +325 tests. `state: ready`.
 - [#1217](https://github.com/SocketDev/socket-patch/pull/1217): Deno crawl scoped to `deno.lock` `jsr` keys; one `locate`, one `lock_section` (shared with VEX). #1216 (E05). +108/−43 prod, +142 tests; 48.1 → 7.5 ms (debug). `state: ready`.
 - [#1209](https://github.com/SocketDev/socket-patch/pull/1209): Go crawl scoped to `go.sum` modules; one `locate_module`. #1207 (E05). +132/−44 prod, +269 tests; 7.7 → 1.0 ms. `state: ready`.
-- [#1205](https://github.com/SocketDev/socket-patch/pull/1205): cargo crawl scoped to `Cargo.lock` registry packages; one `formats::cargo::is_registry_source`. #1204 (E05). +144/−49 prod, +226/−11 tests; 26.0 → 4.7 ms. `state: ready`.
 - [#1188](https://github.com/SocketDev/socket-patch/pull/1188): one `Pipfile.lock` writer (`formats::pipenv::splice_entry`, `formats::json`). Issue #1128 (E14). +303/−235 production. `redirect/mod.rs` wrapper `pipenv_reserialized_around_reference` left for when that file is free. `state: ready`.
-- [#1183](https://github.com/SocketDev/socket-patch/pull/1183): NuGet crawl of a restored project scoped to the restore's `libraries`; one `project.assets.json` reader. #427 (E05). +130 prod, +220 tests; 58 → 0.8 ms. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - Maintainer drafts (decided issues): #1036 (#973), #1041 (#648), #1049 (#792). #1027 (#704), #1030 (#808), #1031 (#966) and #1051 (#580) merged.
 
 **Merged:**
+- [#1205](https://github.com/SocketDev/socket-patch/pull/1205): cargo crawl scoped to `Cargo.lock` registry packages. #1204 (E05 partly fixed). +144/−49 prod, +226/−11 tests.
+- [#1183](https://github.com/SocketDev/socket-patch/pull/1183): NuGet crawl scoped to the restore's `libraries`. #427 (E05 partly fixed). +130 prod, +220 tests.
 - [#1191](https://github.com/SocketDev/socket-patch/pull/1191): 4 more files onto `formats::text`; `PENDING_INLINE_BOMS` 11. Issue #905 (E64 slice 3). +11/−13 production, +74 tests.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; oracle-only free helpers deleted. Issue #631 (E52 partly fixed; the move to `formats/golang/sum.rs` remains).
 - [#1185](https://github.com/SocketDev/socket-patch/pull/1185): one Poetry forward splicer (`utils::poetry_lock`); 2.x `files` multi-line in both modes. Issue #936 (E66 fixed). +37/−166 production.
@@ -20,15 +21,17 @@ _Last updated 2026-10-09T03:29Z · main @ b76d7ab_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #989 item: one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: backend files changed by open PRs (#1008, #1041, #1036, …) |
-| 2 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1008, #1009, #1026, #1180, #1190, #1193) |
-| 3 | #705 (C18): one `utils::uuid` grammar | 0 | 0 | ≈4 | L | ≈8 | skipped: `cli/lib.rs` + `api/client.rs` in #1034, `apply.rs` in #1049 |
-| 4 | #595 Deno child (E05): scope to the `deno.lock` `jsr` entries | 0 | 1 | ≈1 | L | ≈7 (S 3) | **taken: #1216 / #1217** |
-| 5 | #595 shared item: `crawl_unscoped_cache` warning + `CLI_CONTRACT.md` | 0 | 1 | ≈0 | M | ≈0 | wait for #1183/#1205/#1209/#1217 to merge; touches every crawler |
+| 1 | #989 item: one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: every backend file is in an open PR (#1007, #1009, #1026, #1036, #1041, #1161, #1187, #1193, #1211) |
+| 2 | #931 + #998 + #1063 + #1123: one manifest load + error mapper for every command | 4 | 1 | ≈6 | M | ≈24 | skipped: `apply.rs`, `vendor.rs`, `repair.rs`, `remove.rs`, `rollback.rs`, `scan/`, `ledgers.rs`, `args.rs` all in open PRs |
+| 3 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1009, #1026, #1180, #1193, #1211) |
+| 4 | #780 (E19) hosted slice: `formats::gem` spans for hosted convergence | 0 | 1 | ≈2 | L | ≈6 | **taken: #1221**; vendored slice waits for `vendor/gem.rs` (#1026, #1041) |
+| 5 | #1220 (C78): bound upstream-restore fan-out through `utils::concurrent::registry_concurrency` | 1 | 0 | ≈4 | L | ≈11 | skipped: `upstream/{npm,pypi,cargo,composer,mod}.rs` and `concurrent.rs` in open PRs |
 
-Re-ranked 2026-10-09T03:00Z at `b76d7ab` against 17 `arch-refactor/*` / `agent/fix-*` / `arch-fix/*` PRs; only `context.rs`, `lock_cli.rs`, `update.rs`, `composer_hints.rs`, `lib.rs`, `main.rs` and a few `scan/` helpers are free in the CLI. Also blocked: #1098 (`ecosystem_dispatch.rs`), #1129 (`npm_crawler.rs`), #914 (`jvm_jar.rs`, #1041), #893 (`cleanup_blobs.rs`, #1049), #1144 (`commands/vex.rs`, #1041), #757 (`redirect/mod.rs`), #913/#675/#676 (`api/client.rs`), #1064 (`vex/product.rs`, #1007). All five #595 crawler children are now in PRs except Maven (#265, `maven_crawler.rs` blocked by #1036/#1041); the shared warning item waits for them.
+Re-ranked 2026-10-09T04:00Z at `f3c6313` (#1008 merged) against 17 `arch-refactor/*` / `agent/fix-*` / `arch-fix/*` PRs changing 354 files. Free but lower: E16 remainder (`detect_eol` caller in `yarn_classic_lock.rs`, #1211), #1202 (`nuget_feed.rs` in #1041), #1014 (`.mill-version` needs a decision), #265 Maven crawl (no lockfile to scope by: risk H), E37 (`composer_crawler::normalize_version` ≡ `strip_leading_v`, D 1).
 
 **Notes:**
+- Gem lock edits locate through `formats::gem::parse` since #1221: `Section::lines()` / `end`, `remote_line_nos`, `GemfileLock::dependencies` (entries with one name rule). Whitespace-only lines are blank separators. The vendored slice should read the same fields, not add a fourth walker.
+- Real bundler (4.0.18) is installed in the sandbox: `e2e_redirect_gem_build -- --ignored` (25) and `e2e_vendor_gem_build -- --include-ignored` (41) run in ~30 s each.
 - Deno crawl scope (#1217): only a local project whose `<cwd>/deno.lock` parses and has a `version` is scoped; a lock with no `jsr` section crawls no JSR package. A CLI fixture that needs the crawl to find a cached JSR package must lock it (or omit `deno.lock`). `lock_section` lives in `deno_crawler.rs` until `formats/mod.rs` is free for a `formats::deno` model.
 - Go crawl scope (#1209): only a local project with a readable `<cwd>/go.sum` and no workspace (`go.work` in cwd or an ancestor, or `GOWORK` set to a file; `GOWORK=off` scopes) is scoped. A CLI fixture that needs the crawl to vouch for a cached module must list it in `go.sum` or drop `go.sum`.
 - Cargo crawl scope (#1205): only a local project's registry cache with a parseable `<cwd>/Cargo.lock` is scoped; `vendor/`, global and lockless crawls walk. A CLI test that needs "only the crawl vouches" must put the crate in `vendor/`, not an unlocked `CARGO_HOME`. Narrowing a crawl changes `scan --prune` (an unlocked cached crate's entry becomes prunable): say so in the PR.
@@ -39,14 +42,12 @@ Re-ranked 2026-10-09T03:00Z at `b76d7ab` against 17 `arch-refactor/*` / `agent/f
 - A closed issue whose register row is only `partly fixed` needs a new follow-up issue for the remainder (#1150 after #1079); don't reopen the closed one.
 - `formats::xml` (#1145) is the shared XML element scanner (comment + CDATA blanking, `elements`, `children`, `attr`); route new XML readers (NuGet, pom writers) through it instead of a private masker.
 - The skip rule names only `arch-refactor/*` and `agent/fix-*` PRs; `arch-fix/*`, `ci*` and `ci-janitor/*` files are not blockers by the letter, but check their hunks before touching the same lines.
-- Maintainer "Defer" closes (e.g. #706) are steering: don't rank until reopened.
 - E35's crawler oracles can't become `golden.rs` digests: their randomized trees (symlinks, modes, case collisions) differ by OS and uid. Keep them until a crawler can be checked without one.
 - Test-helper migrations (#824): directory binaries import via `crate::common`; prune the unused imports `--no-run --message-format=short` lists. `spawn_env_hygiene` scans test text, string literals included: never spell a bare binary spawn in a new test file, and run that suite before pushing.
 - Source-scan guards: one-sided (fail on new files only) and normalize `\r\n` (Windows CI checks out CRLF).
 - `toml_edit` parse: ~81 µs per `Cargo.toml` vs 0.5 µs for a line scanner; disclose it on hot crawl paths. It skips one leading BOM itself.
 - Equivalence goldens (`tests/equivalence/*.golden`, bless with `SOCKET_PATCH_BLESS_GOLDEN=1`) include mixed-ending inputs: prove only mixed cases move before re-blessing a line-ending change.
 - Upstream gem `restore_manifest` pins CRLF output for a CRLF Gemfile with an LF block; migrate it only together with the forward Gemfile writer in `redirect/mod.rs`.
-- Overlap check: fetch `/pulls/<n>/files` for every open PR, match exact paths; `comm -23` of `git ls-files` against that set lists the free files.
 - Deleting a refactor oracle: refactor the kept code under the oracle, pin its outputs on odd inputs, then delete it (#1103).
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
 - `redirect/pipenv.rs`, `vendor/pypi.rs` and `vendor/lock_inventory/vlt.rs` aren't rustfmt-clean on main: format only your own hunks there. Check `rustfmt --check` on the `main` copy before formatting a whole file.
