@@ -1783,6 +1783,10 @@ fn hosted_unwind_json(
             "SOCKET_NPM_REGISTRY",
             format!("{}/npm-registry", registry.uri()),
         )
+        // The yarn berry restore reads these like yarn does (#1017): an
+        // ambient value must not steer the fixtures' registry.
+        .env_remove("YARN_NPM_REGISTRY_SERVER")
+        .env_remove("YARN_RC_FILENAME")
         .output()
         .unwrap_or_else(|e| panic!("run socket-patch {}: {e}", command[0]));
     let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {

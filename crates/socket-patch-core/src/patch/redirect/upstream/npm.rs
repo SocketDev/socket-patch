@@ -625,10 +625,17 @@ fn yaml_path_in(lines: &[String], path: &[&str]) -> Result<Option<String>, Strin
     yaml_path_in(&dedented, rest)
 }
 
-/// A `.yarnrc.yml` value with its environment references expanded as yarn
-/// expands them: `${NAME}`, `${NAME-fallback}` (the fallback when `NAME`
+/// A `.yarnrc.yml` registry value with its environment references read as
+/// yarn reads them: `${NAME}`, `${NAME-fallback}` (the fallback when `NAME`
 /// is unset) and `${NAME:-fallback}` (also when it is empty). A reference
 /// to an unset variable with no fallback is the error yarn stops on.
+///
+/// A reference to a variable that IS set is never expanded: the rc file
+/// (possibly a checked-in, lower-trust one) would choose which of this
+/// process's variables — a token, say — lands in a URL the restore
+/// requests and may print. That is `Err` too, so the restore falls back to
+/// the default registry with `upstream_registry_fallback`, as for the Bun
+/// and pnpm settings, which never expand an arbitrary variable either.
 fn yarn_expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
@@ -662,7 +669,12 @@ fn yarn_expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<
         };
         let set = var(name);
         let expanded = match (set, fallback) {
-            (Some(v), _) if !v.is_empty() => v,
+            (Some(v), _) if !v.is_empty() => {
+                return Err(format!(
+                    "it references the environment variable {name}, which socket-patch does \
+                     not expand into a registry URL"
+                ))
+            }
             (Some(v), _) if !colon => v,
             (_, Some(fallback)) => fallback.to_string(),
             (_, None) => return Err(format!("the environment variable {name} is not set")),
@@ -3239,14 +3251,18 @@ mod tests {
             _ => None,
         };
         for (value, want) in [
-            ("${REG}", Ok("https://reg.example")),
-            ("${REG:-https://d.example}", Ok("https://reg.example")),
+            // A set variable is never expanded (the rc file must not pick
+            // which of the process's variables lands in a requested URL).
+            ("${REG}", Err(())),
+            ("${REG:-https://d.example}", Err(())),
+            ("${REG-https://d.example}", Err(())),
             ("${UNSET:-https://d.example}", Ok("https://d.example")),
             ("${UNSET-https://d.example}", Ok("https://d.example")),
             ("${EMPTY:-https://d.example}", Ok("https://d.example")),
             ("${EMPTY-https://d.example}", Ok("")),
             ("${EMPTY}", Ok("")),
-            ("https://h/${REG}/x", Ok("https://h/https://reg.example/x")),
+            ("https://h/${REG}/x", Err(())),
+            ("https://h/${UNSET:-m}/x", Ok("https://h/m/x")),
             ("plain $ {REG} ${", Ok("plain $ {REG} ${")),
             ("${UNSET}", Err(())),
         ] {
