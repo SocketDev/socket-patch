@@ -1,37 +1,41 @@
-//! Real-Maven vendored-mode (`vendor`) host capstone, ending in
-//! manifest-less VEX — the host twin of the docker `docker_e2e_vendor_maven`
-//! (which pins the image's Debian Maven); this one runs whichever Maven the
-//! `SOCKET_PATCH_MAVEN_E2E_*` gates select, so every Maven line in the
-//! version matrix proves the same chain:
+//! Real-Maven vendored-mode (`vendor`) host capstone for a single-module
+//! project, ending in manifest-less VEX — the host twin of the docker
+//! `docker_e2e_vendor_maven` (which pins the image's Debian Maven); this one
+//! runs whichever Maven the `SOCKET_PATCH_MAVEN_E2E_*` gates select, so
+//! every Maven line in the version matrix proves the same chain:
 //!
 //!   1. A consumer depending on `commons-text:1.10.0` (parent pom + the
 //!      commons-lang3 transitive) is resolved from Maven Central into a
 //!      per-test local repository — the ACTUAL registry bytes.
 //!   2. A marker patch on the cached jar's `META-INF/NOTICE.txt` is staged
 //!      (manifest + blob, real git-sha256 before/after hashes), and
-//!      `vendor --json --vex` (the real binary) downloads the patched jar
-//!      into the committed maven2 tree `.socket/vendor/maven/<uuid>/…`,
-//!      inserts the `socket-patch-vendor-<uuid>` file:// `<repository>`, and
-//!      attests in-run `(vendored)`.
-//!   3. FRESH CHECKOUT: only `pom.xml` + `.socket/` travel (the manifest and
-//!      blobs deleted — the detached / depscan-PR shape), commons-text is
-//!      purged from the local repository, and Maven resolves the patched jar
-//!      from the file:// repository: byte-identical to the committed jar,
-//!      NOTICE patched, the transitive declared by the vendored upstream pom.
+//!      `vendor --json --vex` (the real binary) plans the single-module pom
+//!      as a reactor of one (#973): the suffixed tree
+//!      `.socket/vendor/maven2/<g>/<a>/<v>-socket.<hex8>/`, the pinned
+//!      `<version>`, `.mvn/maven.config` and the fallback
+//!      `socket-patch-vendor` file repository. With no Maven Wrapper the run
+//!      carries both wrapper-less `vendor_jvm_degraded` warnings
+//!      (`maven_f_outside_root`, `maven_mirror_of_all`), and attests in-run
+//!      `(vendored)`.
+//!   3. FRESH CHECKOUT: only `pom.xml`, `.mvn/` and `.socket/` travel (the
+//!      manifest and blobs deleted). Maven builds against the WARM local
+//!      repository (Central's pristine 1.10.0 still cached: it cannot shadow
+//!      the suffixed version) and again behind a `mirrorOf external:*`
+//!      mirror: the resolved jar is the committed one, NOTICE patched, the
+//!      transitive declared by the suffixed upstream pom.
 //!   4. MANIFEST-LESS VEX over the fresh checkout (`vex_e2e_common`):
-//!      * the ledger present → attested online and `--offline`;
-//!      * the ledgers deleted, online → attested from the pom wiring + the
-//!        committed artifact + the API record; `--offline` →
-//!        `record_unavailable`, ZERO requests;
-//!      * embedded `vendor --vex` and `apply --vex` with no manifest attest
-//!        the same;
-//!      * a tampered committed member → `vendor_hash_mismatch`;
-//!      * the pom reverted to the registry version (ledger + artifact left
-//!        behind) → `vendor_unwired`, with and without `--no-verify`; Maven
-//!        then resolves Central's pristine jar and nothing attests.
-//!   5. TAMPER probe: a mutated committed jar with its stale `.sha1` is
-//!      never consumed (`checksumPolicy=fail`).
-//!   6. The source project's `vendor --revert` byte-restores `pom.xml`, and
+//!      * the ledger present → attested online and `--offline`, and by the
+//!        embedded `vendor --vex` and `apply --vex` with no manifest;
+//!      * the ledgers deleted → nothing attests (a planner pin is never
+//!        attributed without its ledger);
+//!      * a tampered committed member, re-signed or with its stale `.sha1`
+//!        → never attested. Maven before 3.9.2 rejects the stale-`.sha1`
+//!        copy on the fallback repository's `checksumPolicy=fail`; 3.9.2+
+//!        builds it from the unchecked repository tail;
+//!      * the pom reverted to the registry version (ledger + tree left
+//!        behind) → `vendor_unwired`, with and without `--no-verify`, and
+//!        Maven resolves Central's pristine jar.
+//!   5. The source project's `vendor --revert` restores every byte, and
 //!      nothing is left to attest.
 //!
 //! Gated like the other real-toolchain capstones: `#[ignore]` (network to
@@ -62,12 +66,33 @@ fn vulns() -> [(&'static str, &'static [&'static str]); 1] {
     [(GHSA, &[CVE])]
 }
 
-fn leaf_rel() -> String {
-    format!(".socket/vendor/maven/{UUID}/{GROUP_PATH}/{ARTIFACT}/{VERSION}")
+/// The suffixed version the planner pins: `<base>-socket.<uuid hex8>`.
+const SV: &str = "1.10.0-socket.5e6f7081";
+
+fn tree_rel() -> String {
+    format!(".socket/vendor/maven2/{GROUP_PATH}/{ARTIFACT}/{SV}")
 }
 
 fn jar_rel() -> String {
-    format!("{}/{ARTIFACT}-{VERSION}.jar", leaf_rel())
+    format!("{}/{ARTIFACT}-{SV}.jar", tree_rel())
+}
+
+/// Every file under `dir` (relative, forward slashes) with its bytes.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let rel = path.strip_prefix(base).unwrap().to_string_lossy();
+                out.insert(rel.replace('\\', "/"), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
 }
 
 /// `socket-patch <args>` with ambient `SOCKET_*` scrubbed and the per-test
@@ -132,11 +157,18 @@ fn stage_manifest(proj: &Path, member_before: &[u8], member_after: &[u8]) {
     .unwrap();
 }
 
-fn purge(m2: &Path) {
-    let dir = m2.join(GROUP_PATH).join(ARTIFACT);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
+/// The commons-text jar Maven copied into `<cwd>/<out_rel>`, and its name.
+fn copied_jar(cwd: &Path, out_rel: &str) -> (String, Vec<u8>) {
+    let dir = cwd.join(out_rel);
+    let hits: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&format!("{ARTIFACT}-")))
+        .collect();
+    assert_eq!(hits.len(), 1, "{}: {hits:?}", dir.display());
+    let bytes = std::fs::read(dir.join(&hits[0])).unwrap();
+    (hits[0].clone(), bytes)
 }
 
 fn vex_run(m2: &Path) -> VexRun {
@@ -161,7 +193,7 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
     write_settings(&settings, &[]);
 
     // 1. The ACTUAL registry bytes.
-    let Some((jar, _pom)) = warm_fixture(SUITE, &mvn, &proj, &m2, &settings) else {
+    let Some((jar, upstream_pom)) = warm_fixture(SUITE, &mvn, &proj, &m2, &settings) else {
         return;
     };
     let pristine_pom = std::fs::read(proj.join("pom.xml")).unwrap();
@@ -169,6 +201,7 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
     // 2. Stage the patch, then the real writer.
     let (orig, patched) = patched_member(&jar, UUID);
     stage_manifest(&proj, &orig, &patched);
+    let before = snapshot(&proj);
     let (code, env, stderr) = socket(
         &proj,
         &m2,
@@ -187,43 +220,103 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
     assert_eq!(code, Some(0), "vendor --vex: {env}\n{stderr}");
     assert_eq!(env["summary"]["applied"], 1, "{env}");
     assert_eq!(env["summary"]["failed"], 0, "{env}");
+    // No Maven Wrapper: both wrapper-less warnings, whatever Maven runs.
+    let text = env.to_string();
+    for reason in ["maven_f_outside_root", "maven_mirror_of_all"] {
+        assert!(
+            text.contains("vendor_jvm_degraded") && text.contains(&format!("reason: {reason}: ")),
+            "{reason}: {env}"
+        );
+    }
+    assert!(!text.contains("vendor_maven_local_cache_shadow"), "{env}");
     let embedded: serde_json::Value =
         serde_json::from_slice(&std::fs::read(proj.join("embedded.vex.json")).unwrap()).unwrap();
     assert_attested(&embedded, &purl(), UUID, Marker::Vendored, &vulns());
+    std::fs::remove_file(proj.join("embedded.vex.json")).unwrap();
+
     let vendored_jar = std::fs::read(proj.join(jar_rel())).unwrap();
     assert_jar_patched(&vendored_jar, &patched, "vendored jar");
-    assert_ne!(vendored_jar, jar, "the committed jar is not Central's jar");
-    let wired = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
-    assert!(
-        wired.contains(&format!("<id>socket-patch-vendor-{UUID}</id>"))
-            && wired.contains(&format!(
-                "file://${{project.basedir}}/.socket/vendor/maven/{UUID}"
-            ))
-            && wired.contains("<checksumPolicy>fail</checksumPolicy>"),
-        "vendored repository wiring:\n{wired}"
+    assert_eq!(
+        std::fs::read_to_string(proj.join(format!("{}.sha1", jar_rel()))).unwrap(),
+        sha1_hex(&vendored_jar)
     );
+    let tree_pom =
+        std::fs::read_to_string(proj.join(format!("{}/{ARTIFACT}-{SV}.pom", tree_rel()))).unwrap();
+    assert_eq!(
+        tree_pom.replace(SV, VERSION),
+        String::from_utf8_lossy(&upstream_pom),
+        "the suffixed pom differs from upstream only in its version"
+    );
+    let wired = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+    for needle in [
+        format!("<version>{SV}</version>"),
+        "<id>socket-patch-vendor</id>".to_string(),
+        "<url>file://${maven.multiModuleProjectDirectory}/.socket/vendor/maven2</url>".to_string(),
+        "<checksumPolicy>fail</checksumPolicy>".to_string(),
+    ] {
+        assert!(wired.contains(&needle), "pom.xml lacks {needle}:\n{wired}");
+    }
+    assert!(!wired.contains(".socket/vendor/maven/"), "{wired}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join(".mvn/maven.config")).unwrap(),
+        "-Daether.offline.protocols=file\n\
+         -Dmaven.repo.local.tail=${session.rootDirectory}/.socket/vendor/maven2\n"
+    );
+    assert!(!proj.join(".socket/vendor/maven").exists());
     assert!(proj.join(".socket/vendor/state.json").is_file());
 
-    // 3. Fresh checkout (no manifest, no blobs) + real resolve.
+    // An in-sync re-run writes nothing.
+    let vendored = snapshot(&proj);
+    let (code, env, stderr) = socket(
+        &proj,
+        &m2,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(0), "re-vendor: {env}\n{stderr}");
+    assert_eq!(
+        snapshot(&proj),
+        vendored,
+        "an in-sync re-run writes nothing"
+    );
+
+    // 3. Fresh checkout (no manifest, no blobs) + real resolve against the
+    // WARM local repository: Central's 1.10.0 cannot shadow the pin.
     let fresh = root.join("fresh");
     fresh_checkout(&proj, &fresh);
     strip_manifest(&fresh);
     std::fs::remove_dir_all(fresh.join(".socket/blobs")).unwrap();
-    let _ = std::fs::remove_file(fresh.join("embedded.vex.json"));
-    purge(&m2);
-    let out = mvn.copy_dependencies(&fresh, &m2, &settings, "target/dep");
-    assert!(ok(&out), "fresh resolve failed:\n{}", dump(&out));
-    let resolved =
-        std::fs::read(fresh.join(format!("target/dep/{ARTIFACT}-{VERSION}.jar"))).unwrap();
-    assert_eq!(
-        resolved, vendored_jar,
-        "Maven must consume the committed file:// jar, not Central's"
-    );
     assert!(
-        fresh.join(format!("target/dep/{TRANSITIVE_JAR}")).is_file(),
-        "the vendored upstream pom's transitive must resolve"
+        repo_dir(&m2, VERSION)
+            .join(format!("{ARTIFACT}-{VERSION}.jar"))
+            .is_file(),
+        "the local repository stays warm"
     );
-    std::fs::remove_dir_all(fresh.join("target")).unwrap();
+    let mirrored = root.join("mirrored-settings.xml");
+    write_settings(
+        &mirrored,
+        &[("external:*", "https://repo.maven.apache.org/maven2")],
+    );
+    for (label, settings) in [("warm", &settings), ("mirrorOf external:*", &mirrored)] {
+        let out = mvn.copy_dependencies(&fresh, &m2, settings, "target/dep");
+        assert!(ok(&out), "{label}: fresh resolve failed:\n{}", dump(&out));
+        let (name, resolved) = copied_jar(&fresh, "target/dep");
+        assert_eq!(name, format!("{ARTIFACT}-{SV}.jar"), "{label}");
+        assert_eq!(
+            resolved, vendored_jar,
+            "{label}: Maven must consume the committed jar, not Central's"
+        );
+        assert!(
+            fresh.join(format!("target/dep/{TRANSITIVE_JAR}")).is_file(),
+            "{label}: the suffixed upstream pom's transitive must resolve"
+        );
+        std::fs::remove_dir_all(fresh.join("target")).unwrap();
+    }
 
     // 4. MANIFEST-LESS VEX.
     let api = PatchApi::start(vec![(
@@ -232,7 +325,7 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
     )]);
     let run = vex_run(&m2);
 
-    // Ledger present: online and offline.
+    // Ledger present: online, offline, and embedded with no manifest.
     let out = run_vex(
         &binary(),
         &fresh,
@@ -256,42 +349,6 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
     assert_eq!(out.code, Some(0), "{out}");
     assert_attested(out.doc(), &purl(), UUID, Marker::Vendored, &vulns());
     quiet.assert_no_requests();
-
-    // Ledgers gone: pom wiring + committed artifact + the API record.
-    let ledger = std::fs::read(fresh.join(".socket/vendor/state.json")).unwrap();
-    strip_ledgers(&fresh);
-    let before = api.view_requests(UUID);
-    let out = run_vex(
-        &binary(),
-        &fresh,
-        &VexRun {
-            proxy_url: Some(api.uri()),
-            ..run.clone()
-        },
-    );
-    assert_eq!(out.code, Some(0), "{out}");
-    assert_attested(out.doc(), &purl(), UUID, Marker::Vendored, &vulns());
-    assert!(
-        api.view_requests(UUID) > before,
-        "the record came from the API"
-    );
-
-    // Offline, no ledgers: record_unavailable with zero network.
-    let quiet = PatchApi::empty();
-    let out = run_vex(
-        &binary(),
-        &fresh,
-        &VexRun {
-            offline: true,
-            proxy_url: Some(quiet.uri()),
-            ..run.clone()
-        },
-    );
-    assert_eq!(out.code, Some(1), "{out}");
-    assert_not_attested(&out.envelope, &purl(), "record_unavailable");
-    quiet.assert_no_requests();
-
-    // Embedded, no manifest: `vendor --vex` and `apply --vex`.
     for via in [VexVia::Vendor, VexVia::Apply] {
         let out = run_vex(
             &binary(),
@@ -307,23 +364,73 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
         assert_attested(out.doc(), &purl(), UUID, Marker::Vendored, &vulns());
     }
 
-    // A tampered committed member, RE-SIGNED (its `.sha1` updated): Maven
-    // consumes it (the transport check passes), but the record's afterHash
-    // no longer holds — omitted.
+    // Ledgers gone: a planner pin is never attributed without its ledger.
+    let ledger = std::fs::read(fresh.join(".socket/vendor/state.json")).unwrap();
+    strip_ledgers(&fresh);
+    let out = run_vex(
+        &binary(),
+        &fresh,
+        &VexRun {
+            proxy_url: Some(api.uri()),
+            ..run.clone()
+        },
+    );
+    assert_ne!(out.code, Some(0), "{out}");
+    assert_absent(out.doc.as_ref(), &purl());
+    std::fs::write(fresh.join(".socket/vendor/state.json"), &ledger).unwrap();
+
+    // A tampered committed member, RE-SIGNED (its `.sha1` updated): what
+    // the build may consume no longer carries the record's afterHash, so
+    // it is never attested.
     let committed = fresh.join(jar_rel());
     let sidecar = fresh.join(format!("{}.sha1", jar_rel()));
     let good_sidecar = std::fs::read(&sidecar).unwrap();
     let tampered = jar_with_member(&vendored_jar, MEMBER, b"tampered\n");
     std::fs::write(&committed, &tampered).unwrap();
     std::fs::write(&sidecar, sha1_hex(&tampered)).unwrap();
-    purge(&m2);
-    let out = mvn.copy_dependencies(&fresh, &m2, &settings, "target/resigned");
-    assert!(ok(&out), "{}", dump(&out));
-    assert_eq!(
-        std::fs::read(fresh.join(format!("target/resigned/{ARTIFACT}-{VERSION}.jar"))).unwrap(),
-        tampered,
-        "a re-signed committed jar is what Maven builds"
+    let out = run_vex(
+        &binary(),
+        &fresh,
+        &VexRun {
+            proxy_url: Some(api.uri()),
+            ..run.clone()
+        },
     );
+    assert_ne!(out.code, Some(0), "a tampered tree must not attest: {out}");
+    assert_absent(out.doc.as_ref(), &purl());
+
+    // TAMPER probe: the mutated jar with its ORIGINAL (now stale) `.sha1`.
+    // Before 3.9.2 Maven reads the fallback `checksumPolicy=fail` file
+    // repository, so the checksum rejects the copy. 3.9.2+ reads the
+    // `maven.repo.local.tail` tree, a local repository Maven does not
+    // checksum, so the tampered jar is what builds; there the gate is the
+    // committed tree's review and VEX, which never attests it (below).
+    // A COLD re-resolve: step 3 cached the suffixed artifact in the local
+    // repository, which Maven serves without re-reading (or re-checksumming)
+    // any remote, so the cached copy is dropped first. Central's pristine
+    // 1.10.0 stays warm (it cannot shadow the suffixed version).
+    std::fs::write(&sidecar, &good_sidecar).unwrap();
+    let cached = repo_dir(&m2, SV);
+    if cached.exists() {
+        std::fs::remove_dir_all(&cached).unwrap();
+    }
+    let out = mvn.copy_dependencies(&fresh, &m2, &settings, "target/tamper");
+    if mvn.numeric() >= vec![3, 9, 2] {
+        assert!(ok(&out), "{}", dump(&out));
+        assert_eq!(
+            copied_jar(&fresh, "target/tamper"),
+            (format!("{ARTIFACT}-{SV}.jar"), tampered.clone()),
+            "Maven {} reads the unchecked repository tail",
+            mvn.version
+        );
+    } else {
+        assert!(
+            !ok(&out) && dump(&out).to_ascii_lowercase().contains("checksum"),
+            "Maven {}: the fallback repository rejects the stale checksum:\n{}",
+            mvn.version,
+            dump(&out)
+        );
+    }
     let _ = std::fs::remove_dir_all(fresh.join("target"));
     let out = run_vex(
         &binary(),
@@ -333,156 +440,14 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
             ..run.clone()
         },
     );
-    assert_eq!(out.code, Some(1), "{out}");
-    assert_not_attested(&out.envelope, &purl(), "vendor_hash_mismatch");
-
-    // 5. TAMPER probe: the mutated jar with its ORIGINAL (now stale)
-    // `.sha1` is never what the build consumes — and never attested.
-    std::fs::write(&sidecar, &good_sidecar).unwrap();
-    purge(&m2);
-    let out = mvn.copy_dependencies(&fresh, &m2, &settings, "target/tamper");
-    let consumed = std::fs::read(fresh.join(format!("target/tamper/{ARTIFACT}-{VERSION}.jar")));
-    match consumed {
-        // Maven moved on to the next repository (Central) after the
-        // checksum failure: the build gets the PRISTINE registry jar.
-        Ok(bytes) => {
-            eprintln!(
-                "TAMPER (Maven {}): checksum-rejected file:// copy, fell back to Central",
-                mvn.version
-            );
-            assert!(ok(&out), "{}", dump(&out));
-            assert_eq!(
-                bytes,
-                jar,
-                "a tampered committed jar must never be consumed:\n{}",
-                dump(&out)
-            );
-            assert!(
-                dump(&out).to_ascii_lowercase().contains("checksum"),
-                "the file:// copy was rejected on its checksum:\n{}",
-                dump(&out)
-            );
-        }
-        Err(_) => {
-            eprintln!(
-                "TAMPER (Maven {}): resolve failed on the checksum",
-                mvn.version
-            );
-            assert!(
-                !ok(&out) && dump(&out).to_ascii_lowercase().contains("checksum"),
-                "a checksum failure:\n{}",
-                dump(&out)
-            );
-        }
-    }
-    let out = run_vex(
-        &binary(),
-        &fresh,
-        &VexRun {
-            proxy_url: Some(api.uri()),
-            ..run.clone()
-        },
-    );
-    assert_eq!(out.code, Some(2), "stale sidecar = no reference: {out}");
+    assert_ne!(out.code, Some(0), "a tampered tree must not attest: {out}");
     assert_absent(out.doc.as_ref(), &purl());
     std::fs::write(&committed, &vendored_jar).unwrap();
-    let _ = std::fs::remove_dir_all(fresh.join("target"));
 
-    // Sidecar-only damage: the committed jar is intact (its members still
-    // hash-verify against the record) but its `.sha1` — the checksum
-    // `checksumPolicy=fail` validates — no longer matches (or is gone, e.g.
-    // a `*.sha1` gitignore). Maven rejects the file:// copy and builds
-    // Central's PRISTINE jar, so the vendored wiring is not what runs and
-    // nothing may be attested — with or without the ledger.
-    for (label, damage) in [("stale", Some("0".repeat(40))), ("missing", None)] {
-        match &damage {
-            Some(text) => std::fs::write(&sidecar, text).unwrap(),
-            None => std::fs::remove_file(&sidecar).unwrap(),
-        }
-        purge(&m2);
-        let out = mvn.copy_dependencies(&fresh, &m2, &settings, "target/sidecar");
-        if let Ok(bytes) =
-            std::fs::read(fresh.join(format!("target/sidecar/{ARTIFACT}-{VERSION}.jar")))
-        {
-            assert_eq!(
-                bytes,
-                jar,
-                "{label} sidecar: Maven must not consume the file:// jar:\n{}",
-                dump(&out)
-            );
-        }
-        let _ = std::fs::remove_dir_all(fresh.join("target"));
-        let out = run_vex(
-            &binary(),
-            &fresh,
-            &VexRun {
-                proxy_url: Some(api.uri()),
-                ..run.clone()
-            },
-        );
-        assert_ne!(out.code, Some(0), "{label} sidecar must not attest: {out}");
-        assert_absent(out.doc.as_ref(), &purl());
-        std::fs::write(fresh.join(".socket/vendor/state.json"), &ledger).unwrap();
-        let out = run_vex(
-            &binary(),
-            &fresh,
-            &VexRun {
-                offline: true,
-                proxy_url: Some(PatchApi::empty().uri()),
-                ..run.clone()
-            },
-        );
-        assert_eq!(out.code, Some(1), "{label} sidecar + ledger: {out}");
-        assert_not_attested(&out.envelope, &purl(), "vendor_unwired");
-        strip_ledgers(&fresh);
-    }
-    std::fs::write(&sidecar, &good_sidecar).unwrap();
-
-    // The POM's sidecar is not load-bearing for consumption: a stale
-    // `<a>-<v>.pom.sha1` sends only the descriptor to the next repository
-    // (Central serves the same upstream pom the vendor tree copied
-    // verbatim); the JAR still resolves from the file:// repository, so
-    // the patch still runs and still attests.
-    let pom_sidecar = fresh.join(format!("{}/{ARTIFACT}-{VERSION}.pom.sha1", leaf_rel()));
-    let good_pom_sidecar = std::fs::read(&pom_sidecar).unwrap();
-    std::fs::write(&pom_sidecar, "0".repeat(40)).unwrap();
-    purge(&m2);
-    let out = mvn.copy_dependencies(&fresh, &m2, &settings, "target/pomsidecar");
-    assert!(ok(&out), "{}", dump(&out));
-    let consumed =
-        std::fs::read(fresh.join(format!("target/pomsidecar/{ARTIFACT}-{VERSION}.jar"))).unwrap();
-    eprintln!(
-        "POM SIDECAR (Maven {}): consumed the {} jar",
-        mvn.version,
-        if consumed == vendored_jar {
-            "vendored"
-        } else {
-            "registry"
-        }
-    );
-    assert_eq!(
-        consumed,
-        vendored_jar,
-        "a stale pom sidecar must not divert the jar:\n{}",
-        dump(&out)
-    );
-    let out = run_vex(
-        &binary(),
-        &fresh,
-        &VexRun {
-            proxy_url: Some(api.uri()),
-            ..run.clone()
-        },
-    );
-    assert_eq!(out.code, Some(0), "{out}");
-    assert_attested(out.doc(), &purl(), UUID, Marker::Vendored, &vulns());
-    std::fs::write(&pom_sidecar, &good_pom_sidecar).unwrap();
-    let _ = std::fs::remove_dir_all(fresh.join("target"));
-
-    // Reverted to the registry version, ledger + artifact left behind:
-    // dead, with and without --no-verify.
+    // Reverted to the registry version, ledger + tree left behind: dead,
+    // with and without --no-verify, and Maven builds Central's jar.
     std::fs::write(fresh.join("pom.xml"), &pristine_pom).unwrap();
-    std::fs::write(fresh.join(".socket/vendor/state.json"), &ledger).unwrap();
+    std::fs::remove_dir_all(fresh.join(".mvn")).unwrap();
     for no_verify in [false, true] {
         let quiet = PatchApi::empty();
         let out = run_vex(
@@ -499,29 +464,15 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
         assert_not_attested(&out.envelope, &purl(), "vendor_unwired");
         assert_absent(out.doc.as_ref(), &purl());
     }
-    // Maven now builds Central's pristine jar; without the ledger nothing
-    // names a patch at all.
-    purge(&m2);
     let out = mvn.copy_dependencies(&fresh, &m2, &settings, "target/reverted");
     assert!(ok(&out), "{}", dump(&out));
     assert_eq!(
-        std::fs::read(fresh.join(format!("target/reverted/{ARTIFACT}-{VERSION}.jar"))).unwrap(),
-        jar,
+        copied_jar(&fresh, "target/reverted"),
+        (format!("{ARTIFACT}-{VERSION}.jar"), jar.clone()),
         "the reverted pom resolves Central's pristine jar"
     );
-    strip_ledgers(&fresh);
-    let out = run_vex(
-        &binary(),
-        &fresh,
-        &VexRun {
-            proxy_url: Some(api.uri()),
-            ..run.clone()
-        },
-    );
-    assert_eq!(out.code, Some(2), "{out}");
-    assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
 
-    // 6. The source project's real revert.
+    // 5. The source project's real revert.
     let (code, env, stderr) = socket(
         &proj,
         &m2,
@@ -535,11 +486,8 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
         ],
     );
     assert_eq!(code, Some(0), "vendor --revert: {env}\n{stderr}");
-    assert_eq!(
-        std::fs::read(proj.join("pom.xml")).unwrap(),
-        pristine_pom,
-        "revert byte-restores pom.xml"
-    );
+    assert_eq!(snapshot(&proj), before, "revert restores every byte");
+    assert!(!proj.join(".mvn").exists());
     assert!(!proj.join(".socket/vendor").exists());
     strip_manifest(&proj);
     let out = run_vex(

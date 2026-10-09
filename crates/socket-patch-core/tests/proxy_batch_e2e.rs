@@ -21,8 +21,7 @@ fn proxy_client(api_url: &str) -> ApiClient {
     ApiClient::new(ApiClientOptions {
         api_url: api_url.to_string(),
         api_token: None,
-        use_public_proxy: true,
-        org_slug: None,
+        route: socket_patch_core::api::client::ApiRoute::Proxy,
     })
 }
 

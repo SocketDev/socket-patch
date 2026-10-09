@@ -227,11 +227,12 @@ pub(crate) struct RepairRequest<'a> {
     /// The caller's one `load_state` outcome (under the same lock). An
     /// unreadable ledger fails this phase loudly (`vendor_state_unreadable`).
     pub(crate) ledger: std::io::Result<VendorState>,
-    /// The run's API client when the caller already built one: the uuid
-    /// lookups and the re-vendor reuse it instead of constructing another
-    /// (and re-printing its token advisory); `None` builds lazily on first
-    /// need.
-    pub(crate) client: Option<&'a ApiClient>,
+    /// The run's API client slot: the uuid lookups and the re-vendor reuse
+    /// a client the caller already built instead of constructing another
+    /// (and resolving the org again); when it is `None` the phase builds one
+    /// lazily on first need and leaves it here, so the caller (telemetry)
+    /// reuses it too.
+    pub(crate) client: &'a mut Option<ApiClient>,
 }
 
 impl VendoredBackend<'_> {
@@ -274,9 +275,9 @@ impl VendoredBackend<'_> {
             }
         };
 
-        // The one API client of this phase (and its one-time token-shape
-        // stderr advisory), seeded from the run's client when there is one.
-        let mut api_client: Option<ApiClient> = req.client.cloned();
+        // The run's one API client (and its one-time token-shape stderr
+        // advisory): the caller's, or built here on first need.
+        let api_client: &mut Option<ApiClient> = req.client;
         let mut candidates: Vec<Candidate> = Vec::new();
 
         // ── Health check: every in-scope ledger entry ────────────────────
@@ -314,7 +315,7 @@ impl VendoredBackend<'_> {
                 // view from the API.
                 (_, Some(r), None) => r.clone(),
                 (_, None, None) => {
-                    match fetch_record_by_uuid(common, &mut api_client, &entry.uuid).await {
+                    match fetch_record_by_uuid(common, api_client, &entry.uuid).await {
                         Some((_, r)) => r,
                         None => {
                             fail(
@@ -654,7 +655,7 @@ impl VendoredBackend<'_> {
         }
 
         if api_client.is_none() && !common.offline {
-            api_client = Some(
+            *api_client = Some(
                 get_api_client_with_overrides(common.api_client_overrides())
                     .await
                     .0,
@@ -663,7 +664,7 @@ impl VendoredBackend<'_> {
         let use_public_proxy = api_client
             .as_ref()
             .is_some_and(ApiClient::uses_public_proxy);
-        let service = common.vendor_service_config(api_client, use_public_proxy);
+        let service = common.vendor_service_config(api_client.clone(), use_public_proxy);
         for mut candidate in candidates {
             match vendor::redownload::restore(
                 &common.cwd,

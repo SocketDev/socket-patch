@@ -2,9 +2,10 @@
 //! `scan --mode hosted` / `get --mode hosted` write (`redirect::
 //! rewrite_maven_pom`: a `-socket.<hex8>` pinned version + a
 //! `socket-patch-<uuid>` repository on the Socket patch server) and the
-//! vendored wiring `vendor` writes (`vendor::maven_repo`: a
+//! vendored wiring the pre-v5 `vendor` wrote (a
 //! `socket-patch-vendor-<uuid>` file:// repository over the committed
-//! `.socket/vendor/maven/<uuid>/` maven2 tree) are attested from the
+//! `.socket/vendor/maven/<uuid>/` maven2 tree; v5 vendors through the
+//! suffixed JVM planner, attested from its ledger) are attested from the
 //! project files alone — no `.socket/manifest.json` and (except where a cell
 //! says otherwise) no `.socket/vendor/state.json` / `redirect-state.json`
 //! ledger — and never falsely.
@@ -1257,54 +1258,6 @@ fn assert_doc_attests(doc: &Value, uuid: &str, purl: &str, marker: &str) {
     );
 }
 
-/// After a real writer ran: the three standalone shapes — manifest gone
-/// (ledger record, offline), manifest AND ledger gone (API record online;
-/// `record_unavailable` offline), then the wiring reverted with the ledger
-/// restored (`*_unwired`).
-#[allow(clippy::too_many_arguments)]
-fn standalone_after_writer(
-    fx: &Fx,
-    ledger: &str,
-    uuid: &str,
-    record_purl: &str,
-    marker: &str,
-    api_view: Value,
-    revert: &dyn Fn(&Fx),
-    dead_reason: &str,
-) {
-    fx.rm(".socket/manifest.json");
-    fx.rm(".socket/blobs");
-    assert!(
-        fx.cwd.join(ledger).exists(),
-        "the writer persisted {ledger}"
-    );
-    let (code, env) = fx.vex(&["--offline"]);
-    assert_attested(fx, code, &env, uuid, record_purl, marker);
-
-    let saved = std::fs::read(fx.cwd.join(ledger)).unwrap();
-    fx.rm(ledger);
-    let api = Api::serve(vec![(uuid, api_view)]);
-    let (code, env) = fx.vex(&["--proxy-url", &api.uri()]);
-    assert_attested(fx, code, &env, uuid, record_purl, marker);
-    let before = api.requests();
-    let (code, env) = fx.vex(&["--offline", "--proxy-url", &api.uri()]);
-    assert_omitted(
-        code,
-        &env,
-        record_purl,
-        "record_unavailable",
-        "writer, no ledger",
-    );
-    assert_eq!(api.requests(), before);
-
-    fx.put(ledger, &saved);
-    revert(fx);
-    for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
-        let (code, env) = fx.vex(extra);
-        assert_omitted(code, &env, record_purl, dead_reason, "writer, reverted");
-    }
-}
-
 /// After the real HOSTED writer ran: v5 hosted mode left NO ledger, so
 /// the lock pin is the only hosted state — offline there is no local
 /// record (`record_unavailable`, zero requests), online the API's record
@@ -1342,14 +1295,21 @@ fn standalone_after_hosted_writer(
     }
 }
 
-/// A plausible upstream pom for the cached artifact (the maven vendor
-/// backend copies it verbatim next to the rebuilt jar).
+/// A plausible upstream pom for the cached artifact (the vendored tree
+/// serves it with only its version suffixed).
 const COMMONS_TEXT_POM: &str = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
     <modelVersion>4.0.0</modelVersion>\n  <groupId>org.apache.commons</groupId>\n  \
     <artifactId>commons-text</artifactId>\n  <version>1.10.0</version>\n</project>\n";
 
+/// The real `vendor` writer on a single-module pom (#973): the suffixed
+/// planner wiring (a `jvm` ledger entry, `<version>-socket.<hex8>` pin and
+/// the `.socket/vendor/maven2` tree) attests in-run and, with no manifest,
+/// from its ledger offline. A planner pin is attributed only through its
+/// ledger: without one nothing is discovered, online or offline. The pom
+/// reverted to the registry version with the ledger left behind is
+/// `vendor_unwired`.
 #[test]
-fn maven_vendor_command_wiring_reattests_without_manifest_or_ledger() {
+fn maven_vendor_command_wiring_reattests_from_its_ledger_only() {
     let fx = Fx::new();
     let v = Vendored::maven();
     let cached = fx.m2().join("org/apache/commons/commons-text/1.10.0");
@@ -1391,23 +1351,50 @@ fn maven_vendor_command_wiring_reattests_without_manifest_or_ledger() {
         MVN_VENDOR_PURL,
         "vendored",
     );
+    let sv = "1.10.0-socket.7b7b7b7b";
     let pom = std::fs::read_to_string(fx.cwd.join("pom.xml")).unwrap();
-    assert!(
-        pom.contains(&format!("<id>socket-patch-vendor-{MVN_VENDOR_UUID}</id>")),
-        "{pom}"
-    );
-    assert!(fx.cwd.join(&v.artifact_rel).is_file(), "{}", v.artifact_rel);
+    assert!(pom.contains(&format!("<version>{sv}</version>")), "{pom}");
+    assert!(!pom.contains("socket-patch-vendor-"), "{pom}");
+    let jar =
+        format!(".socket/vendor/maven2/org/apache/commons/commons-text/{sv}/commons-text-{sv}.jar");
+    assert!(fx.cwd.join(&jar).is_file(), "{jar}");
+    assert!(!fx.cwd.join(&v.artifact_rel).exists(), "{}", v.artifact_rel);
+    let ledger = std::fs::read_to_string(fx.cwd.join(".socket/vendor/state.json")).unwrap();
+    assert!(ledger.contains("\"ecosystem\": \"jvm\""), "{ledger}");
 
-    standalone_after_writer(
+    fx.rm(".socket/manifest.json");
+    fx.rm(".socket/blobs");
+    let (code, env) = fx.vex(&["--offline"]);
+    assert_attested(
         &fx,
-        ".socket/vendor/state.json",
+        code,
+        &env,
         MVN_VENDOR_UUID,
         MVN_VENDOR_PURL,
         "vendored",
-        v.view(),
-        &|fx| fx.put("pom.xml", registry_pom()),
-        "vendor_unwired",
     );
+
+    let saved = std::fs::read(fx.cwd.join(".socket/vendor/state.json")).unwrap();
+    fx.rm(".socket/vendor/state.json");
+    let api = Api::serve(vec![(MVN_VENDOR_UUID, v.view())]);
+    let (code, env) = fx.vex(&["--proxy-url", &api.uri()]);
+    assert_nothing_to_attest(code, &env, "planner wiring, no ledger, online");
+    let (code, env) = fx.vex(&["--offline", "--proxy-url", &api.uri()]);
+    assert_nothing_to_attest(code, &env, "planner wiring, no ledger, offline");
+    assert_eq!(api.requests(), 0, "an unattributed pin never asks the API");
+
+    fx.put(".socket/vendor/state.json", &saved);
+    fx.put("pom.xml", registry_pom());
+    for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+        let (code, env) = fx.vex(extra);
+        assert_omitted(
+            code,
+            &env,
+            MVN_VENDOR_PURL,
+            "vendor_unwired",
+            "writer, reverted",
+        );
+    }
 }
 
 /// The authenticated API `scan --mode hosted` drives: batch discovery, the

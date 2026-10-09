@@ -237,8 +237,7 @@ mod tests {
         ApiClient::new(ApiClientOptions {
             api_url: "http://127.0.0.1:9".to_string(),
             api_token: token.map(str::to_string),
-            use_public_proxy: false,
-            org_slug: Some("org".to_string()),
+            route: crate::api::client::ApiRoute::org("org"),
         })
     }
 

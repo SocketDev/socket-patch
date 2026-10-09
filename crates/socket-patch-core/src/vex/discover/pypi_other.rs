@@ -1078,6 +1078,34 @@ mod tests {
         );
     }
 
+    /// #1212: a plain-ASCII requirements file whose coding line names an
+    /// ASCII-compatible codec the decoder has no table for is read as pip
+    /// reads it: its pins are evidence, not an unreadable file.
+    #[tokio::test]
+    async fn requirements_files_under_an_ascii_compatible_coding_line_are_read() {
+        for coding in ["iso-8859-15", "cp1250", "mac-roman", "gbk"] {
+            let p = Project::new();
+            p.write(
+                "requirements.txt",
+                format!("# -*- coding: {coding} -*-\nsix==1.16.0\n"),
+            );
+            let out = run(&p).await;
+            assert!(
+                out.diagnostics.is_empty(),
+                "{coding}: {:?}",
+                out.diagnostics
+            );
+            assert_eq!(
+                out.elsewhere
+                    .iter()
+                    .map(|e| e.purl.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["pkg:pypi/six@1.16.0"],
+                "{coding}"
+            );
+        }
+    }
+
     /// A vendored server sdist is wired like a wheel (requirements line,
     /// Pipfile.lock `file`) and names its package the same way.
     #[tokio::test]

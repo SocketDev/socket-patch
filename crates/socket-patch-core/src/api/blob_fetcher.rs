@@ -1125,8 +1125,7 @@ mod tests {
         let client = ApiClient::new(crate::api::client::ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: crate::api::client::ApiRoute::Proxy,
         });
         let body = client
             .fetch_diff("11111111-1111-4111-8111-111111111111")
@@ -1160,8 +1159,7 @@ mod tests {
         let client = ApiClient::new(crate::api::client::ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: crate::api::client::ApiRoute::Proxy,
         });
         let tmp = tempfile::tempdir().unwrap();
         let hashes: HashSet<String> = [hash.clone()].into_iter().collect();

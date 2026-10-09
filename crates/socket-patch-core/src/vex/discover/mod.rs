@@ -199,6 +199,7 @@ pub(crate) mod cargo;
 pub(crate) mod composer;
 pub(crate) mod deno;
 pub(crate) mod gem;
+pub use gem::manifest_source_pins as gem_manifest_source_pins;
 pub(crate) mod golang;
 pub(crate) mod gradle;
 pub(crate) mod maven;
