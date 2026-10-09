@@ -1185,7 +1185,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 ```jsonc
 {
   "command":  "scan" | "apply" | "vex" | "vendor" | "rollback" | "get" | "list" | "remove" | "repair",
-  "status":   "success" | "partialFailure" | "error" | "noManifest" | "paidRequired" | "notFound",
+  "status":   "success" | "partialFailure" | "error" | "noManifest" | "notFound",
   "dryRun":   false,
   "events": [ <PatchEvent>, ... ],
   "summary":  {
@@ -1256,7 +1256,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `apply_failed`            | `failed`         | apply: hash mismatch, write error, archive read error. |
 | `no_local_source` | `skipped`/`failed` | Agent patch application cannot obtain the required local or downloaded patch source. Vendored mode consumes complete server artifacts and no longer stages patch blobs. |
 | `offline_missing_sources` / `sources_download_failed` | apply run-level `warnings[]` | apply (additive): the patch sources were unavailable — `--offline` with no local source, or the download left a patch with no source — so nothing was attempted. The envelope keeps its pinned shape (`partialFailure`, empty `events[]`, zero summary, no top-level `error`); the warning is its machine-readable reason (the human path prints the staging `Error:` line on stderr instead, even under `--silent`). |
-| `paid_required`           | `failed` / status=`paidRequired` | get/scan: patch needs a paid plan and the caller's token isn't entitled. `get <uuid>` on the public proxy reports it (exit 0) both for a `tier: "paid"` view and for the proxy's 403 refusal, whose record then carries only `uuid` + `tier` (the proxy never named the purl). |
+| `paid_required`           | — (top-level `status` of `get`'s legacy JSON, not an event tag) | `get` only: every matching patch needs a paid plan the caller's token isn't entitled to. `get --json` prints `{"status": "paid_required", "found": N, "downloaded": 0, "applied": 0, "patches": [{"purl", "uuid", "tier"}, …]}` (plus any narrowing `skipped`/`warnings`), with no `events` and no `error`, and exits 0. `get <uuid>` on the public proxy reports it both for a `tier: "paid"` view and for the proxy's 403 refusal, whose record then carries only `uuid` + `tier` (the proxy never named the purl). `scan` never reports it: it leaves paid patches out of the selection and counts them in `paidPatches` / `canAccessPaidPatches`. |
 | `download_failed`         | `failed`         | repair/get: network or 404 on patch fetch. |
 | `cleanup_failed`          | `skipped` (warning) | repair: an orphan-sweep pass (blobs, diff or package archives) failed mid-way (e.g. permission error). The run continues and exits 0; human mode carries the warning on stderr (not muted by `--silent`). v5.0: `rollback`'s default GC surfaces the same condition in its run-level `warnings[]` (and `remove`'s extended archive GC on stderr) — same posture, never affects the exit. |
 | `rollback_failed`         | `failed`         | remove/rollback: file restore could not complete. |

@@ -450,12 +450,6 @@ pub enum Status {
     /// there's nothing to apply. Distinct from `Success` because some
     /// consumers want to early-exit on this state.
     NoManifest,
-    /// Reserved: the requested patch requires a paid plan but the caller's
-    /// API token isn't entitled. Nothing emits it yet (`get` reports this
-    /// via its legacy `status: "paid_required"` shape; scan never does).
-    /// Distinct from `Error` so PR bots can post a "upgrade your plan"
-    /// comment instead of failing.
-    PaidRequired,
     /// `remove` / `rollback`: the patch identifier didn't resolve to
     /// anything in the local manifest.
     NotFound,
@@ -1192,7 +1186,6 @@ mod tests {
         // codes on these strings.
         for (status, tag) in [
             (Status::NoManifest, "noManifest"),
-            (Status::PaidRequired, "paidRequired"),
             (Status::NotFound, "notFound"),
         ] {
             let mut env = Envelope::new(Command::Remove);
@@ -1287,10 +1280,10 @@ mod tests {
         // ("Exit 1 when status is partialFailure (any events[*].action ==
         // \"failed\")"). `record` enforces that by escalating every
         // non-Error status — including the success-like specials
-        // (`notFound`, `noManifest`, `paidRequired`) — to PartialFailure.
+        // (`notFound`, `noManifest`) — to PartialFailure.
         // Only a hard `Error` outranks it. Pin that so the auto-escalation
         // can't regress to leaving a `failed` event under an exit-0 status.
-        for start in [Status::NotFound, Status::NoManifest, Status::PaidRequired] {
+        for start in [Status::NotFound, Status::NoManifest] {
             let mut env = Envelope::new(Command::Remove);
             env.status = start;
             env.record(
