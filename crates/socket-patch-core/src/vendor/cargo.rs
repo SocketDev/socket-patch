@@ -38,9 +38,9 @@ use super::cargo_lock::{self, LockEditError};
 use super::cargo_manifest;
 use super::cargo_tag;
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, inventory_or_warn,
-    prune_empty_vendor_levels, refuse_symlinked, refused, service_offline_conflict, stage_dir_for,
-    swap_stage_into_place, synthesized_result,
+    already_patched_result, cleanup_failed_stage, copy_matches_after_hashes, done,
+    inventory_or_warn, prune_empty_vendor_levels, refuse_symlinked, refused,
+    service_offline_conflict, stage_dir_for, swap_stage_into_place, synthesized_result,
 };
 use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
@@ -262,18 +262,6 @@ async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str)
         }
     }
     None
-}
-
-/// Failure cleanup for a staged (re)build: always remove the stage, then
-/// either unwind the whole `<uuid>/` dir (`unwind_uuid_dir` — a fresh vendor
-/// with no pre-existing state worth keeping) or leave existing state
-/// untouched; either way prune any empty-husk dirs left behind.
-async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
-    let _ = remove_tree(stage).await;
-    if unwind_uuid_dir {
-        let _ = remove_tree(uuid_dir).await;
-    }
-    prune_empty_vendor_levels(uuid_dir).await;
 }
 
 /// Outcome of attempting to materialise the cargo copy from the patch service

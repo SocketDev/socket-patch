@@ -65,8 +65,8 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, failed_result, inventory_or_warn,
-    prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
+    already_patched_result, cleanup_failed_stage, copy_matches_after_hashes, done, failed_result,
+    inventory_or_warn, prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
     swap_stage_into_place, synthesized_result,
 };
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
@@ -882,20 +882,6 @@ fn gem_entry(
         pdm: None,
         pipenv: None,
     }
-}
-
-/// Failure cleanup for a staged (re)build: always remove the stage, then
-/// either unwind the whole `<uuid>/` dir (`unwind_uuid_dir` — a fresh vendor
-/// with no pre-existing state worth keeping) or leave existing state
-/// untouched — a live-wired rebuild must never delete the copy the Gemfile
-/// `path:` and the lock's PATH `remote:` still point at; either way prune any
-/// empty-husk dirs left behind.
-async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
-    let _ = remove_tree(stage).await;
-    if unwind_uuid_dir {
-        let _ = remove_tree(uuid_dir).await;
-    }
-    prune_empty_vendor_levels(uuid_dir).await;
 }
 
 /// The path-source stub gemspec served as the gem's SECOND artifact, alongside

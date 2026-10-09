@@ -1581,13 +1581,11 @@ pub async fn run(args: GetArgs) -> i32 {
         print!("{}", format_selected_patches(&selected, color));
     }
 
-    // Agent-mode dry run: preview against the manifest, write nothing.
-    // (Hosted/vendored dry runs are handled inside their engines.) The
-    // per-release variant narrowing the wet run applies inside the
-    // download engine runs here too, so the preview names only the
-    // variants a wet run would fetch.
-    if args.common.dry_run && mode == super::scan::ScanMode::Agent {
-        let (selected, variant_warnings, _views) = filter_to_installed_releases(
+    // Agent wet runs and vendored runs narrow variants in their download
+    // engines. Hosted runs and agent previews need the same narrowing here.
+    let agent_preview = args.common.dry_run && mode == super::scan::ScanMode::Agent;
+    let selected = if agent_preview || mode == super::scan::ScanMode::Hosted {
+        let (selected, variant_warnings, _) = filter_to_installed_releases(
             &selected,
             args.all_releases,
             &args.common.crawler_options(),
@@ -1595,19 +1593,23 @@ pub async fn run(args: GetArgs) -> i32 {
             &api_client,
         )
         .await;
-        let mut narrow_warnings = narrow_warnings;
         narrow_warnings.extend(
             variant_warnings
                 .into_iter()
                 .map(|w| ("release_narrowing".to_string(), w)),
         );
+        selected
+    } else {
+        selected
+    };
+    if agent_preview {
         return agent_dry_run(&args, &selected, &narrow_skips, &narrow_warnings).await;
     }
 
     // Agent mode confirms before acting (default YES). Dry runs skip the
     // prompt: nothing mutates, so nothing to confirm. Hosted and vendored
     // runs never prompt (v5.0), like `scan`.
-    if mode == super::scan::ScanMode::Agent && !args.common.dry_run {
+    if mode == super::scan::ScanMode::Agent {
         let prompt = format_confirm_prompt(args.save_only, selected.len());
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if !quiet {
@@ -1619,30 +1621,6 @@ pub async fn run(args: GetArgs) -> i32 {
 
     match mode {
         super::scan::ScanMode::Hosted => {
-            // Per-release VARIANT narrowing (the finer layer under the
-            // coarse version narrowing above). Agent/vendored runs get it
-            // inside the download engines; hosted never downloads, so run
-            // it here — otherwise every PyPI wheel/sdist, gem platform, and
-            // Maven classifier variant of the installed version would be
-            // granted and rewritten, not just the installed distribution.
-            // Same fallbacks as everywhere else: uninstalled/unmatched
-            // bases keep all variants with a warning; --all-releases
-            // passes through. (The views it fetched are not needed here:
-            // hosted never downloads.)
-            let (selected, variant_warnings, _views) = filter_to_installed_releases(
-                &selected,
-                args.all_releases,
-                &args.common.crawler_options(),
-                quiet,
-                &api_client,
-            )
-            .await;
-            let mut narrow_warnings = narrow_warnings;
-            narrow_warnings.extend(
-                variant_warnings
-                    .into_iter()
-                    .map(|w| ("release_narrowing".to_string(), w)),
-            );
             return run_get_hosted(
                 &args,
                 &api_client,

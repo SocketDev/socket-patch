@@ -21,8 +21,7 @@
 use regex::Regex;
 use serde_json::Value;
 
-use super::npm::{by_uuid, read_or_refuse, refuse_all_in};
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::formats::nuget::{parse_config, NugetConfig};
 use crate::vendor::nuget_feed::normalize_nuget_version;
 

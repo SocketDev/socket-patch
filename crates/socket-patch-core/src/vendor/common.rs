@@ -352,6 +352,16 @@ pub(crate) fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
     swap_sibling_for(copy_dir, ".socket-old")
 }
 
+/// Remove a failed stage, optionally unwind a fresh UUID directory, and prune
+/// empty parents. Existing wired copies must survive failed rebuilds.
+pub(crate) async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
+    let _ = remove_tree(stage).await;
+    if unwind_uuid_dir {
+        let _ = remove_tree(uuid_dir).await;
+    }
+    prune_empty_vendor_levels(uuid_dir).await;
+}
+
 /// Swap a fully-built stage into place without a destructive window: park the
 /// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
 /// stage over the now-vacant copy path, and only then delete the backup. Every
