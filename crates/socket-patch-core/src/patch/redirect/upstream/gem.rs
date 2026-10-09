@@ -658,6 +658,15 @@ pub(crate) async fn restore(
                 Err(why) => result.refuse(&pin.uuid, why),
             }
         }
+        for pin in pins {
+            if !result.handled.contains(&pin.uuid) || result.refused.contains_key(&pin.uuid) {
+                continue;
+            }
+            if let Some(warning) = stale_cache_warning(view.root(), pin, lock.as_deref(), ctx).await
+            {
+                result.warnings.push(warning);
+            }
+        }
         if let (Some(next), Some(endings)) = (lock, endings) {
             let next = endings.restore(&next).into_owned();
             if lock_raw.as_deref() != Some(next.as_str()) {
@@ -671,6 +680,82 @@ pub(crate) async fn restore(
         }
     }
     result
+}
+
+/// The warning code for a patched archive left in Bundler's cache dir by
+/// an unwind (the restore-side counterpart of scan's
+/// `redirect_gem_stale_install`).
+pub(crate) const STALE_CACHE: &str = "upstream_gem_stale_cache";
+
+/// The `CHECKSUMS` sha256 the lock pins for `name (version)`, if any.
+fn lock_checksum(lock: &str, name: &str, version: &str) -> Option<String> {
+    let lines: Vec<&str> = lock.split('\n').collect();
+    let (s, e) = named_section(&lines, "CHECKSUMS")?;
+    lines[s..e].iter().find_map(|line| {
+        let entry = indented(line, 2)?.trim_end();
+        let (n, token, tail) = split_checksum_entry(entry)?;
+        if n != name || token != version {
+            return None;
+        }
+        tail.split_whitespace()
+            .find_map(|tok| tok.strip_prefix("sha256="))
+            .map(str::to_ascii_lowercase)
+    })
+}
+
+/// A restored gem whose `<name>-<version>.gem` still sits in Bundler's
+/// cache dir (`cache_path`, default `vendor/cache`) and is not proven to
+/// be the upstream archive: bundler installs from that dir before
+/// fetching, so the archive a `bundle cache` took while the hosted pin was
+/// live keeps installing the patched bytes (bundler < 2.6, frozen) or
+/// fails every install against the restored upstream checksum (#1260).
+/// The upstream sha is the restored lock's `CHECKSUMS` entry, else the
+/// rubygems.org compact index (already fetched when the restore re-pinned
+/// `CHECKSUMS`). Read-only, like scan's guard: the file is named, never
+/// deleted.
+async fn stale_cache_warning(
+    root: &std::path::Path,
+    pin: &HostedPin,
+    lock: Option<&str>,
+    ctx: &Ctx<'_>,
+) -> Option<(&'static str, String)> {
+    let (name, version) = pin.name_version()?;
+    let cache_dir = crate::crawlers::ruby_crawler::bundler_app_cache_dir(root).await;
+    let archive = cache_dir.join(format!("{name}-{version}.gem"));
+    if !archive.is_file() {
+        return None;
+    }
+    let got = crate::vendor::file_sha256_hex(&archive).await;
+    let upstream = match lock.and_then(|l| lock_checksum(l, &name, &version)) {
+        Some(sha) => Ok(sha),
+        None => ctx.client.rubygems_sha256(&name, &version).await,
+    };
+    let fix = "delete it and run `bundle install` (then `bundle cache` again if the \
+               project commits its cache)";
+    let detail = match (got, upstream) {
+        (Some(got), Ok(want)) if got.eq_ignore_ascii_case(&want) => return None,
+        (Some(_), Ok(_)) => format!(
+            "{purl} is back on its upstream registry entry, but Bundler's cache dir still \
+             holds a non-upstream (patched) archive at {path}; bundler installs from that \
+             dir first, so installs fail on the upstream checksum or keep the patched \
+             bytes: {fix}",
+            purl = pin.purl,
+            path = archive.display(),
+        ),
+        (_, why) => format!(
+            "{purl} is back on its upstream registry entry, but Bundler's cache dir holds \
+             {path}, which could not be checked against the upstream sha256{why}; if it \
+             was cached while the hosted patch was live, bundler keeps installing it: \
+             {fix}",
+            purl = pin.purl,
+            path = archive.display(),
+            why = match why {
+                Err(e) => format!(" ({e})"),
+                Ok(_) => " (the archive is unreadable)".to_string(),
+            },
+        ),
+    };
+    Some((STALE_CACHE, detail))
 }
 
 /// Restore one gem in a lock + manifest pair: `Ok(None)` when neither wires
@@ -1140,6 +1225,235 @@ mod tests {
         .expect("the redirect is found");
         assert_eq!(next_manifest.as_deref(), Some(manifest));
         assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
+    }
+
+    /// A hosted Gemfile + lock pair for `rails 7.0.0` (a direct gem), from
+    /// the real forward rewrite: `checksums` picks a converged
+    /// (bundler 2.6+) or a pre-CHECKSUMS (2.5) lock.
+    fn hosted_pair(checksums: bool, upstream_sha: &str) -> BTreeMap<String, String> {
+        let manifest = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nPLATFORMS\n  \
+             ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nCHECKSUMS\n  rails (7.0.0) \
+             sha256={upstream_sha}\n\nBUNDLED WITH\n   2.6.9\n"
+        );
+        let files = BTreeMap::from([
+            ("Gemfile".to_string(), manifest.to_string()),
+            ("Gemfile.lock".to_string(), lock),
+        ]);
+        let r = crate::patch::redirect::rewrite_registry_redirect(
+            &files,
+            &[crate::patch::redirect::DepOverride {
+                ecosystem: "gem".into(),
+                name: "rails".into(),
+                namespace: None,
+                version: "7.0.0".into(),
+                token: "tok".into(),
+                patch_uuid: UUID.into(),
+                artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                registry_override: Some(crate::patch::redirect::RegistryOverride {
+                    kind: "rubygems-compact-index".into(),
+                    index_url: IDX.into(),
+                    identifiers: crate::patch::redirect::RegistryOverrideIdentifiers {
+                        name: "rails".into(),
+                        version: "7.0.0".into(),
+                        gem_checksum_sha256: Some("f".repeat(64)),
+                        ..Default::default()
+                    },
+                }),
+                integrity: Default::default(),
+            }],
+        );
+        let mut out = r.files;
+        let lock = out.get_mut("Gemfile.lock").expect("the lock is redirected");
+        assert!(lock.contains(IDX), "{lock}");
+        if !checksums {
+            // Bundler 2.5 converges the same hosted lock with no CHECKSUMS.
+            let start = lock.find("CHECKSUMS\n").expect("a converged lock");
+            let end = start + lock[start..].find("\n\n").expect("a section end") + 2;
+            lock.replace_range(start..end, "");
+            assert!(!lock.contains("sha256="), "{lock}");
+        }
+        out
+    }
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// Restore the hosted pair from `hosted_pair` in a temp project whose
+    /// `cache_rel` dir holds `rails-7.0.0.gem` (unless `archive` is None),
+    /// returning the restore's warnings.
+    async fn restore_with_cache(
+        checksums: bool,
+        client: &super::super::UpstreamClient,
+        upstream_sha: &str,
+        bundle_config: Option<&str>,
+        cache_rel: &str,
+        archive: Option<&[u8]>,
+    ) -> (tempfile::TempDir, Vec<(&'static str, String)>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (rel, text) in hosted_pair(checksums, upstream_sha) {
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        if let Some(config) = bundle_config {
+            std::fs::create_dir_all(root.join(".bundle")).unwrap();
+            std::fs::write(root.join(".bundle/config"), config).unwrap();
+        }
+        if let Some(bytes) = archive {
+            std::fs::create_dir_all(root.join(cache_rel)).unwrap();
+            std::fs::write(root.join(cache_rel).join("rails-7.0.0.gem"), bytes).unwrap();
+        }
+        let pin = HostedPin {
+            purl: "pkg:gem/rails@7.0.0".into(),
+            uuid: UUID.into(),
+            files: vec!["Gemfile".into(), "Gemfile.lock".into()],
+        };
+        let ctx = ctx_with(client);
+        let mut view = View::new(root);
+        let r = restore(&mut view, &[&pin], &pin.files, &ctx).await;
+        assert!(r.refused.is_empty(), "{:?}", r.refused);
+        assert!(r.handled.contains(UUID));
+        (tmp, r.warnings)
+    }
+
+    fn stale_cache<'w>(warnings: &'w [(&'static str, String)]) -> Vec<&'w str> {
+        warnings
+            .iter()
+            .filter(|(code, _)| *code == STALE_CACHE)
+            .map(|(_, d)| d.as_str())
+            .collect()
+    }
+
+    /// #1260: `bundle cache` while the hosted pin was live left the
+    /// PATCHED archive in vendor/cache. The restored CHECKSUMS pins the
+    /// upstream sha, so every later install fails (exit 37) until that
+    /// file goes: the unwind must name it.
+    #[tokio::test]
+    async fn restore_warns_about_a_patched_archive_in_vendor_cache() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let (tmp, warnings) = restore_with_cache(
+            true,
+            &client,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"patched gem"),
+        )
+        .await;
+        let hits = stale_cache(&warnings);
+        assert_eq!(hits.len(), 1, "{warnings:?}");
+        let path = tmp.path().join("vendor/cache").join("rails-7.0.0.gem");
+        assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
+        assert!(hits[0].contains("pkg:gem/rails@7.0.0"), "{}", hits[0]);
+        assert!(hits[0].contains("non-upstream"), "{}", hits[0]);
+    }
+
+    /// #1260: an upstream archive in the cache (cached before the hosted
+    /// scan, or re-cached after) is healthy: no warning.
+    #[tokio::test]
+    async fn restore_keeps_quiet_about_an_upstream_archive_in_vendor_cache() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let (_tmp, warnings) = restore_with_cache(
+            true,
+            &client,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"upstream gem"),
+        )
+        .await;
+        assert!(stale_cache(&warnings).is_empty(), "{warnings:?}");
+        // No archive at all: nothing to say either.
+        let (_tmp, warnings) =
+            restore_with_cache(true, &client, &upstream_sha, None, "vendor/cache", None).await;
+        assert!(stale_cache(&warnings).is_empty(), "{warnings:?}");
+    }
+
+    /// #1260, `cache_path gems/cache`: the dir bundler reads is the
+    /// configured one, so that's the archive the warning names.
+    #[tokio::test]
+    async fn restore_follows_the_configured_bundle_cache_path() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let (tmp, warnings) = restore_with_cache(
+            true,
+            &client,
+            &upstream_sha,
+            Some("---\nBUNDLE_CACHE_PATH: \"gems/cache\"\n"),
+            "gems/cache",
+            Some(b"patched gem"),
+        )
+        .await;
+        let hits = stale_cache(&warnings);
+        assert_eq!(hits.len(), 1, "{warnings:?}");
+        let path = tmp.path().join("gems/cache").join("rails-7.0.0.gem");
+        assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
+    }
+
+    /// #1260 on bundler 2.5 (no CHECKSUMS): a frozen install takes the
+    /// cached patched archive without complaint, so the rollback silently
+    /// doesn't take effect. The upstream sha comes from rubygems.org; when
+    /// it can't be fetched (`--offline`) the warning still names the file.
+    #[tokio::test]
+    async fn restore_warns_about_a_cached_archive_without_checksums() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let (_tmp, warnings) = restore_with_cache(
+            false,
+            &client,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"patched gem"),
+        )
+        .await;
+        let hits = stale_cache(&warnings);
+        assert_eq!(hits.len(), 1, "{warnings:?}");
+        assert!(hits[0].contains("non-upstream"), "{}", hits[0]);
+
+        let (_tmp, warnings) = restore_with_cache(
+            false,
+            &client,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"upstream gem"),
+        )
+        .await;
+        assert!(stale_cache(&warnings).is_empty(), "{warnings:?}");
+
+        let offline = super::super::UpstreamClient::new(true);
+        let (tmp, warnings) = restore_with_cache(
+            false,
+            &offline,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"patched gem"),
+        )
+        .await;
+        let hits = stale_cache(&warnings);
+        assert_eq!(hits.len(), 1, "{warnings:?}");
+        let path = tmp.path().join("vendor/cache").join("rails-7.0.0.gem");
+        assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
+        assert!(hits[0].contains("could not be checked"), "{}", hits[0]);
     }
 
     #[test]

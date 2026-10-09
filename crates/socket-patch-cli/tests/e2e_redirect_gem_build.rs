@@ -3311,3 +3311,147 @@ async fn gem_hosted_cap_zero_upgrades_a_superseded_gemfile_only_pin() {
         "the Gemfile must move to the superseding patch:\n{gemfile}"
     );
 }
+
+/// Copy the committable files of `src` (manifest pair, `.bundle`, the
+/// committed bundler cache) into a new dir: a fresh checkout with no
+/// installed tree.
+fn checkout_with_cache(fx: &RedirectFixture, src: &Path, name: &str) -> PathBuf {
+    let fresh = fx.tmp.path().join(name);
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in [fx.gemfile_name, fx.lock_name] {
+        std::fs::copy(src.join(file), fresh.join(file)).unwrap();
+    }
+    copy_dir_recursive(&src.join(".bundle"), &fresh.join(".bundle"));
+    copy_dir_recursive(&src.join("vendor/cache"), &fresh.join("vendor/cache"));
+    fresh
+}
+
+/// #1260 through one unwind `command` (`rollback` / `remove`): a project
+/// that ran `bundle cache` while the hosted pin was live commits the
+/// PATCHED archive. The unwind puts the manifest pair back on rubygems.org
+/// but cannot make that archive upstream, and bundler installs from its
+/// cache first: a fresh checkout either fails on the restored upstream
+/// checksum (exit 37) or keeps installing the patched bytes. The unwind
+/// must name the file, and deleting it must be the whole remedy.
+fn unwind_names_the_patched_cached_archive(fx: &RedirectFixture, command: &str) {
+    let dir = stage_fresh_checkout(fx, &format!("cache-{command}"));
+    let install = bundle(&dir, &["install"]);
+    assert!(
+        install.status.success(),
+        "{command}: hosted install:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let cache_cmd = if fx.bundler.at_least(2, 0) {
+        "cache"
+    } else {
+        "package"
+    };
+    let cache = bundle(&dir, &[cache_cmd]);
+    assert!(
+        cache.status.success(),
+        "{command}: bundle {cache_cmd}:\n{}",
+        String::from_utf8_lossy(&cache.stderr)
+    );
+    let archive = dir
+        .join("vendor/cache")
+        .join(format!("{DEP}-{DEP_VERSION}.gem"));
+    assert!(
+        archive.is_file(),
+        "{command}: bundle {cache_cmd} wrote no archive"
+    );
+
+    let api = fx._server.uri();
+    let upstream = format!("{api}/upstream");
+    let cwd = dir.to_str().expect("utf8 tmp path");
+    let mut argv = vec![command, PURL, "--json", "--cwd", cwd];
+    if command == "remove" {
+        argv.push("--yes");
+    }
+    argv.extend([
+        "--api-url",
+        &api,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        &api,
+    ]);
+    let (code, stdout, stderr) = run_socket_env(&dir, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("{command}: not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "{command}: {env}\nstderr:\n{stderr}");
+    let lock = std::fs::read_to_string(dir.join(fx.lock_name)).unwrap();
+    assert!(
+        !lock.contains(&fx.index_url),
+        "{command}: the lock is back on upstream:\n{lock}"
+    );
+    let hits: Vec<&serde_json::Value> = env["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .filter(|w| w["code"] == "upstream_gem_stale_cache")
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(hits.len(), 1, "{command}: one stale-cache warning: {env}");
+    let detail = hits[0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(&archive.display().to_string()),
+        "{command}: the warning names the cached archive: {detail}"
+    );
+
+    // The defect the warning is about: with the archive left in place a
+    // fresh frozen checkout never installs the upstream bytes.
+    let stale = checkout_with_cache(fx, &dir, &format!("cache-{command}-stale"));
+    let install = bundle_env(&stale, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    let lib = fresh_installed_lib(&stale, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+    assert!(
+        !install.status.success() || std::fs::read(&lib).unwrap() == fx.patched,
+        "{command}: bundler {} must reuse the cached patched archive (test premise)",
+        fx.bundler.version
+    );
+
+    // The remedy the warning prescribes: delete the archive, and a fresh
+    // frozen checkout installs the upstream gem.
+    let fixed = checkout_with_cache(fx, &dir, &format!("cache-{command}-fixed"));
+    std::fs::remove_file(
+        fixed
+            .join("vendor/cache")
+            .join(format!("{DEP}-{DEP_VERSION}.gem")),
+    )
+    .unwrap();
+    let install = bundle_env(&fixed, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        install.status.success(),
+        "{command}: frozen install after deleting the archive:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let lib = fresh_installed_lib(&fixed, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+    assert_eq!(
+        std::fs::read(&lib).unwrap(),
+        orig_lib().into_bytes(),
+        "{command}: the upstream bytes are installed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_unwind_names_a_patched_archive_in_vendor_cache() {
+    let Some(fx) = redirect_scanned_project(
+        "cache-unwind",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    unwind_names_the_patched_cached_archive(&fx, "rollback");
+    unwind_names_the_patched_cached_archive(&fx, "remove");
+}
