@@ -668,8 +668,9 @@ fn open_paragraph(opened: &mut bool) {
 /// arm treats an empty merged set as a fetch failure). The two output
 /// knobs are human-only: `show_progress` shows the status-line counter on
 /// stderr, `warn` prints a warning per failed package once the loop is
-/// done — only when some query succeeded (when every one failed, the
-/// caller's error line carries the cause instead, so nothing repeats).
+/// done — only when some query succeeded, even with no records (when
+/// every one failed, the caller's error line carries the cause instead,
+/// so nothing repeats).
 async fn fetch_patch_details(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
@@ -711,7 +712,8 @@ async fn fetch_patch_details(
         }
     }
     status.finish();
-    if warn && !results.is_empty() {
+    // Not when every query failed: the caller's error line names it.
+    if warn && failures.len() < packages.len() {
         for (purl, e) in &failures {
             eprintln!("Warning: could not fetch details for {purl}: {e}");
         }
@@ -3219,19 +3221,6 @@ async fn run_scan(
             }
         }
         print_rollout_human(&stage, true, silent);
-        // `finish_human` previews the agent / report-only GC; vendored
-        // runs its own GC, so its dry run previews it here, as the
-        // `--json` arm reports it in `gc`.
-        if prune && vendor {
-            gc::run_human_gc(
-                &args.common,
-                &manifest_path,
-                &socket_dir,
-                &scanned_purls,
-                &vendored_purls,
-            )
-            .await;
-        }
         return finish_human(0).await;
     }
 
