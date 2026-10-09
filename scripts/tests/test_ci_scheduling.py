@@ -75,7 +75,9 @@ class Scheduling(unittest.TestCase):
         for family in ("e2e", "cargo-vex-matrix"):
             self.assertIn("pattern: e2e-bin-${{ matrix.os }}*", "\n".join(JOBS[family]))
         for job in ("e2e-build-macos", "e2e-macos", "cargo-vex-matrix-macos", "yarn-berry-e2e-macos"):
-            self.assertIn("    if: github.event_name != 'pull_request'", JOBS[job])
+            # Never on pull_request; lean scope also skips them (CI_SCOPE).
+            self.assertIn("    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full'"
+                          " || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')", JOBS[job])
 
     def test_row_reader_preserves_both_os_siblings(self):
         jobs = reader.jobs("""jobs:
