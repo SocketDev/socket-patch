@@ -58,6 +58,10 @@
 //! cannot reach the registry — unless `SOCKET_PATCH_NPM_E2E_REQUIRED` is set;
 //! every assertion after that is hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -99,10 +103,6 @@ const UUID_UNINSTALLED: &str = "9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f";
 const PURL_UNINSTALLED: &str = "pkg:npm/left-pad@9.9.9";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run the socket-patch binary with a scrubbed environment: every ambient
 /// `SOCKET_*` var is removed (so a developer's `SOCKET_DRY_RUN=1` etc. can't

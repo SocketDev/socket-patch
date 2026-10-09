@@ -95,6 +95,10 @@
 //! below the arm's floor; everything after that is hard — no live network is
 //! involved at all.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -146,10 +150,6 @@ fn patched_lib() -> String {
 const TINY_LIB: &str = "module TinyDep\n  VALUE = \"tiny-ok\"\nend\n";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run the socket-patch binary with the ambient `SOCKET_*` surface scrubbed
 /// (a developer's `SOCKET_DRY_RUN=1` must not steer the assertions) and

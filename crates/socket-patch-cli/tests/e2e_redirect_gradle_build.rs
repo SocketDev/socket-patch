@@ -18,6 +18,10 @@
 //! case is DSL-specific; toolchain selection is `gradle_build_common`'s
 //! `SOCKET_PATCH_GRADLE_E2E_*` knobs.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
@@ -84,10 +88,6 @@ fn coordinate() -> String {
 
 fn purl() -> String {
     jvm_fixture_repo::victim_purl(VICTIM_VERSION)
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
 fn central_file(path: &str) -> Vec<u8> {

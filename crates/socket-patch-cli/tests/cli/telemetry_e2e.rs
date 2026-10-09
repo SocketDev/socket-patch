@@ -8,17 +8,15 @@
 //! count). Each test runs the released binary in a tempdir against
 //! the mock URI.
 
-use std::path::{Path, PathBuf};
+use crate::common::binary;
+
+use std::path::Path;
 use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG_SLUG: &str = "telemetry-test-org";
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 fn write_root_package_json(root: &Path) {
     std::fs::write(

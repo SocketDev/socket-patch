@@ -27,10 +27,12 @@
 //! cargo test -p socket-patch-cli --test e2e_scan -- --ignored
 //! ```
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
 
-use sha2::{Digest, Sha256};
+use std::path::Path;
+use std::process::{Command, Output};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
@@ -62,10 +64,6 @@ const FAKE_OLD_UUID: &str = "11111111-1111-4111-8111-111111111111";
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
 fn has_command(cmd: &str) -> bool {
     let mut probe = Command::new(cmd);
     probe.arg("--version");
@@ -88,14 +86,6 @@ fn require_npm() {
         "npm not found on PATH; the e2e_scan suite requires npm. \
          Install npm before running with --ignored."
     );
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn git_sha256_file(path: &Path) -> String {

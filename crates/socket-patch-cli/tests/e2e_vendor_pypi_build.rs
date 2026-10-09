@@ -54,13 +54,16 @@
 //! older releases, whose lanes run in the `vendored_uv_*` tests. The pip
 //! capstones below keep their own `uv` discovery.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -110,10 +113,6 @@ fn manifestless_vex(fresh: &Path, what: &str, patched: &[u8], original: &[u8]) {
 const ORACLE: &str = "import six; print(six.SOCKET_PATCHED)";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run socket-patch with ambient `SOCKET_*` + `VIRTUAL_ENV` scrubbed
 /// (`VIRTUAL_ENV` is a python-crawler discovery input and must not leak from
@@ -238,13 +237,6 @@ fn assert_tool_ok(out: &Output, context: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Locate `<venv>/lib/python3.X/site-packages` (PEP-405 Unix layout).

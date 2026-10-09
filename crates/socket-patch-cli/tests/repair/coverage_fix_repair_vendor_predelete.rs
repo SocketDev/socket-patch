@@ -6,16 +6,13 @@
 //! forensic bytes must come back. Gem fixtures modeled on
 //! repair_vendor_e2e's.
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG_SLUG: &str = "test-org";
 const BEFORE: &[u8] = b"before\n";
@@ -28,14 +25,6 @@ const GEM_VERSION: &str = "1.2.0";
 const GEM_PURL: &str = "pkg:gem/padlock@1.2.0";
 const GEM_ENCODED: &str = "pkg%3Agem%2Fpadlock%401.2.0";
 const GEMSPEC_STUB: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.summary = \"repair fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn gem_copy_rel() -> String {
     format!(".socket/vendor/gem/{GEM_UUID}/{GEM_NAME}-{GEM_VERSION}")
