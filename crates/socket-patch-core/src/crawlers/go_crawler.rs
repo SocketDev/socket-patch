@@ -5,6 +5,7 @@ use super::listing::{list_dir_sync, ListedEntry};
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir_sync, run_blocking};
+use crate::vendor::go_mod_edit;
 use crate::vendor::go_sum_edit::go_sum_lines;
 
 #[cfg(test)]
@@ -280,21 +281,35 @@ fn locate_module(
 }
 
 /// The `(module, version)` of every module-zip line of `<cwd>/go.sum`
-/// (`/go.mod` lines hash only a manifest and are skipped), in file order.
-/// `None` when a Go workspace is in effect ([`workspace_in_effect`]: its
-/// build list spans other modules' `go.sum` and `go.work.sum`) or there is
-/// no readable `go.sum`; the crawl then walks the whole cache.
+/// (`/go.mod` lines hash only a manifest and are skipped), in file order,
+/// then every `require` of `<cwd>/go.mod` not already listed, sorted. The
+/// requires keep a module the project still builds against when its own
+/// go.sum lines are gone: a `replace`d module's go.sum records only the
+/// replacement (the hosted rewrite drops the original's lines, as
+/// `go mod tidy` does). `None` when a Go workspace is in effect
+/// ([`workspace_in_effect`]: its build list spans other modules' `go.sum`
+/// and `go.work.sum`) or there is no readable `go.sum`; the crawl then
+/// walks the whole cache.
 fn go_sum_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
     if workspace_in_effect(cwd) {
         return None;
     }
     let text = crate::utils::fs::read_regular_to_string_sync(&cwd.join("go.sum")).ok()?;
-    Some(
-        go_sum_lines(&text)
-            .filter(|line| !line.go_mod)
-            .map(|line| (line.module.to_string(), line.version.to_string()))
-            .collect(),
-    )
+    let mut scope: Vec<(String, String)> = go_sum_lines(&text)
+        .filter(|line| !line.go_mod)
+        .map(|line| (line.module.to_string(), line.version.to_string()))
+        .collect();
+    if let Ok(go_mod) = crate::utils::fs::read_regular_to_string_sync(&cwd.join("go.mod")) {
+        let listed: HashSet<(String, String)> = scope.iter().cloned().collect();
+        let mut required: Vec<(String, String)> =
+            go_mod_edit::parse_required_versions(&go_mod_edit::normalize_for_read(&go_mod))
+                .into_iter()
+                .filter(|pair| !listed.contains(pair))
+                .collect();
+        required.sort();
+        scope.extend(required);
+    }
+    Some(scope)
 }
 
 /// Whether the go command would build `cwd` in workspace mode: `GOWORK`
@@ -1464,6 +1479,31 @@ mod tests {
             assert_eq!(
                 f.crawl().await,
                 sorted(&["pkg:golang/github.com/gin-gonic/gin@v1.9.1"])
+            );
+        }
+
+        /// A `replace`d module's go.sum records only its replacement (the
+        /// hosted rewrite drops the original's lines, as `go mod tidy`
+        /// does), but go.mod still requires it: its cached copy is still
+        /// crawled, as the whole-cache walk did.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_required_module_without_go_sum_lines_is_still_crawled() {
+            let f = Fixture::new();
+            f.stage("github.com/gin-gonic/gin", "v1.9.1")
+                .stage("github.com/Azure/azure-sdk-for-go", "v1.0.0-RC1")
+                .stage("example.com/unrelated", "v0.1.0")
+                .go_sum(&[("github.com/gin-gonic/gin", "v1.9.1")], &[]);
+            write(
+                &f.project.join("go.mod"),
+                "\u{feff}module example.com/app\n\nrequire (\n\t\"github.com/gin-gonic/gin\" v1.9.1\n\tgithub.com/Azure/azure-sdk-for-go v1.0.0-RC1 // indirect\n)\n\nreplace github.com/Azure/azure-sdk-for-go v1.0.0-RC1 => patch.socket.dev/gopatch/x v1.0.0-RC1-socketpatch.1\n",
+            );
+            assert_eq!(
+                f.crawl().await,
+                sorted(&[
+                    "pkg:golang/github.com/Azure/azure-sdk-for-go@v1.0.0-RC1",
+                    "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
+                ])
             );
         }
 
