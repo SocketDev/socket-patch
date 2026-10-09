@@ -69,6 +69,45 @@ class BunTransportRetryTests(unittest.TestCase):
         self.assertTrue(bun.has_transport_failure(['API request failed with status 504: error code: 504']))
         self.assertFalse(bun.has_transport_failure({'error': 'API request failed with status 404: not found'}))
 
+    def test_a_harness_fetch_5xx_is_a_transport_failure(self):
+        # run 37852649519: hosted_lockb_digest's urlopen of patch.socket.dev
+        # raised this on all four bun.lockb legs and none of them retried.
+        self.assertTrue(bun.has_transport_failure({'error': 'HTTP Error 503: Service Unavailable'}))
+        self.assertTrue(bun.has_transport_failure({'error': 'HTTP Error 429: Too Many Requests'}))
+        self.assertTrue(bun.has_transport_failure(
+            {'error': '<urlopen error [Errno 104] Connection reset by peer>'}))
+        self.assertFalse(bun.has_transport_failure({'error': 'HTTP Error 404: Not Found'}))
+
+    def test_a_failed_install_fetch_is_a_transport_failure(self):
+        output = 'bun install v1.0.0\nerror: GET https://patch.socket.dev/x.tgz - 503\n'
+        row = dict(passed=False, checks={'frozenPatchedBytes': False},
+                   frozenInstallTransport=bun.bun_transport_failures(output))
+        self.assertTrue(bun.has_transport_failure(row))
+        row['frozenInstallTransport'] = bun.bun_transport_failures('bun install v1.0.0\n')
+        self.assertFalse(bun.has_transport_failure(row))
+
+    def test_a_harness_fetch_5xx_cell_retries_fresh(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            job = ('0.8.1', 'vendored-then-hosted', 'vendored')
+            case = root / 'captures' / '-'.join(job)
+            calls = []
+
+            def run_case(_job):
+                case.mkdir(parents=True)
+                calls.append(True)
+                row = dict(passed=len(calls) > 1, checks={'frozenPatchedBytes': len(calls) > 1})
+                if len(calls) == 1:
+                    row['error'] = 'HTTP Error 503: Service Unavailable'
+                bun.save(case / 'result.json', row)
+                return row
+
+            with patch.object(bun.time, 'sleep'):
+                row = bun.retry_network_cell(run_case, job, root)
+            self.assertTrue(row['passed'])
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(row['networkRetryAttempts'][0]['failedChecks'], ['frozenPatchedBytes'])
+
     def test_functional_failure_is_never_retried(self):
         with tempfile.TemporaryDirectory() as temp:
             row = dict(passed=False, checks={'frozenPatchedBytes': False}, error='installed bytes differ')
@@ -773,6 +812,39 @@ class VltOracleTests(unittest.TestCase):
                          'custom-registry', 'mirror', 'scalar-registry', 'lockfile-only',
                          'hosted-then-vendored', 'vendored-then-hosted', 'get-uuid'}
         self.assertLessEqual(set(vlt.SHAPES), capture_names)
+
+
+class VltInstalledBytesTests(unittest.TestCase):
+    def test_holds_checks_root_and_nested_files_with_optional_package_prefix(self):
+        contents = {
+            'index.js': {'before': b'original entrypoint', 'after': b'patched entrypoint'},
+            'test/proto.js': {'before': b'original test', 'after': b'patched test'},
+        }
+        for prefix in ('', 'package/'):
+            for side in ('before', 'after'):
+                with self.subTest(prefix=prefix, side=side), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    package = root / 'node_modules' / 'minimist'
+                    record = {'files': {
+                        prefix + name: {s + 'Hash': vlt.git_hash(data) for s, data in sides.items()}
+                        for name, sides in contents.items()
+                    }}
+                    cell = vlt.Cell({'out': root, 'record': record}, '1.2.0', 'vendored', 'direct')
+                    expected = {}
+                    for name, sides in contents.items():
+                        path = package / name
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(sides[side])
+                        expected[str(path.relative_to(root))] = vlt.git_hash(sides[side])
+                    self.assertEqual(cell.holds(root, '{}', side), (True, expected))
+                    other_side = 'after' if side == 'before' else 'before'
+                    self.assertFalse(cell.holds(root, '{}', other_side)[0])
+
+                    nested = package / 'test' / 'proto.js'
+                    nested.write_bytes(b'corrupted')
+                    self.assertFalse(cell.holds(root, '{}', side)[0])
+                    nested.unlink()
+                    self.assertFalse(cell.holds(root, '{}', side)[0])
 
 
 class VltConfigTests(unittest.TestCase):

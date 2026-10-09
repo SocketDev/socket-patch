@@ -117,7 +117,7 @@ SHAPES = ['direct', 'dev', 'optional', 'alias', 'transitive', 'two-versions',
 # former `vendored-detached` leg collapsed into `vendored`: same footprint.
 MODES = ['hosted', 'vendored']
 PURL = 'pkg:npm/minimist@1.2.2'
-UUID = '80630680-4da6-45f9-bba8-b888e0ffd58c'
+UUID = '642d7f02-ebc1-4ab0-99e2-07f5dd8463cb'
 # The registry slot bun writes for a non-default registry: the full tarball URL.
 REGISTRY_SLOT = 'https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz'
 LOCAL_TUPLE_SPEC = f'minimist@.socket/vendor/npm/{UUID}/minimist-1.2.2.tgz'
@@ -187,11 +187,12 @@ CLI_TRANSPORT_FAILURE = re.compile(r'error sending request for url \(|API reques
 BUN_TRANSPORT_FAILURE = re.compile(
     r'^error: (?:Connection\w+|FailedToOpenSocket|Timeout|TLSHandshakeTimeout) downloading '
     r'|^error: GET \S+ - 5\d\d\b', re.M)
-
 # The harness's own fetches (published record, hosted tarball digest) that
 # still fail after their in-place retries surface as the cell's `error`:
-# `<urlopen error [Errno 104] Connection reset by peer>`.
-HARNESS_TRANSPORT_FAILURE = re.compile(r'^<urlopen error |^\[(?:Win)?Errno \d+\] Connection reset')
+# a 5xx / 429 (`HTTP Error 503: Service Unavailable`) or no response at all
+# (`<urlopen error [Errno 104] Connection reset by peer>`).
+HARNESS_TRANSPORT_FAILURE = re.compile(
+    r'\bHTTP Error (?:5\d\d|429)\b|^<urlopen error |^\[(?:Win)?Errno \d+\] Connection reset')
 
 
 def bun_transport_failures(output):
@@ -201,7 +202,8 @@ def bun_transport_failures(output):
 
 def has_transport_failure(value):
     """Only explicit request transport errors (a request error or a patch API
-    5xx, from the CLI or from bun's fetch) qualify for a fresh-cell retry."""
+    5xx, from the CLI, from bun's fetch or from the harness's own fetch)
+    qualify for a fresh-cell retry."""
     if isinstance(value, dict):
         return any(has_transport_failure(item) for item in value.values())
     if isinstance(value, list):
@@ -1155,10 +1157,12 @@ def main():
                         ('warmOrdinary', [], 'cache-ordinary')]:
                     if shape == 'production':
                         flags = [*flags, '--production']
-                    code, _ = install(bun, label, flags, cache=cache)
+                    code, output = install(bun, label, flags, cache=cache)
                     correct, hashes = oracle(project, record, 'after')
                     checks[label + 'PatchedBytes'] = code == 0 and correct
                     row[label + 'Files'] = hashes
+                    # Kept so a fetch failure here qualifies the cell for a retry.
+                    row[label + 'InstallTransport'] = bun_transport_failures(output)
                     installed_lock = lock.read_bytes()
                     if (lockb_origin and label == 'ordinary' and installed_lock != patched_lock
                             and ver(version) >= (1, 2, 23)):
