@@ -1874,29 +1874,16 @@ fn rewrite_cargo(
         // a Socket pin would silently replace the user's override with the
         // crates.io-based patched bytes while the stale `[patch]` entry
         // breaks `--locked` (#480). The lock is the authority (it sees every
-        // config in the chain); without one, the override tables the
-        // rewriter can read answer instead.
-        let overridden = match cargo_lock.as_deref() {
-            Some(lock_text) => {
-                cargo_lock_override_source(lock_text, &dep.name, &dep.version, || {
-                    cargo_patch_override_table(&manifests, files, &dep.name)
-                })
+        // config in the chain) and is checked on the lock planner's own
+        // parse below; without one, the override tables the rewriter can
+        // read answer here.
+        if cargo_lock.is_none() {
+            if let Some(how) = cargo_patch_override_table(&manifests, files, &dep.name) {
+                result
+                    .warnings
+                    .push(cargo_overridden_warning(&dep.name, &dep.version, &how));
+                continue;
             }
-            None => cargo_patch_override_table(&manifests, files, &dep.name),
-        };
-        if let Some(how) = overridden {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_cargo_dep_overridden".into(),
-                detail: format!(
-                    "{}@{} is overridden in this project ({how}), so it does not resolve to \
-                     the crates.io package the patch targets; pinning it to the Socket \
-                     registry would drop the override and break `cargo --locked` — \
-                     dependency skipped (nothing rewritten). Remove the override to use \
-                     hosted mode, or patch the overriding source yourself",
-                    dep.name, dep.version
-                ),
-            });
-            continue;
         }
         // A pin reaches only the declarations it sits on: every OTHER lock
         // package depending on the crate — a registry/git crate, or a path
@@ -1955,7 +1942,19 @@ fn rewrite_cargo(
         let lock_commit = if let Some(lock_text) = cargo_lock.as_ref() {
             // A lock that does not parse never reaches here: the dependents
             // check above refuses it.
-            let plan = CargoLock::parse(lock_text).map_or(CargoLockPlan::NotFound, |lock| {
+            let parsed = CargoLock::parse(lock_text).ok();
+            let overridden = parsed.as_ref().and_then(|lock| {
+                cargo_lock_override_source(lock, &dep.name, &dep.version, || {
+                    cargo_patch_override_table(&manifests, files, &dep.name)
+                })
+            });
+            if let Some(how) = overridden {
+                result
+                    .warnings
+                    .push(cargo_overridden_warning(&dep.name, &dep.version, &how));
+                continue;
+            }
+            let plan = parsed.map_or(CargoLockPlan::NotFound, |lock| {
                 lock.plan_hosted(lock_text, &dep.name, &dep.version, index_url, &cksum)
             });
             match plan {
@@ -2253,15 +2252,13 @@ fn is_socket_cargo_index(source: &str) -> bool {
 /// takeover's revert leaves for a crate vendored before any lock existed
 /// (its `[patch]` wiring already gone), which the planner then pins. A path
 /// DECLARATION is refused before this. `None` when it is a crates.io /
-/// Socket block, absent, ambiguous (the lock planner refuses those) or the
-/// lock does not parse (the dependents check refuses that).
+/// Socket block, absent or ambiguous (the lock planner refuses those).
 fn cargo_lock_override_source(
-    lock: &str,
+    lock: &CargoLock,
     crate_name: &str,
     version: &str,
     visible_override: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    let lock = CargoLock::parse(lock).ok()?;
     let mut hits = lock
         .packages()
         .iter()
@@ -2280,6 +2277,21 @@ fn cargo_lock_override_source(
             "Cargo.lock resolves it from a registry other than crates.io — a `[patch]` \
              registry override"
                 .to_string(),
+        ),
+    }
+}
+
+/// The `redirect_cargo_dep_overridden` refusal for `name@version`, `how`
+/// naming the override.
+fn cargo_overridden_warning(name: &str, version: &str, how: &str) -> RewriteWarning {
+    RewriteWarning {
+        code: "redirect_cargo_dep_overridden".into(),
+        detail: format!(
+            "{name}@{version} is overridden in this project ({how}), so it does not resolve to \
+             the crates.io package the patch targets; pinning it to the Socket registry would \
+             drop the override and break `cargo --locked` — dependency skipped (nothing \
+             rewritten). Remove the override to use hosted mode, or patch the overriding \
+             source yourself"
         ),
     }
 }
