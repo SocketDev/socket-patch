@@ -45,7 +45,7 @@ pub type RegistryClient = reqwest::Client;
 pub fn build_registry_client() -> RegistryClient {
     registry_client_builder(USER_AGENT)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("failed to build registry HTTP client")
 }
 
 /// The one builder behind every registry client (npm-family, PyPI, Go,
@@ -55,7 +55,7 @@ pub fn build_registry_client() -> RegistryClient {
 /// artifact that keeps streaming is never cut off while a stalled host
 /// still fails the fetch.
 pub(crate) fn registry_client_builder(user_agent: &str) -> reqwest::ClientBuilder {
-    registry_timeouts().apply(reqwest::Client::builder().user_agent(user_agent))
+    registry_timeouts().apply(crate::utils::http::client_builder().user_agent(user_agent))
 }
 
 fn registry_timeouts() -> ApiTimeouts {
@@ -935,8 +935,16 @@ pub(crate) fn extract_zip_with_prefix_skipping(
 
 /// Capped download. http(s) only; [`crate::utils::http::read_capped`]
 /// enforces [`MAX_DOWNLOAD_BYTES`] on the declared Content-Length AND the
-/// actual stream (a lying server cannot blow past it).
+/// actual stream (a lying server cannot blow past it). Every error quotes
+/// the URL redacted (userinfo from a GOPROXY or `.npmrc` registry, a grant
+/// token, a signed query), reqwest's own error text included.
 pub(crate) async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+    download_unredacted(client, url)
+        .await
+        .map_err(|e| crate::utils::redact::redact_urls_in(&e).into_owned())
+}
+
+async fn download_unredacted(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("refusing non-http(s) artifact URL `{url}`"));
     }
@@ -2507,6 +2515,39 @@ mod tests {
         let wrong = b64.encode(Sha256::digest(b"other"));
         let err = verify_sri(bytes, &format!("sha256-{wrong}")).unwrap_err();
         assert!(err.contains("sha256"), "{err}");
+    }
+
+    /// Every `download` error quotes its URL redacted: a refused scheme, an
+    /// HTTP error status and a transport failure (reqwest's own text).
+    #[tokio::test]
+    async fn download_errors_never_carry_a_credential() {
+        const UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let served = server.uri().replace("http://", "http://u:pw@");
+        // A port nothing listens on: the connect fails.
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        for url in [
+            format!("ftp://u:pw@h.example/patch/npm/a/1.0.0/GRANTTOKEN/{UUID}/a.tgz"),
+            format!("{served}/patch/npm/a/1.0.0/GRANTTOKEN/{UUID}/a.tgz?token=QSECRET"),
+            format!("http://u:pw@{dead}/patch/npm/a/1.0.0/GRANTTOKEN/{UUID}/a.tgz"),
+        ] {
+            let err = download(&build_registry_client(), &url).await.unwrap_err();
+            for needle in ["GRANTTOKEN", "u:pw", "QSECRET"] {
+                assert!(!err.contains(needle), "{needle} in {err}");
+            }
+            assert!(
+                err.contains(UUID),
+                "the error still names the artifact: {err}"
+            );
+        }
     }
 
     #[tokio::test]

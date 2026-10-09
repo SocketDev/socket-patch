@@ -73,6 +73,23 @@ Remove the old CLI with the manager that installed it (`pip uninstall socket-pat
 [supported channel](../README.md#installation), update CI bootstrap commands, and
 run `socket-patch --version` to check which binary your shell finds.
 
+## Support tiers
+
+v5 keeps every lockfile format in the support matrix, including the ones the package
+managers have retired. The [v5 support tiers](ecosystems.md#v5-support-tiers) say how
+mature each one is.
+
+- **Beta:** Maven and Gradle in hosted and vendored mode, and sbt / Mill / scala-cli.
+  They work for the documented build shapes. Run the build before you rely on the
+  result or on a `--vex` document.
+- **Legacy:** binary `bun.lockb` (hosted and vendored), vendored pnpm 7/8 locks
+  (lockfileVersion 5.4 / 6.0) and vlt locks from before 1.0.0-rc.15. They keep
+  working in v5, with an upgrade path and an undo path for each. Plan to move to text
+  `bun.lock`, pnpm 9+ or vlt 1.0+; a future major release may stop writing these
+  formats.
+- No v5.x minor or patch release removes a format or makes one refuse that v5.0
+  accepts. See the [support policy](ecosystems.md#support-policy).
+
 ## Retire `setup` hooks
 
 `socket-patch setup` is removed. Existing hooks may still call `apply`, but v5 no
@@ -160,10 +177,12 @@ whole root, not a `vendor_jvm_degraded` warning on mixed Maven + Gradle roots.
 | `get --no-apply` | `get --save-only` (`SOCKET_SAVE_ONLY` is unchanged) |
 | `socket-patch download` | `socket-patch get` |
 | `socket-patch gc` | `socket-patch repair` |
+| `--download-mode`, `SOCKET_DOWNLOAD_MODE` | No replacement; patch content is always fetched as per-file blobs |
 | `SOCKET_FORCE` | Pass `--force` to the one command that needs it (`apply`, `vendor`, `--update`); the variable is now ignored |
 
 A removed spelling is a usage error (exit 2). `scan --sync` stays as the
 shorthand for `scan --mode agent --prune`.
 
-Legacy `.socket/packages/` archives are no longer read. Patch data uses diff
-archives or blobs; cleanup commands remove obsolete package archives.
+Legacy `.socket/packages/` and `.socket/diffs/` archives are no longer read.
+Patch data uses per-file blobs (`.socket/blobs/`); cleanup commands remove the
+obsolete archives.

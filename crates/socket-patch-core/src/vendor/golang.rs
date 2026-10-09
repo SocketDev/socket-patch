@@ -544,13 +544,7 @@ async fn go_service_redirect(
             format!("failed to update go.mod: {e}"),
         ));
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {module} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
+    warnings.push(archive.downloaded_warning(module));
     Ok(file_inventory)
 }
 
@@ -1016,7 +1010,6 @@ mod tests {
             GO_PATCHES_DIR,
             &record.files,
             &sources,
-            Some(UUID),
             false,
             MismatchPolicy::Warn,
         )
@@ -1078,7 +1071,6 @@ mod tests {
                 GO_PATCHES_DIR,
                 &record.files,
                 &sources,
-                Some(UUID),
                 false,
                 MismatchPolicy::Warn,
             )
@@ -1387,7 +1379,6 @@ mod tests {
             GO_PATCHES_DIR,
             &record.files,
             &sources,
-            Some(UUID),
             false,
             MismatchPolicy::Warn,
         )
@@ -2143,7 +2134,6 @@ mod tests {
             GO_PATCHES_DIR,
             &record.files,
             &sources,
-            Some(UUID),
             false,
             MismatchPolicy::Warn,
         )

@@ -234,7 +234,6 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["cargo".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
@@ -348,7 +347,6 @@ async fn cargo_apply_refuses_on_before_hash_mismatch() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["cargo".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             // strict pins the fail-closed contract: the v3.4 default (and
             // --force) deliberately downgrade a hash mismatch to "ready"
@@ -449,7 +447,6 @@ async fn cargo_crawler_finds_real_fetched_crate() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["cargo".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },

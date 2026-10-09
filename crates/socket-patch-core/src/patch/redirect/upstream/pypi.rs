@@ -231,7 +231,7 @@ fn pipfile_explicit_index(pipfile: &str, name: &str) -> Option<String> {
 
 /// One hosted `Pipfile.lock` entry.
 struct PipenvHit {
-    /// Index into the lock's `pipenv::entries`.
+    /// Index into the lock's `formats::pipenv::entries`.
     entry: usize,
     uuid: String,
     name: String,
@@ -251,7 +251,7 @@ pub(crate) async fn restore_pipfile_lock(
             continue;
         };
         let (entries, doc) = match (
-            super::super::pipenv::entries(&text),
+            crate::formats::pipenv::entries(&text),
             crate::vendor::lock_inventory::pypi::parse_pipfile_lock(&text),
         ) {
             (Ok(entries), Ok(doc)) => (entries, doc),
@@ -366,7 +366,7 @@ pub(crate) async fn restore_pipfile_lock(
             object.insert("hashes".into(), json!(hashes));
             let mut value = Value::Object(object);
             value.sort_all_objects();
-            match super::super::pipenv::format_entry(&value, &text, entry.range.start) {
+            match crate::formats::pipenv::format_entry(&value, &text, entry.range.start) {
                 Ok(rendered) => splices.push((entry.range.clone(), rendered, hit.uuid.clone())),
                 Err(e) => result.refuse(&hit.uuid, format!("{rel}: {e}")),
             }

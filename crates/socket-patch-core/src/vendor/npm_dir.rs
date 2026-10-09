@@ -849,6 +849,7 @@ pub(super) async fn try_service_dir(
     let policy = ServicePolicy::Failure(purl);
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
     let archive = policy.settle(fetched, "artifact", "artifact")?;
+    let downloaded = archive.downloaded_warning(format_args!("{name}@{version}"));
     let (bytes, dest) = (archive.bytes, stage.to_path_buf());
     let extracted = tokio::task::spawn_blocking(move || {
         super::registry_fetch::extract_tgz_strict(&bytes, &dest)
@@ -869,13 +870,7 @@ pub(super) async fn try_service_dir(
                  at their recorded paths"
         )));
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {name}@{version} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
+    warnings.push(downloaded);
     Ok(())
 }
 

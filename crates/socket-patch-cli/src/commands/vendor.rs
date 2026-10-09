@@ -4635,7 +4635,6 @@ mod dispatch_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
         let service = GlobalArgs {
@@ -5019,7 +5018,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5102,7 +5100,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5208,7 +5205,6 @@ mod variant_probe_tests {
             let common = dry_run_over(tmp.path(), &site);
             let sources = PatchSources {
                 blobs_path: tmp.path(),
-                diffs_path: None,
                 mem_blobs: None,
             };
             let mut state = VendorState::default();
@@ -5260,7 +5256,6 @@ mod variant_probe_tests {
         let common = dry_run_over(tmp.path(), &site);
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5319,7 +5314,6 @@ mod variant_probe_tests {
         let common = dry_run_over(tmp.path(), &site);
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 

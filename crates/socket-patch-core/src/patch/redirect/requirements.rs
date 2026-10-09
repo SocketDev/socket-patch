@@ -128,8 +128,17 @@ fn without_hashes(text: &str) -> String {
 }
 
 enum RequirementVersion {
-    /// `==X` (PEP 440 equality), or a direct reference whose archive names X.
+    /// `==X` (PEP 440 equality), or socket-patch's own hosted direct
+    /// reference whose archive names X (a re-scan).
     Exact(String),
+    /// A direct reference to an archive naming release X that is NOT
+    /// socket-patch's hosted artifact: a public-index file, a private
+    /// mirror, an internal fork build, a `file://` path. That is the user's
+    /// own source choice, never rewritten (#542).
+    UserReference {
+        location: String,
+        version: String,
+    },
     /// `===X`: arbitrary equality, a plain string comparison.
     Arbitrary(String),
     Unpinned,
@@ -164,8 +173,17 @@ fn requirement_version(specifier: &str, name_re: &Regex, name: &str) -> Requirem
         return RequirementVersion::Unpinned;
     }
     if let Some(location) = tail.strip_prefix('@') {
-        return archive_version(location.trim(), name)
-            .map_or(RequirementVersion::Ambiguous, RequirementVersion::Exact);
+        let location = location.trim();
+        let Some(version) = archive_version(location, name) else {
+            return RequirementVersion::Ambiguous;
+        };
+        if crate::vendor::lock_inventory::pypi::socket_reference_coords(location).is_none() {
+            return RequirementVersion::UserReference {
+                location: location.to_string(),
+                version,
+            };
+        }
+        return RequirementVersion::Exact(version);
     }
     let (arbitrary, version) = match tail.strip_prefix("===") {
         Some(version) => (true, Some(version)),
@@ -264,6 +282,23 @@ pub(super) fn rewrite(
                     continue
                 }
                 RequirementVersion::Arbitrary(version) if version != dep.version => continue,
+                RequirementVersion::UserReference { version, .. }
+                    if !crate::utils::pep440::versions_equal(&version, &dep.version) =>
+                {
+                    continue
+                }
+                RequirementVersion::UserReference { location, .. } => {
+                    matched = true;
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_requirements_direct_reference".into(),
+                        detail: format!(
+                            "requirements.txt installs {}@{} from the direct reference {location}; \
+                             refusing to overwrite a user-authored source (not rewritten)",
+                            dep.name, dep.version
+                        ),
+                    });
+                    continue;
+                }
                 RequirementVersion::Exact(_) | RequirementVersion::Arbitrary(_) => {}
                 RequirementVersion::Unpinned
                     if row_counts.get(&target) == Some(&1)
@@ -742,17 +777,53 @@ mod tests {
             )
         );
         assert_eq!(result.edits.len(), 1);
-        for source in [
-            "requests @ https://files.pythonhosted.org/requests-2.28.1.tar.gz#sha256=old",
-            "requests ( == 2.28.1 )",
-            "requests===2.28.1",
-        ] {
+        for source in ["requests ( == 2.28.1 )", "requests===2.28.1"] {
             let result = rewrite_registry_redirect(&input(source), &[patch()]);
             assert_eq!(
                 result.files["requirements.txt"],
                 format!("requests @ {URL}#sha256={HASH}")
             );
         }
+    }
+
+    /// #542: a direct reference the user wrote — a public-index file, a
+    /// private mirror, an internal fork, a `file://` path — is their own
+    /// source choice: refused with a warning and left byte-for-byte, never
+    /// swapped for the hosted build (whose rollback would then write a
+    /// plain index pin, losing the original source).
+    #[test]
+    fn user_direct_references_are_refused_not_rewritten() {
+        for location in [
+            "https://files.pythonhosted.org/requests-2.28.1.tar.gz#sha256=old",
+            "http://127.0.0.1:18766/requests-2.28.1-py3-none-any.whl",
+            "file:///abs/private/requests-2.28.1-py3-none-any.whl",
+            "https://mirror.internal/requests-2.28.01-py3-none-any.whl",
+        ] {
+            let source = format!("idna==3.7\nrequests @ {location} ; python_version >= '3.7'\n");
+            let result = rewrite_registry_redirect(&input(&source), &[patch()]);
+            assert!(
+                result.files.is_empty() && result.edits.is_empty(),
+                "{location}"
+            );
+            let codes: Vec<_> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                ["redirect_requirements_direct_reference"],
+                "{location}"
+            );
+            assert!(result.warnings[0].detail.contains(location));
+            assert!(result.confirmed_requirements_uuids.is_empty());
+        }
+        // A user reference to another release is not this patch's entry.
+        let result = rewrite_registry_redirect(
+            &input("requests @ https://mirror.internal/requests-2.32.0-py3-none-any.whl\n"),
+            &[patch()],
+        );
+        assert!(result.files.is_empty());
+        assert_eq!(
+            result.warnings[0].code,
+            "redirect_requirements_entry_not_found"
+        );
     }
 
     /// #376: an unhashed requirements file must stay unhashed. pip turns
