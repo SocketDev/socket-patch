@@ -92,10 +92,12 @@ use super::{
 use crate::formats::yarn::blocks::{berry_field, classic_field};
 use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::{
-    classic_key_real_name, pattern_real_name, resolution_selector_target, split_resolved_sha1,
-    BerryLocator,
+    classic_key_real_name, pattern_real_name, resolution_selector_target, split_pattern,
+    split_resolved_sha1, BerryLocator,
 };
-use crate::formats::yarn::source::{classic_copy_source, CopySource};
+use crate::formats::yarn::source::{
+    classic_copy_source, manifest_name, registry_tarball_name, CopySource,
+};
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
     berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,
@@ -124,7 +126,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if is_berry_lock(text) {
         extract_berry(ctx, berry_entries(text), out).await;
     } else {
-        extract_classic(ctx, classic_entries(text), out);
+        extract_classic(ctx, classic_entries(text), out).await;
     }
 }
 
@@ -139,12 +141,45 @@ fn stray_top_level_line(text: &str) -> Option<&str> {
 
 // ── classic ──────────────────────────────────────────────────────────────
 
-fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Discovery) {
+async fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Discovery) {
+    let mut copies: Vec<LockCopy> = Vec::new();
     for entry in entries {
         if entry.live && !entry.patterns.is_empty() {
-            classic_block(ctx, &entry, out);
+            classic_block(ctx, &entry, &mut copies, out);
         }
     }
+    record_copies(ctx, copies, out).await;
+}
+
+/// The copy a classic `file:` / url block installs, to be read for the
+/// package it really holds ([`record_copies`], #1236): yarn 1 keys it by the
+/// DEPENDENCY name (`"lp2@file:./lpdir"`), like berry. The `file:` path is
+/// the key pattern's, relative to the root (a path yarn resolved against a
+/// workspace member reads nothing there, and is left alone).
+fn classic_copy(entry: &YarnEntry, resolved: Option<&str>) -> Option<LockCopy> {
+    let version = classic_field(&entry.block.lines, "version")?;
+    let file = entry.patterns.iter().find_map(|p| {
+        let (_, range) = split_pattern(p)?;
+        range.strip_prefix("file:")
+    });
+    let source = match file {
+        Some(path) => {
+            let path = path.split('#').next().unwrap_or_default();
+            CopyRef::File(crate::utils::cargo_workspace::normalize_rel("", path)?)
+        }
+        None => {
+            let url = resolved?.split('#').next().unwrap_or_default();
+            if !url.starts_with("http") {
+                return None;
+            }
+            CopyRef::Url(url.to_string())
+        }
+    };
+    Some(LockCopy {
+        key: entry.block.key.clone(),
+        source,
+        version: version.to_string(),
+    })
 }
 
 /// The purl a block stands for when every key pattern names one package.
@@ -165,7 +200,12 @@ fn classic_block_purl(entry: &YarnEntry) -> Option<String> {
 /// installs ONE copy per `name@version`, and which block it takes depends
 /// on which pattern it resolves first, so no wiring of the same version in
 /// this lock is attested beside it.
-fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) {
+fn classic_block(
+    ctx: &DiscoverCtx<'_>,
+    entry: &YarnEntry,
+    copies: &mut Vec<LockCopy>,
+    out: &mut Discovery,
+) {
     let YarnEntry {
         block, patterns, ..
     } = entry;
@@ -205,6 +245,9 @@ fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) 
                 "installs from a file: directory, which yarn copies into node_modules \
                  rather than fetching a tarball",
             );
+            // Locked under the dependency name: the directory's own
+            // `package.json` says which package this copy is (#1236).
+            copies.extend(classic_copy(entry, resolved));
             return;
         }
         // `link:` ranges install from the working tree; `resolved` is inert.
@@ -238,6 +281,13 @@ fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) 
                      first)"
                 ),
             );
+        }
+        // A user's `file:` tarball or url copy is keyed by the dependency
+        // name, so the package it installs is read from the copy (#1236).
+        if classic_copy_source(patterns, Some(resolved)) == CopySource::RemoteTarball
+            && !root_anchored_spelling(resolved)
+        {
+            copies.extend(classic_copy(entry, Some(resolved)));
         }
         return;
     };
@@ -299,7 +349,7 @@ struct BerryHostedKeyed {
 async fn extract_berry(ctx: &DiscoverCtx<'_>, lock: BerryLock, out: &mut Discovery) {
     let mut vendored: Vec<BerryVendored> = Vec::new();
     let mut hosted_keyed: Vec<BerryHostedKeyed> = Vec::new();
-    let mut copies: Vec<BerryCopy> = Vec::new();
+    let mut copies: Vec<LockCopy> = Vec::new();
     for entry in lock.entries.iter().filter(|e| e.live) {
         berry_block(
             ctx,
@@ -311,7 +361,7 @@ async fn extract_berry(ctx: &DiscoverCtx<'_>, lock: BerryLock, out: &mut Discove
             out,
         );
     }
-    record_berry_copies(ctx, copies, out).await;
+    record_copies(ctx, copies, out).await;
     confirm_berry_hosted_keyed(ctx, hosted_keyed, out).await;
     confirm_berry_vendored(ctx, vendored, out).await;
 }
@@ -389,7 +439,7 @@ fn berry_block(
     cache_key: Option<&str>,
     vendored: &mut Vec<BerryVendored>,
     hosted_keyed: &mut Vec<BerryHostedKeyed>,
-    copies: &mut Vec<BerryCopy>,
+    copies: &mut Vec<LockCopy>,
     out: &mut Discovery,
 ) {
     let block = &entry.block;
@@ -436,11 +486,20 @@ fn berry_block(
         } else if locator_version.is_none() && !root_anchored_spelling(spec) {
             // A user's `file:` / url copy: yarn keys it by the DEPENDENCY
             // name (`lp2@file:…`), so which package it installs is read
-            // from the copy itself ([`record_berry_copies`], #939).
-            if let Some(version) = berry_field(&block.lines, "version") {
-                copies.push(BerryCopy {
+            // from the copy itself ([`record_copies`], #939).
+            let source = match reference.strip_prefix("file:") {
+                Some(path) => {
+                    let path = path.split(['#', ':']).next().unwrap_or_default();
+                    berry_file_copy_path(reference, path).map(CopyRef::File)
+                }
+                None => Some(CopyRef::Url(
+                    reference.split('#').next().unwrap_or_default().to_string(),
+                )),
+            };
+            if let (Some(version), Some(source)) = (berry_field(&block.lines, "version"), source) {
+                copies.push(LockCopy {
                     key: block.key.clone(),
-                    reference: reference.to_string(),
+                    source,
                     version: version.to_string(),
                 });
             }
@@ -726,62 +785,63 @@ fn emit(
     }
 }
 
-/// A berry lock entry that installs a user's `file:` tarball / directory or
-/// url tarball (not a Socket wiring), awaiting [`record_berry_copies`].
-struct BerryCopy {
+/// A yarn lock entry (berry or classic) that installs a user's `file:`
+/// tarball / directory or url tarball (not a Socket wiring), awaiting
+/// [`record_copies`].
+struct LockCopy {
     key: String,
-    /// The locator's reference (`file:<path>[#…][::…]` or a url).
-    reference: String,
+    source: CopyRef,
     version: String,
 }
 
-/// Record each [`BerryCopy`] as an unpatched copy of the package it really
-/// installs (#939). yarn keys a `file:` / url dependency by the name the
-/// depender gave it, so `"lp2": "file:left-pad-1.3.0.tgz"` locks as `lp2@…`
-/// while `node_modules/lp2` IS left-pad@1.3.0, and no `resolutions` pin of
-/// `left-pad` reaches it. The real name comes from the copy itself: the
-/// registry tarball path of a url (`…/<name>/-/<name>-<version>.tgz`), the
-/// `package.json` inside a `file:` tarball, or a `file:` directory's
-/// `package.json`. A copy whose name cannot be read is left alone.
-async fn record_berry_copies(ctx: &DiscoverCtx<'_>, copies: Vec<BerryCopy>, out: &mut Discovery) {
+/// Where a [`LockCopy`]'s bytes come from.
+enum CopyRef {
+    /// A root-relative `file:` tarball or directory.
+    File(String),
+    /// A url tarball, `#` fragment dropped.
+    Url(String),
+}
+
+/// Record each [`LockCopy`] as an unpatched copy of the package it really
+/// installs (#939 berry, #1236 classic). yarn keys a `file:` / url
+/// dependency by the name the depender gave it, so
+/// `"lp2": "file:left-pad-1.3.0.tgz"` locks as `lp2@…` while
+/// `node_modules/lp2` IS left-pad@1.3.0, and no pin of `left-pad` reaches
+/// it. The real name comes from the copy itself: the registry tarball path
+/// of a url (`…/<name>/-/<name>-<version>.tgz`), the `package.json` inside
+/// a `file:` tarball, or a `file:` directory's `package.json`. A copy whose
+/// name cannot be read is left alone.
+async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut Discovery) {
     for copy in copies {
-        let (name, how) = if let Some(path) = copy.reference.strip_prefix("file:") {
-            let path = path
-                .split(['#', ':'])
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            let Some(rel) = berry_file_copy_path(&copy.reference, &path) else {
-                continue;
-            };
-            let name = if is_tarball_leaf(&rel) {
-                match ctx.read_advisory_bytes(&rel).await {
-                    Some(bytes) => {
-                        tokio::task::spawn_blocking(move || tarball_package_name(&bytes))
-                            .await
-                            .ok()
-                            .flatten()
+        let (name, how) = match &copy.source {
+            CopyRef::File(rel) => {
+                let name = if is_tarball_leaf(rel) {
+                    match ctx.read_advisory_bytes(rel).await {
+                        Some(bytes) => {
+                            tokio::task::spawn_blocking(move || tarball_package_name(&bytes))
+                                .await
+                                .ok()
+                                .flatten()
+                        }
+                        None => None,
                     }
-                    None => None,
-                }
-            } else {
-                let manifest = if rel.is_empty() {
-                    PACKAGE_JSON.to_string()
                 } else {
-                    format!("{rel}/{PACKAGE_JSON}")
+                    let manifest = if rel.is_empty() {
+                        PACKAGE_JSON.to_string()
+                    } else {
+                        format!("{rel}/{PACKAGE_JSON}")
+                    };
+                    match ctx.read_advisory_text(&manifest).await {
+                        Some(text) => manifest_name(text.as_bytes()),
+                        None => None,
+                    }
                 };
-                match ctx.read_advisory_text(&manifest).await {
-                    Some(text) => manifest_name(text.as_bytes()),
-                    None => None,
-                }
-            };
-            (name, format!("installs it from the user's file:{path}"))
-        } else {
-            let url = copy.reference.split(['#']).next().unwrap_or_default();
-            (
+                (name, format!("installs it from the user's file:{rel}"))
+            }
+            CopyRef::Url(url) => (
                 registry_tarball_name(url, &copy.version),
                 format!("installs it from {url:?}"),
-            )
+            ),
         };
         let Some(name) = name else {
             continue;
@@ -824,46 +884,10 @@ fn is_tarball_leaf(path: &str) -> bool {
     path.ends_with(".tgz") || path.ends_with(".tar.gz")
 }
 
-/// `name` of a `package.json`.
-fn manifest_name(bytes: &[u8]) -> Option<String> {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
-    serde_json::from_slice::<Value>(bytes)
-        .ok()?
-        .get("name")?
-        .as_str()
-        .map(str::to_string)
-}
-
 /// `name` of the `package.json` inside an npm tarball.
 fn tarball_package_name(bytes: &[u8]) -> Option<String> {
     let map = crate::patch::package::read_archive_bytes_to_map(bytes).ok()?;
     manifest_name(map.get(PACKAGE_JSON)?)
-}
-
-/// The package an npm registry tarball url serves, from its
-/// `/<name>/-/<leaf>-<version>.tgz` path (`<name>` may be `@scope/leaf`,
-/// its `@` / `/` possibly percent-encoded); `None` for any other shape.
-fn registry_tarball_name(url: &str, version: &str) -> Option<String> {
-    let path = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let path = path.split(['?']).next()?;
-    let (before, file) = path.rsplit_once("/-/")?;
-    let mut segs: Vec<String> = before
-        .split('/')
-        .skip(1) // the host
-        .map(|seg| crate::utils::purl::percent_decode_purl_component(seg).into_owned())
-        .collect();
-    let leaf_name = segs.pop()?;
-    let (scope, leaf_name) = match leaf_name.split_once('/') {
-        Some((scope, leaf)) => (Some(scope.to_string()), leaf.to_string()),
-        None => (segs.pop().filter(|s| s.starts_with('@')), leaf_name),
-    };
-    if file != format!("{leaf_name}-{version}.tgz") {
-        return None;
-    }
-    Some(match scope {
-        Some(scope) => format!("{scope}/{leaf_name}"),
-        None => leaf_name,
-    })
 }
 
 #[cfg(test)]
@@ -1261,6 +1285,95 @@ mod tests {
                 "{case}: {:?}",
                 out.diagnostics
             );
+        }
+    }
+
+    /// #1236: yarn 1 keys a `file:` directory / tarball or url dependency by
+    /// the DEPENDENCY name (`"lp2@file:./lpdir"`), so a copy of the wired
+    /// left-pad@1.3.0 under another name escapes the pin and installs
+    /// unpatched. Its package is read from the copy itself (the directory's
+    /// or tarball's `package.json`, the registry url's path) and it contests
+    /// the wiring in the same lock, hosted and vendored alike. Control: a
+    /// copy holding another package is not one.
+    #[tokio::test]
+    async fn issue_1236_classic_other_name_copy_contests_the_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wirings = [
+            (
+                "hosted",
+                classic_block("left-pad@1.3.0", "1.3.0", &hosted, Some(SRI)),
+            ),
+            (
+                "vendored",
+                classic_block(
+                    "left-pad@1.3.0",
+                    "1.3.0",
+                    &format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz#{SHA1}"),
+                    Some(SRI),
+                ),
+            ),
+        ];
+        let copies = [
+            (
+                "file: directory",
+                "\"lp2@file:./lpdir\":\n  version \"1.3.0\"\n\n".to_string(),
+            ),
+            (
+                "file: tarball",
+                classic_block(
+                    "\"lp2@file:./forks/left-pad-1.3.0.tgz\"",
+                    "1.3.0",
+                    &format!("file:./forks/left-pad-1.3.0.tgz#{SHA1}"),
+                    None,
+                ),
+            ),
+            (
+                "registry tarball url",
+                classic_block(
+                    "\"lp2@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"",
+                    "1.3.0",
+                    &format!("https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz#{SHA1}"),
+                    None,
+                ),
+            ),
+        ];
+        let project = |blocks: &[String], fork: &str| {
+            let p = Project::new();
+            p.write("yarn.lock", classic(blocks));
+            p.write(
+                "lpdir/package.json",
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            );
+            p.write("forks/left-pad-1.3.0.tgz", npm_tgz(fork, "1.3.0"));
+            p
+        };
+        for (mode, wired) in &wirings {
+            assert_eq!(
+                run(&project(std::slice::from_ref(wired), "left-pad"))
+                    .await
+                    .refs
+                    .len(),
+                1,
+                "{mode}: control, the wiring is a ref"
+            );
+            for (case, copy) in &copies {
+                let out = run(&project(&[wired.clone(), copy.clone()], "left-pad")).await;
+                assert!(out.refs.is_empty(), "{mode} {case}: {:#?}", out.refs);
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains("lp2@")
+                            && d.detail.contains("UNPATCHED")),
+                    "{mode} {case}: {:#?}",
+                    out.diagnostics
+                );
+            }
+            // The `file:` copies hold another package: not a copy of left-pad.
+            for (case, copy) in &copies[..2] {
+                let out = run(&project(&[wired.clone(), copy.clone()], "other-pkg")).await;
+                assert_eq!(out.refs.len(), 1, "{mode} {case}: {:#?}", out.diagnostics);
+            }
         }
     }
 

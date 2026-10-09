@@ -590,6 +590,35 @@ pub async fn read_candidate_files(
         out.read(view, unreadable, crate::patch::redirect::YARNRC_REL)
             .await;
         out.read(view, unreadable, NPMRC_REL).await;
+        // A `file:` directory copy is locked under the DEPENDENCY name, so
+        // the classic rewriter reads which package it is from the
+        // directory's `package.json` (#1236). Advisory: never rewritten,
+        // and an unreadable one only leaves that copy unnamed.
+        let dirs: BTreeSet<String> = out
+            .files
+            .get("yarn.lock")
+            .map(|lock| {
+                crate::vendor::lock_inventory::yarn::classic_entries(lock)
+                    .iter()
+                    .filter_map(|e| {
+                        crate::formats::yarn::source::classic_file_directory(&e.patterns)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for dir in dirs {
+            let rel = if dir.is_empty() {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            };
+            if out.files.contains_key(&rel) {
+                continue;
+            }
+            if let Some(text) = read_advisory(view, unreadable, &rel).await {
+                out.files.insert(rel, text);
+            }
+        }
     }
 
     // Cargo workspace members (and in-root path dependencies) declare
