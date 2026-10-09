@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against main @ cf8b164 on 2026-10-08 by audit-ecosystems (support-tier sizes for `bun.lockb`, pnpm 5.4/6.0 and vlt eras re-measured for E47). Earlier: `e2d9633` on 2026-10-08 by audit-ecosystems (4.1 `formats/yarn` contents and the 4.3 yarn rows after #1057); older checks are in the run entries. Owner: audit-ecosystems._
+_Last checked against main @ f3c6313 on 2026-10-09 by audit-ecosystems (the package-lock walk and the vendor driver after #1008). Earlier: `cf8b164` on 2026-10-08 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -41,7 +41,7 @@ Shared npm-family infrastructure adds `npm_common.rs` 613/832, `npm_flavor.rs` 7
 
 | Format | Vendored writer | Hosted writer | Hosted restore | Inventory + VEX | `recover.rs` | Independent parsers |
 |---|---|---|---|---|---|---|
-| package-lock | `scan_lock_matches` :854, `rewrite_legacy_tree` :978 (serde `Value`, rendered with `JsonLayout` since #357) | `rewrite_one_npm_lock` :881, `rewrite_npm_v2_deps` :1095 (`serialize_json_like` → `JsonLayout`, #357) | `npm_lock_hits` :62, `v2_hits` :98 | `npm_lock_nodes` | full-object original :307 | **4 entry walks** {{E07}} |
+| package-lock | `scan_lock_matches` :854, `rewrite_legacy_tree` :978 (serde `Value`, rendered with `JsonLayout` since #357) | `rewrite_one_npm_lock` :881, `rewrite_npm_v2_deps` :1095 (`serialize_json_like` → `JsonLayout`, #357) | `npm_lock_hits` :62, `v2_hits` :98 | `npm_lock_nodes` | full-object original :307 | **1 entry walk**: `lock_inventory::npm::npm_lock_entries` serves inventory, vendored, hosted and restore (#1008) {{E07}} |
 | pnpm | `formats/pnpm/lines.rs` (`Vec<String>`, **refuses CRLF**) + own `LockIndex`/memo (446 lines) | `formats/pnpm/hosted.rs::plan_hosted` over `grammar.rs` (byte offsets, CRLF-aware) | `grammar.rs` | `grammar.rs` | shared | **2 grammars; 3 `resolution:` emitters** (`grammar.rs:164`, `pnpm_lock.rs:1992`, `pnpm_lock_legacy.rs:1137`) |
 | yarn classic | `formats::yarn::blocks` (`scan_blocks`, `repin_classic_block`) | same, spliced per block (#1057) | same | `scan_blocks` | ad-hoc `strip_prefix("integrity ")` | **1 block parser + 1 ad-hoc** |
 | yarn berry | `scan_blocks` + `berry_field` | `formats::yarn::stanzas` (re-keys and re-sorts entries) | `stanzas` | `berry_entries` | `inline_yaml_field` | **2 views of one grammar module + 1 ad-hoc; gates shared (#657)** |
@@ -62,9 +62,7 @@ The question "which lockfile drives installs?" was answered in **at least eight 
 
 **pnpm v9 vs pnpm legacy.** The drivers are now shared (#583): `vendor_pnpm_legacy` and `revert_pnpm_legacy_opts` are thin wrappers over `pnpm_lock::vendor_pnpm_dialect` / `revert_pnpm_dialect` with `PnpmDialect::Legacy` ([`pnpm_lock_legacy.rs#L200-L223`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/pnpm_lock_legacy.rs#L200-L223), [`#L894-L900`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/pnpm_lock_legacy.rs#L894-L900)), and `KIND_LOCK_PACKAGE` is imported, not redefined. What stays per dialect is the legacy line grammar: `read_lock`, `preflight_package(s)`, `lock_has_target_package`, `edit_*_v54/v60`, `revert_lock_record` and the `Ctx` methods. {{E12}}
 
-**The vendor driver skeleton is copied seven times.** npm_lock, pnpm (both dialects since #583), yarn-berry, yarn-classic, bun_lock, bun_binary and vlt (about 1,940 lines) all repeat the same sequence:
-`guard_coordinates` → read the lock → preflight → `stage_patch_pack` (`stage_patch_dir` for vlt) → `already_patched_result` → `write_marker_or_warn` → a literal 20-field `VendorEntry { … pdm: None, pipenv: None, poetry: None, uv: None, … }`.
-The copies have drifted: the "patch rewrites `package.json`" warning has two codes (`vendor_dep_manifest_rewritten` vs `_stale`) and fires on in-sync re-runs for pnpm and bun only, and `bun_binary` computes its own `uuid_dir_preexisted`. `read_project`, `preflight_package(s)` and `revert_*_opts` exist in 7-9 files each. {{E22}}
+**The vendor driver skeleton is shared for six of seven drivers.** Since #1008, npm_lock, pnpm (both dialects), yarn-berry, yarn-classic, bun_lock and bun_binary implement one `npm_common::NpmLockBackend` trait driven by `vendor_npm_family`, and every npm-family ledger entry is built through `VendorEntry::npm` / `VendorArtifact::{tarball,dir}`. vlt keeps its own directory-artifact driver. The revert half is still per backend: `revert_*` lives in seven files (#920 step 6). One drift survives the merge: the "patch rewrites `package.json`" warning is still `vendor_dep_manifest_rewritten` for npm and `vendor_dep_manifest_stale` for bun. {{E22}}
 
 **Yarn berry project gates are written twice.** {{E09}}
 - cacheKey `10c0` appears as `SUPPORTED_CACHE_KEY` ([`yarn_berry_lock.rs#L89`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/yarn_berry_lock.rs#L89)) and as `YARN_BERRY_SUPPORTED_CACHE_KEY` ([`redirect/mod.rs#L3289`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/patch/redirect/mod.rs#L3287-L3289)).

@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ cf8b164 on 2026-10-08 by audit-ecosystems (5.7 JVM layout after #1032; support-tier sizes for `bun.lockb`, pnpm legacy and vlt re-measured for E47). Earlier: `e2d9633` on 2026-10-08 by audit-ecosystems (5.3 revert mechanisms for Pipenv and Composer re-checked for E14; the E74 bullet after #1050); older checks are in the run entries. Owner: audit-ecosystems._
+_Last checked against main @ f3c6313 on 2026-10-09 by audit-ecosystems (the superseding-patch service policy across backends for E94; the E71 bullet after #1008). Earlier: `cf8b164` on 2026-10-08 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -255,7 +255,8 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 ### New findings since the review
 
 - {{E74}} October 7: "is this vendored entry still in use" had four answers; it is now one discovery verdict (`Discovery::vendor_entry_in_use`), so every ecosystem's dead entries are pruned and JVM orphans are reported (#1050).
-- {{E71}} October 7: a re-pin or remove left the older patch generation's wiring behind. `patch::redirect::generation` now owns the pin-name grammar and the hosted re-pin sweep (Cargo registry block, go.sum pair, Maven `-socket.<hex8>` repository, `remove`/`rollback` by generation; #1035), and vendored uv/Hatch re-vendor was fixed by #943. The vendored and agent supersede policy is still decided per mode (#954, in PR #1008), and the Go and Maven restores still leave older generations' residue.
+- {{E71}} October 7: a re-pin or remove left the older patch generation's wiring behind. `patch::redirect::generation` now owns the pin-name grammar and the hosted re-pin sweep (Cargo registry block, go.sum pair, Maven `-socket.<hex8>` repository, `remove`/`rollback` by generation; #1035), and vendored uv/Hatch re-vendor was fixed by #943. #1008 fixed #954 for the npm family: while the superseding patch is unbuilt, the run keeps the older vendored patch and reports a skip. Every other vendored backend still fails that run (E94 below), and the Go and Maven restores still leave older generations' residue.
+- {{E94}} October 9: "keep the older vendored patch while the superseding one is unserved" (#954) is decided only for the npm family. `ServicePolicy::unserved` carries the unserved code only under the npm backends' `ServiceTerminal::Failure`; Composer, Cargo, Go, gem, PyPI, Maven and NuGet refuse `vendor_prebuilt_required`, so a re-run exits 1 with the older wiring intact until the service builds the patch (executed twice on Composer).
 - {{E80}} Maven `.jar` and NuGet `.nupkg` vendored artifacts can be git-ignored by stock templates with no warning.
 - {{E86}} Vendored JVM fetches upstream artifacts and checksums only from Central or `SOCKET_MAVEN_REGISTRY`.
 - {{E68}}: vendored gem treats a Gemfile that merely contains the copy path as wired, but its revert needs the exact recorded line and reverts the lock records anyway: a trailing comment on the wired line leaves `Gemfile.lock` restored to the registry while the Gemfile keeps `path:`, and every later revert drift-keeps (executed three times). Same forward/revert split as #977; see 5.3.

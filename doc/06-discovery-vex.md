@@ -2,7 +2,7 @@
 
 ## Part 6: Discovery, inventory and VEX
 
-_Last checked against main @ 03b9418 on 2026-10-09 by audit-ecosystems (NuGet version identity across vendor, `PurlKey`, VEX liveness and the crawler for E93; go.mod `replace` readers, uv/pylock source handling and the Cargo crates.io source test searched). Earlier: `cf8b164` on 2026-10-08 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
+_Last checked against main @ f3c6313 on 2026-10-09 by audit-ecosystems (`vex_consumed.rs` after #1008 for E40). Earlier: `03b9418` on 2026-10-09 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `vex/**` (incl. `vex/discover/*`), `crawlers/**`, `formats/**`, `vendor/lock_inventory/*`, and the CLI consumers `vex.rs`, `vex_sources.rs`, `vex_consumed.rs`, `scan/discovery.rs`, `context.rs`, `list.rs`, `ecosystem_dispatch.rs`.
 
@@ -94,7 +94,7 @@ Across the repo that is **eight hand-rolled XML scanners**, 4–5 independent wa
 
 - **`verify.rs` is small** (346 production lines): a hash check per record, the vendored artifact basis, and `HostedCopies`. The complexity lives elsewhere:
   - **`vex_sources.rs`** (976) merges five sources: manifest, vendor ledger, *legacy* redirect ledger, discovery refs and API-fetched records. It has 5 omission gates, 7 note codes and 3 `Basis` kinds.
-  - **`vex_consumed.rs`** (1,173 lines on `4646693`, up from 596) decides "which installed copy the hosted build consumes". That covers cargo registry host-hash matching, Maven `-socket.<hex8>` dirs, the Go replacement module, and npm alias and store variants. **This is a third copy of package-manager layout knowledge** (after the crawlers and `vendor/*`), and it lives in the CLI. Its npm alias walk now duplicates the core resolver's `alias_copies` (#738), and the Maven suffix is rebuilt beside two core builders and three parsers of the same grammar. {{E40}}
+  - **`vex_consumed.rs`** (about 450 production lines on `f3c6313`, down from 1,173 on `4646693`) decides "which installed copy the hosted build consumes". That covers cargo registry host-hash matching, Maven `-socket.<hex8>` dirs, the Go replacement module, and npm alias and store variants. **This is a third copy of package-manager layout knowledge** (after the crawlers and `vendor/*`), and it lives in the CLI. Its own npm alias walk is gone: alias copies come from the core resolver since #1008. The Maven suffix is rebuilt beside two core builders and three parsers of the same grammar. {{E40}}
   - **Discovery liveness** (`discover/mod.rs:1490-1990`, ~500 lines), including the raw-text fallbacks `vendored_wiring_in_files` and `hosted_wiring_in_files`.
 - **`product.rs`** (659 production lines) only auto-detects the top-level product purl:
   - ~200 lines parse the git `origin` remote;
@@ -163,7 +163,7 @@ cli: ProjectContext owns ONE Inventory; one EmbeddedVex helper
 
 - "Is this an sbt / Mill / scala-cli build?" had six marker lists since #690. #1032 moved them into `vendor::jvm::layout`, and `is_jvm_project` now delegates to `layout::is_jvm_build`, so an sbt root with only `project/build.properties` or a scala-cli directory with only `.scala-build` gets Coursier roots. One split remains: sbt and hosted guidance count `.mill-version` as a Mill marker (`MILL_MARKERS`), while scala-cli counts only `MILL_BUILD_FILES` (#1014). {{E69}}
 
-- npm alias discovery is written twice: core `NpmCrawler::alias_copies` (apply, rollback, the VEX installed lookup) and the CLI's `vex_consumed` walk (hosted VEX). They have drifted on case: on Linux, an alias dir whose name differs from the package only by case is a copy for VEX but invisible to apply (proven by execution). This is behind #851 and #852. {{E40}}
+- npm alias discovery was written twice, in core `NpmCrawler::alias_copies` and in the CLI's `vex_consumed`, and the two had drifted on case. Hosted VEX now resolves alias copies through the core resolver, and the CLI walk is deleted (#1008, #856). The cargo, Maven and Go consumed-copy rules are still in the CLI (#855). {{E40}}
 
 - {{E72}} October 7: VEX attested over yarn Plug'n'Play loaders, pnpm bundled copies and deno.lock npm copies. Standalone `vex` no longer does (#1033, fixing #519). The in-run `scan --mode hosted --vex` path still attests a deno project's `package-lock.json` pin (#406), and npm and vlt still emit their own bundled-copy diagnostics.
 - {{E87}} Product detection has no Gradle or sbt probe, and `scan --vex` resolves the product only after writing.
