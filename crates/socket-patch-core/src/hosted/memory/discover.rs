@@ -15,6 +15,7 @@ use std::time::Duration;
 use crate::api::client::{ApiError, ApiFuture, PatchApi};
 use crate::api::ranking::cmp_search_results;
 use crate::api::types::{BatchPackagePatches, PackageVendorResult, PatchResponse, SearchResponse};
+use crate::hosted::npm_manifest::HostedClassicArtifact;
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use crate::utils::purl_key::PurlKey;
 
@@ -391,26 +392,28 @@ pub(crate) async fn fetch_npm_manifests(
         .collect()
 }
 
-/// Served npm tarballs' sha1 once per distinct `(url, sha512)`, for the
-/// yarn classic pin's `#<sha1>` fragment when the grant carries none
-/// (#558): the disk flow's `fetch_hosted_npm_sha1` over the provider.
-pub(crate) async fn fetch_npm_sha1s(
+/// The served npm tarballs a yarn classic pin reads (sha1 and
+/// package.json), once per distinct `(url, sha512)`: the disk flow's
+/// `fetch_hosted_classic_artifact` over the provider.
+pub(crate) async fn fetch_classic_artifacts(
     provider: &Provider,
     wanted: &BTreeSet<(String, String)>,
     max_bytes: u64,
-) -> BTreeMap<String, Result<String, String>> {
+) -> BTreeMap<String, Result<HostedClassicArtifact, String>> {
     let ordered: Vec<&(String, String)> = wanted.iter().collect();
     let futures: Vec<BoxFuture<'_, _>> = ordered
         .iter()
-        .map(|(url, sha512)| -> BoxFuture<'_, Result<String, String>> {
-            Box::pin(async move {
-                let bytes = provider
-                    .download_artifact(url, max_bytes)
-                    .await
-                    .map_err(|error| format!("cannot fetch the hosted tarball: {error}"))?;
-                crate::hosted::npm_manifest::decode_hosted_npm_sha1(&bytes, sha512)
-            })
-        })
+        .map(
+            |(url, sha512)| -> BoxFuture<'_, Result<HostedClassicArtifact, String>> {
+                Box::pin(async move {
+                    let bytes = provider
+                        .download_artifact(url, max_bytes)
+                        .await
+                        .map_err(|error| format!("cannot fetch the hosted tarball: {error}"))?;
+                    crate::hosted::npm_manifest::decode_hosted_classic_artifact(&bytes, sha512)
+                })
+            },
+        )
         .collect();
     let results = join_bounded(futures, provider.concurrency).await;
     ordered

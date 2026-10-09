@@ -3,6 +3,8 @@
 //!
 //! * which grammar a lock is ([`sniff_grammar`], [`is_berry_lock`]);
 //! * the block walk and field reads ([`blocks`]);
+//! * a classic block's dependency sub-maps against a patched manifest
+//!   ([`classic_deps`]);
 //! * key, descriptor and locator patterns ([`patterns`]);
 //! * where yarn 1 installs a block's copy from ([`source`]);
 //! * the stanza view the hosted berry writers re-key and re-order
@@ -17,6 +19,7 @@
 pub(crate) mod berry_entry;
 pub mod berry_gates;
 pub(crate) mod blocks;
+pub(crate) mod classic_deps;
 pub(crate) mod patterns;
 pub(crate) mod source;
 pub(crate) mod stanzas;

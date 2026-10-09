@@ -12,6 +12,7 @@ use crate::api::types::PackageVendorResult;
 use crate::hosted::engine::{
     self, Candidate, CandidateFiles, Refusal, RewriteOptions, SkippedPatch,
 };
+use crate::hosted::npm_manifest::HostedClassicArtifact;
 use crate::hosted::vlt::Preflight;
 use crate::patch::redirect::npmrc::OuterAllowRemote;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
@@ -157,9 +158,9 @@ pub(crate) struct Planned {
     /// `(artifact url, sha512)` of every npm tarball whose own
     /// package.json a yarn berry pin needs (#718).
     pub(crate) npm_manifests: Vec<(String, Option<String>)>,
-    /// `(artifact url, sha512)` of every npm tarball whose sha1 a yarn
-    /// classic pin needs because its grant carries none (#558).
-    pub(crate) npm_sha1s: Vec<(String, String)>,
+    /// `(artifact url, sha512)` of every npm tarball a yarn classic pin
+    /// reads (its sha1, #558, and its package.json, #591).
+    pub(crate) npm_classic: Vec<(String, String)>,
     /// The vlt artifact preflight, judged offline (no network here, so
     /// every in-scope dep is withheld instead of pinned: `--offline`
     /// parity).
@@ -213,10 +214,14 @@ pub(crate) async fn plan(
         .into_iter()
         .map(|dep| (dep.artifact_url.clone(), dep.integrity.sha512.clone()))
         .collect();
-    let npm_sha1s = engine::yarn_classic_sha1_targets(&candidates, &read.files)
-        .into_iter()
-        .filter_map(|dep| Some((dep.artifact_url.clone(), dep.integrity.sha512.clone()?)))
-        .collect();
+    let npm_classic = engine::yarn_classic_artifact_targets(
+        &candidates,
+        &read.files,
+        &OuterYarnMirror::default(),
+    )
+    .into_iter()
+    .filter_map(|dep| Some((dep.artifact_url.clone(), dep.integrity.sha512.clone()?)))
+    .collect();
     Ok(Planned {
         project,
         candidates,
@@ -225,7 +230,7 @@ pub(crate) async fn plan(
         read,
         wheels,
         npm_manifests,
-        npm_sha1s,
+        npm_classic,
         vlt_preflight,
     })
 }
@@ -249,12 +254,13 @@ pub(crate) struct RewriteRefused {
     pub(crate) skipped: Vec<SkippedPatch>,
 }
 
-/// Wheel metadata, served npm manifests and served npm tarballs' sha1s
-/// (each keyed by artifact URL) → the engine's rewrite → the guard.
+/// Wheel metadata, served npm manifests and the served npm tarballs a
+/// yarn classic pin reads (each keyed by artifact URL) → the engine's
+/// rewrite → the guard.
 pub(crate) async fn rewrite(
     planned: Planned,
     artifact_metadata: &BTreeMap<String, Result<Option<String>, String>>,
-    artifact_sha1s: &BTreeMap<String, Result<String, String>>,
+    artifact_classic: &BTreeMap<String, Result<HostedClassicArtifact, String>>,
     options: StageOptions,
 ) -> Result<Rewritten, RewriteRefused> {
     let Planned {
@@ -265,7 +271,7 @@ pub(crate) async fn rewrite(
         read,
         wheels,
         npm_manifests,
-        npm_sha1s,
+        npm_classic,
         vlt_preflight,
     } = planned;
     let skipped_before = skipped.clone();
@@ -314,9 +320,14 @@ pub(crate) async fn rewrite(
             }
         }
     }
-    for (url, _) in &npm_sha1s {
-        match artifact_sha1s.get(url) {
-            Some(Ok(sha1)) => engine::set_derived_sha1(&mut candidates, url, sha1),
+    for (url, _) in &npm_classic {
+        match artifact_classic.get(url) {
+            Some(Ok(artifact)) => engine::record_classic_artifact(
+                &mut candidates,
+                &mut python_metadata,
+                url,
+                artifact,
+            ),
             Some(Err(detail)) => {
                 if unavailable.insert(url.clone()) {
                     for dep in candidates

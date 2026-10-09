@@ -28,9 +28,9 @@ use serde_json::Value;
 
 use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::blocks::{
-    block_eol, body_field_line, classic_field, repin_classic_block, replace_block, scan_blocks,
-    LockBlock,
+    block_eol, classic_field, repin_classic_block, replace_block, scan_blocks, LockBlock,
 };
+use crate::formats::yarn::classic_deps::{unlocked_descriptors, with_manifest_dep_maps};
 use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::manifest::schema::PatchRecord;
@@ -222,6 +222,29 @@ impl NpmLockBackend for YarnClassicBackend {
         }))
     }
 
+    /// #591: yarn 1 installs a package's dependencies from the lock, so a
+    /// patch whose `package.json` adds a dependency or changes a range
+    /// needs a lock block for every new descriptor. Vendoring can't
+    /// resolve one (the sub-map rewrite alone leaves it dangling: online
+    /// frozen installs fetch it unpinned, offline ones fail, and every
+    /// plain `yarn install` re-saves the lock), so it refuses instead.
+    fn manifest_refusal(
+        &self,
+        plan: &YarnClassicPlan,
+        staged_pkg: &Value,
+        coords: &NpmCoords,
+    ) -> Option<VendorOutcome> {
+        let blocks = scan_blocks_shared(&plan.text);
+        let missing = unlocked_descriptors(&blocks, staged_pkg);
+        if missing.is_empty() {
+            return None;
+        }
+        Some(refused(
+            "vendor_dep_manifest_unlocked",
+            unlocked_detail(&coords.name, &coords.version, &missing),
+        ))
+    }
+
     fn manifest_warning(&self, name: &str, version: &str) -> VendorWarning {
         VendorWarning::new(
             "vendor_dep_manifest_rewritten",
@@ -232,6 +255,19 @@ impl NpmLockBackend for YarnClassicBackend {
             ),
         )
     }
+}
+
+/// The refusal detail for a patch whose `package.json` declares
+/// dependencies `yarn.lock` doesn't lock (#591).
+fn unlocked_detail(name: &str, version: &str, missing: &[String]) -> String {
+    format!(
+        "the patch rewrites {name}@{version}'s package.json to depend on {}, which \
+         {YARN_LOCK} does not lock; yarn 1 would install them unpinned (and fail \
+         `--offline` installs), so {name}@{version} was not vendored. Lock them first \
+         (for example `yarn add {}`), then re-run",
+        missing.join(", "),
+        missing.join(" ")
+    )
 }
 
 /// [`vendor_yarn_classic`]'s defensive re-sniff: the flavor router already
@@ -883,44 +919,10 @@ fn rewrite_classic_block(
     staged_pkg: Option<&Value>,
 ) -> Vec<String> {
     let pinned = repin_classic_block(lines, resolved_value, integrity_value);
-    let Some(pkg) = staged_pkg else {
-        return pinned;
-    };
-    let mut out = Vec::with_capacity(pinned.len());
-    let mut i = 0;
-    while i < pinned.len() {
-        if i > 0
-            && body_field_line(&pinned[i])
-                .is_some_and(|r| r == "dependencies:" || r == "optionalDependencies:")
-        {
-            // Drop the stale sub-map (header + 4-space entries); the
-            // recomputed ones are appended below in yarn's order.
-            i += 1;
-            while i < pinned.len() && body_field_line(&pinned[i]).is_none() {
-                i += 1;
-            }
-            continue;
-        }
-        out.push(pinned[i].clone());
-        i += 1;
+    match staged_pkg {
+        Some(pkg) => with_manifest_dep_maps(&pinned, pkg),
+        None => pinned,
     }
-    for field in ["dependencies", "optionalDependencies"] {
-        let Some(map) = pkg.get(field).and_then(Value::as_object) else {
-            continue;
-        };
-        if map.is_empty() {
-            continue;
-        }
-        out.push(format!("  {field}:"));
-        let mut keys: Vec<&String> = map.keys().collect();
-        keys.sort_unstable();
-        for k in keys {
-            if let Some(range) = map.get(k).and_then(Value::as_str) {
-                out.push(format!("    {} \"{range}\"", quote_yarn_key(k)));
-            }
-        }
-    }
-    out
 }
 
 /// Does this block's `resolved` already point into `.socket/vendor/npm/`
@@ -976,23 +978,6 @@ pub(crate) fn scan_blocks_shared(text: &str) -> Arc<Vec<LockBlock>> {
 /// is how a write stops the memo holding a scan nothing will hit again.
 pub(super) fn forget_block_scans() {
     BLOCK_MEMO.invalidate();
-}
-
-/// yarn v1's lockfile key quoting (stringify.js `shouldWrapKey`): wrap when
-/// the key would not parse bare.
-fn quote_yarn_key(key: &str) -> String {
-    let needs = key.is_empty()
-        || key.starts_with("true")
-        || key.starts_with("false")
-        || !key.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-        || key
-            .chars()
-            .any(|c| matches!(c, ':' | ' ' | '\n' | '\t' | '\\' | '"' | ',' | '[' | ']'));
-    if needs {
-        format!("\"{key}\"")
-    } else {
-        key.to_string()
-    }
 }
 
 pub(super) fn lines_to_json(lines: &[String]) -> Value {
@@ -1429,10 +1414,17 @@ left-pad@^1.3.0:
   integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==
   dependencies:
     old-dep "^1.0.0"
+
+wow@^1.0.0:
+  version "1.0.0"
+
+"@scope/opt@^2.0.0":
+  version "2.0.0"
 "#;
         let mut fx = fixture_with_lock(lock).await;
 
-        // The patch rewrites package.json: new dependency + an optional one.
+        // The patch rewrites package.json: new dependency + an optional one,
+        // both already locked (#591: an unlocked one is refused).
         let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
         let after: &[u8] = br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^1.0.0"},"optionalDependencies":{"@scope/opt":"^2.0.0"}}"#;
         let after_hash = compute_git_sha256_from_bytes(after);
@@ -1465,12 +1457,91 @@ left-pad@^1.3.0:
         );
     }
 
+    /// A lock block for the `wow@^1.0.0` descriptor the manifest-rewriting
+    /// fixtures' patches add (#591: vendoring needs it locked).
+    const WOW_BLOCK: &str = "\nwow@^1.0.0:\n  version \"1.0.0\"\n";
+
+    /// Stage a patch on `fx` that rewrites left-pad's package.json to
+    /// `after`.
+    async fn patch_manifest(fx: &mut Fixture, after: &[u8]) {
+        let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash,
+            },
+        );
+    }
+
+    /// #591: a patch whose package.json adds a dependency yarn.lock doesn't
+    /// lock is refused before any wiring: rewriting the sub-map alone would
+    /// leave a dangling descriptor yarn 1 installs unpinned (and an
+    /// `--offline` install fails). The lock and the vendor dir are left as
+    /// they were.
+    #[tokio::test]
+    async fn issue_591_added_dependency_without_a_lock_block_is_refused() {
+        let mut fx = fixture_with_lock(Y2_BEFORE).await;
+        patch_manifest(
+            &mut fx,
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"is-odd":"^3.0.0"}}"#,
+        )
+        .await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_dep_manifest_unlocked");
+        assert!(
+            detail.contains("is-odd@^3.0.0") && detail.contains("yarn add is-odd@^3.0.0"),
+            "{detail}"
+        );
+        assert_eq!(fx.lock_text().await, Y2_BEFORE, "lock untouched");
+        assert!(
+            !fx.root().join(".socket/vendor/npm").join(UUID).exists(),
+            "the staged tarball is unstaged"
+        );
+    }
+
+    /// #591 (range change): the patch moves an existing dependency to a
+    /// range no block locks. Same refusal: the lock's `is-number@^6.0.0`
+    /// block can't stand in for `^7.0.0`.
+    #[tokio::test]
+    async fn issue_591_changed_range_without_a_lock_block_is_refused() {
+        let lock = format!(
+            "{Y2_BEFORE}  dependencies:\n    is-number \"^6.0.0\"\n\n\
+             is-number@^6.0.0:\n  version \"6.0.0\"\n"
+        );
+        let mut fx = fixture_with_lock(&lock).await;
+        patch_manifest(
+            &mut fx,
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"is-number":"^7.0.0"}}"#,
+        )
+        .await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_dep_manifest_unlocked");
+        assert!(detail.contains("is-number@^7.0.0"), "{detail}");
+        assert!(!detail.contains("^6.0.0"), "{detail}");
+        assert_eq!(fx.lock_text().await, lock, "lock untouched");
+
+        // Once the new range is locked, the patch vendors with the
+        // sub-map rewritten to it.
+        let locked = format!("{lock}\nis-number@^7.0.0:\n  version \"7.0.0\"\n");
+        tokio::fs::write(fx.lock_path(), &locked).await.unwrap();
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        let text = fx.lock_text().await;
+        assert!(
+            text.contains("  dependencies:\n    is-number \"^7.0.0\"\n"),
+            "{text}"
+        );
+    }
+
     /// #920: the `package.json` advisory is emitted once, by the run that
     /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
     /// AlreadyPatched.
     #[tokio::test]
     async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
-        let mut fx = fixture_with_lock(Y2_BEFORE).await;
+        let mut fx = fixture_with_lock(&format!("{Y2_BEFORE}{WOW_BLOCK}")).await;
         let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
         let after: &[u8] =
             br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^1.0.0"}}"#;
@@ -1514,6 +1585,9 @@ left-pad@^1.3.0:
   integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==
   dependencies:
     old-dep "^1.0.0"
+
+wow@^1.0.0:
+  version "1.0.0"
 "#;
         let mut fx = fixture_with_lock(lock).await;
         let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
@@ -2449,12 +2523,6 @@ left-pad@^1.3.0:
         );
         assert_eq!(pattern_real_name("alias@npm:left-pad"), Some("left-pad"));
         assert_eq!(pattern_real_name("no-at-sign"), None);
-
-        // yarn's key quoting rule.
-        assert_eq!(quote_yarn_key("left-pad"), "left-pad");
-        assert_eq!(quote_yarn_key("@scope/x"), "\"@scope/x\"");
-        assert_eq!(quote_yarn_key("3d-lib"), "\"3d-lib\"");
-        assert_eq!(quote_yarn_key("true-lib"), "\"true-lib\"");
     }
 
     #[test]
