@@ -153,16 +153,6 @@ pub(crate) fn detect_indent(text: &str) -> String {
     "  ".to_string()
 }
 
-/// The file's dominant line terminator (new lines we write use it; bytes
-/// outside edited spans keep whatever they had).
-pub(crate) fn detect_eol(text: &str) -> &'static str {
-    if text.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
-
 /// Pretty-print JSON with `indent` + a trailing newline (the shape npm and
 /// composer themselves emit), so untouched keys stay byte-identical and a
 /// later `npm install` / `composer update` produces no format-only churn.

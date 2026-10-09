@@ -25,12 +25,13 @@ use std::path::Path;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::terminator;
 use crate::utils::requirements::{
     expand_env_vars, hash_options, logical_lines, requires_hashes, shlex_split, split_comment,
     strip_comment, vendor_tag,
 };
 
-use super::common::{detect_eol, refuse_symlinked};
+use super::common::refuse_symlinked;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
@@ -424,7 +425,7 @@ pub(super) async fn revert_requirements(
                 return RevertOutcome::failed(format!("cannot read {file}: {e}"));
             }
         };
-        let nl = detect_eol(&content);
+        let nl = terminator(&content);
         let had_trailing_newline = content.ends_with('\n');
         let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
 
@@ -595,7 +596,7 @@ async fn plan_requirements(
         if spans.is_empty() {
             continue;
         }
-        let nl = detect_eol(&file.content);
+        let nl = terminator(&file.content);
         let original_lines: Vec<String> = file.content.lines().map(str::to_string).collect();
         let mut lines = original_lines.clone();
         let mut records = Vec::new();
@@ -653,7 +654,7 @@ async fn plan_requirements(
             &None,
             true,
         );
-        let nl = detect_eol(&root_file.content);
+        let nl = terminator(&root_file.content);
         let mut new_content = root_file.content.clone();
         if !new_content.is_empty() && !new_content.ends_with('\n') {
             new_content.push_str(nl);
@@ -748,7 +749,7 @@ fn plan_rewire(
         if !file.editable {
             return Err(format!("{rel} is outside the project root"));
         }
-        let nl = detect_eol(&file.content);
+        let nl = terminator(&file.content);
         let mut lines: Vec<String> = file.content.lines().map(str::to_string).collect();
         let mut taken: HashSet<usize> = HashSet::new();
         let mut records = Vec::new();
