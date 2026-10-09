@@ -1969,8 +1969,9 @@ async fn guard_unwired_pypi_revert(
 /// directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock` with its paired
 /// script), and every other root-level `*.txt` (a `uv export -o` target, or
 /// a `requirements-dev.txt` the user moved a vendor line into), plus every
-/// `*.txt` in a project subdirectory ([`subdir_txt_names`]: a
-/// `requirements/dev.txt` the root never includes, #1167). `skip`
+/// `*.txt` or Python lock in a project subdirectory
+/// ([`subdir_probe_names`]: a `requirements/dev.txt` the root never
+/// includes, #1167, or a `deploy/pylock.toml` export, #1213). `skip`
 /// names files left out of the probe (a dry run's not-yet-restored wiring).
 /// Every step fails closed: a root that cannot be listed, an include tree
 /// that cannot be read, or a listed file (a symlink included — lstat only,
@@ -2050,7 +2051,7 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
             names.push(name);
         }
     }
-    for name in subdir_txt_names(project_root) {
+    for name in subdir_probe_names(project_root) {
         if !names.contains(&name) {
             names.push(name);
         }
@@ -2081,7 +2082,7 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
     None
 }
 
-/// Directory names [`subdir_txt_names`] never descends into: VCS metadata,
+/// Directory names [`subdir_probe_names`] never descends into: VCS metadata,
 /// socket-patch's own state, and tool or cache trees whose `*.txt` files
 /// are package payloads, not requirements files anyone installs from.
 const PROBE_SKIPPED_DIRS: &[&str] = &[
@@ -2100,11 +2101,14 @@ const PROBE_SKIPPED_DIRS: &[&str] = &[
     "site-packages",
 ];
 
-/// Every `*.txt` below the project root's subdirectories, as `/`-joined
-/// root-relative names in a stable order (#1167): `pip install -r
+/// Every `*.txt` and every Python lock (with a script lock's paired
+/// script) below the project root's subdirectories, as `/`-joined
+/// root-relative names in a stable order (#1167, #1213): `pip install -r
 /// requirements/dev.txt` installs from a file the root `-r` tree never
-/// reaches, and `pip freeze > requirements/lock.txt` or `uv export -o
-/// requirements/lock.txt` writes one. The walk skips [`PROBE_SKIPPED_DIRS`]
+/// reaches, `pip freeze > requirements/lock.txt` or `uv export -o
+/// requirements/lock.txt` writes one, and `uv export --format pylock.toml
+/// -o deploy/pylock.toml` writes a PEP 751 lock a deploy context installs
+/// from. The walk skips [`PROBE_SKIPPED_DIRS`]
 /// and any virtualenv or conda env (a dir holding `pyvenv.cfg` or
 /// `conda-meta`), and does not follow symlinked directories, so it always
 /// terminates inside the project. A subdirectory that cannot be listed is
@@ -2112,7 +2116,7 @@ const PROBE_SKIPPED_DIRS: &[&str] = &[
 /// not reach a requirements file in it either, and an unrelated unreadable
 /// dir (a container volume) must not pin every vendored wheel forever. A
 /// listed file that then cannot be read still fails closed in the caller.
-fn subdir_txt_names(project_root: &Path) -> Vec<String> {
+fn subdir_probe_names(project_root: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut stack: Vec<String> = vec![String::new()];
     while let Some(rel) = stack.pop() {
@@ -2148,9 +2152,17 @@ fn subdir_txt_names(project_root: &Path) -> Vec<String> {
                     continue;
                 }
                 subdirs.push(child);
-            } else if !rel.is_empty() && name.ends_with(".txt") && (ft.is_file() || ft.is_symlink())
-            {
+            } else if !rel.is_empty() && (ft.is_file() || ft.is_symlink()) {
                 // Root-level files are the caller's own listing.
+                let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
+                if !is_lock && !name.ends_with(".txt") {
+                    continue;
+                }
+                if is_lock {
+                    if let Some(script) = crate::utils::python_lock::script_of_lock(&name) {
+                        out.push(format!("{rel}/{script}"));
+                    }
+                }
                 out.push(child);
             }
         }
@@ -6064,6 +6076,116 @@ wheels = [
             assert!(!finished.kept_artifact, "{file}: {:?}", finished.warnings);
             assert!(!uuid_dir.exists(), "{file}: the artifact must be reclaimed");
         }
+    }
+
+    /// #1213: a PEP 751 lock exported into a subdirectory (`uv export
+    /// --format pylock.toml -o deploy/pylock.toml`, the deploy or Docker
+    /// context shape) installs from the wheel exactly like a subdirectory
+    /// requirements file. The dry run previews the keep and the wet revert
+    /// keeps the wheel and the ledger entry; once the export stops naming the
+    /// wheel the next revert cleans up.
+    #[tokio::test]
+    async fn revert_keeps_artifact_for_subdir_pylock() {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        let archive = "[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n\
+                       archive = { path = \"{UP}.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\" }\n";
+        for (file, up) in [
+            ("deploy/pylock.toml", "../"),
+            ("deploy/pylock.prod.toml", "../"),
+            ("a/b/pylock.toml", "../../"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+                .await
+                .unwrap();
+            let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+            let wiring = wire_requirements(root, "six", "1.16.0", &rel_wheel, &"0".repeat(64))
+                .await
+                .unwrap();
+            let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+            tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+            let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
+            tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+            let path = root.join(file);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, archive.replace("{UP}", up).replace("{UUID}", UUID))
+                .await
+                .unwrap();
+
+            let entry = revert_entry("requirements", &rel_wheel, wiring);
+            let preview = revert_pypi(&entry, root, true).await;
+            assert!(preview.success, "{file}: {:?}", preview.error);
+            assert!(
+                preview.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(file)
+                }),
+                "{file}: the dry run must preview the keep: {:?}",
+                preview.warnings
+            );
+
+            let outcome = revert_pypi(&entry, root, false).await;
+            assert!(outcome.success, "{file}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(file)
+                }),
+                "{file}: {:?}",
+                outcome.warnings
+            );
+            assert!(outcome.kept_artifact, "{file}: the ledger entry must stay");
+            assert!(
+                wheel.is_file(),
+                "{file} still installs the wheel; deleting it breaks that install"
+            );
+
+            tokio::fs::write(&path, "lock-version = \"1.0\"\n")
+                .await
+                .unwrap();
+            let finished = revert_pypi(&entry, root, false).await;
+            assert!(finished.success, "{file}: {:?}", finished.error);
+            assert!(!finished.kept_artifact, "{file}: {:?}", finished.warnings);
+            assert!(!uuid_dir.exists(), "{file}: the artifact must be reclaimed");
+        }
+    }
+
+    /// #1213 scope: the subdirectory walk probes every Python lock name the
+    /// root listing does, a uv script lock together with its paired script
+    /// (whose `[tool.uv.sources]` can name the wheel), and still ignores a
+    /// non-lock `*.toml` in a subdirectory.
+    #[tokio::test]
+    async fn reference_probe_reads_subdir_python_locks_and_scripts() {
+        let line = format!("../.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir_all(root.join("tools")).await.unwrap();
+        tokio::fs::write(root.join("tools/config.toml"), &line)
+            .await
+            .unwrap();
+        assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+
+        tokio::fs::write(root.join("tools/s.py"), &line)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("tools/s.py.lock"), "version = 1\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            pypi_reference_clause(root, UUID, &[]).await.as_deref(),
+            Some("tools/s.py still resolves through it")
+        );
+        tokio::fs::remove_file(root.join("tools/s.py"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("tools/s.py.lock"), &line)
+            .await
+            .unwrap();
+        assert_eq!(
+            pypi_reference_clause(root, UUID, &[]).await.as_deref(),
+            Some("tools/s.py.lock still resolves through it")
+        );
     }
 
     /// #1167 scope: the subdirectory walk reads `*.txt` files at any depth
