@@ -1,15 +1,15 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T01:20Z · main @ 793edd4_
+_Last updated 2026-10-09T02:15Z · main @ eb3fcc4_
 
 **In flight:**
 - [#1205](https://github.com/SocketDev/socket-patch/pull/1205): project-mode cargo crawl looks up `Cargo.lock`'s registry packages in `registry/src/*` instead of walking; one `formats::cargo::is_registry_source`. Issue #1204 (E05, #595 cargo child). +144/−49 production, +226/−11 tests. Only change: cached-but-unlocked crates no longer crawled (so `scan --prune` treats their manifest entries as uninstalled). 3,000-crate cache, 300-crate lock: 26.0 ms → 4.7 ms. `state: ready`.
-- [#1191](https://github.com/SocketDev/socket-patch/pull/1191): 4 more files onto `formats::text` (`redirect/vlt.rs`, `go_mod_edit.rs`, `jvm/gradle.rs`, `lock_inventory/pypi.rs`); `PENDING_INLINE_BOMS` 11. Issue #905 (E64 slice 3). Only change: a two-BOM `Pipfile.lock` no longer parses. `state: ready`.
 - [#1188](https://github.com/SocketDev/socket-patch/pull/1188): one `Pipfile.lock` writer: the hosted span reader moves to `formats::pipenv` (+ `splice_entry`); vendored wire/revert splice instead of re-serializing; Composer's `escape_non_ascii` shared as `formats::json`. Issue #1128 (E14). +303/−235 production (≈170 moved), +154/−32 tests. Only change: untouched entries keep their bytes (`\uXXXX`), BOM locks vendor; `redirect/mod.rs` wrapper `pipenv_reserialized_around_reference` left for when that file is free. `state: ready`.
 - [#1183](https://github.com/SocketDev/socket-patch/pull/1183): project-mode NuGet crawl of a restored project looks up the shared roots for the restore's `libraries` instead of walking them; one `project.assets.json` reader. Issue #427 (E05, #595 NuGet child). +130 production, +220 tests. Only change: unresolved shared-cache packages are no longer crawled. 3,000-package cache: 58 ms → 0.8 ms. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - Maintainer drafts (decided issues): #1036 (#973), #1041 (#648), #1049 (#792). #1027 (#704), #1030 (#808), #1031 (#966) and #1051 (#580) merged.
 
 **Merged:**
+- [#1191](https://github.com/SocketDev/socket-patch/pull/1191): 4 more files onto `formats::text`; `PENDING_INLINE_BOMS` 11. Issue #905 (E64 slice 3). +11/−13 production, +74 tests.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; oracle-only free helpers deleted. Issue #631 (E52 partly fixed; the move to `formats/golang/sum.rs` remains).
 - [#1185](https://github.com/SocketDev/socket-patch/pull/1185): one Poetry forward splicer (`utils::poetry_lock`); 2.x `files` multi-line in both modes. Issue #936 (E66 fixed). +37/−166 production.
 - Earlier: #1108 (E16 slice 1), #1163 (C41; `blob_hash_matches` remains), #1160 (E64 slice 2), #1153, #1151, #1145, #1141 (see entries), #1106 (C48), #1110 (E15 slice 1), #1117 (E64), #1121 (E89 slice 1), #1124 (C30), #1021 (C05), #1015 (E61; left: dead `eco == "maven2"` arm in `commands/vendor.rs`), #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
