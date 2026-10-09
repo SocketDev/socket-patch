@@ -1,16 +1,15 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T21:50Z · main @ 9c00b54_
+_Last updated 2026-10-09T21:57Z · main @ 9c00b54_
 
 **In flight:**
 - [#1370](https://github.com/SocketDev/socket-patch/pull/1370): #782 slice (#801 scope): dead `lock_inventory/wired.rs` (`wired_vendor_integrity`) and its tests deleted. E41. +3/−224 prod, +4/−256 tests. `state: ready`.
 - [#1366](https://github.com/SocketDev/socket-patch/pull/1366): #824 children 2–3 slice 3: 5 more test files use `tests/common` `binary()`/`git_sha256` (`vendor_ecosystem_fixtures` includers take `mod common`). C30. +0/−0 prod, +24/−50 tests. `state: ready`.
 - [#1358](https://github.com/SocketDev/socket-patch/pull/1358): scala-cli Bloop evidence fails closed on an oversized, unreadable or non-Bloop project file, the sbt reader's policy; skip branches deleted. Fixes #1270 (E95). +23/−6 prod, +87/−1 tests. `state: ready`.
-- [#1347](https://github.com/SocketDev/socket-patch/pull/1347): one `crawlers::pnpm_layout` answers where pnpm installs (crawler roots, `detect_npm_pkg_manager`, PnP carve-out over disk/snapshot/memory); `node_modules`-only probes deleted. Fixes #1129 (E92). +191/−92 prod, +213 tests. `state: ready`.
 - [#1188](https://github.com/SocketDev/socket-patch/pull/1188): one `Pipfile.lock` writer (`formats::pipenv::splice_entry`). #1128 (E14). +303/−235 prod. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - Maintainer draft: #1049 (#792).
 
-**Merged:** #1294 (C80, fixes #1292; +78/−34 prod, +168 tests), #1288 (E10, #685; +128/−150 prod), #1277 (E64), #1272 (C32), #1262 (C77), #1258 (C30), #1245 (E24), #1264 (E16), #1239, #1253, #1227, #1221, #1230, #1217/#1209/#1205/#1183; 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015), `vendor/common.rs` jar caller of #1253.
+**Merged:** #1347 (E92, fixes #1129; +191/−92 prod, +213 tests), #1294 (C80, fixes #1292; +78/−34 prod, +168 tests), #1288 (E10, #685; +128/−150 prod), #1277 (E64), #1272 (C32), #1262 (C77), #1258 (C30), #1245 (E24), #1264 (E16), #1239, #1253, #1227, #1221, #1230, #1217/#1209/#1205/#1183; 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015), `vendor/common.rs` jar caller of #1253.
 
 **Queue** (score = 3B + 2U + 2D + S − risk). Standalone refactor issues closed `not_planned` live on as tracker checklist items; rank the tracker's next item.
 
