@@ -92,10 +92,10 @@ pub async fn run(args: RepairArgs) -> i32 {
         if !has_vendor_traces {
             let legacy_ledger = args
                 .common
-                .cwd
+                .project_root()
                 .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
             let hosted = tokio::fs::metadata(&legacy_ledger).await.is_ok()
-                || !crate::commands::hosted_inventory(&args.common, &args.common.cwd)
+                || !crate::commands::hosted_inventory(&args.common, &args.common.project_root())
                     .await
                     .is_empty();
             if hosted {

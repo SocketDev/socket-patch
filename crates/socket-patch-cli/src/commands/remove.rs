@@ -342,7 +342,6 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let loud = !args.common.json && !args.common.silent;
 
     let manifest_path = args.common.resolved_manifest_path();
-    let cwd = &args.common.cwd;
 
     // ── state discovery ─────────────────────────────────────────────────
     // A manifest-less project (vendored mode keeps its records in the
@@ -361,7 +360,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let project_state = crate::commands::project_state_in_scope(&args.common);
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
     let hosted_inventory = if project_state {
-        crate::commands::hosted_inventory(&args.common, cwd).await
+        crate::commands::hosted_inventory(&args.common, &args.common.project_root()).await
     } else {
         Default::default()
     };
