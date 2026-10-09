@@ -8,6 +8,7 @@
 pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
+pub mod interrupt;
 /// The in-memory hosted engine, which lives in core
 /// ([`socket_patch_core::hosted::memory`]); re-exported under its old path
 /// for the `hosted-bundle` harness and the integration tests.
@@ -71,7 +72,6 @@ pub enum Commands {
     Scan(commands::scan::ScanArgs),
 
     /// Patch one package, CVE, GHSA or patch UUID (hosted mode by default)
-    #[command(visible_alias = "download")]
     Get(commands::get::GetArgs),
 
     /// List the patches in this project: hosted and vendored lockfile
@@ -106,7 +106,6 @@ pub enum Commands {
     /// Restores missing blobs and diff/package archives, rebuilds missing
     /// or corrupt vendored artifacts, then deletes the artifacts nothing
     /// references.
-    #[command(visible_alias = "gc")]
     Repair(commands::repair::RepairArgs),
 
     // Internal parse target of the root `--update` flag (see the rewrite

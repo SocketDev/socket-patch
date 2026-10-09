@@ -236,11 +236,9 @@ fn scan_args(cwd: &Path, api_url: String, all_releases: bool) -> ScanArgs {
         batch_size: Some(100),
         // apply (not sync) so the post-sync GC doesn't sweep beforeHash
         // blobs the later rollback/remove needs offline.
-        apply: true,
         prune: false,
         sync: false,
-        vendor: false,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
         all_releases,
         vex: Default::default(),
         rollout: Default::default(),

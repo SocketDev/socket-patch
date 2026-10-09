@@ -315,11 +315,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // `--preserve-state` restores the tree and keeps the state — together
     // they select the do-nothing quadrant.
     if args.preserve_state && args.skip_rollback {
-        eprintln!(
-            "Error: --preserve-state cannot be used with --skip-rollback: the \
-             combination would be a no-op (nothing would change)"
+        return crate::json_envelope::usage_error(
+            Command::Remove,
+            args.common.json,
+            args.common.dry_run,
+            "invalid_args",
+            "--preserve-state cannot be used with --skip-rollback: the \
+             combination would be a no-op (nothing would change)",
         );
-        return 2;
     }
 
     let (telemetry_client, _) =

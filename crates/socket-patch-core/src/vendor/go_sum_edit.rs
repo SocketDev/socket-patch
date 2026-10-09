@@ -20,7 +20,8 @@
 //!
 //! Everything here is a pure `&str` transform (the hosted rewriters operate on
 //! in-memory file content, mirrored byte-identically by depscan's TS twins).
-//! Unrelated lines are preserved verbatim. [`upsert_module_lines`] inserts at
+//! Unrelated lines are preserved verbatim.
+//! [`GoSumEditor::upsert_module_lines`] inserts at
 //! the whole-line byte-order position, which matches go's `(module, semver)`
 //! sort (so a later `go mod tidy` is a no-op) because `' '` compares below
 //! every module-path/version character and `' '` < `'/'` puts the zip line
@@ -36,114 +37,15 @@ fn module_lines(module: &str, version: &str, zip_h1: &str, gomod_h1: &str) -> [S
     ]
 }
 
-/// Upsert the two `go.sum` lines for `module@version`. Any existing lines for
-/// exactly that module+version (either suffix form) are replaced; everything
-/// else — including stale lines for the *replaced* original module, which go
-/// tolerates and `go mod tidy` prunes — is preserved verbatim. `content` may
-/// be empty (a project whose `go.sum` does not exist yet). Returns the new
-/// content, or `None` when the file already carries exactly these lines.
-pub fn upsert_module_lines(
-    content: &str,
-    module: &str,
-    version: &str,
-    zip_h1: &str,
-    gomod_h1: &str,
-) -> Option<String> {
-    let want = module_lines(module, version, zip_h1, gomod_h1);
-    let zip_key = format!("{module} {version} ");
-    let gomod_key = format!("{module} {version}/go.mod ");
-
-    let mut lines: Vec<&str> = content.lines().collect();
-    // "Already applied" means the key-matching lines are exactly the two
-    // wanted ones — a bare match count is not enough: a stale same-key line
-    // with a different hash (a union-merged go.sum straddling a republish) is
-    // a hard go `SECURITY ERROR`, and a duplicated zip line can stand in for
-    // a missing /go.mod line. Both still need the rewrite below.
-    let mut want_seen = [0usize; 2];
-    let mut stale_key_line = false;
-    for l in &lines {
-        if **l == want[0] {
-            want_seen[0] += 1;
-        } else if **l == want[1] {
-            want_seen[1] += 1;
-        } else if l.starts_with(&zip_key) || l.starts_with(&gomod_key) {
-            stale_key_line = true;
-        }
-    }
-    if want_seen == [1, 1] && !stale_key_line {
-        return None;
-    }
-    lines.retain(|l| !l.starts_with(&zip_key) && !l.starts_with(&gomod_key));
-
-    // Insert both lines at their sorted position (stable against an unsorted
-    // user file: first line strictly greater wins; ties cannot occur — the
-    // exact-key duplicates were just removed).
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len() + 2);
-    let mut pending = want.iter().map(String::as_str).peekable();
-    for line in lines {
-        while pending.peek().is_some_and(|w| *w < line) {
-            out.push(
-                pending
-                    .next()
-                    .expect("peek() just confirmed a pending element"),
-            );
-        }
-        out.push(line);
-    }
-    out.extend(pending);
-
-    let eol = super::common::detect_eol(content);
-    let mut joined = out.join(eol);
-    joined.push_str(eol);
-    Some(joined)
-}
-
-/// True when `go.sum` carries a line (zip or `/go.mod` form) for exactly
-/// `module@version` — go records one for every module version its build
-/// graph loads.
-pub fn has_module_version(content: &str, module: &str, version: &str) -> bool {
-    let zip_key = format!("{module} {version} ");
-    let gomod_key = format!("{module} {version}/go.mod ");
-    content
-        .lines()
-        .any(|l| l.starts_with(&zip_key) || l.starts_with(&gomod_key))
-}
-
-/// Remove the lines for exactly `module@version` (both the zip and `/go.mod`
-/// forms). Used to prune the REPLACED original's lines: once a version-pinned
-/// `replace` covers the resolved version, go never fetches (or verifies) the
-/// original at all, and `go mod tidy` prunes exactly these lines — writing
-/// that state up front keeps the first day-2 tidy a byte-level no-op. Returns
-/// `(new_content, removed_lines)`, or `None` when nothing matched.
-pub fn remove_exact_module_version_lines(
-    content: &str,
-    module: &str,
-    version: &str,
-) -> Option<(String, Vec<String>)> {
-    let zip_key = format!("{module} {version} ");
-    let gomod_key = format!("{module} {version}/go.mod ");
-    let mut removed: Vec<String> = Vec::new();
-    let kept: Vec<&str> = content
-        .lines()
-        .filter(|l| {
-            if l.starts_with(&zip_key) || l.starts_with(&gomod_key) {
-                removed.push((*l).to_string());
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-    if removed.is_empty() {
-        return None;
-    }
-    if kept.is_empty() {
-        return Some((String::new(), removed));
-    }
-    let eol = super::common::detect_eol(content);
-    let mut joined = kept.join(eol);
-    joined.push_str(eol);
-    Some((joined, removed))
+/// True when `line` is a `go.sum` line (zip or `/go.mod` form) for exactly
+/// `module@version`: `"{module} {version} "` or `"{module} {version}/go.mod "`
+/// starts it. The trailing space or `/go.mod` keeps `v1.0.0` from matching a
+/// longer version such as `v1.0.0-socketpatch.1`.
+fn is_version_line(line: &str, module: &str, version: &str) -> bool {
+    line.strip_prefix(module)
+        .and_then(|rest| rest.strip_prefix(' '))
+        .and_then(|rest| rest.strip_prefix(version))
+        .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with("/go.mod "))
 }
 
 /// Remove every `go.sum` line whose module path starts with `module_prefix`
@@ -310,7 +212,24 @@ impl GoSumEditor {
         };
     }
 
-    /// [`upsert_module_lines`] in place; `true` when it changed the content.
+    /// The current content's lines, as `str::lines` splits them.
+    fn current_lines(&self) -> impl Iterator<Item = &str> {
+        let (text, lines) = match &self.state {
+            GoSumState::Text(text) => (Some(text.lines()), None),
+            GoSumState::Lines { lines, .. } => (None, Some(lines.iter().map(String::as_str))),
+        };
+        text.into_iter()
+            .flatten()
+            .chain(lines.into_iter().flatten())
+    }
+
+    /// Upsert the two `go.sum` lines for `module@version`. Any existing lines
+    /// for exactly that module+version (either suffix form) are replaced;
+    /// everything else — including stale lines for the *replaced* original
+    /// module, which go tolerates and `go mod tidy` prunes — is preserved
+    /// verbatim. The content may be empty (a project whose `go.sum` does not
+    /// exist yet). `true` when it changed the content, `false` when the file
+    /// already carries exactly these lines.
     pub(crate) fn upsert_module_lines(
         &mut self,
         module: &str,
@@ -319,34 +238,32 @@ impl GoSumEditor {
         gomod_h1: &str,
     ) -> bool {
         let want = module_lines(module, version, zip_h1, gomod_h1);
-        let zip_key = format!("{module} {version} ");
-        let gomod_key = format!("{module} {version}/go.mod ");
-        let is_key = |l: &str| l.starts_with(&zip_key) || l.starts_with(&gomod_key);
-        let applied = {
-            let mut want_seen = [0usize; 2];
-            let mut stale_key_line = false;
-            let mut scan = |l: &str| {
-                if l == want[0] {
-                    want_seen[0] += 1;
-                } else if l == want[1] {
-                    want_seen[1] += 1;
-                } else if is_key(l) {
-                    stale_key_line = true;
-                }
-            };
-            match &self.state {
-                GoSumState::Text(text) => text.lines().for_each(&mut scan),
-                GoSumState::Lines { lines, .. } => {
-                    lines.iter().map(String::as_str).for_each(&mut scan)
-                }
+        let is_key = |l: &str| is_version_line(l, module, version);
+        // "Already applied" means the key-matching lines are exactly the two
+        // wanted ones — a bare match count is not enough: a stale same-key
+        // line with a different hash (a union-merged go.sum straddling a
+        // republish) is a hard go `SECURITY ERROR`, and a duplicated zip line
+        // can stand in for a missing /go.mod line. Both still need the
+        // rewrite below.
+        let mut want_seen = [0usize; 2];
+        let mut stale_key_line = false;
+        for l in self.current_lines() {
+            if l == want[0] {
+                want_seen[0] += 1;
+            } else if l == want[1] {
+                want_seen[1] += 1;
+            } else if is_key(l) {
+                stale_key_line = true;
             }
-            want_seen == [1, 1] && !stale_key_line
-        };
-        if applied {
+        }
+        if want_seen == [1, 1] && !stale_key_line {
             return false;
         }
         let (mut lines, eol) = self.take_lines();
         lines.retain(|l| !is_key(l));
+        // Insert both lines at their sorted position (stable against an
+        // unsorted user file: first line strictly greater wins; ties cannot
+        // occur — the exact-key duplicates were just removed).
         let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
         let mut pending = want.into_iter().peekable();
         for line in lines {
@@ -364,37 +281,33 @@ impl GoSumEditor {
         true
     }
 
-    /// [`has_module_version`] over the current content.
+    /// True when the content carries a line (zip or `/go.mod` form) for
+    /// exactly `module@version` — go records one for every module version
+    /// its build graph loads.
     pub(crate) fn has_module_version(&self, module: &str, version: &str) -> bool {
-        let zip_key = format!("{module} {version} ");
-        let gomod_key = format!("{module} {version}/go.mod ");
-        let is_key = |l: &str| l.starts_with(&zip_key) || l.starts_with(&gomod_key);
-        match &self.state {
-            GoSumState::Text(text) => text.lines().any(is_key),
-            GoSumState::Lines { lines, .. } => lines.iter().any(|l| is_key(l)),
-        }
+        self.current_lines()
+            .any(|l| is_version_line(l, module, version))
     }
 
-    /// [`remove_exact_module_version_lines`] in place: the removed lines, or
-    /// `None` when nothing matched.
+    /// Remove the lines for exactly `module@version` (both the zip and
+    /// `/go.mod` forms). Used to prune the REPLACED original's lines: once a
+    /// version-pinned `replace` covers the resolved version, go never fetches
+    /// (or verifies) the original at all, and `go mod tidy` prunes exactly
+    /// these lines — writing that state up front keeps the first day-2 tidy
+    /// a byte-level no-op. Returns the removed lines, or `None` when nothing
+    /// matched.
     pub(crate) fn remove_exact_module_version_lines(
         &mut self,
         module: &str,
         version: &str,
     ) -> Option<Vec<String>> {
-        let zip_key = format!("{module} {version} ");
-        let gomod_key = format!("{module} {version}/go.mod ");
-        let is_key = |l: &str| l.starts_with(&zip_key) || l.starts_with(&gomod_key);
-        let any = match &self.state {
-            GoSumState::Text(text) => text.lines().any(is_key),
-            GoSumState::Lines { lines, .. } => lines.iter().any(|l| is_key(l)),
-        };
-        if !any {
+        if !self.has_module_version(module, version) {
             return None;
         }
         let (lines, eol) = self.take_lines();
-        let (removed, kept): (Vec<String>, Vec<String>) =
-            lines.into_iter().partition(|l| is_key(l));
+        let (removed, kept): (Vec<String>, Vec<String>) = lines
+            .into_iter()
+            .partition(|l| is_version_line(l, module, version));
         self.commit(kept, eol);
         Some(removed)
     }
@@ -491,6 +404,32 @@ mod tests {
     const VER: &str = "v1.4.2-socketpatch.1";
     const ZIP_H1: &str = "h1:mU9vN/n1hbXktM62lJ6MbRKOk3aI8NDH+szCf62RXtE=";
     const GOMOD_H1: &str = "h1:XgagPTRZSCprrzR+3Ro36/XJpibdovhAbsKThYI8bxg=";
+
+    /// [`GoSumEditor::upsert_module_lines`] on `content`: the new content,
+    /// or `None` when it was unchanged.
+    fn upsert_module_lines(
+        content: &str,
+        module: &str,
+        version: &str,
+        zip_h1: &str,
+        gomod_h1: &str,
+    ) -> Option<String> {
+        let mut editor = GoSumEditor::new(content.to_string());
+        editor
+            .upsert_module_lines(module, version, zip_h1, gomod_h1)
+            .then(|| editor.into_string())
+    }
+
+    /// [`GoSumEditor::remove_exact_module_version_lines`] on `content`.
+    fn remove_exact_module_version_lines(
+        content: &str,
+        module: &str,
+        version: &str,
+    ) -> Option<(String, Vec<String>)> {
+        let mut editor = GoSumEditor::new(content.to_string());
+        let removed = editor.remove_exact_module_version_lines(module, version)?;
+        Some((editor.into_string(), removed))
+    }
 
     #[test]
     fn creates_from_empty_and_is_idempotent() {
@@ -682,8 +621,96 @@ mod tests {
         out
     }
 
+    /// Mixed and bare-`\r` line endings, a missing final newline and a
+    /// blank line: the outputs the text transforms gave before they were
+    /// folded into the editor.
     #[test]
-    fn editor_matches_the_text_transforms_step_by_step() {
+    fn odd_line_endings_give_the_recorded_outputs() {
+        let mixed = "a.com/x v1.0.0 h1:A=\nb.com/z v1.0.0 h1:B=\r\nc.com/q v1.0.0 h1:C=";
+        assert_eq!(
+            upsert_module_lines(mixed, "b.com/y", "v1.0.0", "h1:Z=", "h1:G=").as_deref(),
+            Some(
+                "a.com/x v1.0.0 h1:A=\r\nb.com/y v1.0.0 h1:Z=\r\n\
+                 b.com/y v1.0.0/go.mod h1:G=\r\nb.com/z v1.0.0 h1:B=\r\n\
+                 c.com/q v1.0.0 h1:C=\r\n"
+            )
+        );
+        assert_eq!(
+            remove_exact_module_version_lines(mixed, "b.com/y", "v1.0.0"),
+            None
+        );
+
+        let bare_cr = "a.com/x v1.0.0 h1:A=\r\rb.com/y v1.0.0 h1:Q=\nb.com/z v1.0.0 h1:B=\r\n";
+        assert_eq!(
+            upsert_module_lines(bare_cr, "b.com/y", "v1.0.0", "h1:Z=", "h1:G=").as_deref(),
+            Some(
+                "a.com/x v1.0.0 h1:A=\r\rb.com/y v1.0.0 h1:Q=\r\n\
+                 b.com/y v1.0.0 h1:Z=\r\nb.com/y v1.0.0/go.mod h1:G=\r\n\
+                 b.com/z v1.0.0 h1:B=\r\n"
+            )
+        );
+        assert!(!GoSumEditor::new(bare_cr.to_string()).has_module_version("b.com/y", "v1.0.0"));
+
+        let blank = "b.com/y v1.0.0 h1:OLD=\r\n\nb.com/y v1.0.0/go.mod h1:OLDM=\n";
+        assert!(GoSumEditor::new(blank.to_string()).has_module_version("b.com/y", "v1.0.0"));
+        assert_eq!(
+            upsert_module_lines(blank, "b.com/y", "v1.0.0", "h1:Z=", "h1:G=").as_deref(),
+            Some("\r\nb.com/y v1.0.0 h1:Z=\r\nb.com/y v1.0.0/go.mod h1:G=\r\n")
+        );
+        assert_eq!(
+            remove_exact_module_version_lines(blank, "b.com/y", "v1.0.0"),
+            Some((
+                "\r\n".to_string(),
+                vec![
+                    "b.com/y v1.0.0 h1:OLD=".to_string(),
+                    "b.com/y v1.0.0/go.mod h1:OLDM=".to_string(),
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn version_line_key_rule() {
+        assert!(is_version_line("a.com/x v1.0.0 h1:A=", "a.com/x", "v1.0.0"));
+        assert!(is_version_line(
+            "a.com/x v1.0.0/go.mod h1:A=",
+            "a.com/x",
+            "v1.0.0"
+        ));
+        assert!(!is_version_line(
+            "a.com/x v1.0.01 h1:A=",
+            "a.com/x",
+            "v1.0.0"
+        ));
+        assert!(!is_version_line(
+            "a.com/x v1.0.0-pre h1:A=",
+            "a.com/x",
+            "v1.0.0"
+        ));
+        assert!(!is_version_line(
+            "a.com/x/y v1.0.0 h1:A=",
+            "a.com/x",
+            "v1.0.0"
+        ));
+        assert!(!is_version_line(
+            "a.com/x v1.0.0/go.modx h1:A=",
+            "a.com/x",
+            "v1.0.0"
+        ));
+        assert!(!is_version_line("a.com/x v1.0.0", "a.com/x", "v1.0.0"));
+        assert!(!is_version_line(
+            "a.com/x  v1.0.0 h1:A=",
+            "a.com/x",
+            "v1.0.0"
+        ));
+    }
+
+    /// The editor holds its content as text or as lines. A run of edits on
+    /// one editor must give, after every step, what the same edit gives on
+    /// a fresh editor over the previous step's text: the lines form is only
+    /// a cache of the text form.
+    #[test]
+    fn lines_form_matches_the_text_form_step_by_step() {
         for seed in 1..=3000u64 {
             let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
             let mut rng = move |n: usize| {
@@ -698,37 +725,31 @@ mod tests {
             for step in 0..rng(8) {
                 let module = ["a.com/x", "b.com/z", "patch.socket.dev/gopatch/u1"][rng(3)];
                 let version = ["v1.0.0", "v2.0.0"][rng(2)];
+                let mut fresh = GoSumEditor::new(text.clone());
                 match rng(3) {
                     0 => {
                         let (zip, gomod) = [("h1:A=", "h1:B="), ("h1:C=", "h1:A=")][rng(2)];
-                        let want = upsert_module_lines(&text, module, version, zip, gomod);
+                        let want = fresh.upsert_module_lines(module, version, zip, gomod);
                         let got = editor.upsert_module_lines(module, version, zip, gomod);
-                        assert_eq!(got, want.is_some(), "seed {seed} step {step}");
-                        if let Some(new) = want {
-                            text = new;
-                        }
+                        assert_eq!(got, want, "seed {seed} step {step}");
                     }
                     1 => {
-                        let want = remove_exact_module_version_lines(&text, module, version);
+                        let want = fresh.remove_exact_module_version_lines(module, version);
                         let got = editor.remove_exact_module_version_lines(module, version);
-                        assert_eq!(
-                            got,
-                            want.as_ref().map(|(_, removed)| removed.clone()),
-                            "seed {seed} step {step}"
-                        );
-                        if let Some((new, _)) = want {
-                            text = new;
-                        }
+                        assert_eq!(got, want, "seed {seed} step {step}");
                     }
                     _ => {
-                        let want = remove_module_prefix_lines(&text, "patch.socket.dev/gopatch/");
+                        let want = fresh.remove_module_prefix_lines("patch.socket.dev/gopatch/");
                         let got = editor.remove_module_prefix_lines("patch.socket.dev/gopatch/");
-                        assert_eq!(got, want.is_some(), "seed {seed} step {step}");
-                        if let Some(new) = want {
-                            text = new;
-                        }
+                        assert_eq!(got, want, "seed {seed} step {step}");
                     }
                 }
+                assert_eq!(
+                    editor.has_module_version(module, version),
+                    fresh.has_module_version(module, version),
+                    "seed {seed} step {step}"
+                );
+                text = fresh.into_string();
                 let snapshot = GoSumEditor {
                     state: match &editor.state {
                         GoSumState::Text(t) => GoSumState::Text(t.clone()),

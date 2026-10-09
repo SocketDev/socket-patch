@@ -7,7 +7,7 @@ use crate::patch::path_safety;
 use crate::utils::fs::{entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, run_blocking};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 use crate::utils::relpath::normalize_lexically;
-use crate::vendor::lock_inventory::{DiskSnapshot, ProjectView};
+use crate::vendor::lock_inventory::ProjectView;
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
 /// directories or global gem installation paths.
@@ -200,7 +200,7 @@ impl RubyCrawler {
                 // an absolute path, NUL). `verify_gem_at_path` only checks
                 // for `lib/`/`.gemspec` and gems patch in place, so fail
                 // closed here — same as the deno/go/maven/npm/nuget guards.
-                if !is_safe_gem_coordinate(name, version) {
+                if !path_safety::is_safe_name_version(name, version) {
                     continue;
                 }
                 // The purl is the base PURL (qualifiers stripped upstream).
@@ -1085,7 +1085,7 @@ impl RubyCrawler {
                 .map(|purl| {
                     let (name, version) = crate::utils::purl::parse_gem_purl(purl)?;
                     let (name, version) = (name.as_ref(), version.as_ref());
-                    if !is_safe_gem_coordinate(name, version) {
+                    if !path_safety::is_safe_name_version(name, version) {
                         return None;
                     }
                     let gem_dir = locate_gem_dir_sync(&gem_path, name, version, &mut names)?;
@@ -1443,6 +1443,18 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
     value.to_path_buf()
 }
 
+/// The files [`bundler_loaded_manifest`] reads for `root`: the app config,
+/// the global config when there is one, and the `gems.rb` its pair choice
+/// probes.
+fn bundler_config_files(root: &Path) -> Vec<PathBuf> {
+    let app = bundler_app_config_dir(root, std::env::var_os("BUNDLE_APP_CONFIG").as_deref())
+        .join("config");
+    [app, PathBuf::from("gems.rb")]
+        .into_iter()
+        .chain(ambient_bundler_global_config_file(root))
+        .collect()
+}
+
 /// [`crate::formats::gem::manifest::classify`] for `root` on disk: the
 /// manifest bundler loads, reading the ambient `BUNDLE_GEMFILE` /
 /// `BUNDLE_LOCKFILE` / `BUNDLE_APP_CONFIG` and the app config file.
@@ -1485,7 +1497,12 @@ pub(crate) async fn bundler_loaded_manifest_in(
 ) -> crate::formats::gem::manifest::LoadedManifest {
     use crate::formats::gem::manifest;
     match view {
-        ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(root) => bundler_loaded_manifest(root).await,
+        ProjectView::Snapshot(snap) => {
+            // The only files the probe reads: the app config, the global
+            // config and `gems.rb` (the environment it also reads is fixed
+            // for the run).
+            let root = snap.root_reading(bundler_config_files(snap.root_reading::<&Path>([])));
             bundler_loaded_manifest(root).await
         }
         ProjectView::Memory(_) => {
@@ -2086,21 +2103,6 @@ async fn bundle_config_dir_reading(
     } else {
         current
     }
-}
-
-/// Whether a PURL-derived gem coordinate is safe to join onto the gem root.
-/// SECURITY: `find_by_purls` formats name/version into a `<name>-<version>`
-/// directory name joined onto `gem_path`, and a real gem name/version is
-/// dash/dot/word characters only — never a separator, colon, NUL, or bare
-/// dot segment. `verify_gem_at_path` only checks for `lib/`/`.gemspec` and
-/// gems are patched in place, so a tampered manifest PURL (`pkg:gem/../x@1.0`,
-/// an absolute name, a `/`-bearing version) must be rejected here, fail
-/// closed. Delegates to [`path_safety::is_safe_single_segment`], which also
-/// rejects `:` — a Windows drive-relative coordinate (`C:evil`) joins as an
-/// absolute path. Mirrors the deno/go/maven/npm/nuget crawler coordinate
-/// guards.
-fn is_safe_gem_coordinate(name: &str, version: &str) -> bool {
-    path_safety::is_safe_single_segment(name) && path_safety::is_safe_single_segment(version)
 }
 
 #[cfg(test)]
@@ -5132,32 +5134,6 @@ mod tests {
             result.is_empty(),
             "version with separators must not escape the gem root: {result:?}"
         );
-    }
-
-    /// Unit contract for the coordinate gate: real gem names/versions pass,
-    /// anything with a separator, NUL, or bare dot segment fails closed.
-    #[test]
-    fn test_is_safe_gem_coordinate() {
-        assert!(is_safe_gem_coordinate("rails", "7.1.0"));
-        assert!(is_safe_gem_coordinate("aws-sdk-s3", "1.143.0"));
-        assert!(is_safe_gem_coordinate("ruby2_keywords", "0.0.5"));
-        assert!(is_safe_gem_coordinate("nokogiri", "1.16.5.pre.rc1"));
-
-        assert!(!is_safe_gem_coordinate("", "1.0.0"));
-        assert!(!is_safe_gem_coordinate("rails", ""));
-        assert!(!is_safe_gem_coordinate("..", "1.0.0"));
-        assert!(!is_safe_gem_coordinate(".", "1.0.0"));
-        assert!(!is_safe_gem_coordinate("rails", ".."));
-        assert!(!is_safe_gem_coordinate("../outside", "1.0.0"));
-        assert!(!is_safe_gem_coordinate("a/b", "1.0.0"));
-        assert!(!is_safe_gem_coordinate("rails", "1.0/../../x"));
-        assert!(!is_safe_gem_coordinate("a\\b", "1.0.0"));
-        assert!(!is_safe_gem_coordinate("a\0b", "1.0.0"));
-        assert!(!is_safe_gem_coordinate("/abs/evil", "1.0.0"));
-        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
-        // joined path absolute under `Path::join`.
-        assert!(!is_safe_gem_coordinate("C:evil", "1.0.0"));
-        assert!(!is_safe_gem_coordinate("rails", "C:1.0.0"));
     }
 
     /// Names with embedded `-<digit>` runs (`http-2`, `http-2-next`) must

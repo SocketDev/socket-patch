@@ -1,8 +1,8 @@
-//! CLI contract tests for the `repair` subcommand (and its `gc` visible alias).
+//! CLI contract tests for the `repair` subcommand.
 //!
-//! These tests pin the public clap parser surface for `RepairArgs`. The
-//! `gc` visible alias is also exercised so a refactor that drops it is
-//! caught immediately.
+//! These tests pin the public clap parser surface for `RepairArgs`. v5.0
+//! removed `--download-mode` (repair always fetches per-file blobs) and the
+//! `gc` alias; both must stay parse errors.
 //!
 //! See `crates/socket-patch-cli/CLI_CONTRACT.md` for the full repair table.
 //!
@@ -103,17 +103,6 @@ fn parse_repair(extra: &[&str]) -> RepairArgs {
     match cli.command {
         Commands::Repair(a) => a,
         _ => panic!("expected Repair"),
-    }
-}
-
-fn parse_gc(extra: &[&str]) -> RepairArgs {
-    let _scrub = EnvScrub::new();
-    let mut argv = vec!["socket-patch", "gc"];
-    argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
-    match cli.command {
-        Commands::Repair(a) => a,
-        _ => panic!("expected Repair via gc alias"),
     }
 }
 
@@ -298,29 +287,6 @@ fn repair_download_mode_flag_is_removed() {
     }
 }
 
-#[test]
-#[serial_test::serial]
-fn repair_gc_alias_defaults_match_repair() {
-    let via_gc = parse_gc(&[]);
-    let via_repair = parse_repair(&[]);
-
-    // The whole point of the alias: identical parsing. Compare the *entire*
-    // parsed surface, and independently anchor both to the contract defaults
-    // so the test isn't merely "the parser agrees with itself".
-    assert_eq!(snapshot(&via_gc), expected_defaults());
-    assert_eq!(snapshot(&via_repair), expected_defaults());
-    assert_eq!(snapshot(&via_gc), snapshot(&via_repair));
-}
-
-#[test]
-#[serial_test::serial]
-fn repair_gc_alias_accepts_flags() {
-    let args = parse_gc(&["--dry-run"]);
-    let mut expected = expected_defaults();
-    expected.dry_run = true;
-    assert_eq!(snapshot(&args), expected);
-}
-
 /// Regression: an exported-but-empty `SOCKET_DOWNLOAD_ONLY=` — the shell/CI
 /// idiom for blanking a variable without unsetting it — must mean "unset,
 /// fall back to the default (false)", not abort every `repair` invocation
@@ -416,15 +382,11 @@ fn repair_unknown_flag_is_unknown_argument_error() {
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
-// --- `gc` is a first-class visible alias for `repair` ---------------------
+// --- `repair` in help; the removed `gc` alias -------------------------------
 //
 // `scan --mode agent --prune` (or `--sync`) combines apply and GC in one
-// pass, but `gc`/`repair` remain documented commands for users who want to
-// clean up without an
-// apply pass. These tests guard the `visible_alias = "gc"` attribute on
-// `Commands::Repair` — if a future refactor demotes the alias (to
-// `alias = "gc"` or removes it entirely), the help output check below
-// will fail.
+// pass, but `repair` remains a documented command for users who want to
+// clean up without an apply pass. v5 removed its `gc` alias.
 
 fn top_level_help() -> String {
     let _scrub = EnvScrub::new();
@@ -448,29 +410,13 @@ fn repair_appears_in_top_level_help() {
 
 #[test]
 #[serial_test::serial]
-fn gc_alias_is_visible_in_top_level_help() {
+fn removed_gc_alias_is_a_usage_error() {
     let help = top_level_help();
-    // clap renders a *visible* alias inline on the subcommand's help row as
-    // `[aliases: gc]`. A hidden `alias = "gc"` produces no such marker at all,
-    // so this fails loudly if the alias is demoted or dropped. Require the
-    // exact visible-alias marker — accepting a bare `gc` substring would match
-    // unrelated help text (e.g. the prose explaining the alias).
-    assert!(
-        help.contains("[aliases: gc]"),
-        "`gc` visible alias must be listed in --help output:\n{help}"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn gc_alias_parses_as_repair() {
+    assert!(!help.contains("[aliases: gc]"), "{help}");
     let _scrub = EnvScrub::new();
     match Cli::try_parse_from(["socket-patch", "gc"]) {
-        Ok(cli) => assert!(
-            matches!(cli.command, Commands::Repair(_)),
-            "gc should resolve to Repair"
-        ),
-        Err(e) => panic!("gc alias should parse: {e}"),
+        Ok(_) => panic!("`gc` should no longer parse"),
+        Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::InvalidSubcommand),
     }
 }
 

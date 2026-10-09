@@ -740,7 +740,7 @@ async fn repair_redownload_human_mode_prints_summary() {
     let (code, stdout, stderr) = run_cli(
         tmp.path(),
         &mock.uri(),
-        &["scan", "--vendor", "--yes"],
+        &["scan", "--mode", "vendored", "--yes"],
         true,
     );
     assert_eq!(

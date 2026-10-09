@@ -314,11 +314,9 @@ fn scan_args(tmp: &Path, api_url: String, all_releases: bool) -> ScanArgs {
         // from the API. Keeping GC off leaves the before-blobs on disk so
         // rollback restores offline. (Prune's base-vs-qualified handling
         // is covered by `detect_prunable` unit tests.)
-        apply: true,
         prune: false,
         sync: false,
-        vendor: false,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
         all_releases,
         vex: Default::default(),
         rollout: Default::default(),

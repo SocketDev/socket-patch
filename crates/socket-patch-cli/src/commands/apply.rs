@@ -2978,7 +2978,7 @@ const LOCKFILE_ONLY_DETAIL: &str =
 /// this host — an `os`/`cpu`-gated optional dependency (`fsevents`,
 /// `@esbuild/<os>-<cpu>`), a devDependency under `npm ci --omit=dev`. The
 /// tree is in its correct end state, so they are calm skips, as `scan
-/// --apply` treats lockfile-only packages. Global runs have no project
+/// --mode agent` treats lockfile-only packages. Global runs have no project
 /// lock, so nothing is lockfile-resolved there.
 async fn lockfile_resolved(common: &GlobalArgs, unmatched: &[String]) -> HashSet<String> {
     if unmatched.is_empty() || common.is_global() {

@@ -84,7 +84,7 @@ fn get_refuses_project_modes_under_global_scope() {
             let v = parse(&stdout, "");
             assert_eq!(v["status"], "error", "{v}");
             assert!(
-                v["error"]
+                v["error"]["message"]
                     .as_str()
                     .unwrap()
                     .starts_with(&expected["Error: ".len()..]),
@@ -99,7 +99,7 @@ fn get_refuses_project_modes_under_global_scope() {
     assert!(!tmp.path().join(".socket").exists(), "nothing written");
 }
 
-/// `scan -g --mode vendored` (and the hidden `--vendor` spelling) is a
+/// `scan -g --mode vendored` is a
 /// usage error like `--mode hosted` already is.
 #[test]
 fn scan_refuses_vendored_mode_under_global_scope() {
@@ -108,7 +108,6 @@ fn scan_refuses_vendored_mode_under_global_scope() {
     let prefix = prefix.path().to_str().unwrap();
     for (args, flag) in [
         (vec!["scan", "--mode", "vendored", "--global"], "--global"),
-        (vec!["scan", "--vendor", "--global"], "--global"),
         (
             vec!["scan", "--mode", "vendored", "--global-prefix", prefix],
             "--global-prefix",

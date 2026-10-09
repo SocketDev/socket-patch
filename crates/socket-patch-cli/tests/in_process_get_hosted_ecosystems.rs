@@ -504,6 +504,88 @@ async fn maven_pom_hosted_pins_suffixed_version_fail_closed() {
     .expect("manifest-less vex leg");
 }
 
+/// #260: a pom whose only `commons-lang3` dependency sits in a `<profile>`
+/// (read by Maven only when that profile is active). Lockfile discovery —
+/// what `vex`, `list` and `rollback` read — never takes a profile-scoped
+/// pin as wiring, so the run must not claim the redirect; it used to be
+/// confirmed by substring once any Socket text landed in the pom. Nothing
+/// may be written for it.
+#[tokio::test]
+#[serial]
+async fn maven_profile_scoped_dependency_is_not_redirected() {
+    const UUID: &str = "b3b3b3b3-b3b3-4b3b-8b3b-b3b3b3b3b3b3";
+    const PURL: &str = "pkg:maven/org.apache.commons/commons-lang3@3.12.0";
+    const SUFFIXED: &str = "3.12.0-socket.b3b3b3b3";
+    let index_url = format!("http://patch.test/patch-registry/maven/{TOKEN}/{UUID}/maven2");
+    let url = format!(
+        "http://patch.test/patch/maven/org.apache.commons/commons-lang3/3.12.0/{TOKEN}/{UUID}/commons-lang3-{SUFFIXED}.jar"
+    );
+    let server = MockServer::start().await;
+    mock_view(&server, UUID, PURL).await;
+    mock_reference(
+        &server,
+        UUID,
+        PURL,
+        &url,
+        serde_json::json!({ "sha256": "c".repeat(64) }),
+        serde_json::json!({
+            "kind": "maven2",
+            "indexUrl": index_url,
+            "identifiers": {
+                "name": "org.apache.commons/commons-lang3",
+                "version": "3.12.0",
+                "mavenGroupId": "org.apache.commons",
+                "mavenArtifactId": "commons-lang3",
+                "mavenSuffixedVersion": SUFFIXED,
+                "mavenPomSha256": "d".repeat(64),
+            }
+        }),
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pom = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>dev.socket.test</groupId>
+  <artifactId>consumer</artifactId>
+  <version>1.0.0</version>
+  <profiles>
+    <profile>
+      <id>extra</id>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.commons</groupId>
+          <artifactId>commons-lang3</artifactId>
+          <version>3.12.0</version>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>
+"#;
+    std::fs::write(tmp.path().join("pom.xml"), pom).unwrap();
+
+    let code =
+        socket_patch_cli::commands::get::run(get_hosted_args(UUID, tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "an unattributable pin is a skip, not a failure");
+    assert_eq!(
+        reference_bodies(&server).await.len(),
+        1,
+        "the grant flow ran (anti-vacuity)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pom.xml")).unwrap(),
+        pom,
+        "a pin discovery never attributes is not written"
+    );
+    assert!(
+        !tmp.path().join(".mvn").exists(),
+        "no trusted-checksums wiring either"
+    );
+    assert_no_manifest_no_blobs(tmp.path());
+}
+
 /// Manifest-less VEX over what `get <uuid> --mode hosted` committed for a
 /// maven pom (nothing installed: the fail-closed suffixed pin is the
 /// evidence). v5 `get` writes no ledger, so: attested from the pom wiring +

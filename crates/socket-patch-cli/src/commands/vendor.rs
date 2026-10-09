@@ -870,15 +870,13 @@ pub async fn run(args: VendorArgs) -> i32 {
     // Usage errors exit 2, like scan's and get's global mode guard. Checked
     // before anything reads or locks the project.
     if let Some(message) = global_scope_conflict(&args) {
-        if args.common.json {
-            let mut env = Envelope::new(Command::Vendor);
-            env.dry_run = args.common.dry_run;
-            env.mark_error(EnvelopeError::new("global_scope_unsupported", message));
-            println!("{}", env.to_pretty_json());
-        } else {
-            eprintln!("Error: {message}");
-        }
-        return 2;
+        return crate::json_envelope::usage_error(
+            Command::Vendor,
+            args.common.json,
+            args.common.dry_run,
+            "global_scope_unsupported",
+            &message,
+        );
     }
     if args.check {
         return run_check(&args).await;

@@ -66,28 +66,17 @@ mod tests {
     /// on #905 step 3 (they are changed by open PRs). Drop a file when you
     /// move it onto the helpers above.
     const PENDING_INLINE_BOMS: &[&str] = &[
-        "crawlers/gradle_cache.rs",
-        "crawlers/ivy_cache.rs",
         "crawlers/npm_crawler.rs",
         "formats/pnpm/lines.rs",
-        "formats/sbt/owned_file.rs",
-        "formats/yarn/berry_gates.rs",
-        "formats/yarn/mod.rs",
         "hosted/governing_root.rs",
-        "patch/redirect/gradle.rs",
         "patch/redirect/mod.rs",
         "patch/redirect/npmrc.rs",
-        "patch/redirect/upstream/gradle.rs",
         "patch/redirect/upstream/npm.rs",
         "patch/redirect/upstream/pypi.rs",
         "patch/redirect/vlt.rs",
-        "policy/mod.rs",
-        "vendor/common.rs",
         "vendor/go_mod_edit.rs",
         "vendor/jvm/gradle.rs",
         "vendor/lock_inventory/pypi.rs",
-        "vendor/npm_dir.rs",
-        "vendor/pypi_hatch.rs",
         "vendor/yarn_classic_lock.rs",
         "vex/discover/npm.rs",
         "vex/discover/pypi_other.rs",
@@ -99,6 +88,12 @@ mod tests {
         // `sbt_version` reads a Java properties file line by line and skips
         // a BOM on any line (its test pins a BOM after a comment line).
         "formats/sbt/build.rs",
+        // An owned sbt file with any leading BOM is `Modified`, never
+        // `Foreign`: the parser refuses to claim a file someone re-saved.
+        "formats/sbt/owned_file.rs",
+        // Output sanitizing drops U+FEFF anywhere as an invisible
+        // formatting character; it is not a leading-BOM rule.
+        "policy/mod.rs",
         // vlt cannot read a BOM lock, so the sniff refuses it unstripped.
         "vendor/vlt_lock_text.rs",
     ];

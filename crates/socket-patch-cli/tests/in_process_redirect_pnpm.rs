@@ -93,10 +93,8 @@ fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: Some(ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
@@ -1248,10 +1246,10 @@ fn assert_refused_lock_elsewhere(
     );
     assert_eq!(doc["status"], "error", "{doc}");
     assert_eq!(
-        doc["errorCode"], "redirect_pnpm_lockfile_elsewhere",
+        doc["error"]["code"], "redirect_pnpm_lockfile_elsewhere",
         "{doc}"
     );
-    let message = doc["error"].as_str().unwrap_or_default();
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("pnpm-lock.yaml") && message.contains("nothing was written"),
         "the error names the governing lock: {message}"
@@ -1471,10 +1469,10 @@ async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
     assert_eq!(code, Some(1), "{doc}");
     assert_eq!(doc["status"], "error", "{doc}");
     assert_eq!(
-        doc["errorCode"], "redirect_pnpm_settings_elsewhere",
+        doc["error"]["code"], "redirect_pnpm_settings_elsewhere",
         "{doc}"
     );
-    let message = doc["error"].as_str().unwrap_or_default();
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains(&root_ws.display().to_string())
             && message.contains("trustLockfile: true")
@@ -1738,7 +1736,7 @@ async fn hosted_scan_from_vlt_workspace_member_refuses() {
         let (code, doc) = run_hosted_json(&member, &server.uri());
         assert_refused_workspace_lock_elsewhere(workspaces, code, &doc, &lock, &before, &member);
         assert!(
-            doc["error"]
+            doc["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("vlt.json"),
@@ -1762,10 +1760,10 @@ fn assert_refused_workspace_lock_elsewhere(
     );
     assert_eq!(doc["status"], "error", "{case}: {doc}");
     assert_eq!(
-        doc["errorCode"], "redirect_workspace_lockfile_elsewhere",
+        doc["error"]["code"], "redirect_workspace_lockfile_elsewhere",
         "{case}: {doc}"
     );
-    let message = doc["error"].as_str().unwrap_or_default();
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
     let lock_name = lock.file_name().unwrap().to_str().unwrap();
     assert!(
         message.contains(lock_name) && message.contains("nothing was written"),
@@ -1780,4 +1778,89 @@ fn assert_refused_workspace_lock_elsewhere(
         !cwd.join(".socket").exists(),
         "{case}: nothing written in the member"
     );
+}
+
+/// #1094: an npm workspace member holding a stray `package-lock.json` /
+/// `npm-shrinkwrap.json` of its own (one npm never reads; members install
+/// from the root lock) used to skip the #884 refusal. `scan` and `get`
+/// pinned the ignored member lock and exited 0. They now refuse, name the
+/// root lock and the ignored member lock, and leave both untouched.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_npm_member_with_stray_lock_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    for (root_lock, member_lock) in [
+        ("package-lock.json", "package-lock.json"),
+        ("package-lock.json", "npm-shrinkwrap.json"),
+        ("npm-shrinkwrap.json", "package-lock.json"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_package_json_workspace(tmp.path(), root_lock, false);
+        let stray = member.join(member_lock);
+        let stray_text = serde_json::json!({
+            "name": "a", "version": "1.0.0", "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "a", "version": "1.0.0", "dependencies": { NAME: VERSION } },
+                format!("node_modules/{NAME}"): {
+                    "version": VERSION,
+                    "resolved": format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"),
+                    "integrity": "sha512-orig=="
+                }
+            }
+        })
+        .to_string();
+        std::fs::write(&stray, &stray_text).unwrap();
+        let lock = tmp.path().join(root_lock);
+        let before = std::fs::read_to_string(&lock).unwrap();
+        let case = format!("root {root_lock}, member {member_lock}");
+
+        for args in [
+            vec!["scan", "--mode", "hosted"],
+            vec!["get", UUID, "--mode", "hosted"],
+        ] {
+            let out = scrubbed_cli()
+                .args(&args)
+                .args([
+                    "--json",
+                    "--yes",
+                    "--cwd",
+                    member.to_str().unwrap(),
+                    "--api-url",
+                    &server.uri(),
+                    "--org",
+                    ORG,
+                    "--api-token",
+                    "fake",
+                ])
+                .output()
+                .expect("run socket-patch");
+            let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "{case} {args:?}: output is not JSON ({e}):\n{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+            let case = format!("{case} {args:?}");
+            assert_refused_workspace_lock_elsewhere(
+                &case,
+                out.status.code(),
+                &doc,
+                &lock,
+                &before,
+                &member,
+            );
+            let message = doc["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains(member_lock), "{case}: {message}");
+            assert_eq!(
+                std::fs::read_to_string(&stray).unwrap(),
+                stray_text,
+                "{case}: the stray member lock is untouched"
+            );
+            assert!(!member.join(".npmrc").exists(), "{case}");
+        }
+    }
 }

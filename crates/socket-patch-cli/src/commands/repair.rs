@@ -45,14 +45,13 @@ pub async fn run(args: RepairArgs) -> i32 {
     // --offline implies strict airgap: no network calls. `--download-only`
     // is the inverse (network-only). The two are now mutually exclusive.
     if args.common.offline && args.download_only {
-        let msg = "--offline and --download-only are mutually exclusive";
-        if args.common.json {
-            let env = error_envelope(Command::Repair, args.common.dry_run, "invalid_args", msg);
-            println!("{}", env.to_pretty_json());
-        } else {
-            eprintln!("Error: {msg}");
-        }
-        return 2;
+        return crate::json_envelope::usage_error(
+            Command::Repair,
+            args.common.json,
+            args.common.dry_run,
+            "invalid_args",
+            "--offline and --download-only are mutually exclusive",
+        );
     }
 
     let manifest_path = args.common.resolved_manifest_path();

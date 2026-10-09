@@ -243,13 +243,9 @@ pub(crate) async fn detect_npm_lock_flavor_in(
                 ));
             }
             // 4. Nothing recognizable.
-            let location = match view {
-                ProjectView::Disk(root)
-                | ProjectView::Snapshot(super::lock_inventory::DiskSnapshot { root, .. }) => {
-                    project_root_location(root)
-                }
-                ProjectView::Memory(_) => project_root_location(Path::new(".")),
-            };
+            // Only the root's name, for the message: nothing is read.
+            let shown = view.disk_root_reading(std::iter::empty::<&str>());
+            let location = project_root_location(shown.unwrap_or(Path::new(".")));
             return Err((
                 "vendor_lockfile_missing",
                 format!(
@@ -395,6 +391,26 @@ async fn detect_vendorable_npm_flavor_with(
     ))
 }
 
+/// #1094: a package-lock project that is a member of an npm workspace
+/// holds a lock npm never reads (members install from the workspace
+/// root's lock), so vendoring into it would wire nothing. Refused as a
+/// member without that lock is (`vendor_lockfile_missing`). Shared by
+/// [`vendor_npm_any`] and the hosted→vendored takeover preflight
+/// ([`super::npm_lock::npm_lock_vendor_preflight`]), which must refuse
+/// before the takeover restores the hosted pin.
+pub(crate) async fn npm_member_stray_lock_refusal(
+    project_root: &Path,
+) -> Option<(&'static str, String)> {
+    let (root, detail) = crate::hosted::governing_root::npm_member_stray_lock(project_root).await?;
+    Some((
+        "vendor_lockfile_missing",
+        format!(
+            "{detail}; vendor from {} (the workspace root)",
+            root.display()
+        ),
+    ))
+}
+
 /// Vendor one npm package through whichever lockfile-flavor backend serves
 /// this project (package-lock / yarn classic / yarn berry node-modules /
 /// pnpm / pnpm legacy / bun / vlt). Probe refusals (PnP, unsupported lock
@@ -417,6 +433,11 @@ pub async fn vendor_npm_any<'a>(
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
     };
+    if flavor == NpmLockFlavor::PackageLock {
+        if let Some((code, detail)) = npm_member_stray_lock_refusal(project_root).await {
+            return VendorOutcome::Refused { code, detail };
+        }
+    }
     if let Some(detail) = flavor_change_refusal(project_root, purl, flavor).await {
         return VendorOutcome::Refused {
             code: "vendor_flavor_changed",
@@ -1680,6 +1701,57 @@ mod tests {
         assert!(lock.contains(&format!(
             "file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
         )));
+    }
+
+    /// #1094: a workspace member's own package-lock.json is a lock npm never
+    /// reads (members install from the workspace root's lock), so vendoring
+    /// into it would wire nothing. The member is refused as it is without
+    /// the stray lock, and nothing is written.
+    #[tokio::test]
+    async fn npm_member_with_stray_lock_is_refused() {
+        let (tmp, record) = npm_project().await;
+        let ws = tempfile::tempdir().unwrap();
+        let member = ws.path().join("packages/a");
+        tokio::fs::create_dir_all(member.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::rename(tmp.path(), &member).await.unwrap();
+        touch(
+            ws.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .await;
+        touch(ws.path(), "package-lock.json", "{}").await;
+        let lock_before = tokio::fs::read(member.join("package-lock.json"))
+            .await
+            .unwrap();
+
+        // The hosted→vendored takeover preflight raises the same refusal
+        // first, so a leftover hosted pin is never restored only to be
+        // refused (Bugbot on #1095).
+        let preflight = crate::vendor::npm_lock_vendor_preflight(&member)
+            .await
+            .expect("the takeover preflight refuses the member");
+
+        let outcome = vendor_any(&member, &record).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "vendor_lockfile_missing");
+        assert!(
+            detail.contains("workspace") && detail.contains("ignores"),
+            "{detail}"
+        );
+        assert!(!detail.contains("delete"), "{detail}");
+        assert_eq!(preflight, (code, detail));
+        assert!(!member.join(".socket/vendor").exists());
+        assert_eq!(
+            tokio::fs::read(member.join("package-lock.json"))
+                .await
+                .unwrap(),
+            lock_before
+        );
     }
 
     /// A yarn.lock ROUTES to the yarn-classic backend. With a header-only

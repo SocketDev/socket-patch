@@ -371,7 +371,7 @@ async fn every_batch_exhausted_is_the_all_failed_error() {
     assert_eq!(code, 1, "{stdout}\n{stderr}");
     let v = json(&stdout);
     assert_eq!(v["status"], "error");
-    let err = v["error"].as_str().unwrap();
+    let err = v["error"]["message"].as_str().unwrap();
     assert!(
         err.starts_with("API request failed with status 503: busy-")
             && err.ends_with(" (gave up after 3 retries)"),
@@ -428,7 +428,7 @@ async fn exhausted_detail_fetch_is_a_json_warning() {
     let (code, stdout, stderr) = run_scan(
         tmp.path(),
         &server.uri(),
-        &["--json", "--apply", "--dry-run"],
+        &["--json", "--mode", "agent", "--dry-run"],
         &[],
     );
     let v = json(&stdout);

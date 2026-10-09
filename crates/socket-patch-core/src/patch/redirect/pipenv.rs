@@ -126,7 +126,7 @@ pub(super) fn format_entry(value: &Value, text: &str, start: usize) -> Result<St
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect();
-    let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let ending = crate::utils::line_endings::terminator(text);
     Ok(formatted.replace('\n', &format!("{ending}{indent}")))
 }
 
@@ -416,6 +416,22 @@ mod tests {
         let mut value = json!({"_meta":{"pipfile-spec":6,"hash":{"sha256":"unchanged"}},"default":{"urllib3":{"version":"==1.26.18","index":"pypi","hashes":["old"],"extras":["socks"],"markers":"python_version < '4'"}},"develop":{},"tests":{"urllib3":{"version":"==1.26.18"}}});
         value.sort_all_objects();
         format_entry(&value, "{", 0).unwrap() + "\n"
+    }
+
+    /// #815: a re-rendered entry takes the lock's majority line ending.
+    #[test]
+    fn formatted_entry_takes_the_majority_line_ending() {
+        let value = json!({"a": 1, "b": 2});
+        let lf_majority = "{\r\n    \"x\": {\n    }\n}\n";
+        assert_eq!(
+            format_entry(&value, lf_majority, 0).unwrap(),
+            "{\n    \"a\": 1,\n    \"b\": 2\n}"
+        );
+        let crlf_majority = "{\r\n    \"x\": {\r\n    }\n}\r\n";
+        assert_eq!(
+            format_entry(&value, crlf_majority, 0).unwrap(),
+            "{\r\n    \"a\": 1,\r\n    \"b\": 2\r\n}"
+        );
     }
 
     #[test]

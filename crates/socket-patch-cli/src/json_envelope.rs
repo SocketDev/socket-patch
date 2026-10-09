@@ -462,6 +462,96 @@ impl EnvelopeError {
     }
 }
 
+/// The `{code, message}` object every `--json` failure carries as its
+/// top-level `error` — the serialized form of an [`EnvelopeError`].
+pub(crate) fn error_object(err: &EnvelopeError) -> serde_json::Value {
+    serde_json::json!({ "code": err.code, "message": err.message })
+}
+
+/// Mark a legacy (`scan` / `get` / `rollback`) JSON result as a top-level
+/// failure: `status: "error"` plus `error: {code, message}`. Any older
+/// top-level `errorCode` sibling is removed — the code lives in
+/// `error.code` (v5.0). Per-record `errorCode`s inside arrays are untouched.
+pub(crate) fn set_error(value: &mut serde_json::Value, err: EnvelopeError) {
+    // `status` first, so a fresh object reads `{status, error}`.
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("status".into(), serde_json::json!("error"));
+    }
+    set_error_keep_status(value, err);
+}
+
+/// [`set_error`] without touching `status`, for results whose status is
+/// itself the routing signal (get's `selection_required`).
+pub(crate) fn set_error_keep_status(value: &mut serde_json::Value, err: EnvelopeError) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("errorCode");
+        obj.insert("error".into(), error_object(&err));
+    }
+}
+
+/// The minimal legacy failure shape: `{status: "error", error: {code,
+/// message}}`.
+pub(crate) fn legacy_error(code: &str, message: &str) -> serde_json::Value {
+    let mut v = serde_json::json!({});
+    set_error(&mut v, EnvelopeError::new(code, message));
+    v
+}
+
+/// Print [`legacy_error`] on stdout.
+pub(crate) fn print_legacy_error(code: &str, message: &str) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&legacy_error(code, message)).expect("json serialize")
+    );
+}
+
+/// Whether `command` still prints its legacy (non-[`Envelope`]) JSON shape.
+fn is_legacy_shape(command: Command) -> bool {
+    matches!(command, Command::Scan | Command::Get | Command::Rollback)
+}
+
+/// The JSON a self-enforced usage error prints under `--json`: a full
+/// [`Envelope`] for commands already on it, the legacy error shape for
+/// `scan` / `get` / `rollback`.
+pub(crate) fn usage_error_json(
+    command: Command,
+    dry_run: bool,
+    code: &str,
+    message: &str,
+) -> serde_json::Value {
+    if is_legacy_shape(command) {
+        legacy_error(code, message)
+    } else {
+        let mut env = Envelope::new(command);
+        env.dry_run = dry_run;
+        env.mark_error(EnvelopeError::new(code, message));
+        serde_json::to_value(&env).expect("envelope serialize")
+    }
+}
+
+/// Report a usage error a command enforces itself (clap's own parse errors
+/// never reach here) and return its exit code, 2. Under `--json` the coded
+/// error goes to stdout so a consumer always gets parseable output;
+/// otherwise `Error: <message>` goes to stderr.
+pub(crate) fn usage_error(
+    command: Command,
+    json: bool,
+    dry_run: bool,
+    code: &str,
+    message: &str,
+) -> i32 {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&usage_error_json(command, dry_run, code, message))
+                .expect("json serialize")
+        );
+    } else {
+        eprintln!("Error: {message}");
+    }
+    2
+}
+
 /// One run-level advisory (see [`Envelope::warnings`]). Same `code`/`detail`
 /// vocabulary as per-event reasons, but scoped to the whole project/run.
 #[derive(Debug, Clone, Serialize)]
@@ -480,6 +570,175 @@ pub struct RunWarning {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_error_writes_object_and_drops_error_code() {
+        let mut v = serde_json::json!({
+            "status": "success",
+            "errorCode": "lock_held",
+            "error": "old",
+            "patches": [{ "errorCode": "apply_failed", "error": "per-record" }],
+        });
+        set_error(&mut v, EnvelopeError::new("lock_held", "held"));
+        assert_eq!(v["status"], "error");
+        assert_eq!(
+            v["error"],
+            serde_json::json!({"code": "lock_held", "message": "held"})
+        );
+        assert!(v.get("errorCode").is_none(), "{v}");
+        // Per-record keys are out of scope and untouched.
+        assert_eq!(v["patches"][0]["errorCode"], "apply_failed");
+        assert_eq!(v["patches"][0]["error"], "per-record");
+    }
+
+    #[test]
+    fn set_error_keep_status_leaves_status() {
+        let mut v = serde_json::json!({ "status": "selection_required" });
+        set_error_keep_status(&mut v, EnvelopeError::new("selection_required", "pick"));
+        assert_eq!(v["status"], "selection_required");
+        assert_eq!(v["error"]["code"], "selection_required");
+        assert_eq!(v["error"]["message"], "pick");
+    }
+
+    #[test]
+    fn legacy_error_has_minimal_shape() {
+        let v = legacy_error("manifest_unreadable", "bad json");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "status": "error",
+                "error": { "code": "manifest_unreadable", "message": "bad json" },
+            })
+        );
+    }
+
+    #[test]
+    fn usage_error_json_legacy_vs_envelope() {
+        for cmd in [Command::Scan, Command::Get, Command::Rollback] {
+            let v = usage_error_json(cmd, true, "invalid_args", "bad");
+            assert_eq!(v, legacy_error("invalid_args", "bad"), "{cmd:?}");
+        }
+        for cmd in [
+            Command::Apply,
+            Command::List,
+            Command::Remove,
+            Command::Repair,
+            Command::Vendor,
+            Command::Vex,
+        ] {
+            let v = usage_error_json(cmd, true, "invalid_args", "bad");
+            assert_eq!(v["command"], serde_json::to_value(cmd).unwrap());
+            assert_eq!(v["status"], "error");
+            assert_eq!(v["dryRun"], true);
+            assert_eq!(v["events"], serde_json::json!([]));
+            assert_eq!(v["error"]["code"], "invalid_args");
+            assert_eq!(v["error"]["message"], "bad");
+        }
+    }
+
+    #[test]
+    fn usage_error_returns_two() {
+        assert_eq!(
+            usage_error(Command::Scan, false, false, "invalid_args", "x"),
+            2
+        );
+        assert_eq!(
+            usage_error(Command::Remove, true, false, "invalid_args", "x"),
+            2
+        );
+    }
+
+    /// Every `src/commands/**/*.rs` file, with its path relative to the
+    /// crate root.
+    fn command_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src/commands") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        walk(&root.join("src/commands"), &mut files);
+        files.sort();
+        assert!(!files.is_empty(), "no command sources found");
+        files
+            .into_iter()
+            .map(|p| {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, std::fs::read_to_string(&p).expect("read source"))
+            })
+            .collect()
+    }
+
+    /// Guard (#704): a command's self-enforced usage error goes through
+    /// [`usage_error`], which prints the coded error under `--json` and
+    /// returns 2. A bare `return 2;` would bypass that.
+    #[test]
+    fn no_bare_exit_two_in_commands() {
+        const ALLOW: &[&str] = &["src/commands/hosted_bundle.rs"];
+        let mut offenders = Vec::new();
+        for (rel, src) in command_sources() {
+            if ALLOW.contains(&rel.as_str()) {
+                continue;
+            }
+            for (i, line) in src.lines().enumerate() {
+                if line.trim() == "return 2;" {
+                    offenders.push(format!("{rel}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use json_envelope::usage_error for exit-2 usage errors: {offenders:?}"
+        );
+    }
+
+    /// Guard (#704): a `"status": "error"` JSON literal carries `error` as a
+    /// `{code, message}` object and no top-level `"errorCode"`. Checks the
+    /// keys at the same indentation as `"status": "error"`, so per-record
+    /// keys nested deeper are not flagged.
+    #[test]
+    fn error_json_literals_use_the_object_shape() {
+        let mut offenders = Vec::new();
+        for (rel, src) in command_sources() {
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.trim() != r#""status": "error","# {
+                    continue;
+                }
+                let indent = line.len() - line.trim_start().len();
+                for next in &lines[i + 1..] {
+                    let trimmed = next.trim_start();
+                    let next_indent = next.len() - trimmed.len();
+                    if trimmed.is_empty() || next_indent < indent {
+                        break;
+                    }
+                    if next_indent > indent {
+                        continue;
+                    }
+                    let bad = trimmed.starts_with(r#""errorCode":"#)
+                        || (trimmed.starts_with(r#""error":"#)
+                            && !trimmed[r#""error":"#.len()..].trim_start().starts_with('{'));
+                    if bad {
+                        offenders.push(format!("{rel}:{}: {}", i + 1, trimmed));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "top-level `error` must be {{code, message}} with no `errorCode`: {offenders:?}"
+        );
+    }
 
     #[test]
     fn action_tags_round_trip() {

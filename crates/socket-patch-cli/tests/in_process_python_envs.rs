@@ -132,10 +132,8 @@ fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
