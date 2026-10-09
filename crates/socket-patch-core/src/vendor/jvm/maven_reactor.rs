@@ -3800,7 +3800,10 @@ mod tests {
             </configuration></plugin></plugins></build></project>";
         assert!(!declares_modules(ear));
         let read = |p: &str| (p == "pom.xml").then(|| ear.as_bytes().to_vec());
-        assert_eq!(super::super::detect(&read), Shape::Other);
+        let builds = super::super::detect_builds(&read);
+        assert_eq!(builds.maven, Some(super::super::MavenShape::Single));
+        // A single pom is a reactor of one (#973).
+        assert_eq!(builds.shape(), Shape::MavenReactor);
     }
 
     #[test]

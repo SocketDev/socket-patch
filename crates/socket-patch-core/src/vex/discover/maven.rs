@@ -54,9 +54,15 @@
 //! fail-closed pin (no other repository serves it; the Socket repository is
 //! `checksumPolicy=fail`).
 //!
-//! ## Vendored (`vendor::maven_repo`)
+//! ## Vendored, pre-v5 (the retired single-pom backend)
 //!
-//! `vendor_maven` inserts `<id>socket-patch-vendor-<uuid></id>` +
+//! Ledgers written before v5 still carry this wiring until `vendor
+//! --revert` (vendoring such a root is refused as `legacy_maven_root`); v5
+//! vendors every pom root through the JVM planner instead, whose suffixed
+//! pins are attributed through its ledger only (a suffixed pin whose tree
+//! is committed under `.socket/vendor/maven2` is no ref here). The retired
+//! backend inserted
+//! `<id>socket-patch-vendor-<uuid></id>` +
 //! `<url>file://${project.basedir}/.socket/vendor/maven/<uuid></url>` and
 //! leaves the dependency at its ORIGINAL version, so the GAV lives only in
 //! the committed maven2 tree: `.socket/vendor/maven/<uuid>/<g-path>/<a>/<v>/
@@ -1188,16 +1194,22 @@ mod tests {
         hex::encode(Sha1::digest(V_JAR))
     }
 
-    /// A project wired exactly as `vendor_maven` wires it (its own
-    /// `build_repo_edit`), with the committed maven2 tree.
+    /// A project wired exactly as the pre-v5 single-pom backend left it (a
+    /// `<repositories>` section before `</project>`), with the committed
+    /// maven2 tree: VEX still reads such a legacy ledger.
     fn vendored_project(uuid: &str) -> Project {
         let p = Project::new();
-        let wired = crate::vendor::maven_repo::build_repo_edit(
-            &project_pom("1.10.0"),
-            &format!("socket-patch-vendor-{uuid}"),
-            &format!(".socket/vendor/maven/{uuid}"),
-        )
-        .expect("vendor wiring edit");
+        let pom = project_pom("1.10.0");
+        let at = pom.rfind("</project>").expect("project close");
+        let wired = format!(
+            "{}  <repositories>\n    <repository>\n      <id>socket-patch-vendor-{uuid}</id>\n      \
+             <url>file://${{project.basedir}}/.socket/vendor/maven/{uuid}</url>\n      \
+             <releases>\n        <enabled>true</enabled>\n        \
+             <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        \
+             <enabled>false</enabled>\n      </snapshots>\n    </repository>\n  </repositories>\n{}",
+            &pom[..at],
+            &pom[at..]
+        );
         p.write("pom.xml", wired);
         let jar = v_jar_rel(uuid);
         p.write(&jar, V_JAR);

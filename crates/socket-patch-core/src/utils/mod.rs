@@ -12,6 +12,7 @@ pub(crate) mod http;
 pub(crate) mod line_endings;
 pub mod lock_fragments;
 pub mod notice;
+pub(crate) mod package_manager;
 pub mod pdm_lock;
 pub(crate) mod pep440;
 pub mod pipenv;
@@ -31,5 +32,6 @@ pub mod socket_dir;
 pub mod target;
 pub(crate) mod toml_edit_ext;
 pub mod uri;
+pub(crate) mod workspace_globs;
 
 pub mod hatch;

@@ -63,23 +63,20 @@ use crate::utils::fs::{
 };
 use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{already_patched_result, done, parse_json_manifest, refused, JsonLayout};
+use super::common::{parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
-    done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
-    stage_patch_pack, tgz_rel_leaf,
+    gate_packages, guard_revert_uuid_dir, refusal_code, tgz_rel_leaf, vendor_npm_family, NpmCommit,
+    NpmCoords, NpmLockBackend, NpmStagedPack, NpmVendorRequest, WireCx,
 };
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
-use super::state::{
-    write_marker_or_warn, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
-    WiringRecord,
-};
+use super::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::PNPM_LOCK;
 use crate::formats::pnpm::lines::{
-    indent_of, next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
-    yaml_key_like, YamlBlock,
+    indent_of, next_block, parse_key_line, section_bounds, split_lines, split_project_document,
+    unquote_value, yaml_key, yaml_key_like, YamlBlock,
 };
 use crate::formats::pnpm::workspace;
 use crate::formats::pnpm::{check_v9_lock_version as check_lock_version, vendored_npm_uuids};
@@ -91,11 +88,22 @@ use crate::utils::pnpm_workspace::{governing_workspace_file, PNPM_WORKSPACE};
 /// ancestor `pnpm-workspace.yaml` (see [`read_project`]).
 pub(crate) const VENDOR_PNPM_SETTINGS_ELSEWHERE: &str = "vendor_pnpm_settings_elsewhere";
 
+/// Refusal code for a multi-document `pnpm-lock.yaml` whose documents are
+/// not pnpm's env document followed by the project lock (see
+/// [`split_v9_lock`]).
+pub(crate) const VENDOR_PNPM_LOCK_MULTI_DOCUMENT: &str = "vendor_pnpm_lock_multi_document";
+
+/// Warning code: the vendored package is also a pnpm config dependency,
+/// whose own copy (the lock's env document) vendoring leaves unpatched.
+pub(crate) const VENDOR_CONFIG_DEPENDENCY_UNPATCHED: &str = "vendor_config_dependency_unpatched";
+
 /// The root-only workspace member list written into a freshly created
 /// `pnpm-workspace.yaml`. pnpm 9 refuses a workspace file whose `packages`
 /// field is missing or empty; `.` (the root, already the sole importer) is a
 /// no-op that cannot accidentally glob a stray `packages/` subtree into a
-/// workspace the way `packages/*` would.
+/// workspace the way `packages/*` would. It still makes the project a
+/// workspace, so a project pinned to pnpm 9.0–10.4 (which refuse `pnpm add`
+/// there) never gets one (#734).
 const WS_SCAFFOLD_PACKAGES: [&str; 2] = ["packages:", "  - '.'"];
 
 /// Wiring kinds (the `WiringRecord.kind` discriminators this backend owns).
@@ -178,252 +186,210 @@ pub(super) async fn vendor_pnpm_dialect(
     service: Option<&super::VendorServiceConfig>,
     dialect: PnpmDialect,
 ) -> VendorOutcome {
-    let mut warnings: Vec<VendorWarning> = Vec::new();
-
-    // ── 1. Coordinates (shared fail-closed guard) ─────────────────────────
-    let coords = match guard_coordinates(purl, record) {
-        Ok(coords) => coords,
-        Err(outcome) => return *outcome,
-    };
-    let (name, version) = (coords.name.as_str(), coords.version.as_str());
-    let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
-    // pnpm spells the override target `file:<root-relative path>` with NO
-    // `./` (spike P1 fixtures, verbatim).
-    let spec = format!("file:{rel_tgz}");
-    let override_key = format!("{name}@{version}");
-
-    // ── 2. Read the pair (refuse before any write) ───────────────────────
-    let project = match read_project(project_root, dialect).await {
-        Ok(project) => project,
-        Err(outcome) => return *outcome,
-    };
-
-    // ── 3. Pre-flight refusals (override conflicts, entry present) ───────
-    let effective_key = match preflight_package(&project, name, version, &override_key) {
-        Ok(key) => key,
-        Err(outcome) => return *outcome,
-    };
-    let PnpmProject {
-        pkg_bytes,
-        mut pkg,
-        mut lock,
-        ws_text,
-    } = project;
-
-    // ── 4. Stage → patch → pack (shared flavor-agnostic pipeline) ────────
-    let (staged, result) = match stage_patch_pack(
-        purl,
-        installed_dir,
-        project_root,
-        record,
-        sources,
-        dry_run,
-        force,
-        &mut warnings,
-        service,
+    vendor_npm_family(
+        &PnpmBackend { dialect },
+        NpmVendorRequest {
+            purl,
+            installed_dir,
+            project_root,
+            record,
+            sources,
+            vendored_at,
+            dry_run,
+            force,
+            service,
+        },
     )
     .await
-    {
-        Ok(pair) => pair,
-        Err(outcome) => return *outcome,
-    };
-    let Some(staged) = staged else {
-        // Failed patch or dry run: wiring never ran, project byte-untouched.
-        return done(result, None, warnings);
-    };
-    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
-    debug_assert_eq!(staged.rel_tgz, rel_tgz);
-    let packed = staged.packed;
-    if staged.staged_pkg_json.is_some() {
+}
+
+/// The pnpm half of [`vendor_pnpm`] (both lock dialects).
+struct PnpmBackend {
+    dialect: PnpmDialect,
+}
+
+/// [`PnpmBackend`]'s pre-flight product: the gated project and the
+/// override key the wiring writes under.
+struct PnpmPlan {
+    project: PnpmProject,
+    effective_key: String,
+}
+
+impl NpmLockBackend for PnpmBackend {
+    type Plan = PnpmPlan;
+
+    fn flavor(&self) -> Option<&'static str> {
+        Some(self.dialect.flavor())
+    }
+
+    async fn preflight(
+        &self,
+        project_root: &Path,
+        coords: &NpmCoords,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<PnpmPlan, Box<VendorOutcome>> {
+        let (name, version) = (coords.name.as_str(), coords.version.as_str());
+        let override_key = format!("{name}@{version}");
+
+        // ── 2. Read the pair (refuse before any write) ───────────────────
+        let project = read_project(project_root, self.dialect).await?;
+
+        // ── 3. Pre-flight refusals (override conflicts, entry present) ───
+        let effective_key = preflight_package(&project, name, version, &override_key)?;
+        // The env document of a two-document lock is never edited, so a
+        // config dependency's own copy of the package (installed under
+        // `node_modules/.pnpm-config`) keeps the registry bytes.
+        if lock_has_target_package(&split_lines(&project.lock_prefix), name, version) {
+            warnings.push(VendorWarning::new(
+                VENDOR_CONFIG_DEPENDENCY_UNPATCHED,
+                format!(
+                    "{name}@{version} is also a pnpm config dependency (the first document of \
+                     {PNPM_LOCK}); vendoring wires the project's copy only, and the copy pnpm \
+                     installs under node_modules/.pnpm-config stays unpatched — use \
+                     `--mode hosted` to patch both"
+                ),
+            ));
+        }
+        Ok(PnpmPlan {
+            project,
+            effective_key,
+        })
+    }
+
+    async fn wire(
+        &self,
+        plan: PnpmPlan,
+        cx: &WireCx<'_>,
+        staged: &mut NpmStagedPack,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<Option<NpmCommit>, String> {
+        let dialect = self.dialect;
+        let project_root = cx.project_root;
+        let PnpmPlan {
+            project:
+                PnpmProject {
+                    pkg_bytes,
+                    mut pkg,
+                    mut lock,
+                    lock_prefix,
+                    ws_text,
+                },
+            effective_key,
+        } = plan;
+        let rel_tgz = staged.rel_tgz.as_str();
+        // pnpm spells the override target `file:<root-relative path>` with
+        // NO `./` (spike P1 fixtures, verbatim).
+        let spec = format!("file:{rel_tgz}");
+
+        // ── 5. Compute both edits in memory (nothing written yet) ────────
+        let ctx = EditCtx {
+            name: &cx.coords.name,
+            version: &cx.coords.version,
+            rel_tgz,
+            spec: &spec,
+            integrity: &staged.packed.integrity,
+            override_key: &effective_key,
+        };
+        let mut wiring: Vec<WiringRecord> = Vec::new();
+
+        // The package.json copy is a back-compat surface for pnpm that reads
+        // overrides only from package.json. When the lock shows the
+        // project's pnpm reads them from pnpm-workspace.yaml, a new
+        // package.json `pnpm.overrides` would REPLACE the user's workspace
+        // overrides on pnpm 10 (#360), so only the workspace file and the
+        // lock are wired.
+        let skip_pkg_copy = dialect == PnpmDialect::V9
+            && workspace_overrides_govern(&pkg, ws_text.as_deref(), lock.lines());
+        let (pkg_changed, created_pnpm_table, created_overrides_table) = if skip_pkg_copy {
+            (false, false, false)
+        } else {
+            apply_pkg_override(&mut pkg, &effective_key, &spec, &mut wiring)?
+        };
+        let (lock_changed, lock_warning) = lock
+            .edit(&ctx, &mut wiring)
+            .map_err(|e| format!("{PNPM_LOCK} surgery failed: {e}"))?;
+
+        // Only modern locks mirror overrides into pnpm-workspace.yaml.
+        // Legacy pnpm reads package.json alone; creating a workspace changes
+        // its mode. So does a project with no workspace file pinned to pnpm
+        // 9.0–10.4: those read package.json `pnpm.overrides` (wired above)
+        // and refuse `pnpm add` in the root-only workspace a created file
+        // would make (#734). A later run on pnpm >= 10.5 adds the mirror.
+        let ws_edit = if dialect == PnpmDialect::V9
+            && !(ws_text.is_none() && pinned_pre_10_5(project_root, &pkg_bytes).await)
+        {
+            apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring)
+                .map_err(|e| format!("{PNPM_WORKSPACE} surgery failed: {e}"))?
+        } else {
+            WorkspaceEdit::default()
+        };
+
+        if !pkg_changed && !lock_changed && ws_edit.new_text.is_none() {
+            // Everything already carries this uuid + the packed integrity:
+            // the project is in sync.
+            return Ok(None);
+        }
+
+        if let Some(warning) = lock_warning {
+            warnings.push(warning);
+        }
+
+        // ── 6. Commit: package.json + pnpm-workspace.yaml FIRST, lock
+        //    second, unwind the override surfaces on a lock failure (P3
+        //    desync safety). Re-render package.json in its own layout (BOM,
+        //    indent, line ending, trailer) so a Windows / autocrlf manifest
+        //    diffs only in the override.
+        let new_pkg_bytes = JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes))
+            .render(&pkg)
+            .map_err(|e| format!("cannot serialize {PACKAGE_JSON}: {e}"))?;
+        // An env document ahead of the project lock is carried over verbatim.
+        let lock_out = format!("{lock_prefix}{}", lock.lines().join("\n"));
+        commit_surfaces(
+            project_root,
+            pkg_changed.then_some(new_pkg_bytes.as_slice()),
+            &pkg_bytes,
+            ws_edit.new_text.as_deref().map(str::as_bytes),
+            ws_text.as_deref().map(str::as_bytes),
+            ws_edit.created_file,
+            lock_changed.then_some(lock_out.as_bytes()),
+        )
+        .await?;
+        if lock_changed {
+            // Re-seed the memo with the lock just written, so the next
+            // package reads it back without re-splitting it. Only when the
+            // split of those bytes is provably these lines (no line carries
+            // a `\n`); otherwise the next read simply misses.
+            if let ProjectLock::V9(LockLines::Owned(written)) = lock {
+                if !written.iter().any(|l| l.contains('\n')) {
+                    LOCK_MEMO.store(lock_out.into_bytes(), LockDoc::new(written));
+                }
+            }
+        }
+        Ok(Some(NpmCommit {
+            wiring,
+            pnpm: Some(PnpmMeta {
+                created_overrides_table,
+                created_pnpm_table,
+                created_workspace_file: ws_edit.created_file,
+                created_workspace_overrides: ws_edit.created_overrides,
+            }),
+            ..NpmCommit::default()
+        }))
+    }
+
+    fn manifest_warning(&self, name: &str, version: &str) -> VendorWarning {
         // pnpm snapshots mirror the package's own dependency maps; the spike
         // has no fixture for a manifest-rewriting patch, so the mirrors are
         // preserved verbatim and the user is told to re-resolve.
-        warnings.push(VendorWarning::new(
+        VendorWarning::new(
             "vendor_dep_manifest_stale",
             format!(
                 "the patch rewrites {name}@{version}'s package.json; pnpm-lock.yaml's \
                  dependency mirrors were preserved verbatim — if the patch changed \
                  dependency ranges, run `pnpm install` to re-resolve them"
             ),
-        ));
-    }
-
-    // ── 5. Compute both edits in memory (nothing written yet) ────────────
-    let ctx = EditCtx {
-        name,
-        version,
-        rel_tgz: &rel_tgz,
-        spec: &spec,
-        integrity: &packed.integrity,
-        override_key: &effective_key,
-    };
-    let mut wiring: Vec<WiringRecord> = Vec::new();
-
-    // The package.json copy is a back-compat surface for pnpm that reads
-    // overrides only from package.json. When the lock shows the project's
-    // pnpm reads them from pnpm-workspace.yaml, a new package.json
-    // `pnpm.overrides` would REPLACE the user's workspace overrides on
-    // pnpm 10 (#360), so only the workspace file and the lock are wired.
-    let skip_pkg_copy = dialect == PnpmDialect::V9
-        && workspace_overrides_govern(&pkg, ws_text.as_deref(), lock.lines());
-    let (pkg_changed, created_pnpm_table, created_overrides_table) = if skip_pkg_copy {
-        (false, false, false)
-    } else {
-        match apply_pkg_override(&mut pkg, &effective_key, &spec, &mut wiring) {
-            Ok(out) => out,
-            Err(e) => {
-                return done_failure_unstage(
-                    purl,
-                    e,
-                    project_root,
-                    &coords.uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await
-            }
-        }
-    };
-    let (lock_changed, lock_warning) = match lock.edit(&ctx, &mut wiring) {
-        Ok(edit) => edit,
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("{PNPM_LOCK} surgery failed: {e}"),
-                project_root,
-                &coords.uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await
-        }
-    };
-
-    // Only modern locks mirror overrides into pnpm-workspace.yaml. Legacy
-    // pnpm reads package.json alone; creating a workspace changes its mode.
-    let ws_edit = if dialect == PnpmDialect::V9 {
-        match apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring) {
-            Ok(edit) => edit,
-            Err(e) => {
-                return done_failure_unstage(
-                    purl,
-                    format!("{PNPM_WORKSPACE} surgery failed: {e}"),
-                    project_root,
-                    &coords.uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await
-            }
-        }
-    } else {
-        WorkspaceEdit::default()
-    };
-
-    if !pkg_changed && !lock_changed && ws_edit.new_text.is_none() {
-        // Everything already carries this uuid + the packed integrity: the
-        // project is in sync. The integrity is that of the reused committed
-        // tarball (the shared pipeline wrote nothing) or, when reuse missed,
-        // of a fresh acquisition that reproduced the pinned bytes;
-        // synthesize AlreadyPatched and record nothing (the existing ledger
-        // entry stays authoritative).
-        return done(
-            already_patched_result(purl, &project_root.join(&rel_tgz), &record.files),
-            None,
-            warnings,
-        );
-    }
-
-    if let Some(warning) = lock_warning {
-        warnings.push(warning);
-    }
-
-    // ── 6. Commit: package.json + pnpm-workspace.yaml FIRST, lock second,
-    //    unwind the override surfaces on a lock failure (P3 desync safety).
-    // Re-render package.json in its own layout (BOM, indent, line ending,
-    // trailer) so a Windows / autocrlf manifest diffs only in the override.
-    let new_pkg_bytes = match JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes)).render(&pkg) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("cannot serialize {PACKAGE_JSON}: {e}"),
-                project_root,
-                &coords.uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await
-        }
-    };
-    let lock_out = lock.lines().join("\n");
-    if let Err(e) = commit_surfaces(
-        project_root,
-        pkg_changed.then_some(new_pkg_bytes.as_slice()),
-        &pkg_bytes,
-        ws_edit.new_text.as_deref().map(str::as_bytes),
-        ws_text.as_deref().map(str::as_bytes),
-        ws_edit.created_file,
-        lock_changed.then_some(lock_out.as_bytes()),
-    )
-    .await
-    {
-        return done_failure_unstage(
-            purl,
-            e,
-            project_root,
-            &coords.uuid_dir_rel,
-            uuid_dir_preexisted,
         )
-        .await;
     }
-    if lock_changed {
-        // Re-seed the memo with the lock just written, so the next package
-        // reads it back without re-splitting it. Only when the split of
-        // those bytes is provably these lines (no line carries a `\n`);
-        // otherwise the next read simply misses.
-        if let ProjectLock::V9(LockLines::Owned(written)) = lock {
-            if !written.iter().any(|l| l.contains('\n')) {
-                LOCK_MEMO.store(lock_out.into_bytes(), LockDoc::new(written));
-            }
-        }
-    }
-
-    // ── 7. Marker + ledger entry ─────────────────────────────────────────
-    let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
-    write_marker_or_warn(
-        &project_root.join(&coords.uuid_dir_rel),
-        &marker,
-        &mut warnings,
-    )
-    .await;
-
-    let entry = VendorEntry {
-        ecosystem: "npm".to_string(),
-        base_purl: coords.base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: rel_tgz,
-            sha256: packed.sha256_hex,
-            size: Some(packed.size),
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: Some(dialect.flavor().to_string()),
-        uv: None,
-        pnpm: Some(PnpmMeta {
-            created_overrides_table,
-            created_pnpm_table,
-            created_workspace_file: ws_edit.created_file,
-            created_workspace_overrides: ws_edit.created_overrides,
-        }),
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    };
-    done(result, Some(entry), warnings)
 }
 
 /// The pair the pnpm wiring edits, read and structurally gated before any
@@ -435,7 +401,11 @@ pub(super) async fn vendor_pnpm_dialect(
 struct PnpmProject {
     pkg_bytes: Vec<u8>,
     pkg: Value,
+    /// The project document's lines (the whole lock unless it has an env
+    /// document, see [`split_v9_lock`]).
     lock: ProjectLock,
+    /// Everything ahead of the project document, written back verbatim.
+    lock_prefix: String,
     ws_text: Option<String>,
 }
 
@@ -476,6 +446,27 @@ impl ProjectLock {
     }
 }
 
+/// The refusal for a project whose `gitBranchLockfile` setting installs
+/// the branch from a `pnpm-lock.<branch>.yaml` (#556): the wiring edits
+/// `pnpm-lock.yaml` only, and pnpm would then fail every
+/// `--frozen-lockfile` install on the branch over the overrides the
+/// manifest gained. Also raised by the flavor probe when the branch lock
+/// is the only one.
+pub(super) async fn git_branch_lock_refusal(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+) -> Option<(&'static str, String)> {
+    use crate::utils::pnpm_workspace::{git_branch_locks, GitBranchLocks};
+    let branch = git_branch_locks(view).await?;
+    Some((
+        "vendor_pnpm_git_branch_lockfile",
+        format!(
+            "{}; vendoring wires {PNPM_LOCK} only, so nothing was changed — {}",
+            branch.describe(),
+            GitBranchLocks::REMEDY
+        ),
+    ))
+}
+
 /// Read the pair, refusing (before any write) a file that is missing,
 /// unreadable, not the shape the surgery has fixtures for, or CRLF.
 async fn read_project(
@@ -504,6 +495,13 @@ async fn read_project(
             )));
         }
     };
+    if let Some(refusal) = git_branch_lock_refusal(
+        &crate::vendor::lock_inventory::ProjectView::Disk(project_root),
+    )
+    .await
+    {
+        return Err(Box::new(refused(refusal.0, refusal.1)));
+    }
     let lock_text = match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
         Ok(text) => text,
         Err(e) => {
@@ -554,14 +552,31 @@ async fn read_project(
                 project_root,
                 grammar,
             )?),
+            lock_prefix: String::new(),
             ws_text: None,
         });
     }
+    let (lock_prefix, project_text) = match split_v9_lock(&lock_text) {
+        Ok(split) => split,
+        Err(why) => {
+            return Err(Box::new(refused(
+                VENDOR_PNPM_LOCK_MULTI_DOCUMENT,
+                format!(
+                    "{why} — vendored mode wires only the project document of a lock in \
+                     pnpm's two-document layout (its config-dependency / `packageManager` \
+                     document, then the project lock) and will not guess which document \
+                     to edit; use `--mode hosted`; nothing was written"
+                ),
+            )));
+        }
+    };
     // The split (and its section index) is the run's, while the bytes just
-    // read are the ones it came from; see [`LOCK_MEMO`].
+    // read are the ones it came from; see [`LOCK_MEMO`]. The memo maps the
+    // whole lock's bytes to its project document's lines.
     let lines = LockLines::Shared(LOCK_MEMO.parse_infallible(lock_text.as_bytes(), || {
-        LockDoc::new(split_lines(&lock_text))
+        LockDoc::new(split_lines(project_text))
     }));
+    let lock_prefix = lock_prefix.to_string();
     // `pnpm-workspace.yaml` is optional (single-package projects have none);
     // its `overrides:` is where pnpm >= 11 reads them. ONLY a missing file
     // counts as "no file": an existing one we cannot read (non-UTF-8
@@ -589,7 +604,9 @@ async fn read_project(
     // nest a `packages: ['.']` scaffold pnpm ignores, and every root
     // install then fails (frozen) or drops the override (#881). The
     // override cannot go in the root file either: socket-patch writes only
-    // inside the project. Hosted mode pins such a member.
+    // inside the project. Hosted mode pins such a member. A directory the
+    // root's `packages:` globs do not list is standalone and takes the
+    // create path (#1006).
     if ws_text.is_none() {
         if let Some(file) = governing_workspace_file(project_root) {
             return Err(Box::new(refused(
@@ -624,8 +641,23 @@ async fn read_project(
         pkg_bytes,
         pkg,
         lock: ProjectLock::V9(lines),
+        lock_prefix,
         ws_text,
     })
+}
+
+/// `(prefix, project document)` of a v9 lock ([`split_project_document`]),
+/// the project document's own head version-checked. `Err` names why the
+/// lock's documents are not pnpm's layout.
+fn split_v9_lock(text: &str) -> Result<(&str, &str), String> {
+    let (prefix, project) =
+        split_project_document(text).map_err(|why| format!("{PNPM_LOCK} {why}"))?;
+    if !prefix.is_empty() {
+        check_lock_version(project).map_err(|e| {
+            format!("the project document of {PNPM_LOCK} fails its version check: {e}")
+        })?;
+    }
+    Ok((prefix, project))
 }
 
 /// The per-package pre-flight against an already-read project: override
@@ -640,18 +672,43 @@ fn preflight_package(
     override_key: &str,
 ) -> Result<String, Box<VendorOutcome>> {
     // A user-authored exact-version pin equal to `version` is TAKEN OVER
-    // (the pin's key is rewritten to our spec on both surfaces and the
+    // (the pin's key is rewritten to our spec on every surface and the
     // original value recorded for revert); anything else same-name refuses.
-    let disposition = match classify_pkg_override(&project.pkg, name, version, override_key) {
-        Ok(d) => d,
-        Err(detail) => return Err(Box::new(refused("vendor_override_conflict", detail))),
+    // The pin may live in package.json or, for modern locks, in
+    // pnpm-workspace.yaml (the map pnpm 10.5+ reads; #854).
+    let conflict = |detail| Box::new(refused("vendor_override_conflict", detail));
+    let pkg_d =
+        classify_pkg_override(&project.pkg, name, version, override_key).map_err(conflict)?;
+    let ws_d = match &project.lock {
+        ProjectLock::V9(_) => {
+            classify_ws_override(project.ws_text.as_deref(), name, version, override_key)
+                .map_err(conflict)?
+        }
+        ProjectLock::Legacy(_) => OverrideDisposition::Insert,
     };
-    let effective_key = disposition.effective_key(override_key).to_string();
+    let (effective_key, source) = match (&pkg_d, &ws_d) {
+        (OverrideDisposition::Insert, OverrideDisposition::Insert) => (override_key, None),
+        (OverrideDisposition::Insert, ws) => (ws.effective_key(override_key), Some(PNPM_WORKSPACE)),
+        (pkg, ws) => {
+            let pkg_key = pkg.effective_key(override_key);
+            let ws_key = ws.effective_key(override_key);
+            if !matches!(ws, OverrideDisposition::Insert) && ws_key != pkg_key {
+                return Err(conflict(format!(
+                    "{PNPM_WORKSPACE} carries the override key `{ws_key}` for `{name}` while \
+                     {PACKAGE_JSON} carries `{pkg_key}` — make the two agree before vendoring"
+                )));
+            }
+            (pkg_key, Some(PACKAGE_JSON))
+        }
+    };
+    let effective_key = effective_key.to_string();
     if let ProjectLock::V9(lines) = &project.lock {
         lines.note_probe();
     }
-    if let Err(detail) = check_lock_override(project.lock.lines(), name, version, &effective_key) {
-        return Err(Box::new(refused("vendor_override_conflict", detail)));
+    if let Err(detail) =
+        check_lock_override(project.lock.lines(), name, version, &effective_key, source)
+    {
+        return Err(conflict(detail));
     }
     match &project.lock {
         ProjectLock::V9(lines) => {
@@ -842,6 +899,31 @@ pub(super) async fn revert_pnpm_dialect(
             return blocked;
         }
     }
+    // A v9 lock whose documents are not pnpm's layout cannot be reverted
+    // without guessing which document holds the wiring: fail before any
+    // surface is touched (the dry run too, so the preview never advertises
+    // a revert the wet run refuses) instead of reverting package.json and
+    // the workspace file around a lock left wired to the artifact.
+    let mut lock_text: Option<std::io::Result<String>> = None;
+    if dialect == PnpmDialect::V9
+        && entry
+            .wiring
+            .iter()
+            .any(|r| r.file != PACKAGE_JSON && dialect.allows_revert_file(&r.file))
+    {
+        let read = read_regular_to_string(&project_root.join(PNPM_LOCK)).await;
+        if let Ok(text) = &read {
+            if let Err(why) = split_v9_lock(text) {
+                return RevertOutcome::failed(format!(
+                    "{why}, so the vendored wiring of {} cannot be located; nothing was \
+                     reverted — restore the vendored {PNPM_LOCK} (or re-lock it with pnpm) \
+                     and re-run the revert",
+                    entry.base_purl
+                ));
+            }
+        }
+        lock_text = Some(read);
+    }
     if dry_run {
         return RevertOutcome::ok();
     }
@@ -872,9 +954,26 @@ pub(super) async fn revert_pnpm_dialect(
     // Load both surfaces up front (fail-closed on unparseable; a missing
     // file degrades to a warning and the artifact removal still proceeds).
     let mut lock_lines: Option<Vec<String>> = None;
+    let mut lock_prefix = String::new();
     if touches_lock {
-        match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
-            Ok(text) => lock_lines = Some(split_lines(&text)),
+        let read = match lock_text {
+            Some(read) => read,
+            None => read_regular_to_string(&project_root.join(PNPM_LOCK)).await,
+        };
+        match read {
+            // The wiring lives in the project document; an env document
+            // ahead of it is written back verbatim.
+            Ok(text) => match dialect {
+                PnpmDialect::V9 => {
+                    let (prefix, project) = match split_v9_lock(&text) {
+                        Ok(split) => split,
+                        Err(why) => return RevertOutcome::failed(why),
+                    };
+                    lock_prefix = prefix.to_string();
+                    lock_lines = Some(split_lines(project));
+                }
+                PnpmDialect::Legacy => lock_lines = Some(split_lines(&text)),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 outcome.warnings.push(VendorWarning::new(
                     "vendor_lockfile_missing",
@@ -974,7 +1073,7 @@ pub(super) async fn revert_pnpm_dialect(
         if let Some(lines) = &lock_lines {
             if let Err(e) = atomic_write_bytes_preserving_mode(
                 &project_root.join(PNPM_LOCK),
-                lines.join("\n").as_bytes(),
+                format!("{lock_prefix}{}", lines.join("\n")).as_bytes(),
             )
             .await
             {
@@ -1311,8 +1410,9 @@ pub(super) fn vendor_value_is_for(value: &str, name: &str, version: &str) -> boo
         .is_some_and(|p| p.eco == "npm" && p.leaf == tgz_rel_leaf(name, version))
 }
 
-/// How the package.json `pnpm.overrides` table relates to the package
-/// being vendored. The lock's `overrides:` section must mirror this map
+/// How the package.json `pnpm.overrides` table (or the pnpm-workspace.yaml
+/// `overrides:` section) relates to the package being vendored. The
+/// lock's `overrides:` section must mirror this map
 /// key-for-key (pnpm hard-checks the two and fails
 /// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` on any drift), so whichever key
 /// this classification yields is the one BOTH surfaces edit.
@@ -1362,12 +1462,79 @@ pub(super) fn classify_pkg_override(
     let Some(map) = overrides.as_object() else {
         return Err("package.json pnpm.overrides is not an object".to_string());
     };
+    classify_override_entries(
+        map.iter().map(|(key, value)| {
+            (
+                key.as_str(),
+                value.as_str().unwrap_or(""),
+                value.to_string(),
+            )
+        }),
+        name,
+        version,
+        our_key,
+        PACKAGE_JSON,
+    )
+}
+
+/// Classify the pnpm-workspace.yaml `overrides:` section for `name` with
+/// the same rules as [`classify_pkg_override`] — on pnpm 10.5+ (always on
+/// 11/12) it is the authoritative override map, so a user exact pin there
+/// is taken over just like one in package.json (#854). Values compare as
+/// YAML reads them ([`ws_override_value`]): a quoted pin (`'1.3.0'`) or one
+/// with a trailing comment is the same pin as the plain `1.3.0`. A missing
+/// file, a missing section and an inline/flow section classify as
+/// `Insert`; [`check_workspace_override`] refuses the shapes the surgery
+/// cannot edit.
+fn classify_ws_override(
+    ws_text: Option<&str>,
+    name: &str,
+    version: &str,
+    our_key: &str,
+) -> Result<OverrideDisposition, String> {
+    let Some(text) = ws_text else {
+        return Ok(OverrideDisposition::Insert);
+    };
+    let lines = split_lines(text);
+    let Some((start, end, indent)) = ws_overrides_section(&lines) else {
+        return Ok(OverrideDisposition::Insert);
+    };
+    classify_override_entries(
+        lines[start + 1..end]
+            .iter()
+            .filter_map(|l| parse_key_line(l, indent))
+            .map(|(key, _repr, rest)| (key, ws_override_value(rest), rest.to_string())),
+        name,
+        version,
+        our_key,
+        PNPM_WORKSPACE,
+    )
+}
+
+/// A pnpm-workspace.yaml override's value as YAML reads it: a trailing
+/// ` #` comment and one layer of quotes dropped, so a hand-written
+/// `left-pad: '1.3.0'  # CVE-…` pins the same `1.3.0` its lock mirror
+/// records. Comparisons only — the raw text is what a takeover records as
+/// the original, so revert restores the line byte-for-byte.
+fn ws_override_value(rest: &str) -> &str {
+    unquote_value(workspace::strip_comment(rest).trim())
+}
+
+/// The shared per-entry rules of [`classify_pkg_override`] and
+/// [`classify_ws_override`] over `(key, value, value as shown)` entries of
+/// the override map `source` carries.
+fn classify_override_entries<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a str, String)>,
+    name: &str,
+    version: &str,
+    our_key: &str,
+    source: &str,
+) -> Result<OverrideDisposition, String> {
     let mut found: Option<OverrideDisposition> = None;
-    for (key, value) in map {
+    for (key, value_str, shown) in entries {
         if override_key_name(key) != name {
             continue;
         }
-        let value_str = value.as_str().unwrap_or("");
         // A SIBLING version's vendored override coexists — not ours to
         // touch (and not a conflict): skip it entirely.
         if is_vendor_value(value_str) && !vendor_value_is_for(value_str, name, version) {
@@ -1375,16 +1542,20 @@ pub(super) fn classify_pkg_override(
         }
         if found.is_some() {
             return Err(format!(
-                "package.json carries more than one pnpm override for `{name}`; vendoring \
+                "{source} carries more than one pnpm override for `{name}`; vendoring \
                  cannot pick one — remove the extras first"
             ));
         }
         let classified = if key.contains('>') {
             None
         } else if is_vendor_value(value_str) {
-            Some(OverrideDisposition::Ours { key: key.clone() })
+            Some(OverrideDisposition::Ours {
+                key: key.to_string(),
+            })
         } else if value_str == version && (key == name || key == our_key) {
-            Some(OverrideDisposition::Takeover { key: key.clone() })
+            Some(OverrideDisposition::Takeover {
+                key: key.to_string(),
+            })
         } else {
             None
         };
@@ -1392,7 +1563,7 @@ pub(super) fn classify_pkg_override(
             Some(d) => found = Some(d),
             None => {
                 return Err(format!(
-                    "package.json already carries a pnpm override for `{key}` ({value}); \
+                    "{source} already carries a pnpm override for `{key}` ({shown}); \
                      vendoring would fight it — remove the override (or vendor --revert) \
                      first (an exact-version pin equal to {version} is taken over \
                      automatically)"
@@ -1409,11 +1580,14 @@ pub(super) fn classify_pkg_override(
 /// drift means the pair is already desynced) with a value the edit can
 /// own: ours, the exact pinned `version` (takeover), or already our spec.
 /// A missing section/key is fine — the edit inserts it, restoring parity.
+/// `source` names the file `effective_key` came from (`None`: no override
+/// for `name` anywhere, so it is the key vendoring would add).
 pub(super) fn check_lock_override(
     lines: &[String],
     name: &str,
     version: &str,
     effective_key: &str,
+    source: Option<&str>,
 ) -> Result<(), String> {
     let Some((start, end)) = section_bounds(lines, "overrides") else {
         return Ok(());
@@ -1428,10 +1602,17 @@ pub(super) fn check_lock_override(
                 continue;
             }
             if key != effective_key {
+                let theirs = match source {
+                    Some(source) => format!("{source}'s `{effective_key}`"),
+                    None => format!(
+                        "the `{effective_key}` vendoring would add (no override for `{name}` \
+                         exists to take over)"
+                    ),
+                };
                 return Err(format!(
                     "{PNPM_LOCK} carries an override key `{key}` for `{name}` that does not \
-                     match package.json's `{effective_key}` — the two override maps must \
-                     agree (run `pnpm install` to re-sync them) before vendoring"
+                     match {theirs} — the two override maps must agree (run `pnpm install` \
+                     to re-sync them) before vendoring"
                 ));
             }
             if !(is_vendor_value(rest) || rest == version) {
@@ -1755,11 +1936,13 @@ pub(super) fn apply_pkg_override(
 /// Does the pnpm that wrote this lock read `overrides:` from
 /// pnpm-workspace.yaml (pnpm 10.5+) rather than package.json? True when
 /// package.json has no `pnpm.overrides` of its own and the lock's
-/// `overrides:` records a user-authored (non-vendored) key of the
-/// workspace file's `overrides:` section. pnpm 9 and 10.0–10.4 ignore the
-/// workspace block, so their locks never record it; and with no user
-/// workspace override both surfaces agree anyway, so the package.json
-/// copy stays harmless there.
+/// `overrides:` records a key of the workspace file's `overrides:`
+/// section. pnpm 9 and 10.0–10.4 ignore the workspace block, so their
+/// locks never record it; and with no workspace override both surfaces
+/// agree anyway, so the package.json copy stays harmless there. A
+/// vendored value counts too: after a workspace-only takeover (#854) or
+/// an earlier skipped copy, the lock recording it still shows the
+/// workspace file governs, and a copy now would shadow it.
 fn workspace_overrides_govern(pkg: &Value, ws_text: Option<&str>, lock: &[String]) -> bool {
     if pkg.get("pnpm").and_then(|p| p.get("overrides")).is_some() {
         return false;
@@ -1781,7 +1964,7 @@ fn workspace_overrides_govern(pkg: &Value, ws_text: Option<&str>, lock: &[String
     ws_lines[ws_start + 1..ws_end]
         .iter()
         .filter_map(|l| parse_key_line(l, indent))
-        .any(|(key, _, rest)| !is_vendor_value(rest) && lock_keys.contains(&key))
+        .any(|(key, _, _)| lock_keys.contains(&key))
 }
 
 // ─────────────────────── pnpm-workspace.yaml override ─────────────────────
@@ -1789,6 +1972,21 @@ fn workspace_overrides_govern(pkg: &Value, ws_text: Option<&str>, lock: &[String
 // `<name>@<version>` → `file:` mapping is mirrored here. Edits are line
 // splices (never a YAML library) so untouched lines stay byte-identical and
 // revert restores the file byte-for-byte (or deletes a file we created).
+
+/// Whether every pnpm pin of a project (package.json, the installed
+/// `node_modules/.modules.yaml`) is a release that refuses `pnpm add` in a
+/// root-only workspace, so no pnpm-workspace.yaml is created for it. The
+/// install record is advisory: unreadable counts as absent.
+async fn pinned_pre_10_5(project_root: &Path, pkg_bytes: &[u8]) -> bool {
+    let modules = read_regular_to_string(&project_root.join("node_modules/.modules.yaml"))
+        .await
+        .ok();
+    crate::formats::pnpm::root_only_workspace_breaks_add(
+        std::str::from_utf8(pkg_bytes).ok(),
+        modules.as_deref(),
+    )
+    .is_some()
+}
 
 /// The bytes of a freshly created pnpm-workspace.yaml: a root-only
 /// `packages:` list (pnpm 9 refuses a workspace file with no `packages`
@@ -1874,8 +2072,9 @@ fn check_workspace_override(
         if override_key_name(key) != name {
             continue;
         }
+        let value = ws_override_value(rest);
         // A sibling version's vendored override coexists — skip it.
-        if is_vendor_value(rest) && !vendor_value_is_for(rest, name, version) {
+        if is_vendor_value(value) && !vendor_value_is_for(value, name, version) {
             continue;
         }
         if key != effective_key {
@@ -1884,7 +2083,7 @@ fn check_workspace_override(
                  match `{effective_key}` — remove it (or vendor --revert) first"
             ));
         }
-        if !(is_vendor_value(rest) || rest == version) {
+        if !(is_vendor_value(value) || value == version) {
             return Err(format!(
                 "{PNPM_WORKSPACE} already carries an override for `{key}` ({rest}); vendoring \
                  would fight it — remove the override (or vendor --revert) first"
@@ -1937,8 +2136,9 @@ fn apply_workspace_override(
                 });
             }
             // Ours (stale uuid, no original) or the user's exact-version pin
-            // being TAKEN OVER (recorded, live quoting preserved).
-            let original = (!is_vendor_value(&rest)).then(|| rest.clone());
+            // being TAKEN OVER (recorded raw — quotes, comment and all — so
+            // revert restores the line byte-for-byte).
+            let original = (!is_vendor_value(ws_override_value(&rest))).then(|| rest.clone());
             lines[i] = format!("{pad}{}: {spec}", yaml_key_like(our_key, &repr));
             wiring.push(ws_record(our_key, spec, WiringAction::Rewritten, original));
         } else {
@@ -3204,7 +3404,8 @@ fn revert_importer_dep(
 
 /// Restore a rekeyed packages/snapshots block: locate the block by the NEW
 /// key (from `rec.new`'s first line), verify ownership, splice the original
-/// lines back.
+/// lines back — merged with any dependency ref ANOTHER entry rewrote inside
+/// the block since (#830, [`merge_live_dep_refs`]).
 fn revert_block(
     lines: &mut Vec<String>,
     rec: &WiringRecord,
@@ -3258,19 +3459,21 @@ fn revert_block(
             )));
             return;
         };
-        lines.splice(block.header..block.end, original);
+        let restored = merge_live_dep_refs(&original, &new_lines, &live);
+        lines.splice(block.header..block.end, restored);
         *dirty = true;
         return;
     }
     // ALREADY CONVERGED: an earlier partial revert restored this record —
     // the splice rekeys the block back to its pre-vendor key, so the
     // recorded `file:` key no longer matches while the original block is
-    // live verbatim. Not drift: stay silent so the drift-skip keep gate can
-    // converge instead of keeping the artifacts forever.
+    // live (up to the dependency refs the merge kept). Not drift: stay
+    // silent so the drift-skip keep gate can converge instead of keeping
+    // the artifacts forever.
     if let Some(orig) = rec.original.as_ref().and_then(value_lines) {
         let mut j = start + 1;
         while let Some(block) = next_block(lines, j, end) {
-            if lines[block.header..block.end] == orig[..] {
+            if same_modulo_dep_refs(&lines[block.header..block.end], &orig) {
                 return;
             }
             j = block.end;
@@ -3281,6 +3484,11 @@ fn revert_block(
     )));
 }
 
+/// Restore one dependent snapshot's ref to this entry. The record is keyed
+/// by the dependent's snapshot key AT VENDOR TIME, which a later vendor or
+/// revert of the dependent itself rekeys (`debug@4.3.4` ⇄
+/// `debug@file:…`): when that key is gone, the ref is found in the block
+/// that names the same package under its other key (#830).
 fn revert_snapshot_ref(
     lines: &mut [String],
     rec: &WiringRecord,
@@ -3301,48 +3509,214 @@ fn revert_snapshot_ref(
         ));
         return;
     };
-    let mut i = start + 1;
-    while let Some(block) = next_block(lines, i, end) {
-        if block.key != snapshot_key {
-            i = block.end;
-            continue;
-        }
-        for line in lines[block.header + 1..block.end].iter_mut() {
-            let Some((d, _repr, rest)) = parse_key_line(line, 6) else {
-                continue;
-            };
-            if d != dep {
-                continue;
-            }
-            // ALREADY CONVERGED: the live ref already equals the recorded
-            // pre-vendor original — an earlier partial revert (or the
-            // user, by hand) already restored it. Not drift.
-            if rec.original.as_ref().and_then(Value::as_str) == Some(rest) {
-                return;
-            }
-            let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
-                || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
-            if !ours {
-                warnings.push(drifted(format!(
-                    "snapshot ref `{key}` was re-resolved since vendoring ({rest}); left alone"
-                )));
-                return;
-            }
-            let Some(original) = rec.original.as_ref().and_then(Value::as_str) else {
-                warnings.push(drifted(format!(
-                    "snapshot ref `{key}` has no recorded pre-vendor original; left as-is"
-                )));
-                return;
-            };
-            *line = format!("      {}: {original}", yaml_key(dep));
-            *dirty = true;
+    let target = DepRef {
+        rec,
+        key,
+        dep,
+        entry_uuid,
+        label: "snapshot ref",
+        dep_maps_only: false,
+    };
+    for (header, block_end) in ref_record_blocks(lines, start, end, snapshot_key) {
+        if target.restore_in(lines, header, block_end, dirty, warnings) {
             return;
         }
-        break;
     }
     warnings.push(removed(format!(
         "snapshot ref `{key}` no longer exists; nothing to restore"
     )));
+}
+
+/// The `[header, end)` ranges a dependency-ref record keyed by `block_key`
+/// may live in: that block itself, else (it was rekeyed since) every block
+/// naming the same package ([`key_package_leaves`]).
+pub(super) fn ref_record_blocks(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    block_key: &str,
+) -> Vec<(usize, usize)> {
+    let mut i = start + 1;
+    while let Some(block) = next_block(lines, i, end) {
+        if block.key == block_key {
+            return vec![(block.header, block.end)];
+        }
+        i = block.end;
+    }
+    let leaves = key_package_leaves(block_key);
+    let mut same_package = Vec::new();
+    let mut i = start + 1;
+    while let Some(block) = next_block(lines, i, end) {
+        if key_package_leaves(&block.key)
+            .iter()
+            .any(|l| leaves.contains(l))
+        {
+            same_package.push((block.header, block.end));
+        }
+        i = block.end;
+    }
+    same_package
+}
+
+/// The package a packages/snapshots key names, as its vendored tarball
+/// leaves ([`tgz_rel_leaf`]): from the embedded vendor path of a `file:`
+/// key, else from a registry key in every dialect's spelling (`name@ver`,
+/// `/name@ver`, `/name/ver` — the misparses never equal a real leaf).
+/// Peer-suffixed keys match nothing, and are never rekeyed anyway.
+fn key_package_leaves(key: &str) -> Vec<String> {
+    let path = key.rsplit_once("@file:").map_or(key, |(_, p)| p);
+    if let Some(p) = parse_vendor_path(path) {
+        return if p.eco == "npm" {
+            vec![p.leaf]
+        } else {
+            Vec::new()
+        };
+    }
+    let bare = key.strip_prefix('/').unwrap_or(key);
+    [bare.rsplit_once('@'), bare.rsplit_once('/')]
+        .into_iter()
+        .flatten()
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+        .map(|(name, version)| tgz_rel_leaf(name, version))
+        .collect()
+}
+
+/// One recorded dependency ref to restore (a v9 snapshot ref or a legacy
+/// packages dep ref).
+pub(super) struct DepRef<'a> {
+    pub(super) rec: &'a WiringRecord,
+    pub(super) key: &'a str,
+    pub(super) dep: &'a str,
+    pub(super) entry_uuid: &'a str,
+    /// Warning prefix (`snapshot ref` / `dep ref`).
+    pub(super) label: &'a str,
+    /// Only look inside `dependencies:` / `optionalDependencies:` maps (the
+    /// legacy edit's scope; the v9 edit rewrites any 6-space key).
+    pub(super) dep_maps_only: bool,
+}
+
+impl DepRef<'_> {
+    /// Restore the ref inside the block `[header, end)`. `false` when the
+    /// block has no such ref line (the caller tries the next candidate).
+    pub(super) fn restore_in(
+        &self,
+        lines: &mut [String],
+        header: usize,
+        end: usize,
+        dirty: &mut bool,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> bool {
+        let at = if self.dep_maps_only {
+            dep_map_refs(&lines[header..end])
+                .into_iter()
+                .find(|&(_, d, _, _)| d == self.dep)
+                .map(|(i, ..)| header + i)
+        } else {
+            (header + 1..end)
+                .find(|&k| parse_key_line(&lines[k], 6).is_some_and(|(d, _, _)| d == self.dep))
+        };
+        let Some(k) = at else {
+            return false;
+        };
+        let Some((_, _, rest)) = parse_key_line(&lines[k], 6) else {
+            return false;
+        };
+        let rec = self.rec;
+        // ALREADY CONVERGED: the live ref already equals the recorded
+        // pre-vendor original — an earlier partial revert (or the user, by
+        // hand) already restored it. Not drift.
+        if rec.original.as_ref().and_then(Value::as_str) == Some(rest) {
+            return true;
+        }
+        let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
+            || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
+        if !ours {
+            warnings.push(drifted(format!(
+                "{} `{}` was re-resolved since vendoring ({rest}); left alone",
+                self.label, self.key
+            )));
+            return true;
+        }
+        let Some(original) = rec.original.as_ref().and_then(Value::as_str) else {
+            warnings.push(drifted(format!(
+                "{} `{}` has no recorded pre-vendor original; left as-is",
+                self.label, self.key
+            )));
+            return true;
+        };
+        lines[k] = format!("      {}: {original}", yaml_key(self.dep));
+        *dirty = true;
+        true
+    }
+}
+
+/// `(index, dep, repr, value)` for each ref line of a packages/snapshots
+/// `block` (header first) inside a 4-space `dependencies:` /
+/// `optionalDependencies:` map — the resolution maps the ref edits rewrite
+/// (`peerDependencies` holds ranges, `transitivePeerDependencies` a list).
+fn dep_map_refs(block: &[String]) -> Vec<(usize, &str, &str, &str)> {
+    let mut refs = Vec::new();
+    let mut in_dep_map = false;
+    for (i, line) in block.iter().enumerate().skip(1) {
+        if let Some((field, _repr, rest)) = parse_key_line(line, 4) {
+            in_dep_map =
+                rest.is_empty() && matches!(field, "dependencies" | "optionalDependencies");
+            continue;
+        }
+        if in_dep_map {
+            if let Some((dep, repr, value)) = parse_key_line(line, 6) {
+                refs.push((i, dep, repr, value));
+            }
+        }
+    }
+    refs
+}
+
+/// The block a rekeyed packages/snapshots record restores (#830): its
+/// recorded pre-vendor `original`, except a dependency ref whose `live`
+/// value moved off what this entry wrote (`new`) — another entry's vendor
+/// or revert rewrote it since (a vendored parent's child, vendored or
+/// unwound on its own) — keeps that live value, so the lock stays
+/// resolvable whichever entry is unwound first. With `live == new` this is
+/// `original` verbatim.
+pub(super) fn merge_live_dep_refs(
+    original: &[String],
+    new: &[String],
+    live: &[String],
+) -> Vec<String> {
+    let values = |block| -> HashMap<&str, &str> {
+        dep_map_refs(block)
+            .into_iter()
+            .map(|(_, dep, _, value)| (dep, value))
+            .collect()
+    };
+    let (new_refs, live_refs) = (values(new), values(live));
+    let mut merged = original.to_vec();
+    for (i, dep, repr, value) in dep_map_refs(original) {
+        let Some(&live_value) = live_refs.get(dep) else {
+            continue;
+        };
+        if new_refs.get(dep) != Some(&live_value) && live_value != value {
+            merged[i] = format!("      {}: {live_value}", yaml_key_like(dep, repr));
+        }
+    }
+    merged
+}
+
+/// Are two blocks equal up to their dependency-ref VALUES (what
+/// [`merge_live_dep_refs`] may change)?
+pub(super) fn same_modulo_dep_refs(a: &[String], b: &[String]) -> bool {
+    let (refs_a, refs_b) = (dep_map_refs(a), dep_map_refs(b));
+    a.len() == b.len()
+        && refs_a.len() == refs_b.len()
+        && refs_a
+            .iter()
+            .zip(&refs_b)
+            .all(|(x, y)| x.0 == y.0 && x.1 == y.1)
+        && a.iter()
+            .zip(b)
+            .enumerate()
+            .all(|(i, (x, y))| x == y || refs_a.iter().any(|r| r.0 == i))
 }
 
 pub(super) fn drifted(detail: impl Into<String>) -> VendorWarning {
@@ -3874,9 +4248,7 @@ snapshots:
         // As the refusal spells it: canonical (Windows expands 8.3 names),
         // without the verbatim prefix.
         let governing = crate::utils::pnpm_workspace::without_verbatim_prefix(
-            std::fs::canonicalize(&ws_root)
-                .unwrap()
-                .join(PNPM_WORKSPACE),
+            std::fs::canonicalize(ws_root).unwrap().join(PNPM_WORKSPACE),
         );
         for dry_run in [true, false] {
             let outcome = crate::vendor::test_support::vendor_pnpm(
@@ -3928,6 +4300,59 @@ snapshots:
             .unwrap();
         let (result, _, _) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
+    }
+
+    /// #1006: a project below a `pnpm-workspace.yaml` whose `packages:`
+    /// globs do not list it is no workspace member. pnpm 11.28+/12 install
+    /// it standalone (its own lock) and read only its own settings file, so
+    /// vendoring wires the override into a new nested file, as for any
+    /// single project, and leaves the unrelated root file alone.
+    #[tokio::test]
+    async fn project_outside_the_workspace_globs_vendors_into_its_own_file() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let ws_root = fx.root();
+        let project = ws_root.join("examples/demo");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        for name in [PACKAGE_JSON, PNPM_LOCK, "node_modules"] {
+            tokio::fs::rename(ws_root.join(name), project.join(name))
+                .await
+                .unwrap();
+        }
+        let root_ws = "packages:\n  - 'packages/*'\n";
+        tokio::fs::write(ws_root.join(PNPM_WORKSPACE), root_ws)
+            .await
+            .unwrap();
+        let blobs = ws_root.join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let preflight =
+            preflight_packages(&project, &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+        assert_eq!(preflight, vec![Ok(())]);
+        let outcome = crate::vendor::test_support::vendor_pnpm(
+            "pkg:npm/left-pad@1.3.0",
+            &project.join("node_modules/left-pad"),
+            &project,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let (result, entry, _) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("success carries a ledger entry");
+        assert!(entry.pnpm.as_ref().unwrap().created_workspace_file);
+        let nested = tokio::fs::read_to_string(project.join(PNPM_WORKSPACE))
+            .await
+            .unwrap();
+        assert!(nested.contains("overrides:"), "{nested}");
+        assert_eq!(
+            tokio::fs::read_to_string(ws_root.join(PNPM_WORKSPACE))
+                .await
+                .unwrap(),
+            root_ws
+        );
     }
 
     #[tokio::test]
@@ -5151,6 +5576,48 @@ snapshots:
         );
     }
 
+    /// `gitBranchLockfile` with a branch lock: pnpm installs the branch from
+    /// `pnpm-lock.<branch>.yaml`, so wiring `pnpm-lock.yaml` (stale there)
+    /// would break every `--frozen-lockfile` install on an overrides
+    /// mismatch. Refused before any write, by the pre-flight too (#556).
+    #[tokio::test]
+    async fn a_git_branch_lock_refuses_before_any_write() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let workspace = "packages:\n  - '.'\ngitBranchLockfile: true\n";
+        tokio::fs::write(fx.root().join(PNPM_WORKSPACE), workspace)
+            .await
+            .unwrap();
+        tokio::fs::write(fx.root().join("pnpm-lock.feature.yaml"), P1_BEFORE_LOCK)
+            .await
+            .unwrap();
+        for dry_run in [true, false] {
+            let detail =
+                expect_refused(fx.vendor(dry_run).await, "vendor_pnpm_git_branch_lockfile");
+            assert!(
+                detail.contains("pnpm-lock.feature.yaml")
+                    && detail.contains("--merge-git-branch-lockfiles"),
+                "{detail}"
+            );
+        }
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(planned, Err("vendor_pnpm_git_branch_lockfile"));
+        assert_eq!(looped, Err("vendor_pnpm_git_branch_lockfile"));
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock untouched");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg untouched");
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            workspace,
+            "workspace untouched"
+        );
+        assert!(!fx.root().join(".socket/vendor").exists());
+
+        // The setting with no branch lock installs from pnpm-lock.yaml.
+        tokio::fs::remove_file(fx.root().join("pnpm-lock.feature.yaml"))
+            .await
+            .unwrap();
+        assert!(matches!(fx.vendor(false).await, VendorOutcome::Done { .. }));
+    }
+
     /// A CRLF pnpm-lock.yaml (Windows autocrlf checkout) passes the version
     /// sniff (`str::lines` strips `\r`) but breaks every structural probe —
     /// the refusal must name the line endings as the cause, not the
@@ -5225,6 +5692,228 @@ snapshots:
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    // ── two-document locks (#466) ──────────────────────────────────────────
+    // pnpm >= 11 writes `pnpm-lock.yaml` as two YAML documents when the
+    // project has config dependencies (`pnpm add --config`, pnpm 11 and 12)
+    // or pins pnpm through `packageManager` (pnpm 12): an env document with
+    // its own `importers:` / `packages:` / `snapshots:`, then the project
+    // lock. Provenance: captured from pnpm 12.8.1 (`packageManager:
+    // "pnpm@12.8.1"`; the 14 `@pnpm/exe.*` platform entries trimmed to one)
+    // and pnpm 11.27.0 (`pnpm add --config left-pad@1.3.0`).
+    const ENV_DOC_PACKAGE_MANAGER: &str = "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    configDependencies: {}
+    packageManagerDependencies:
+      pnpm:
+        specifier: 12.8.1
+        version: 12.8.1
+
+packages:
+
+  '@pnpm/exe.linux-x64@12.8.1':
+    resolution: {integrity: sha512-8bDZ0lZlCdi2rvnFul7EYgcC7zKeWSe76y8JV2oXobaS8p9i9d6PSf6LgLtTM0fI7R9Oh4eLCbveXyNDMmvZ+g==}
+    cpu: [x64]
+    os: [linux]
+    libc: [glibc]
+
+  pnpm@12.8.1:
+    resolution: {integrity: sha512-9kupB1B/XOr+BsjTjmBS0BeURFgOwSed3Vv8EctIqoomRLZlmOB+dh2oSHKp/FfV+QK4f6SdAkGY1VhhKqu+RQ==}
+    engines: {node: '>=18.*'}
+    hasBin: true
+
+snapshots:
+
+  '@pnpm/exe.linux-x64@12.8.1':
+    optional: true
+
+  pnpm@12.8.1:
+    optionalDependencies:
+      '@pnpm/exe.linux-x64': 12.8.1
+";
+    /// The vendored package is ALSO a config dependency: the env document
+    /// carries its registry key (the config dependency's own copy).
+    const ENV_DOC_CONFIG_DEP: &str = "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    configDependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+
+snapshots:
+
+  left-pad@1.3.0: {}
+";
+
+    /// pnpm's two-document layout: `---`, the env document, `---`, the
+    /// project lock.
+    fn two_doc(env: &str, project: &str) -> String {
+        format!("---\n{env}\n---\n{project}")
+    }
+
+    /// #466: vendoring a two-document lock edits the PROJECT document only —
+    /// byte-for-byte the single-document oracle — and leaves the env
+    /// document untouched, even when a config dependency shares the
+    /// vendored package's registry key (the edits used to land in the env
+    /// document, so a frozen install failed). The in-sync re-run is stable
+    /// and the revert restores the two-document lock byte-for-byte.
+    #[tokio::test]
+    async fn two_document_lock_vendors_and_reverts_the_project_document() {
+        for (env, config_dep) in [(ENV_DOC_PACKAGE_MANAGER, false), (ENV_DOC_CONFIG_DEP, true)] {
+            let before = two_doc(env, P1_BEFORE_LOCK);
+            let fx = fixture_with(P1_BEFORE_PKG, &before).await;
+            let preflight =
+                preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+            assert_eq!(preflight, vec![Ok(())], "config_dep={config_dep}");
+
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.expect("success carries a ledger entry");
+            let actual = fx.actual_integrity().await;
+            let after = two_doc(env, &P1_AFTER_LOCK.replace(SPIKE_INTEGRITY, &actual));
+            assert_eq!(fx.read(PNPM_LOCK).await, after, "config_dep={config_dep}");
+            assert_eq!(fx.read(PACKAGE_JSON).await, P1_AFTER_PKG);
+            assert_eq!(
+                warnings
+                    .iter()
+                    .any(|w| w.code == VENDOR_CONFIG_DEPENDENCY_UNPATCHED),
+                config_dep,
+                "{warnings:?}"
+            );
+
+            // In sync: nothing rewritten.
+            let (result, entry2, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(entry2.is_none(), "an in-sync re-run records nothing");
+            assert_eq!(fx.read(PNPM_LOCK).await, after);
+
+            for dry_run in [true, false] {
+                let outcome = revert_pnpm(&entry, fx.root(), dry_run).await;
+                assert!(outcome.success, "{:?}", outcome.error);
+                assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            }
+            assert_eq!(fx.read(PNPM_LOCK).await, before, "config_dep={config_dep}");
+            assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+            assert!(!fx.root().join(PNPM_WORKSPACE).exists());
+            assert!(!fx.root().join(fx.rel_tgz()).exists());
+        }
+    }
+
+    /// #466: a project vendored on a single-document lock that pnpm later
+    /// re-wrote as two documents (`packageManager` added on pnpm 12) reverts
+    /// the project document byte-exactly. Every lock record used to read as
+    /// drifted, so the revert left the lock wired to the artifact while
+    /// still removing the package.json / workspace overrides.
+    #[tokio::test]
+    async fn revert_after_the_lock_became_two_documents_restores_the_project_document() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let vendored = fx.read(PNPM_LOCK).await;
+        tokio::fs::write(
+            fx.root().join(PNPM_LOCK),
+            two_doc(ENV_DOC_PACKAGE_MANAGER, &vendored),
+        )
+        .await
+        .unwrap();
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            two_doc(ENV_DOC_PACKAGE_MANAGER, P1_BEFORE_LOCK)
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert!(!fx.root().join(fx.rel_tgz()).exists());
+    }
+
+    /// Multi-document locks the planner cannot classify — three documents,
+    /// a first document that is not pnpm's env document, a BOM before the
+    /// separator, an end marker — are refused before any write (dry run and
+    /// pre-flight included), and a revert over one fails, dry run included,
+    /// with every surface untouched: a guessed document would either edit
+    /// the wrong copy or half-revert the project.
+    #[tokio::test]
+    async fn unclassifiable_multi_document_lock_is_refused_and_not_half_reverted() {
+        let not_env = ENV_DOC_PACKAGE_MANAGER.replace("configDependencies: {}", "dependencies: {}");
+        let unclassifiable = [
+            format!(
+                "---\n{ENV_DOC_PACKAGE_MANAGER}\n---\n{ENV_DOC_CONFIG_DEP}\n---\n{}",
+                P1_BEFORE_LOCK
+            ),
+            two_doc(&not_env, P1_BEFORE_LOCK),
+            format!(
+                "\u{feff}{}",
+                two_doc(ENV_DOC_PACKAGE_MANAGER, P1_BEFORE_LOCK)
+            ),
+            format!("{}...\n", two_doc(ENV_DOC_PACKAGE_MANAGER, P1_BEFORE_LOCK)),
+            two_doc(
+                ENV_DOC_PACKAGE_MANAGER,
+                &P1_BEFORE_LOCK.replace("lockfileVersion: '9.0'", "lockfileVersion: '6.0'"),
+            ),
+        ];
+        for lock in &unclassifiable {
+            let fx = fixture_with(P1_BEFORE_PKG, lock).await;
+            for dry_run in [true, false] {
+                let blobs = fx.root().join(".socket/blobs");
+                let outcome = crate::vendor::test_support::vendor_pnpm(
+                    "pkg:npm/left-pad@1.3.0",
+                    &fx.installed(),
+                    fx.root(),
+                    &fx.record,
+                    &PatchSources::blobs_only(&blobs),
+                    "2026-06-09T00:00:00Z",
+                    dry_run,
+                    false,
+                    None,
+                )
+                .await;
+                expect_refused(outcome, VENDOR_PNPM_LOCK_MULTI_DOCUMENT);
+            }
+            let preflight =
+                preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+            assert_eq!(preflight, vec![Err(VENDOR_PNPM_LOCK_MULTI_DOCUMENT)]);
+            assert_eq!(&fx.read(PNPM_LOCK).await, lock);
+            assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+            assert!(!fx.root().join(".socket/vendor").exists());
+            assert!(!fx.root().join(PNPM_WORKSPACE).exists());
+        }
+
+        // Revert: vendored on a single-document lock, then the lock became
+        // unclassifiable (three documents).
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let vendored = fx.read(PNPM_LOCK).await;
+        let lock =
+            format!("---\n{ENV_DOC_PACKAGE_MANAGER}\n---\n{ENV_DOC_CONFIG_DEP}\n---\n{vendored}");
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &lock)
+            .await
+            .unwrap();
+        let ws = fx.read(PNPM_WORKSPACE).await;
+        for dry_run in [true, false] {
+            let outcome = revert_pnpm(&entry, fx.root(), dry_run).await;
+            assert!(!outcome.success, "dry_run={dry_run}: must fail closed");
+            let error = outcome.error.unwrap_or_default();
+            assert!(error.contains(PNPM_LOCK), "{error}");
+        }
+        assert_eq!(fx.read(PNPM_LOCK).await, lock);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_AFTER_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws);
+        assert!(fx.root().join(fx.rel_tgz()).exists());
     }
 
     /// A CRLF, BOM or BOM+CRLF+tab `package.json` (a Windows / autocrlf
@@ -5689,6 +6378,123 @@ snapshots:
             !ws_exists(&fx).await,
             "revert deletes the workspace file it created"
         );
+    }
+
+    /// #734: a project with no workspace file whose pnpm is 9.0–10.4 (the
+    /// installed `.modules.yaml`, or package.json's pin) gets none: it would
+    /// make the project a root-only workspace those releases refuse `pnpm
+    /// add` in, and they read package.json `pnpm.overrides`, which is wired
+    /// with the lock. Revert restores both byte-for-byte. A later vendor on
+    /// pnpm >= 10.5 adds the mirror, and revert then undoes all three.
+    #[tokio::test]
+    async fn project_pinned_to_pnpm_9_through_10_4_gets_no_workspace_scaffold() {
+        let modules = |version: &str| {
+            format!("hoistPattern:\n  - '*'\nlayoutVersion: 5\npackageManager: pnpm@{version}\n")
+        };
+        let pinned_pkg =
+            P1_BEFORE_PKG.replacen("{\n", "{\n  \"packageManager\": \"pnpm@10.4.1\",\n", 1);
+        assert_ne!(pinned_pkg, P1_BEFORE_PKG);
+        for (pkg, modules_yaml) in [
+            (P1_BEFORE_PKG.to_string(), Some(modules("9.15.9"))),
+            (pinned_pkg.clone(), None),
+        ] {
+            let fx = fixture_with(&pkg, P1_BEFORE_LOCK).await;
+            if let Some(text) = &modules_yaml {
+                tokio::fs::write(fx.root().join("node_modules/.modules.yaml"), text)
+                    .await
+                    .unwrap();
+            }
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            let spec = format!("file:{}", fx.rel_tgz());
+            assert!(!ws_exists(&fx).await, "no root-only workspace for {pkg}");
+            assert!(fx
+                .read(PACKAGE_JSON)
+                .await
+                .contains(&format!("\"left-pad@1.3.0\": \"{spec}\"")));
+            assert!(fx
+                .read(PNPM_LOCK)
+                .await
+                .contains(&format!("overrides:\n  left-pad@1.3.0: {spec}")));
+            assert!(entry.wiring.iter().all(|r| r.file != PNPM_WORKSPACE));
+            assert!(!entry.pnpm.as_ref().unwrap().created_workspace_file);
+
+            // A re-run is in sync: nothing is written, still no workspace.
+            let (rerun, rerun_entry, _) = expect_done(fx.vendor(false).await);
+            assert!(rerun.success && rerun_entry.is_none());
+            assert!(!ws_exists(&fx).await);
+
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(fx.read(PACKAGE_JSON).await, pkg);
+            assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+        }
+
+        // The upgrade: vendored on pnpm 9, then installed with pnpm 11.
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let modules_path = fx.root().join("node_modules/.modules.yaml");
+        tokio::fs::write(&modules_path, modules("9.15.9"))
+            .await
+            .unwrap();
+        let (_, prev, _) = expect_done(fx.vendor(false).await);
+        let prev = prev.unwrap();
+        assert!(!ws_exists(&fx).await);
+        tokio::fs::write(&modules_path, modules("11.0.0"))
+            .await
+            .unwrap();
+        let (_, revendored, _) = expect_done(fx.vendor(false).await);
+        let mut merged = revendored.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            ws_scaffold_text("left-pad@1.3.0", &spec),
+            "pnpm 11 reads overrides from the workspace file: the mirror is added"
+        );
+        super::super::state::carry_forward_wiring(&prev, &mut merged);
+        let outcome = revert_pnpm(&merged, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+        assert!(!ws_exists(&fx).await);
+    }
+
+    /// The #734 gate stays closed on pnpm >= 10.5, and on any pin that does
+    /// not agree: the root-only scaffold is created as before.
+    #[tokio::test]
+    async fn pnpm_10_5_or_a_disagreeing_pin_still_gets_the_workspace_scaffold() {
+        for (pkg_pin, modules_pin) in [
+            (None, Some("10.5.0")),
+            (Some("11.1.0"), Some("9.15.9")),
+            (Some("9.15.9"), Some("11.0.0")),
+        ] {
+            let pkg = match pkg_pin {
+                Some(v) => P1_BEFORE_PKG.replacen(
+                    "{\n",
+                    &format!("{{\n  \"packageManager\": \"pnpm@{v}\",\n"),
+                    1,
+                ),
+                None => P1_BEFORE_PKG.to_string(),
+            };
+            let fx = fixture_with(&pkg, P1_BEFORE_LOCK).await;
+            if let Some(v) = modules_pin {
+                tokio::fs::write(
+                    fx.root().join("node_modules/.modules.yaml"),
+                    format!("{{\"packageManager\":\"pnpm@{v}\"}}"),
+                )
+                .await
+                .unwrap();
+            }
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let spec = format!("file:{}", fx.rel_tgz());
+            assert_eq!(
+                fx.read(PNPM_WORKSPACE).await,
+                ws_scaffold_text("left-pad@1.3.0", &spec),
+                "{pkg_pin:?} / {modules_pin:?}"
+            );
+            assert!(entry.unwrap().pnpm.unwrap().created_workspace_file);
+        }
     }
 
     /// Existing workspace file WITHOUT an `overrides:` section: vendor
@@ -6497,6 +7303,291 @@ snapshots:
             drifted_ws,
             "foreign value left alone"
         );
+    }
+
+    // ── #854: an exact pin carried ONLY by pnpm-workspace.yaml ────────────
+
+    /// [`P1_BEFORE_LOCK`] with an `overrides:` section holding `key: value`
+    /// (what pnpm 10.5+ writes when the override lives in the workspace file).
+    fn p1_lock_with_override(key: &str, value: &str) -> String {
+        P1_BEFORE_LOCK.replacen(
+            "\nimporters:\n",
+            &format!("\noverrides:\n  {key}: {value}\n\nimporters:\n"),
+            1,
+        )
+    }
+    fn ws_with_override(key: &str, value: &str) -> String {
+        format!("packages:\n  - '.'\noverrides:\n  {key}: {value}\n")
+    }
+
+    /// #854: on pnpm 10.5+/11/12 the workspace file is the authoritative
+    /// override map, so a bare-key exact pin there is taken over exactly
+    /// like the same pin in package.json: the user's key keeps its
+    /// spelling in the workspace file and the lock, package.json is left
+    /// alone (#360), a re-run is in sync, and revert restores every byte.
+    /// It used to refuse with a detail blaming package.json.
+    #[tokio::test]
+    async fn ws_bare_key_exact_pin_is_taken_over_and_revert_restores_it() {
+        let lock_before = p1_lock_with_override("left-pad", "1.3.0");
+        let ws_before = ws_with_override("left-pad", "1.3.0");
+        let fx = fixture_with(P1_BEFORE_PKG, &lock_before).await;
+        write_ws(&fx, &ws_before).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+
+        let ws_after = fx.read(PNPM_WORKSPACE).await;
+        assert_eq!(ws_after, ws_with_override("left-pad", &spec));
+        let lock_after = fx.read(PNPM_LOCK).await;
+        assert!(
+            lock_after.contains(&format!("overrides:\n  left-pad: {spec}\n\n")),
+            "{lock_after}"
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert!(entry.wiring.iter().all(|r| r.kind != KIND_PKG_OVERRIDE));
+        for kind in [KIND_WS_OVERRIDE, KIND_LOCK_OVERRIDES] {
+            let rec = entry
+                .wiring
+                .iter()
+                .find(|r| r.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} record: {:?}", entry.wiring));
+            assert_eq!(rec.key.as_deref(), Some("left-pad"), "{kind}");
+            assert_eq!(rec.action, WiringAction::Rewritten, "{kind}");
+            assert_eq!(rec.original, Some(Value::String("1.3.0".into())), "{kind}");
+        }
+
+        // Re-run: in sync, nothing recorded, all three files byte-stable
+        // (no package.json copy appears once the ws value is ours).
+        let (result, again, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(again.is_none(), "in-sync re-run records nothing");
+        assert!(result
+            .files_verified
+            .iter()
+            .all(|v| v.status == crate::patch::apply::VerifyStatus::AlreadyPatched));
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_after);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_after);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_before);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_before);
+    }
+
+    /// #854: a hand-written workspace pin that is quoted or carries a
+    /// trailing comment is the same exact pin as the plain value its lock
+    /// mirror records (`left-pad: 1.3.0`), so it is taken over too. The raw
+    /// text is the recorded original, so revert restores the quotes and the
+    /// comment byte-for-byte. It used to refuse, with a detail claiming an
+    /// exact pin equal to 1.3.0 is taken over automatically.
+    #[tokio::test]
+    async fn ws_quoted_or_commented_exact_pin_is_taken_over_and_reverted_verbatim() {
+        let lock_before = p1_lock_with_override("left-pad", "1.3.0");
+        for value in [
+            "'1.3.0'",
+            "\"1.3.0\"",
+            "1.3.0  # CVE-2099-0001",
+            "'1.3.0' # pinned",
+        ] {
+            let ws_before = ws_with_override("left-pad", value);
+            let fx = fixture_with(P1_BEFORE_PKG, &lock_before).await;
+            write_ws(&fx, &ws_before).await;
+
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{value}: {:?}", result.error);
+            let entry = entry.unwrap();
+            let spec = format!("file:{}", fx.rel_tgz());
+            assert_eq!(
+                fx.read(PNPM_WORKSPACE).await,
+                ws_with_override("left-pad", &spec),
+                "{value}"
+            );
+            assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "{value}");
+            let rec = entry
+                .wiring
+                .iter()
+                .find(|r| r.kind == KIND_WS_OVERRIDE)
+                .unwrap();
+            assert_eq!(rec.original, Some(Value::String(value.into())), "{value}");
+
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{value}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{value}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_before, "{value}");
+            assert_eq!(fx.read(PNPM_LOCK).await, lock_before, "{value}");
+            assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "{value}");
+        }
+    }
+
+    /// The normalization reads a value, not a version: a quoted or
+    /// commented range / other version still refuses.
+    #[tokio::test]
+    async fn ws_quoted_or_commented_non_matching_pin_still_refuses() {
+        for value in ["'^1.3.0'", "1.4.0 # 1.3.0", "'1.3.0 # x'"] {
+            let lock = p1_lock_with_override("left-pad", "1.3.0");
+            let ws = ws_with_override("left-pad", value);
+            let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+            write_ws(&fx, &ws).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+            assert!(detail.contains(PNPM_WORKSPACE), "{value}: {detail}");
+            assert_eq!(fx.read(PNPM_WORKSPACE).await, ws, "refusal writes nothing");
+            assert_eq!(fx.read(PNPM_LOCK).await, lock);
+        }
+    }
+
+    /// #854, pnpm 9 shape: the lock does not record the workspace pin
+    /// (pnpm 9 reads overrides from package.json only). The pin is still
+    /// taken over in the workspace file, and the package.json copy plus the
+    /// lock entry use the same `left-pad` key so all three maps agree.
+    #[tokio::test]
+    async fn ws_bare_key_exact_pin_without_lock_mirror_is_taken_over() {
+        let ws_before = ws_with_override("left-pad", "1.3.0");
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        write_ws(&fx, &ws_before).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            ws_with_override("left-pad", &spec)
+        );
+        let pkg: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
+        assert_eq!(
+            pkg["pnpm"]["overrides"]["left-pad"],
+            Value::String(spec.clone())
+        );
+        assert!(pkg["pnpm"]["overrides"].get("left-pad@1.3.0").is_none());
+        assert!(fx
+            .read(PNPM_LOCK)
+            .await
+            .contains(&format!("overrides:\n  left-pad: {spec}\n")));
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_before);
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+    }
+
+    /// #854: a genuine workspace-file conflict (a range, another version, a
+    /// selector chain) still refuses, and the detail names the file that
+    /// actually carries the override.
+    #[tokio::test]
+    async fn ws_conflicting_pins_refuse_naming_the_workspace_file() {
+        for (key, value) in [
+            ("left-pad", "^1.3.0"),
+            ("left-pad", "1.4.0"),
+            ("consumer>left-pad", "1.3.0"),
+        ] {
+            let lock = p1_lock_with_override(key, value);
+            let ws = ws_with_override(key, value);
+            let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+            write_ws(&fx, &ws).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+            assert!(detail.contains(PNPM_WORKSPACE), "{key}: {detail}");
+            assert!(!detail.contains("package.json"), "{key}: {detail}");
+            assert_eq!(fx.read(PNPM_WORKSPACE).await, ws, "refusal writes nothing");
+            assert_eq!(fx.read(PNPM_LOCK).await, lock);
+            assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        }
+    }
+
+    /// #854: ws↔lock key-shape drift refuses (pnpm itself would fail the
+    /// config check), and the detail compares against the workspace file,
+    /// not package.json.
+    #[tokio::test]
+    async fn ws_and_lock_key_shape_drift_refuses_naming_the_workspace_file() {
+        let lock = p1_lock_with_override("left-pad@1.3.0", "1.3.0");
+        let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+        write_ws(&fx, &ws_with_override("left-pad", "1.3.0")).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains("does not match"), "{detail}");
+        assert!(detail.contains(PNPM_WORKSPACE), "{detail}");
+        assert!(!detail.contains("package.json's"), "{detail}");
+        assert_eq!(fx.read(PNPM_LOCK).await, lock, "refusal writes nothing");
+    }
+
+    /// #854: package.json and the workspace file both pin the version but
+    /// under different keys; there is no single key all three maps can
+    /// share, so vendoring refuses naming both files.
+    #[tokio::test]
+    async fn pkg_and_ws_pins_with_different_key_shapes_refuse() {
+        let (pkg, lock) = pin_fixture_inputs("left-pad", "1.3.0");
+        let ws = ws_with_override("left-pad@1.3.0", "1.3.0");
+        let fx = fixture_with(&pkg, &lock).await;
+        write_ws(&fx, &ws).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains(PNPM_WORKSPACE), "{detail}");
+        assert!(detail.contains("package.json"), "{detail}");
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws, "refusal writes nothing");
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock);
+    }
+
+    /// #854: the versioned-key pin on the workspace file and the lock only
+    /// (package.json has no overrides) was already taken over, but its
+    /// re-run added a package.json copy once the ws value became ours.
+    /// The re-run is now in sync and byte-stable.
+    #[tokio::test]
+    async fn ws_versioned_key_pin_only_on_ws_and_lock_rerun_is_byte_stable() {
+        let lock_before = p1_lock_with_override("left-pad@1.3.0", "1.3.0");
+        let ws_before = ws_with_override("left-pad@1.3.0", "1.3.0");
+        let fx = fixture_with(P1_BEFORE_PKG, &lock_before).await;
+        write_ws(&fx, &ws_before).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        let ws_after = fx.read(PNPM_WORKSPACE).await;
+        let lock_after = fx.read(PNPM_LOCK).await;
+
+        let (result, again, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(again.is_none(), "in-sync re-run records nothing");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_after);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_after);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_before);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_before);
+    }
+
+    /// #854 / #360 twin: after a workspace-only takeover every workspace
+    /// override can be a vendored value. The lock still records them, so
+    /// the workspace file still governs, and vendoring ANOTHER package
+    /// must not write a package.json copy that would shadow it on pnpm 10.
+    #[test]
+    fn vendored_workspace_overrides_recorded_in_the_lock_still_govern() {
+        let pkg: Value = serde_json::from_str(P1_BEFORE_PKG).unwrap();
+        let spec =
+            "file:.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+        let ws = ws_with_override("left-pad", spec);
+        let lock = p1_lock_with_override("left-pad", spec);
+        assert!(workspace_overrides_govern(
+            &pkg,
+            Some(&ws),
+            &split_lines(&lock)
+        ));
+        // Unrecorded in the lock (pnpm 9): package.json still governs.
+        assert!(!workspace_overrides_govern(
+            &pkg,
+            Some(&ws),
+            &split_lines(P1_BEFORE_LOCK)
+        ));
     }
 
     /// pnpm-workspace.yaml deleted since vendoring while the record carries a
@@ -7965,6 +9056,39 @@ snapshots:
             .contains(&format!("  left-pad@file:{}:", fx.rel_tgz())));
     }
 
+    /// #920: the `package.json` advisory is emitted once, by the run that
+    /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
+    /// AlreadyPatched.
+    #[tokio::test]
+    async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
+        let mut fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let after: &[u8] = br#"{"name":"left-pad","version":"1.3.0","sideEffects":false}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash,
+            },
+        );
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code.starts_with("vendor_dep_manifest"))
+                .count()
+        };
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_none(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
+    }
+
     // ── parser + revert-uuid guard micro edges ──────────────────────────────
 
     #[test]
@@ -9097,6 +10221,7 @@ snapshots:
             lock: ProjectLock::V9(LockLines::Shared(Arc::new(LockDoc::new(split_lines(
                 P1_BEFORE_LOCK,
             ))))),
+            lock_prefix: String::new(),
             ws_text: None,
         };
         let doc_of = |p: &PnpmProject| match &p.lock {
@@ -9526,5 +10651,294 @@ snapshots:
 
         revert_in_order(&fx, [IS_NUMBER, LEFT_PAD]).await;
         assert_eq!(fx.read(PACKAGE_JSON).await, pkg);
+    }
+
+    // ── a vendored parent and its vendored dependency (#830) ─────────────
+
+    const PC_PKG: &str = r#"{
+  "name": "fx",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "debug": "4.3.4"
+  }
+}
+"#;
+
+    const PC_LOCK: &str = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      debug:
+        specifier: 4.3.4
+        version: 4.3.4
+
+packages:
+
+  debug@4.3.4:
+    resolution: {integrity: sha512-3NN8vD3qzN8YtsF8Mxz4wHinpTcRP71BdOdGhzQk7dVDwXhUjS7O9BXaHGhn7m7Y1hB+L4szF+XwoAhBc2upBw==}
+    engines: {node: '>=6.0'}
+    peerDependencies:
+      supports-color: '*'
+    peerDependenciesMeta:
+      supports-color:
+        optional: true
+
+  ms@2.1.2:
+    resolution: {integrity: sha512-sGkPx+VjMtmA6MX27oA4FBFELFCZZ4S4XqeGOXCv68tT+jb3vk/RyaKWP0PTKyWtmLSM0b+adUTEvbs1PEaH2w==}
+
+  unrelated@1.0.0:
+    resolution: {integrity: sha512-unrelated==}
+
+snapshots:
+
+  debug@4.3.4:
+    dependencies:
+      ms: 2.1.2
+
+  ms@2.1.2: {}
+
+  unrelated@1.0.0:
+    dependencies:
+      ms: 2.1.2
+";
+
+    const PC_DEBUG: &str = "pkg:npm/debug@4.3.4";
+    const PC_MS: &str = "pkg:npm/ms@2.1.2";
+    const PC_DEBUG_UUID: &str = "55555555-5555-4555-8555-555555555555";
+    const PC_MS_UUID: &str = "66666666-6666-4666-8666-666666666666";
+
+    fn pc_parts(purl: &str) -> (&'static str, &'static str, &'static str) {
+        match purl {
+            PC_DEBUG => ("debug", "4.3.4", PC_DEBUG_UUID),
+            PC_MS => ("ms", "2.1.2", PC_MS_UUID),
+            other => panic!("unknown purl {other}"),
+        }
+    }
+
+    /// Vendor `purl` into `fx` (its own installed dir + patch uuid),
+    /// persisting the ledger the way the vendor loop does.
+    async fn pc_vendor(fx: &Fixture, purl: &str) {
+        let (name, version, uuid) = pc_parts(purl);
+        let installed = fx.root().join("node_modules").join(name);
+        tokio::fs::create_dir_all(&installed).await.unwrap();
+        tokio::fs::write(
+            installed.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(installed.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
+        let mut record = fx.record.clone();
+        record.uuid = uuid.to_string();
+        let blobs = fx.root().join(".socket/blobs");
+        let outcome = crate::vendor::test_support::vendor_pnpm(
+            purl,
+            &installed,
+            fx.root(),
+            &record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let (result, entry, _) = expect_done(outcome);
+        assert!(result.success, "{purl}: {:?}", result.error);
+        let mut state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+        state.entries.insert(purl.to_string(), entry.unwrap());
+        crate::vendor::state::save_state(fx.root(), &state)
+            .await
+            .unwrap();
+    }
+
+    /// Every snapshot dependency ref names an existing snapshots key — the
+    /// `ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY` check a frozen install runs.
+    fn assert_snapshot_refs_resolve(lock: &str) {
+        let lines = split_lines(lock);
+        let (start, end) = section_bounds(&lines, "snapshots").unwrap();
+        let mut keys = std::collections::HashSet::new();
+        let mut refs = Vec::new();
+        let mut i = start + 1;
+        while let Some(block) = next_block(&lines, i, end) {
+            keys.insert(block.key.clone());
+            for line in &lines[block.header + 1..block.end] {
+                if let Some((dep, _, rest)) = parse_key_line(line, 6) {
+                    refs.push(format!("{dep}@{rest}"));
+                }
+            }
+            i = block.end;
+        }
+        for r in refs {
+            assert!(keys.contains(&r), "dangling snapshot ref `{r}`:\n{lock}");
+        }
+    }
+
+    /// Vendor both packages in `vendor_order`, then unwind them one at a
+    /// time in `revert_order`: every step must leave a lock pnpm accepts,
+    /// warn nothing, and keep nothing; a re-run of the first revert is a
+    /// silent no-op; the end state is byte-identical to the pre-vendor one.
+    async fn pc_round_trip(vendor_order: [&str; 2], revert_order: [&str; 2]) {
+        let fx = fixture_with(PC_PKG, PC_LOCK).await;
+        for purl in vendor_order {
+            pc_vendor(&fx, purl).await;
+        }
+        for (step, purl) in revert_order.into_iter().enumerate() {
+            let mut state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+            let entry = state.entries.get(purl).cloned().unwrap();
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            let label = format!("vendor {vendor_order:?}, revert {purl}");
+            assert!(outcome.success, "{label}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{label}: {:?}",
+                outcome.warnings
+            );
+            assert!(!outcome.kept_artifact, "{label}: artifact kept");
+            state.entries.remove(purl);
+            crate::vendor::state::save_state(fx.root(), &state)
+                .await
+                .unwrap();
+            let lock = fx.read(PNPM_LOCK).await;
+            assert_snapshot_refs_resolve(&lock);
+            if step == 0 {
+                // The other package is still vendored, refs included.
+                let (name, version, uuid) = pc_parts(revert_order[1]);
+                let spec = format!("file:.socket/vendor/npm/{uuid}/{name}-{version}.tgz");
+                assert!(
+                    lock.contains(&format!("  {name}@{spec}:")),
+                    "{label}:\n{lock}"
+                );
+                if name == "ms" {
+                    assert!(
+                        lock.contains(&format!("      ms: {spec}")),
+                        "{label}:\n{lock}"
+                    );
+                }
+                // A re-run of the same revert converges silently.
+                let again = revert_pnpm(&entry, fx.root(), false).await;
+                assert!(again.success, "{label} re-run: {:?}", again.error);
+                assert!(
+                    again.warnings.is_empty(),
+                    "{label} re-run: {:?}",
+                    again.warnings
+                );
+                assert_eq!(fx.read(PNPM_LOCK).await, lock, "{label}: re-run is a no-op");
+            }
+        }
+        assert_eq!(fx.read(PNPM_LOCK).await, PC_LOCK, "lock byte-restored");
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            PC_PKG,
+            "package.json byte-restored"
+        );
+        for uuid in [PC_DEBUG_UUID, PC_MS_UUID] {
+            assert!(!fx
+                .root()
+                .join(format!(".socket/vendor/npm/{uuid}"))
+                .exists());
+        }
+    }
+
+    /// #830: unwinding the parent alone (`remove debug`) must keep the
+    /// vendored child's live ref in the parent's restored snapshot; the
+    /// child's ref record (keyed by the parent's now-gone `file:` key) must
+    /// still find and restore it afterwards.
+    #[tokio::test]
+    async fn parent_first_revert_keeps_the_vendored_child_ref() {
+        pc_round_trip([PC_DEBUG, PC_MS], [PC_DEBUG, PC_MS]).await;
+    }
+
+    /// #830, reverse twin: the child vendored first (its ref record keyed by
+    /// the parent's registry key), then the parent; unwinding the child
+    /// alone must still restore the ref inside the parent's `file:` block.
+    #[tokio::test]
+    async fn child_first_vendored_child_revert_restores_the_ref_in_the_rekeyed_parent() {
+        pc_round_trip([PC_MS, PC_DEBUG], [PC_MS, PC_DEBUG]).await;
+    }
+
+    /// Guards: the two orders that already round-tripped stay clean.
+    #[tokio::test]
+    async fn parent_child_guard_orders_round_trip() {
+        pc_round_trip([PC_DEBUG, PC_MS], [PC_MS, PC_DEBUG]).await;
+        pc_round_trip([PC_MS, PC_DEBUG], [PC_DEBUG, PC_MS]).await;
+    }
+
+    #[test]
+    fn merge_live_dep_refs_keeps_only_refs_another_entry_moved() {
+        let block = |key: &str, ms: &str, peer: &str| -> Vec<String> {
+            [
+                format!("  {key}:"),
+                "    peerDependencies:".to_string(),
+                format!("      supports-color: '{peer}'"),
+                "    dependencies:".to_string(),
+                format!("      ms: {ms}"),
+                "      '@s/x': 1.0.0".to_string(),
+            ]
+            .to_vec()
+        };
+        let ms = "file:.socket/vendor/npm/66666666-6666-4666-8666-666666666666/ms-2.1.2.tgz";
+        let original = block("debug@4.3.4", "2.1.2", "*");
+        let new = block("debug@file:x", "2.1.2", "*");
+        // live == new: the original verbatim.
+        assert_eq!(merge_live_dep_refs(&original, &new, &new), original);
+        // A dep ref another entry moved survives; a peer RANGE edit does
+        // not (not a resolution ref), nor does the header.
+        let live = block("debug@file:x", ms, ">=1");
+        let merged = merge_live_dep_refs(&original, &new, &live);
+        assert_eq!(merged, block("debug@4.3.4", ms, "*"));
+        assert!(same_modulo_dep_refs(&merged, &original));
+        assert!(!same_modulo_dep_refs(
+            &block("debug@4.3.4", ms, ">=1"),
+            &original
+        ));
+        assert!(!same_modulo_dep_refs(
+            &block("debug@4.3.5", "2.1.2", "*"),
+            &original
+        ));
+    }
+
+    #[test]
+    fn same_package_key_pairs_a_registry_key_with_its_vendored_rekey() {
+        let same_package_key = |a: &str, b: &str| {
+            let leaves = key_package_leaves(a);
+            key_package_leaves(b).iter().any(|l| leaves.contains(l))
+        };
+        let d = "file:.socket/vendor/npm/55555555-5555-4555-8555-555555555555/debug-4.3.4.tgz";
+        let s = "file:.socket/vendor/npm/55555555-5555-4555-8555-555555555555/@s/n-1.0.0.tgz";
+        for (a, b) in [
+            ("debug@4.3.4".to_string(), format!("debug@{d}")),
+            ("/debug/4.3.4".to_string(), d.to_string()),
+            ("/debug@4.3.4".to_string(), d.to_string()),
+            ("@s/n@1.0.0".to_string(), format!("@s/n@{s}")),
+            ("/@s/n/1.0.0".to_string(), s.to_string()),
+            ("/@s/n@1.0.0".to_string(), s.to_string()),
+        ] {
+            assert!(same_package_key(&a, &b), "{a} ~ {b}");
+            assert!(same_package_key(&b, &a), "{b} ~ {a}");
+        }
+        for (a, b) in [
+            ("debug@4.3.5".to_string(), format!("debug@{d}")),
+            ("unrelated@1.0.0".to_string(), format!("debug@{d}")),
+            (
+                "debug@4.3.4(supports-color@8.1.1)".to_string(),
+                format!("debug@{d}"),
+            ),
+            (
+                "consumer@file:consumer".to_string(),
+                "debug@4.3.4".to_string(),
+            ),
+        ] {
+            assert!(!same_package_key(&a, &b), "{a} !~ {b}");
+        }
     }
 }

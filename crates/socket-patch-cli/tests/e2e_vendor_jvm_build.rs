@@ -332,13 +332,12 @@ fn maven_tree_rel() -> String {
     format!(".socket/vendor/maven2/{GROUP_PATH}/{ARTIFACT}/{SV}")
 }
 
-/// `package` + `build-classpath` into each module's `target/cp.txt`.
-fn mvn_classpath(mvn: &Mvn, cwd: &Path, m2: &Path, settings: &Path, offline: bool) -> Output {
+/// `package` + `build-classpath` into each module's `target/cp.txt`, after
+/// `flags` (`-o`, `-U`).
+fn mvn_classpath(mvn: &Mvn, cwd: &Path, m2: &Path, settings: &Path, flags: &[&str]) -> Output {
     let goal = format!("{CLASSPATH_PLUGIN}:build-classpath");
-    let mut args = vec!["package", goal.as_str(), "-Dmdep.outputFile=target/cp.txt"];
-    if offline {
-        args.insert(0, "-o");
-    }
+    let mut args = flags.to_vec();
+    args.extend(["package", goal.as_str(), "-Dmdep.outputFile=target/cp.txt"]);
     mvn.run(cwd, m2, settings, &args)
 }
 
@@ -389,7 +388,10 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
         return;
     };
     write_reactor(&proj);
-    let out = mvn_classpath(&mvn, &proj, &m2, &settings, false);
+    // Online: the lifecycle plugins and CLASSPATH_PLUGIN are not warmed.
+    let out = with_central_fallback(SUITE, "pre-vendor reactor build", &settings, |s, flags| {
+        mvn_classpath(&mvn, &proj, &m2, s, flags)
+    });
     assert!(ok(&out), "pre-vendor reactor build:\n{}", dump(&out));
     let entry = classpath_entry(&proj.join("b"));
     assert_eq!(
@@ -513,7 +515,7 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
     let fresh = root.join("fresh");
     fresh_checkout_all(&proj, &fresh);
     purge(&m2);
-    let out = mvn_classpath(&mvn, &fresh, &m2, &settings, true);
+    let out = mvn_classpath(&mvn, &fresh, &m2, &settings, &["-o"]);
     assert!(ok(&out), "fresh offline reactor build:\n{}", dump(&out));
     assert_vendored_on_classpath(&fresh.join("a"), &patched, "root build, module a");
     assert_vendored_on_classpath(

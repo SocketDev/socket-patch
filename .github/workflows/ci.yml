@@ -1317,10 +1317,16 @@ jobs:
 
       - name: Unpack the e2e binaries
         shell: bash
+        # Decompress to a file, not into `| tar -xf -`: a tar that exits at
+        # the end-of-archive marker without draining stdin (macOS's does)
+        # leaves zstd writing into a closed pipe, and pipefail turns its
+        # "Broken pipe" into a failed leg that evicts the queue entry.
         run: |
           set -euo pipefail
           mkdir -p target/e2e-bin
-          zstd -q -d -c target/e2e-archive/e2e-bin.tar.zst | tar -xf - -C target/e2e-bin
+          zstd -q -d -f target/e2e-archive/e2e-bin.tar.zst -o target/e2e-bin.tar
+          tar -xf target/e2e-bin.tar -C target/e2e-bin
+          rm target/e2e-bin.tar
 
       - name: Stage the CLI where the test binaries expect it
         # `CARGO_BIN_EXE_socket-patch` was baked in at compile time as
@@ -1452,7 +1458,7 @@ jobs:
         # The composer capstones shell out to a real composer; `composer:`
         # pins the release line (1, 2.2 LTS, 2) so the composer.lock grammar
         # the edits assert stays stable across runners.
-        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: '8.2'
           tools: composer:${{ matrix.composer }}
@@ -2165,10 +2171,16 @@ jobs:
           path: target/e2e-archive
       - name: Unpack the e2e binaries
         shell: bash
+        # Decompress to a file, not into `| tar -xf -`: a tar that exits at
+        # the end-of-archive marker without draining stdin (macOS's does)
+        # leaves zstd writing into a closed pipe, and pipefail turns its
+        # "Broken pipe" into a failed leg that evicts the queue entry.
         run: |
           set -euo pipefail
           mkdir -p target/e2e-bin
-          zstd -q -d -c target/e2e-archive/e2e-bin.tar.zst | tar -xf - -C target/e2e-bin
+          zstd -q -d -f target/e2e-archive/e2e-bin.tar.zst -o target/e2e-bin.tar
+          tar -xf target/e2e-bin.tar -C target/e2e-bin
+          rm target/e2e-bin.tar
       - name: Install Rust
         run: rustup show
       - name: Install the cargo under test

@@ -3278,3 +3278,95 @@ async fn get_uuid_json_nested_apply_failure_names_the_patch() {
         "json={json}"
     );
 }
+
+// ===========================================================================
+// Nested apply mismatch-overwrite warnings in the JSON envelope (#1004)
+// ===========================================================================
+
+/// Locally edited bytes: neither the patch's beforeHash nor its afterHash.
+const LOCAL_EDIT_BYTES: &[u8] = b"vulnerable\n// local edit\n";
+
+/// Whether `json["warnings"]` carries a `content_mismatch_overwritten`
+/// entry naming `purl` and the overwritten file.
+fn has_mismatch_warning(json: &serde_json::Value, purl: &str) -> bool {
+    json["warnings"].as_array().is_some_and(|ws| {
+        ws.iter().filter_map(|w| w.as_str()).any(|w| {
+            w.starts_with("(content_mismatch_overwritten) ")
+                && w.contains(purl)
+                && w.contains("package/index.js")
+        })
+    })
+}
+
+/// The agent engine (`scan --mode agent --json`'s path) over an installed
+/// file a local edit changed: the default policy overwrites it, and the
+/// envelope must say so — the warning `apply --json` reports as a
+/// `content_mismatch_overwritten` event — while the patch still counts as
+/// applied.
+#[tokio::test]
+#[serial]
+async fn engine_nested_apply_mismatch_overwrite_reaches_the_json_envelope() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let installed = tmp.path().join("node_modules").join(NAME).join("index.js");
+    std::fs::write(&installed, LOCAL_EDIT_BYTES).unwrap();
+    let mut params = engine_params(tmp.path());
+    params.save_only = false;
+    let selected = vec![search_result(UUID, PURL)];
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+
+    assert_eq!(code, 0, "json={json}");
+    assert_eq!(json["status"], "success", "json={json}");
+    assert_eq!(json["applied"], 1, "json={json}");
+    assert_eq!(json["patches"][0]["action"], "added", "json={json}");
+    assert!(
+        has_mismatch_warning(&json, PURL),
+        "the overwrite must be reported: {json}"
+    );
+    assert_eq!(std::fs::read(&installed).unwrap(), AFTER_BYTES);
+}
+
+/// A clean apply carries no mismatch warning.
+#[tokio::test]
+#[serial]
+async fn engine_nested_apply_clean_has_no_mismatch_warning() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let mut params = engine_params(tmp.path());
+    params.save_only = false;
+    let selected = vec![search_result(UUID, PURL)];
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+    assert_eq!(code, 0, "json={json}");
+    assert!(json.get("warnings").is_none(), "json={json}");
+}
+
+/// `get <uuid> --json` over a locally edited installed file: one JSON
+/// document whose `warnings[]` names the overwrite, and nothing on stderr
+/// (the envelope is the JSON caller's channel).
+#[tokio::test]
+async fn get_uuid_json_mismatch_overwrite_is_reported() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let installed = tmp.path().join("node_modules").join(NAME).join("index.js");
+    std::fs::write(&installed, LOCAL_EDIT_BYTES).unwrap();
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let json = parse_single_json_doc(&stdout);
+    assert_eq!(json["status"], "success", "json={json}");
+    assert_eq!(json["applied"], 1, "json={json}");
+    assert!(
+        has_mismatch_warning(&json, PURL),
+        "the overwrite must be reported: {json}"
+    );
+    assert!(!stderr.contains("did not match"), "stderr={stderr}");
+    assert_eq!(std::fs::read(&installed).unwrap(), AFTER_BYTES);
+}

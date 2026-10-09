@@ -796,17 +796,8 @@ pub(crate) async fn lock_text_refusals_for(
     let cwd = params.cwd.as_path();
     let origins =
         crate::commands::hosted_unwind::patch_server_origins_of(params.patch_server_url.as_deref());
-    let pins = socket_patch_core::patch::redirect::upstream::HostedPin::all(
-        &socket_patch_core::vex::discover_patched_refs_with(
-            cwd,
-            &socket_patch_core::vex::DiscoverOptions {
-                patch_server_origins: origins.clone(),
-            },
-        )
-        .await,
-    );
-    let claimed: std::collections::HashSet<PurlKey> =
-        pins.iter().map(|pin| PurlKey::new(&pin.purl)).collect();
+    let pins = hosted_pins(cwd, origins.clone()).await;
+    let claimed = claimed_purls(&pins);
     let fetchable: Vec<&PatchSearchResult> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -850,6 +841,42 @@ pub(crate) async fn lock_text_refusals_for(
         .await,
     );
     refusals
+}
+
+/// The purl keys the project's lockfiles pin hosted (a patch-server
+/// tarball, Socket's own or one of `origins`): the purls whose vendored
+/// run is a hosted → vendored takeover.
+/// The fetch-phase gate ([`lock_text_refusals_for`]) and the scan preview
+/// (`scan/vendor_flow.rs`) both read the takeovers through here, so the dry
+/// run and the wet run agree on which purls they are.
+pub(crate) async fn hosted_claimed_purls(
+    cwd: &Path,
+    origins: Vec<String>,
+) -> std::collections::HashSet<PurlKey> {
+    claimed_purls(&hosted_pins(cwd, origins).await)
+}
+
+/// The project's hosted pins (see [`hosted_claimed_purls`]).
+async fn hosted_pins(
+    cwd: &Path,
+    origins: Vec<String>,
+) -> Vec<socket_patch_core::patch::redirect::upstream::HostedPin> {
+    socket_patch_core::patch::redirect::upstream::HostedPin::all(
+        &socket_patch_core::vex::discover_patched_refs_with(
+            cwd,
+            &socket_patch_core::vex::DiscoverOptions {
+                patch_server_origins: origins,
+            },
+        )
+        .await,
+    )
+}
+
+/// The purl keys of `pins`.
+fn claimed_purls(
+    pins: &[socket_patch_core::patch::redirect::upstream::HostedPin],
+) -> std::collections::HashSet<PurlKey> {
+    pins.iter().map(|pin| PurlKey::new(&pin.purl)).collect()
 }
 
 /// The record a detached ledger entry already carries for `purl` at
@@ -1389,6 +1416,22 @@ pub(crate) async fn run_nested_apply(
     report
 }
 
+/// The nested apply's non-fatal warnings (today the default policy's
+/// `content_mismatch_overwritten` overwrites, #1004) as `get`'s string
+/// `warnings[]` entries, code-prefixed like `get`'s `fold_narrowing_into_result`.
+/// A JSON caller's nested apply is silent, so the envelope is the only
+/// place these surface; a human caller's apply already printed them.
+pub(crate) fn apply_warning_lines(report: Option<&ApplyRunReport>) -> Vec<String> {
+    report
+        .map(|r| {
+            r.warnings
+                .iter()
+                .map(|w| format!("({}) {}", w.code, w.detail))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether apply's package key `key` covers the patch record purl
 /// `record`: the same purl, or `key` is the unqualified base of a
 /// qualified record (apply keys a release-variant base by its base purl).
@@ -1665,7 +1708,9 @@ pub async fn download_and_apply_patches_with(
     }
     // Surface release-narrowing fallbacks (uninstalled package / no
     // matching variant) so JSON consumers can see why all variants were
-    // kept. Omitted entirely when narrowing was clean.
+    // kept, and the apply's mismatch overwrites. Omitted entirely when
+    // both were clean.
+    warnings.extend(apply_warning_lines(apply_report.as_ref()));
     if !warnings.is_empty() {
         result_json["warnings"] = serde_json::json!(warnings);
     }

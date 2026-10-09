@@ -3608,6 +3608,56 @@ async fn requirements_utf16_files_are_inventoried() {
     }
 }
 
+/// #1119: with no BOM, pip decodes a requirements file through a PEP 263
+/// coding line, so a Latin-1 root file and a Latin-1 include are
+/// inventoried on a fresh checkout instead of reading as "no requirements",
+/// on disk and in memory.
+#[tokio::test]
+async fn requirements_pep_263_files_are_inventoried() {
+    let latin1 = |pins: &str| {
+        let mut bytes = b"# -*- coding: latin-1 -*-\n# Maintainer: Jos\xe9\n".to_vec();
+        bytes.extend_from_slice(pins.as_bytes());
+        bytes
+    };
+    for (root_bytes, base_bytes) in [
+        // The root file itself.
+        (
+            latin1("-r requirements/base.txt\nidna==3.7\n"),
+            b"six==1.16.0\n".to_vec(),
+        ),
+        // Only the include.
+        (
+            b"-r requirements/base.txt\nidna==3.7\n".to_vec(),
+            latin1("six==1.16.0\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("requirements")).unwrap();
+        std::fs::write(tmp.path().join("requirements.txt"), &root_bytes).unwrap();
+        std::fs::write(tmp.path().join("requirements/base.txt"), &base_bytes).unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![
+                ("idna".to_string(), "3.7".to_string()),
+                ("six".to_string(), "1.16.0".to_string()),
+            ],
+            "{entries:?}"
+        );
+
+        let mut project = MemoryProject::new();
+        project.insert("requirements.txt", MemoryEntry::Binary(root_bytes.into()));
+        project.insert(
+            "requirements/base.txt",
+            MemoryEntry::Binary(base_bytes.into()),
+        );
+        let in_memory = super::pypi::inventory_pypi_locks_in(&ProjectView::Memory(&project))
+            .await
+            .unwrap();
+        assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
+    }
+}
+
 /// pip applies an index option from ANY file of the tree globally, so an
 /// `--index-url` inside an include keeps the root file's hashed pins
 /// unverifiable too (the `public_index` rule spans the whole tree).

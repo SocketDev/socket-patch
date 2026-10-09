@@ -521,8 +521,7 @@ mod tests {
             socket_patch_core::api::client::ApiClientOptions {
                 api_url: "http://127.0.0.1:9".into(),
                 api_token: Some("secret".into()),
-                use_public_proxy: false,
-                org_slug: Some("org".into()),
+                route: socket_patch_core::api::client::ApiRoute::org("org"),
             },
         )
     }

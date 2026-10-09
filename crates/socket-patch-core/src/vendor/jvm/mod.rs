@@ -1,7 +1,8 @@
 //! The v5 vendored JVM backend (`docs/design/maven-vendoring.md`).
 //!
-//! Handles multi-module Maven reactors and Gradle builds automatically.
-//! Single-POM builds retain the legacy backend.
+//! Handles every Maven root (a single-module pom is planned as a reactor
+//! of one), Gradle builds, mixed Maven + Gradle roots, sbt builds and
+//! scala-cli directory builds.
 //!
 //! The planners are pure: they read project files through a [`ReadFn`] and
 //! return the full post-vendor bytes of every file they touch plus one
@@ -213,7 +214,8 @@ impl<'a> JvmPatch<'a> {
 /// Which JVM build the project root holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
-    /// A root `pom.xml` that declares `<modules>`.
+    /// A root `pom.xml`, whether it declares `<modules>` or is a single
+    /// module (a reactor of one).
     MavenReactor,
     /// No root `pom.xml`, and a Gradle settings or build script.
     Gradle,
@@ -224,7 +226,7 @@ pub enum Shape {
     Sbt,
     /// A scala-cli directory build ([`scala_cli::detect`]).
     ScalaCli,
-    /// Anything else (including a single-module pom, which stays legacy).
+    /// No root `pom.xml` and no Gradle, sbt or scala-cli build.
     Other,
 }
 
@@ -315,18 +317,18 @@ pub struct Detected {
 }
 
 impl Detected {
-    /// The backend's planner shape: a single pom alone stays on the legacy
-    /// backend; next to a Gradle build it is planned as a one-pom reactor,
-    /// so both halves share one ledger entry.
+    /// The backend's planner shape. Any root pom, single-module or not, is
+    /// planned as a reactor; next to a Gradle build both halves are planned
+    /// together, so they share one ledger entry.
     pub fn shape(&self) -> Shape {
         if let Some(scala) = self.scala {
             return scala;
         }
         match (self.maven, self.gradle) {
             (Some(_), true) => Shape::Mixed,
-            (Some(MavenShape::Reactor), false) => Shape::MavenReactor,
+            (Some(_), false) => Shape::MavenReactor,
             (None, true) => Shape::Gradle,
-            _ => Shape::Other,
+            (None, false) => Shape::Other,
         }
     }
 }
@@ -381,11 +383,17 @@ pub fn plan_with_config(
         }
         Shape::Sbt => sbt::plan(read, patch),
         Shape::ScalaCli => scala_cli::plan(read, patch),
-        Shape::Other => Err(JvmRefusal {
-            code: "vendor_jvm_shape_unsupported",
-            detail: "reason: no_build_file: not a multi-module Maven reactor or a Gradle build"
-                .to_string(),
-        }),
+        Shape::Other => Err(no_build_file_refusal()),
+    }
+}
+
+/// The refusal of a [`Shape::Other`] root.
+pub fn no_build_file_refusal() -> JvmRefusal {
+    JvmRefusal {
+        code: "vendor_jvm_shape_unsupported",
+        detail: "reason: no_build_file: no pom.xml, Gradle, sbt or scala-cli build at the \
+                 project root"
+            .to_string(),
     }
 }
 
@@ -816,7 +824,7 @@ mod tests {
         };
         assert_eq!(detect(&reactor), Shape::MavenReactor);
         let single = |p: &str| (p == "pom.xml").then(|| b"<project></project>".to_vec());
-        assert_eq!(detect(&single), Shape::Other);
+        assert_eq!(detect(&single), Shape::MavenReactor);
         let gradle = |p: &str| (p == "settings.gradle.kts").then(Vec::new);
         assert_eq!(detect(&gradle), Shape::Gradle);
         let empty = |_: &str| None;
@@ -824,7 +832,7 @@ mod tests {
     }
 
     /// #395: a `pom.xml` next to a Gradle build is both, whichever kind of
-    /// pom it is; a single pom alone stays on the legacy backend.
+    /// pom it is; a single pom alone is a reactor of one (#973).
     #[test]
     fn detect_reports_both_builds_of_a_mixed_root() {
         let files = |pom: &'static [u8], gradle: Option<&'static str>| {
@@ -858,7 +866,7 @@ mod tests {
                 Shape::Mixed,
             ),
             (&reactor[..], None, MavenShape::Reactor, Shape::MavenReactor),
-            (&single[..], None, MavenShape::Single, Shape::Other),
+            (&single[..], None, MavenShape::Single, Shape::MavenReactor),
         ] {
             let read = files(pom, gradle);
             let d = detect_builds(&read);
