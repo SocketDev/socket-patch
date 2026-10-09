@@ -13,13 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use super::client::NpmDist;
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::vendor::lock_inventory::{npm_lock_entries, NpmLockEntry};
-
-/// The pins by uuid.
-pub(super) fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
-    pins.iter().map(|p| (p.uuid.as_str(), *p)).collect()
-}
 
 /// Resolve the dist of every `(uuid, name, version)` wanted from the
 /// default registry, concurrently. A failed lookup refuses its pin.
@@ -272,40 +267,6 @@ pub(crate) async fn restore_npm_locks(
         }
     }
     result
-}
-
-/// Read `rel` through the view; a missing or unreadable file refuses every
-/// pin discovery found in it.
-pub(super) async fn read_or_refuse(
-    view: &mut View<'_>,
-    rel: &str,
-    pins: &BTreeMap<&str, &HostedPin>,
-    result: &mut FormatResult,
-) -> Option<String> {
-    match view.read(rel).await {
-        Ok(Some(text)) => Some(text),
-        Ok(None) => {
-            refuse_all_in(pins, rel, result, format!("{rel} no longer exists"));
-            None
-        }
-        Err(e) => {
-            refuse_all_in(pins, rel, result, e);
-            None
-        }
-    }
-}
-
-pub(super) fn refuse_all_in(
-    pins: &BTreeMap<&str, &HostedPin>,
-    rel: &str,
-    result: &mut FormatResult,
-    why: String,
-) {
-    for pin in pins.values() {
-        if pin.files.iter().any(|f| f == rel) {
-            result.refuse(&pin.uuid, why.clone());
-        }
-    }
 }
 
 // ── yarn.lock ────────────────────────────────────────────────────────────────

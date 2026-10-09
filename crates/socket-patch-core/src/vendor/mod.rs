@@ -292,9 +292,9 @@ const ARCHIVE_PREFETCH_BYTES: usize = 128 * 1024 * 1024;
 
 impl VendorServiceConfig {
     /// Whether this run may actually attempt a service download right now:
-    /// the mode permits it, we're online, and a client is configured.
+    /// we're online and a client is configured.
     pub fn service_enabled(&self) -> bool {
-        self.source.may_use_service() && !self.offline && self.client.is_some()
+        !self.offline && self.client.is_some()
     }
 
     /// Whether a run through this config would prefetch service downloads

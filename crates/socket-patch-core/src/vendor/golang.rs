@@ -36,9 +36,7 @@ use super::common::{
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip_with_prefix};
-use super::service_fetch::{
-    claim_prestaged, fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal,
-};
+use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServicePolicy};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -272,11 +270,11 @@ pub async fn vendor_go_module<'a>(
     )
     .await
     {
-        GoServiceRedirect::Used(inventory) => (
+        Ok(inventory) => (
             already_patched_result(purl, &copy_dir, &record.files),
             inventory,
         ),
-        GoServiceRedirect::HardFail(outcome) => return *outcome,
+        Err(outcome) => return *outcome,
     };
 
     if dry_run {
@@ -383,58 +381,47 @@ pub async fn vendor_go_module<'a>(
     write_marker_or_warn(&project_root.join(&base_rel), &marker, &mut warnings).await;
 
     let entry = VendorEntry {
-        ecosystem: "golang".to_string(),
-        base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: format!("{base_rel}/{module}@{version}"),
-            sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
-            size: None,
-            platform_locked: None,
-            file_inventory,
-        },
-        wiring: vec![WiringRecord {
-            file: "go.mod".to_string(),
-            kind: "go_replace".to_string(),
-            // Rewritten whenever ANY socket-owned directive pre-existed (a
-            // go-patches or hosted takeover, or a re-vendor refreshing an
-            // older uuid).
-            action: if prior_target.is_some() {
-                WiringAction::Rewritten
-            } else {
-                WiringAction::Added
-            },
-            key: Some(module.to_string()),
-            original: prior_target.map(serde_json::Value::from),
-            new: Some(serde_json::Value::from(replace_target_path(
-                &base_rel, module, version,
-            ))),
-        }],
-        lock: None,
         took_over_go_patches: takeover,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
+        ..VendorEntry::new(
+            "golang".to_string(),
+            base_purl,
+            record.uuid.clone(),
+            VendorArtifact {
+                yarn_berry10c0: None,
+                path: format!("{base_rel}/{module}@{version}"),
+                sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
+                size: None,
+                platform_locked: None,
+                file_inventory,
+            },
+            vec![WiringRecord {
+                file: "go.mod".to_string(),
+                kind: "go_replace".to_string(),
+                // Rewritten whenever ANY socket-owned directive pre-existed (a
+                // go-patches or hosted takeover, or a re-vendor refreshing an
+                // older uuid).
+                action: if prior_target.is_some() {
+                    WiringAction::Rewritten
+                } else {
+                    WiringAction::Added
+                },
+                key: Some(module.to_string()),
+                original: prior_target.map(serde_json::Value::from),
+                new: Some(serde_json::Value::from(replace_target_path(
+                    &base_rel, module, version,
+                ))),
+            }],
+        )
     };
 
     done(result, Some(entry), warnings)
 }
 
-/// Outcome of attempting to materialise the go copy from the patch service
-/// (`Used`: the prebuilt module zip was extracted and the `replace` wired).
-type GoServiceRedirect = ServiceAttempt<Option<std::collections::BTreeMap<String, String>>>;
-
 /// Download the prebuilt module zip, verify it (sha512 + the `h1:` dirhash,
 /// done by `fetch_verified_archive`), extract it into `copy_dir` (stripping its
 /// `{module}@{version}/` prefix), ensure a `go.mod`, and wire the `replace`
 /// directive — the same end state `apply_go_redirect` produces, minus the copy
-/// + local apply. Maps each service outcome onto the `auto` / `service` policy.
+/// + local apply.
 ///
 /// `wired` — the run started with the vendor `replace` already pointing at
 /// THIS uuid's copy; a failure leg must then also drop that directive with the
@@ -453,40 +440,34 @@ async fn go_service_redirect(
     copy_was_ok: bool,
     wired: bool,
     warnings: &mut Vec<VendorWarning>,
-) -> GoServiceRedirect {
+) -> Result<Option<std::collections::BTreeMap<String, String>>, Box<VendorOutcome>> {
     if record.files.is_empty() || copy_was_ok {
         if let Err(e) =
             go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, dry_run)
                 .await
         {
-            return GoServiceRedirect::HardFail(Box::new(refused(
+            return Err(Box::new(refused(
                 "vendor_prebuilt_wire_failed",
                 e.to_string(),
             )));
         }
-        return GoServiceRedirect::Used(None);
+        return Ok(None);
     }
     if dry_run {
         let prefix = format!("{module}@{version}/");
-        return match super::service_fetch::preview_service(service, record, move |bytes, dest| {
+        return super::service_fetch::preview_service(service, record, move |bytes, dest| {
             extract_zip_with_prefix(bytes, dest, &prefix)
         })
         .await
-        {
-            Ok(()) => GoServiceRedirect::Used(None),
-            Err(outcome) => GoServiceRedirect::HardFail(outcome),
-        };
+        .map(|()| None);
     }
     let Some(cfg) = service.filter(|cfg| cfg.service_enabled()) else {
-        return GoServiceRedirect::HardFail(Box::new(super::service_fetch::required()));
+        return Err(Box::new(super::service_fetch::required()));
     };
-    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+    let policy = ServicePolicy::Refused;
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
     let subject = format!("module zip for {module}");
-    let mut archive = match policy.settle(fetched, "module zip", &subject, warnings) {
-        Ok(archive) => archive,
-        Err(attempt) => return attempt,
-    };
+    let mut archive = policy.settle(fetched, "module zip", &subject)?;
     // Extract the module zip (strip its literal `{module}@{version}/`
     // prefix) into a STAGE sibling of the copy dir and swap it into
     // place only once verified — the cargo / composer / gem shape: a
@@ -502,10 +483,10 @@ async fn go_service_redirect(
         if let Err(e) = tokio::fs::create_dir_all(&stage).await {
             cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
                 .await;
-            return policy.hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_write_failed",
                 format!("cannot create {}: {e}", stage.display()),
-            );
+            ));
         }
         let zip_bytes = std::mem::take(&mut archive.bytes);
         let prefix_owned = prefix.clone();
@@ -516,40 +497,36 @@ async fn go_service_redirect(
         {
             cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
                 .await;
-            return policy.hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_extract_failed",
                 format!("cannot extract the prebuilt module zip: {e}"),
-            );
+            ));
         }
     }
     // A `replace` target needs a go.mod declaring the module path;
     // pre-modules zips may lack one — synthesize the minimal form.
     if let Err(e) = ensure_module_go_mod(&stage, module).await {
         cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired).await;
-        return policy.hard(
+        return Err(policy.hard(
             "vendor_prebuilt_write_failed",
             format!("cannot synthesize go.mod for the copy: {e}"),
-        );
+        ));
     }
     if !copy_matches_after_hashes(&stage, &record.files).await {
         cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired).await;
-        return policy.miss(
-            warnings,
-            "vendor_prebuilt_layout_mismatch",
-            format!(
-                "prebuilt module zip for {module} extracted to an \
+        return Err(policy.miss(format!(
+            "prebuilt module zip for {module} extracted to an \
                  unexpected layout (patched files absent at their \
                  recorded paths)"
-            ),
-        );
+        )));
     }
     let file_inventory = inventory_or_warn(&stage, &format!("{module}@{version}"), warnings).await;
     if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
         cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired).await;
-        return policy.hard(
+        return Err(policy.hard(
             "vendor_prebuilt_write_failed",
             format!("cannot move the extracted module into place: {e}"),
-        );
+        ));
     }
     if let Err(e) =
         go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false).await
@@ -562,13 +539,13 @@ async fn go_service_redirect(
         if !wired {
             teardown_failed_service_copy(project_root, base_rel, module, false).await;
         }
-        return policy.hard(
+        return Err(policy.hard(
             "vendor_prebuilt_wire_failed",
             format!("failed to update go.mod: {e}"),
-        );
+        ));
     }
     warnings.push(archive.downloaded_warning(module));
-    GoServiceRedirect::Used(file_inventory)
+    Ok(file_inventory)
 }
 
 /// Failure cleanup for the service legs (the vendor-side sibling of the

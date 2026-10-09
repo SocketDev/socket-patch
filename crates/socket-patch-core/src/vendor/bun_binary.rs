@@ -105,26 +105,23 @@ fn merge_duplicates(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor(
     purl: &str,
-    installed_dir: super::source::PackageSource<'_>,
+    _installed_dir: super::source::PackageSource<'_>,
     root: &Path,
     record: &PatchRecord,
-    sources: &crate::patch::apply::PatchSources<'_>,
+    _sources: &crate::patch::apply::PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     super::npm_common::vendor_npm_family(
         &BunBinaryBackend,
         super::npm_common::NpmVendorRequest {
             purl,
-            installed_dir,
             project_root: root,
             record,
-            sources,
             vendored_at,
             dry_run,
-            force,
             service,
         },
     )

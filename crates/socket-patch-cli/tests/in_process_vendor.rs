@@ -2648,11 +2648,11 @@ async fn vendored_golang_purl_skipped_by_apply() {
     let mut state = VendorState::new();
     state.entries.insert(
         purl.clone(),
-        VendorEntry {
-            ecosystem: "golang".to_string(),
-            base_purl: purl.clone(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "golang".to_string(),
+            purl.clone(),
+            UUID.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: format!(".socket/vendor/golang/{UUID}/{MODULE}@{VERSION}"),
                 sha256: String::new(),
@@ -2660,18 +2660,8 @@ async fn vendored_golang_purl_skipped_by_apply() {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
+            Vec::new(),
+        ),
     );
     socket_patch_core::vendor::save_state(root, &state)
         .await

@@ -97,26 +97,23 @@ const DEP_MANIFEST_FIELDS: [&str; 4] = [
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_npm<'a>(
     purl: &str,
-    installed_dir: impl Into<PackageSource<'a>>,
+    _installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     vendor_npm_family(
         &PackageLockBackend,
         NpmVendorRequest {
             purl,
-            installed_dir: installed_dir.into(),
             project_root,
             record,
-            sources,
             vendored_at,
             dry_run,
-            force,
             service,
         },
     )
@@ -5170,11 +5167,11 @@ mod tests {
             fx.lock_bytes
         );
         // And revert refuses to delete through a tampered uuid too.
-        let entry = VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: fx.purl(),
-            uuid: "../../x".into(),
-            artifact: VendorArtifact {
+        let entry = VendorEntry::new(
+            "npm".into(),
+            fx.purl(),
+            "../../x".into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: "whatever".into(),
                 sha256: String::new(),
@@ -5182,18 +5179,8 @@ mod tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        };
+            Vec::new(),
+        );
         let outcome = revert_npm(&entry, fx.root(), false).await;
         assert!(!outcome.success, "tampered uuid must fail closed");
     }

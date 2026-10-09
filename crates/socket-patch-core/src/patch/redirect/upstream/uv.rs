@@ -57,10 +57,9 @@ use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use super::client::PypiFile;
 use super::pypi::{
-    by_uuid, fetch_release_files, is_pypi_simple, pin_of, read_or_refuse, refuse_all_in,
-    toml_quote, toml_value, universal_release,
+    fetch_release_files, is_pypi_simple, pin_of, toml_quote, toml_value, universal_release,
 };
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::{paired_metadata_rel, preserve_line_endings, UvSource};
 use crate::vendor::common::pep508_name;

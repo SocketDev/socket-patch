@@ -17,10 +17,8 @@
 
 use std::collections::BTreeSet;
 
-use super::npm::{
-    bun_tarball_url, by_uuid, fetch_dists_on, refuse_all_in, BunConfigOrder, BunRegistrySettings,
-};
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::npm::{bun_tarball_url, fetch_dists_on, BunConfigOrder, BunRegistrySettings};
+use super::{by_uuid, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::vendor::bun_lockb::{BunLockb, NORMALIZED_FORMAT_1, NORMALIZED_WORKSPACE};
 
 pub(super) async fn restore(

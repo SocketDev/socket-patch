@@ -65,8 +65,8 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, failed_result, inventory_or_warn,
-    prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
+    already_patched_result, cleanup_failed_stage, copy_matches_after_hashes, done, failed_result,
+    inventory_or_warn, prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
     swap_stage_into_place, synthesized_result,
 };
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
@@ -74,7 +74,7 @@ use super::registry_fetch::{extract_gem_data, extract_on_blocking_pool};
 use super::revert::{self, KeepPolicy};
 use super::service_fetch::{
     claim_prestaged, fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult,
-    ServiceAttempt, ServicePolicy, ServiceTerminal,
+    ServicePolicy,
 };
 use super::source::PackageSource;
 use super::state::{
@@ -131,7 +131,6 @@ struct GemPrelude {
     gemfile_text: String,
     lock_path: PathBuf,
     lock_text: String,
-    local_stub: Option<(PathBuf, String)>,
     /// Gemfile and Gemfile.lock already wire this uuid's copy.
     lock_wired: bool,
     /// ...and the committed copy is intact (the in-sync hot path, which
@@ -381,14 +380,14 @@ async fn gem_prelude(
         }
     };
 
-    let local_stub: Option<(PathBuf, String)> = {
+    let local_stub = {
         let spec_src = installed_path
             .parent()
             .filter(|gems| gems.file_name().is_some_and(|n| n == "gems"))
             .and_then(Path::parent)
             .map(|home| home.join("specifications").join(format!("{leaf}.gemspec")));
         match spec_src {
-            Some(p) => read_regular_to_string(&p).await.ok().map(|t| (p, t)),
+            Some(p) => read_regular_to_string(&p).await.ok(),
             None => None,
         }
     };
@@ -398,7 +397,7 @@ async fn gem_prelude(
     // Only the local stub is checked here (when present); the service stub is
     // re-checked in `gem_service_copy`, and a native gem emits no service stub
     // at all (the converter refuses it), so the service path also misses.
-    if let Some((_, text)) = &local_stub {
+    if let Some(text) = &local_stub {
         if gemspec_declares_extensions(text) {
             return Err(refused(
                 "native_extensions_unsupported",
@@ -461,7 +460,6 @@ async fn gem_prelude(
         gemfile_text,
         lock_path,
         lock_text,
-        local_stub,
         lock_wired,
         copy_ok,
     })
@@ -544,10 +542,10 @@ pub async fn vendor_gem<'a>(
     installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     let installed_dir = installed_dir.into();
@@ -565,7 +563,6 @@ pub async fn vendor_gem<'a>(
         gemfile_text,
         lock_path,
         lock_text: _,
-        local_stub,
         lock_wired,
         copy_ok,
     } = &prelude;
@@ -603,15 +600,10 @@ pub async fn vendor_gem<'a>(
             let mut warnings: Vec<VendorWarning> = Vec::new();
             let result = match materialise_patched_copy(
                 purl,
-                installed_dir,
                 copy_dir,
                 uuid_dir,
                 name,
-                version,
-                local_stub.as_ref().map(|(p, t)| (p.as_path(), t.as_str())),
                 record,
-                sources,
-                force,
                 false, // live-wired: never unwind the uuid dir on failure
                 service,
                 &mut warnings,
@@ -679,15 +671,10 @@ pub async fn vendor_gem<'a>(
     }
     let mut result = match materialise_patched_copy(
         purl,
-        installed_dir,
         copy_dir,
         uuid_dir,
         name,
-        version,
-        local_stub.as_ref().map(|(p, t)| (p.as_path(), t.as_str())),
         record,
-        sources,
-        force,
         true, // fresh vendor: nothing pre-existing worth keeping
         service,
         &mut warnings,
@@ -858,11 +845,11 @@ fn gem_entry(
     file_inventory: Option<std::collections::BTreeMap<String, String>>,
     wiring: Vec<WiringRecord>,
 ) -> VendorEntry {
-    VendorEntry {
-        ecosystem: "gem".to_string(),
+    VendorEntry::new(
+        "gem".to_string(),
         base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
+        record.uuid.clone(),
+        VendorArtifact {
             yarn_berry10c0: None,
             path: copy_rel,
             sha256: String::new(), // dir-shaped: whole-tree integrity is the inventory
@@ -871,31 +858,7 @@ fn gem_entry(
             file_inventory,
         },
         wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    }
-}
-
-/// Failure cleanup for a staged (re)build: always remove the stage, then
-/// either unwind the whole `<uuid>/` dir (`unwind_uuid_dir` — a fresh vendor
-/// with no pre-existing state worth keeping) or leave existing state
-/// untouched — a live-wired rebuild must never delete the copy the Gemfile
-/// `path:` and the lock's PATH `remote:` still point at; either way prune any
-/// empty-husk dirs left behind.
-async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
-    let _ = remove_tree(stage).await;
-    if unwind_uuid_dir {
-        let _ = remove_tree(uuid_dir).await;
-    }
-    prune_empty_vendor_levels(uuid_dir).await;
+    )
 }
 
 /// The path-source stub gemspec served as the gem's SECOND artifact, alongside
@@ -904,31 +867,8 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
 /// eval-able Ruby form a bundler path source loads.
 pub(crate) const GEM_STUB_ARTIFACT_KIND: &str = "gem-stub-gemspec";
 
-/// Outcome of attempting to materialise the gem copy from the patch service.
-pub(super) enum GemServiceCopy {
-    /// The prebuilt `.gem` was extracted into `copy_dir` and the verified stub
-    /// gemspec written as `<name>.gemspec`.
-    Used,
-    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
-    HardFail(Box<VendorOutcome>),
-}
-
-/// Download the prebuilt `.gem` + its `gem-stub-gemspec` secondary artifact,
-/// integrity-verify both, extract the `.gem`'s `data.tar.gz` into `copy_dir`,
-/// and write the stub as `<name>.gemspec`. The extracted `.gem` IS the patched
-/// package the converter built, so it needs no local install — the point of
-/// the service path. Maps each service outcome onto the `auto` / `service`
-/// fallback policy.
-///
-/// A MISSING stub artifact is a terminal miss (fall back under `auto`, refuse
-/// under `service`): it means either a native-extension gem (the converter
-/// emits no stub — bundler can't build extensions for a path source) or a gem
-/// patch built before the stub rollout (the invalidation migration rebuilds
-/// those). The downloaded stub is re-checked for native extensions as defense
-/// in depth, and an INVALID stub — one missing the rubygems-required
-/// `summary`/`authors` assignments — follows
-/// the same miss policy under its own `vendor_prebuilt_stub_invalid` code
-/// (always loud, even under `auto`).
+/// Download and verify the `.gem` and its stub gemspec, then atomically
+/// replace the copy. Missing, invalid, or native-extension stubs are refused.
 pub(super) async fn gem_service_copy(
     service: Option<&VendorServiceConfig>,
     record: &PatchRecord,
@@ -937,81 +877,37 @@ pub(super) async fn gem_service_copy(
     uuid_dir: &Path,
     unwind_uuid_dir: bool,
     warnings: &mut Vec<VendorWarning>,
-) -> GemServiceCopy {
-    let Some(cfg) = service else {
-        return GemServiceCopy::HardFail(Box::new(super::service_fetch::required()));
-    };
-    if !cfg.service_enabled() {
-        return GemServiceCopy::HardFail(Box::new(super::service_fetch::required()));
-    }
-    fn hard(code: &'static str, detail: String) -> GemServiceCopy {
-        GemServiceCopy::HardFail(Box::new(refused(code, detail)))
-    }
-    // One policy for every service miss: explicit `service` refuses (the
-    // `refusal` tuple names the terminal code and an optional remedy sentence
-    // for its detail), `auto` warns under `code` and falls back to the local
-    // build. `is_stub_defect` marks the misses where the service DID serve a
-    // stub that failed validation — the reason then rides the `FallBack`
-    // payload (see [`GemServiceCopy::FallBack`]).
-    let miss = |_warnings: &mut Vec<VendorWarning>,
-                _code: &'static str,
-                refusal: (&'static str, &str),
-                reason: String,
-                _is_stub_defect: bool| {
-        let (code, remedy) = refusal;
-        hard(
-            code,
-            if remedy.is_empty() {
-                reason
-            } else {
-                format!("{reason}. {remedy}")
-            },
-        )
-    };
-
+) -> Result<(), Box<VendorOutcome>> {
+    let cfg = service
+        .filter(|cfg| cfg.service_enabled())
+        .ok_or_else(|| Box::new(super::service_fetch::required()))?;
     // Step 1: the prebuilt `.gem` (sha512-verified against the reference).
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
     let subject = format!(".gem for {name}");
-    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
-    let mut archive = match policy.settle::<()>(fetched, ".gem", &subject, warnings) {
-        Ok(archive) => archive,
-        Err(ServiceAttempt::HardFail(outcome)) => return GemServiceCopy::HardFail(outcome),
-        Err(ServiceAttempt::Used(())) => {
-            return GemServiceCopy::HardFail(Box::new(super::service_fetch::required()));
-        }
-    };
+    let policy = ServicePolicy::Refused;
+    let mut archive = policy.settle(fetched, ".gem", &subject)?;
 
     // Step 2: the stub gemspec the converter generated alongside the `.gem`.
     let stub = match fetch_verified_secondary(cfg, &archive, GEM_STUB_ARTIFACT_KIND).await {
         SecondaryArtifactResult::Ready(bytes) => bytes,
         SecondaryArtifactResult::Absent => {
-            return miss(
-                warnings,
-                "vendor_prebuilt_stub_missing",
-                ("vendor_prebuilt_required", ""),
+            return Err(policy.miss(
                 "the patch service served no stub gemspec for this gem (a native-extension \
                  gem, or a patch built before the stub rollout)"
                     .to_string(),
-                false,
-            );
+            ));
         }
         SecondaryArtifactResult::IntegrityMismatch(reason) => {
-            return hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_integrity_mismatch",
                 format!(
                     "prebuilt stub gemspec for {name} failed integrity verification ({reason}); \
                      refusing to fall back to a local build on tampered bytes"
                 ),
-            );
+            ));
         }
         SecondaryArtifactResult::Failed(reason) => {
-            return miss(
-                warnings,
-                "vendor_prebuilt_unavailable",
-                ("vendor_prebuilt_required", ""),
-                format!("could not fetch the stub gemspec ({reason})"),
-                false,
-            );
+            return Err(policy.miss(format!("could not fetch the stub gemspec ({reason})")));
         }
     };
     let stub_text = String::from_utf8_lossy(&stub);
@@ -1020,24 +916,17 @@ pub(super) async fn gem_service_copy(
     // refuse one here too — bundler silently skips extension builds for path
     // sources, so a native gem would install and then fail at `require` time.
     if gemspec_declares_extensions(&stub_text) {
-        return hard(
+        return Err(policy.hard(
             "native_extensions_unsupported",
             format!(
                 "the served stub gemspec for {name} declares native extensions; bundler does \
                  not build extensions for path-sourced gems"
             ),
-        );
+        ));
     }
 
-    // Defense in depth: a served stub may omit the rubygems-required
-    // `summary`/`authors`, and every bundler major validates path-source
-    // gemspecs — writing such a stub
-    // verbatim makes every later `bundle install` exit 1 (`missing value for
-    // attribute summary`). An INVALID stub follows the MISSING-stub policy
-    // (fall back under `auto`, refuse under `service`) but under its own
-    // `vendor_prebuilt_stub_invalid` code, and always loudly — the served
-    // artifact is defective, not merely absent. Nothing has been written yet,
-    // so the refusal leaves no partial artifacts.
+    // Bundler rejects path-source gemspecs without summary/authors. Refuse
+    // before writing anything, so invalid stubs leave no partial artifact.
     let missing_attrs = gemspec_missing_required_attrs(&stub_text);
     if !missing_attrs.is_empty() {
         let licenses_note = if gemspec_assigns_attr(&stub_text, &["licenses", "license"]) {
@@ -1052,16 +941,13 @@ pub(super) async fn gem_service_copy(
              `bundle install` fail",
             missing_attrs.join(", "),
         );
-        return miss(
-            warnings,
+        return Err(policy.hard(
             "vendor_prebuilt_stub_invalid",
-            (
-                "vendor_prebuilt_stub_invalid",
-                "Retry after the patch service publishes a corrected artifact",
+            format!(
+                "{}. Retry after the patch service publishes a corrected artifact",
+                reason
             ),
-            reason,
-            true,
-        );
+        ));
     }
 
     // Extract the patched `.gem`'s data.tar.gz into a STAGE sibling, add the
@@ -1077,82 +963,58 @@ pub(super) async fn gem_service_copy(
         let _ = remove_tree(&stage).await;
         if let Err(e) = tokio::fs::create_dir_all(&stage).await {
             cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-            return hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_write_failed",
                 format!("cannot create {}: {e}", stage.display()),
-            );
+            ));
         }
         let gem_bytes = std::mem::take(&mut archive.bytes);
         if let Err(e) = extract_on_blocking_pool(gem_bytes, &stage, extract_gem_data).await {
             cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-            return hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_extract_failed",
                 format!("cannot extract the prebuilt .gem: {e}"),
-            );
+            ));
         }
     }
     if let Err(e) = tokio::fs::write(stage.join(format!("{name}.gemspec")), &stub).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-        return hard(
+        return Err(policy.hard(
             "vendor_prebuilt_write_failed",
             format!("cannot write the stub gemspec into the vendored dir: {e}"),
-        );
+        ));
     }
     if !copy_matches_after_hashes(&stage, &record.files).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-        return miss(
-            warnings,
-            "vendor_prebuilt_layout_mismatch",
-            ("vendor_prebuilt_required", ""),
-            format!(
-                "prebuilt .gem for {name} extracted to an unexpected layout \
+        return Err(policy.miss(format!(
+            "prebuilt .gem for {name} extracted to an unexpected layout \
                  (patched files absent at their recorded paths)"
-            ),
-            false,
-        );
+        )));
     }
     if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-        return hard(
+        return Err(policy.hard(
             "vendor_prebuilt_write_failed",
             format!("cannot move the extracted .gem into place: {e}"),
-        );
+        ));
     }
     warnings.push(archive.downloaded_warning(name));
-    GemServiceCopy::Used
+    Ok(())
 }
 
-/// Materialise the patched copy at `copy_dir` plus its `<name>.gemspec` stub,
-/// service-download first (see [`gem_service_copy`]) and local copy+stub+apply
-/// as the fallback. Returns the verify [`ApplyResult`] (a synthesized
-/// `AlreadyPatched` on the service path), or a terminal [`VendorOutcome`] to
-/// bubble. A non-fatal copy/stub/patch failure is surfaced as an UN-successful
-/// `ApplyResult` (the caller returns it as a `Done` with no ledger entry).
-///
-/// Either build is staged (see [`swap_stage_into_place`]) and swapped into
-/// `copy_dir` only on success, so a failure never destroys a pre-existing
-/// copy: with `unwind_uuid_dir` (a fresh vendor — nothing pre-existing to
-/// keep) the whole uuid dir is removed on failure, without it (the wired
-/// hot-path rebuild, where the Gemfile `path:` and the lock's PATH `remote:`
-/// still point at the copy) the previous copy, marker, and wiring are left
-/// exactly as they were.
+/// Acquire a verified service copy without replacing the prior copy on failure.
 #[allow(clippy::too_many_arguments)]
 async fn materialise_patched_copy(
     purl: &str,
-    _installed_dir: PackageSource<'_>,
     copy_dir: &Path,
     uuid_dir: &Path,
     name: &str,
-    _version: &str,
-    _local_stub: Option<(&Path, &str)>,
     record: &PatchRecord,
-    _sources: &PatchSources<'_>,
-    _force: bool,
     unwind_uuid_dir: bool,
     service: Option<&VendorServiceConfig>,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<ApplyResult, Box<VendorOutcome>> {
-    match gem_service_copy(
+    gem_service_copy(
         service,
         record,
         name,
@@ -1161,15 +1023,8 @@ async fn materialise_patched_copy(
         unwind_uuid_dir,
         warnings,
     )
-    .await
-    {
-        GemServiceCopy::Used => {
-            // The service `.gem` is the patched package; trust its verified
-            // integrity (every file reads as AlreadyPatched).
-            Ok(already_patched_result(purl, copy_dir, &record.files))
-        }
-        GemServiceCopy::HardFail(outcome) => Err(outcome),
-    }
+    .await?;
+    Ok(already_patched_result(purl, copy_dir, &record.files))
 }
 
 /// Revert a gem vendor entry: restore the Gemfile line / delete the managed

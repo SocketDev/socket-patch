@@ -460,10 +460,8 @@ mod takeover_reach_tests {
 
     fn entry(flavor: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6c".into(),
-            artifact: VendorArtifact {
+flavor: Some(flavor.into()),
+..VendorEntry::new("pypi".into(), "pkg:pypi/six@1.16.0".into(), "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6c".into(), VendorArtifact {
                 yarn_berry10c0: None,
                 path: ".socket/vendor/pypi/5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6c/six-1.16.0-py3-none-any.whl"
                     .into(),
@@ -471,19 +469,8 @@ mod takeover_reach_tests {
                 size: None,
                 platform_locked: None,
                 file_inventory: None,
-            },
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: Some(flavor.into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+            }, wiring)
+}
     }
 
     #[test]

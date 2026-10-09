@@ -18,15 +18,10 @@ use serde_json::{json, Value};
 use toml_edit::{DocumentMut, Item};
 
 use super::client::PypiFile;
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::preserve_line_endings;
 use crate::vendor::common::pep508_name;
-
-/// The pins by uuid.
-pub(super) fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
-    pins.iter().map(|p| (p.uuid.as_str(), *p)).collect()
-}
 
 /// The in-scope pin a hosted `location` names.
 pub(super) fn pin_of<'p>(
@@ -45,40 +40,6 @@ pub(super) fn pin_coords(pin: &HostedPin, result: &mut FormatResult) -> Option<(
         None => {
             result.refuse(&pin.uuid, format!("{} is not a pypi purl", pin.purl));
             None
-        }
-    }
-}
-
-/// Read `rel` through the view; a missing or unreadable file refuses every
-/// pin discovery found in it.
-pub(super) async fn read_or_refuse(
-    view: &mut View<'_>,
-    rel: &str,
-    pins: &BTreeMap<&str, &HostedPin>,
-    result: &mut FormatResult,
-) -> Option<String> {
-    match view.read(rel).await {
-        Ok(Some(text)) => Some(text),
-        Ok(None) => {
-            refuse_all_in(pins, rel, result, format!("{rel} no longer exists"));
-            None
-        }
-        Err(e) => {
-            refuse_all_in(pins, rel, result, e);
-            None
-        }
-    }
-}
-
-pub(super) fn refuse_all_in(
-    pins: &BTreeMap<&str, &HostedPin>,
-    rel: &str,
-    result: &mut FormatResult,
-    why: String,
-) {
-    for pin in pins.values() {
-        if pin.files.iter().any(|f| f == rel) {
-            result.refuse(&pin.uuid, why.clone());
         }
     }
 }

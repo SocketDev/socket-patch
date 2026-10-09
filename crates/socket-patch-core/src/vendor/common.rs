@@ -105,19 +105,11 @@ pub(crate) fn done(
     }
 }
 
-/// Shared helper the vendor backends delegate to: the fail-closed refusals
-/// for a `--vendor-source=service` run that cannot reach the service —
-/// combined with `--offline`, or with no API client configured — checked
-/// before any service consultation. Every backend's service helper treats
-/// `!service_enabled()` as "build locally", so this is the one gate that
-/// keeps `service` mode from silently building.
+/// Refuse network acquisition when offline or without an API client.
 pub(crate) fn service_offline_conflict(
     service: Option<&VendorServiceConfig>,
 ) -> Option<VendorOutcome> {
     let cfg = service?;
-    if !cfg.source.requires_service() {
-        return None;
-    }
     if cfg.offline {
         return Some(refused(
             "vendor_service_offline_conflict",
@@ -350,6 +342,16 @@ pub(crate) fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
 /// The backup sibling the old copy is parked at mid-swap: `<copy>.socket-old`.
 pub(crate) fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
     swap_sibling_for(copy_dir, ".socket-old")
+}
+
+/// Remove a failed stage, optionally unwind a fresh UUID directory, and prune
+/// empty parents. Existing wired copies must survive failed rebuilds.
+pub(crate) async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
+    let _ = remove_tree(stage).await;
+    if unwind_uuid_dir {
+        let _ = remove_tree(uuid_dir).await;
+    }
+    prune_empty_vendor_levels(uuid_dir).await;
 }
 
 /// Swap a fully-built stage into place without a destructive window: park the
