@@ -723,8 +723,9 @@ fn hosted_only_remove_without_manifest_restores_upstream() {
     assert!(
         events.iter().any(|e| e["action"] == "removed"
             && e["purl"] == NPM_PURL
-            && e["errorCode"] == "hosted_reverted"),
-        "removed/hosted_reverted event expected; envelope={v}"
+            && e["errorCode"] == "hosted_reverted"
+            && e["details"]["mode"] == "hosted"),
+        "removed/hosted_reverted event (details.mode hosted) expected; envelope={v}"
     );
     assert_eq!(
         std::fs::read_to_string(&lock_path).unwrap(),
@@ -785,8 +786,17 @@ fn hosted_remove_with_manifest_entry_restores_upstream() {
     assert!(
         events.iter().any(|e| e["action"] == "removed"
             && e["errorCode"] == "hosted_reverted"
-            && e["purl"] == NPM_PURL),
-        "expected a removed/hosted_reverted event: {events:?}"
+            && e["purl"] == NPM_PURL
+            && e["details"]["mode"] == "hosted"),
+        "expected a removed/hosted_reverted event (details.mode hosted): {events:?}"
+    );
+    // The manifest entry's own removal is agent-mode: no mode.
+    assert!(
+        events
+            .iter()
+            .filter(|e| e["action"] == "removed" && e["errorCode"].is_null())
+            .all(|e| e["details"].get("mode").is_none()),
+        "{events:?}"
     );
     assert!(
         events

@@ -545,7 +545,16 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         // it vanished since (TOCTOU) → nothing to verify. An `Err` means it exists
         // but is unreadable/corrupt: fail-closed (report drift) rather than
         // silently passing — the guard treats exit 0 as "in sync".
-        Ok(None) => return 0,
+        Ok(None) => {
+            // Same answer as the no-manifest exit in `run`.
+            if args.common.json {
+                let mut env = Envelope::new(Command::Apply);
+                env.status = Status::NoManifest;
+                env.dry_run = args.common.dry_run;
+                println!("{}", env.to_pretty_json());
+            }
+            return 0;
+        }
         Err(e) => {
             let msg = format!(
                 "Patch check could not read the manifest ({e}); \

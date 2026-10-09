@@ -484,9 +484,8 @@ async fn repair_inner(
     let blobs_path = socket_dir.join("blobs");
     let diffs_path = socket_dir.join("diffs");
 
-    let download_mode =
-        DownloadMode::parse(&args.common.download_mode)
-            .map_err(|e| EnvelopeError::new("repair_failed", e.to_string()))?;
+    let download_mode = DownloadMode::parse(&args.common.download_mode)
+        .map_err(|e| EnvelopeError::new("repair_failed", e.to_string()))?;
 
     // `--silent` ("suppress non-error output") must mute the human-readable
     // progress just like `--json` does — otherwise a silent repair still
@@ -907,9 +906,12 @@ mod tests {
     /// True when `env` carries the download / would-download artifact event
     /// (identified by its `details.downloadMode` field, unique to that event).
     fn has_download_event(env: &Envelope) -> bool {
-        env.events
-            .iter()
-            .any(|e| e.details.as_ref().and_then(|d| d.get("downloadMode")).is_some())
+        env.events.iter().any(|e| {
+            e.details
+                .as_ref()
+                .and_then(|d| d.get("downloadMode"))
+                .is_some()
+        })
     }
 
     /// Regression for the offline + dry-run leak: with `--offline` set, the

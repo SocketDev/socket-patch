@@ -2136,10 +2136,7 @@ async fn run_vendor(
             // The shared manifest-load mapping (#931): `manifest_invalid`
             // for unparseable JSON / a schema violation, else
             // `manifest_unreadable`.
-            env.mark_error(crate::json_envelope::manifest_load_error(
-                manifest_path,
-                &e,
-            ));
+            env.mark_error(crate::json_envelope::manifest_load_error(manifest_path, &e));
             if !common.json {
                 eprintln!("Error: Could not read manifest: {e}");
             }

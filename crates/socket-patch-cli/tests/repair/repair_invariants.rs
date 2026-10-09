@@ -761,7 +761,10 @@ fn repair_deletes_lock_file_even_when_repair_fails() {
     std::fs::write(socket.join("apply.lock"), b"leftover").expect("stage stale lock");
 
     let (code, stdout) = run_repair(tmp.path(), &[]);
-    assert_eq!(code, 1, "expected manifest_invalid exit 1; stdout=\n{stdout}");
+    assert_eq!(
+        code, 1,
+        "expected manifest_invalid exit 1; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
     assert_eq!(v["error"]["code"], "manifest_invalid");
     assert!(

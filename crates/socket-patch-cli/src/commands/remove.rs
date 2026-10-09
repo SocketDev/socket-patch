@@ -1128,17 +1128,16 @@ pub async fn run(args: RemoveArgs) -> i32 {
         for ev in vendor_skipped {
             env.record(ev);
         }
-        env.warnings
-            .extend(
-                rollback_warnings
-                    .iter()
-                    .chain(&hosted_leg_warnings)
-                    .chain(&cleanup_warnings)
-                    .map(|(code, detail)| crate::json_envelope::RunWarning {
-                        code: code.clone(),
-                        detail: detail.clone(),
-                    }),
-            );
+        env.warnings.extend(
+            rollback_warnings
+                .iter()
+                .chain(&hosted_leg_warnings)
+                .chain(&cleanup_warnings)
+                .map(|(code, detail)| crate::json_envelope::RunWarning {
+                    code: code.clone(),
+                    detail: detail.clone(),
+                }),
+        );
         // The in-place restores ran before the manifest mutation.
         for ev in rolled_back_events {
             env.record(ev);

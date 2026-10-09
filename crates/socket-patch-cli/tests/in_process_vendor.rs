@@ -2389,6 +2389,7 @@ async fn remove_reverts_vendoring() {
     assert_eq!(env["status"], "success");
     let reverted = find_event(&env, "removed", Some("vendor_reverted"));
     assert_eq!(reverted["purl"], PURL);
+    assert_eq!(reverted["details"]["mode"], "vendored", "{env:#}");
     assert_eq!(
         env["summary"]["removed"], 1,
         "summary.removed counts manifest entries only: {env:#}"
@@ -2492,6 +2493,7 @@ async fn remove_detached_only_purl_reverts() {
     assert_eq!(env["status"], "success");
     let reverted = find_event(&env, "removed", Some("vendor_reverted"));
     assert_eq!(reverted["purl"], PURL);
+    assert_eq!(reverted["details"]["mode"], "vendored", "{env:#}");
     assert_eq!(env["summary"]["removed"], 1, "{env:#}");
 
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
