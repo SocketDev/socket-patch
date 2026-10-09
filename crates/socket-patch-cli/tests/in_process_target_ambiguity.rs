@@ -210,7 +210,6 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
             api_token: Some("fake-token-for-tests".to_string()),
             api_url: Some(api_url),
             json: true,
-            download_mode: "diff".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         identifier: identifier.to_string(),
