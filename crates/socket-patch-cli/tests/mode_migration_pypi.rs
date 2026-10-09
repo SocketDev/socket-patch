@@ -1332,9 +1332,18 @@ async fn ledger_update_failure_changes_nothing() {
     set_mode(0o755);
     assert_eq!(code, 1, "{env:#}");
     assert_eq!(env["status"], "error", "{env:#}");
-    assert!(!env.to_string().contains("redirect_takeover_unpatched"), "{env:#}");
-    assert_eq!(std::fs::read(root.join("requirements.txt")).unwrap(), vendored);
-    assert_eq!(std::fs::read(root.join(".socket/vendor/state.json")).unwrap(), state);
+    assert!(
+        !env.to_string().contains("redirect_takeover_unpatched"),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("requirements.txt")).unwrap(),
+        vendored
+    );
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        state
+    );
     assert!(root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
 }
 
