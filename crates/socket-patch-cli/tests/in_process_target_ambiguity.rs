@@ -1,7 +1,8 @@
 //! The shared target grammar on the verbs that act on one package per
 //! name: `get`, `remove` and `rollback` refuse a bare name whose
 //! last-segment rule reaches several packages (`core` → `@angular/core`
-//! and `@babel/core`), a Go major-version suffix (`v2`) is never a name,
+//! and `@babel/core`) or whose case-insensitive rule reaches case-distinct
+//! ones (`jsonstream` → `JSONStream` and `jsonstream`), a Go major-version suffix (`v2`) is never a name,
 //! and `rollback` treats a slash-containing package name (composer
 //! `vendor/pkg`) as a target before it treats it as a path glob.
 //!
@@ -139,6 +140,58 @@ async fn remove_never_treats_a_go_major_suffix_as_a_name() {
     let after = read_manifest(tmp.path());
     assert!(!after.contains("github.com/x/y/v2"), "{after}");
     assert!(after.contains("github.com/x/z/v2"), "{after}");
+}
+
+/// npm's legacy `JSONStream` and `jsonstream` are two packages (#1292).
+const JSONSTREAM_UPPER: (&str, &str) = (
+    "pkg:npm/JSONStream@1.3.5",
+    "f6f6f6f6-0000-4000-8000-000000000006",
+);
+const JSONSTREAM_LOWER: (&str, &str) = (
+    "pkg:npm/jsonstream@0.0.1",
+    "a7a7a7a7-0000-4000-8000-000000000007",
+);
+
+#[tokio::test]
+#[serial]
+async fn remove_never_reaches_a_case_distinct_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let before = write_manifest(tmp.path(), &[JSONSTREAM_UPPER, JSONSTREAM_LOWER]);
+    // A lowercase name reaching both is ambiguous: nothing removed.
+    assert_eq!(remove_run(remove_args(tmp.path(), "jsonstream")).await, 1);
+    assert_eq!(read_manifest(tmp.path()), before, "nothing may be removed");
+
+    // A versionless purl selects its own spelling only.
+    assert_eq!(
+        remove_run(remove_args(tmp.path(), "pkg:npm/jsonstream")).await,
+        0
+    );
+    let after = read_manifest(tmp.path());
+    assert!(after.contains("pkg:npm/JSONStream@1.3.5"), "{after}");
+    assert!(!after.contains("pkg:npm/jsonstream@0.0.1"), "{after}");
+
+    // An exact-case name settles on that package.
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), &[JSONSTREAM_UPPER, JSONSTREAM_LOWER]);
+    assert_eq!(remove_run(remove_args(tmp.path(), "JSONStream")).await, 0);
+    let after = read_manifest(tmp.path());
+    assert!(!after.contains("pkg:npm/JSONStream@1.3.5"), "{after}");
+    assert!(after.contains("pkg:npm/jsonstream@0.0.1"), "{after}");
+}
+
+#[tokio::test]
+#[serial]
+async fn rollback_refuses_a_lowercase_name_reaching_case_distinct_packages() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), &[JSONSTREAM_UPPER, JSONSTREAM_LOWER]);
+    assert_eq!(
+        rollback_run(rollback_args(tmp.path(), &["jsonstream"])).await,
+        1
+    );
+    assert_eq!(
+        rollback_run(rollback_args(tmp.path(), &["pkg:npm/jsonstream"])).await,
+        0
+    );
 }
 
 #[tokio::test]
