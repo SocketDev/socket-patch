@@ -10,8 +10,11 @@
 //! shapes) produces the vendored lock + `.socket/vendor/state.json` entry;
 //! the hosted API is wiremock (`in_process_redirect_pnpm.rs` shapes).
 
+#[path = "common/envelope.rs"]
+mod envelope;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
+use envelope::codes_in;
 
 use std::path::Path;
 
@@ -328,13 +331,6 @@ fn rewritten_files(doc: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-fn warning_codes(doc: &Value) -> Vec<&str> {
-    doc["redirect"]["warnings"]
-        .as_array()
-        .map(|w| w.iter().filter_map(|e| e["code"].as_str()).collect())
-        .unwrap_or_default()
-}
-
 /// The dry-run preview must match the wet run's takeover outcome: the
 /// vendored purl counts as `redirected` (the wet run reverts its vendored
 /// state, then redirects), the `redirect_would_revert_vendored` warning
@@ -363,15 +359,15 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
     );
     assert_eq!(doc["redirect"]["dryRun"], true, "envelope: {doc:#}");
 
-    let codes = warning_codes(&doc);
+    let codes = codes_in(&doc["redirect"]["warnings"]);
     assert!(
-        codes.contains(&"redirect_would_revert_vendored"),
+        codes.iter().any(|c| c == "redirect_would_revert_vendored"),
         "the takeover plan must be announced: {doc:#}"
     );
     // Previewing against the still-vendored lock would refuse it,
     // contradicting the takeover warning above.
     assert!(
-        !codes.contains(&"redirect_pnpm_entry_vendored"),
+        !codes.iter().any(|c| c == "redirect_pnpm_entry_vendored"),
         "the dry-run must not also tell the user to run `vendor --revert` \
          for a purl this run just promised to revert itself: {doc:#}"
     );
@@ -480,13 +476,13 @@ async fn dry_run_refuses_unrevertable_vendored_state_like_the_wet_run() {
     let (code, doc) = scan_hosted_json(root, &server.uri(), /*dry_run=*/ true);
     assert_eq!(code, 0, "dry-run scan --mode hosted must succeed: {doc:#}");
 
-    let codes = warning_codes(&doc);
+    let codes = codes_in(&doc["redirect"]["warnings"]);
     assert!(
-        codes.contains(&"redirect_vendored_revert_failed"),
+        codes.iter().any(|c| c == "redirect_vendored_revert_failed"),
         "the unrevertable state must be refused in the preview too: {doc:#}"
     );
     assert!(
-        !codes.contains(&"redirect_would_revert_vendored"),
+        !codes.iter().any(|c| c == "redirect_would_revert_vendored"),
         "a refused purl must not also be promised a takeover: {doc:#}"
     );
     assert!(
@@ -659,7 +655,9 @@ async fn dry_run_package_lock_takeover_previews_the_npmrc_write() {
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(tree_snapshot(root), vendored_tree, "dry run writes nothing");
     assert!(
-        warning_codes(&doc).contains(&"redirect_would_revert_vendored"),
+        codes_in(&doc["redirect"]["warnings"])
+            .iter()
+            .any(|c| c == "redirect_would_revert_vendored"),
         "{doc:#}"
     );
     assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");

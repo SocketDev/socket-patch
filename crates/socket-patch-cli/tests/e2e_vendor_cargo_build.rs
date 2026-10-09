@@ -81,7 +81,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -274,11 +274,6 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
     )
     .unwrap();
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
-}
-
-fn parse_envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("vendor --json output is not JSON: {e}\nstdout:\n{stdout}"))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
@@ -638,7 +633,7 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
     // summary.applied / the event action are pinned by
@@ -871,7 +866,7 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
     assert_eq!(
@@ -931,7 +926,7 @@ fn cargo_vendor_reports_applied_event() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(
         env["summary"]["applied"], 1,
         "a successful first-time vendor must count as applied: {env}"
@@ -1041,7 +1036,7 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
         code, 0,
         "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["found"], 1, "envelope: {env}");
     assert_eq!(env["downloaded"], 1, "envelope: {env}");
@@ -1215,7 +1210,7 @@ fn vendor_ok(proj: &Path, cargo_home: &Path, tag: &str) -> serde_json::Value {
         code, 0,
         "{tag}: vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    parse_envelope(&stdout)
+    parse_json_envelope(&stdout)
 }
 
 fn revert_ok(proj: &Path, cargo_home: &Path, tag: &str) {

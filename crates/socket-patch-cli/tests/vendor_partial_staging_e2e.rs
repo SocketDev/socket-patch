@@ -1,6 +1,9 @@
 //! Vendoring consumes immutable service artifacts without downloading patch blobs.
+#[path = "common/envelope.rs"]
+mod envelope;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
+use envelope::events;
 use std::path::Path;
 use std::process::Command;
 
@@ -184,10 +187,6 @@ fn vendor_cli_with_source(root: &Path, api_url: &str, source: &str) -> (i32, Val
         panic!("vendor --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
     });
     (out.status.code().unwrap_or(-1), env, stderr)
-}
-
-fn events(env: &Value) -> &Vec<Value> {
-    env["events"].as_array().expect("events array")
 }
 
 fn event_for<'a>(env: &'a Value, purl: &str) -> &'a Value {

@@ -38,6 +38,12 @@ pub mod hermetic;
 
 pub use hermetic::command as hermetic_command;
 
+/// Readers for the `--json` envelope (parse, `events[]`, error and warning
+/// codes).
+pub mod envelope;
+
+pub use envelope::{envelope_error_code, envelope_error_message, json_string, parse_json_envelope};
+
 // ── Binary discovery + invocation ─────────────────────────────────────
 
 /// Absolute path to the built `socket-patch` binary that cargo
@@ -391,36 +397,6 @@ pub fn write_blob(socket_dir: &Path, hash: &str, content: &[u8]) {
     let blobs = socket_dir.join("blobs");
     std::fs::create_dir_all(&blobs).expect("create .socket/blobs");
     std::fs::write(blobs.join(hash), content).expect("write blob");
-}
-
-/// Parse `--json` apply output, returning the top-level JSON object
-/// or panicking with the raw text on parse failure. Most safety tests
-/// want to assert on specific fields (`errorCode`, `status`, etc.).
-pub fn parse_json_envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("failed to parse JSON envelope: {e}\nstdout:\n{stdout}"))
-}
-
-/// Extract a stringified field from a parsed JSON envelope, or None
-/// if the field is missing / not a string. Convenience for the
-/// `status` checks the safety tests do repeatedly.
-pub fn json_string<'a>(env: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    env.get(key).and_then(|v| v.as_str())
-}
-
-/// Extract `env.error.code` from a parsed envelope. The v3.0
-/// envelope shape nests the error under a top-level `error` object
-/// (`{"error": {"code": "lock_held", "message": "..."}}`), not at
-/// the top level. This helper centralises that lookup so individual
-/// tests can stay terse.
-pub fn envelope_error_code(env: &serde_json::Value) -> Option<&str> {
-    env.get("error")?.get("code")?.as_str()
-}
-
-/// Extract `env.error.message` from a parsed envelope. Companion to
-/// [`envelope_error_code`].
-pub fn envelope_error_message(env: &serde_json::Value) -> Option<&str> {
-    env.get("error")?.get("message")?.as_str()
 }
 
 /// Map a slice of `(env-var-name, env-var-value)` tuples into a

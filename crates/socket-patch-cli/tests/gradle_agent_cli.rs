@@ -13,6 +13,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
+use common::envelope::codes_in;
 use common::git_sha256;
 
 #[path = "common/hermetic.rs"]
@@ -348,20 +349,10 @@ struct Out {
 
 impl Out {
     fn warning_codes(&self) -> Vec<String> {
-        let mut codes: Vec<String> = self.json["warnings"]
-            .as_array()
+        [&self.json["warnings"], &self.json["vex"]["warnings"]]
             .into_iter()
-            .flatten()
-            .filter_map(|w| w["code"].as_str().map(str::to_string))
-            .collect();
-        codes.extend(
-            self.json["vex"]["warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|w| w["code"].as_str().map(str::to_string)),
-        );
-        codes
+            .flat_map(codes_in)
+            .collect()
     }
 
     fn ok(&self) -> &Self {
