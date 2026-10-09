@@ -4,6 +4,8 @@ ci.yml is the one matching change and its vlt cells are untouched."""
 import contextlib
 import importlib.util
 import io
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -71,6 +73,66 @@ class Decision(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             gate.main(["--event", "pull_request", "--base", "0" * 40])
         self.assertEqual(out.getvalue().split(), ["matrix=true"])
+
+
+class ChangedPaths(unittest.TestCase):
+    """main() on real commits: odd file names and renames still match."""
+
+    def commit_pair(self, before, after):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+
+        def run(*args):
+            return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+
+        def write(files):
+            for name, body in files.items():
+                path = repo / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body, encoding="utf-8")
+
+        run("init", "-q")
+        run("config", "user.email", "t@example.com")
+        run("config", "user.name", "t")
+        write(before)
+        run("add", "-A")
+        run("commit", "-qm", "base")
+        base = run("rev-parse", "HEAD")
+        for name in [n for n in before if n not in after]:
+            run("rm", "-q", name)
+        write(after)
+        run("add", "-A")
+        run("commit", "-qm", "head")
+        return repo, base
+
+    def decide(self, before, after):
+        repo, base = self.commit_pair(before, after)
+        out = io.StringIO()
+        old_repo = gate.REPO
+        gate.REPO = repo
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                gate.main(["--event", "pull_request", "--base", base])
+        finally:
+            gate.REPO = old_repo
+        return out.getvalue().split()
+
+    def base_tree(self):
+        return {CI_PATH: CI, "scripts/check-vlt-legs.py": "x\n"}
+
+    def test_inert_ci_yml_edit_skips(self):
+        after = dict(self.base_tree(), **{CI_PATH: CI + "\n# unrelated\n"})
+        self.assertEqual(self.decide(self.base_tree(), after), ["matrix=false"])
+
+    def test_odd_names_and_renames_still_run(self):
+        for name in ("crates/socket-patch-cli/tests/a vlt b.rs",
+                     "crates/socket-patch-cli/tests/\u00e9vlt.rs"):
+            after = dict(self.base_tree(), **{CI_PATH: CI + "\n# unrelated\n", name: "x\n"})
+            self.assertEqual(self.decide(self.base_tree(), after), ["matrix=true"], name)
+        moved = {CI_PATH: CI + "\n# unrelated\n", "scripts/elsewhere.py": "x\n"}
+        self.assertEqual(self.decide(self.base_tree(), moved), ["matrix=true"])
 
 
 class Workflow(unittest.TestCase):

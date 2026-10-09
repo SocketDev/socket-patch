@@ -20,6 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "vlt-compatibility.yml"
+REPO = ROOT  # where git runs; the tests point it at a scratch repository
 CI_PATH = ".github/workflows/ci.yml"
 
 
@@ -69,7 +70,7 @@ def ci_cells(text):
 
 
 def git(*args):
-    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True, check=True).stdout
 
 
 def needs_matrix(event, changed, filters, base_ci, head_ci):
@@ -92,7 +93,10 @@ def main(argv=None):
     matrix = True
     if args.event in ("pull_request", "push") and args.base:
         try:
-            changed = git("diff", "--name-only", args.base, args.head).split()
+            # NUL-separated paths are never quoted or split on spaces; with
+            # --no-renames a moved file lists both its old and new path.
+            out = git("diff", "-z", "--name-only", "--no-renames", args.base, args.head)
+            changed = [p for p in out.split("\0") if p]
             filters = event_paths(WORKFLOW.read_text(encoding="utf-8"), args.event)
             base_ci = git("show", f"{args.base}:{CI_PATH}")
             head_ci = git("show", f"{args.head}:{CI_PATH}")
