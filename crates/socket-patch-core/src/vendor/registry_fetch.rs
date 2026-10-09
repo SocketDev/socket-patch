@@ -45,7 +45,7 @@ pub type RegistryClient = reqwest::Client;
 pub fn build_registry_client() -> RegistryClient {
     registry_client_builder(USER_AGENT)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("failed to build registry HTTP client")
 }
 
 /// The one builder behind every registry client (npm-family, PyPI, Go,
@@ -55,7 +55,7 @@ pub fn build_registry_client() -> RegistryClient {
 /// artifact that keeps streaming is never cut off while a stalled host
 /// still fails the fetch.
 pub(crate) fn registry_client_builder(user_agent: &str) -> reqwest::ClientBuilder {
-    registry_timeouts().apply(reqwest::Client::builder().user_agent(user_agent))
+    registry_timeouts().apply(crate::utils::http::client_builder().user_agent(user_agent))
 }
 
 fn registry_timeouts() -> ApiTimeouts {
