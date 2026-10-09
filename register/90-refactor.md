@@ -1,9 +1,7 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T21:57Z · main @ 9c00b54_
+_Last updated 2026-10-09T23:12Z · main @ 43af719_
 
 **In flight:**
-- [#1370](https://github.com/SocketDev/socket-patch/pull/1370): #782 slice (#801 scope): dead `lock_inventory/wired.rs` (`wired_vendor_integrity`) and its tests deleted. E41. +3/−224 prod, +4/−256 tests. `state: ready`.
-- [#1366](https://github.com/SocketDev/socket-patch/pull/1366): #824 children 2–3 slice 3: 5 more test files use `tests/common` `binary()`/`git_sha256` (`vendor_ecosystem_fixtures` includers take `mod common`). C30. +0/−0 prod, +24/−50 tests. `state: ready`.
 - [#1358](https://github.com/SocketDev/socket-patch/pull/1358): scala-cli Bloop evidence fails closed on an oversized, unreadable or non-Bloop project file, the sbt reader's policy; skip branches deleted. Fixes #1270 (E95). +23/−6 prod, +87/−1 tests. `state: ready`.
 - [#1188](https://github.com/SocketDev/socket-patch/pull/1188): one `Pipfile.lock` writer (`formats::pipenv::splice_entry`). #1128 (E14). +303/−235 prod. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
@@ -15,7 +13,7 @@ _Last updated 2026-10-09T21:57Z · main @ 9c00b54_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #782 E41 (#801 scope): delete dead `lock_inventory/wired.rs` | 0 | 0 | ≈2.3 | L | ≈4.6 | **taken: #1370** |
+| 1 | #782 E41 (#801 scope): delete dead `lock_inventory/wired.rs` | 0 | 0 | ≈2.3 | L | ≈4.6 | merged (#1370) |
 | 2 | #931 + #998 + #1063 + #1123: one manifest load + error mapper | 4 | 1 | ≈6 | M | ≈24 | skipped: `apply.rs`, `vendor.rs`, `repair.rs` (#1049, #1273, #1345, #1357, #1369 …) |
 | 3 | #1365 (E96): one requirements.txt exact-pin grammar | 1 | 1 | ≈2.5 | M | ≈6 | skipped: `redirect/requirements.rs` (#1333, #1279), `vendor/pypi_requirements.rs` (#1309, #1279) |
 | 4 | #824 child 4: `oracle_support` and `npm_crawler/oracle` xorshift onto `test_rng::Rng` | 0 | 0 | 2 | L | 4 | free |

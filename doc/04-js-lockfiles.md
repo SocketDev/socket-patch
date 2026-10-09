@@ -33,7 +33,7 @@ _Last checked against main @ 9ab72d4 on 2026-10-09 by audit-ecosystems (the E17 
 | **bun.lockb (binary)** | `bun_lockb.rs` 1663/591; `bun_binary.rs` 664/351; `bun_workspace.rs` 184/199; `redirect/bun_binary.rs` 108/61; `upstream/bun_lockb.rs` 152/229 | **2,771** | **1,431** | 1,574 |
 | **vlt** | `vlt_lock.rs` 2080/2032; `vlt_lock_text.rs` 1008/1540; `npm_dir.rs` 910/319; `redirect/vlt.rs` 676/313; `vlt_heal.rs` 542/573; `vlt_preflight.rs` 233/302; `hosted/vlt.rs` 217; `upstream/vlt.rs` 328/268; inventory 165; vex 392/794 | **6,551** | **6,141** | ~9.3K (10 files + 3 shared dirs) |
 
-Shared npm-family infrastructure adds `npm_common.rs` 613/832, `npm_flavor.rs` 707/1338 and about 1.8K lines in `lock_inventory/{mod,view,wired,recover,npm_family}`.
+Shared npm-family infrastructure adds `npm_common.rs` 613/832, `npm_flavor.rs` 707/1338 and about 1.6K lines in `lock_inventory/{mod,view,recover,npm_family}` (`wired.rs` deleted, #1370).
 
 `crawlers/npm_crawler/oracle.rs` (1,846 lines) is **entirely test code**: a verbatim copy of the old crawler, kept as an equivalence oracle (`oracle.rs:1-5`). It has done its job and can be retired.
 

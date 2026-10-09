@@ -237,7 +237,7 @@ Several patterns show code that outlived its purpose:
 - **Parity suites** that exist only because two orchestrators exist.
 - **Covgap tests:** 402 tests (26.9K lines), 136 of them asserting human text.
 - **Exact-sentence assertions:** 328 of them. The output-polish PR touched 65 test files.
-- **Dead flags and vestigial abstractions:** `--vendor-source` (one valid value), `VendorSource`/`PackageSource` (one variant each), `PatchSources::mem_blobs` (never `Some`; {{C23}}), `lock_inventory/wired.rs` (no production caller), pre-v5 redirect-ledger readers.
+- **Dead flags and vestigial abstractions:** `--vendor-source` (one valid value), `VendorSource`/`PackageSource` (one variant each), `PatchSources::mem_blobs` (never `Some`; {{C23}}), `PnpmLock::wired_integrity` (no production caller since `lock_inventory/wired.rs` was deleted, #1370), pre-v5 redirect-ledger readers.
 - **History in reference docs:** 177 `v5.0` annotations in the contract.
 - **Very large squash merges:** +53K, +85K and +94K lines.
 

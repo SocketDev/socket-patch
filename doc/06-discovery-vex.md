@@ -87,7 +87,7 @@ Across the repo that is **eight hand-rolled XML scanners**, 4–5 independent wa
 - **Test RNG.** xorshift is implemented four times.
 
 **Dead code:**
-- `lock_inventory/wired.rs` (`wired_vendor_integrity`, 221 production lines) has **no production caller** (verified); only tests use it. That matches the v5 migration note "`repair` no longer reconstructs a missing ledger from lockfiles". The module docs at `lock_inventory/mod.rs:13-15` are stale. Its only consumer, `formats::pnpm::PnpmLock::wired_integrity`, is dead with it, and it imports `vex::discover` (a `vendor` → `vex` edge). {{E41}}
+- `lock_inventory/wired.rs` (`wired_vendor_integrity`), which had no production caller, was deleted with its tests (#1370), and with it the `vendor` → `vex` import it carried. Its only consumer, `formats::pnpm::PnpmLock::wired_integrity`, is now dead too; it and the stale `"wired_vendor_integrity("` needle in `vex/discover/mod.rs`'s forbidden-reader guard remain. {{E41}}
 - `vex/discover/deno.rs` is an empty extractor, by design: its module doc keeps per-ecosystem coverage explicit. Not a defect.
 
 ### 6.5 VEX design
