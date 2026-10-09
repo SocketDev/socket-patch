@@ -1,7 +1,7 @@
 //! End-to-end tests for the npm patch lifecycle.
 //!
 //! These tests exercise the full CLI against the real Socket API, using the
-//! **minimist@1.2.2** patch (UUID `80630680-4da6-45f9-bba8-b888e0ffd58c`),
+//! **minimist@1.2.2** patch (UUID `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb`),
 //! which fixes CVE-2021-44906 (Prototype Pollution).
 //!
 //! # Prerequisites
@@ -26,14 +26,14 @@ use common::cache_env;
 // Constants
 // ---------------------------------------------------------------------------
 
-const NPM_UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+const NPM_UUID: &str = "642d7f02-ebc1-4ab0-99e2-07f5dd8463cb";
 const NPM_PURL: &str = "pkg:npm/minimist@1.2.2";
 
 /// Git SHA-256 of the *unpatched* `index.js` shipped with minimist 1.2.2.
 const BEFORE_HASH: &str = "311f1e893e6eac502693fad8617dcf5353a043ccc0f7b4ba9fe385e838b67a10";
 
 /// Git SHA-256 of the *patched* `index.js` after the security fix.
-const AFTER_HASH: &str = "043f04d19e884aa5f8371428718d2a3f27a0d231afe77a2620ac6312f80aaa28";
+const AFTER_HASH: &str = "ec956dcafb886f14315570bf3981d44aa12c561716abb46eed8b067aaa1f6bdf";
 
 // ---------------------------------------------------------------------------
 // Helpers

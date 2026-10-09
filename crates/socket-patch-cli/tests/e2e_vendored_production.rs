@@ -49,7 +49,7 @@
 //!
 //! | Ecosystem | PURL | Patch UUID | Marker in the patched bytes |
 //! |-----------|------|------------|-----------------------------|
-//! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
+//! | npm    | `pkg:npm/minimist@1.2.2`        | `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb` | `Socket Community Patch` header |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | `Socket Community Patch` header |
 //! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_PATCHES`]               | `Socket Community Patch` header |
 //!
@@ -137,7 +137,7 @@ const PROXY: &str = "https://patches-api.socket.dev";
 const NPM_PURL: &str = "pkg:npm/minimist@1.2.2";
 const NPM_NAME: &str = "minimist";
 const NPM_VERSION: &str = "1.2.2";
-const NPM_UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+const NPM_UUID: &str = "642d7f02-ebc1-4ab0-99e2-07f5dd8463cb";
 
 const PYPI_PURL: &str = "pkg:pypi/urllib3@1.26.18";
 const PYPI_NAME: &str = "urllib3";
