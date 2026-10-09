@@ -904,7 +904,6 @@ mod tests {
                 base,
                 &files,
                 &sources,
-                None,
                 false,
                 MismatchPolicy::Warn,
             )
