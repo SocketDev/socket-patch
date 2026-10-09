@@ -2176,32 +2176,34 @@ mod tests {
         );
     }
 
-    /// `vendor --force` keeps its missing-file tolerance (strict superset
-    /// of the auto-force policy).
+    /// Vendoring ignores the installed copy's content: a missing patch
+    /// target vendors the same with or without `force` (#923).
     #[tokio::test]
-    async fn vendor_force_still_skips_missing_files() {
-        let fx = fixture().await;
-        tokio::fs::remove_file(fx.installed().join("index.js"))
-            .await
-            .unwrap();
+    async fn vendor_ignores_missing_installed_files_with_or_without_force() {
+        for force in [false, true] {
+            let fx = fixture().await;
+            tokio::fs::remove_file(fx.installed().join("index.js"))
+                .await
+                .unwrap();
 
-        let blobs = fx.root().join(".socket/blobs");
-        let sources = PatchSources::blobs_only(&blobs);
-        let outcome = crate::vendor::test_support::vendor_npm(
-            &fx.purl(),
-            &fx.installed(),
-            fx.root(),
-            &fx.record,
-            &sources,
-            "2026-06-09T00:00:00Z",
-            false,
-            /*force=*/ true,
-            None,
-        )
-        .await;
-        let (result, entry, _) = expect_done(outcome);
-        assert!(result.success, "{:?}", result.error);
-        assert!(entry.is_some());
+            let blobs = fx.root().join(".socket/blobs");
+            let sources = PatchSources::blobs_only(&blobs);
+            let outcome = crate::vendor::test_support::vendor_npm(
+                &fx.purl(),
+                &fx.installed(),
+                fx.root(),
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                force,
+                None,
+            )
+            .await;
+            let (result, entry, _) = expect_done(outcome);
+            assert!(result.success, "force={force}: {:?}", result.error);
+            assert!(entry.is_some(), "force={force}");
+        }
     }
 
     /// A package already patched IN PLACE by `apply` vendors cleanly: the
