@@ -817,7 +817,11 @@ worse, lets a warm cache silently serve unpatched bytes):
   whole-file wiring cannot tell a converged fragment from a drifted one, keep the artifact exactly
   while the live `composer.lock` / `pom.xml` / `nuget.config` still names its
   `.socket/vendor/<eco>/<uuid>` dir — a file that no longer references it is warned about and the
-  artifact removed; in the npm family (npm, yarn classic and berry, pnpm, bun) a recorded lock entry
+  artifact removed; nuget (v5.0, #537) compares `nuget.config` line-ending-insensitively, so a
+  `core.autocrlf` checkout of the file vendor wrote is not drift (the original is restored in the
+  checkout's line endings), and while `nuget.config` is drift-kept the `packages.lock.json` pin is
+  kept too (`vendor_lock_entry_drifted`), never reverted under a config that still routes the id to
+  the vendored feed; in the npm family (npm, yarn classic and berry, pnpm, bun) a recorded lock entry
   that no longer exists at all — the user removed the dependency — is not drift: it warns
   `vendor_lock_entry_removed` and the artifact and entry are kept unless every wired file that exists
   was read and none mentions the uuid in any spelling (an unreadable lock keeps them), so `rollback` / `remove` / `scan --prune` clean up
