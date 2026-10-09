@@ -242,9 +242,9 @@ fn remove_rollback_downloads_missing_blob_via_flag_overrides() {
     // The blob's on-disk lifecycle: it must have LANDED in .socket/blobs for
     // remove to proceed (the post-download `still_missing` re-check reads the
     // dir; exit 0 below is unreachable otherwise), and then remove's
-    // unused-blob sweep deletes it again — beforeHash blobs are by design
-    // downloaded on-demand and never retained (`cleanup_unused_blobs` keeps
-    // only afterHash blobs, and this patch was just removed anyway).
+    // unused-blob sweep deletes it again — this patch was just removed (and
+    // rolled back), so nothing references its original any more; only the
+    // blobs of patches still in the manifest are retained.
     assert!(
         !socket.join("blobs").join(&before_hash).exists(),
         "remove's unused-blob sweep must not retain the on-demand before-blob.\n\

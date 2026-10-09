@@ -633,7 +633,7 @@ async fn repair_inner(
     // summary prints once all three passes are in, so "nothing to clean
     // up" is only said when all three really are empty.
     if let (false, Some(manifest)) = (args.download_only, manifest.as_ref()) {
-        let sweep = ArtifactReferences::for_apply(manifest)
+        let sweep = ArtifactReferences::active(manifest)
             .sweep(&socket_dir, args.common.dry_run)
             .await;
         let passes = [
