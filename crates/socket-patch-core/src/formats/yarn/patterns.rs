@@ -66,12 +66,38 @@ pub(crate) fn split_pattern(pattern: &str) -> Option<(&str, &str)> {
     Some((name, range))
 }
 
+/// Split a classic key pattern `name@range` like [`split_pattern`], but
+/// keep an EMPTY range (#1271): `""` is valid npm semver (the same as `*`),
+/// and yarn 1 locks `"left-pad": ""` under `left-pad@:` — merged with other
+/// ranges as `left-pad@, left-pad@^1.3.0:`. Berry never writes a rangeless
+/// descriptor (its ranges carry a protocol), so the berry readers keep the
+/// strict [`split_pattern`] and treat `name@` as malformed.
+pub(crate) fn split_classic_pattern(pattern: &str) -> Option<(&str, &str)> {
+    let from = usize::from(pattern.starts_with('@'));
+    let at = pattern[from..].find('@')? + from;
+    let (name, range) = (&pattern[..at], &pattern[at + 1..]);
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, range))
+}
+
 /// The real package a key pattern stands for: its name, unless the range is
 /// an `npm:` alias — then the aliased target's name.
 pub(crate) fn pattern_real_name(pattern: &str) -> Option<&str> {
-    let (name, range) = split_pattern(pattern)?;
+    real_name_with(pattern, split_pattern)
+}
+
+/// [`pattern_real_name`] over the classic grammar ([`split_classic_pattern`]):
+/// a rangeless `left-pad@` stands for `left-pad`.
+pub(crate) fn classic_pattern_real_name(pattern: &str) -> Option<&str> {
+    real_name_with(pattern, split_classic_pattern)
+}
+
+fn real_name_with(pattern: &str, split: fn(&str) -> Option<(&str, &str)>) -> Option<&str> {
+    let (name, range) = split(pattern)?;
     if let Some(aliased) = range.strip_prefix("npm:") {
-        return match split_pattern(aliased) {
+        return match split(aliased) {
             Some((real, _)) => Some(real),
             None => Some(aliased), // `npm:left-pad` with no range
         };
@@ -80,10 +106,10 @@ pub(crate) fn pattern_real_name(pattern: &str) -> Option<&str> {
 }
 
 /// The one real package EVERY pattern of a classic key stands for
-/// ([`pattern_real_name`]): `None` when there is no pattern, one does not
-/// parse, or they name different packages.
+/// ([`classic_pattern_real_name`]): `None` when there is no pattern, one
+/// does not parse, or they name different packages.
 pub(crate) fn classic_key_real_name(patterns: &[String]) -> Option<&str> {
-    let mut names = patterns.iter().map(|p| pattern_real_name(p));
+    let mut names = patterns.iter().map(|p| classic_pattern_real_name(p));
     let first = names.next()??;
     names.all(|n| n == Some(first)).then_some(first)
 }
@@ -168,6 +194,36 @@ pub(crate) fn berry_npm_alias_target(range: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1271: the classic grammar keeps an empty range (`left-pad@` from
+    /// `"left-pad": ""`); the strict berry grammar still rejects it.
+    #[test]
+    fn classic_patterns_keep_an_empty_range() {
+        assert_eq!(split_classic_pattern("left-pad@"), Some(("left-pad", "")));
+        assert_eq!(
+            split_classic_pattern("@scope/pkg@"),
+            Some(("@scope/pkg", ""))
+        );
+        assert_eq!(
+            split_classic_pattern("left-pad@^1.3.0"),
+            Some(("left-pad", "^1.3.0"))
+        );
+        assert_eq!(split_classic_pattern("@scope/pkg"), None);
+        assert_eq!(split_classic_pattern("left-pad"), None);
+        assert_eq!(split_classic_pattern("@"), None);
+        assert_eq!(split_pattern("left-pad@"), None);
+
+        assert_eq!(classic_pattern_real_name("left-pad@"), Some("left-pad"));
+        assert_eq!(
+            classic_pattern_real_name("lp@npm:left-pad@"),
+            Some("left-pad")
+        );
+        let merged = split_key_patterns("left-pad@, left-pad@^1.3.0");
+        assert_eq!(merged, ["left-pad@", "left-pad@^1.3.0"]);
+        assert_eq!(classic_key_real_name(&merged), Some("left-pad"));
+        let quoted = split_key_patterns("\"@scope/pkg@\", \"@scope/pkg@^1.0.0\"");
+        assert_eq!(classic_key_real_name(&quoted), Some("@scope/pkg"));
+    }
 
     #[test]
     fn resolution_selector_targets() {

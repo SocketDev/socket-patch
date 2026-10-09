@@ -157,8 +157,11 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   those cases requires marker-specific source mappings. Standalone PEP 751
   rewriting selects the exact package version; duplicate entries for the same
   name and version are refused when source selection is ambiguous.
-- Hosted requirements select exact `==`/`===` pins or identifiable archive URLs.
-  Other versions remain unchanged. A bare requirement is rewritten only when
+- Hosted requirements select exact `==`/`===` pins or socket-patch's own
+  hosted archive URLs. A user-authored direct reference to the patched release
+  (`name @ <url>` on any other origin, `files.pythonhosted.org` and `file://`
+  included) is refused with `redirect_requirements_direct_reference` and left
+  unchanged. Other versions remain unchanged. A bare requirement is rewritten only when
   one row and one override version identify the selection. Ranges, wildcard
   pins, opaque URLs, and ambiguous unpinned rows are reported as
   `redirect_requirements_version_ambiguous` and preserved.
