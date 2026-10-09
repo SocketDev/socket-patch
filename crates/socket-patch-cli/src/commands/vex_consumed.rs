@@ -25,7 +25,7 @@
 //! | maven | `<repo>/<g>/<a>/<base>-socket.<hex8>/` (the version the pom or the hosted Gradle wiring pins) in `~/.m2` and every Gradle `files-2.1` holding it (hash dirs expanded), its artifact files matched under the suffixed name | the `<base>` version dir |
 //! | npm | every `node_modules` copy the crawler finds (pnpm and vlt store copies included), every peer / modifier / registry variant of those in the same `.pnpm` / `.vlt` store, alias installs (`node_modules/<alias>` holding the package) in the root's and every workspace member's tree included | — each serves some dependent: ALL must verify |
 //! | pypi | every copy in the crawler's environment set (the project's venvs when it has any, else the interpreters) | — any may be the one that runs the project: ALL must verify |
-//! | gem | every copy in bundler's gem path | — bundler loads whichever `Gem.path` home it hits first: ALL must verify |
+//! | gem | every copy in bundler's gem path; under an explicit or deployment `path` the `gem env` homes hold only default gems bundler loads (#1098) | a non-default gem's `gem env` copy when bundler doesn't use system gems; otherwise bundler loads whichever `Gem.path` home it hits first: ALL must verify |
 //!
 //! composer and nuget have ONE install location shared by every source
 //! (`vendor/`, the global packages folder — which restore reuses whatever
