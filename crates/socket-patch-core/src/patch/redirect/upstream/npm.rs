@@ -2268,9 +2268,12 @@ mod tests {
         let member = ws.join("packages/a");
         let mut view = View::new(&member);
         let prefix = pnpm_settings_prefix(&mut view, "pnpm-lock.yaml").await;
+        // The prefix is shown without Windows' verbatim `\\?\` prefix,
+        // which `canonicalize` added to `ws`.
+        let shown = crate::utils::pnpm_workspace::without_verbatim_prefix(ws.clone());
         assert_eq!(
             prefix,
-            format!("{}{}", ws.display(), std::path::MAIN_SEPARATOR)
+            format!("{}{}", shown.display(), std::path::MAIN_SEPARATOR)
         );
         assert_eq!(
             read_sibling(&mut view, &prefix, ".npmrc").await.as_deref(),
