@@ -57,11 +57,12 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
-        # reads rust-toolchain.toml in the repo root, then installs the
-        # pinned channel + listed components if missing. No third-party
+        # rustup is pre-installed on GitHub-hosted runners. `toolchain
+        # install` with no name reads rust-toolchain.toml in the repo root,
+        # then installs the pinned channel + listed components if missing
+        # (retried past download blips; see the script). No third-party
         # action dependency needed for toolchain setup.
-        run: rustup show
+        run: scripts/rustup-retry.sh toolchain install
 
       - name: Cache cargo
         # Swatinem/rust-cache instead of a raw actions/cache of the whole
@@ -100,7 +101,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        run: rustup show
+        run: scripts/rustup-retry.sh toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -283,11 +284,13 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
-        # reads rust-toolchain.toml in the repo root, then installs the
-        # pinned channel + listed components if missing. No third-party
+        # rustup is pre-installed on GitHub-hosted runners. `toolchain
+        # install` with no name reads rust-toolchain.toml in the repo root,
+        # then installs the pinned channel + listed components if missing
+        # (retried past download blips; see the script). No third-party
         # action dependency needed for toolchain setup.
-        run: rustup show
+        shell: bash
+        run: scripts/rustup-retry.sh toolchain install
 
       - name: Cache cargo
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
@@ -449,11 +452,12 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
-        # reads rust-toolchain.toml in the repo root, then installs the
-        # pinned channel + listed components if missing. No third-party
+        # rustup is pre-installed on GitHub-hosted runners. `toolchain
+        # install` with no name reads rust-toolchain.toml in the repo root,
+        # then installs the pinned channel + listed components if missing
+        # (retried past download blips; see the script). No third-party
         # action dependency needed for toolchain setup.
-        run: rustup show
+        run: scripts/rustup-retry.sh toolchain install
 
       - name: Cache cargo
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
@@ -493,12 +497,12 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        # `rustup show` installs the rust-toolchain.toml channel + listed
-        # components; `rustup component add` adds the llvm-tools-preview
+        # `toolchain install` installs the rust-toolchain.toml channel +
+        # listed components; `component add` adds the llvm-tools-preview
         # bits cargo-llvm-cov needs to merge .profraw files into lcov.
         run: |
-          rustup show
-          rustup component add llvm-tools-preview
+          scripts/rustup-retry.sh toolchain install
+          scripts/rustup-retry.sh component add llvm-tools-preview
 
       - name: Install cargo-llvm-cov
         # taiki-e/install-action ships precompiled binaries — much faster
@@ -676,11 +680,11 @@ jobs:
           driver: docker
 
       - name: Install Rust
-        # `rustup show` consumes rust-toolchain.toml; the explicit
+        # `toolchain install` consumes rust-toolchain.toml; the explicit
         # `component add` covers llvm-tools-preview for cargo-llvm-cov.
         run: |
-          rustup show
-          rustup component add llvm-tools-preview
+          scripts/rustup-retry.sh toolchain install
+          scripts/rustup-retry.sh component add llvm-tools-preview
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
@@ -888,7 +892,8 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        run: rustup show
+        shell: bash
+        run: scripts/rustup-retry.sh toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -1933,7 +1938,7 @@ jobs:
           driver: docker
 
       - name: Install Rust
-        run: rustup show
+        run: scripts/rustup-retry.sh toolchain install
 
       # No `actions/cache` here intentionally. This job builds Docker
       # images and would be flagged by zizmor's cache-poisoning audit.
@@ -2010,7 +2015,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup show
+        run: scripts/rustup-retry.sh toolchain install
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -2057,7 +2062,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup show
+        shell: bash
+        run: scripts/rustup-retry.sh toolchain install
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -2163,7 +2169,8 @@ jobs:
           tar -xf target/e2e-bin.tar -C target/e2e-bin
           rm target/e2e-bin.tar
       - name: Install Rust
-        run: rustup show
+        shell: bash
+        run: scripts/rustup-retry.sh toolchain install
       - name: Install the cargo under test
         # bash, not the Windows default pwsh: in PowerShell
         # "$CARGO_TEST_TOOLCHAIN" is an (unset) PowerShell variable, so the
@@ -2171,7 +2178,7 @@ jobs:
         shell: bash
         env:
           CARGO_TEST_TOOLCHAIN: ${{ matrix.toolchain }}
-        run: rustup toolchain install "$CARGO_TEST_TOOLCHAIN" --profile minimal
+        run: scripts/rustup-retry.sh toolchain install "$CARGO_TEST_TOOLCHAIN" --profile minimal
       - name: Real-cargo hosted/vendored + manifest-less VEX
         # The e2e-build binaries, run from the package root as `cargo test`
         # would (see the e2e job's staging step).
@@ -2286,7 +2293,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup show
+        run: scripts/rustup-retry.sh toolchain install
       - name: Pull the old cargos under test
         run: |
           docker pull rust:1.41-slim
@@ -2392,7 +2399,7 @@ jobs:
 
       - name: Install Rust
         if: steps.gate.outputs.run == 'true'
-        run: rustup show
+        run: scripts/rustup-retry.sh toolchain install
 
       - name: Cache cargo
         if: steps.gate.outputs.run == 'true'
