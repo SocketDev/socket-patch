@@ -32,18 +32,21 @@ use socket_patch_core::utils::target::is_uuid_shaped;
     version,
     propagate_version = true,
     after_help = "Patch a project:\n  \
-        socket-patch scan       Patch every dependency with a patch (hosted: rewrites lockfiles)\n  \
-        socket-patch get        Patch one package, CVE, GHSA or patch UUID\n  \
-        socket-patch list       Show the patches in this project\n\n\
+        socket-patch scan --dry-run   Preview hosted changes from dependency files\n  \
+        socket-patch scan             Write hosted references for dependencies with patches\n  \
+        socket-patch get              Patch one package, CVE, GHSA or patch UUID\n  \
+        socket-patch list             Show the patches in this project\n\n\
+        Supported lockfiles work from a fresh checkout; install dependencies after scanning.\n\n\
         Undo:\n  \
-        socket-patch remove     Unwind one patch (by PURL or UUID)\n  \
-        socket-patch rollback   Unwind every patch\n\n\
+        socket-patch remove           Unwind one patch (by PURL or UUID)\n  \
+        socket-patch rollback         Unwind every patch\n\n\
         Ship:\n  \
-        socket-patch vex        Emit an OpenVEX document for your vulnerability scanner\n  \
-        socket-patch vendor     Eject the patches into .socket/vendor/ for offline installs\n\n\
+        socket-patch vex              Emit an OpenVEX document for your vulnerability scanner\n  \
+        socket-patch vendor           Eject the patches into .socket/vendor/ for offline installs\n\n\
+        Repair artifacts (agent and vendored):\n  \
+        socket-patch repair           Restore missing or corrupt artifacts; clean unused ones\n\n\
         Agent mode (`scan --mode agent` edits installed files in place):\n  \
-        socket-patch apply      Re-apply .socket/manifest.json after each install (e.g. in CI)\n  \
-        socket-patch repair     Restore missing patch artifacts"
+        socket-patch apply            Re-apply .socket/manifest.json after each install (e.g. in CI)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -68,8 +71,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Find patches for installed packages and apply them by rewriting
-    /// lockfiles to Socket-hosted patched packages
+    /// Find patches from project dependency files; write hosted lockfile
+    /// references by default (preview with --dry-run)
+    ///
+    /// Rewrites lockfiles and related dependency files to use Socket-hosted
+    /// patched packages without prompting. Use `scan --dry-run` to preview
+    /// changes without writing them.
+    ///
+    /// Supported lockfiles can be scanned from a fresh checkout before
+    /// installing dependencies. Some workflows require installed packages or
+    /// build-tool resolution records first: agent mode patches installed
+    /// files, and sbt / scala-cli need their build tool's resolution records.
     Scan(commands::scan::ScanArgs),
 
     /// Patch one package, CVE, GHSA or patch UUID (hosted mode by default)
@@ -102,11 +114,12 @@ pub enum Commands {
     /// Agent mode: apply the patches in `.socket/manifest.json` in place
     Apply(commands::apply::ApplyArgs),
 
-    /// Agent mode: download missing patch artifacts and clean up unused ones
+    /// Restore agent or vendored patch artifacts and clean up unused ones
     ///
-    /// Restores missing blobs and diff/package archives, rebuilds missing
-    /// or corrupt vendored artifacts, then deletes the artifacts nothing
-    /// references.
+    /// Downloads missing agent patch data and redownloads missing or corrupt
+    /// vendored artifacts using the existing vendor ledger, then deletes
+    /// unreferenced artifacts. A lost `.socket/vendor/state.json` cannot be
+    /// reconstructed; restore it from version control.
     Repair(commands::repair::RepairArgs),
 
     // Internal parse target of the root `--update` flag (see the rewrite

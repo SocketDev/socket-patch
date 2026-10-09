@@ -202,15 +202,17 @@ fn vendor_and_repair_summaries_read_as_one_line() {
     );
     assert!(
         text.lines().any(|l| l
-            == "  repair    Agent mode: download missing patch artifacts and clean up unused ones"),
+            == "  repair    Restore agent or vendored patch artifacts and clean up unused ones"),
         "{text}"
     );
     let repair = long_help(&["repair"]);
     assert!(
         repair.starts_with(
-            "Agent mode: download missing patch artifacts and clean up unused ones\n\n\
-             Restores missing blobs and diff/package archives, rebuilds missing or corrupt \
-             vendored artifacts, then deletes the artifacts nothing references.\n"
+            "Restore agent or vendored patch artifacts and clean up unused ones\n\n\
+             Downloads missing agent patch data and redownloads missing or corrupt \
+             vendored artifacts using the existing vendor ledger, then deletes \
+             unreferenced artifacts. A lost `.socket/vendor/state.json` cannot be \
+             reconstructed; restore it from version control.\n"
         ),
         "{repair}"
     );
