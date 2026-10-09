@@ -458,15 +458,32 @@ fn test_npm_global_lifecycle() {
     assert_eq!(patches[0]["purl"].as_str().unwrap(), NPM_PURL);
 
     // -- ROLLBACK: restore original file globally ----------------------------
+    // v5.0 rollback is full-state: by default it also drops the rolled-back
+    // manifest records, leaving `apply` nothing to re-apply. This lifecycle
+    // re-applies next, so it rolls back with `--preserve-state`, which
+    // restores the file and keeps the record.
     assert_run_ok(
         cwd,
-        &["rollback", "-g", "--global-prefix", nm_str],
-        "rollback -g",
+        &[
+            "rollback",
+            "-g",
+            "--global-prefix",
+            nm_str,
+            "--preserve-state",
+        ],
+        "rollback -g --preserve-state",
     );
     assert_eq!(
         git_sha256_file(&index_js),
         BEFORE_HASH,
         "index.js should match beforeHash after global rollback"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert_eq!(
+        manifest["patches"][NPM_PURL]["uuid"].as_str(),
+        Some(NPM_UUID),
+        "rollback --preserve-state keeps the manifest record"
     );
 
     // -- APPLY: re-apply from manifest globally ------------------------------
@@ -690,7 +707,11 @@ fn test_npm_macos_global_auto_discovery() {
     );
 }
 
-/// UUID shortcut: `socket-patch <UUID>` should behave like `socket-patch get <UUID>`.
+/// UUID shortcut: `socket-patch <UUID>` behaves like `socket-patch get
+/// <UUID>`. In v5.0 a bare `get` in a lockfile project runs hosted mode: the
+/// lockfile is redirected to the Socket-hosted patched tarball and the
+/// installed tree is left for the next install; `--mode agent` passes
+/// through the shortcut and patches in place, recording the manifest.
 #[test]
 #[ignore]
 fn test_npm_uuid_shortcut() {
@@ -708,28 +729,53 @@ fn test_npm_uuid_shortcut() {
     let index_js = cwd.join("node_modules/minimist/index.js");
     assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
 
-    // Run with bare UUID (no "get" subcommand).
-    assert_run_ok(cwd, &[NPM_UUID], "uuid shortcut");
+    // Bare UUID (no "get" subcommand): hosted mode, like a bare `get`.
+    let (stdout, _) = assert_run_ok(cwd, &[NPM_UUID, "--json"], "uuid shortcut");
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("uuid shortcut --json is not JSON ({e}): {stdout}"));
+    assert_eq!(env["status"], "success", "{env:#}");
+    let lock = std::fs::read_to_string(cwd.join("package-lock.json")).unwrap();
+    let lock: serde_json::Value = serde_json::from_str(&lock).unwrap();
+    let resolved = lock["packages"]["node_modules/minimist"]["resolved"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        resolved.starts_with("https://patch.socket.dev/") && resolved.contains(NPM_UUID),
+        "the shortcut's hosted get pins minimist to the hosted patch, got {resolved:?}"
+    );
+    assert_eq!(
+        git_sha256_file(&index_js),
+        BEFORE_HASH,
+        "hosted mode rewires the lockfile, not the installed tree"
+    );
+    assert!(
+        !cwd.join(".socket/manifest.json").exists(),
+        "hosted mode keeps no manifest"
+    );
 
+    // `--mode agent` passes through the shortcut: in place, with a manifest.
+    let agent = tempfile::tempdir().unwrap();
+    let cwd = agent.path();
+    write_package_json(cwd);
+    npm_run(cwd, &["install", "minimist@1.2.2"]);
+    let index_js = cwd.join("node_modules/minimist/index.js");
+    assert_run_ok(
+        cwd,
+        &[NPM_UUID, "--mode", "agent"],
+        "uuid shortcut --mode agent",
+    );
     assert_eq!(
         git_sha256_file(&index_js),
         AFTER_HASH,
-        "index.js should match afterHash after UUID shortcut"
+        "index.js should match afterHash after `<UUID> --mode agent`"
     );
-
-    // The shortcut must behave like `get`: the manifest must actually record
-    // our patch, not merely exist as an empty stub.
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(
-        manifest_path.exists(),
-        "manifest should exist after UUID shortcut"
-    );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
     let patch = &manifest["patches"][NPM_PURL];
     assert!(
         patch.is_object(),
-        "manifest should contain {NPM_PURL} after UUID shortcut"
+        "manifest should contain {NPM_PURL} after the agent-mode shortcut"
     );
     assert_eq!(patch["uuid"].as_str().unwrap(), NPM_UUID);
 }
