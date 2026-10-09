@@ -1121,7 +1121,9 @@ mod tests {
         core.ecosystem = "golang".into();
         core.base_purl = "pkg:golang/github.com/x/Core@1.0.0".into();
         let core_key = "pkg:golang/github.com/x/!core@1.0.0";
-        let other = "pkg:npm/core@1.0.0";
+        // Another last-segment-only match: a full-name match such as
+        // `pkg:npm/core` would settle the name on its own.
+        let other = "pkg:npm/@x/core@1.0.0";
         let core_name = Target::parse("core");
         assert!(core.matches_target(core_key, &core_name));
         assert!(core_name
