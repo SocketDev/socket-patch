@@ -1,8 +1,8 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-09 (run 35), main `03b9418`, latest release 4.0.0.
+Last updated: 2026-10-09 (run 36), main `f3c6313`, latest release 4.0.0.
 
-Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
+Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
 ## Coverage matrix
 
@@ -355,6 +355,16 @@ Interrupted takeover (debug build, `SOCKET_PATCH_FAILPOINT` = `group_commit_jour
 
 Re-triage (run 34): #466's takeover half is fixed by #1039 (fails closed with `redirect_vendored_revert_failed`, nothing touched, ledger kept); its `vendor --revert` / `rollback` halves still reproduce on 12.10.1 (commented). #734 still reproduces (9.15.9 hosted, `ERR_PNPM_ADDING_TO_ROOT`).
 
+Run 36 additions (main `f3c6313`, Linux; #1008 npm fixes, none pnpm-specific):
+- Vendored with left-pad as an `optionalDependencies` / `devDependencies` entry: 9.15.9 / 12.10.1 pass (fresh frozen install patched).
+- left-pad brought in only through `packageExtensions` (package.json on 9, workspace file on 12) or a `.pnpmfile.cjs` `readPackage` hook, hosted / vendored: 9.15.9 / 12.10.1 pass (fresh frozen install patched, all 8 cells).
+- Vendored 1.3.0, then upgrading to 1.2.0 (`pnpm add -E`): **fail, commented on #1155** on 8.15.9 (legacy backend) / 9.15.9 / 10.34.6 / 11.28.5 / 12.10.1. `scan --prune`, `vendor --revert` and `remove` drift-keep the entry (only the importer / root dep counts as drift), `remove` exits 1, and `vendor --check` stays 1. PR #1187 covers npm / Bun only.
+- Upgrade orphan (#1197 variant): pnpm 12.10.1 keeps `.pnpm/left-pad@1.3.0` after `pnpm add -E left-pad@1.2.0`, so the vendored scan exits 1 (3×). `pnpm install` doesn't clear it, `pnpm prune` does on 12. Commented on #1197.
+- Vendored over a `pnpm patch`-ed left-pad on 12.10.1: refuses loudly (a known non-bug); hosted pins it (`patchedDependencies` hosted cells are already covered).
+- Agent `vex` after an upgrade on 9.15.9 still attests the orphaned, patched `left-pad@1.3.0` (see Known non-bugs).
+
+Re-triage (run 36): #1074 still reproduces on `f3c6313` (12.10.1, workspace `lockfile: false`: hosted success, lock-only `vex` not_affected). #1129 (arch-audit, not `bughunt`): `pnpm_pnp_layout_in` still hard-codes `node_modules`; no action.
+
 Run 35 additions (main `03b9418`, Linux; #1058 hosted pins through lockfile discovery, #1147 vendored revert of a removed dependency):
 - Hosted, peer-suffixed `ajv-keywords@3.5.2` with two `ajv` peers (two snapshot instances): 8.15.9 (lock 6.0, two resolutions) / 9.15.9 / 12.10.1 pass. Both instances install patched on 8 and 12.
 - Hosted `npm:` alias (`lp: npm:left-pad@1.3.0`): 7.33.7 / 9.15.9 / 12.10.1 pass (dead-registry frozen install patched on 7 and 12).
@@ -405,7 +415,9 @@ Global mode (`-g`, v5 main `2463257`):
 
 00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot and over Rush / subspace locks. (`sharedWorkspaceLockfile: false` member: vendored now refuses `vendor_pnpm_settings_elsewhere` on 10.34.6 too, by design. #1029 `modulesDir` / `virtualStoreDir` and `unpinned` rows: done in run 34.)
 00b. #1039 follow-ups: the takeover over a `pnpm patch`-ed vendored package, and a takeover on Windows (CRLF autocrlf checkout). The interrupted takeover is #1157. (Interrupted vendored-only commit: done in run 35, pass.)
-00c. #1197 follow-ups: an upgrade (`pnpm add left-pad@<newer>`) that leaves the patched version orphaned, a workspace member's orphan, agent-mode `vex` over an orphan, and re-verification on 7–11 once fixed.
+00c. #1197 follow-ups: a workspace member's orphan, and re-verification on 7–12 once fixed. (Upgrade orphan on 12 and agent `vex` over an orphan: done in run 36.)
+00e. #1155 (pnpm half): re-verify on 8 (legacy) and 9–12 once a fix covers `pnpm_lock.rs` / `pnpm_lock_legacy.rs`. Also an upgrade to a version that has its own patch (needs a second left-pad patch in the mock).
+00f. Not yet covered: `bundledDependencies` (`vex_pnpm_bundled_copy`) end to end, `pnpm update` after a hosted pin, and `prefer-offline` with a warm store.
 00d. #1058 follow-ups: Rush / subspace locks and `sharedWorkspaceLockfile: false` through the new ProjectView discovery, a `git+` copy beside a registry copy (expect `redirect_unattributable`), and in-memory engine parity (`get <uuid> --mode hosted`).
 
 000. #1111 follow-ups: the passive update-notifier text on a real newer release, and a pnpm global install on Windows (`%LOCALAPPDATA%\pnpm`) and macOS. Needs a probe. #1096: marker-only files are done (run 32, commented); vendored on 10.4.1 with a comment-only file is still to do.
@@ -457,6 +469,8 @@ Global mode (`-g`, v5 main `2463257`):
 - On v5, vendoring always downloads its artifact from the patch service (`--vendor-source build` was removed), so offline vendoring with only a staged manifest fails with `vendor_service_offline_conflict`. Fixtures need the mock grant to match the manifest UUID.
 - `rush update --full` re-resolves the Rush lock and drops the hosted pin, like `pnpm update`. VEX then honestly reports nothing to attest.
 - pnpm 9.15.9's frozen install fails on its own unmodified lock when a workspace uses `dependenciesMeta.injected` ("importer dependencies meta (undefined) doesn't match"). That's upstream pnpm, not socket-patch.
+- Agent-mode `vex` after an upgrade (9.15.9, orphan kept) still attests the patched, orphaned `left-pad@1.3.0` as a subcomponent. The statement is true of those bytes and nothing installs them, so it hides no vulnerability (run 36).
+- After a vendored package is upgraded, `vendor_ledger_entry_unwired` repeating after a drift-keeping prune is documented (CLI_CONTRACT warning table). The loop itself is #1155.
 - Old pnpm needs an old Node (≤ 6 needs Node 16, ≤ 2 needs Node 10), and pnpm 3 takes `--store` rather than `--store-dir`. Fixture notes.
 - Agent apply over a pnpm `patchedDependencies` edit to the same file overwrites it with the verified patched content and warns `content_mismatch_overwritten` (documented default mismatch policy; `--strict` refuses). Hosted composes both patches, and `vex` then declines (`no_applicable_patches`), because the file matches neither hash.
 - Hosted on pnpm 11/12 respects an explicit `trustLockfile: false` (any YAML spelling) and warns `redirect_pnpm_trust_lockfile` with the remedy. The following frozen install fails, which is documented.
