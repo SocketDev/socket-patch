@@ -465,10 +465,16 @@ pub async fn atomic_write_bytes_preserving_mode(
 /// already exists (`/dev/stdout`, a FIFO, a character device) has no inode to
 /// swap, so it is written in place: on Windows a DOS device name (`NUL`,
 /// `CON`, `COM1`) or a `\\.\` device path such as a named pipe, which std
-/// reports as a file. Never captured by an open group commit: the path is
-/// the user's output, not one of the run's commit points.
+/// reports as a file. A path that is, or links through, `/dev/…` or
+/// `/proc/…` (`/dev/stdout`, `/dev/fd/1`, `/proc/self/fd/1`) is a stream
+/// too, even when the descriptor behind it is a regular file
+/// (`--output /dev/stdout > vex.json`): renaming over its target would
+/// detach the caller's open descriptor, and on macOS `/dev/fd` holds no
+/// stage. Never captured by an open group commit: the path is the user's
+/// output, not one of the run's commit points.
 pub async fn write_user_output(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let special = (cfg!(windows) && is_windows_device_path(path))
+        || links_through_dev_or_proc(path)
         || matches!(
             tokio::fs::metadata(path).await,
             Ok(meta) if !meta.is_file() && !meta.is_dir()
@@ -488,6 +494,30 @@ pub async fn write_user_output(path: &Path, content: &[u8]) -> std::io::Result<(
         },
     )
     .await
+}
+
+/// Whether `path`, or any hop of the symlink chain its final component
+/// starts, names something under `/dev/` or `/proc/`. The chain is read link
+/// by link, never canonicalized: `/proc/self/fd/1` resolves to the regular
+/// file behind the descriptor, which is exactly what must not be renamed
+/// over.
+fn links_through_dev_or_proc(path: &Path) -> bool {
+    let under = |p: &Path| p.starts_with("/dev") || p.starts_with("/proc");
+    let mut hop = path.to_path_buf();
+    // The kernel's own loop limit for symlink resolution.
+    for _ in 0..40 {
+        if under(&hop) {
+            return true;
+        }
+        let Ok(target) = std::fs::read_link(&hop) else {
+            return false;
+        };
+        hop = match hop.parent() {
+            Some(dir) if target.is_relative() => dir.join(target),
+            _ => target,
+        };
+    }
+    false
 }
 
 /// Whether Windows resolves `path` to a device rather than a file: the
@@ -1098,6 +1128,67 @@ mod tests {
         );
         drop(group);
         assert_eq!(std::fs::read(&fresh).unwrap(), b"doc");
+    }
+
+    /// `--output /dev/stdout > vex.json`: the descriptor behind a `/dev` or
+    /// `/proc` path is written in place even when it is a regular file, so
+    /// the caller's open file keeps the bytes; a user's link to such a path
+    /// is a stream too (review on #1262).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn user_output_writes_descriptor_paths_in_place() {
+        use std::io::{Read as _, Seek as _};
+        use std::os::fd::AsRawFd as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let captured = tmp.path().join("captured.json");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&captured)
+            .unwrap();
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        assert!(links_through_dev_or_proc(&fd_path));
+        write_user_output(&fd_path, b"doc").await.unwrap();
+        let mut seen = String::new();
+        file.rewind().unwrap();
+        file.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "doc", "the open descriptor must see the bytes");
+
+        let link = tmp.path().join("out.vex.json");
+        std::os::unix::fs::symlink(&fd_path, &link).unwrap();
+        assert!(links_through_dev_or_proc(&link));
+        write_user_output(&link, b"doc2").await.unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        seen.clear();
+        file.rewind().unwrap();
+        file.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "doc2");
+        let names = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(names, 2, "no stage left beside the captured file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_and_proc_paths_are_streams() {
+        for stream in ["/dev/stdout", "/dev/stderr", "/dev/fd/1", "/proc/self/fd/1"] {
+            assert!(links_through_dev_or_proc(Path::new(stream)), "{stream}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("vex.json");
+        std::fs::write(&file, b"{}").unwrap();
+        assert!(!links_through_dev_or_proc(&file));
+        assert!(!links_through_dev_or_proc(&tmp.path().join("missing.json")));
+        let relative = tmp.path().join("rel.json");
+        std::os::unix::fs::symlink("vex.json", &relative).unwrap();
+        assert!(!links_through_dev_or_proc(&relative));
+        let looped = tmp.path().join("loop");
+        std::os::unix::fs::symlink("loop", &looped).unwrap();
+        assert!(!links_through_dev_or_proc(&looped));
     }
 
     /// Windows device names and the `\\.\` namespace are written in place

@@ -1559,6 +1559,81 @@ fn compact_flag_emits_single_line_json() {
 // vexctl integration (run only when the binary is on PATH)
 // ──────────────────────────────────────────────────────────────────────
 
+/// `vex --output /dev/stdout > vex.json`: the document reaches the file the
+/// shell redirected stdout to, through the caller's own descriptor.
+/// `/dev/stdout` is written in place, never staged and renamed over the
+/// descriptor's target, which would leave the caller's open file without
+/// the document (review on #1262). Read through a kept handle, not the
+/// path, so a rename shows. The human summary line also goes to fd 1 and
+/// overwrites the head of the document, as on `main`; only the body is
+/// asserted.
+#[cfg(unix)]
+#[test]
+fn output_to_dev_stdout_reaches_the_redirected_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/x@1.0.0".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            "a".repeat(64).as_str(),
+            "b".repeat(64).as_str(),
+            "GHSA-zzzz",
+            &["CVE-9999"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+    use std::io::{Read as _, Seek as _};
+    let captured = cwd.join("captured.vex.json");
+    let stdout = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&captured)
+        .unwrap();
+    let mut kept = stdout.try_clone().unwrap();
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--no-verify",
+            "--output",
+            "/dev/stdout",
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut text = String::new();
+    kept.rewind().unwrap();
+    kept.read_to_string(&mut text).unwrap();
+    assert!(
+        text.contains("\"author\": \"Socket\"") && text.contains("GHSA-zzzz"),
+        "the redirected file must hold the document; got {text:?}"
+    );
+    let stages = std::fs::read_dir(cwd)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".socket-stage-")
+        })
+        .count();
+    assert_eq!(stages, 0);
+}
+
 /// A write that fails part-way (here `EFBIG` from `RLIMIT_FSIZE`, the
 /// same short write a full disk gives) never leaves a prefix of the new
 /// document at `--output`. The document is staged beside the destination
