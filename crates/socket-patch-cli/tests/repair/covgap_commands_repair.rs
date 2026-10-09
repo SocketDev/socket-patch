@@ -221,10 +221,7 @@ fn repair_failed_human_mode_prints_error_to_stderr() {
 // Human-mode summaries
 // ---------------------------------------------------------------------------
 
-/// The loud "All {artifacts} are present locally." summary. Every
-/// existing loud run used the default diff mode with no `<uuid>.tar.gz`
-/// present (always "missing"), and every all-present run was `--json` —
-/// so the print never executed. `--download-mode file` with the referenced
+/// The loud "All blobs are present locally." summary: the referenced
 /// blob on disk is the all-present shape.
 #[test]
 fn repair_all_present_human_mode_prints_summary() {
@@ -233,7 +230,7 @@ fn repair_all_present_human_mode_prints_summary() {
     write_blob(&socket, REFERENCED_HASH, b"patched content");
 
     let out = socket_cmd(tmp.path())
-        .args(["repair", "--offline", "--download-mode", "file"])
+        .args(["repair", "--offline"])
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -266,7 +263,7 @@ fn repair_offline_warning_truncates_missing_list_after_five() {
     // No blobs on disk → all 12 afterHashes are missing.
 
     let out = socket_cmd(tmp.path())
-        .args(["repair", "--offline", "--download-mode", "file"])
+        .args(["repair", "--offline"])
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -316,7 +313,7 @@ fn repair_dry_run_preview_truncates_missing_list_after_ten() {
     let socket = write_twelve_file_manifest(tmp.path());
 
     let out = socket_cmd(tmp.path())
-        .args(["repair", "--dry-run", "--download-mode", "file"])
+        .args(["repair", "--dry-run"])
         .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run socket-patch");
@@ -352,18 +349,16 @@ fn repair_dry_run_preview_truncates_missing_list_after_ten() {
     );
 }
 
-/// The loud orphan-archive removal print — each directory's summary names
-/// its own artifact kind (`format_cleanup_result_for` takes the noun). One orphan in `diffs/` next to the
-/// referenced `<uuid>.tar.gz` that must survive, and two legacy archives in
-/// `packages/` (one under the referenced uuid) that both go: v5.0 reads no
-/// package archives, so the sweep keeps none.
+/// The loud obsolete-archive removal print — each directory's summary names
+/// its own artifact kind (`format_cleanup_result_for` takes the noun). Two
+/// archives in `diffs/` and two in `packages/` (one of each under the
+/// referenced uuid) all go: v5.0 reads no diff or package archives, so the
+/// sweep keeps none.
 #[test]
 fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     write_blob(&socket, REFERENCED_HASH, b"kept");
-    // The referenced diff archive keeps the default diff mode's
-    // missing-check happy AND must survive the sweep.
     write_archive(&socket, "diffs", REFERENCED_UUID, b"kept-diff");
     write_archive(&socket, "packages", REFERENCED_UUID, b"kept-package");
     const ORPHAN_DIFF: &str = "99999999-9999-4999-8999-999999999999";
@@ -385,7 +380,7 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
     // Each directory's summary names its own artifact kind (the formatter
     // takes the noun; no string rewriting of the blob wording).
     assert!(
-        stdout.contains("Removed 1 unused diff archive (17 B freed)"),
+        stdout.contains("Removed 2 unused diff archives (26 B freed)"),
         "the diffs sweep must print its own summary; stdout=\n{stdout}"
     );
     assert!(
@@ -393,17 +388,15 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
         "the packages sweep must print its own summary; stdout=\n{stdout}"
     );
     assert!(
-        !stdout.contains("blob"),
+        !stdout.contains("unused blob"),
         "no archive line may use the blob wording; stdout=\n{stdout}"
     );
-    // Bonus pin: with the referenced diff archive present, the default diff
-    // mode takes the all-present branch too.
+    // The download phase checks blobs only: the referenced one is present.
     assert!(
-        stdout.contains("All diff archives are present locally."),
-        "diff mode with the referenced archive present is all-present; stdout=\n{stdout}"
+        stdout.contains("All blobs are present locally."),
+        "the referenced blob is present; stdout=\n{stdout}"
     );
-    // Disk effects: orphans and legacy archives gone, the referenced diff
-    // archive intact.
+    // Disk effects: every obsolete archive is gone.
     assert!(
         !socket
             .join("diffs")
@@ -418,10 +411,7 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
             .exists(),
         "the orphan package archive must be swept"
     );
-    assert!(socket
-        .join("diffs")
-        .join(format!("{REFERENCED_UUID}.tar.gz"))
-        .exists());
+    assert!(!socket.join("diffs").exists());
     assert!(!socket
         .join("packages")
         .join(format!("{REFERENCED_UUID}.tar.gz"))
@@ -454,7 +444,7 @@ fn repair_archive_cleanup_failure_warns_and_continues() {
 
     // Loud human mode: stderr warning, exit 0, packages pass still ran.
     let loud = socket_cmd(tmp.path())
-        .args(["repair", "--offline", "--download-mode", "file"])
+        .args(["repair", "--offline"])
         .output()
         .expect("run socket-patch");
     let loud_stdout = String::from_utf8_lossy(&loud.stdout);
@@ -485,7 +475,7 @@ fn repair_archive_cleanup_failure_warns_and_continues() {
     // the envelope as an informational skip while status stays success.
     write_archive(&socket, "packages", ORPHAN_PKG, b"orphan pkg bytes");
     let json = socket_cmd(tmp.path())
-        .args(["repair", "--json", "--offline", "--download-mode", "file"])
+        .args(["repair", "--json", "--offline"])
         .output()
         .expect("run socket-patch");
     let json_stdout = String::from_utf8_lossy(&json.stdout);
@@ -554,7 +544,7 @@ fn repair_exits_zero_and_stays_quiet_when_lock_file_unremovable() {
         .expect("chmod .socket read-only");
 
     let out = socket_cmd(tmp.path())
-        .args(["repair", "--offline", "--download-mode", "file"])
+        .args(["repair", "--offline"])
         .output()
         .expect("run socket-patch");
 

@@ -26,6 +26,10 @@ pub(crate) struct NpmDist {
     /// berry writes in the `bin:` section of the version's `npm:` entry
     /// (#1131). Empty when the document declares none.
     pub bin: std::collections::BTreeMap<String, String>,
+    /// Whether yarn's npm resolver gives this version the implicit
+    /// `node-gyp: "npm:latest"` dependency (see
+    /// `formats::yarn::berry_entry::registry_adds_node_gyp`, #737).
+    pub node_gyp: bool,
 }
 
 /// A Go module version's two go.sum hashes.
@@ -301,6 +305,7 @@ impl UpstreamClient {
             integrity: str_field("integrity"),
             shasum: str_field("shasum"),
             bin: crate::formats::yarn::berry_entry::manifest_bin(&doc),
+            node_gyp: crate::formats::yarn::berry_entry::registry_adds_node_gyp(&doc),
         })
     }
 
@@ -847,6 +852,7 @@ mod tests {
                     integrity: registry_sri,
                     shasum: registry_sha1,
                     bin: Default::default(),
+                    node_gyp: false,
                 }),
             );
             for _ in 0..2 {
@@ -908,6 +914,7 @@ mod tests {
                     integrity: Some("sha512-other".into()),
                     shasum: None,
                     bin: Default::default(),
+                    node_gyp: false,
                 }),
             );
             assert!(

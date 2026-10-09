@@ -874,6 +874,7 @@ pub(super) async fn try_service_dir(
         Ok(archive) => archive,
         Err(attempt) => return attempt,
     };
+    let downloaded = archive.downloaded_warning(format_args!("{name}@{version}"));
     let (bytes, dest) = (archive.bytes, stage.to_path_buf());
     let extracted = tokio::task::spawn_blocking(move || {
         super::registry_fetch::extract_tgz_strict(&bytes, &dest)
@@ -898,13 +899,7 @@ pub(super) async fn try_service_dir(
             ),
         );
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {name}@{version} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
+    warnings.push(downloaded);
     ServiceDir::Used(())
 }
 

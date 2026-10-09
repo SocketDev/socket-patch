@@ -17,7 +17,9 @@
 
 use std::collections::BTreeSet;
 
-use super::npm::{bun_tarball_url, by_uuid, fetch_dists_on, refuse_all_in, BunRegistrySettings};
+use super::npm::{
+    bun_tarball_url, by_uuid, fetch_dists_on, refuse_all_in, BunConfigOrder, BunRegistrySettings,
+};
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::vendor::bun_lockb::{BunLockb, NORMALIZED_FORMAT_1, NORMALIZED_WORKSPACE};
 
@@ -104,7 +106,9 @@ pub(super) async fn restore(
             .collect();
         // The record keeps the tarball URL Bun fetches from, which is the
         // project registry's for a mirror (#992).
-        let settings = BunRegistrySettings::read(view, rel).await;
+        // A binary lock does not say which Bun wrote it (#1276).
+        let settings = BunRegistrySettings::read(view, rel, BunConfigOrder::Unknown).await;
+        let wanted = settings.refuse_ambiguous(rel, wanted, &mut result);
         let dists = fetch_dists_on(
             &wanted,
             |n| settings.registry_with_credentials(n),
