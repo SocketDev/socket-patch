@@ -22143,10 +22143,10 @@ packages:
     #[test]
     fn issue_737_pin_drops_the_implicit_node_gyp_and_the_subtree_only_it_reached() {
         const BEFORE: &str =
-            include_str!("../../../tests/fixtures/yarn-berry-node-gyp/before.lock");
+            include_str!("../../../tests/fixtures/yarn-berry-node-gyp-before.lock");
         const NAN_ONLY: &str =
-            include_str!("../../../tests/fixtures/yarn-berry-node-gyp/nan-only.lock");
-        const BOTH: &str = include_str!("../../../tests/fixtures/yarn-berry-node-gyp/both.lock");
+            include_str!("../../../tests/fixtures/yarn-berry-node-gyp-nan-only.lock");
+        const BOTH: &str = include_str!("../../../tests/fixtures/yarn-berry-node-gyp-both.lock");
         fn checksum_of(lock: &str, key: &str) -> String {
             let at = lock.find(key).expect(key);
             let line = lock[at..]
