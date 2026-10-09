@@ -782,7 +782,11 @@ impl Reactor {
     ) -> Result<Option<ManagedConflict>, Missing> {
         let (g, a) = (patch.group_id, patch.artifact_id);
         let ext_chain = self.external_chain(root, lookup)?;
-        for rel in self.scope.iter().filter(|rel| self.local_root(rel) == root) {
+        // Every module under this root must agree: one module whose
+        // management already resolves the base version says nothing about
+        // the next, which may interpolate a different one the root pin would
+        // override.
+        'modules: for rel in self.scope.iter().filter(|rel| self.local_root(rel) == root) {
             let locally_versioned = self.chain(rel).any(|p| {
                 let doc = &self.poms[p].doc;
                 doc.keyed_declarations(g, a)
@@ -822,7 +826,7 @@ impl Reactor {
                     // overridden by management, so a pin cannot reach it
                     // even at the base version.
                     if managed && is_base_like(&v, patch.version) {
-                        return Ok(None);
+                        continue 'modules;
                     }
                     let how = if managed {
                         "managed by"
@@ -866,7 +870,7 @@ impl Reactor {
                 let mut seen = BTreeSet::new();
                 if let Some(v) = bom_manages(bom, g, a, lookup, &mut seen, 0)? {
                     if is_base_like(&v, patch.version) {
-                        return Ok(None);
+                        continue 'modules;
                     }
                     let (bg, ba, bv) = bom;
                     return Ok(Some(ManagedConflict {
@@ -3121,6 +3125,48 @@ mod tests {
             !root_pinned(&again, &after),
             "the re-run must drop the pin, not report it in sync"
         );
+    }
+
+    #[test]
+    fn a_later_module_importing_another_version_leaves_the_root_unpinned() {
+        // Module `a` sees the root's BOM at the base version; module `b`
+        // imports its own BOM managing another one. A root pin would
+        // override `b`'s management, so one agreeing module is not enough.
+        let mut files = external_reactor(
+            "<properties><bom.version>1</bom.version></properties>",
+            IMPORT_BOM,
+        );
+        let root = text(&files, "pom.xml")
+            .replace("<module>a</module>", "<module>a</module><module>b</module>");
+        files.insert("pom.xml".into(), root.into_bytes());
+        let b = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
+                 <groupId>com.example</groupId>\n    <artifactId>root</artifactId>\n    \
+                 <version>1.0.0</version>\n  </parent>\n  <artifactId>b</artifactId>\n  \
+                 <dependencyManagement><dependencies><dependency>\
+                 <groupId>com.corp</groupId><artifactId>corp-bom</artifactId><version>2</version>\
+                 <type>pom</type><scope>import</scope></dependency></dependencies>\
+                 </dependencyManagement>\n  \
+                 <dependencies>\n    <dependency><groupId>org.apache.commons</groupId>\
+                 <artifactId>commons-text</artifactId></dependency>\n  </dependencies>\n\
+                 </project>\n";
+        files.insert("b/pom.xml".into(), b.as_bytes().to_vec());
+        let repo = ExternalPoms::from([
+            (
+                corp("corp-bom", "1"),
+                Some(bom("corp-bom", "1", &dep("1.10.0"))),
+            ),
+            (
+                corp("corp-bom", "2"),
+                Some(bom("corp-bom", "2", &dep("1.11.0"))),
+            ),
+        ]);
+        let plan = run_external(&files, &repo).0.unwrap();
+        assert!(
+            reasons(&plan).contains(&"conflicting_managed_version".to_string()),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!root_pinned(&plan, &files), "the root must not be pinned");
     }
 
     #[test]
