@@ -15,6 +15,9 @@
 //!   far smaller than the inline text, the others stay version 1, and the
 //!   revert is exact.
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[path = "vendor_ecosystem_fixtures/mod.rs"]
 mod fx;
 
