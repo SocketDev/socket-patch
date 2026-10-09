@@ -37,6 +37,68 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 > copy-out modes — `vendor`, `scan --mode vendored`, `scan --mode hosted` — never write
 > into the caches and avoid the issue entirely.
 
+## v5 support tiers
+
+The matrix above lists what each mode handles. This table says how much that support
+is worth for v5.x. v5 removes no format or mode: everything in the matrix works in v5.0
+and keeps working through v5.x.
+
+| Tier | Meaning |
+|---|---|
+| **Supported** | The default. Covered by CI. A regression is a release blocker. |
+| **Beta** | Works for the build shapes documented on this page and is tested in CI. Some shapes outside them are refused, and the open issues for that ecosystem describe shapes that are patched incompletely. Preview with `--dry-run` and confirm with a real build before you commit the result. |
+| **Legacy** | A format that the package manager itself has retired. socket-patch keeps reading and writing it in v5 and still fixes its bugs, but adds no new features for it. Prefer the upgrade path in the table below. |
+| **Not supported** | Refused with an error code that names the remedy. |
+
+| Ecosystem / format | agent | vendored | hosted |
+|---|---|---|---|
+| npm: package-lock / npm-shrinkwrap, yarn classic, yarn berry, pnpm lock v9, text `bun.lock`, vlt lock eras C–F | Supported | Supported | Supported |
+| npm: binary `bun.lockb` | Supported (agent mode patches `node_modules`, not the lock) | Legacy | Legacy |
+| npm: pnpm 7/8 locks (lockfileVersion 5.4 / 6.0) | Supported | Legacy | Supported |
+| npm: older pnpm locks (pnpm 1–6, `shrinkwrap.yaml`) | Supported | Not supported | Supported (see [npm hosted-mode notes](#npm-hosted-mode-notes) for the version floors) |
+| npm: vlt lock eras A0–B (before 1.0.0-rc.15) | Supported | Legacy (A0 is refused) | Legacy |
+| PyPI, Cargo, RubyGems, Go, NuGet, Composer | Supported | Supported | Supported, with the per-ecosystem limits in the matrix |
+| Maven (`pom.xml` builds) | Supported, with the [sidecar caveats](#maven--nuget-caveats) | Beta | Beta |
+| Gradle | Supported, with the [`files-2.1` advisories](#gradle) | Beta (Gradle 6.8+) | Beta (Gradle 6.8+) |
+| sbt / Mill / scala-cli | Beta | Beta (sbt and scala-cli directory builds; Mill is not wired) | Beta (Mill and scala-cli get manual snippets only) |
+| Deno | Supported | Not supported | Not supported |
+
+**Hosted and vendored Maven and Gradle are Beta in v5.** Each wiring is built to fail
+closed: hosted mode and vendored Maven pin a Socket-only `-socket.<hex8>` version, and
+vendored Gradle checks the SHA-256 of the vendored artifact, so a build that cannot get
+the patched artifact fails instead of silently building the upstream jar. But the pom
+and Gradle rewriters still have open gaps. For example: multi-module builds, `<classifier>`
+dependencies, dependencies declared inside profiles, plugins or comments, `${property}`
+coordinates, imported BOMs, and repository mirrors. The open
+[`pm:maven`](https://github.com/SocketDev/socket-patch/issues?q=is%3Aissue+is%3Aopen+label%3Apm%3Amaven)
+and [`pm:gradle`](https://github.com/SocketDev/socket-patch/issues?q=is%3Aissue+is%3Aopen+label%3Apm%3Agradle)
+issues track them. Before you rely on a JVM `--vex` attestation, run the build and check
+that it resolves the patched artifact of each patched dependency.
+
+### Legacy formats: upgrade and undo
+
+Each Legacy format has an upgrade path and an undo path. Both work in v5:
+
+| Format | Leave the legacy format | Undo socket-patch's changes |
+|---|---|---|
+| Binary `bun.lockb` | Bun 1.2+ writes text `bun.lock` by default. Undo socket-patch's changes (next column), convert with `bun install --save-text-lockfile --frozen-lockfile --lockfile-only`, delete `bun.lockb`, then rerun `socket-patch scan --mode <mode>` with the mode you used before | Vendored: `socket-patch rollback`. Hosted: `rollback` refuses a hosted `bun.lockb` pin, because the binary lock cannot be re-derived. Restore the lock from version control (`git checkout -- bun.lockb`), as the refusal says |
+| pnpm 7/8 lock, vendored | Run `socket-patch rollback`, re-lock with pnpm 9 or later, then rerun `socket-patch scan --mode vendored`. A pnpm 9+ lock is not path-bound (see `vendor_pnpm_legacy_absolute_specifier` in the matrix) | `socket-patch rollback` |
+| vlt eras A0–B | Run `socket-patch rollback`, re-lock with vlt 1.0 or later, then rerun `socket-patch scan --mode <mode>` with the mode you used before | `socket-patch rollback` |
+
+### Support policy
+
+- **v5.x minor and patch releases** do not remove a format or mode from the matrix,
+  and do not make a format refuse that v5.0 accepts. Bug fixes can still refuse a
+  specific input that would otherwise produce a wrong result. Each refusal has an error
+  code and a remedy.
+- **A tier can move up** (Beta to Supported) in any release. A move down, or a new
+  Legacy entry, is announced in the release notes and on this page.
+- **Removing write support for a Legacy format** can happen only in a major release.
+  The removed path becomes a refusal with an error code and a re-lock remedy. socket-patch
+  keeps reading the format for `list`, `vex` and `rollback`, so state that an older
+  socket-patch wrote can still be undone (or is refused with a version-control remedy,
+  as hosted `bun.lockb` is today).
+
 ## npm hosted-mode notes
 
 - **npm (package-lock.json / npm-shrinkwrap.json)** — every present npm lock is
