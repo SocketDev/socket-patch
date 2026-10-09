@@ -23,9 +23,9 @@ RUN apt-get update \
 
 RUN set -eu \
  && cd /tmp \
- && curl -fsSL --retry 3 -o composer.phar \
+ && curl -fsSL --retry 3 --retry-all-errors -o composer.phar \
       "https://getcomposer.org/download/${COMPOSER_VERSION}/composer.phar" \
- && curl -fsSL --retry 3 -o composer.phar.sha256sum \
+ && curl -fsSL --retry 3 --retry-all-errors -o composer.phar.sha256sum \
       "https://getcomposer.org/download/${COMPOSER_VERSION}/composer.phar.sha256sum" \
  && echo "$(cut -d' ' -f1 composer.phar.sha256sum)  composer.phar" | sha256sum -c - \
  && if [ -n "${COMPOSER_SHA256}" ]; then \

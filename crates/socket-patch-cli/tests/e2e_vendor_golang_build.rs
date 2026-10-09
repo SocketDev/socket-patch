@@ -27,7 +27,8 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::envelope::find_event;
+use common::{binary, git_sha256, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -220,22 +221,6 @@ fn write_patch(consumer: &Path) {
     .unwrap();
 }
 
-fn parse_envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("--json output is not JSON: {e}\nstdout:\n{stdout}"))
-}
-
-fn find_event<'a>(
-    env: &'a serde_json::Value,
-    action: &str,
-    error_code: &str,
-) -> Option<&'a serde_json::Value> {
-    env["events"]
-        .as_array()?
-        .iter()
-        .find(|e| e["action"] == action && e["errorCode"] == error_code)
-}
-
 fn copy_dir_recursive(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -395,7 +380,7 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
     // summary.applied / the event action are pinned by
@@ -554,7 +539,7 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
     assert_eq!(
@@ -667,7 +652,7 @@ async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
         code, 0,
         "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["downloaded"], 1, "one record downloaded: {env}");
     assert!(
@@ -859,12 +844,10 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "takeover is a success: {env}");
-    assert!(
-        find_event(&env, "skipped", "vendor_takeover").is_some(),
-        "the takeover must be surfaced as a `vendor_takeover` event: {env}"
-    );
+    // The takeover must be surfaced as a `vendor_takeover` event.
+    find_event(&env, "skipped", Some("vendor_takeover"));
 
     let gomod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
     let expected_replace =
@@ -918,11 +901,10 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
         code, 0,
         "apply on a vendored module must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let aenv = parse_envelope(&stdout);
+    let aenv = parse_json_envelope(&stdout);
     assert_eq!(aenv["status"], "success", "apply envelope: {aenv}");
-    let yielded = find_event(&aenv, "skipped", "vendored").unwrap_or_else(|| {
-        panic!("apply must skip the vendored purl with errorCode `vendored`: {aenv}")
-    });
+    // Apply must skip the vendored purl with errorCode `vendored`.
+    let yielded = find_event(&aenv, "skipped", Some("vendored"));
     assert_eq!(
         yielded["purl"], UPURL,
         "the vendored purl is the one skipped: {aenv}"
@@ -968,11 +950,9 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
-    assert!(
-        find_event(&renv, "skipped", "takeover_not_restored").is_some(),
-        "revert must warn that the go-patches redirect was not restored: {renv}"
-    );
+    let renv = parse_json_envelope(&stdout);
+    // Revert must warn that the go-patches redirect was not restored.
+    find_event(&renv, "skipped", Some("takeover_not_restored"));
     let gomod_reverted = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
     assert!(
         !gomod_reverted.contains("replace "),
@@ -1033,7 +1013,7 @@ fn go_vendor_reports_applied_event() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(
         env["summary"]["applied"], 1,
         "a successful first-time vendor must count as applied: {env}"

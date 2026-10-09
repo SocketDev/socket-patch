@@ -81,6 +81,10 @@
 //!   cargo test -p socket-patch-cli --test e2e_hosted_production -- --ignored
 //! ```
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -266,10 +270,6 @@ macro_rules! soft_skip {
 // ---------------------------------------------------------------------------
 // CLI invocation
 // ---------------------------------------------------------------------------
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 fn has_command(cmd: &str) -> bool {
     // `go` has no `--version` — it takes `go version` as a subcommand and

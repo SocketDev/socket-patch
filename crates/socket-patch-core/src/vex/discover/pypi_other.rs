@@ -342,12 +342,8 @@ async fn extract_hatch(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 
 async fn read_toml(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) -> Option<DocumentMut> {
     let text = ctx.read_text(file, out).await?;
-    toml_or_diag(
-        file,
-        text.trim_start_matches('\u{feff}'),
-        TomlDiag::BomFlattened,
-        out,
-    )
+    // The TOML lexer skips one leading BOM itself (`formats::text`'s rule).
+    toml_or_diag(file, &text, TomlDiag::BomFlattened, out)
 }
 
 /// One PEP 508 dependency string. `root_uri_expanded`: whether Hatch
@@ -1430,6 +1426,33 @@ mod tests {
             );
         }
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// Hatch's TOML reads skip one leading BOM (the TOML lexer does, as
+    /// `formats::text` rules): a second one is content, so the file is
+    /// unparseable.
+    #[tokio::test]
+    async fn hatch_toml_reads_past_one_bom_only() {
+        let wheel = vendored_wheel(UUID_A, WHEEL);
+        let pyproject = format!(
+            "[project]\nname = \"app\"\nversion = \"0\"\ndependencies = \
+             [\"urllib3 @ {{root:uri}}/{wheel}#sha256={SHA}\"]\n"
+        );
+        for bom in ["", "\u{feff}"] {
+            let p = Project::new();
+            p.write("pyproject.toml", format!("{bom}{pyproject}"));
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[("pkg:pypi/urllib3@1.26.18", UUID_A, WiringMode::Vendored)],
+            );
+            assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        }
+        let p = Project::new();
+        p.write("pyproject.toml", format!("\u{feff}\u{feff}{pyproject}"));
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(diag_codes(&out), vec![DIAG_LOCKFILE_UNPARSEABLE]);
     }
 
     /// Hatch reads hatch.toml's top-level `envs` INSTEAD of pyproject's

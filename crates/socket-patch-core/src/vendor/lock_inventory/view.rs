@@ -1175,11 +1175,23 @@ mod tests {
         // Rewritten in place with the same length.
         std::fs::write(root.join("a.lock"), "two").unwrap();
         assert!(!set.unchanged(), "an in-place rewrite");
-        // Replaced (rename over) with the same bytes.
+        // Replaced (rename over) with other bytes of the same length.
         let set = recorded(root, read).await.unwrap();
-        std::fs::write(root.join("a.tmp"), "two").unwrap();
+        std::fs::write(root.join("a.tmp"), "six").unwrap();
         std::fs::rename(root.join("a.tmp"), root.join("a.lock")).unwrap();
         assert!(!set.unchanged(), "a replacement");
+        // Replaced with the same bytes: only Unix's (dev, ino, ctime) sees
+        // it. On Windows NTFS tunnelling gives the new file the old one's
+        // creation time and a write in the same ~16 ms tick keeps mtime, so
+        // every stat survives and the racy content compare finds the bytes
+        // the view read: the set rightly holds.
+        #[cfg(unix)]
+        {
+            let set = recorded(root, read).await.unwrap();
+            std::fs::write(root.join("a.tmp"), "six").unwrap();
+            std::fs::rename(root.join("a.tmp"), root.join("a.lock")).unwrap();
+            assert!(!set.unchanged(), "a same-bytes replacement");
+        }
         // A file that was missing appears.
         let set = recorded(root, read).await.unwrap();
         std::fs::write(root.join("b.lock"), "late").unwrap();

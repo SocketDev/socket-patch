@@ -283,11 +283,28 @@ fn is_resolution_failure(out: &Output) -> bool {
 /// A user `settings.xml` with the given `(mirrorOf, url)` mirrors (none =
 /// an empty settings file that just shields the run from `~/.m2`).
 pub fn write_settings(path: &Path, mirrors: &[(&str, &str)]) {
+    let ids: Vec<String> = (0..mirrors.len())
+        .map(|i| format!("e2e-mirror-{i}"))
+        .collect();
+    let mirrors: Vec<(&str, &str, &str)> = ids
+        .iter()
+        .zip(mirrors)
+        .map(|(id, (of, url))| (id.as_str(), *of, *url))
+        .collect();
+    write_settings_with_ids(path, &mirrors);
+}
+
+/// [`write_settings`] with explicit `(id, mirrorOf, url)` mirrors. A mirror
+/// that serves Central's content should keep the id `central`: the local
+/// repository records which repository id each artifact came from and
+/// re-fetches anything cached under another id, so a differently named
+/// mirror re-downloads the whole warm plugin closure from Central.
+pub fn write_settings_with_ids(path: &Path, mirrors: &[(&str, &str, &str)]) {
     let mut body =
         String::from("<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\">\n  <mirrors>\n");
-    for (i, (of, url)) in mirrors.iter().enumerate() {
+    for (id, of, url) in mirrors {
         body.push_str(&format!(
-            "    <mirror>\n      <id>e2e-mirror-{i}</id>\n      <mirrorOf>{of}</mirrorOf>\n      \
+            "    <mirror>\n      <id>{id}</id>\n      <mirrorOf>{of}</mirrorOf>\n      \
              <url>{url}</url>\n    </mirror>\n"
         ));
     }

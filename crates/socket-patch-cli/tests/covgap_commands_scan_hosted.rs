@@ -24,6 +24,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/mod.rs"]
 mod common;
+use common::envelope::codes_in;
 
 const ORG: &str = "test-org";
 const NAME: &str = "covgap-hosted";
@@ -363,18 +364,6 @@ fn scan_hosted_json(
         panic!("stdout must be the JSON envelope ({e});\nstdout=\n{stdout}\nstderr=\n{stderr}")
     });
     (code, doc)
-}
-
-/// The `code` of every warning in the redirect envelope.
-fn warning_codes(doc: &Value) -> Vec<String> {
-    doc["redirect"]["warnings"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|w| w["code"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The `detail` of the first warning carrying `code` (panics when absent).
@@ -1593,7 +1582,7 @@ async fn fifo_bun_lockb_refuses_before_spawning_bun_and_never_wedges() {
         );
         let detail = warning_detail(&doc, "redirect_bun_lockb_invalid");
         assert!(detail.contains("not a regular file"), "{extra:?}: {detail}");
-        let codes = warning_codes(&doc);
+        let codes = codes_in(&doc["redirect"]["warnings"]);
         assert_eq!(
             codes
                 .iter()
@@ -2510,7 +2499,8 @@ async fn vlt_takeover_refusal_before_revert() {
         "{doc:#}"
     );
     assert!(warning_detail(&doc, "redirect_vendored_revert_failed").contains("vlt-lock.json"));
-    assert!(!warning_codes(&doc).contains(&"redirect_takeover_reverted_vendored".to_string()));
+    assert!(!codes_in(&doc["redirect"]["warnings"])
+        .contains(&"redirect_takeover_reverted_vendored".to_string()));
     assert_eq!(
         std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
         state_before
@@ -2588,7 +2578,8 @@ async fn vlt_decides_before_binary_bun_and_a_refused_uuid_is_never_confirmed() {
 
     let (refused, tmp) = run(true);
     assert!(
-        warning_codes(&refused).contains(&"redirect_vlt_unsupported_lock_key".to_string()),
+        codes_in(&refused["redirect"]["warnings"])
+            .contains(&"redirect_vlt_unsupported_lock_key".to_string()),
         "{refused:#}"
     );
     assert!(
@@ -2684,7 +2675,8 @@ async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
     );
     assert_eq!(code, 0, "{doc:#}");
     assert!(
-        !warning_codes(&doc).contains(&"redirect_npm_shrinkwrap_only".to_string()),
+        !codes_in(&doc["redirect"]["warnings"])
+            .contains(&"redirect_npm_shrinkwrap_only".to_string()),
         "{doc:#}"
     );
     assert_eq!(doc["vex"]["statements"], 1, "{doc:#}");
@@ -2747,7 +2739,7 @@ async fn hosted_yarn_classic_pin_warns_berry_migration_risk() {
         ] {
             let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), extra, &[]);
             assert_eq!(code, 0, "{package_manager:?} {label}: {doc:#}");
-            let codes = warning_codes(&doc);
+            let codes = codes_in(&doc["redirect"]["warnings"]);
             assert_eq!(
                 codes
                     .iter()
@@ -2781,7 +2773,7 @@ async fn hosted_yarn_classic_pin_with_yarn1_package_manager_stays_silent() {
 
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    let codes = warning_codes(&doc);
+    let codes = codes_in(&doc["redirect"]["warnings"]);
     assert!(
         !codes
             .iter()

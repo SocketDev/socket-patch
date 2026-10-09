@@ -24,6 +24,7 @@ use crate::utils::digest::is_hex;
 use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
 use crate::utils::notice::{notice_once, Notice};
 use crate::utils::socket_cli_config;
+use crate::utils::target::is_uuid_shaped;
 
 // Each client advisory prints at most once per process: commands build
 // several clients (telemetry, discovery, download) in one run.
@@ -1190,7 +1191,7 @@ impl ApiClient {
         vendor_url: Option<&str>,
         patch_server_url: Option<&str>,
     ) -> VendorServiceOutcome {
-        if !is_valid_uuid(uuid) {
+        if !is_uuid_shaped(uuid) {
             return VendorServiceOutcome::Failed(ApiError::InvalidHash(format!(
                 "Invalid patch UUID: {uuid}"
             )));
@@ -1289,7 +1290,7 @@ impl ApiClient {
     ) -> VendorPrefetchGuard {
         let planned: Vec<PlannedDownload> = downloads
             .into_iter()
-            .filter(|d| is_valid_uuid(&d.uuid))
+            .filter(|d| is_uuid_shaped(&d.uuid))
             .collect();
         let plan = Arc::new(VendorPrefetch::new(
             planned,
@@ -2569,19 +2570,6 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> String {
     format!("{}...", truncated)
 }
 
-/// Validate the standard 8-4-4-4-12 UUID hex grouping.
-fn is_valid_uuid(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 {
-        return false;
-    }
-    let lengths = [8, 4, 4, 4, 12];
-    parts
-        .iter()
-        .zip(lengths.iter())
-        .all(|(part, &want)| part.len() == want && part.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
 /// Convert a `PatchSearchResult` into a `BatchPatchInfo`, extracting
 /// CVE/GHSA IDs and computing the highest severity.
 fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchInfo {
@@ -3804,25 +3792,25 @@ mod tests {
     // ── UUID validation tests ───────────────────────────────────────
 
     #[test]
-    fn test_is_valid_uuid_accepts_standard_form() {
-        assert!(is_valid_uuid("80630680-4da6-45f9-bba8-b888e0ffd58c"));
-        assert!(is_valid_uuid("00000000-0000-0000-0000-000000000000"));
+    fn test_is_uuid_shaped_accepts_standard_form() {
+        assert!(is_uuid_shaped("80630680-4da6-45f9-bba8-b888e0ffd58c"));
+        assert!(is_uuid_shaped("00000000-0000-0000-0000-000000000000"));
         // Uppercase hex is acceptable.
-        assert!(is_valid_uuid("ABCDEF01-2345-6789-ABCD-EF0123456789"));
+        assert!(is_uuid_shaped("ABCDEF01-2345-6789-ABCD-EF0123456789"));
     }
 
     #[test]
-    fn test_is_valid_uuid_rejects_malformed() {
-        assert!(!is_valid_uuid(""));
-        assert!(!is_valid_uuid("not-a-uuid"));
+    fn test_is_uuid_shaped_rejects_malformed() {
+        assert!(!is_uuid_shaped(""));
+        assert!(!is_uuid_shaped("not-a-uuid"));
         // Wrong segment count.
-        assert!(!is_valid_uuid("80630680-4da6-45f9-bba8"));
+        assert!(!is_uuid_shaped("80630680-4da6-45f9-bba8"));
         // Wrong length on first segment.
-        assert!(!is_valid_uuid("8063068-4da6-45f9-bba8-b888e0ffd58c"));
+        assert!(!is_uuid_shaped("8063068-4da6-45f9-bba8-b888e0ffd58c"));
         // Non-hex character.
-        assert!(!is_valid_uuid("80630680-4da6-45f9-bba8-b888e0ffd58z"));
+        assert!(!is_uuid_shaped("80630680-4da6-45f9-bba8-b888e0ffd58z"));
         // No dashes.
-        assert!(!is_valid_uuid("80630680xxxxx"));
+        assert!(!is_uuid_shaped("80630680xxxxx"));
     }
 
     // ── Token shape validation ─────────────────────────────────────────

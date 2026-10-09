@@ -13,6 +13,8 @@
 //! remove_invariants.rs / remove_duality_invariants.rs /
 //! interactive_prompts_e2e.rs.
 
+use crate::common::binary;
+
 use std::path::{Path, PathBuf};
 
 use crate::common;
@@ -1892,10 +1894,6 @@ mod pty {
     use super::*;
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::time::Duration;
-
-    fn binary() -> PathBuf {
-        env!("CARGO_BIN_EXE_socket-patch").into()
-    }
 
     /// Spawn the binary inside a PTY, send `input`, collect all output
     /// until exit (watchdog-killed after `timeout`).

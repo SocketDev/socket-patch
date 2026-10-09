@@ -60,13 +60,13 @@ use super::{
 };
 use crate::formats::text::{split_bom, strip_bom};
 use crate::gradle::dsl::{self, is_ident, is_punct, Dsl, Tok, Token};
-use crate::gradle::eol::{eol_eq, newline_of, to_lf};
 use crate::gradle::graph::{
     filter_claims_group, wrapper_version, BuildKind, DeclKind, ScriptGraph, Site,
 };
 use crate::gradle::locks;
 use crate::gradle::selector::{admits, gradle_version_cmp, parse_selector, Selector};
 use crate::patch::path_safety::is_canonical_uuid;
+use crate::utils::line_endings::{eol_eq, terminator, to_lf};
 use crate::vendor::jvm::gradle as vendored;
 use crate::vendor::jvm::layout::GRADLE_ROOT_FILES;
 
@@ -196,7 +196,7 @@ pub fn suffixed_version(base: &str, uuid: &str) -> String {
 /// The rows of an index text (LF or CRLF). `Err` names the first line the
 /// script would refuse (an unknown header, a malformed or duplicate row).
 pub fn parse_index(text: &str) -> Result<Vec<HostedRow>, String> {
-    let lf = String::from_utf8_lossy(&to_lf(text.as_bytes())).into_owned();
+    let lf = to_lf(text);
     let mut lines = lf.split('\n');
     if lines.next() != Some(HOSTED_INDEX_HEADER) {
         return Err(format!("{HOSTED_INDEX_REL} has an unknown header"));
@@ -229,7 +229,7 @@ pub fn render_index(rows: &[HostedRow]) -> String {
 /// The apply line's digest of an index text: the first 16 hex of the
 /// sha256 of its LF form.
 pub fn index_digest(text: &str) -> String {
-    let digest = Sha256::digest(to_lf(text.as_bytes()));
+    let digest = Sha256::digest(to_lf(text).as_bytes());
     hex::encode(digest)[..16].to_string()
 }
 
@@ -380,7 +380,7 @@ pub fn with_apply_line(
         return Some(format!("{}{line}{}", &text[..start], &text[end..]));
     }
     let line = apply_line(dsl, prefix, digest, created);
-    let nl = newline_of(text);
+    let nl = terminator(text);
     let mut out = text.to_string();
     if !strip_bom(&out).is_empty() && !out.ends_with('\n') {
         out.push_str(nl);

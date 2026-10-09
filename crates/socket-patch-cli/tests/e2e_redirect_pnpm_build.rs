@@ -111,7 +111,7 @@ const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-fn binary() -> PathBuf {
+fn socket_bin() -> PathBuf {
     std::env::var_os("SOCKET_PATCH_PNPM_E2E_SOCKET_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_socket-patch")))
@@ -210,7 +210,7 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 
 /// [`run_socket`] with extra env applied after the scrub.
 fn run_socket_env(cwd: &Path, args: &[&str], env: &[(String, String)]) -> (i32, String, String) {
-    let mut cmd = hermetic::command(&binary());
+    let mut cmd = hermetic::command(&socket_bin());
     cmd.args(args).current_dir(cwd);
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pnpm]);
     for (k, v) in env {
@@ -614,7 +614,7 @@ async fn redirect_scanned_pnpm_project(
         off_runtime(|| {
             let api = hosted_patch_api(PURL, &patched);
             let out = run_vex(
-                &binary(),
+                &socket_bin(),
                 &proj,
                 &VexRun {
                     patch_server_url: Some(server.uri()),
@@ -925,7 +925,7 @@ fn assert_manifestless_hosted_vex(
     tag: &str,
 ) {
     off_runtime(|| {
-        let bin = binary();
+        let bin = socket_bin();
         let api = hosted_patch_api(purl, patched);
         let with_origin = |run: VexRun| VexRun {
             patch_server_url: Some(patch_server.to_string()),
