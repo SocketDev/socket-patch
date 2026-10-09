@@ -354,3 +354,333 @@ fn go_build_links_patch_via_replace_redirect() {
     // Best-effort: relax perms so the temp cache cleans up.
     chmod_writable(tmp.path());
 }
+
+// ── consumer sync: vendor/modules.txt (#343) and requirements (#618) ──
+
+/// Publish `module@version` (its files, `go.mod` included) into the file
+/// proxy at `tmp/proxy`.
+fn publish(tmp: &Path, module: &str, version: &str, files: &[(&str, &str)]) {
+    let stage_root = tmp.join("stage-pub");
+    let _ = std::fs::remove_dir_all(&stage_root);
+    let dir = stage_root.join(format!("{module}@{version}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, body) in files {
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+    let pxv = tmp.join("proxy").join(module).join("@v");
+    std::fs::create_dir_all(&pxv).unwrap();
+    std::fs::write(
+        pxv.join(format!("{version}.info")),
+        format!("{{\"Version\":\"{version}\"}}"),
+    )
+    .unwrap();
+    let go_mod = files.iter().find(|(n, _)| *n == "go.mod").unwrap().1;
+    std::fs::write(pxv.join(format!("{version}.mod")), go_mod).unwrap();
+    let status = Command::new("zip")
+        .args([
+            "-q",
+            "-r",
+            pxv.join(format!("{version}.zip")).to_str().unwrap(),
+            &format!("{module}@{version}"),
+        ])
+        .current_dir(&stage_root)
+        .status()
+        .expect("run zip");
+    assert!(status.success(), "zip failed");
+    let mut list = std::fs::read_to_string(pxv.join("list")).unwrap_or_default();
+    list.push_str(&format!("{version}\n"));
+    std::fs::write(pxv.join("list"), list).unwrap();
+}
+
+/// The JSON `warnings[]` codes of a `--json` run's stdout.
+fn warning_codes(stdout: &str) -> Vec<String> {
+    let env: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("not a JSON envelope ({e}):\n{stdout}"));
+    env["warnings"]
+        .as_array()
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| w["code"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// #343: in a project with a committed `vendor/` (`go mod vendor`), the
+/// redirect alone breaks every default build ("inconsistent vendoring").
+/// apply names `go mod vendor`, `apply --check` reports the drift until it
+/// is run, and the same holds the other way round after a rollback.
+#[test]
+fn committed_vendor_dir_needs_go_mod_vendor_after_apply_and_rollback() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(vendor-dir)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy_url) = stage(tmp.path());
+    let cs = consumer.to_str().unwrap();
+    let mc = modcache.to_str().unwrap();
+    let mut goenv = go_env(mc, &proxy_url);
+    let vendored = go(&consumer, &["mod", "vendor"], &goenv);
+    assert!(
+        vendored.status.success(),
+        "go mod vendor: {}",
+        String::from_utf8_lossy(&vendored.stderr)
+    );
+    // Default flags from here on: go builds from vendor/.
+    goenv.retain(|(k, _)| *k != "GOFLAGS");
+    goenv.push(("GOFLAGS", ""));
+    let base = go(&consumer, &["build", "./..."], &goenv);
+    assert!(
+        base.status.success(),
+        "{}",
+        String::from_utf8_lossy(&base.stderr)
+    );
+
+    write_patch(&consumer);
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "apply",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--json",
+            "--cwd",
+            cs,
+        ],
+        &modcache,
+    );
+    assert_eq!(code, 0, "apply failed.\n{so}\n{se}");
+    assert!(
+        warning_codes(&so).contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
+        "apply must name the vendor/modules.txt regeneration:\n{so}"
+    );
+    let broken = go(&consumer, &["build", "./..."], &goenv);
+    assert!(
+        !broken.status.success()
+            && String::from_utf8_lossy(&broken.stderr).contains("inconsistent vendoring"),
+        "the fixture reproduces the broken build: {}",
+        String::from_utf8_lossy(&broken.stderr)
+    );
+    let (code, _so, se) = run_socket(
+        &consumer,
+        &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+        &modcache,
+    );
+    assert_eq!(
+        code, 1,
+        "apply --check must report the out-of-sync vendor/:\n{se}"
+    );
+    assert!(se.contains("go mod vendor"), "{se}");
+
+    // The step the warning names fixes the build, and --check agrees.
+    let revendor = go(&consumer, &["mod", "vendor"], &goenv);
+    assert!(
+        revendor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revendor.stderr)
+    );
+    let run = go(&consumer, &["run", "."], &goenv);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("OUT: PATCHED"),
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let (code, so, se) = run_socket(
+        &consumer,
+        &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+        &modcache,
+    );
+    assert_eq!(code, 0, "in sync after go mod vendor:\n{so}\n{se}");
+
+    // Rollback drops the replace; modules.txt still records it.
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "rollback",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--json",
+            "--cwd",
+            cs,
+        ],
+        &modcache,
+    );
+    assert_eq!(code, 0, "rollback failed.\n{so}\n{se}");
+    assert!(
+        warning_codes(&so).contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
+        "rollback must name the vendor/modules.txt regeneration:\n{so}"
+    );
+    let (code, _so, se) = run_socket(
+        &consumer,
+        &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+        &modcache,
+    );
+    assert_eq!(code, 1, "stale vendor/modules.txt is drift:\n{se}");
+    assert!(
+        se.contains("no longer has") && se.contains("go mod vendor"),
+        "{se}"
+    );
+
+    chmod_writable(tmp.path());
+}
+
+/// #618: a patch whose go.mod raises a requirement (the common security-fix
+/// shape) leaves the default `-mod=readonly` build failing with "updates
+/// to go.mod needed". apply names `go mod tidy`, `apply --check` reports
+/// the drift until it is run, and after it the patched bytes build.
+#[test]
+fn patched_go_mod_requirement_bump_needs_go_mod_tidy() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(requirements)") {
+        return;
+    }
+    let godir = golang_e2e_matrix::go_directive();
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    const DEP: &str = "example.com/dep";
+    let dep_mod = format!("module {DEP}\n\ngo {godir}\n");
+    let dep_src = |tag: &str| {
+        format!("package dep\n\nfunc Safe(s string) string {{ return \"{tag}-\" + s }}\n")
+    };
+    publish(
+        t,
+        DEP,
+        "v1.0.0",
+        &[("go.mod", &dep_mod), ("dep.go", &dep_src("OLD"))],
+    );
+    publish(
+        t,
+        DEP,
+        "v1.1.0",
+        &[("go.mod", &dep_mod), ("dep.go", &dep_src("FIXED"))],
+    );
+    let up_mod = |v: &str| format!("module {UMOD}\n\ngo {godir}\n\nrequire {DEP} {v}\n");
+    let up_lib = |tag: &str| {
+        format!(
+            "package upstream\n\nimport \"{DEP}\"\n\nfunc Greeting() string {{ return dep.Safe(\"{tag}\") }}\n"
+        )
+    };
+    let (before_mod, after_mod) = (up_mod("v1.0.0"), up_mod("v1.1.0"));
+    let (before_lib, after_lib) = (up_lib("PRISTINE"), up_lib("PATCHED"));
+    publish(
+        t,
+        UMOD,
+        UVER,
+        &[("go.mod", &before_mod), ("lib.go", &before_lib)],
+    );
+
+    let modcache = t.join("modcache");
+    std::fs::create_dir_all(&modcache).unwrap();
+    let proxy_url = format!("file://{}", t.join("proxy").display());
+    let consumer = t.join("consumer");
+    std::fs::create_dir_all(&consumer).unwrap();
+    std::fs::write(
+        consumer.join("go.mod"),
+        format!("module example.com/consumer\n\ngo {godir}\n\nrequire {UMOD} {UVER}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join("main.go"),
+        format!(
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"{UMOD}\"\n)\n\nfunc main() {{ fmt.Println(\"OUT:\", upstream.Greeting()) }}\n"
+        ),
+    )
+    .unwrap();
+    let mc = modcache.to_str().unwrap();
+    let mut goenv = go_env(mc, &proxy_url);
+    let tidy = go(&consumer, &["mod", "tidy"], &goenv);
+    assert!(
+        tidy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tidy.stderr)
+    );
+    goenv.retain(|(k, _)| *k != "GOFLAGS");
+    goenv.push(("GOFLAGS", ""));
+    let base = go(&consumer, &["run", "."], &goenv);
+    assert!(
+        String::from_utf8_lossy(&base.stdout).contains("OUT: OLD-PRISTINE"),
+        "{}",
+        String::from_utf8_lossy(&base.stderr)
+    );
+
+    // The patch: lib.go and the go.mod requirement bump.
+    let socket = consumer.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    for body in [&after_lib, &after_mod] {
+        std::fs::write(socket.join("blobs").join(git_sha256(body.as_bytes())), body).unwrap();
+    }
+    let manifest = serde_json::json!({"patches": {UPURL: {
+        "uuid": UUID, "exportedAt": "t",
+        "files": {
+            "lib.go": {"beforeHash": git_sha256(before_lib.as_bytes()),
+                       "afterHash": git_sha256(after_lib.as_bytes())},
+            "go.mod": {"beforeHash": git_sha256(before_mod.as_bytes()),
+                       "afterHash": git_sha256(after_mod.as_bytes())},
+        },
+        "vulnerabilities": {GHSA: {"cves": [CVE], "summary": "s", "severity": "high",
+                                   "description": "d"}},
+        "description": "", "license": "", "tier": ""}}});
+    std::fs::write(socket.join("manifest.json"), manifest.to_string()).unwrap();
+
+    let cs = consumer.to_str().unwrap();
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "apply",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--json",
+            "--cwd",
+            cs,
+        ],
+        &modcache,
+    );
+    assert_eq!(code, 0, "apply failed.\n{so}\n{se}");
+    assert!(
+        warning_codes(&so).contains(&"go_requirements_out_of_sync".to_string()),
+        "apply must name the go.mod/go.sum refresh:\n{so}"
+    );
+    let broken = go(&consumer, &["build", "./..."], &goenv);
+    assert!(
+        !broken.status.success(),
+        "the fixture reproduces the readonly failure"
+    );
+    let (code, _so, se) = run_socket(
+        &consumer,
+        &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+        &modcache,
+    );
+    assert_eq!(
+        code, 1,
+        "apply --check must report the requirement drift:\n{se}"
+    );
+    assert!(se.contains("go mod tidy"), "{se}");
+
+    let mut tidy_env = goenv.clone();
+    tidy_env.retain(|(k, _)| *k != "GOFLAGS");
+    tidy_env.push(("GOFLAGS", "-mod=mod"));
+    let tidy = go(&consumer, &["mod", "tidy"], &tidy_env);
+    assert!(
+        tidy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tidy.stderr)
+    );
+    let run = go(&consumer, &["run", "."], &goenv);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("OUT: FIXED-PATCHED"),
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let (code, so, se) = run_socket(
+        &consumer,
+        &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+        &modcache,
+    );
+    assert_eq!(code, 0, "in sync after go mod tidy:\n{so}\n{se}");
+
+    chmod_writable(tmp.path());
+}

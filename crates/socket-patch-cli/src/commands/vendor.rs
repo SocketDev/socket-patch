@@ -1236,6 +1236,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     } else {
         None
     };
+    let go_sync_issues = tokio::sync::OnceCell::new();
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1266,6 +1267,26 @@ async fn run_check(args: &VendorArgs) -> i32 {
             // `vex`'s `vendor_unwired`.
             if !discovery.vendor_entry_live(root, entry).await {
                 failure = Some(unwired_check_failure(discovery, root, key, entry).await);
+            }
+        }
+        // The committed copy and its `replace` can be intact while the
+        // project no longer builds: vendor/modules.txt or the go.mod
+        // requirements out of step with the `replace` (#343, #618).
+        if failure.is_none() && entry.ecosystem == "golang" {
+            if let Some((module, _)) = socket_patch_core::utils::purl::parse_golang_purl(key) {
+                let issues: Vec<String> = go_sync_issues
+                    .get_or_init(|| async {
+                        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new())
+                            .await
+                    })
+                    .await
+                    .iter()
+                    .filter(|issue| issue.module() == module)
+                    .map(ToString::to_string)
+                    .collect();
+                if !issues.is_empty() {
+                    failure = Some(issues.join("; "));
+                }
             }
         }
         if vendor::jvm::apply::upstream_unverified(entry) {
@@ -3775,6 +3796,19 @@ pub(crate) async fn vendor_records_reusing(
                 PatchEvent::new(PatchAction::Skipped, purl.clone())
                     .with_reason("package_not_installed", detail),
             );
+        }
+    }
+
+    // A vendored Go module builds only if the committed vendor/modules.txt
+    // and the go.mod requirements agree with its `replace` (#343, #618).
+    if !common.dry_run && records.keys().any(|p| p.starts_with("pkg:golang/")) {
+        for w in
+            crate::commands::apply::go_consumer_sync_warnings(&common.cwd, &HashMap::new()).await
+        {
+            if !common.json && !common.silent {
+                eprintln!("Warning: {}", w.detail);
+            }
+            env.warnings.push(w);
         }
     }
 

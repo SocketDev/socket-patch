@@ -2660,6 +2660,19 @@ pub(crate) async fn rollback_patches_inner(
         results.push(result);
     }
 
+    // Dropping a `replace` leaves a committed vendor/modules.txt recording
+    // it, which breaks every vendored build until it is regenerated (#343).
+    if !common.dry_run
+        && results
+            .iter()
+            .any(|r| r.success && is_local_go(&r.package_key, common))
+    {
+        let none = std::collections::HashMap::new();
+        for w in crate::commands::apply::go_consumer_sync_warnings(&common.cwd, &none).await {
+            warnings.push((w.code, w.detail));
+        }
+    }
+
     superseded_left.sort();
     superseded_left.dedup();
     Ok(RollbackOutcome {

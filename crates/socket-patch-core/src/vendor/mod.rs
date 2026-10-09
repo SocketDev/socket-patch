@@ -63,6 +63,7 @@ pub mod cargo_tag;
 pub(crate) mod common;
 pub mod composer_lock;
 pub mod gem;
+pub mod go_consumer_sync;
 pub mod go_mod_edit;
 pub mod go_sum_edit;
 pub mod golang;

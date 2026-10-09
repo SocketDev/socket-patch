@@ -327,7 +327,7 @@ fn rhs_is_path(tok: &str) -> bool {
 /// Parse the `module path => target [version]` body of a replace directive
 /// (the part after the `replace` keyword, or a line inside a `replace ( … )`
 /// block). Returns `None` if there is no `=>` (not a replace body).
-fn parse_replace_body(body: &str) -> Option<ReplaceEntry> {
+pub(crate) fn parse_replace_body(body: &str) -> Option<ReplaceEntry> {
     let (lhs, rhs) = body.split_once("=>")?;
     let lhs: Vec<&str> = lhs.split_whitespace().map(unquote).collect();
     let rhs: Vec<&str> = rhs.split_whitespace().map(unquote).collect();

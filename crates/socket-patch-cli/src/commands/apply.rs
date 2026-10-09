@@ -523,6 +523,26 @@ async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet
     }
 }
 
+/// The consumer-sync audit ([`go_consumer_sync::audit`]) of the project at
+/// `root` as run warnings: a committed `vendor/modules.txt` or a go.mod
+/// requirement set that no longer matches the socket `replace` directives,
+/// each naming the go command that fixes it.
+///
+/// [`go_consumer_sync::audit`]: socket_patch_core::vendor::go_consumer_sync::audit
+pub(crate) async fn go_consumer_sync_warnings(
+    root: &Path,
+    pristine_go_mods: &HashMap<String, PathBuf>,
+) -> Vec<RunWarning> {
+    socket_patch_core::vendor::go_consumer_sync::audit(root, pristine_go_mods)
+        .await
+        .into_iter()
+        .map(|issue| RunWarning {
+            code: issue.code().to_string(),
+            detail: issue.to_string(),
+        })
+        .collect()
+}
+
 /// Read-only verification that the manifest's patches are in place, for CI
 /// / GitHub-App auditing. Lock-free, fetch-free, offline-safe, and it never
 /// writes. Exits 0 when in sync, 1 on drift.
@@ -608,6 +628,21 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                     drifts.push((id, "go_redirect_drift".to_string(), d.to_string()));
                 }
             }
+            // The redirects can be intact while the project no longer
+            // builds: a committed vendor/modules.txt or the go.mod
+            // requirements out of step with them (#343, #618).
+            for issue in socket_patch_core::vendor::go_consumer_sync::audit(
+                &args.common.cwd,
+                &HashMap::new(),
+            )
+            .await
+            {
+                drifts.push((
+                    issue.module().to_string(),
+                    issue.code().to_string(),
+                    issue.to_string(),
+                ));
+            }
         }
     }
 
@@ -676,7 +711,14 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             for (_, _, detail) in &drifts {
                 eprintln!("  {detail}");
             }
-            eprintln!("Run `socket-patch apply` to regenerate them.");
+            // A go consumer-sync drift names its own go command; apply
+            // cannot regenerate vendor/modules.txt or go.sum.
+            if drifts.iter().any(|(_, code, _)| {
+                code != socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
+                    && code != socket_patch_core::vendor::go_consumer_sync::REQUIREMENTS_CODE
+            }) {
+                eprintln!("Run `socket-patch apply` to regenerate them.");
+            }
         }
         1
     }
@@ -2228,6 +2270,7 @@ async fn apply_patches_inner(
         });
     }
     let mut fallback_skips: Vec<FallbackHomeSkip> = Vec::new();
+    let mut go_pristine_mods: HashMap<String, PathBuf> = HashMap::new();
 
     // Multi-copy aware: npm nests genuine duplicates of one `name@version`
     // (nested dupes, diamonds, `file:` dups), so the resolver returns EVERY
@@ -2650,7 +2693,16 @@ async fn apply_patches_inner(
                     match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, policy)
                         .await
                     {
-                        Some(r) => r,
+                        Some(r) => {
+                            // The unpatched go.mod, so the consumer-sync
+                            // audit below can tell requirements the patch
+                            // added from ones upstream always had (#618).
+                            if let Some((module, _)) = parse_golang_purl(purl) {
+                                go_pristine_mods
+                                    .insert(module.into_owned(), pkg_path.join("go.mod"));
+                            }
+                            r
+                        }
                         None => {
                             apply_package_patch(
                                 purl,
@@ -2726,6 +2778,13 @@ async fn apply_patches_inner(
     print_lockfile_only_note(args, &unmatched, &lockfile_only);
 
     // The human summary is printed by `run`, after the per-package list.
+
+    // A redirect leaves the project building only if its committed
+    // `vendor/modules.txt` and its go.mod requirements still agree with the
+    // `replace` directives (#343, #618): name the regeneration step.
+    if !args.common.dry_run && eco_in_local_scope(&args.common, Ecosystem::Golang) {
+        run_warnings.extend(go_consumer_sync_warnings(&args.common.cwd, &go_pristine_mods).await);
+    }
 
     // Note: `apply` deliberately does NOT garbage-collect unused blobs in
     // `.socket/`. GC is the responsibility of `socket-patch repair` /

@@ -1575,6 +1575,26 @@ pub(crate) async fn run_redirect_selected(
     engine_warnings.extend(done.rush_warnings.iter().cloned());
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
     engine_warnings.extend(done.npm_warnings.iter().cloned());
+    // A hosted Go `replace` breaks a committed vendor/ directory until
+    // `go mod vendor` re-records it in vendor/modules.txt (#343).
+    if !common.dry_run
+        && done
+            .rewritten
+            .iter()
+            .any(|f| f == "go.mod" || f.ends_with("/go.mod"))
+    {
+        for w in crate::commands::apply::go_consumer_sync_warnings(
+            &common.cwd,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        {
+            engine_warnings.push(socket_patch_core::patch::redirect::RewriteWarning {
+                code: w.code,
+                detail: w.detail,
+            });
+        }
+    }
     let mut warnings: Vec<serde_json::Value> =
         socket_patch_core::hosted::render::rewrite_warnings_json(&engine_warnings);
     warnings.extend(gem_stale.warnings.iter().cloned());
