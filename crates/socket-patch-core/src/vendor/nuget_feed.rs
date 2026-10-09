@@ -1184,9 +1184,22 @@ async fn revert_config_record(
     //     two authored elements. Both are reproduced verbatim from the source
     //     key + uuid dir (the source `<add>`) and matched structurally by our
     //     source key (the mapping `<packageSource>`).
-    let nl = terminator(&live);
-    let source_add = format!("    <add key=\"{source_key}\" value=\"{uuid_dir_rel}\" />{nl}");
-    let mapping_block = excise_source_mapping(&live, source_key, nl);
+    // Vendor inserts LF lines, even into a CRLF file (which then has
+    // mixed endings until git converts it), so the LF spelling is tried
+    // first, then the file's own terminator (a `core.autocrlf` checkout).
+    let spelled = |nl: &str| {
+        (
+            format!("    <add key=\"{source_key}\" value=\"{uuid_dir_rel}\" />{nl}"),
+            excise_source_mapping(&live, source_key, nl),
+        )
+    };
+    let lf = spelled("\n");
+    let (source_add, mapping_block) =
+        if live.contains(&lf.0) || lf.1.is_some() || terminator(&live) == "\n" {
+            lf
+        } else {
+            spelled(terminator(&live))
+        };
     if !live.contains(&source_add) && mapping_block.is_none() {
         // (c) Neither authored element is present verbatim → drift, leave alone.
         return Ok(false);
@@ -2426,6 +2439,34 @@ mod tests {
             !after.replace("\r\n", "").contains('\n'),
             "CRLF kept: {after:?}"
         );
+    }
+
+    /// #537 review: an existing CRLF config gets our LF lines (mixed until
+    /// git converts it); a CRLF sibling edit sends the revert down the
+    /// excision path, which must still find our LF fragments.
+    #[tokio::test]
+    async fn revert_excises_lf_fragments_from_a_mixed_crlf_config() {
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<configuration>\r\n  <packageSources>\r\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\r\n  </packageSources>\r\n  <packageSourceMapping>\r\n    <packageSource key=\"nuget.org\">\r\n      <package pattern=\"*\" />\r\n    </packageSource>\r\n  </packageSourceMapping>\r\n</configuration>\r\n";
+        let (dir, blobs, installed, record) = fixture(true, Some(orig)).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        let cfg = root.join("nuget.config");
+        let wired = tokio::fs::read_to_string(&cfg).await.unwrap();
+        let sibling = wired.replacen(
+            "  </packageSources>",
+            "    <add key=\"corp\" value=\"https://corp.example/v3/index.json\" />\r\n  </packageSources>",
+            1,
+        );
+        tokio::fs::write(&cfg, &sibling).await.unwrap();
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact);
+        let after = tokio::fs::read_to_string(&cfg).await.unwrap();
+        assert!(!after.contains(UUID), "{after}");
+        assert!(after.contains("key=\"corp\""), "{after}");
     }
 
     /// #537: a config left wired (drift-kept, it still routes to the feed)
