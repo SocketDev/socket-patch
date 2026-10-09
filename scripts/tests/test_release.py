@@ -684,7 +684,7 @@ class TrainScenarioTests(unittest.TestCase):
         self.assertNotIn("-rc.", synced)
 
     def test_sync_main_on_a_working_tree_stamps_the_newest_tag(self):
-        copy_packaging(self.repo.root)
+        copy_packaging(self.repo.root, baseline="4.0.0")
         self.repo.write(TRAIN)
         self.repo.commit("packaging")
         self.repo.git("tag", "-f", "v4.0.0")

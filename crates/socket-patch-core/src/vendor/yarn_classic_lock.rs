@@ -36,18 +36,18 @@ use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::terminator;
 use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{already_patched_result, detect_eol, refused};
+use super::common::refused;
 use super::npm_common::{
-    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
+    guard_revert_uuid_dir, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend, NpmStagedPack,
+    NpmVendorRequest, WireCx,
 };
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
-use super::state::{
-    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
-};
+use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 const YARN_LOCK: &str = "yarn.lock";
@@ -61,7 +61,8 @@ const KIND_LOCK_BLOCK: &str = "yarn_lock_block";
 /// Same contract as [`super::npm_lock::vendor_npm`]: refuse-early, wire-last
 /// (every refusal fires before any write inside the project; the lock edit is
 /// the final mutation), `entry` is `None` for dry runs and the in-sync
-/// re-run.
+/// re-run. The flow is [`vendor_npm_family`]'s; [`YarnClassicBackend`] is
+/// the v1 lock grammar.
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_yarn_classic<'a>(
     purl: &str,
@@ -74,202 +75,162 @@ pub async fn vendor_yarn_classic<'a>(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
-    let installed_dir = installed_dir.into();
-    let mut warnings: Vec<VendorWarning> = Vec::new();
-
-    // ── 1. Coordinates (shared fail-closed guard, before any disk access) ─
-    let coords = match guard_coordinates(purl, record) {
-        Ok(coords) => coords,
-        Err(outcome) => return *outcome,
-    };
-    let (name, version) = (coords.name.as_str(), coords.version.as_str());
-    let uuid_dir_rel = coords.uuid_dir_rel;
-    let base_purl = coords.base_purl;
-
-    // ── 2. Lockfile ───────────────────────────────────────────────────────
-    let lock_path = project_root.join(YARN_LOCK);
-    let text = match read_yarn_lock(project_root).await {
-        Ok(t) => t,
-        Err(outcome) => return *outcome,
-    };
-    if let Err(outcome) = refuse_berry_lock(&text) {
-        return *outcome;
-    }
-
-    // ── 3. Find the rewritable blocks (pre-flight, BEFORE staging) ────────
-    let blocks = scan_blocks_shared(&text);
-    let candidate_keys = match rewritable_candidates(&blocks, name, version) {
-        Ok((keys, skipped)) => {
-            warnings.extend(skipped);
-            keys
-        }
-        Err(outcome) => return *outcome,
-    };
-    drop(blocks);
-
-    // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline) ───────
-    let (staged, result) = match stage_patch_pack(
-        purl,
-        installed_dir,
-        project_root,
-        record,
-        sources,
-        dry_run,
-        force,
-        &mut warnings,
-        service,
+    vendor_npm_family(
+        &YarnClassicBackend,
+        NpmVendorRequest {
+            purl,
+            installed_dir: installed_dir.into(),
+            project_root,
+            record,
+            sources,
+            vendored_at,
+            dry_run,
+            force,
+            service,
+        },
     )
     .await
-    {
-        Ok(pair) => pair,
-        Err(outcome) => return *outcome,
-    };
-    let Some(staged) = staged else {
-        // Failed patch (no lock writes — wiring is last) or a dry run.
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
-    };
-    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
-    let rel_tgz = staged.rel_tgz;
-    let packed = staged.packed;
-    let staged_pkg_json = staged.staged_pkg_json;
-    let dest = project_root.join(&rel_tgz);
-    // SECURITY/CORRECTNESS: the `file:./` prefix is load-bearing — a bare
-    // path is registry-relative to yarn classic (spike Y2: 404).
-    let resolved_value = format!("file:./{rel_tgz}#{}", packed.sha1_hex);
+}
 
-    // ── 8. Lock rewrite: splice each candidate block, byte-preserving ─────
-    let eol = detect_eol(&text);
-    let mut new_text = text;
-    let mut wiring: Vec<WiringRecord> = Vec::new();
-    for key in &candidate_keys {
-        let edit = {
-            // While nothing has been spliced yet, `new_text` is still the
-            // text scanned above and every candidate hits that scan — the
-            // whole idempotent re-run takes this arm. Once a splice has
-            // rewritten it, each key sees text no later read can ask for
-            // again, so scan it without paying the memo's copy of it.
-            let blocks = if wiring.is_empty() {
-                scan_blocks_shared(&new_text)
-            } else {
-                Arc::new(scan_blocks(&new_text))
-            };
-            let Some(block) = blocks.iter().find(|b| &b.key == key) else {
-                return done_failure_unstage(
-                    purl,
-                    format!("lock block `{key}` vanished mid-rewrite"),
-                    project_root,
-                    &uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await;
-            };
-            let new_lines = rewrite_classic_block(
-                &block.lines,
-                &resolved_value,
-                &packed.integrity,
-                staged_pkg_json.as_ref(),
-            );
-            if new_lines == block.lines {
-                // Idempotency: already carrying our exact spec — no edit, no
-                // wiring record.
-                None
-            } else {
-                // Never record one of our own (stale) edits as the
-                // "original" — revert must restore the pre-vendor registry
-                // fragment, not a dangling `.socket/vendor/` pointer.
-                let was_vendored = block_points_into_vendor(&block.lines);
-                let rec = WiringRecord {
-                    file: YARN_LOCK.to_string(),
-                    kind: KIND_LOCK_BLOCK.to_string(),
-                    action: WiringAction::Rewritten,
-                    key: Some(key.clone()),
-                    original: if was_vendored {
-                        None
-                    } else {
-                        Some(lines_to_json(&block.lines))
-                    },
-                    new: Some(lines_to_json(&new_lines)),
-                };
-                Some((replace_block(&new_text, block, &new_lines, eol), rec))
-            }
-        };
-        if let Some((replaced, rec)) = edit {
-            new_text = replaced;
-            wiring.push(rec);
-        }
+/// The yarn-classic half of [`vendor_yarn_classic`].
+struct YarnClassicBackend;
+
+/// [`YarnClassicBackend`]'s pre-flight product: the lock text and the keys
+/// of the blocks to rewrite.
+struct YarnClassicPlan {
+    text: String,
+    candidate_keys: Vec<String>,
+}
+
+impl NpmLockBackend for YarnClassicBackend {
+    type Plan = YarnClassicPlan;
+
+    fn flavor(&self) -> Option<&'static str> {
+        Some("yarn-classic")
     }
-    if staged_pkg_json.is_some() && !wiring.is_empty() {
-        warnings.push(VendorWarning::new(
+
+    async fn preflight(
+        &self,
+        project_root: &Path,
+        coords: &NpmCoords,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<YarnClassicPlan, Box<VendorOutcome>> {
+        // ── 2. Lockfile ───────────────────────────────────────────────────
+        let text = read_yarn_lock(project_root).await?;
+        refuse_berry_lock(&text)?;
+
+        // ── 3. Find the rewritable blocks (pre-flight, BEFORE staging) ────
+        let blocks = scan_blocks_shared(&text);
+        let other_name =
+            other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version).await;
+        let (candidate_keys, skipped) =
+            rewritable_candidates(&blocks, &coords.name, &coords.version).map_err(|o| {
+                only_other_name_copies(o, &blocks, &coords.name, &coords.version, &other_name)
+            })?;
+        warnings.extend(skipped);
+        warnings.extend(other_name);
+        Ok(YarnClassicPlan {
+            text,
+            candidate_keys,
+        })
+    }
+
+    async fn wire(
+        &self,
+        plan: YarnClassicPlan,
+        cx: &WireCx<'_>,
+        staged: &mut NpmStagedPack,
+        _warnings: &mut Vec<VendorWarning>,
+    ) -> Result<Option<NpmCommit>, String> {
+        let YarnClassicPlan {
+            text,
+            candidate_keys,
+        } = plan;
+        // SECURITY/CORRECTNESS: the `file:./` prefix is load-bearing — a
+        // bare path is registry-relative to yarn classic (spike Y2: 404).
+        let resolved_value = format!("file:./{}#{}", staged.rel_tgz, staged.packed.sha1_hex);
+
+        // ── 8. Lock rewrite: splice each candidate block, byte-preserving ─
+        let eol = terminator(&text);
+        let mut new_text = text;
+        let mut wiring: Vec<WiringRecord> = Vec::new();
+        for key in &candidate_keys {
+            let edit = {
+                // While nothing has been spliced yet, `new_text` is still the
+                // text scanned above and every candidate hits that scan — the
+                // whole idempotent re-run takes this arm. Once a splice has
+                // rewritten it, each key sees text no later read can ask for
+                // again, so scan it without paying the memo's copy of it.
+                let blocks = if wiring.is_empty() {
+                    scan_blocks_shared(&new_text)
+                } else {
+                    Arc::new(scan_blocks(&new_text))
+                };
+                let Some(block) = blocks.iter().find(|b| &b.key == key) else {
+                    return Err(format!("lock block `{key}` vanished mid-rewrite"));
+                };
+                let new_lines = rewrite_classic_block(
+                    &block.lines,
+                    &resolved_value,
+                    &staged.packed.integrity,
+                    staged.staged_pkg_json.as_ref(),
+                );
+                if new_lines == block.lines {
+                    // Idempotency: already carrying our exact spec — no edit,
+                    // no wiring record.
+                    None
+                } else {
+                    // Never record one of our own (stale) edits as the
+                    // "original" — revert must restore the pre-vendor
+                    // registry fragment, not a dangling `.socket/vendor/`
+                    // pointer.
+                    let was_vendored = block_points_into_vendor(&block.lines);
+                    let rec = WiringRecord {
+                        file: YARN_LOCK.to_string(),
+                        kind: KIND_LOCK_BLOCK.to_string(),
+                        action: WiringAction::Rewritten,
+                        key: Some(key.clone()),
+                        original: if was_vendored {
+                            None
+                        } else {
+                            Some(lines_to_json(&block.lines))
+                        },
+                        new: Some(lines_to_json(&new_lines)),
+                    };
+                    Some((replace_block(&new_text, block, &new_lines, eol), rec))
+                }
+            };
+            if let Some((replaced, rec)) = edit {
+                new_text = replaced;
+                wiring.push(rec);
+            }
+        }
+
+        if wiring.is_empty() {
+            // Every block already points at this uuid with the packed
+            // hashes (`#sha1` and `integrity`): in sync.
+            return Ok(None);
+        }
+
+        forget_block_scans();
+        atomic_write_bytes_preserving_mode(&cx.project_root.join(YARN_LOCK), new_text.as_bytes())
+            .await
+            .map_err(|e| format!("cannot write {YARN_LOCK}: {e}"))?;
+        Ok(Some(NpmCommit {
+            wiring,
+            ..NpmCommit::default()
+        }))
+    }
+
+    fn manifest_warning(&self, name: &str, version: &str) -> VendorWarning {
+        VendorWarning::new(
             "vendor_dep_manifest_rewritten",
             format!(
                 "the patch rewrites {name}@{version}'s package.json; its lock blocks' \
                  dependencies/optionalDependencies sub-maps were recomputed from the patched \
                  manifest"
             ),
-        ));
-    }
-
-    if wiring.is_empty() {
-        // Every block already points at this uuid with the packed hashes:
-        // in sync. `#sha1` and `integrity` were derived from the reused
-        // committed tarball (or, when reuse missed, from a fresh acquisition
-        // that reproduced them); touch nothing and synthesize
-        // AlreadyPatched.
-        return VendorOutcome::Done {
-            result: already_patched_result(purl, &dest, &record.files),
-            entry: None,
-            warnings,
-        };
-    }
-
-    forget_block_scans();
-    if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, new_text.as_bytes()).await {
-        return done_failure_unstage(
-            purl,
-            format!("cannot write {YARN_LOCK}: {e}"),
-            project_root,
-            &uuid_dir_rel,
-            uuid_dir_preexisted,
         )
-        .await;
-    }
-
-    // ── 9. Marker + ledger entry ──────────────────────────────────────────
-    let marker = VendorMarker::new("npm", &base_purl, record, vendored_at);
-    write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
-
-    let entry = VendorEntry {
-        ecosystem: "npm".to_string(),
-        base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: rel_tgz,
-            sha256: packed.sha256_hex,
-            size: Some(packed.size),
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: Some("yarn-classic".to_string()),
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    };
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
     }
 }
 
@@ -382,6 +343,108 @@ fn rewritable_candidates(
     Ok((candidate_keys, skipped))
 }
 
+/// A named warning for each block that installs `name@version` under
+/// ANOTHER dependency name (#1236): yarn 1 keys a `file:` directory or url
+/// copy by the name the depender gave it (`"lp2@file:./lpdir"`), so which
+/// package it is comes from the copy itself (the directory's
+/// `package.json`, the registry url's path). No re-lock of `name` reaches
+/// that copy, so it stays unpatched; the registry blocks are still wired.
+async fn other_name_copy_warnings(
+    project_root: &Path,
+    blocks: &[LockBlock],
+    name: &str,
+    version: &str,
+) -> Vec<VendorWarning> {
+    let mut out = Vec::new();
+    for block in blocks {
+        let patterns = split_key_patterns(&block.key);
+        if classic_key_real_name(&patterns) == Some(name)
+            || classic_field(&block.lines, "version") != Some(version)
+        {
+            continue;
+        }
+        let manifest = crate::formats::yarn::source::classic_file_directory(&patterns).map(|dir| {
+            if dir.is_empty() {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            }
+        });
+        let text = match manifest {
+            Some(rel) => read_regular_to_string(&project_root.join(&rel)).await.ok(),
+            None => None,
+        };
+        let copy = crate::formats::yarn::source::classic_copy_real_name(
+            &patterns,
+            classic_field(&block.lines, "resolved"),
+            version,
+            |_| text.clone(),
+        );
+        let Some((_, source)) = copy.filter(|(n, _)| n == name) else {
+            continue;
+        };
+        let (code, from) = match source {
+            CopySource::Directory => (
+                "vendor_link_entry_skipped",
+                "a file: directory, which yarn copies into node_modules",
+            ),
+            _ => (
+                "vendor_yarn_classic_non_registry_entry_skipped",
+                "a URL tarball",
+            ),
+        };
+        out.push(VendorWarning::new(
+            code,
+            format!(
+                "lock entry `{}` installs {name}@{version} under another dependency name, \
+                 from {from}; vendoring can't rewire it, so this copy stays UNPATCHED",
+                block.key
+            ),
+        ));
+    }
+    out
+}
+
+/// A `vendor_lock_entry_not_found` refusal of a package whose only copies
+/// are locked under ANOTHER dependency name ([`other_name_copy_warnings`])
+/// becomes `vendor_lock_entry_not_rewritable` naming them: the package IS
+/// installed, and `yarn install` can't re-lock those copies to it (#1236).
+/// A block of the package under its OWN name (one with no `resolved`,
+/// which `yarn install` does re-lock) keeps the "not found" remedy. Any
+/// other refusal passes through.
+fn only_other_name_copies(
+    refusal: Box<VendorOutcome>,
+    blocks: &[LockBlock],
+    name: &str,
+    version: &str,
+    other_name: &[VendorWarning],
+) -> Box<VendorOutcome> {
+    if other_name.is_empty()
+        || has_own_name_block(blocks, name, version)
+        || super::npm_common::refusal_code(&refusal) != "vendor_lock_entry_not_found"
+    {
+        return refusal;
+    }
+    let details: Vec<&str> = other_name.iter().map(|w| w.detail.as_str()).collect();
+    Box::new(refused(
+        "vendor_lock_entry_not_rewritable",
+        format!(
+            "every {YARN_LOCK} block for {name}@{version} is a copy locked under another \
+             dependency name, which vendoring can't rewire — those copies stay UNPATCHED and \
+             `yarn install` will not help: {}",
+            details.join("; ")
+        ),
+    ))
+}
+
+/// Whether any block locks `name@version` under the package's own name.
+fn has_own_name_block(blocks: &[LockBlock], name: &str, version: &str) -> bool {
+    blocks.iter().any(|b| {
+        classic_key_real_name(&split_key_patterns(&b.key)) == Some(name)
+            && classic_field(&b.lines, "version") == Some(version)
+    })
+}
+
 /// The lock as [`vendor_yarn_classic`]'s step 2 leaves it: read, re-sniffed
 /// and scanned into blocks. Read once for the vendor loop's download plan
 /// ([`preflight_packages`]); the loop itself runs the same steps inline,
@@ -412,16 +475,34 @@ pub(crate) async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Result<(), &'static str>> {
-    super::npm_common::gate_packages(
-        read_project(project_root).await,
-        packages,
-        |project, coords| {
-            let (name, version) = (coords.name.as_str(), coords.version.as_str());
-            rewritable_candidates(&project.blocks, name, version)
-                .map(drop)
-                .map_err(|o| super::npm_common::refusal_code(&o))
-        },
-    )
+    let project = read_project(project_root).await;
+    let blocks = project.as_ref().ok().map(|p| Arc::clone(&p.blocks));
+    let mut gated = super::npm_common::gate_packages(project, packages, |project, coords| {
+        let (name, version) = (coords.name.as_str(), coords.version.as_str());
+        rewritable_candidates(&project.blocks, name, version)
+            .map(drop)
+            .map_err(|o| super::npm_common::refusal_code(&o))
+    });
+    // The loop's step 3 turns "not found" into "not rewritable" when the
+    // package's only copies are locked under another name; so does the plan.
+    if let Some(blocks) = blocks {
+        for ((purl, record), gate) in packages.iter().zip(gated.iter_mut()) {
+            if *gate != Err("vendor_lock_entry_not_found") {
+                continue;
+            }
+            let Ok(coords) = super::npm_common::guard_coordinates(purl, record) else {
+                continue;
+            };
+            if !has_own_name_block(&blocks, &coords.name, &coords.version)
+                && !other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version)
+                    .await
+                    .is_empty()
+            {
+                *gate = Err("vendor_lock_entry_not_rewritable");
+            }
+        }
+    }
+    gated
 }
 
 /// Undo one yarn-classic vendored package: restore the recorded lock blocks
@@ -1384,6 +1465,40 @@ left-pad@^1.3.0:
         );
     }
 
+    /// #920: the `package.json` advisory is emitted once, by the run that
+    /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
+    /// AlreadyPatched.
+    #[tokio::test]
+    async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
+        let mut fx = fixture_with_lock(Y2_BEFORE).await;
+        let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let after: &[u8] =
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^1.0.0"}}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash,
+            },
+        );
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code.starts_with("vendor_dep_manifest"))
+                .count()
+        };
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_none(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
+    }
+
     /// Twin of npm_lock's relock re-pin test: a relock back to the registry
     /// block, re-pinned from the REUSED tarball (no request under the
     /// outage), recomputes the dependency sub-maps from the reused bytes'
@@ -1512,11 +1627,7 @@ left-pad@^1.3.0:
             .filter(|&c| c != "vendor_prebuilt_downloaded")
             .collect();
         assert_eq!(codes, ["vendor_yarn_classic_non_registry_legacy_wiring"]);
-        let detail = &warnings
-            .iter()
-            .find(|w| w.code == codes[0])
-            .unwrap()
-            .detail;
+        let detail = &warnings.iter().find(|w| w.code == codes[0]).unwrap().detail;
         assert!(
             detail.contains("host.test/fork")
                 && detail.contains("vendor --revert")
@@ -1577,6 +1688,97 @@ left-pad@^1.3.0:
         let text = fx.lock_text().await;
         assert!(text.contains("\"left-pad@link:../somewhere\":\n  version \"1.3.0\""));
         assert!(text.contains("\"left-pad@file:./local-left-pad\":\n  version \"1.3.0\""));
+    }
+
+    /// #1236: yarn 1 locks a `file:` directory or url copy under the
+    /// DEPENDENCY name, so a copy of left-pad@1.3.0 declared as `lp2` is
+    /// read from the copy itself and named; the registry block is still
+    /// wired and the copy stays byte-untouched. Control: a directory
+    /// holding another package is not named.
+    #[tokio::test]
+    async fn issue_1236_other_name_copies_are_named() {
+        let extra = r#"
+"lp2@file:./lpdir":
+  version "1.3.0"
+
+"lp3@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz":
+  version "1.3.0"
+  resolved "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz#bbbb"
+"#;
+        let lock = format!("{Y2_BEFORE}{extra}");
+        for (fork, named) in [("left-pad", true), ("other-pkg", false)] {
+            let fx = fixture_with_lock(&lock).await;
+            tokio::fs::create_dir_all(fx.root().join("lpdir"))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                fx.root().join("lpdir/package.json"),
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            )
+            .await
+            .unwrap();
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(entry.unwrap().wiring.len(), 1, "the registry block");
+            let dir: Vec<&VendorWarning> = warnings
+                .iter()
+                .filter(|w| w.code == "vendor_link_entry_skipped" && w.detail.contains("lp2@"))
+                .collect();
+            assert_eq!(dir.len(), usize::from(named), "{fork}: {warnings:?}");
+            let url: Vec<&VendorWarning> = warnings
+                .iter()
+                .filter(|w| {
+                    w.code == "vendor_yarn_classic_non_registry_entry_skipped"
+                        && w.detail.contains("lp3@")
+                })
+                .collect();
+            assert_eq!(url.len(), 1, "{fork}: {warnings:?}");
+            let text = fx.lock_text().await;
+            assert!(text.contains("\"lp2@file:./lpdir\":\n  version \"1.3.0\""));
+        }
+    }
+
+    /// #1236 (review): when left-pad@1.3.0 is locked ONLY under another
+    /// dependency name, vendoring refuses `vendor_lock_entry_not_rewritable`
+    /// naming that copy, in the loop and in the download plan alike, not
+    /// `vendor_lock_entry_not_found` with a `yarn install` remedy that
+    /// can't help. Control: a directory holding another package is still
+    /// "not found".
+    #[tokio::test]
+    async fn issue_1236_only_other_name_copies_are_refused_as_not_rewritable() {
+        let lock = "# yarn lockfile v1\n\n\n\"lp2@file:./lpdir\":\n  version \"1.3.0\"\n";
+        // Review: beside a same-name block with no `resolved`, which
+        // `yarn install` does re-lock, "not found" and its remedy stand.
+        let with_unresolved = format!("{lock}\nleft-pad@^1.3.0:\n  version \"1.3.0\"\n");
+        for (lock, fork, code) in [
+            (lock, "left-pad", "vendor_lock_entry_not_rewritable"),
+            (lock, "other-pkg", "vendor_lock_entry_not_found"),
+            (
+                with_unresolved.as_str(),
+                "left-pad",
+                "vendor_lock_entry_not_found",
+            ),
+        ] {
+            let fx = fixture_with_lock(lock).await;
+            tokio::fs::create_dir_all(fx.root().join("lpdir"))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                fx.root().join("lpdir/package.json"),
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            )
+            .await
+            .unwrap();
+            let detail = expect_refused(fx.vendor(false).await, code);
+            if code == "vendor_lock_entry_not_rewritable" {
+                assert!(detail.contains("lp2@file:./lpdir"), "{detail}");
+                assert!(detail.contains("yarn install` will not help"), "{detail}");
+            }
+            assert_eq!(fx.lock_text().await, lock);
+            let pre =
+                preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+            assert_eq!(pre, vec![Err(code)], "{fork}");
+        }
     }
 
     #[tokio::test]
@@ -2283,6 +2485,16 @@ left-pad@^1.3.0:
         let last = "x:\r\n  v: 1\r\n\r\ny:";
         let blocks = scan_blocks(last);
         assert_eq!(block_eol(last, &blocks[1]), "\r\n");
+        // In a mixed lock that fallback is the majority break, the same
+        // `line_endings::terminator` the forward splice uses.
+        for (mixed, eol) in [
+            ("x:\r\n  v: 1\n\ny:", "\n"),
+            ("x:\r\n  v: 1\r\n\ny:", "\r\n"),
+        ] {
+            let blocks = scan_blocks(mixed);
+            assert_eq!(block_eol(mixed, &blocks[1]), eol, "{mixed:?}");
+            assert_eq!(terminator(mixed), eol, "{mixed:?}");
+        }
     }
 
     /// A second canonical uuid, distinct from [`UUID`], for re-vendor tests.

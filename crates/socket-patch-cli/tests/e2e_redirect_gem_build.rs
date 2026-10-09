@@ -95,6 +95,10 @@
 //! below the arm's floor; everything after that is hard — no live network is
 //! involved at all.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -106,8 +110,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/bundler_e2e.rs"]
 mod bundler_e2e;
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -146,10 +149,6 @@ fn patched_lib() -> String {
 const TINY_LIB: &str = "module TinyDep\n  VALUE = \"tiny-ok\"\nend\n";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run the socket-patch binary with the ambient `SOCKET_*` surface scrubbed
 /// (a developer's `SOCKET_DRY_RUN=1` must not steer the assertions) and
@@ -1912,6 +1911,294 @@ async fn gem_get_uuid_hosted_fresh_checkout_bundle_install() {
     manifestless_vex_matrix(&fx, &fresh).await;
 }
 
+/// One patched gem a later patch generation serves: its uuid, the patched
+/// `.gem`, and the lib file's before/after bytes for the view record.
+struct GenerationGem {
+    name: &'static str,
+    uuid: &'static str,
+    deps: Vec<String>,
+    lib_file: &'static str,
+    orig: String,
+    patched: String,
+    gem: Vec<u8>,
+}
+
+/// Layer a new patch generation over the fixture's API mocks (wiremock
+/// serves the lowest `priority` first): the batch, by-package, reference and
+/// view routes answer with `gems`, and each uuid gets its own patch-registry
+/// compact index under the fixture's grant token.
+async fn mount_patch_generation(server: &MockServer, priority: u8, gems: &[GenerationGem]) {
+    let purl = |g: &GenerationGem| format!("pkg:gem/{}@{DEP_VERSION}", g.name);
+    for g in gems {
+        mount_compact_index(
+            server,
+            &format!("/patch-registry/gem/{TOKEN}/{}", g.uuid),
+            &[IndexGem {
+                name: g.name,
+                version: DEP_VERSION,
+                deps: g.deps.clone(),
+                gem: g.gem.clone(),
+            }],
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{}", g.uuid)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": g.uuid,
+                "purl": purl(g),
+                "publishedAt": "2026-02-01T00:00:00Z",
+                "files": {
+                    format!("lib/{}", g.lib_file): {
+                        "beforeHash": compute_git_sha256_from_bytes(g.orig.as_bytes()),
+                        "afterHash": compute_git_sha256_from_bytes(g.patched.as_bytes()),
+                    }
+                },
+                "vulnerabilities": {
+                    GHSA: {
+                        "cves": ["CVE-2026-3333"],
+                        "summary": "gem redirect capstone vuln",
+                        "severity": "high",
+                        "description": "d"
+                    }
+                },
+                "description": "x", "license": "MIT", "tier": "free"
+            })))
+            .with_priority(priority)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.*{}.*$",
+                g.name
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "patches": [{
+                    "uuid": g.uuid, "purl": purl(g),
+                    "publishedAt": "2026-02-01T00:00:00Z",
+                    "description": "x", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .with_priority(priority)
+            .mount(server)
+            .await;
+    }
+    let packages: Vec<serde_json::Value> = gems
+        .iter()
+        .map(|g| {
+            serde_json::json!({
+                "purl": purl(g),
+                "patches": [{
+                    "uuid": g.uuid, "purl": purl(g), "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "gem redirect capstone fixture"
+                }]
+            })
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": packages,
+            "canAccessPaidPatches": false,
+        })))
+        .with_priority(priority)
+        .mount(server)
+        .await;
+    let results: serde_json::Map<String, serde_json::Value> = gems
+        .iter()
+        .map(|g| {
+            let sha = sha256_hex(&g.gem);
+            let hosted_url = format!(
+                "{}/patch/gem/{}/{DEP_VERSION}/{TOKEN}/{}/{}-{DEP_VERSION}.gem",
+                server.uri(),
+                g.name,
+                g.uuid,
+                g.name
+            );
+            let index_url = format!("{}/patch-registry/gem/{TOKEN}/{}/", server.uri(), g.uuid);
+            (
+                g.uuid.to_string(),
+                serde_json::json!({
+                    "status": "granted",
+                    "url": hosted_url,
+                    "purl": purl(g),
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": hosted_url,
+                        "integrity": { "sha256": sha }
+                    }],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": index_url,
+                        "identifiers": {
+                            "name": g.name,
+                            "version": DEP_VERSION,
+                            "gemChecksumSha256": sha,
+                        }
+                    }
+                }),
+            )
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results })),
+        )
+        .with_priority(priority)
+        .mount(server)
+        .await;
+}
+
+/// The `remote:` URLs of a lock's `GEM` sections, in file order.
+fn gem_remotes(lock: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut in_gem = false;
+    for line in lock.lines() {
+        if !line.starts_with(' ') && !line.is_empty() {
+            in_gem = line == "GEM";
+        } else if let Some(url) = line.strip_prefix("  remote: ").filter(|_| in_gem) {
+            out.push(url);
+        }
+    }
+    out
+}
+
+/// #1186: two gems hosted in their own patch-registry `GEM` sections, then a
+/// superseding patch for one of them whose new uuid sorts AFTER its
+/// sibling. The re-scan must move the refreshed section to where bundler
+/// writes it (sections sorted by remote URL): a converged CHECKSUMS lock
+/// that `bundle lock` leaves byte-identical and a cold frozen install
+/// accepts. An in-place refresh left the sections out of order, and every
+/// frozen install on bundler 4.0.19+ exited 16 ("Your lockfile needs to be
+/// updated, but it can't be because frozen mode is set").
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_superseding_patch_keeps_gem_sections_in_bundler_order() {
+    let Some(fx) = redirect_scanned_project(
+        "supersede-section-order",
+        Spelling::Gemfile,
+        true,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    const VULN_GEN2: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    const TINY_GEN2: &str = "80000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    const VULN_GEN3: &str = "9a9a9a9a-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let stage = fx.tmp.path().join("generation-stage");
+    let vuln = |uuid: &'static str, lib: String| {
+        let gem = build_gem(
+            &stage.join(uuid),
+            DEP,
+            DEP_VERSION,
+            "vuln_gem.rb",
+            &lib,
+            &[TRANSITIVE],
+        );
+        GenerationGem {
+            name: DEP,
+            uuid,
+            deps: vec![format!("{TRANSITIVE}:>= 0")],
+            lib_file: "vuln_gem.rb",
+            orig: orig_lib(),
+            patched: lib,
+            gem,
+        }
+    };
+    let tiny_patched = TINY_LIB.replace("tiny-ok", "tiny-patched");
+    let tiny = GenerationGem {
+        name: TRANSITIVE,
+        uuid: TINY_GEN2,
+        deps: vec![],
+        lib_file: "tiny_dep.rb",
+        orig: TINY_LIB.to_string(),
+        patched: tiny_patched.clone(),
+        gem: build_gem(
+            &stage.join(TINY_GEN2),
+            TRANSITIVE,
+            "1.0.0",
+            "tiny_dep.rb",
+            &tiny_patched,
+            &[],
+        ),
+    };
+    let server = fx._server.uri();
+    let registry = |uuid: &str| format!("{server}/patch-registry/gem/{TOKEN}/{uuid}/");
+    let upstream = format!("{server}/upstream/");
+    let lock_path = fx.proj.join(fx.lock_name);
+    let scan = |what: &str| {
+        let (code, stdout, stderr) = run_hosted_scan(&fx.proj, &server);
+        assert_eq!(
+            code, 0,
+            "{what} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        std::fs::read_to_string(&lock_path).unwrap()
+    };
+
+    // Generation 2: both gems hosted, each in its own section, inserted
+    // sorted (the path that already worked).
+    let tiny_gem = tiny.gem.clone();
+    mount_patch_generation(&fx._server, 2, &[vuln(VULN_GEN2, patched_lib()), tiny]).await;
+    let lock = scan("generation-2 scan");
+    assert_eq!(
+        gem_remotes(&lock),
+        [registry(VULN_GEN2), registry(TINY_GEN2), upstream.clone()],
+        "generation 2 sections:\n{lock}"
+    );
+
+    // Generation 3: a superseding patch for vuln-gem only (same version,
+    // new bytes) whose uuid sorts after tiny-dep's section.
+    let gen3_lib = patched_lib().replace("PATCHED", "PATCHED-GEN3");
+    assert_ne!(gen3_lib, patched_lib(), "generation 3 must change bytes");
+    let tiny = GenerationGem {
+        name: TRANSITIVE,
+        uuid: TINY_GEN2,
+        deps: vec![],
+        lib_file: "tiny_dep.rb",
+        orig: TINY_LIB.to_string(),
+        patched: tiny_patched,
+        gem: tiny_gem,
+    };
+    mount_patch_generation(&fx._server, 1, &[vuln(VULN_GEN3, gen3_lib), tiny]).await;
+    let lock = scan("generation-3 scan");
+    assert_eq!(
+        gem_remotes(&lock),
+        [registry(TINY_GEN2), registry(VULN_GEN3), upstream.clone()],
+        "the superseded section must move to bundler's sorted position:\n{lock}"
+    );
+
+    // Bundler agrees: `bundle lock` re-renders the committed lock
+    // byte-identically, and a cold frozen install accepts it.
+    let relock = stage_fresh_checkout(&fx, "fresh-relock");
+    let out = bundle(&relock, &["lock"]);
+    assert!(
+        out.status.success(),
+        "bundle lock failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(relock.join(fx.lock_name)).unwrap(),
+        lock,
+        "bundle lock must leave the converged lock byte-identical"
+    );
+    let fresh = stage_fresh_checkout(&fx, "fresh-frozen");
+    let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    let stderr = String::from_utf8_lossy(&install.stderr);
+    assert!(
+        install.status.success() && !stderr.contains("Cannot write a changed lockfile"),
+        "cold frozen install must accept the lock unchanged.\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&install.stdout),
+    );
+}
+
 /// Bundler's modern `gems.rb`/`gems.locked` spelling, end to end: the
 /// candidate list must read the pair, the rewriter must key its edits to it,
 /// and the real bundler must install the patched gem from the redirected
@@ -2822,4 +3109,362 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
         ..fx
     };
     manifestless_vex_matrix(&rotated, &fresh).await;
+}
+
+/// `scan --mode hosted --json --yes --max-new-patches <cap>`: one capped
+/// gradual-rollout run. Returns the parsed envelope.
+fn run_capped_hosted_scan(proj: &Path, api: &str, cap: &str) -> serde_json::Value {
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--max-new-patches",
+            cap,
+            "--cwd",
+            proj.to_str().expect("utf8 tmp path"),
+            "--api-url",
+            api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "capped scan (--max-new-patches {cap}) failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    serde_json::from_str(&stdout).expect("capped scan envelope JSON")
+}
+
+/// The rollout counts of a capped scan envelope, as `(new, upgrade,
+/// already, deferred)`.
+fn rollout_counts(env: &serde_json::Value) -> (u64, u64, u64, u64) {
+    let c = &env["rollout"]["counts"];
+    let n = |k: &str| c[k].as_u64().unwrap_or_else(|| panic!("counts.{k}: {env}"));
+    (n("new"), n("upgrade"), n("already"), n("deferred"))
+}
+
+/// #1224: on a lock with no CHECKSUMS section (bundler < 2.6, or an older
+/// lock bundler 4 keeps without one) the hosted redirect wires only the
+/// Gemfile's `source "<patch registry>" do` block and leaves the lock for
+/// the next unfrozen install. A capped re-scan must still count that pin as
+/// ALREADY: `--max-new-patches 0` must not defer it, and under a cap of 1
+/// the run after the first must spend its slot on the NEXT gem instead of
+/// re-counting the wired one as NEW forever.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_capped_rescan_counts_a_gemfile_only_pin_as_already() {
+    let Some(fx) = redirect_scanned_project(
+        "capped-gemfile-only",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let api = fx._server.uri();
+    let lock_path = fx.proj.join(fx.lock_name);
+    let gemfile_path = fx.proj.join(fx.gemfile_name);
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        !lock.contains("CHECKSUMS") && !lock.contains(&fx.index_url),
+        "the fixture must leave the CHECKSUMS-less lock mixed (Gemfile-only pin):\n{lock}"
+    );
+
+    // Single gem, already wired in the Gemfile: "upgrade existing patches
+    // only" must read it as ALREADY, not defer it as NEW.
+    let env = run_capped_hosted_scan(&fx.proj, &api, "0");
+    assert_eq!(rollout_counts(&env), (0, 0, 1, 0), "cap 0 re-scan: {env}");
+    let deferred = env["skipped"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|s| s["reason"] == "rollout_deferred");
+    assert!(!deferred, "a wired gem must not be rollout_deferred: {env}");
+
+    // Two patchable gems under a cap of 1, from the pristine pair: run 1
+    // wires one, run 2 must wire the other, run 3 finds both in place.
+    const TINY_GEN2: &str = "80000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let stage = fx.tmp.path().join("generation-stage");
+    let vuln = GenerationGem {
+        name: DEP,
+        uuid: UUID,
+        deps: vec![format!("{TRANSITIVE}:>= 0")],
+        lib_file: "vuln_gem.rb",
+        orig: orig_lib(),
+        patched: patched_lib(),
+        gem: build_gem(
+            &stage.join("vuln"),
+            DEP,
+            DEP_VERSION,
+            "vuln_gem.rb",
+            &patched_lib(),
+            &[TRANSITIVE],
+        ),
+    };
+    let tiny_patched = TINY_LIB.replace("tiny-ok", "tiny-patched");
+    let tiny = GenerationGem {
+        name: TRANSITIVE,
+        uuid: TINY_GEN2,
+        deps: vec![],
+        lib_file: "tiny_dep.rb",
+        orig: TINY_LIB.to_string(),
+        patched: tiny_patched.clone(),
+        gem: build_gem(
+            &stage.join("tiny"),
+            TRANSITIVE,
+            "1.0.0",
+            "tiny_dep.rb",
+            &tiny_patched,
+            &[],
+        ),
+    };
+    mount_patch_generation(&fx._server, 1, &[vuln, tiny]).await;
+    std::fs::write(&gemfile_path, &fx.pristine_gemfile).unwrap();
+    std::fs::write(&lock_path, &fx.pristine_lock).unwrap();
+    let registry = |uuid: &str| format!("{api}/patch-registry/gem/{TOKEN}/{uuid}/");
+
+    let env = run_capped_hosted_scan(&fx.proj, &api, "1");
+    assert_eq!(rollout_counts(&env), (1, 0, 0, 1), "run 1: {env}");
+    let env = run_capped_hosted_scan(&fx.proj, &api, "1");
+    assert_eq!(
+        rollout_counts(&env),
+        (1, 0, 1, 0),
+        "run 2 must count the gem run 1 wired as ALREADY and add the other: {env}"
+    );
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    for (gem, patch) in [(DEP, UUID), (TRANSITIVE, TINY_GEN2)] {
+        assert!(
+            gemfile.contains(&registry(patch)),
+            "run 2 must leave both gems wired ({gem} missing)"
+        );
+    }
+    let env = run_capped_hosted_scan(&fx.proj, &api, "1");
+    assert_eq!(rollout_counts(&env), (0, 0, 2, 0), "run 3: {env}");
+    assert_eq!(
+        std::fs::read_to_string(&gemfile_path).unwrap(),
+        gemfile,
+        "run 3 must leave the Gemfile byte-identical"
+    );
+}
+
+/// #1224 (superseding shape): a newer patch for the same gem version, new
+/// uuid, over a Gemfile-only pin. `--max-new-patches 0` ("upgrade existing
+/// patches only") must see the recorded pin and UPGRADE it to the new uuid,
+/// as it does on a CHECKSUMS lock, instead of deferring it as NEW and
+/// leaving the Gemfile on the superseded patch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_cap_zero_upgrades_a_superseded_gemfile_only_pin() {
+    let Some(fx) = redirect_scanned_project(
+        "cap-zero-supersede",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let api = fx._server.uri();
+    const VULN_GEN2: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let gen2_lib = patched_lib().replace("PATCHED", "PATCHED-GEN2");
+    let stage = fx.tmp.path().join("generation-stage");
+    let vuln = GenerationGem {
+        name: DEP,
+        uuid: VULN_GEN2,
+        deps: vec![format!("{TRANSITIVE}:>= 0")],
+        lib_file: "vuln_gem.rb",
+        orig: orig_lib(),
+        patched: gen2_lib.clone(),
+        gem: build_gem(
+            &stage.join(VULN_GEN2),
+            DEP,
+            DEP_VERSION,
+            "vuln_gem.rb",
+            &gen2_lib,
+            &[TRANSITIVE],
+        ),
+    };
+    mount_patch_generation(&fx._server, 1, &[vuln]).await;
+
+    let env = run_capped_hosted_scan(&fx.proj, &api, "0");
+    assert_eq!(rollout_counts(&env), (0, 1, 0, 0), "cap 0 re-scan: {env}");
+    let gemfile = std::fs::read_to_string(fx.proj.join(fx.gemfile_name)).unwrap();
+    assert!(
+        gemfile.contains(&format!("{api}/patch-registry/gem/{TOKEN}/{VULN_GEN2}/"))
+            && !gemfile.contains(&fx.index_url),
+        "the Gemfile must move to the superseding patch:\n{gemfile}"
+    );
+}
+
+/// Copy the committable files of `src` (manifest pair, `.bundle`, the
+/// committed bundler cache) into a new dir: a fresh checkout with no
+/// installed tree.
+fn checkout_with_cache(fx: &RedirectFixture, src: &Path, name: &str) -> PathBuf {
+    let fresh = fx.tmp.path().join(name);
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in [fx.gemfile_name, fx.lock_name] {
+        std::fs::copy(src.join(file), fresh.join(file)).unwrap();
+    }
+    copy_dir_recursive(&src.join(".bundle"), &fresh.join(".bundle"));
+    copy_dir_recursive(&src.join("vendor/cache"), &fresh.join("vendor/cache"));
+    fresh
+}
+
+/// #1260 through one unwind `command` (`rollback` / `remove`): a project
+/// that ran `bundle cache` while the hosted pin was live commits the
+/// PATCHED archive. The unwind puts the manifest pair back on rubygems.org
+/// but cannot make that archive upstream, and bundler installs from its
+/// cache first: a fresh checkout either fails on the restored upstream
+/// checksum (exit 37) or keeps installing the patched bytes. The unwind
+/// must name the file, and deleting it must be the whole remedy.
+fn unwind_names_the_patched_cached_archive(fx: &RedirectFixture, command: &str) {
+    let dir = stage_fresh_checkout(fx, &format!("cache-{command}"));
+    let install = bundle(&dir, &["install"]);
+    assert!(
+        install.status.success(),
+        "{command}: hosted install:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let cache_cmd = if fx.bundler.at_least(2, 0) {
+        "cache"
+    } else {
+        "package"
+    };
+    let cache = bundle(&dir, &[cache_cmd]);
+    assert!(
+        cache.status.success(),
+        "{command}: bundle {cache_cmd}:\n{}",
+        String::from_utf8_lossy(&cache.stderr)
+    );
+    let archive = dir
+        .join("vendor")
+        .join("cache")
+        .join(format!("{DEP}-{DEP_VERSION}.gem"));
+    assert!(
+        archive.is_file(),
+        "{command}: bundle {cache_cmd} wrote no archive"
+    );
+
+    let api = fx._server.uri();
+    let upstream = format!("{api}/upstream");
+    let cwd = dir.to_str().expect("utf8 tmp path");
+    let mut argv = vec![command, PURL, "--json", "--cwd", cwd];
+    if command == "remove" {
+        argv.push("--yes");
+    }
+    argv.extend([
+        "--api-url",
+        &api,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        &api,
+    ]);
+    let (code, stdout, stderr) = run_socket_env(&dir, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("{command}: not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "{command}: {env}\nstderr:\n{stderr}");
+    let lock = std::fs::read_to_string(dir.join(fx.lock_name)).unwrap();
+    assert!(
+        !lock.contains(&fx.index_url),
+        "{command}: the lock is back on upstream:\n{lock}"
+    );
+    let hits: Vec<&serde_json::Value> = env["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .filter(|w| w["code"] == "upstream_gem_stale_cache")
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(hits.len(), 1, "{command}: one stale-cache warning: {env}");
+    let detail = hits[0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(&archive.display().to_string()),
+        "{command}: the warning names the cached archive: {detail}"
+    );
+
+    // The defect the warning is about: with the archive left in place a
+    // fresh frozen checkout never installs the upstream bytes.
+    let stale = checkout_with_cache(fx, &dir, &format!("cache-{command}-stale"));
+    let install = bundle_env(&stale, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    let lib = fresh_installed_lib(&stale, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+    assert!(
+        !install.status.success() || std::fs::read(&lib).unwrap() == fx.patched,
+        "{command}: bundler {} must reuse the cached patched archive (test premise)",
+        fx.bundler.version
+    );
+
+    // The remedy the warning prescribes: delete the archive and re-cache
+    // (a frozen install with a committed cache dir reads only the cache
+    // on some bundlers), and a fresh frozen checkout installs upstream.
+    let recached = checkout_with_cache(fx, &dir, &format!("cache-{command}-recached"));
+    std::fs::remove_file(
+        recached
+            .join("vendor/cache")
+            .join(format!("{DEP}-{DEP_VERSION}.gem")),
+    )
+    .unwrap();
+    let cache = bundle(&recached, &[cache_cmd]);
+    assert!(
+        cache.status.success(),
+        "{command}: bundle {cache_cmd} after deleting the archive:\n{}",
+        String::from_utf8_lossy(&cache.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(recached.join(fx.lock_name)).unwrap(),
+        lock,
+        "{command}: re-caching leaves the restored lock alone"
+    );
+    let fixed = checkout_with_cache(fx, &recached, &format!("cache-{command}-fixed"));
+    let install = bundle_env(&fixed, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        install.status.success(),
+        "{command}: frozen install from the re-cached checkout:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let lib = fresh_installed_lib(&fixed, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+    assert_eq!(
+        std::fs::read(&lib).unwrap(),
+        orig_lib().into_bytes(),
+        "{command}: the upstream bytes are installed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_unwind_names_a_patched_archive_in_vendor_cache() {
+    let Some(fx) = redirect_scanned_project(
+        "cache-unwind",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    unwind_names_the_patched_cached_archive(&fx, "rollback");
+    unwind_names_the_patched_cached_archive(&fx, "remove");
 }

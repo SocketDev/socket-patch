@@ -133,6 +133,12 @@ fn run(case: &ManifestlessCase<'_>, run: VexRun) -> VexOutcome {
 ///    all (the lock was the only hosted state). With the ledgers gone as
 ///    well nothing names the patch either way.
 ///
+/// A shrinkwrap-only checkout (npm <= 11's `npm shrinkwrap`) first runs the
+/// `shrinkwrap-only` cell (#899): npm >= 12 never reads npm-shrinkwrap.json,
+/// so nothing is attested (`vex_npm_shrinkwrap_only`). The cells above then
+/// run after committing the package-lock.json twin npm 12 reads (the
+/// documented remedy: a copy of the wired shrinkwrap).
+///
 /// Leaves the project reverted (locks at registry bytes, no ledgers).
 pub fn manifestless_vex_matrix(case: &ManifestlessCase<'_>) -> MatrixReport {
     let mut report = MatrixReport::default();
@@ -157,6 +163,19 @@ pub fn manifestless_vex_matrix(case: &ManifestlessCase<'_>) -> MatrixReport {
         .copied()
         .filter(|via| !(hosted && *via == VexVia::Vendor))
         .collect();
+
+    // npm >= 12 never reads a shrinkwrap without its package-lock.json twin.
+    let shrinkwrap = "npm-shrinkwrap.json";
+    let twin = "package-lock.json";
+    let shrinkwrap_only = p.join(shrinkwrap).is_file() && !p.join(twin).exists();
+    if shrinkwrap_only {
+        let out = run(case, VexRun::online(case.api));
+        assert_eq!(out.code, Some(1), "[{label}] shrinkwrap-only:\n{out}");
+        assert_not_attested(&out.envelope, case.purl, "vex_npm_shrinkwrap_only");
+        assert_absent(out.doc.as_ref(), case.purl);
+        std::fs::copy(p.join(shrinkwrap), p.join(twin)).unwrap();
+        report.pass("shrinkwrap-only");
+    }
 
     // 0. a LEGACY vendored checkout: vendored mode is manifest-free now,
     //    but a pre-5.0 run left the record in `.socket/manifest.json`
@@ -235,6 +254,9 @@ pub fn manifestless_vex_matrix(case: &ManifestlessCase<'_>) -> MatrixReport {
     }
     for (lock, bytes) in &case.registry_locks {
         std::fs::write(p.join(lock), bytes).unwrap();
+        if shrinkwrap_only && *lock == shrinkwrap {
+            std::fs::write(p.join(twin), bytes).unwrap();
+        }
     }
     for no_verify in [false, true] {
         let mut r = VexRun::online(case.api);

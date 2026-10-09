@@ -16,6 +16,7 @@ mod cli_dry_run_paths_e2e;
 mod covgap_api_client;
 mod covgap_commands_list;
 mod covgap_output;
+mod envelope_helper_copies;
 mod interactive_prompts_e2e;
 mod output_modes_e2e;
 mod shared_helper_copies;

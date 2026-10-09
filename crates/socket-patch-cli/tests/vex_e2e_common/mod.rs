@@ -81,6 +81,24 @@ pub const DEFAULT_PRODUCT: &str = "pkg:npm/app@1.0.0";
 /// Default document path, relative to the project.
 pub const DEFAULT_OUTPUT: &str = "out.vex.json";
 
+/// Whether the pnpm that installed `proj` (the `packageManager` its
+/// `node_modules/.modules.yaml` records) is 9.0–10.4, the releases that get
+/// no root-only pnpm-workspace.yaml (#734).
+pub fn installed_pnpm_pre_10_5(proj: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(proj.join("node_modules/.modules.yaml")) else {
+        return false;
+    };
+    let Some(at) = text.find("pnpm@") else {
+        return false;
+    };
+    let mut parts = text[at + "pnpm@".len()..].split(|c: char| !c.is_ascii_digit());
+    let mut next = || parts.next().and_then(|p| p.parse::<u64>().ok());
+    match (next(), next()) {
+        (Some(major), Some(minor)) => (9, 0) <= (major, minor) && (major, minor) < (10, 5),
+        _ => false,
+    }
+}
+
 /// Absolute path of the `socket-patch` binary under test.
 pub fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()

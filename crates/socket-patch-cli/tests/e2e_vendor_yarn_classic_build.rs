@@ -48,7 +48,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -168,11 +168,6 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
 }
 
-fn parse_envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("vendor --json output is not JSON: {e}\nstdout:\n{stdout}"))
-}
-
 fn copy_dir_recursive(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -276,7 +271,7 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
@@ -526,7 +521,7 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
         code, 0,
         "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env2 = parse_envelope(&stdout);
+    let env2 = parse_json_envelope(&stdout);
     assert_eq!(env2["summary"]["failed"], 0, "re-run must not fail: {env2}");
     assert_eq!(
         std::fs::read(&lock_path).unwrap(),
@@ -562,7 +557,7 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
         code, 0,
         "pinned re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env3 = parse_envelope(&stdout);
+    let env3 = parse_json_envelope(&stdout);
     assert!(
         env3.get("warnings").is_none(),
         "a yarn@1 packageManager pin must suppress the advisory (and empty \
@@ -585,7 +580,7 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
     assert!(
@@ -747,7 +742,7 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
         code, 0,
         "scan --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
         env["vendor"]["summary"]["applied"], 1,
@@ -944,7 +939,7 @@ fn yarn_classic_vendored_tarball_survives_a_tgz_gitignore_rule() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
 
     git(&proj, &["add", "-A"]);
@@ -1006,7 +1001,7 @@ fn yarn_classic_vendored_tarball_survives_a_tgz_gitignore_rule() {
         code, 1,
         "vendor --check must fail on an unledgered lock reference.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert!(
         env["events"].as_array().unwrap().iter().any(|e| {
             e["errorCode"] == "vendor_ledger_missing"
@@ -1124,7 +1119,7 @@ fn yarn_classic_vendor_refuses_a_symlinked_lock() {
         &["vendor", "--json", "--offline", "--dry-run", "--cwd", cwd],
     );
     assert_eq!(code, 0, "dry run.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert!(
         env["events"].as_array().unwrap().iter().any(|e| {
             e["errorCode"] == "vendor_would_refuse_symlinked_file"
@@ -1136,7 +1131,7 @@ fn yarn_classic_vendor_refuses_a_symlinked_lock() {
     let (code, stdout, stderr) =
         run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
     assert_eq!(code, 1, "vendor.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(
         env["error"]["code"], "redirect_symlinked_file_unsupported",
         "{env}"

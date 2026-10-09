@@ -2,7 +2,7 @@
 //! `core.autocrlf=true`, or a lock committed with CRLF).
 //!
 //! Every vendored front door — `vendor` over a staged manifest, `scan
-//! --vendor`, and `get <uuid> --mode vendored` — must write the wired lock
+//! --mode vendored`, and `get <uuid> --mode vendored` — must write the wired lock
 //! back in CRLF (so the diff is the one entry, not every line), an in-sync
 //! re-run must leave it byte-identical, and `vendor --revert` must restore
 //! the pre-vendor bytes exactly. Each test runs the built binary; the
@@ -305,11 +305,11 @@ async fn scan_vendor_keeps_a_crlf_lock_and_reverts_it_byte_identically() {
     let root = tmp.path();
     write_project(root);
     let uri = server.uri();
-    let mut args = vec!["scan", "--vendor", "--vendor-source", "service"];
+    let mut args = vec!["scan", "--mode", "vendored", "--vendor-source", "service"];
     args.extend(api_args(&uri));
 
     let (code, env) = run_json(root, &args);
-    assert_eq!(code, 0, "scan --vendor must succeed: {env:#}");
+    assert_eq!(code, 0, "scan --mode vendored must succeed: {env:#}");
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "{env:#}");
     let vendored = assert_wired_crlf(root);
     assert_rerun_and_revert(root, &args, &vendored);

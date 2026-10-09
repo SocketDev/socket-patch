@@ -14,17 +14,20 @@
 //! `--hash=sha256:ab#cd` are data. Exactly one leading BOM is encoding, not
 //! data (pip decodes with utf-8-sig; uv strips it too).
 
-use crate::formats::text::strip_bom;
+use crate::formats::text::{strip_bom, strip_bom_bytes};
 
 /// Decode a requirements file the way pip's `auto_decode` does: a UTF-16
-/// or UTF-32 byte-order mark selects that encoding and is dropped; anything
+/// or UTF-32 byte-order mark selects that encoding and is dropped; a
+/// mark-less file with a PEP 263 coding line (`# -*- coding: latin-1 -*-`)
+/// in its first two lines is decoded in that encoding (#1119); anything
 /// else is UTF-8, its one leading BOM kept for [`logical_lines`] to drop.
 /// Windows PowerShell 5.1 writes `pip freeze > requirements.txt` as UTF-16
 /// LE with a BOM, and pip installs from it (#721). pip tries the UTF-16
 /// marks first, so a UTF-32 LE mark (`FF FE 00 00`) reads as UTF-16 LE, as
-/// it does for pip. `None` when the bytes are not valid in that encoding.
-/// (pip's last resort, the locale's encoding for a mark-less non-UTF-8
-/// file, is machine-dependent and not modelled.)
+/// it does for pip. `None` when the bytes are not valid in that encoding,
+/// or the coding line names a codec this reader does not model (see
+/// [`coding_line_codec`]). (pip's last resort, the locale's encoding for a
+/// mark-less non-UTF-8 file, is machine-dependent and not modelled.)
 pub(crate) fn decode(bytes: &[u8]) -> Option<String> {
     fn utf16(body: &[u8], unit: fn([u8; 2]) -> u16) -> Option<String> {
         if !body.len().is_multiple_of(2) {
@@ -49,7 +52,160 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<String> {
             .map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
             .collect();
     }
+    if strip_bom_bytes(bytes).len() == bytes.len() {
+        if let Some(name) = coding_line(bytes) {
+            return match coding_line_codec(&name)? {
+                Codec::Utf8 => String::from_utf8(bytes.to_vec()).ok(),
+                Codec::Ascii => bytes
+                    .is_ascii()
+                    .then(|| String::from_utf8_lossy(bytes).into_owned()),
+                Codec::Latin1 => Some(bytes.iter().map(|&b| char::from(b)).collect()),
+                Codec::Cp1252 => bytes.iter().map(|&b| cp1252_char(b)).collect(),
+                Codec::AsciiCompatible => bytes
+                    .is_ascii()
+                    .then(|| String::from_utf8_lossy(bytes).into_owned()),
+            };
+        }
+    }
     String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// The codecs a PEP 263 coding line may select that [`decode`] models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    Utf8,
+    Ascii,
+    Latin1,
+    Cp1252,
+    /// A codec with no table here whose low half is ASCII: plain-ASCII
+    /// bytes decode as ASCII under it, anything else is unreadable.
+    AsciiCompatible,
+}
+
+/// The encoding name of pip's PEP 263 check: the first of the file's first
+/// two lines that starts with `#` and matches `coding[:=]\s*([-\w.]+)`.
+fn coding_line(bytes: &[u8]) -> Option<String> {
+    bytes.split(|&b| b == b'\n').take(2).find_map(|line| {
+        if line.first() != Some(&b'#') {
+            return None;
+        }
+        line.windows(6)
+            .enumerate()
+            .filter(|(_, w)| *w == b"coding")
+            .find_map(|(at, _)| {
+                let rest = &line[at + 6..];
+                let rest = rest
+                    .strip_prefix(b":")
+                    .or_else(|| rest.strip_prefix(b"="))?;
+                let start = rest.iter().position(|b| !b.is_ascii_whitespace())?;
+                let name: Vec<u8> = rest[start..]
+                    .iter()
+                    .copied()
+                    .take_while(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                    .collect();
+                (!name.is_empty()).then(|| String::from_utf8_lossy(&name).into_owned())
+            })
+    })
+}
+
+/// Python's codec lookup for the names [`decode`] models: case-folded,
+/// `-` and ` ` read as `_`, then Python's alias table for UTF-8, ASCII,
+/// Latin-1 and cp1252, then [`ASCII_COMPATIBLE_CODECS`] (#1212). Any
+/// other codec (pip would use it) is `None`, so the file reads as
+/// undecodable rather than being guessed at.
+fn coding_line_codec(name: &str) -> Option<Codec> {
+    let name = name.to_ascii_lowercase().replace(['-', ' '], "_");
+    Some(match name.as_str() {
+        "utf_8" | "utf8" | "u8" | "utf" | "utf8_ucs2" | "utf8_ucs4" | "cp65001" | "utf_8_sig" => {
+            Codec::Utf8
+        }
+        "ascii" | "646" | "us_ascii" | "us" | "cp367" | "csascii" | "ibm367" | "iso646_us"
+        | "iso_ir_6" | "ansi_x3.4_1968" | "ansi_x3_4_1968" | "ansi_x3.4_1986"
+        | "iso_646.irv_1991" => Codec::Ascii,
+        "latin_1" | "latin1" | "latin" | "l1" | "8859" | "cp819" | "csisolatin1" | "ibm819"
+        | "iso8859" | "iso8859_1" | "iso_8859_1" | "iso_8859_1_1987" | "iso_ir_100" => {
+            Codec::Latin1
+        }
+        "cp1252" | "windows_1252" | "1252" => Codec::Cp1252,
+        _ if ASCII_COMPATIBLE_CODECS
+            .split_ascii_whitespace()
+            .any(|known| known == python_codec_key(&name)) =>
+        {
+            Codec::AsciiCompatible
+        }
+        _ => return None,
+    })
+}
+
+/// A codec name as Python's `encodings.search_function` looks it up:
+/// runs of anything but ASCII letters, digits and `.` become one `_`
+/// (`normalize_encoding`), then `.` reads as `_`.
+fn python_codec_key(name: &str) -> String {
+    name.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+        .replace('.', "_")
+}
+
+/// Every name (module and alias, as [`python_codec_key`] spells it) of
+/// the Python 3.11 codecs, beyond those [`coding_line_codec`] models,
+/// that decode each ASCII byte as itself: the ISO-8859, Windows, DOS,
+/// Mac, KOI8 and CJK multibyte families. A header copied from a template
+/// (`# -*- coding: iso-8859-15 -*-`) over a plain-ASCII file is the
+/// common case, and pip reads it as ASCII. Left out, so still `None`:
+/// codecs that read ASCII bytes differently (EBCDIC, cp864, UTF-16/32,
+/// UTF-7, HZ, ISO-2022, Shift_JIS-2004, the escape codecs, idna,
+/// punycode) and the bytes-to-bytes codecs pip cannot decode text with.
+/// Space-separated, sorted.
+const ASCII_COMPATIBLE_CODECS: &str =
+    "1125 1250 1251 1253 1254 1255 1256 1257 1258 437 775 850 852 855 857 858 860 861 862 863 \
+     865 866 869 932 936 949 950 arabic asmo_708 big5 big5_hkscs big5_tw big5hkscs chinese \
+     cp1006 cp1051 cp1125 cp1250 cp1251 cp1253 cp1254 cp1255 cp1256 cp1257 cp1258 cp1361 \
+     cp154 cp437 cp720 cp737 cp775 cp850 cp852 cp855 cp856 cp857 cp858 cp860 cp861 cp862 \
+     cp863 cp865 cp866 cp866u cp869 cp874 cp932 cp936 cp949 cp950 cp_gr cp_is csbig5 csibm855 \
+     csibm857 csibm858 csibm860 csibm861 csibm863 csibm865 csibm866 csibm869 csiso58gb231280 \
+     csisolatin2 csisolatin3 csisolatin4 csisolatin5 csisolatin6 csisolatinarabic \
+     csisolatincyrillic csisolatingreek csisolatinhebrew cskoi8r cspc775baltic \
+     cspc850multilingual cspc862latinhebrew cspc8codepage437 cspcp852 csptcp154 csshiftjis \
+     cyrillic cyrillic_asian ecma_114 ecma_118 elot_928 euc_cn euc_jis2004 euc_jis_2004 \
+     euc_jisx0213 euc_jp euc_kr euccn eucgb2312_cn eucjis2004 eucjisx0213 eucjp euckr gb18030 \
+     gb18030_2000 gb2312 gb2312_1980 gb2312_80 gbk greek greek8 hebrew hkscs hp_roman8 \
+     ibm1051 ibm1125 ibm437 ibm775 ibm850 ibm852 ibm855 ibm857 ibm858 ibm860 ibm861 ibm862 \
+     ibm863 ibm865 ibm866 ibm869 iso8859_10 iso8859_11 iso8859_13 iso8859_14 iso8859_15 \
+     iso8859_16 iso8859_2 iso8859_3 iso8859_4 iso8859_5 iso8859_6 iso8859_7 iso8859_8 \
+     iso8859_9 iso_8859_10 iso_8859_10_1992 iso_8859_11 iso_8859_11_2001 iso_8859_13 \
+     iso_8859_14 iso_8859_14_1998 iso_8859_15 iso_8859_16 iso_8859_16_2001 iso_8859_2 \
+     iso_8859_2_1987 iso_8859_3 iso_8859_3_1988 iso_8859_4 iso_8859_4_1988 iso_8859_5 \
+     iso_8859_5_1988 iso_8859_6 iso_8859_6_1987 iso_8859_7 iso_8859_7_1987 iso_8859_8 \
+     iso_8859_8_1988 iso_8859_9 iso_8859_9_1989 iso_celtic iso_ir_101 iso_ir_109 iso_ir_110 \
+     iso_ir_126 iso_ir_127 iso_ir_138 iso_ir_144 iso_ir_148 iso_ir_157 iso_ir_166 iso_ir_199 \
+     iso_ir_226 iso_ir_58 jisx0213 johab koi8_r koi8_t koi8_u korean ks_c_5601 ks_c_5601_1987 \
+     ks_x_1001 ksc5601 ksx1001 kz1048 kz_1048 l10 l2 l3 l4 l5 l6 l7 l8 l9 latin10 latin2 \
+     latin3 latin4 latin5 latin6 latin7 latin8 latin9 mac_arabic mac_centeuro mac_croatian \
+     mac_cyrillic mac_farsi mac_greek mac_iceland mac_latin2 mac_roman mac_romanian \
+     mac_turkish maccentraleurope maccyrillic macgreek maciceland macintosh maclatin2 \
+     macroman macturkish ms1361 ms932 ms936 ms949 ms950 ms_kanji mskanji palmos pt154 ptcp154 \
+     r8 rk1048 roman8 ruscii s_jis shift_jis shiftjis sjis strk1048_2002 thai tis620 tis_620 \
+     tis_620_0 tis_620_2529_0 tis_620_2529_1 u_jis uhc ujis windows_1250 windows_1251 \
+     windows_1253 windows_1254 windows_1255 windows_1256 windows_1257 windows_1258 \
+     x_mac_japanese x_mac_korean x_mac_simp_chinese x_mac_trad_chinese";
+
+/// One cp1252 byte as Python decodes it: Latin-1 outside `0x80..=0x9F`,
+/// Windows punctuation inside it, and five bytes Python leaves undefined.
+fn cp1252_char(b: u8) -> Option<char> {
+    const HIGH: [u16; 32] = [
+        0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039,
+        0x0152, 0, 0x017D, 0, 0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC,
+        0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+    ];
+    match b {
+        0x80..=0x9F => match HIGH[usize::from(b - 0x80)] {
+            0 => None,
+            unit => char::from_u32(u32::from(unit)),
+        },
+        _ => Some(char::from(b)),
+    }
 }
 
 /// One logical requirements line.
@@ -86,9 +242,12 @@ pub(crate) fn logical_lines(content: &str) -> Vec<LogicalLine> {
             i += 1;
             physical.push(lines[i].to_string());
         }
+        // A continued line with nothing after it is complete at EOF, and
+        // pip's join strips its backslash too (#1249).
+        let dangling = lines[i].trim_end().ends_with('\\') && !comment(i);
         let mut text = String::new();
         for (k, pl) in physical.iter().enumerate() {
-            if k + 1 < physical.len() {
+            if k + 1 < physical.len() || dangling {
                 // pip's join: the backslash and the newline vanish.
                 text.push_str(pl.trim_end().strip_suffix('\\').unwrap_or(pl));
             } else {
@@ -393,6 +552,113 @@ mod tests {
         assert_eq!(decode(&[b's', 0xC3, 0x28]), None);
     }
 
+    /// #1119: with no BOM, pip honours a PEP 263 coding line in the
+    /// file's first two lines (`auto_decode`), so a Latin-1 file with a
+    /// non-ASCII comment installs. Codecs this reader does not model stay
+    /// unreadable instead of guessed.
+    #[test]
+    fn decode_follows_pips_pep_263_coding_line() {
+        let latin1 = b"# -*- coding: latin-1 -*-\n# Maintainer: Jos\xe9\nsix==1.16.0\n";
+        assert_eq!(
+            decode(latin1).as_deref(),
+            Some("# -*- coding: latin-1 -*-\n# Maintainer: Jos\u{e9}\nsix==1.16.0\n")
+        );
+        // The second line counts; every alias spelling Python accepts.
+        for coding in ["ISO-8859-1", "iso8859_1", "latin1", "L1", "cp819"] {
+            let text = format!("# deps\n# vim: set fileencoding={coding} :\nsix==1.16.0 # Jos");
+            let mut bytes = text.into_bytes();
+            bytes.push(0xE9);
+            assert!(
+                decode(&bytes).is_some_and(|t| t.ends_with("Jos\u{e9}")),
+                "{coding}"
+            );
+        }
+        // cp1252's Windows punctuation, and its bytes Python leaves undefined.
+        assert_eq!(
+            decode(b"# coding=cp1252\n# \x93six\x94\nsix==1.16.0\n").as_deref(),
+            Some("# coding=cp1252\n# \u{201c}six\u{201d}\nsix==1.16.0\n")
+        );
+        assert_eq!(decode(b"# coding: windows-1252\n# \x81\n"), None);
+        // A UTF-8 coding line still requires UTF-8.
+        assert_eq!(decode(b"# coding: utf-8\n# Jos\xe9\n"), None);
+        assert_eq!(decode(b"# coding: ascii\n# Jos\xe9\n"), None);
+        // A coding line on the third line, or not in a comment, is data.
+        assert_eq!(decode(b"# a\n# b\n# coding: latin-1\n# \xe9\n"), None);
+        assert_eq!(decode(b"six==1.16.0  # coding: latin-1 \xe9\n"), None);
+        // A codec this reader does not model is unreadable, never guessed.
+        assert_eq!(decode(b"# coding: koi8-r\n# \xe9\n"), None);
+        // A BOM wins over a coding line, as in pip.
+        assert_eq!(
+            decode(b"\xef\xbb\xbf# coding: latin-1\nsix==1.16.0\n").as_deref(),
+            Some("\u{feff}# coding: latin-1\nsix==1.16.0\n")
+        );
+    }
+
+    /// #1212: pip decodes with whatever codec the coding line names, and
+    /// every ASCII-compatible codec decodes ASCII bytes as ASCII, so a
+    /// plain-ASCII file under a header naming one this reader has no table
+    /// for (copied from a template) reads as its text. Its non-ASCII bytes
+    /// are still unreadable, and so is ASCII under a codec that decodes it
+    /// differently (EBCDIC, UTF-16/32, UTF-7, HZ, ISO-2022, escape codecs)
+    /// or a name Python does not know (pip fails on those).
+    #[test]
+    fn decode_reads_ascii_under_any_ascii_compatible_coding_line() {
+        for coding in [
+            "iso-8859-15",
+            "latin9",
+            "ISO8859_15",
+            "iso.8859.15",
+            "l9",
+            "cp1250",
+            "windows-1250",
+            "mac-roman",
+            "macintosh",
+            "gbk",
+            "GB18030",
+            "shift_jis",
+            "big5",
+            "euc-kr",
+            "koi8-r",
+            "cp437",
+            "iso-8859-2",
+            "tis-620",
+        ] {
+            let text = format!("# -*- coding: {coding} -*-\nsix==1.16.0\n");
+            assert_eq!(
+                decode(text.as_bytes()).as_deref(),
+                Some(&text[..]),
+                "{coding}"
+            );
+            let mut high = text.into_bytes();
+            high.extend_from_slice(b"# Jos\xe9\n");
+            assert_eq!(decode(&high), None, "{coding}");
+        }
+        for coding in [
+            "cp037",
+            "cp500",
+            "cp864",
+            "utf-16",
+            "utf-32-le",
+            "utf-7",
+            "hz",
+            "iso2022_jp",
+            "shift_jis_2004",
+            "unicode_escape",
+            "raw_unicode_escape",
+            "idna",
+            "punycode",
+            "rot13",
+            "hex",
+            // Not names Python's lookup knows (pip raises LookupError).
+            "latin-9",
+            "cp-1250",
+            "no-such-codec",
+        ] {
+            let text = format!("# coding: {coding}\nsix==1.16.0\n");
+            assert_eq!(decode(text.as_bytes()), None, "{coding}");
+        }
+    }
+
     #[test]
     fn requires_hashes_reads_pip_hash_checking_mode() {
         for hashed in [
@@ -492,6 +758,31 @@ mod tests {
             hash_options("x --hash=sha256:aa --hash sha256:bb --hash=md5:cc"),
             vec!["aa".to_string(), "bb".to_string()]
         );
+    }
+
+    /// #1249: a continued last line with nothing after it is complete at
+    /// EOF, and pip's `join_lines` strips its backslash like any other.
+    #[test]
+    fn lexer_strips_a_dangling_continuation_at_eof() {
+        for content in ["six==1.16.0 \\", "six==1.16.0 \\\n", "six==1.16.0 \\\r\n"] {
+            let lines = logical_lines(content);
+            assert_eq!(lines.len(), 1, "{content:?}");
+            assert_eq!(lines[0].text, "six==1.16.0 ", "{content:?}");
+            assert_eq!(
+                lines[0].physical,
+                vec!["six==1.16.0 \\".to_string()],
+                "physical stays raw"
+            );
+            assert_eq!(
+                exact_pin(strip_comment(&lines[0].text)),
+                Some(("six", "1.16.0"))
+            );
+        }
+        let lines = logical_lines("six==1.16.0 \\\n    --hash=sha256:abc \\\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "six==1.16.0     --hash=sha256:abc ");
+        // A comment's backslash is the comment's text, at EOF too.
+        assert_eq!(logical_lines("# note \\")[0].text, "# note \\");
     }
 
     #[test]

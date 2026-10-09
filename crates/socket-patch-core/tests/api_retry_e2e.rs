@@ -63,8 +63,11 @@ fn options(uri: &str, proxy: bool) -> ApiClientOptions {
     ApiClientOptions {
         api_url: uri.to_string(),
         api_token: (!proxy).then(|| "tok".to_string()),
-        use_public_proxy: proxy,
-        org_slug: (!proxy).then(|| ORG.to_string()),
+        route: if proxy {
+            socket_patch_core::api::client::ApiRoute::Proxy
+        } else {
+            socket_patch_core::api::client::ApiRoute::org(ORG)
+        },
     }
 }
 

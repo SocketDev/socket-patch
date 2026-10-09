@@ -239,10 +239,8 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: true,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
@@ -359,10 +357,8 @@ async fn cargo_apply_refuses_on_before_hash_mismatch() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: true,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
@@ -458,10 +454,8 @@ async fn cargo_crawler_finds_real_fetched_crate() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),

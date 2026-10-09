@@ -5,6 +5,8 @@ use super::listing::{list_dir_sync, ListedEntry};
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir_sync, run_blocking};
+use crate::vendor::go_mod_edit;
+use crate::vendor::go_sum_edit::go_sum_lines;
 
 #[cfg(test)]
 mod oracle;
@@ -111,11 +113,18 @@ impl GoCrawler {
 
     /// Crawl the Go module cache and return all discovered packages.
     ///
-    /// The whole walk is one blocking-pool task (a module cache holds tens
+    /// A local project with a `go.sum` and no Go workspace in effect only
+    /// gets the modules its `go.sum` records, each looked up in the cache
+    /// ([`go_sum_scope`], [`locate_module`]), so a module another project
+    /// left in `GOMODCACHE` is never crawled and the cache tree is not
+    /// walked. Everything else (`--global`, `--global-prefix`, no `go.sum`,
+    /// a workspace) walks the whole cache.
+    ///
+    /// The whole crawl is one blocking-pool task (a module cache holds tens
     /// of thousands of directories; one runtime hop per readdir and stat
-    /// dominated the crawl), visiting entries in the same depth-first,
-    /// readdir order as before so the first-seen PURL dedup keeps the same
-    /// winners.
+    /// dominated the crawl). The walk visits entries in the same
+    /// depth-first, readdir order as before so the first-seen PURL dedup
+    /// keeps the same winners; located modules come out in `go.sum` order.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
         let cache_paths = self
             .get_module_cache_paths(options)
@@ -124,12 +133,20 @@ impl GoCrawler {
         if cache_paths.is_empty() {
             return Vec::new();
         }
+        let project =
+            (!options.global && options.global_prefix.is_none()).then(|| options.cwd.clone());
 
         run_blocking(move || {
+            let scope = project.as_deref().and_then(go_sum_scope);
             let mut packages = Vec::new();
             let mut seen = HashSet::new();
             for cache_path in &cache_paths {
-                scan_cache_sync(cache_path, &mut seen, &mut packages);
+                match &scope {
+                    Some(recorded) => {
+                        locate_recorded(cache_path, recorded, &mut seen, &mut packages)
+                    }
+                    None => scan_cache_sync(cache_path, &mut seen, &mut packages),
+                }
             }
             packages
         })
@@ -212,50 +229,143 @@ fn find_by_purls_sync(cache_path: &Path, purls: &[String]) -> HashMap<String, Cr
 
     for purl in purls {
         if let Some((module_path, version)) = crate::utils::purl::parse_golang_purl(purl) {
-            let (module_path, version) = (module_path.as_ref(), version.as_ref());
-            // SECURITY: `module_path`/`version` come straight from the
-            // (untrusted) manifest PURL and are joined onto the cache root
-            // below. In global mode the resolved directory is patched IN
-            // PLACE (no `replace`-redirect backend stands between the
-            // crawler and disk), so a tampered PURL with a `..` segment
-            // must not be able to escape the cache. Reject fail-closed
-            // before the `is_dir` probe — the twin of the deno crawler's
-            // `is_safe_jsr_component` gate.
-            if !is_safe_module_coordinate(module_path, version) {
-                continue;
-            }
-            // Encode the module path AND the version for the filesystem.
-            // Go case-escapes both halves of the directory name, so a
-            // version like `v1.0.0-RC1` must be looked up as
-            // `v1.0.0-!r!c1` or the directory is never found.
-            let encoded = encode_module_path(module_path);
-            let encoded_version = encode_module_path(version);
-
-            // Go module cache layout: <encoded-module-path>@<encoded-version>/
-            let module_dir = cache_path.join(format!("{encoded}@{encoded_version}"));
-
-            if is_dir_sync(&module_dir) {
-                if is_partially_extracted(cache_path, &encoded, &encoded_version) {
-                    continue;
-                }
-                // Split module_path into namespace and name
-                let (namespace, name) = split_module_path(module_path);
-
-                result.insert(
-                    purl.clone(),
-                    CrawledPackage {
-                        name: name.to_string(),
-                        version: version.to_string(),
-                        namespace: Some(namespace.to_string()),
-                        purl: purl.clone(),
-                        path: module_dir,
-                    },
-                );
+            if let Some(pkg) = locate_module(cache_path, &module_path, &version, purl.clone()) {
+                result.insert(purl.clone(), pkg);
             }
         }
     }
 
     result
+}
+
+/// The extracted cache directory of `module_path@version` under
+/// `cache_path`, reported under `purl`: the one lookup behind
+/// [`GoCrawler::find_by_purls`] and the `go.sum`-scoped crawl.
+fn locate_module(
+    cache_path: &Path,
+    module_path: &str,
+    version: &str,
+    purl: String,
+) -> Option<CrawledPackage> {
+    // SECURITY: `module_path`/`version` come straight from an untrusted
+    // manifest PURL or project `go.sum` and are joined onto the cache root
+    // below. In global mode the resolved directory is patched IN PLACE (no
+    // `replace`-redirect backend stands between the crawler and disk), so
+    // a tampered coordinate with a `..` segment must not be able to escape
+    // the cache. Reject fail-closed before the `is_dir` probe — the twin
+    // of the deno crawler's `is_safe_jsr_component` gate.
+    if !is_safe_module_coordinate(module_path, version) {
+        return None;
+    }
+    // Encode the module path AND the version for the filesystem.
+    // Go case-escapes both halves of the directory name, so a
+    // version like `v1.0.0-RC1` must be looked up as
+    // `v1.0.0-!r!c1` or the directory is never found.
+    let encoded = encode_module_path(module_path);
+    let encoded_version = encode_module_path(version);
+
+    // Go module cache layout: <encoded-module-path>@<encoded-version>/
+    let module_dir = cache_path.join(format!("{encoded}@{encoded_version}"));
+
+    if !is_dir_sync(&module_dir) || is_partially_extracted(cache_path, &encoded, &encoded_version) {
+        return None;
+    }
+    let (namespace, name) = split_module_path(module_path);
+    Some(CrawledPackage {
+        name: name.to_string(),
+        version: version.to_string(),
+        namespace: Some(namespace.to_string()),
+        purl,
+        path: module_dir,
+    })
+}
+
+/// The `(module, version)` of every module-zip line of `<cwd>/go.sum`
+/// (`/go.mod` lines hash only a manifest and are skipped), in file order,
+/// then every `require` of `<cwd>/go.mod` not already listed, sorted. The
+/// requires keep a module the project still builds against when its own
+/// go.sum lines are gone: a `replace`d module's go.sum records only the
+/// replacement (the hosted rewrite drops the original's lines, as
+/// `go mod tidy` does). `None` when a Go workspace is in effect
+/// ([`workspace_in_effect`]: its build list spans other modules' `go.sum`
+/// and `go.work.sum`) or there is no readable `go.sum`; the crawl then
+/// walks the whole cache.
+fn go_sum_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
+    if workspace_in_effect(cwd) {
+        return None;
+    }
+    let text = crate::utils::fs::read_regular_to_string_sync(&cwd.join("go.sum")).ok()?;
+    let mut scope: Vec<(String, String)> = go_sum_lines(&text)
+        .filter(|line| !line.go_mod)
+        .map(|line| (line.module.to_string(), line.version.to_string()))
+        .collect();
+    if let Ok(go_mod) = crate::utils::fs::read_regular_to_string_sync(&cwd.join("go.mod")) {
+        let listed: HashSet<(String, String)> = scope.iter().cloned().collect();
+        let mut required: Vec<(String, String)> =
+            go_mod_edit::parse_required_versions(&go_mod_edit::normalize_for_read(&go_mod))
+                .into_iter()
+                .filter(|pair| !listed.contains(pair))
+                .collect();
+        required.sort();
+        scope.extend(required);
+    }
+    Some(scope)
+}
+
+/// Whether the go command would build `cwd` in workspace mode: `GOWORK`
+/// names a file, or (`GOWORK` unset or empty) a `go.work` exists in `cwd`
+/// or an ancestor. `GOWORK=off` disables workspaces.
+fn workspace_in_effect(cwd: &Path) -> bool {
+    match std::env::var_os("GOWORK") {
+        Some(v) if v == "off" => false,
+        Some(v) if !v.is_empty() => true,
+        _ => go_work_at_or_above(cwd, &std::env::current_dir().unwrap_or_default()),
+    }
+}
+
+/// Whether a `go.work` exists in `cwd` or an ancestor, a relative `cwd`
+/// taken against `base` first: the CLI's default `cwd` is `.`, whose
+/// lexical ancestors stop at itself, so a parent `go.work` would be missed.
+fn go_work_at_or_above(cwd: &Path, base: &Path) -> bool {
+    base.join(cwd)
+        .ancestors()
+        .any(|dir| std::fs::symlink_metadata(dir.join("go.work")).is_ok())
+}
+
+/// Look up each `recorded` module in cache root `cache_path` instead of
+/// walking it. A coordinate the walk could never report
+/// ([`walk_reaches`]) is skipped, so the result is a subset of
+/// [`scan_cache_sync`]'s.
+fn locate_recorded(
+    cache_path: &Path,
+    recorded: &[(String, String)],
+    seen: &mut HashSet<String>,
+    results: &mut Vec<CrawledPackage>,
+) {
+    for (module_path, version) in recorded {
+        if !walk_reaches(module_path, version) {
+            continue;
+        }
+        let purl = crate::utils::purl::build_golang_purl(module_path, version);
+        if seen.contains(&purl) {
+            continue;
+        }
+        if let Some(pkg) = locate_module(cache_path, module_path, version, purl.clone()) {
+            seen.insert(purl);
+            results.push(pkg);
+        }
+    }
+}
+
+/// Whether [`scan_cache_sync`] can report `module_path@version`: no
+/// segment is hidden, the first is not the root `cache/` metadata
+/// directory, and neither half holds the `@` the walk splits on (Go allows
+/// none of these in a real module coordinate).
+fn walk_reaches(module_path: &str, version: &str) -> bool {
+    !module_path.split('/').any(|s| s.starts_with('.'))
+        && module_path.split('/').next() != Some("cache")
+        && !module_path.contains('@')
+        && !version.contains('@')
 }
 
 /// Walk one module cache root.
@@ -1102,6 +1212,318 @@ mod tests {
             packages[0].purl,
             "pkg:golang/github.com/gin-gonic/gin@v1.9.1"
         );
+    }
+
+    // ---- Project-mode go.sum scope (#595) ----
+
+    mod go_sum_scope {
+        use super::*;
+        use crate::crawlers::oracle_support::{mkdir, write};
+
+        const H1: &str = "h1:mU9vN/n1hbXktM62lJ6MbRKOk3aI8NDH+szCf62RXtE=";
+
+        /// A project dir and a module cache, with `GOMODCACHE` pointed at
+        /// the cache and `GOWORK` unset for the test's lifetime.
+        struct Fixture {
+            _tmp: tempfile::TempDir,
+            project: PathBuf,
+            cache: PathBuf,
+            _env: (EnvGuard, EnvGuard),
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let tmp = tempfile::tempdir().unwrap();
+                let project = tmp.path().join("project");
+                let cache = tmp.path().join("modcache");
+                mkdir(&project);
+                mkdir(&cache);
+                write(&project.join("go.mod"), "module example.com/app\n");
+                let env = (
+                    EnvGuard::set("GOMODCACHE", cache.to_str().unwrap()),
+                    EnvGuard::unset("GOWORK"),
+                );
+                Fixture {
+                    _tmp: tmp,
+                    project,
+                    cache,
+                    _env: env,
+                }
+            }
+
+            /// Extract `<encoded module>@<encoded version>/` into the cache.
+            fn stage(&self, module: &str, version: &str) -> &Self {
+                let dir = self.cache.join(format!(
+                    "{}@{}",
+                    encode_module_path(module),
+                    encode_module_path(version)
+                ));
+                write(&dir.join("go.mod"), &format!("module {module}\n"));
+                self
+            }
+
+            /// Write `go.sum` with a zip and a `/go.mod` line per module,
+            /// plus `/go.mod`-only lines for `manifest_only`.
+            fn go_sum(&self, modules: &[(&str, &str)], manifest_only: &[(&str, &str)]) -> &Self {
+                let mut text = String::new();
+                for (m, v) in modules {
+                    text.push_str(&format!("{m} {v} {H1}\n{m} {v}/go.mod {H1}\n"));
+                }
+                for (m, v) in manifest_only {
+                    text.push_str(&format!("{m} {v}/go.mod {H1}\n"));
+                }
+                write(&self.project.join("go.sum"), &text);
+                self
+            }
+
+            async fn crawl(&self) -> Vec<String> {
+                let options = CrawlerOptions {
+                    cwd: self.project.clone(),
+                    global: false,
+                    global_prefix: None,
+                };
+                let mut purls: Vec<String> = GoCrawler::new()
+                    .crawl_all(&options)
+                    .await
+                    .into_iter()
+                    .map(|p| p.purl)
+                    .collect();
+                purls.sort();
+                purls
+            }
+        }
+
+        fn sorted(purls: &[&str]) -> Vec<String> {
+            let mut v: Vec<String> = purls.iter().map(|p| p.to_string()).collect();
+            v.sort();
+            v
+        }
+
+        /// The cache holds modules of other projects, another version of a
+        /// recorded module and a module go.sum only hashes the go.mod of;
+        /// only the recorded zips are crawled.
+        fn stage_shared_cache(f: &Fixture) {
+            f.stage("github.com/gin-gonic/gin", "v1.9.1")
+                .stage("github.com/gin-gonic/gin", "v1.8.0")
+                .stage("github.com/Azure/azure-sdk-for-go", "v1.0.0-RC1")
+                .stage("golang.org/x/text", "v0.14.0")
+                .stage("example.com/unrelated", "v0.1.0")
+                .go_sum(
+                    &[
+                        ("github.com/gin-gonic/gin", "v1.9.1"),
+                        ("github.com/Azure/azure-sdk-for-go", "v1.0.0-RC1"),
+                        ("example.com/not-downloaded", "v1.0.0"),
+                    ],
+                    &[("golang.org/x/text", "v0.14.0")],
+                );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_project_crawls_only_the_modules_its_go_sum_records() {
+            let f = Fixture::new();
+            stage_shared_cache(&f);
+            assert_eq!(
+                f.crawl().await,
+                sorted(&[
+                    "pkg:golang/github.com/Azure/azure-sdk-for-go@v1.0.0-RC1",
+                    "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
+                ])
+            );
+        }
+
+        /// The scoped crawl and `find_by_purls` share `locate_module`:
+        /// for every recorded coordinate they report the same directory
+        /// and identity, including the case-encoded ones.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn the_scoped_crawl_reports_what_find_by_purls_finds() {
+            let f = Fixture::new();
+            stage_shared_cache(&f);
+            let options = CrawlerOptions {
+                cwd: f.project.clone(),
+                global: false,
+                global_prefix: None,
+            };
+            let crawled = GoCrawler::new().crawl_all(&options).await;
+            let purls: Vec<String> = crawled.iter().map(|p| p.purl.clone()).collect();
+            let found = GoCrawler::new()
+                .find_by_purls(&f.cache, &purls)
+                .await
+                .unwrap();
+            assert_eq!(found.len(), crawled.len());
+            for pkg in &crawled {
+                let hit = &found[&pkg.purl];
+                assert_eq!(
+                    (&hit.name, &hit.version, &hit.namespace, &hit.path),
+                    (&pkg.name, &pkg.version, &pkg.namespace, &pkg.path)
+                );
+            }
+            // And the walk reports the same rows for those directories.
+            let walked = GoCrawler::new()
+                .crawl_all(&CrawlerOptions {
+                    cwd: f.project.clone(),
+                    global: false,
+                    global_prefix: Some(f.cache.clone()),
+                })
+                .await;
+            for pkg in &crawled {
+                let w = walked.iter().find(|w| w.purl == pkg.purl).unwrap();
+                assert_eq!(
+                    (&w.name, &w.version, &w.namespace, &w.path),
+                    (&pkg.name, &pkg.version, &pkg.namespace, &pkg.path)
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn without_a_go_sum_the_whole_cache_is_walked() {
+            let f = Fixture::new();
+            f.stage("github.com/gin-gonic/gin", "v1.9.1")
+                .stage("example.com/unrelated", "v0.1.0");
+            assert_eq!(
+                f.crawl().await,
+                sorted(&[
+                    "pkg:golang/example.com/unrelated@v0.1.0",
+                    "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
+                ])
+            );
+        }
+
+        /// A workspace's build list spans other modules' go.sum files and
+        /// go.work.sum, so a go.work in cwd or an ancestor, or a GOWORK
+        /// file, keeps the walk; GOWORK=off scopes again.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_workspace_keeps_the_walk_unless_gowork_is_off() {
+            let f = Fixture::new();
+            f.stage("github.com/gin-gonic/gin", "v1.9.1")
+                .stage("example.com/unrelated", "v0.1.0")
+                .go_sum(&[("github.com/gin-gonic/gin", "v1.9.1")], &[]);
+            let scoped = sorted(&["pkg:golang/github.com/gin-gonic/gin@v1.9.1"]);
+            let walked = sorted(&[
+                "pkg:golang/example.com/unrelated@v0.1.0",
+                "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
+            ]);
+            assert_eq!(f.crawl().await, scoped);
+
+            // go.work in an ancestor of cwd.
+            let parent_work = f.project.parent().unwrap().join("go.work");
+            write(&parent_work, "go 1.22\nuse ./project\n");
+            assert_eq!(f.crawl().await, walked);
+            {
+                let _off = EnvGuard::set("GOWORK", "off");
+                assert_eq!(f.crawl().await, scoped);
+            }
+            std::fs::remove_file(&parent_work).unwrap();
+
+            // go.work in cwd.
+            write(&f.project.join("go.work"), "go 1.22\nuse .\n");
+            assert_eq!(f.crawl().await, walked);
+            std::fs::remove_file(f.project.join("go.work")).unwrap();
+
+            // GOWORK naming a file elsewhere.
+            let _gowork = EnvGuard::set("GOWORK", "/elsewhere/go.work");
+            assert_eq!(f.crawl().await, walked);
+        }
+
+        /// A relative `cwd` (the CLI passes `.`) still finds a parent
+        /// go.work, resolved against the process's directory.
+        #[test]
+        fn a_relative_cwd_still_sees_a_parent_workspace() {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("ws").join("project");
+            mkdir(&project);
+            assert!(!go_work_at_or_above(Path::new("."), &project));
+            write(&tmp.path().join("ws").join("go.work"), "go 1.22\n");
+            assert!(go_work_at_or_above(Path::new("."), &project));
+            assert!(go_work_at_or_above(
+                Path::new("project"),
+                &tmp.path().join("ws")
+            ));
+            // An absolute cwd ignores the base.
+            assert!(go_work_at_or_above(&project, Path::new("/elsewhere")));
+        }
+
+        /// go.sum is project content joined onto the cache root: traversal
+        /// coordinates are refused, and a partially extracted module, a
+        /// hidden segment or the root `cache/` directory is not reported
+        /// (the walk never reports them either).
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn unsafe_unreachable_and_partial_coordinates_are_not_located() {
+            let f = Fixture::new();
+            f.stage("github.com/gin-gonic/gin", "v1.9.1")
+                .stage("github.com/half/done", "v1.0.0")
+                .stage("cache/download/x", "v1.0.0")
+                .stage("github.com/.hidden/mod", "v1.0.0");
+            write(
+                &f.cache
+                    .join("cache/download/github.com/half/done/@v/v1.0.0.partial"),
+                "",
+            );
+            // A directory outside the cache that `..` would reach.
+            mkdir(&f.cache.parent().unwrap().join("escape@v1.0.0"));
+            f.go_sum(
+                &[
+                    ("github.com/gin-gonic/gin", "v1.9.1"),
+                    ("github.com/half/done", "v1.0.0"),
+                    ("cache/download/x", "v1.0.0"),
+                    ("github.com/.hidden/mod", "v1.0.0"),
+                    ("../escape", "v1.0.0"),
+                    ("github.com/gin-gonic/gin", "../../escape"),
+                ],
+                &[],
+            );
+            assert_eq!(
+                f.crawl().await,
+                sorted(&["pkg:golang/github.com/gin-gonic/gin@v1.9.1"])
+            );
+        }
+
+        /// A `replace`d module's go.sum records only its replacement (the
+        /// hosted rewrite drops the original's lines, as `go mod tidy`
+        /// does), but go.mod still requires it: its cached copy is still
+        /// crawled, as the whole-cache walk did.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_required_module_without_go_sum_lines_is_still_crawled() {
+            let f = Fixture::new();
+            f.stage("github.com/gin-gonic/gin", "v1.9.1")
+                .stage("github.com/Azure/azure-sdk-for-go", "v1.0.0-RC1")
+                .stage("example.com/unrelated", "v0.1.0")
+                .go_sum(&[("github.com/gin-gonic/gin", "v1.9.1")], &[]);
+            write(
+                &f.project.join("go.mod"),
+                "\u{feff}module example.com/app\n\nrequire (\n\t\"github.com/gin-gonic/gin\" v1.9.1\n\tgithub.com/Azure/azure-sdk-for-go v1.0.0-RC1 // indirect\n)\n\nreplace github.com/Azure/azure-sdk-for-go v1.0.0-RC1 => patch.socket.dev/gopatch/x v1.0.0-RC1-socketpatch.1\n",
+            );
+            assert_eq!(
+                f.crawl().await,
+                sorted(&[
+                    "pkg:golang/github.com/Azure/azure-sdk-for-go@v1.0.0-RC1",
+                    "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
+                ])
+            );
+        }
+
+        /// A duplicated go.sum line (a union merge) yields one package.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_repeated_go_sum_line_is_crawled_once() {
+            let f = Fixture::new();
+            f.stage("github.com/gin-gonic/gin", "v1.9.1").go_sum(
+                &[
+                    ("github.com/gin-gonic/gin", "v1.9.1"),
+                    ("github.com/gin-gonic/gin", "v1.9.1"),
+                ],
+                &[],
+            );
+            assert_eq!(
+                f.crawl().await,
+                sorted(&["pkg:golang/github.com/gin-gonic/gin@v1.9.1"])
+            );
+        }
     }
 
     // ---- get_gomodcache env tests ----

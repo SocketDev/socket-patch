@@ -13,7 +13,7 @@
 //!       reference (`scan_vendor_references` tokenizes the pnpm/yarn/bun
 //!       locks) is reported as `vendor_ledger_missing`, never reconstructed.
 //!
-//! The fixtures run the ACTUAL `scan --vendor` flow in-test the way the
+//! The fixtures run the ACTUAL `scan --mode vendored` flow in-test the way the
 //! capstones stage it — a hand-written flavor lock (the pre-vendor shape each
 //! backend's capstone asserts) plus an installed `node_modules/<dep>` copy,
 //! driven through the built binary against a mock API (no real package
@@ -21,9 +21,10 @@
 //! lockfile, so vendoring proceeds offline from the installed copy + the
 //! view-fetched patch content.
 
+use crate::common::git_sha256;
+
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -41,14 +42,6 @@ const ENCODED: &str = "pkg%3Anpm%2Fleft-pad%401.3.0";
 const BEFORE: &[u8] = b"before\n";
 const AFTER: &[u8] = b"after\n";
 const AFTER_B64: &str = "YWZ0ZXIK";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// The three npm flavors this file parameterizes over. Each knows how to lay
 /// down its pre-vendor lockfile and how to prove the vendor lock rewrite
@@ -418,12 +411,12 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
     common::run_with_env(root, &full, &[("SOCKET_TELEMETRY_DISABLED", "1")])
 }
 
-/// `scan --vendor --yes` to establish a vendored flavor project; returns the
+/// `scan --mode vendored --yes` to establish a vendored flavor project; returns the
 /// vendored tarball path (identical layout for every npm flavor). A v0/v1
 /// bun workspace shape gains its workspace member AFTER vendoring — the only
 /// way such a lock arises (a fresh vendor into it is refused by design).
 fn vendor_project(root: &Path, mock_uri: &str, flavor: Flavor) -> PathBuf {
-    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--vendor", "--yes"]);
+    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--mode", "vendored", "--yes"]);
     assert_eq!(
         code,
         0,

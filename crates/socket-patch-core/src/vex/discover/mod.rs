@@ -199,6 +199,7 @@ pub(crate) mod cargo;
 pub(crate) mod composer;
 pub(crate) mod deno;
 pub(crate) mod gem;
+pub use gem::manifest_source_pins as gem_manifest_source_pins;
 pub(crate) mod golang;
 pub(crate) mod gradle;
 pub(crate) mod maven;
@@ -369,14 +370,23 @@ pub struct UnlockedPin {
     /// `version = "…"`); a ledger version must satisfy every one. Empty =
     /// none to check (nuget: the csproj `Version` is only a minimum).
     pub version_reqs: Vec<String>,
+    /// The Socket index url the pin routes to (the nuget source value, the
+    /// cargo registry's `index`): its grant-token segment is part of this
+    /// pin, not other hosted wiring.
+    pub index_url: Option<String>,
 }
 
 impl UnlockedPin {
     /// Whether this pin routes `purl` (any spelling) to patch `uuid`.
     fn covers(&self, purl: &str, uuid: &str) -> bool {
-        if self.uuid != uuid {
-            return false;
-        }
+        self.uuid == uuid && self.routes(purl)
+    }
+
+    /// Whether this pin routes `purl` (any spelling, exact version) to its
+    /// patch: the package matches and the version satisfies every
+    /// requirement the pin declares. The rollout's recorded view reads a
+    /// lockless pin through this (it has no version of its own to index).
+    pub fn routes(&self, purl: &str) -> bool {
         let key = canonical_base_purl(purl);
         let Some(version) = key.rsplit_once('@').map(|(_, v)| v) else {
             return false;
@@ -455,6 +465,11 @@ pub enum UnattestedKind {
     /// a `package.json` project's npm deps from it, never from the
     /// npm-family lock that carries the wiring.
     DenoLock,
+    /// The wiring is in a root `npm-shrinkwrap.json` with no
+    /// `package-lock.json` twin (#899): npm >= 12 never reads the
+    /// shrinkwrap, resolves the package from the registry and writes a
+    /// fresh package-lock.json, so only npm <= 11 installs the patch.
+    NpmShrinkwrapOnly,
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,
@@ -546,6 +561,36 @@ pub struct Discovery {
     pub unwired_copies: Vec<UnwiredCopy>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
+    /// Refs withheld from `refs` only because the build ALSO installs an
+    /// unpatched copy of the same `name@version` that no rewire can reach
+    /// (a bundled copy unpacked from its parent's tarball, or a same-lock
+    /// [`Discovery::unpatched_copy`]), each diagnosed
+    /// [`DIAG_REF_UNATTRIBUTABLE`]. Never attested, but the wiring itself
+    /// is the rewriters' own output and names exactly one package version,
+    /// so the management commands (rollback, remove, list, the vendored
+    /// takeover) still see and unwind it (#828). Validated like `refs`.
+    pub shadowed: Vec<PatchedRef>,
+    /// Refs withheld from `refs` because another copy of the same
+    /// `name@version` that a re-run CAN rewire still resolves elsewhere:
+    /// another entry of the same lock (an `npm:` alias added after the
+    /// pin), the npm twin lock, another manager's lock
+    /// ([`Discovery::contest_across_locks`]), npm 6's legacy mirror, a Bun
+    /// registry entry. Each is diagnosed [`DIAG_REF_UNATTRIBUTABLE`] and is
+    /// neither attested nor unwound by the management commands, but it is
+    /// still a pin a live lock records: the rollout's recorded view counts
+    /// it ([`HostedPin::recorded`]), so the re-scan that rewires the other
+    /// copy is not capped as NEW (#1195). Validated and sorted like `refs`.
+    ///
+    /// [`HostedPin::recorded`]: crate::patch::redirect::upstream::HostedPin::recorded
+    pub rewirable: Vec<PatchedRef>,
+    /// The bundled copies (purl → root-relative directory) the vlt
+    /// extractor found in the installed store for the lock's nodes, exactly
+    /// as [`crate::vendor::vlt_bundled::bundled_copies`] reports them: the
+    /// only installed-tree input that discovery reads for vlt. `None` when it
+    /// did not look (no readable `vlt-lock.json`, or no disk). A caller
+    /// that changed the store since (the vlt heal) can compare this with
+    /// the store's copies now to tell whether this discovery still holds.
+    pub vlt_bundled_copies: Option<std::collections::BTreeMap<String, String>>,
     /// Root-relative files that are not locks of their own but part of
     /// another file's install tree, mapped to that tree's root file: the
     /// in-root `-r` includes of `requirements.txt`, which pip reads with the
@@ -592,7 +637,40 @@ impl Discovery {
     /// * the purl is `pkg:<known type>/<name>@<version>` (then canonicalized);
     /// * a vendored ref names a root-anchored artifact under its OWN uuid dir
     ///   and its purl's ecosystem dir.
-    pub fn push(&mut self, mut r: PatchedRef) {
+    pub fn push(&mut self, r: PatchedRef) {
+        if let Some(r) = self.validated(r) {
+            if !self.refs.contains(&r) {
+                self.refs.push(r);
+            }
+        }
+    }
+
+    /// Withhold the wired `r` from attestation because an unpatched copy of
+    /// its `name@version` installs beside it ([`Discovery::shadowed`]). The
+    /// caller diagnoses why. Validated exactly like [`Discovery::push`].
+    pub(crate) fn shadow(&mut self, r: PatchedRef) {
+        if let Some(r) = self.validated(r) {
+            if !self.shadowed.contains(&r) {
+                self.shadowed.push(r);
+            }
+        }
+    }
+
+    /// Withhold the wired `r` from attestation because another copy of its
+    /// `name@version` that a re-run can rewire resolves elsewhere
+    /// ([`Discovery::rewirable`]). The caller diagnoses why. Validated
+    /// exactly like [`Discovery::push`].
+    pub(crate) fn withhold_rewirable(&mut self, r: PatchedRef) {
+        if let Some(r) = self.validated(r) {
+            if !self.rewirable.contains(&r) {
+                self.rewirable.push(r);
+            }
+        }
+    }
+
+    /// [`Discovery::push`]'s gate: the canonicalized ref, or `None` after
+    /// diagnosing why it is invalid.
+    fn validated(&mut self, mut r: PatchedRef) -> Option<PatchedRef> {
         let file = r.source_file.to_string_lossy().into_owned();
         if !is_canonical_uuid(&r.uuid) {
             self.diag(
@@ -603,7 +681,7 @@ impl Discovery {
                     r.purl, r.uuid
                 ),
             );
-            return;
+            return None;
         }
         // Every identity an extractor builds a ref from is recognized — the
         // valid ref and the one rejected below alike (rule 11). This is also
@@ -617,7 +695,7 @@ impl Discovery {
                 &file,
                 format!("{file}: {:?} is not a usable package purl", r.purl),
             );
-            return;
+            return None;
         };
         r.purl = purl;
         match r.mode {
@@ -641,7 +719,7 @@ impl Discovery {
                             r.purl, r.artifact_rel, r.uuid
                         ),
                     );
-                    return;
+                    return None;
                 }
                 r.integrity_required = false;
                 r.url = None;
@@ -651,9 +729,7 @@ impl Discovery {
         if matches!(r.locked_integrity, Some(LockIntegrity::None)) {
             r.locked_integrity = None;
         }
-        if !self.refs.contains(&r) {
-            self.refs.push(r);
-        }
+        Some(r)
     }
 
     /// Record a diagnostic for root-relative `file`. `detail` is shown to
@@ -706,15 +782,17 @@ impl Discovery {
     /// package managers that keep several lockfiles side by side (npm,
     /// pnpm, yarn, bun; uv, pylock, poetry, pdm, Pipfile, requirements)
     /// call it for every such entry with exact coordinates.
+    ///
+    /// Duplicates are kept until [`Discovery::finalize`] sorts and dedups
+    /// the list: a membership check here made recording quadratic in the
+    /// lock's size (#993), and every reader before then only asks whether
+    /// some entry matches.
     pub(crate) fn resolved_elsewhere(&mut self, file: &str, purl: Option<String>) {
         let Some(purl) = purl else { return };
-        let entry = ResolvedElsewhere {
+        self.elsewhere.push(ResolvedElsewhere {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
-        };
-        if !self.elsewhere.contains(&entry) {
-            self.elsewhere.push(entry);
-        }
+        });
     }
 
     /// Record that lock `file`'s entry `key` installs its own copy of `purl`
@@ -749,8 +827,8 @@ impl Discovery {
     /// Drop every ref whose OWN lock also installs an unpatched copy of the
     /// same `name@version` ([`Discovery::unpatched_copy`]): the build ships
     /// that copy whatever the wiring does, so the ref is diagnosed
-    /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted. Its
-    /// uuid stays recognized (rule 11).
+    /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted, but
+    /// [`Discovery::shadowed`]. Its uuid stays recognized (rule 11).
     fn contest_within_locks(&mut self) {
         if self.unpatched_copies.is_empty() {
             return;
@@ -774,6 +852,9 @@ impl Discovery {
                             r.purl, r.uuid, c.key, c.how
                         ),
                     );
+                    // Withheld, not lost: rollback / remove / the takeover
+                    // still unwind the wiring (#828).
+                    self.shadow(r);
                 }
                 None => self.refs.push(r),
             }
@@ -845,6 +926,7 @@ impl Discovery {
                     other.display()
                 ),
             );
+            self.withhold_rewirable(r);
         }
     }
 
@@ -1000,15 +1082,17 @@ impl Discovery {
         self.unattested.dedup();
         self.contested.sort();
         self.contested.dedup();
-        self.refs.sort_by(|a, b| {
-            (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
-                &b.source_file,
-                &b.purl,
-                &b.uuid,
-                b.mode,
-            ))
-        });
-        self.refs.dedup();
+        for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
+            refs.sort_by(|a, b| {
+                (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
+                    &b.source_file,
+                    &b.purl,
+                    &b.uuid,
+                    b.mode,
+                ))
+            });
+            refs.dedup();
+        }
         self.diagnostics
             .sort_by(|a, b| (&a.file, a.code, &a.detail).cmp(&(&b.file, b.code, &b.detail)));
         self.recognized.sort();
@@ -1052,9 +1136,34 @@ pub async fn discover_patched_refs_in(
     snapshot: &crate::vendor::lock_inventory::DiskSnapshot<'_>,
     opts: &DiscoverOptions,
 ) -> Discovery {
-    let mut ctx = DiscoverCtx::with_origins(snapshot.root, &opts.patch_server_origins);
-    ctx.view = crate::vendor::lock_inventory::ProjectView::Snapshot(snapshot);
-    discover_with_ctx(ctx).await
+    discover_patched_refs_view(
+        crate::vendor::lock_inventory::ProjectView::Snapshot(snapshot),
+        opts,
+    )
+    .await
+}
+
+/// [`discover_patched_refs_with`] over any [`ProjectView`]: the disk, a
+/// per-run snapshot of it (possibly overlaid with a rewrite's output, see
+/// [`DiskSnapshot::overlay`]), or an in-memory project. Over memory the
+/// disk-only probes (installed trees, vendored artifact dirs, the sbt
+/// resolution evidence) see nothing, exactly as an in-memory hosted scan
+/// sees no installed tree.
+///
+/// [`ProjectView`]: crate::vendor::lock_inventory::ProjectView
+/// [`DiskSnapshot::overlay`]: crate::vendor::lock_inventory::DiskSnapshot::overlay
+pub async fn discover_patched_refs_view(
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+    opts: &DiscoverOptions,
+) -> Discovery {
+    // Boxed as `Send` here, where the extractors' futures are concrete: the
+    // in-memory hosted engine's future must be `Send`, and proving it
+    // through every extractor from inside the engine's loops trips rustc's
+    // higher-ranked auto-trait check.
+    let run: std::pin::Pin<Box<dyn std::future::Future<Output = Discovery> + Send + '_>> = Box::pin(
+        discover_with_ctx(DiscoverCtx::over(view, &opts.patch_server_origins)),
+    );
+    run.await
 }
 
 async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
@@ -1062,6 +1171,7 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     // Each extractor's reads are tagged with the vendor ecosystem it reads
     // for ([`Discovery::read`]).
     ctx.ecosystem = "npm";
+    ignore_member_stray_locks(&mut ctx, &mut out).await;
     npm::extract(&ctx, &mut out).await;
     yarn::extract(&ctx, &mut out).await;
     bun::extract(&ctx, &mut out).await;
@@ -1094,24 +1204,73 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     out
 }
 
+/// A workspace member's own npm, Bun or vlt lock that its package manager
+/// never reads (npm #1094, Bun #1101, vlt #1134: the member installs from
+/// the workspace root's lock, see
+/// [`crate::hosted::governing_root::member_stray_lock`]) is read as absent,
+/// as it is by the install: nothing in it is wiring, so its pins attest
+/// nothing. Its Socket identities are still recognized (rule 11), so a
+/// ledger claim it alone mentions is dead, and one diagnostic says why.
+/// Disk runs only: an in-memory project has no ancestors.
+async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discovery) {
+    // Declares the project files the check reads; the rest are above the
+    // project, which no overlay of the project's files changes.
+    let Some(root) =
+        ctx.disk_root_reading(crate::hosted::governing_root::member_stray_lock_own_files())
+    else {
+        return;
+    };
+    let Some(stray) = crate::hosted::governing_root::member_stray_lock(root).await else {
+        return;
+    };
+    for rel in &stray.ignored {
+        let mentions = match ctx.view.read_bytes(rel).await {
+            Ok(bytes) => {
+                !socket_identities(&String::from_utf8_lossy(&bytes), ctx.patch_server_origins)
+                    .is_empty()
+            }
+            Err(_) => false,
+        };
+        ctx.recognize_ignored(rel).await;
+        if mentions {
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                rel,
+                format!(
+                    "{}, so the Socket references in {rel} are not attested; run socket-patch \
+                     from {} (the workspace root)",
+                    stray.detail,
+                    stray.root.display()
+                ),
+            );
+        }
+    }
+    ctx.ignored = stray.ignored;
+}
+
 /// A PEP 723 script lock (`<script>.py.lock`).
 fn is_script_lock(file: &Path) -> bool {
     crate::utils::python_lock::is_script_lock_name(&file.to_string_lossy())
 }
 
-/// What every extractor receives: the project root plus the hosted-origin
+/// What every extractor receives: the project view plus the hosted-origin
 /// allowlist, with the guarded-read and identity helpers bolted on.
 pub(crate) struct DiscoverCtx<'a> {
-    pub(crate) root: &'a Path,
-    /// Where the guarded reads read from: `root` on disk, or a per-run
-    /// snapshot of it.
-    view: crate::vendor::lock_inventory::ProjectView<'a>,
+    /// Where the guarded reads read from: the root on disk, a per-run
+    /// snapshot of it, or an in-memory project.
+    pub(crate) view: crate::vendor::lock_inventory::ProjectView<'a>,
     patch_server_origins: &'a [String],
+    /// Root-relative lock files the package manager never reads here (a
+    /// workspace member's stray lock, see [`ignore_member_stray_locks`]):
+    /// the guarded reads see them as absent.
+    ignored: Vec<&'static str>,
     /// What the guarded reads have recognized so far (rule 11) — collected
     /// here, not in the extractor's `&mut Discovery`, so a read into a
     /// scratch `Discovery` (a file parsed only to explain it) still counts.
     /// A `Mutex` keeps the ctx `Sync` across the extractors' `.await`s.
     recognized: Mutex<BTreeSet<Recognized>>,
+    /// The hosts a Socket-hosted url can name (see [`DiscoverCtx::hosted_uuid`]).
+    hosted_hosts: std::sync::OnceLock<BTreeSet<String>>,
     /// The ecosystem the running extractor reads for (set by
     /// [`discover_with_ctx`] between extractors), tagging [`Self::read`].
     ecosystem: &'static str,
@@ -1121,11 +1280,22 @@ pub(crate) struct DiscoverCtx<'a> {
 
 impl<'a> DiscoverCtx<'a> {
     pub(crate) fn with_origins(root: &'a Path, patch_server_origins: &'a [String]) -> Self {
-        DiscoverCtx {
-            root,
-            view: crate::vendor::lock_inventory::ProjectView::Disk(root),
+        Self::over(
+            crate::vendor::lock_inventory::ProjectView::Disk(root),
             patch_server_origins,
+        )
+    }
+
+    pub(crate) fn over(
+        view: crate::vendor::lock_inventory::ProjectView<'a>,
+        patch_server_origins: &'a [String],
+    ) -> Self {
+        DiscoverCtx {
+            view,
+            patch_server_origins,
+            ignored: Vec::new(),
             recognized: Mutex::new(BTreeSet::new()),
+            hosted_hosts: std::sync::OnceLock::new(),
             ecosystem: "",
             read: Mutex::new(BTreeSet::new()),
         }
@@ -1150,6 +1320,22 @@ impl<'a> DiscoverCtx<'a> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *read).into_iter().collect()
+    }
+
+    /// The project root on disk, for the probes only a real tree answers
+    /// (installed packages, vendored artifact dirs, build evidence); `None`
+    /// over an in-memory project, where those probes find nothing.
+    pub(crate) fn disk_root(&self) -> Option<&'a Path> {
+        self.view.disk_root()
+    }
+
+    /// [`Self::disk_root`] for a probe that reads exactly `paths` (see
+    /// [`crate::vendor::lock_inventory::DiskSnapshot::root_reading`]).
+    pub(crate) fn disk_root_reading<P: AsRef<Path>>(
+        &self,
+        paths: impl IntoIterator<Item = P>,
+    ) -> Option<&'a Path> {
+        self.view.disk_root_reading(paths)
     }
 
     /// Record every Socket identity `text` (the content of root-relative
@@ -1219,14 +1405,39 @@ impl<'a> DiscoverCtx<'a> {
     /// The patch uuid of a Socket-HOSTED url, or `None` for anything else
     /// (see [`crate::patch::redirect::hosted_patch_uuid`] for the accepted
     /// spellings and the host allowlist).
+    ///
+    /// A plain url ([`plain_url_domain`]) on any other host is answered
+    /// without parsing it: every lock entry's registry url comes through
+    /// here.
     pub(crate) fn hosted_uuid(&self, url: &str) -> Option<String> {
+        if let Some(host) = plain_url_domain(url) {
+            let hosts = self.hosted_hosts.get_or_init(|| {
+                let mut hosts =
+                    BTreeSet::from([crate::patch::redirect::SOCKET_PATCH_SERVER_HOST.to_string()]);
+                hosts.extend(self.patch_server_origins.iter().filter_map(|o| {
+                    reqwest::Url::parse(o.trim())
+                        .ok()?
+                        .host_str()
+                        .map(str::to_string)
+                }));
+                hosts
+            });
+            if !hosts.contains(&host) {
+                return None;
+            }
+        }
         crate::patch::redirect::hosted_patch_uuid(url, self.patch_server_origins)
     }
 
     /// Whether `rel` exists (lstat — a dangling symlink still "exists", the
     /// read then fails and diagnoses).
     pub(crate) async fn exists(&self, rel: &str) -> bool {
-        self.view.exists_no_follow(rel).await
+        !self.is_ignored(rel) && self.view.exists_no_follow(rel).await
+    }
+
+    /// Whether `rel` is a lock the package manager never reads here.
+    fn is_ignored(&self, rel: &str) -> bool {
+        self.ignored.contains(&rel)
     }
 
     /// Guarded UTF-8 read of root-relative `rel`: `None` when missing
@@ -1235,6 +1446,9 @@ impl<'a> DiscoverCtx<'a> {
     /// parsing (rule 11) — so a file that then fails to parse, or an entry
     /// the extractor rejects or skips, is still recognized.
     pub(crate) async fn read_text(&self, rel: &str, out: &mut Discovery) -> Option<String> {
+        if self.is_ignored(rel) {
+            return None;
+        }
         match self.view.read_text(rel).await {
             Ok(text) => {
                 self.log_read(rel, true);
@@ -1248,6 +1462,51 @@ impl<'a> DiscoverCtx<'a> {
                     DIAG_LOCKFILE_UNREADABLE,
                     rel,
                     format!("cannot read {rel}: {e}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// [`DiscoverCtx::read_text`] for a pip requirements file: the bytes are
+    /// decoded as pip decodes them ([`crate::utils::requirements::decode`]:
+    /// a UTF-16 / UTF-32 byte-order mark, a PEP 263 coding line, else
+    /// UTF-8), so a UTF-16 export pip and uv install from is evidence like
+    /// its UTF-8 twin (#1120). A file those rules cannot decode records
+    /// [`DIAG_LOCKFILE_UNREADABLE`].
+    pub(crate) async fn read_requirements_text(
+        &self,
+        rel: &str,
+        out: &mut Discovery,
+    ) -> Option<String> {
+        let bytes = match self.view.read_bytes(rel).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                self.log_read(rel, false);
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    rel,
+                    format!("cannot read {rel}: {e}"),
+                );
+                return None;
+            }
+        };
+        match crate::utils::requirements::decode(&bytes) {
+            Some(text) => {
+                self.log_read(rel, true);
+                self.recognize_text(rel, &text);
+                Some(text)
+            }
+            None => {
+                self.log_read(rel, false);
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    rel,
+                    format!(
+                        "cannot read {rel}: not text pip's decoding rules can read (a \
+                         byte-order mark, a PEP 263 coding line, or UTF-8)"
+                    ),
                 );
                 None
             }
@@ -1273,6 +1532,9 @@ impl<'a> DiscoverCtx<'a> {
     /// left in `bun.lockb`'s append-only pool names a DEAD patch, which is
     /// exactly what recognition should say about it.
     pub(crate) async fn read_bytes(&self, rel: &str, out: &mut Discovery) -> Option<Vec<u8>> {
+        if self.is_ignored(rel) {
+            return None;
+        }
         match self.view.read_bytes(rel).await {
             Ok(bytes) => {
                 self.log_read(rel, true);
@@ -1294,6 +1556,53 @@ impl<'a> DiscoverCtx<'a> {
 }
 
 // ── identity helpers ─────────────────────────────────────────────────────
+
+/// The host of `url` when it is a PLAIN `http(s)` url — printable ASCII
+/// only, no `%`, `\\` or userinfo, a DNS name of letters, digits, `.` and
+/// `-` whose last label starts with a letter — lowercased, which is then
+/// exactly what [`crate::patch::redirect::hosted_patch_url_uuids`]'s url
+/// parse would call its host (no decoding, IDNA mapping or IP-address
+/// reading applies to such a name). `None` for anything else, which takes
+/// the full parse.
+fn plain_url_domain(url: &str) -> Option<String> {
+    let url = url.trim();
+    if !url
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && b != b'%' && b != b'\\')
+    {
+        return None;
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    // `sparse+https://…` / `registry+https://…`, as the parse strips it.
+    let scheme = match scheme.rsplit_once('+') {
+        Some((kind, scheme))
+            if !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_alphabetic()) =>
+        {
+            scheme
+        }
+        _ => scheme,
+    };
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return None,
+        None => authority,
+    };
+    let last = host.strip_suffix('.').unwrap_or(host).rsplit('.').next()?;
+    let plain = !host.is_empty()
+        && !rest.starts_with('/')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && last.starts_with(|c: char| c.is_ascii_alphabetic())
+        && !host
+            .split('.')
+            .any(|label| label.len() >= 4 && label[..4].eq_ignore_ascii_case("xn--"));
+    plain.then(|| host.to_ascii_lowercase())
+}
 
 /// The uuid of a Socket-owned registry / repository / source NAME:
 /// `socket-patch-<uuid>` (cargo `[registries.*]` + Cargo.toml `registry =`,
@@ -1328,8 +1637,66 @@ pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<Strin
 /// escapes and (doubled) Windows backslashes are folded to `/`. Bounded
 /// work per anchor, so a tampered multi-megabyte lock costs one linear pass
 /// per anchor kind.
+///
+/// Memoized by content ([`IdentityMemo`]): one scan runs several
+/// discoveries over mostly byte-identical lockfiles, and this sweep is the
+/// largest per-file cost after parsing.
 fn socket_identities(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
-    socket_identities_inner(text, origins)
+    IdentityMemo::sweep(text, origins)
+}
+
+/// The process-wide memo behind [`socket_identities`]: the sweep's result
+/// keyed by the SHA-256 of the swept text and the (sorted, deduplicated)
+/// origin allowlist — never by path, so a pending rewrite overlaid on a
+/// path, or the file rewritten on disk, is swept afresh. The sweep is a
+/// pure function of exactly that key (the origins are only ever tested
+/// with `any`). Small texts are swept directly (hashing them saves
+/// nothing), and only the most recent [`IdentityMemo::CAPACITY`] results
+/// are kept.
+struct IdentityMemo;
+
+type IdentitySet = BTreeSet<(String, WiringMode)>;
+type IdentityKey = ([u8; 32], Vec<String>);
+
+impl IdentityMemo {
+    const CAPACITY: usize = 64;
+    /// Below this many bytes the sweep is cheaper than the hash.
+    const MIN_LEN: usize = 16 * 1024;
+
+    fn entries() -> &'static Mutex<std::collections::VecDeque<(IdentityKey, IdentitySet)>> {
+        static ENTRIES: std::sync::OnceLock<
+            Mutex<std::collections::VecDeque<(IdentityKey, IdentitySet)>>,
+        > = std::sync::OnceLock::new();
+        ENTRIES.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+    }
+
+    fn sweep(text: &str, origins: &[String]) -> IdentitySet {
+        if text.len() < Self::MIN_LEN {
+            return socket_identities_inner(text, origins);
+        }
+        use sha2::Digest as _;
+        let mut origin_key = origins.to_vec();
+        origin_key.sort();
+        origin_key.dedup();
+        let key: IdentityKey = (sha2::Sha256::digest(text.as_bytes()).into(), origin_key);
+        let lock = || {
+            Self::entries()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some((_, found)) = lock().iter().find(|(k, _)| *k == key) {
+            return found.clone();
+        }
+        let found = socket_identities_inner(text, origins);
+        let mut entries = lock();
+        if !entries.iter().any(|(k, _)| *k == key) {
+            if entries.len() == Self::CAPACITY {
+                entries.pop_front();
+            }
+            entries.push_back((key, found.clone()));
+        }
+        found
+    }
 }
 
 /// The hosted patch uuids `text` mentions, under the same recognition
@@ -1344,41 +1711,66 @@ pub(crate) fn hosted_uuids_in_text(text: &str, origins: &[String]) -> BTreeSet<S
 }
 
 fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
+    use aho_corasick::AhoCorasick;
+    use std::borrow::Cow;
+
     let mut found = BTreeSet::new();
-    let norm = decode_escapes(text)
-        .replace("\\/", "/")
-        .replace("\\\\", "/")
-        .replace('\\', "/");
+    let decoded = decode_escapes(text);
+    // The folds only ever touch a backslash.
+    let norm: Cow<'_, str> = if decoded.contains('\\') {
+        Cow::Owned(
+            decoded
+                .replace("\\/", "/")
+                .replace("\\\\", "/")
+                .replace('\\', "/"),
+        )
+    } else {
+        decoded
+    };
     let bytes = norm.as_bytes();
 
-    for sep in ['/', '+', '§'] {
-        let anchor = format!("{VENDOR_DIR}/").replace('/', &sep.to_string());
-        for (at, _) in norm.match_indices(anchor.as_str()) {
-            let rest = &norm[at + anchor.len()..];
-            for eco in ECOSYSTEM_DIRS {
-                let uuid = rest
-                    .strip_prefix(eco)
-                    .and_then(|r| r.strip_prefix(sep))
-                    .and_then(|r| r.get(..36))
-                    .filter(|u| is_canonical_uuid(u));
-                if let Some(uuid) = uuid {
-                    found.insert((uuid.to_string(), WiringMode::Vendored));
+    // Every anchor in one pass. None of them overlaps itself, so each
+    // pattern's occurrences here are exactly its `match_indices`.
+    const VENDOR_SEPS: [char; 3] = ['/', '+', '§'];
+    const GO: usize = VENDOR_SEPS.len();
+    static ANCHORS: std::sync::OnceLock<(Vec<String>, AhoCorasick)> = std::sync::OnceLock::new();
+    let (anchors, anchor_finder) = ANCHORS.get_or_init(|| {
+        let mut anchors: Vec<String> = VENDOR_SEPS
+            .iter()
+            .map(|sep| format!("{VENDOR_DIR}/").replace('/', &sep.to_string()))
+            .collect();
+        anchors.push(HOSTED_GO_MODULE_PREFIX.to_string());
+        let finder = AhoCorasick::new(&anchors).expect("literal anchor patterns");
+        (anchors, finder)
+    });
+    for m in anchor_finder.find_overlapping_iter(bytes) {
+        let (pattern, at) = (m.pattern().as_usize(), m.start());
+        if pattern == GO {
+            let start = m.end();
+            let end = token_end(bytes, start, b"@");
+            for segment in norm[start..end].split('/') {
+                if is_canonical_uuid(segment) {
+                    found.insert((segment.to_string(), WiringMode::Hosted));
                 }
             }
+            continue;
         }
-    }
-
-    for (at, _) in norm.match_indices(HOSTED_GO_MODULE_PREFIX) {
-        let start = at + HOSTED_GO_MODULE_PREFIX.len();
-        let end = token_end(bytes, start, b"@");
-        for segment in norm[start..end].split('/') {
-            if is_canonical_uuid(segment) {
-                found.insert((segment.to_string(), WiringMode::Hosted));
+        let sep = VENDOR_SEPS[pattern];
+        let rest = &norm[at + anchors[pattern].len()..];
+        for eco in ECOSYSTEM_DIRS {
+            let uuid = rest
+                .strip_prefix(eco)
+                .and_then(|r| r.strip_prefix(sep))
+                .and_then(|r| r.get(..36))
+                .filter(|u| is_canonical_uuid(u));
+            if let Some(uuid) = uuid {
+                found.insert((uuid.to_string(), WiringMode::Vendored));
             }
         }
     }
 
-    // Cheap pre-filter: only a token naming an accepted host can be ours.
+    // Cheap pre-filter: only a token naming an accepted host (any ASCII
+    // case) can be ours.
     let mut hosts = vec![crate::patch::redirect::SOCKET_PATCH_SERVER_HOST.to_string()];
     hosts.extend(origins.iter().filter_map(|o| {
         reqwest::Url::parse(o.trim())
@@ -1386,20 +1778,28 @@ fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, 
             .host_str()
             .map(str::to_ascii_lowercase)
     }));
-    let lower = norm.to_ascii_lowercase();
-    for separator in ["://", "%3a%2f%2f"] {
-        for (at, _) in lower.match_indices(separator) {
-            let Some(start) = scheme_start(bytes, at) else {
-                continue;
-            };
-            let end = token_end(bytes, at + separator.len(), b"");
-            if !hosts.iter().any(|h| lower[start..end].contains(h.as_str())) {
-                continue;
-            }
-            let uuids = crate::patch::redirect::hosted_patch_url_uuids(&norm[start..end], origins);
-            for uuid in uuids.into_iter().flatten() {
-                found.insert((uuid, WiringMode::Hosted));
-            }
+    let host_finder = AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(&hosts)
+        .expect("literal host patterns");
+    static SEPARATORS: std::sync::OnceLock<AhoCorasick> = std::sync::OnceLock::new();
+    let separators = SEPARATORS.get_or_init(|| {
+        AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(["://", "%3a%2f%2f"])
+            .expect("literal separator patterns")
+    });
+    for m in separators.find_overlapping_iter(bytes) {
+        let Some(start) = scheme_start(bytes, m.start()) else {
+            continue;
+        };
+        let end = token_end(bytes, m.end(), b"");
+        if !host_finder.is_match(&bytes[start..end]) {
+            continue;
+        }
+        let uuids = crate::patch::redirect::hosted_patch_url_uuids(&norm[start..end], origins);
+        for uuid in uuids.into_iter().flatten() {
+            found.insert((uuid, WiringMode::Hosted));
         }
     }
     found
@@ -3873,6 +4273,150 @@ mod tests {
         );
     }
 
+    /// The sweep's memo is keyed by content and origins, never by path or
+    /// by call: a large text swept twice answers the same, and the same
+    /// text with one byte changed (a pending rewrite overlaid on the same
+    /// path) or under other origins is swept afresh.
+    #[test]
+    fn socket_identities_memo_is_keyed_by_content_and_origins() {
+        let a = UUID_A;
+        let b = UUID_B;
+        let pad = "x".repeat(IdentityMemo::MIN_LEN);
+        let lock = |uuid: &str| {
+            format!(
+                "{pad}\n\"resolved\": \"http://127.0.0.1:4545/patch/npm/x/1/{TOKEN}/{uuid}/x.tgz\"\n\
+                 \"file:.socket/vendor/npm/{uuid}/x-1.0.0.tgz\"\n"
+            )
+        };
+        let staging = ["http://127.0.0.1:4545".to_string()];
+        let uuids = |text: &str, origins: &[String]| {
+            socket_identities(text, origins)
+                .into_iter()
+                .map(|(u, m)| (u, m == WiringMode::Hosted))
+                .collect::<BTreeSet<_>>()
+        };
+        let all = |uuid: &str| {
+            BTreeSet::from([
+                (uuid.to_string(), false),
+                (uuid.to_string(), true),
+                (TOKEN.to_string(), true),
+            ])
+        };
+        for _ in 0..2 {
+            assert_eq!(uuids(&lock(a), &staging), all(a));
+            assert_eq!(
+                uuids(&lock(a), &[]),
+                BTreeSet::from([(a.to_string(), false)])
+            );
+            assert_eq!(uuids(&lock(b), &staging), all(b));
+        }
+        // Origins are a set: order and duplicates do not change the key.
+        let twice = [
+            staging[0].clone(),
+            "https://patch.socket.dev".into(),
+            staging[0].clone(),
+        ];
+        assert_eq!(uuids(&lock(a), &twice), uuids(&lock(a), &staging));
+        assert_eq!(
+            socket_identities(&lock(a), &staging),
+            socket_identities_inner(&lock(a), &staging)
+        );
+    }
+
+    /// [`DiscoverCtx::hosted_uuid`]'s plain-url shortcut answers exactly
+    /// what the full parse does, for plain urls on other hosts and for
+    /// every spelling it must leave to the parse.
+    #[test]
+    fn hosted_uuid_shortcut_agrees_with_the_full_parse() {
+        let (a, t) = (UUID_A, TOKEN);
+        let path = format!("/patch/npm/x/1.0.0/{t}/{a}/x-1.0.0.tgz");
+        let hosts = [
+            "patch.socket.dev",
+            "PATCH.Socket.DEV",
+            "patch.socket.dev.",
+            "patch.socket.dev:443",
+            "patch.socket.dev:8443",
+            "patch.socket.dev:",
+            "registry.npmjs.org",
+            "registry.npmjs.org:443",
+            "127.0.0.1:4545",
+            "127.0.0.1",
+            "0x7f.0.0.1:4545",
+            "127.1:4545",
+            "[::1]:4545",
+            "staging.example.com:8443",
+            "Staging.Example.COM:8443",
+            "staging.example.com",
+            "xn--stging-bua.example.com",
+            "user@patch.socket.dev",
+            "user:pw@registry.npmjs.org",
+            "patch%2esocket.dev",
+            "patch.soc\tket.dev",
+            "patch.socket.dev\\",
+            "foo.123",
+            "foo.0x1f",
+            "",
+        ];
+        let urls: Vec<String> = hosts
+            .iter()
+            .flat_map(|host| {
+                [
+                    format!("https://{host}{path}"),
+                    format!("http://{host}{path}"),
+                    format!("HTTPS://{host}{path}"),
+                    format!("sparse+https://{host}{path}"),
+                    format!("git+https://{host}{path}"),
+                    format!("https:///{host}{path}"),
+                    format!("https://{host}?q={path}"),
+                    format!("  https://{host}{path}  "),
+                    format!("https://{host}"),
+                ]
+            })
+            .chain([
+                format!("https:\\/\\/patch.socket.dev{}", path.replace('/', "\\/")),
+                format!("https%3A%2F%2Fpatch.socket.dev{}", path.replace('/', "%2F")),
+                "file:x.tgz".to_string(),
+                "npm:x@1.0.0".to_string(),
+                "https://".to_string(),
+            ])
+            .collect();
+        for origins in [
+            vec![],
+            vec!["http://127.0.0.1:4545".to_string()],
+            vec![
+                "https://staging.example.com:8443".to_string(),
+                "http://[::1]:4545".to_string(),
+                "https://xn--stging-bua.example.com".to_string(),
+            ],
+        ] {
+            let ctx = DiscoverCtx::with_origins(Path::new("/nonexistent"), &origins);
+            for url in &urls {
+                assert_eq!(
+                    ctx.hosted_uuid(url),
+                    crate::patch::redirect::hosted_patch_uuid(url, &origins),
+                    "{url} under {origins:?}"
+                );
+            }
+            assert_eq!(
+                ctx.hosted_uuid(&format!("https://patch.socket.dev{path}"))
+                    .as_deref(),
+                Some(a)
+            );
+        }
+        assert_eq!(
+            plain_url_domain("https://Registry.NPMJS.org/x"),
+            Some("registry.npmjs.org".into())
+        );
+        for not_plain in [
+            "https://127.0.0.1/x",
+            "https://a%2eb.com/x",
+            "https://u@a.com/x",
+            "https://xn--a.com/x",
+        ] {
+            assert_eq!(plain_url_domain(not_plain), None, "{not_plain}");
+        }
+    }
+
     /// The claim API: a recognized uuid is decided by the refs alone (live
     /// only for the package — and, vendored, the artifact — a ref wires),
     /// while an unrecognized one is left to the caller (`None`).
@@ -4548,5 +5092,111 @@ mod tests {
         let out = p.discover().await;
         assert!(out.refs.is_empty(), "{:?}", out.refs);
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+}
+
+#[cfg(test)]
+mod member_stray_lock_tests {
+    use super::testing::fixture_path;
+    use super::*;
+
+    fn copy_dir(src: &Path, dest: &Path) {
+        for entry in std::fs::read_dir(src).unwrap() {
+            let path = entry.unwrap().path();
+            let target = dest.join(path.file_name().unwrap());
+            if path.is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                copy_dir(&path, &target);
+            } else {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    /// #1101 (Bun), #1134 (vlt), #1094 (npm): a workspace member's own
+    /// hosted-pinned lock is one its package manager never reads (the
+    /// member installs from the workspace root's lock), so lock-only VEX
+    /// from the member must not attest its pins. The lock is read as
+    /// absent, its uuid stays recognized (a ledger claim on it is dead),
+    /// and one diagnostic names it. The same lock outside a workspace is
+    /// read as usual.
+    #[tokio::test]
+    async fn a_member_lock_its_manager_ignores_attests_nothing() {
+        for (fixture, lock, uuid, root_files) in [
+            (
+                "redirect/npm/bun/basic/expected",
+                "bun.lock",
+                "77777777-7777-7777-7777-777777777777",
+                &[
+                    (
+                        "package.json",
+                        r#"{"private":true,"workspaces":["packages/*"]}"#,
+                    ),
+                    ("bun.lockb", "binary"),
+                ][..],
+            ),
+            (
+                "redirect/npm/vlt/basic/expected",
+                "vlt-lock.json",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &[
+                    ("vlt.json", r#"{"workspaces":"packages/*"}"#),
+                    ("vlt-lock.json", "{}"),
+                ][..],
+            ),
+            (
+                "redirect/npm/package-lock-v3/basic/expected",
+                "package-lock.json",
+                "22222222-2222-2222-2222-222222222222",
+                &[
+                    (
+                        "package.json",
+                        r#"{"private":true,"workspaces":["packages/*"]}"#,
+                    ),
+                    ("package-lock.json", "{}"),
+                ][..],
+            ),
+        ] {
+            let ws = tempfile::tempdir().unwrap();
+            let member = ws.path().join("packages/a");
+            copy_dir(&fixture_path(fixture), &member);
+            std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+
+            // Control: not a workspace member yet, so the pin is wiring.
+            let out = discover_patched_refs(&member).await;
+            assert!(
+                out.refs.iter().any(|r| r.uuid == uuid),
+                "{fixture}: {:?}",
+                out.refs
+            );
+
+            for (rel, text) in root_files {
+                std::fs::write(ws.path().join(rel), text).unwrap();
+            }
+            let out = discover_patched_refs(&member).await;
+            assert!(
+                out.refs.is_empty(),
+                "{fixture}: a stray member lock wires nothing: {:?}",
+                out.refs
+            );
+            assert!(
+                out.recognized
+                    .iter()
+                    .any(|r| r.uuid == uuid && r.file == Path::new(lock)),
+                "{fixture}: {:?}",
+                out.recognized
+            );
+            let diag = out
+                .diagnostics
+                .iter()
+                .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.file == Path::new(lock))
+                .unwrap_or_else(|| panic!("{fixture}: {:?}", out.diagnostics));
+            assert!(
+                diag.detail.contains("ignores") && diag.detail.contains("not attested"),
+                "{fixture}: {}",
+                diag.detail
+            );
+        }
     }
 }

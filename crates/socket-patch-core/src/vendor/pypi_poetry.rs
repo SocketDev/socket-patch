@@ -10,12 +10,11 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 
 use super::common::{
     ensure_unchanged, item_get, lock_units_named, pep621_declared_names, record, refuse_symlinked,
-    revert_lock_fragment_splice_atomic, unit_has_canon_name,
+    revert_lock_fragment_splice_atomic,
 };
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::state::{PoetryMeta, VendorEntry, WiringAction, WiringRecord};
-use super::toml_surgery::{find_unit_span, package_unit_lines, replace_files_array};
 use super::{RevertOutcome, VendorWarning};
 
 /// The only file this backend ever writes (and the revert allowlist).
@@ -316,36 +315,26 @@ pub(super) async fn wire_poetry(
         PoetryTarget::Fresh => {}
     }
 
-    let edits =
-        if matches!(p.lock_version.as_str(), "0" | "1.0" | "1.1") || p.lock_text.contains("\r\n") {
-            let rewrite = crate::utils::poetry_lock::rewrite_poetry_lock_with_edits(
-                &p.lock_text,
-                canon_name,
-                version,
-                "file",
-                rel_wheel,
-                wheel_file_name,
-                wheel_sha256_hex,
-            )
-            .map_err(|detail| ("pypi_poetry_lock_parse_failed", detail))?
-            .ok_or_else(|| {
-                (
-                    "pypi_poetry_lock_package_missing",
-                    format!("no {canon_name}@{version} in {LOCK_FILE}"),
-                )
-            })?;
-            rewrite
-                .edits()
-                .map_err(|detail| ("pypi_poetry_lock_parse_failed", detail))?
-        } else {
-            vec![rewrite_target_package_unit(
-                &p.lock_text,
-                canon_name,
-                rel_wheel,
-                wheel_file_name,
-                wheel_sha256_hex,
-            )?]
-        };
+    // Every lock generation and line ending goes through the shared engine
+    // hosted mode uses, so both modes write one shape and share its gates.
+    let edits = crate::utils::poetry_lock::rewrite_poetry_lock_with_edits(
+        &p.lock_text,
+        canon_name,
+        version,
+        "file",
+        rel_wheel,
+        wheel_file_name,
+        wheel_sha256_hex,
+    )
+    .map_err(|detail| ("pypi_poetry_lock_parse_failed", detail))?
+    .ok_or_else(|| {
+        (
+            "pypi_poetry_lock_package_missing",
+            format!("no {canon_name}@{version} in {LOCK_FILE}"),
+        )
+    })?
+    .edits()
+    .map_err(|detail| ("pypi_poetry_lock_parse_failed", detail))?;
     let mut new_lock = p.lock_text.clone();
     for (old_unit, new_unit) in &edits {
         new_lock = new_lock.replacen(old_unit, new_unit, 1);
@@ -418,60 +407,6 @@ fn is_newer_2x(v: &str) -> bool {
         .and_then(|rest| rest.split('.').next())
         .and_then(|minor| minor.parse::<u64>().ok())
         .is_some_and(|minor| minor > 1)
-}
-
-/// Rewrite the target `[[package]]` unit to the file-source shape proven by
-/// the fixture pairs: `files = [...]` becomes the single
-/// `{file = "<wheel>", hash = "sha256:<ours>"}` element and a
-/// `[package.source] type = "file"` table is appended as the LAST subtable
-/// (poetry's own placement on both majors — spike P1). Every other line —
-/// version, python-versions, groups (2.1) / no groups (2.0), description,
-/// existing subtables — is preserved verbatim. Returns `(old_unit, new_unit)`
-/// for the wiring record.
-fn rewrite_target_package_unit(
-    lock_text: &str,
-    canon: &str,
-    rel_wheel: &str,
-    wheel_file_name: &str,
-    wheel_sha256_hex: &str,
-) -> Result<(String, String), (&'static str, String)> {
-    let span =
-        find_unit_span(lock_text, |lines| unit_has_canon_name(lines, canon)).ok_or_else(|| {
-            (
-                "pypi_poetry_lock_package_missing",
-                format!("{LOCK_FILE} has no [[package]] entry for {canon}"),
-            )
-        })?;
-    let unit = package_unit_lines(&lock_text[span]);
-    let old_unit = unit.join("\n");
-    // Defensive backstop: CRLF locks are routed to the line-ending-preserving
-    // `poetry_lock` rewriter before this point, so a fragment that cannot
-    // byte-match the file here is an unexpected shape. The caller's replacen
-    // splice would silently no-op while still recording a rewrite, so fail
-    // closed instead.
-    if !lock_text.contains(&old_unit) {
-        return Err((
-            "pypi_poetry_lock_parse_failed",
-            format!(
-                "the {canon} [[package]] entry cannot be spliced back into {LOCK_FILE} \
-                 (non-LF line endings?); normalize the lock to LF and retry"
-            ),
-        ));
-    }
-    let mut out =
-        replace_files_array(&unit, wheel_file_name, wheel_sha256_hex).ok_or_else(|| {
-            // 2.x locks always carry files[]; a unit without one is a shape we
-            // have no fixture for — fail closed rather than guess a placement.
-            (
-                "pypi_poetry_lock_parse_failed",
-                format!("the {canon} [[package]] entry has no files array to rewrite"),
-            )
-        })?;
-    out.push(String::new());
-    out.push("[package.source]".to_string());
-    out.push("type = \"file\"".to_string());
-    out.push(format!("url = \"{rel_wheel}\""));
-    Ok((old_unit, out.join("\n")))
 }
 
 #[cfg(test)]
@@ -1289,70 +1224,95 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         assert_eq!(read_lock(tmp.path()).await, crlf);
     }
 
-    /// Valid TOML poetry itself never emits — `name="six"` with no spaces
-    /// around the `=` — parses fine, so the parsed-TOML guards pass Fresh,
-    /// but the text surgery's literal `name = ` line matcher cannot find the
-    /// unit: wire must fail closed (refuse before any write) rather than
-    /// splice a wrong span.
+    /// The forward rewrite is the shared `utils::poetry_lock` engine for
+    /// every line ending: each 2.x fixture wired as LF and as CRLF gives the
+    /// same lock once CRLF is normalized, and that lock is the fixture
+    /// Poetry itself wrote (one file per line in `files`).
     #[tokio::test]
-    async fn wire_fails_closed_when_text_surgery_cannot_find_the_parsed_unit() {
-        let lock = LOCK21_DIRECT_REGISTRY.replace("name = \"six\"", "name=\"six\"");
-        let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
-        let p = load_poetry_project(tmp.path()).await.unwrap();
-        assert_eq!(
-            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
-            PoetryTarget::Fresh,
-            "the parsed guards see the unit"
-        );
-
-        let err = wire_poetry(
-            &p,
-            tmp.path(),
-            "six",
-            "1.16.0",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-            UUID,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.0, "pypi_poetry_lock_package_missing");
-        assert_eq!(read_lock(tmp.path()).await, lock, "refusal writes nothing");
+    async fn lf_and_crlf_locks_wire_to_the_same_fixture() {
+        for (registry, vendored, pyproject) in [
+            (
+                LOCK21_DIRECT_REGISTRY,
+                LOCK21_DIRECT_VENDORED,
+                PYPROJECT_DIRECT,
+            ),
+            (
+                LOCK21_TRANSITIVE_REGISTRY,
+                LOCK21_TRANSITIVE_VENDORED,
+                PYPROJECT_TRANSITIVE,
+            ),
+            (
+                LOCK20_DIRECT_REGISTRY,
+                LOCK20_DIRECT_VENDORED,
+                PYPROJECT_DIRECT,
+            ),
+            (
+                LOCK20_TRANSITIVE_REGISTRY,
+                LOCK20_TRANSITIVE_VENDORED,
+                PYPROJECT_TRANSITIVE,
+            ),
+        ] {
+            let mut wired = Vec::new();
+            for crlf in [false, true] {
+                let lock = if crlf {
+                    registry.replace('\n', "\r\n")
+                } else {
+                    registry.to_string()
+                };
+                let tmp = write_project(&lock, pyproject).await;
+                let project = load_poetry_project(tmp.path()).await.unwrap();
+                wire_default(&project, tmp.path()).await;
+                wired.push(read_lock(tmp.path()).await.replace("\r\n", "\n"));
+            }
+            assert_eq!(wired[0], wired[1], "LF and CRLF wire one shape");
+            assert_eq!(wired[0], vendored, "the wired lock is Poetry's own");
+        }
     }
 
-    /// A target unit with no top-level `files = [` array (a hand-minimized
-    /// or degenerate lock — the guards never inspect files[], so wire is the
-    /// first to notice) must fail closed rather than guess a placement for
-    /// the rewritten array.
+    /// Valid TOML poetry itself never emits — `name="six"` with no spaces
+    /// around the `=` — names the same package to the parsed engine, so it
+    /// wires (whatever the line endings) and reverts byte-exact.
     #[tokio::test]
-    async fn wire_fails_closed_on_unit_without_files_array() {
+    async fn wire_accepts_a_unit_spelled_without_spaces() {
+        for crlf in [false, true] {
+            let lock = LOCK21_DIRECT_REGISTRY.replace("name = \"six\"", "name=\"six\"");
+            let lock = if crlf {
+                lock.replace('\n', "\r\n")
+            } else {
+                lock
+            };
+            let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
+            let p = load_poetry_project(tmp.path()).await.unwrap();
+            let (wiring, meta) = wire_default(&p, tmp.path()).await;
+            let rewritten = read_lock(tmp.path()).await;
+            assert!(rewritten.contains(REL_WHEEL), "{rewritten}");
+            let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
+            assert!(outcome.success, "{outcome:?}");
+            assert_eq!(read_lock(tmp.path()).await, lock, "revert is byte-exact");
+        }
+    }
+
+    /// A target unit with no top-level `files` array (a hand-minimized or
+    /// degenerate lock) gets the patched wheel's one-entry array, as hosted
+    /// mode writes it, and reverts byte-exact.
+    #[tokio::test]
+    async fn wire_adds_files_to_a_unit_without_one() {
         let lock = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\noptional = false\n\
                     python-versions = \"*\"\ngroups = [\"main\"]\n\n[metadata]\n\
                     lock-version = \"2.1\"\npython-versions = \">=3.9\"\ncontent-hash = \"x\"\n";
         let tmp = write_project(lock, PYPROJECT_DIRECT).await;
         let p = load_poetry_project(tmp.path()).await.unwrap();
-        assert_eq!(
-            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
-            PoetryTarget::Fresh,
-            "guards do not inspect files[]"
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        let rewritten = read_lock(tmp.path()).await;
+        assert!(
+            rewritten.contains(&format!(
+                "files = [\n    {{file = \"{WHEEL_NAME}\", hash = \"sha256:{WHEEL_SHA}\"}},\n]\n"
+            )),
+            "{rewritten}"
         );
-
-        let err = wire_poetry(
-            &p,
-            tmp.path(),
-            "six",
-            "1.16.0",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-            UUID,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.0, "pypi_poetry_lock_parse_failed");
-        assert!(err.1.contains("no files array"), "{}", err.1);
-        assert_eq!(read_lock(tmp.path()).await, lock, "refusal writes nothing");
+        let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert_eq!(read_lock(tmp.path()).await, lock, "revert is byte-exact");
     }
 
     #[tokio::test]

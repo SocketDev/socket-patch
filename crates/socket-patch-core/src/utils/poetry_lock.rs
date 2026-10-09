@@ -87,6 +87,18 @@ fn legacy_files_entry(table: &dyn TableLike, name: &str, files: Array, rewritten
     if !populated {
         return value(files);
     }
+    multiline_files(files)
+}
+
+/// `files` laid out one file per line, Poetry's own rendering of a non-empty
+/// files array (tomlkit `multiline(True)`):
+///
+/// ```toml
+/// files = [
+///     {file = "<wheel>", hash = "sha256:<hex>"},
+/// ]
+/// ```
+fn multiline_files(files: Array) -> Item {
     let entries: Vec<String> = files
         .iter()
         .filter_map(Value::as_inline_table)
@@ -347,7 +359,9 @@ fn mutate_poetry_lock(
         package.insert("files", value(files.clone()));
     }
     if format.starts_with('2') {
-        package.insert("files", value(files));
+        // Poetry 2.x writes every package's `files` one file per line;
+        // hosted and vendored rewrites both keep that shape.
+        package.insert("files", multiline_files(files));
     } else {
         let field = if format == "0" { "hashes" } else { "files" };
         let table = lock
@@ -657,6 +671,50 @@ mod tests {
         rewrite_poetry_lock(text, "urllib3", "1.26.18", "url", URL, WHEEL, &sha())
     }
 
+    /// Hosted and vendored rewrites of a 2.x lock write the package's
+    /// `files` one file per line, the shape Poetry itself writes (#936).
+    #[test]
+    fn lock_2x_files_keep_poetrys_multiline_shape() {
+        let expected = format!(
+            "files = [\n    {{file = \"{WHEEL}\", hash = \"sha256:{}\"}},\n]\n",
+            sha()
+        );
+        for version in ["1.3.2", "1.8.5", "2.4.3"] {
+            let original = fixture(version);
+            for (source_type, url) in [("url", URL), ("file", ".socket/vendor/pypi/x/w.whl")] {
+                let text = rewrite_poetry_lock(
+                    &original,
+                    "urllib3",
+                    "1.26.18",
+                    source_type,
+                    url,
+                    WHEEL,
+                    &sha(),
+                )
+                .unwrap()
+                .unwrap();
+                assert!(text.contains(&expected), "{version} {source_type}:\n{text}");
+                assert!(!text.contains("files = [{"), "{version} {source_type}");
+                // Idempotent: a re-run over its own output changes nothing.
+                assert_eq!(
+                    rewrite_poetry_lock(
+                        &text,
+                        "urllib3",
+                        "1.26.18",
+                        source_type,
+                        url,
+                        WHEEL,
+                        &sha(),
+                    )
+                    .unwrap()
+                    .as_deref(),
+                    Some(text.as_str()),
+                    "{version} {source_type}"
+                );
+            }
+        }
+    }
+
     /// #695: a mixed-ending lock's rewritten unit (and legacy integrity
     /// entry) takes the ending most of its own lines had, every other line
     /// keeps its own, and the recorded edits replay back byte for byte
@@ -892,12 +950,19 @@ mod tests {
                 "{version}: pristine must not be a prefix of new"
             );
             // A relock that keeps `[package.source]` but drops the inserted
-            // `files` line must NOT contain the pristine fragment either.
-            let drifted: String = rewritten
-                .lines()
-                .filter(|l| !l.starts_with("files = [{ file"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // `files` array must NOT contain the pristine fragment either.
+            // (1.0/1.1 insert it inline, 2.x one file per line.)
+            let drifted = match rewritten.find("files = [\n    {file") {
+                Some(start) => {
+                    let end = start + rewritten[start..].find("\n]\n").unwrap() + 3;
+                    format!("{}{}", &rewritten[..start], &rewritten[end..])
+                }
+                None => rewritten
+                    .lines()
+                    .filter(|l| !l.starts_with("files = [{ file"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
             assert!(!drifted.contains(original.as_str()), "{version}");
         }
         // Two adjacent packages: the first fragment ends with the second's

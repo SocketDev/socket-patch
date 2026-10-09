@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::formats::cargo::manifest::package_name_version;
+use crate::formats::cargo::CargoLock;
 use crate::patch::path_safety;
-use crate::utils::fs::{is_dir, run_blocking};
+use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
 
 #[cfg(test)]
 mod oracle;
@@ -42,66 +43,44 @@ impl CargoCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        if options.global || options.global_prefix.is_some() {
-            if let Some(ref custom) = options.global_prefix {
-                return Ok(vec![custom.clone()]);
-            }
-            return Ok(Self::get_registry_src_paths().await);
-        }
-
-        // Local mode is gated on this actually being a Cargo project. A
-        // bare `vendor/` directory is NOT cargo-specific — it is the
-        // standard layout for Composer (PHP) and Go — so we must confirm
-        // a `Cargo.toml`/`Cargo.lock` is present in `cwd` *before*
-        // treating `vendor/` (or the global registry) as cargo crate
-        // sources. Checking `vendor/` first would misclassify a non-Rust
-        // project's vendor tree as cargo sources, violating the contract
-        // documented above.
-        let has_cargo_toml = tokio::fs::metadata(options.cwd.join("Cargo.toml"))
-            .await
-            .is_ok();
-        let has_cargo_lock = tokio::fs::metadata(options.cwd.join("Cargo.lock"))
-            .await
-            .is_ok();
-
-        if !(has_cargo_toml || has_cargo_lock) {
-            // Not a Cargo project — return empty.
-            return Ok(Vec::new());
-        }
-
-        // Cargo project: prefer a vendored source tree if present, else
-        // fall back to the global registry cache.
-        let vendor_dir = options.cwd.join("vendor");
-        if is_dir(&vendor_dir).await {
-            return Ok(vec![vendor_dir]);
-        }
-
-        Ok(Self::get_registry_src_paths().await)
+        Ok(source_roots(options).await.0)
     }
 
     /// Crawl all discovered crate source directories and return every
     /// package found.
     ///
+    /// A `vendor/` tree, a `--global-prefix` and the global registry cache
+    /// are walked. The registry cache of a local project with a
+    /// `Cargo.lock` is only looked up for the registry packages the lock
+    /// resolves ([`lock_scope`], [`locate_crates`]), so a crate another
+    /// project left in `$CARGO_HOME/registry/src` is never crawled, and
+    /// the crawl no longer reads every cached crate's `Cargo.toml`.
+    ///
     /// The scan runs as one blocking-pool task (a registry cache holds
     /// thousands of crates, and one runtime hop per stat and `Cargo.toml`
-    /// read dominated the crawl), in listing order, so the first-seen PURL
-    /// keeps winning exactly as before. (Reading the manifests in parallel
-    /// on the walk pool measured no faster and cost the pool's thread
-    /// start-up in system time.)
+    /// read dominated the crawl), walked roots in listing order and located
+    /// ones in lock order, so the first root to yield a PURL wins. (Reading
+    /// the manifests in parallel on the walk pool measured no faster and
+    /// cost the pool's thread start-up in system time.)
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
-        let src_paths = self
-            .get_crate_source_paths(options)
-            .await
-            .unwrap_or_default();
+        let (src_paths, project_registry) = source_roots(options).await;
         if src_paths.is_empty() {
             return Vec::new();
         }
+        let scope = if project_registry {
+            lock_scope(&options.cwd).await
+        } else {
+            None
+        };
 
         run_blocking(move || {
             let mut packages = Vec::new();
             let mut seen = HashSet::new();
             for src_path in &src_paths {
-                packages.extend(scan_crate_source(src_path, &mut seen));
+                match &scope {
+                    Some(locked) => packages.extend(locate_crates(src_path, locked, &mut seen)),
+                    None => packages.extend(scan_crate_source(src_path, &mut seen)),
+                }
             }
             packages
         })
@@ -257,6 +236,106 @@ impl CargoCrawler {
     }
 }
 
+/// [`CargoCrawler::get_crate_source_paths`], and whether those roots are
+/// the shared registry cache of a local Cargo project (the roots
+/// [`lock_scope`] narrows).
+async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
+    if options.global || options.global_prefix.is_some() {
+        if let Some(ref custom) = options.global_prefix {
+            return (vec![custom.clone()], false);
+        }
+        return (CargoCrawler::get_registry_src_paths().await, false);
+    }
+
+    // Local mode is gated on this actually being a Cargo project. A
+    // bare `vendor/` directory is NOT cargo-specific — it is the
+    // standard layout for Composer (PHP) and Go — so we must confirm
+    // a `Cargo.toml`/`Cargo.lock` is present in `cwd` *before*
+    // treating `vendor/` (or the global registry) as cargo crate
+    // sources. Checking `vendor/` first would misclassify a non-Rust
+    // project's vendor tree as cargo sources, violating the contract
+    // documented above.
+    let has_cargo_toml = tokio::fs::metadata(options.cwd.join("Cargo.toml"))
+        .await
+        .is_ok();
+    let has_cargo_lock = tokio::fs::metadata(options.cwd.join("Cargo.lock"))
+        .await
+        .is_ok();
+
+    if !(has_cargo_toml || has_cargo_lock) {
+        // Not a Cargo project — return empty.
+        return (Vec::new(), false);
+    }
+
+    // Cargo project: prefer a vendored source tree if present, else
+    // fall back to the global registry cache.
+    let vendor_dir = options.cwd.join("vendor");
+    if is_dir(&vendor_dir).await {
+        return (vec![vendor_dir], false);
+    }
+
+    (CargoCrawler::get_registry_src_paths().await, true)
+}
+
+/// The `(name, version)` of every registry-sourced `[[package]]` in
+/// `<cwd>/Cargo.lock` (`LockedPackage::is_from_registry`), in lock order.
+/// `None` when there is no readable lock or it is not TOML: the crawl then
+/// keeps walking the whole cache.
+async fn lock_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
+    let text = crate::utils::fs::read_regular_to_string(&cwd.join("Cargo.lock"))
+        .await
+        .ok()?;
+    let lock = CargoLock::parse(&text).ok()?;
+    Some(
+        lock.packages()
+            .iter()
+            .filter(|p| p.is_from_registry())
+            .map(|p| (p.name.clone(), p.version.clone()))
+            .collect(),
+    )
+}
+
+/// Look up each `locked` crate in registry index directory `src_path`
+/// (`<name>-<version>/`) instead of walking it. A crate is reported under
+/// the identity its `Cargo.toml` declares, as [`scan_crate_source`] would
+/// report the same directory, and only when that is the locked
+/// `(name, version)`.
+fn locate_crates(
+    src_path: &Path,
+    locked: &[(String, String)],
+    seen: &mut HashSet<String>,
+) -> Vec<CrawledPackage> {
+    let mut results = Vec::new();
+    for (name, version) in locked {
+        // The lock is project content joined onto the cache root: the
+        // same traversal guard `find_by_purls` applies.
+        if !path_safety::is_safe_name_version(name, version) {
+            continue;
+        }
+        let dir_name = format!("{name}-{version}");
+        let crate_path = src_path.join(&dir_name);
+        if !is_dir_sync(&crate_path) {
+            continue;
+        }
+        match read_crate_cargo_toml(&crate_path, &dir_name) {
+            Some((n, v)) if n == *name && v == *version => {}
+            _ => continue,
+        }
+        let purl = crate::utils::purl::build_cargo_purl(name, version);
+        if !seen.insert(purl.clone()) {
+            continue;
+        }
+        results.push(CrawledPackage {
+            name: name.clone(),
+            version: version.clone(),
+            namespace: None,
+            purl,
+            path: crate_path,
+        });
+    }
+    results
+}
+
 /// Scan a crate source directory (either a registry index directory or
 /// a vendor directory) and return all valid crate packages found.
 fn scan_crate_source(src_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
@@ -300,8 +379,7 @@ fn read_crate_cargo_toml(crate_path: &Path, dir_name: &str) -> Option<(String, S
     let content = crate::utils::fs::read_regular_to_string_sync(&cargo_toml_path).ok()?;
 
     // Fallback: parse directory name as <name>-<version>
-    package_name_version(&content)
-        .or_else(|| CargoCrawler::parse_dir_name_version(dir_name))
+    package_name_version(&content).or_else(|| CargoCrawler::parse_dir_name_version(dir_name))
 }
 
 impl Default for CargoCrawler {
@@ -869,6 +947,226 @@ version = "fake"
         let packages = crawler.crawl_all(&options).await;
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].purl, "pkg:cargo/serde@1.0.200");
+    }
+
+    // ── Project-mode registry scope (#595) ──────────────────────────────
+
+    mod lock_scope {
+        use super::*;
+        use crate::crawlers::oracle_support::{mkdir, write};
+
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+        /// Points `CARGO_HOME` at a temp dir for one test, restoring it on drop.
+        struct CargoHome(Option<std::ffi::OsString>);
+        impl CargoHome {
+            fn set(path: &Path) -> Self {
+                let prev = std::env::var_os("CARGO_HOME");
+                std::env::set_var("CARGO_HOME", path);
+                CargoHome(prev)
+            }
+        }
+        impl Drop for CargoHome {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("CARGO_HOME", v),
+                    None => std::env::remove_var("CARGO_HOME"),
+                }
+            }
+        }
+
+        fn stage(src: &Path, name: &str, version: &str) {
+            write(
+                &src.join(format!("{name}-{version}")).join("Cargo.toml"),
+                &format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            );
+        }
+
+        fn lock(entries: &[(&str, &str, Option<&str>)]) -> String {
+            let mut out = String::from("version = 3\n");
+            for (name, version, source) in entries {
+                out.push_str(&format!(
+                    "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n"
+                ));
+                if let Some(source) = source {
+                    out.push_str(&format!("source = \"{source}\"\n"));
+                }
+            }
+            out
+        }
+
+        /// A cargo home with two index dirs; the project's own crates and
+        /// crates other projects left behind are cached side by side.
+        fn cache(home: &Path) -> (PathBuf, PathBuf) {
+            let src = home.join("registry").join("src");
+            let crates_io = src.join("index.crates.io-6f17d22bba15001f");
+            let other = src.join("example.com-0123456789abcdef");
+            stage(&crates_io, "serde", "1.0.200");
+            stage(&crates_io, "unrelated", "0.1.0");
+            stage(&crates_io, "serde", "1.0.100");
+            stage(&other, "tokio", "1.38.0");
+            stage(&other, "unrelated-too", "2.0.0");
+            (crates_io, other)
+        }
+
+        fn local(cwd: &Path) -> CrawlerOptions {
+            CrawlerOptions {
+                cwd: cwd.to_path_buf(),
+                global: false,
+                global_prefix: None,
+            }
+        }
+
+        fn purls(pkgs: &[CrawledPackage]) -> Vec<&str> {
+            let mut out: Vec<&str> = pkgs.iter().map(|p| p.purl.as_str()).collect();
+            out.sort_unstable();
+            out
+        }
+
+        /// The fix: a locked project's crawl reports only the registry
+        /// crates its `Cargo.lock` resolves, from whichever index dir holds
+        /// them; path, git and unsourced entries are never looked up.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn locked_project_crawls_only_its_locked_registry_crates() {
+            let home = tempfile::tempdir().unwrap();
+            let (crates_io, other) = cache(home.path());
+            stage(&crates_io, "gitdep", "0.3.0");
+            stage(&crates_io, "member", "0.1.0");
+            let _g = CargoHome::set(home.path());
+
+            let project = tempfile::tempdir().unwrap();
+            write(
+                &project.path().join("Cargo.toml"),
+                "[package]\nname = \"member\"\n",
+            );
+            write(
+                &project.path().join("Cargo.lock"),
+                &lock(&[
+                    ("member", "0.1.0", None),
+                    ("serde", "1.0.200", Some(CRATES_IO)),
+                    ("tokio", "1.38.0", Some("sparse+https://example.com/index/")),
+                    ("gitdep", "0.3.0", Some("git+https://example.com/g#abc")),
+                    ("missing", "9.9.9", Some(CRATES_IO)),
+                ]),
+            );
+
+            let pkgs = CargoCrawler::new().crawl_all(&local(project.path())).await;
+            assert_eq!(
+                purls(&pkgs),
+                ["pkg:cargo/serde@1.0.200", "pkg:cargo/tokio@1.38.0"]
+            );
+            let tokio = pkgs.iter().find(|p| p.name == "tokio").unwrap();
+            assert_eq!(tokio.path, other.join("tokio-1.38.0"));
+            assert_eq!(tokio.version, "1.38.0");
+            assert_eq!(tokio.namespace, None);
+
+            // `get_crate_source_paths` (agent apply, VEX) still names every
+            // index dir: only the crawl is scoped.
+            let mut roots = CargoCrawler::new()
+                .get_crate_source_paths(&local(project.path()))
+                .await
+                .unwrap();
+            roots.sort();
+            assert_eq!(roots, vec![other, crates_io]);
+        }
+
+        /// A cached dir whose manifest names another crate or version, or
+        /// a lock coordinate that would leave the index dir, is not reported.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn located_crate_must_declare_the_locked_identity() {
+            let home = tempfile::tempdir().unwrap();
+            let (crates_io, _) = cache(home.path());
+            write(
+                &crates_io.join("liar-1.0.0").join("Cargo.toml"),
+                "[package]\nname = \"liar\"\nversion = \"2.0.0\"\n",
+            );
+            stage(home.path(), "escape", "1.0.0");
+            let _g = CargoHome::set(home.path());
+
+            let project = tempfile::tempdir().unwrap();
+            write(
+                &project.path().join("Cargo.lock"),
+                &lock(&[
+                    ("liar", "1.0.0", Some(CRATES_IO)),
+                    ("..", "x", Some(CRATES_IO)),
+                    ("../../../escape", "1.0.0", Some(CRATES_IO)),
+                    ("serde", "1.0.200", Some(CRATES_IO)),
+                ]),
+            );
+
+            let pkgs = CargoCrawler::new().crawl_all(&local(project.path())).await;
+            assert_eq!(purls(&pkgs), ["pkg:cargo/serde@1.0.200"]);
+        }
+
+        /// Without a usable lock (none, or not TOML) the cache is walked
+        /// as before; so is a `vendor/` tree and the global cache.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn walks_without_a_lock_for_vendor_and_globally() {
+            let home = tempfile::tempdir().unwrap();
+            cache(home.path());
+            let _g = CargoHome::set(home.path());
+            let every = [
+                "pkg:cargo/serde@1.0.100",
+                "pkg:cargo/serde@1.0.200",
+                "pkg:cargo/tokio@1.38.0",
+                "pkg:cargo/unrelated-too@2.0.0",
+                "pkg:cargo/unrelated@0.1.0",
+            ];
+            let crawler = CargoCrawler::new();
+
+            let no_lock = tempfile::tempdir().unwrap();
+            write(&no_lock.path().join("Cargo.toml"), "[workspace]\n");
+            assert_eq!(
+                purls(&crawler.crawl_all(&local(no_lock.path())).await),
+                every
+            );
+
+            let bad_lock = tempfile::tempdir().unwrap();
+            write(&bad_lock.path().join("Cargo.lock"), "[[package]\nname = ");
+            assert_eq!(
+                purls(&crawler.crawl_all(&local(bad_lock.path())).await),
+                every
+            );
+
+            let locked = lock(&[("serde", "1.0.200", Some(CRATES_IO))]);
+            let global = tempfile::tempdir().unwrap();
+            write(&global.path().join("Cargo.lock"), &locked);
+            let options = CrawlerOptions {
+                global: true,
+                ..local(global.path())
+            };
+            assert_eq!(purls(&crawler.crawl_all(&options).await), every);
+
+            let vendored = tempfile::tempdir().unwrap();
+            write(&vendored.path().join("Cargo.lock"), &locked);
+            stage(&vendored.path().join("vendor"), "unlocked", "1.0.0");
+            mkdir(&vendored.path().join("vendor").join(".hidden"));
+            assert_eq!(
+                purls(&crawler.crawl_all(&local(vendored.path())).await),
+                ["pkg:cargo/unlocked@1.0.0"]
+            );
+        }
+
+        /// A lock with no registry packages resolves nothing from the cache.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn lock_without_registry_packages_crawls_nothing() {
+            let home = tempfile::tempdir().unwrap();
+            cache(home.path());
+            let _g = CargoHome::set(home.path());
+            let project = tempfile::tempdir().unwrap();
+            write(
+                &project.path().join("Cargo.lock"),
+                &lock(&[("member", "0.1.0", None)]),
+            );
+            assert!(CargoCrawler::new()
+                .crawl_all(&local(project.path()))
+                .await
+                .is_empty());
+        }
     }
 
     // ── Equivalence with the per-call async scan (oracle) ─────────────

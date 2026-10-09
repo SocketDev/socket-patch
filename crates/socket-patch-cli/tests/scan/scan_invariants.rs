@@ -7,15 +7,13 @@
 //! depending on the live Socket API. The real-API end-to-end suite
 //! lives in `e2e_scan.rs` (gated behind `#[ignore]`).
 
-use std::path::{Path, PathBuf};
+use crate::common::binary;
+
+use std::path::Path;
 use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG_SLUG: &str = "test-org";
 
@@ -297,7 +295,7 @@ async fn scan_emits_updates_entry_when_newer_uuid_available() {
 
 #[tokio::test]
 async fn scan_update_candidate_is_the_highest_ranked_patch() {
-    // `updates[].newUuid` must name the patch `--apply` would install —
+    // `updates[].newUuid` must name the patch `--mode agent` would install —
     // the highest-ranked one (severity → advisory count → recency), NOT whatever
     // the server listed first. The two are computed by different code over
     // different API shapes (`detect_updates` over the batch response,
@@ -427,7 +425,7 @@ async fn scan_emits_updates_entry_for_scoped_purl_despite_manifest_percent_encod
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "@scope/left-pad", "1.3.0");
-    // Manifest keyed by the ENCODED purl — exactly what `get`/`scan --apply`
+    // Manifest keyed by the ENCODED purl — exactly what `get`/`scan --mode agent`
     // write for a scoped package.
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
@@ -555,7 +553,7 @@ async fn scan_without_prune_omits_gc_field() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// --apply --dry-run — synthesizes per-patch actions without writing
+// --mode agent --dry-run — synthesizes per-patch actions without writing
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -584,7 +582,7 @@ async fn scan_apply_dry_run_with_empty_manifest_emits_added_action() {
         })))
         .mount(&mock)
         .await;
-    // by-package search (used by --apply mode for full PatchSearchResult)
+    // by-package search (used by --mode agent mode for full PatchSearchResult)
     Mock::given(method("GET"))
         .and(path(format!(
             "/v0/orgs/{ORG_SLUG}/patches/by-package/pkg%3Anpm%2Fminimist%401.2.2"
@@ -608,17 +606,20 @@ async fn scan_apply_dry_run_with_empty_manifest_emits_added_action() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
 
-    let (code, stdout, stderr) =
-        run_scan(tmp.path(), &mock.uri(), &["--apply", "--dry-run", "--yes"]);
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--dry-run", "--yes"],
+    );
     assert_eq!(
         code, 0,
-        "scan --apply --dry-run must succeed; stdout={stdout}; stderr={stderr}"
+        "scan --mode agent --dry-run must succeed; stdout={stdout}; stderr={stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
     let apply = v["apply"]
         .as_object()
-        .expect("apply object present in --apply mode");
+        .expect("apply object present in --mode agent mode");
     assert_eq!(apply["dryRun"], true);
     assert_eq!(apply["found"], 1);
     assert_eq!(apply["added"], 1);
@@ -633,10 +634,10 @@ async fn scan_apply_dry_run_with_empty_manifest_emits_added_action() {
     // CRITICAL: dry-run must not write the manifest.
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
-        "scan --apply --dry-run must not write .socket/manifest.json"
+        "scan --mode agent --dry-run must not write .socket/manifest.json"
     );
 
-    // --apply mode must query BOTH endpoints: the batch search (carrying
+    // --mode agent mode must query BOTH endpoints: the batch search (carrying
     // the crawled PURL) and the per-package detail fetch. The "added"
     // action above is only trustworthy if it was synthesized from a real
     // detail fetch, not fabricated.
@@ -644,7 +645,7 @@ async fn scan_apply_dry_run_with_empty_manifest_emits_added_action() {
     assert_single_batch_carries_purl(&reqs, purl);
     assert!(
         by_package_gets(&reqs) >= 1,
-        "scan --apply must fetch per-package patch details; saw {} by-package GET(s)",
+        "scan --mode agent must fetch per-package patch details; saw {} by-package GET(s)",
         by_package_gets(&reqs)
     );
 }
@@ -696,7 +697,7 @@ async fn scan_apply_dry_run_with_existing_uuid_emits_skipped_action() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
-    // Manifest already has the SAME UUID — scan --apply must skip it.
+    // Manifest already has the SAME UUID — scan --mode agent must skip it.
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(
@@ -719,7 +720,11 @@ async fn scan_apply_dry_run_with_existing_uuid_emits_skipped_action() {
     )
     .unwrap();
 
-    let (code, stdout, _) = run_scan(tmp.path(), &mock.uri(), &["--apply", "--dry-run", "--yes"]);
+    let (code, stdout, _) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--dry-run", "--yes"],
+    );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let apply = &v["apply"];
@@ -733,7 +738,7 @@ async fn scan_apply_dry_run_with_existing_uuid_emits_skipped_action() {
     assert_single_batch_carries_purl(&reqs, purl);
     assert!(
         by_package_gets(&reqs) >= 1,
-        "scan --apply must fetch per-package patch details; saw {} by-package GET(s)",
+        "scan --mode agent must fetch per-package patch details; saw {} by-package GET(s)",
         by_package_gets(&reqs)
     );
 }
@@ -808,7 +813,11 @@ async fn scan_apply_dry_run_with_different_uuid_emits_updated_action() {
     )
     .unwrap();
 
-    let (code, stdout, _) = run_scan(tmp.path(), &mock.uri(), &["--apply", "--dry-run", "--yes"]);
+    let (code, stdout, _) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--dry-run", "--yes"],
+    );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let apply = &v["apply"];
@@ -824,7 +833,7 @@ async fn scan_apply_dry_run_with_different_uuid_emits_updated_action() {
     assert_single_batch_carries_purl(&reqs, purl);
     assert!(
         by_package_gets(&reqs) >= 1,
-        "scan --apply must fetch per-package patch details; saw {} by-package GET(s)",
+        "scan --mode agent must fetch per-package patch details; saw {} by-package GET(s)",
         by_package_gets(&reqs)
     );
 }
@@ -1049,7 +1058,7 @@ async fn mount_batch_ok_details_500(mock: &MockServer, purl: &str, uuid: &str) {
 /// failures honor that — `--offline` and the all-batches-failed bail both
 /// print `{"status": "error", "error": ...}`. The all-detail-queries-failed
 /// bail did not: it returned exit 1 straight out of `discover_selected`
-/// with EMPTY stdout, so a bot parsing `scan --json --apply` got a JSON
+/// with EMPTY stdout, so a bot parsing `scan --json --mode agent` got a JSON
 /// parse error instead of a diagnosable failure envelope.
 #[tokio::test]
 async fn scan_apply_all_detail_queries_failed_emits_json_error_envelope() {
@@ -1061,11 +1070,11 @@ async fn scan_apply_all_detail_queries_failed_emits_json_error_envelope() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
 
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--apply", "--yes"]);
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--yes"]);
 
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!(
-            "scan --json --apply must emit a JSON envelope even when every \
+            "scan --json --mode agent must emit a JSON envelope even when every \
              patch-detail query fails; err={e}; stdout={stdout:?}; stderr={stderr}"
         )
     });
@@ -1255,9 +1264,9 @@ async fn scan_prune_removes_withdrawn_patch_entry() {
 
 /// Update detection: when the API returns a different UUID for the
 /// same PURL that's in the manifest, `scan` surfaces that in the
-/// `updates` array even without `--apply`. Sibling to
+/// `updates` array even without `--mode agent`. Sibling to
 /// `scan_emits_updates_entry_when_newer_uuid_available` but exercised
-/// with a stub blob on disk so we pin that scan without `--apply` never
+/// with a stub blob on disk so we pin that scan without `--mode agent` never
 /// rewrites the manifest or existing blobs.
 #[tokio::test]
 async fn scan_detects_update_without_touching_existing_blobs() {
@@ -1310,7 +1319,7 @@ async fn scan_detects_update_without_touching_existing_blobs() {
         ),
     )
     .unwrap();
-    // Marker blob: scan without --apply must leave it untouched.
+    // Marker blob: scan without --mode agent must leave it untouched.
     let marker = socket.join("blobs").join("untouched-by-scan");
     std::fs::write(&marker, b"original contents").unwrap();
 
@@ -1324,19 +1333,19 @@ async fn scan_detects_update_without_touching_existing_blobs() {
     assert_eq!(updates[0]["oldUuid"], OLD_UUID);
     assert_eq!(updates[0]["newUuid"], NEW_UUID);
 
-    // Scan without --apply never rewrites the manifest or blobs. The manifest still records the OLD
-    // UUID and the marker blob is byte-for-byte unchanged.
+    // Scan without --mode agent never rewrites the manifest or blobs. The
+    // manifest still records the OLD UUID and the marker blob is byte-for-byte unchanged.
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
             .unwrap();
     assert_eq!(
         manifest["patches"]["pkg:npm/lodash@4.17.20"]["uuid"], OLD_UUID,
-        "scan without --apply must not rewrite the manifest"
+        "scan without --mode agent must not rewrite the manifest"
     );
     assert_eq!(
         std::fs::read(&marker).unwrap(),
         b"original contents",
-        "scan without --apply must not touch existing blobs"
+        "scan without --mode agent must not touch existing blobs"
     );
 
     let reqs = recorded(&mock).await;

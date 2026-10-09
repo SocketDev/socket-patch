@@ -123,38 +123,42 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unpatched_copies,
         unattested,
         contested,
+        shadowed,
+        rewirable,
+        // Bookkeeping of what the vlt extractor read from the store, not a
+        // finding: every copy it found already shows as a contest and a
+        // diagnostic above.
+        vlt_bundled_copies: _,
         install_trees,
         read: _,
         withheld: _,
         // Already folded into `unattested` by the time a run returns.
         unwired_copies: _,
     } = out;
-    let refs: Vec<Value> = refs
-        .iter()
-        .map(|r| {
-            let PatchedRef {
-                purl,
-                uuid,
-                mode: m,
-                source_file,
-                artifact_rel,
-                locked_integrity,
-                integrity_required,
-                url,
-            } = r;
-            json!({
-                "purl": purl,
-                "uuid": uuid,
-                "mode": mode(*m),
-                "source_file": path_str(source_file),
-                "artifact_rel": artifact_rel,
-                "locked_integrity": locked_integrity.as_ref().map(|i| format!("{i:?}")),
-                "integrity_required": integrity_required,
-                "url": url,
-                "lockfile_basis_ok": r.lockfile_basis_ok(),
-            })
+    let render_ref = |r: &PatchedRef| {
+        let PatchedRef {
+            purl,
+            uuid,
+            mode: m,
+            source_file,
+            artifact_rel,
+            locked_integrity,
+            integrity_required,
+            url,
+        } = r;
+        json!({
+            "purl": purl,
+            "uuid": uuid,
+            "mode": mode(*m),
+            "source_file": path_str(source_file),
+            "artifact_rel": artifact_rel,
+            "locked_integrity": locked_integrity.as_ref().map(|i| format!("{i:?}")),
+            "integrity_required": integrity_required,
+            "url": url,
+            "lockfile_basis_ok": r.lockfile_basis_ok(),
         })
-        .collect();
+    };
+    let refs: Vec<Value> = refs.iter().map(render_ref).collect();
     let diagnostics: Vec<Value> = diagnostics
         .iter()
         .map(|d| {
@@ -186,6 +190,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
                 uuid,
                 file,
                 version_reqs,
+                index_url: _,
             } = p;
             json!({
                 "ecosystem": ecosystem,
@@ -254,6 +259,12 @@ fn render(out: &Discovery, root: &Path) -> Value {
             })
             .collect::<Vec<_>>()
             .into();
+    }
+    if !shadowed.is_empty() {
+        rendered["shadowed"] = shadowed.iter().map(render_ref).collect::<Vec<_>>().into();
+    }
+    if !rewirable.is_empty() {
+        rendered["rewirable"] = rewirable.iter().map(render_ref).collect::<Vec<_>>().into();
     }
     if !unpatched_copies.is_empty() {
         rendered["unpatched_copies"] = unpatched_copies

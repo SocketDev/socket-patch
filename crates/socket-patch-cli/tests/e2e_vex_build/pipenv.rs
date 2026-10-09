@@ -6,7 +6,7 @@
 //! 1. `pipenv install six==1.16.0` from PyPI (in-project venv) — the native
 //!    Pipfile.lock that release writes;
 //! 2. `socket-patch scan --mode hosted --vex` (hosted, on the lock-only
-//!    checkout: the CI shape) / `scan --vendor --vendor-source build --vex`
+//!    checkout: the CI shape) / `scan --mode vendored --vendor-source build --vex`
 //!    (vendored, from the pristine install) against a wiremock Socket API
 //!    that also serves the patched wheel — the same-run document attests;
 //! 3. a FRESH checkout of the committed state (Pipfile, Pipfile.lock,
@@ -17,7 +17,7 @@
 //! 4. the manifest-less VEX matrix (`vex_pipenv_pip_real`): manifest
 //!    deleted, ledgers deleted, `--offline` (zero requests), lock reverted
 //!    to the registry (also `--no-verify`), `apply --vex`; plus the
-//!    embedded `scan --mode hosted --vex` / `scan --vendor --vex` re-run on the
+//!    embedded `scan --mode hosted --vex` / `scan --mode vendored --vex` re-run on the
 //!    manifest-less checkout.
 //!
 //! Versions: `SOCKET_PATCH_PIPENV_E2E_VERSIONS` (space / comma separated),
@@ -346,6 +346,139 @@ fn pipenv_every_major_hosted_and_vendored_end_in_manifest_less_vex() {
                     .unwrap_or_default();
                 failures.push(format!("pipenv {version} {}: {msg}", mode.label()));
             }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+const PYLOCK_PIPFILE: &str = "[[source]]\nurl = \"https://pypi.org/simple\"\nverify_ssl = true\nname = \"pypi\"\n\n[packages]\nsix = \"==1.16.0\"\n\n[dev-packages]\n\n[pipenv]\nuse_pylock = true\n";
+
+/// #912 / #1122 on a real Pipenv 2026 `use_pylock = true` project, whose
+/// `pipenv lock` writes both `Pipfile.lock` and `pylock.toml`:
+///
+/// * #1122: vendored wires `Pipfile.lock` (what Pipenv installs from when
+///   both exist), leaves the pylock alone, and a fresh
+///   `pipenv install --deploy` gets the PATCHED six.
+/// * #912: the pylock-only checkout (no `Pipfile.lock`) is refused in both
+///   modes — Pipenv would drop the `archive` entry and install the upstream
+///   release — and the pylock is left byte-identical.
+fn pylock_flow(pipenv: &Pipenv, root: &Path) {
+    let v = pipenv.version.as_str();
+    let what = format!("pipenv {v} use_pylock");
+    let proj = root.join("pylock").join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("Pipfile"), PYLOCK_PIPFILE).unwrap();
+    let python = venv_bin(&pipenv.venv, "python");
+    pipenv.project_venv(&proj);
+    let out = pipenv.run(&proj, &["install", "--python", python.to_str().unwrap()]);
+    assert_ok(&out, &format!("{what}: pipenv install"));
+    if !proj.join("pylock.toml").is_file() {
+        assert_ok(
+            &pipenv.run(&proj, &["lock"]),
+            &format!("{what}: pipenv lock"),
+        );
+    }
+    let pristine_pylock = read(&proj.join("pylock.toml"));
+    let py = venv_bin(&proj.join(".venv"), "python");
+    let (_, pristine, _) =
+        six_oracle(&py, &proj).unwrap_or_else(|| panic!("{what}: six not importable"));
+    let patched = [pristine.as_slice(), PATCH_SUFFIX].concat();
+
+    // #912: the pylock-only checkout, both modes.
+    for mode in [Mode::Hosted, Mode::Vendored] {
+        let only = root.join("pylock").join(format!("only-{}", mode.label()));
+        copy_tree(&proj, &only, &[".venv"]);
+        std::fs::remove_file(only.join("Pipfile.lock")).unwrap();
+        let api = RealApi::start(mode.uuid(), &pristine, &patched);
+        let (_, env, stderr) = socket_scan(&only, &api, mode.scan_flags(), &pipenv.envs);
+        let code = match mode {
+            Mode::Hosted => "redirect_pipenv_pylock_unsupported",
+            Mode::Vendored => "pypi_pipenv_pylock_unsupported",
+        };
+        let ok = env.to_string().contains(code)
+            && read(&only.join("pylock.toml")) == pristine_pylock
+            && !only.join("Pipfile.lock").exists();
+        record(
+            "pipenv",
+            v,
+            &format!("pylock-only/{}", mode.label()),
+            "refused",
+            if ok { "pass" } else { "FAIL" },
+        );
+        assert!(
+            ok,
+            "{what} pylock-only {}: expected {code}, pylock untouched: {env}\n{stderr}",
+            mode.label()
+        );
+    }
+
+    // #1122: both locks, vendored.
+    let mode = Mode::Vendored;
+    let api = RealApi::start(mode.uuid(), &pristine, &patched);
+    let (code, env, stderr) = socket_scan(&proj, &api, mode.scan_flags(), &pipenv.envs);
+    assert_eq!(code, Some(0), "{what}: vendored scan: {env}\n{stderr}");
+    let lock = String::from_utf8(read(&proj.join("Pipfile.lock"))).unwrap();
+    assert!(
+        lock.contains(&format!(".socket/vendor/pypi/{}/", mode.uuid())),
+        "{what}: Pipfile.lock must point at the vendored wheel: {lock}"
+    );
+    assert_eq!(
+        read(&proj.join("pylock.toml")),
+        pristine_pylock,
+        "{what}: the pylock Pipenv ignores is left alone"
+    );
+    let fresh = root.join("pylock").join("fresh");
+    copy_tree(&proj, &fresh, &[".venv"]);
+    pipenv.project_venv(&fresh);
+    let out = pipenv.run(
+        &fresh,
+        &["install", "--deploy", "--python", python.to_str().unwrap()],
+    );
+    assert_ok(&out, &format!("{what}: fresh `pipenv install --deploy`"));
+    let (_, bytes, is_patched) = six_oracle(&venv_bin(&fresh.join(".venv"), "python"), &fresh)
+        .unwrap_or_else(|| panic!("{what}: six not importable in the fresh checkout"));
+    let ok = is_patched && bytes == patched;
+    record(
+        "pipenv",
+        v,
+        "use_pylock/vendored",
+        "install-patched",
+        if ok { "pass" } else { "FAIL" },
+    );
+    assert!(ok, "{what}: the fresh install must carry the PATCHED six");
+}
+
+#[test]
+#[ignore = "real Pipenv releases + PyPI (network). Run with --ignored."]
+fn pipenv_pylock_projects_wire_what_pipenv_installs() {
+    let Some(uv) = find_uv() else {
+        return skip_or_fail(REQUIRED, "uv is not installed");
+    };
+    let mut failures = Vec::new();
+    // `[pipenv] use_pylock` is a Pipenv 2026 setting.
+    for version in versions(VERSIONS_VAR, VERSIONS)
+        .into_iter()
+        .filter(|v| year(v) >= 2026)
+    {
+        let scratch = tempfile::tempdir().unwrap();
+        let pipenv = match Pipenv::bootstrap(&uv, &version, scratch.path()) {
+            Ok(p) => p,
+            Err(e) => {
+                record("pipenv", &version, "use_pylock", "bootstrap", "SKIP");
+                skip_or_fail(REQUIRED, &format!("pipenv {version} bootstrap: {e}"));
+                continue;
+            }
+        };
+        let root = scratch.path().join("run");
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pylock_flow(&pipenv, &root)));
+        if let Err(e) = result {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            failures.push(format!("pipenv {version} use_pylock: {msg}"));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));

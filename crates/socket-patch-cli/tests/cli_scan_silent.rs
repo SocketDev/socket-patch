@@ -15,32 +15,23 @@
 //! `get_api_client_with_overrides` in core for every command and is
 //! out of scope for `scan`'s `--silent` gating.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn write_root(root: &Path) {
     std::fs::write(
@@ -307,7 +298,7 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
 }
 
 /// A v3 package-lock with a single registry-resolved dependency, so the
-/// `--vendor` flow can rewire it to the vendored artifact (the npm vendor
+/// `--mode vendored` flow can rewire it to the vendored artifact (the npm vendor
 /// backend keys off lock entries).
 fn write_npm_lock(root: &Path) {
     let lock = serde_json::json!({
@@ -365,7 +356,7 @@ fn seed_manifest_with_gone_entry(root: &Path) {
 }
 
 /// The vendored-mode GC line must honor `--silent` like the apply-mode one
-/// does: `scan --vendor --prune --silent --yes` prints nothing when it
+/// does: `scan --mode vendored --prune --silent --yes` prints nothing when it
 /// succeeds: `run_vendor_interactive_path` must not print "GC: pruned N
 /// manifest entries and removed …" (or the vendored-revert GC line).
 #[tokio::test]
@@ -385,7 +376,8 @@ async fn scan_vendor_silent_gc_prints_nothing() {
     let (code, stdout, stderr) = run_scan(
         tmp.path(),
         &[
-            "--vendor",
+            "--mode",
+            "vendored",
             "--prune",
             "--silent",
             "--yes",
@@ -399,7 +391,7 @@ async fn scan_vendor_silent_gc_prints_nothing() {
     );
     assert_eq!(
         code, 0,
-        "scan --vendor --prune must succeed; stdout={stdout:?} stderr={stderr:?}"
+        "scan --mode vendored --prune must succeed; stdout={stdout:?} stderr={stderr:?}"
     );
     assert!(
         stdout.trim().is_empty(),
@@ -455,7 +447,8 @@ async fn scan_vendor_silent_gc_prints_nothing() {
     let (loud_code, loud_stdout, loud_stderr) = run_scan(
         tmp2.path(),
         &[
-            "--vendor",
+            "--mode",
+            "vendored",
             "--prune",
             "--yes",
             "--api-url",

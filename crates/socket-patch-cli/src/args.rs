@@ -20,6 +20,7 @@ use socket_patch_core::api::client::{
 };
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::Ecosystem;
+use socket_patch_core::telemetry::TelemetryAuth;
 use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 
 /// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
@@ -28,7 +29,7 @@ use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 /// loudly instead of silently matching nothing.
 ///
 /// Without this, an unsupported name parsed fine and was then silently
-/// dropped by `partition_purls`/`crawl_all_ecosystems`, so the user got a
+/// dropped by `partition_purls`/`crawl_ecosystems`, so the user got a
 /// "0 patches" result with no hint that the ecosystem name was the cause.
 fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
     if Ecosystem::all().iter().any(|e| e.cli_name() == s) {
@@ -567,6 +568,15 @@ impl GlobalArgs {
     pub(crate) fn telemetry_credentials(&self) -> (Option<String>, Option<String>) {
         let overrides = self.api_client_overrides();
         resolve_ambient_credentials(overrides.api_token, overrides.org_slug)
+    }
+
+    /// Telemetry's route for a run that built no API client:
+    /// [`Self::telemetry_credentials`] as a [`TelemetryAuth`] (the org
+    /// endpoint only for a token + slug; never a network call). A run that
+    /// has a client uses [`TelemetryAuth::for_client`] instead.
+    pub(crate) fn telemetry_auth(&self) -> TelemetryAuth {
+        let (api_token, org_slug) = self.telemetry_credentials();
+        TelemetryAuth::from_credentials(api_token.as_deref(), org_slug.as_deref())
     }
 
     /// The vendoring-service config every vendor entry point (`vendor`,

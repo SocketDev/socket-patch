@@ -33,6 +33,18 @@
 //! `maxTotalBytes`, so such a repo can fail with a `limit` error where the
 //! disk run would succeed. Fetching fewer would instead silently drop
 //! manifests the disk run pins.
+//!
+//! A pnpm workspace member's own `pnpm-lock.yaml` (a root the nearest
+//! ancestor `pnpm-workspace.yaml` lists) is demoted into that workspace
+//! root, which reads it as a disk run from the root does: pinned beside the
+//! root lock under `sharedWorkspaceLockfile: false`, ignored beside a
+//! shared root lock (#492). Only once the root's files confirm it (the
+//! globs read and list the member, which has a package manifest, and the
+//! root pins or knowingly ignores its lock) and socket.yml admits the root:
+//! otherwise the member keeps its lock as a root of its own. Path selection
+//! cannot read the globs, so under a workspace root it fetches every
+//! `pnpm-lock.yaml` beside a package manifest outside pnpm's skipped trees,
+//! the same over-fetch tradeoff as Cargo member manifests above.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -63,12 +75,12 @@ use crate::policy::{
     PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
 };
 use crate::rollout::stage::{
-    classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, RecordedIndex, Row,
+    classify, lookup_incomplete, mark_pinned, offers_from_results, Offers, RecordedIndex, Row,
     Stage, ROLLOUT_DEFERRED,
 };
+use crate::utils::purl_key::PurlKey;
 use discover::Provider;
 use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
-use crate::utils::purl_key::PurlKey;
 
 /// `"<crate version>+<git sha or 'unknown'>"`; the sha comes from the
 /// `SOCKET_PATCH_GIT_SHA` build-time variable.
@@ -301,6 +313,157 @@ fn demote_cargo_members(states: &mut [RootState], warnings: &mut Vec<EngineWarni
     }
 }
 
+/// The confirmed pnpm workspace members among `candidates`
+/// ([`roots::pnpm_member_candidates`]), each with its workspace root: the
+/// root's own files (as a disk run from it reads them) account for the
+/// member's lock
+/// ([`root_accounts_for_member_lock`](crate::utils::pnpm_workspace::root_accounts_for_member_lock)),
+/// and `admitted` (the socket.yml path policy) lets that root be scanned.
+/// Any other candidate keeps its lock as a root of its own, as before #492
+/// ([`refuse_governed_pnpm_members`] guards its trust auto-config): a lock
+/// demoted into a root that leaves it unread, or that is never scanned,
+/// would be pinned by no one.
+async fn confirm_pnpm_members(
+    files: &BTreeMap<String, SharedFile>,
+    candidates: Vec<(String, String)>,
+    admitted: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    let mut views: BTreeMap<String, MemoryProject> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (member, workspace) in candidates {
+        if !admitted(&workspace) {
+            continue;
+        }
+        let Some(rel) = roots::strip_root(&workspace, &member).map(str::to_string) else {
+            continue;
+        };
+        let project = views
+            .entry(workspace.clone())
+            .or_insert_with(|| project_for(&workspace, files).0);
+        let view = ProjectView::Memory(project);
+        if crate::utils::pnpm_workspace::root_accounts_for_member_lock(&view, &rel).await {
+            out.push((member, workspace));
+        }
+    }
+    out
+}
+
+/// A pnpm root with a v9 lock but no `pnpm-workspace.yaml` of its own that
+/// the nearest ancestor `pnpm-workspace.yaml` may list as a workspace
+/// project, and whose lock was not demoted into that workspace root
+/// ([`confirm_pnpm_members`]): pnpm reads `trustLockfile` only from that
+/// ancestor file, so the trust auto-config's `pnpm-workspace.yaml` in the
+/// member would be ignored and pnpm >= 11 would reject the hosted pins.
+/// The disk run refuses a member run the same way
+/// (`redirect_pnpm_settings_elsewhere`), so the member is refused rather
+/// than given a file pnpm never reads. A governing file the engine cannot
+/// read (a symlink, oversize, content not provided) or whose globs it
+/// cannot model counts as listing the member, the refusing side.
+fn refuse_governed_pnpm_members(files: &BTreeMap<String, SharedFile>, states: &mut [RootState]) {
+    use crate::hosted::governing_root::PNPM_SETTINGS_ELSEWHERE;
+    use crate::hosted::guidance::PNPM_WORKSPACE_REL;
+    for state in states.iter_mut() {
+        let Some(project) = state.project.as_ref() else {
+            continue;
+        };
+        if state.root.is_empty() || project.contains(PNPM_WORKSPACE_REL) {
+            continue;
+        }
+        let v9 = matches!(
+            project.get("pnpm-lock.yaml"),
+            Some(MemoryEntry::Text(lock))
+                if crate::formats::pnpm::lock_version_major(lock).is_some_and(|major| major >= 9)
+        );
+        if !v9 {
+            continue;
+        }
+        let mut dir = state.root.as_str();
+        let governing = loop {
+            dir = roots::split_path(dir).0;
+            let path = roots::join_root(dir, PNPM_WORKSPACE_REL);
+            if let Some(file) = files.get(&path) {
+                break Some((path, file));
+            }
+            if dir.is_empty() {
+                break None;
+            }
+        };
+        let Some((path, file)) = governing else {
+            continue;
+        };
+        let rel: Vec<String> = roots::strip_root(dir, &state.root)
+            .unwrap_or(&state.root)
+            .split('/')
+            .map(str::to_string)
+            .collect();
+        let member = match &file.entry {
+            MemoryEntry::Text(text) if !file.unreadable => {
+                crate::utils::pnpm_workspace::lists_as_member(text, &rel)
+            }
+            _ => true,
+        };
+        if member {
+            let workspace = if dir.is_empty() { "." } else { dir };
+            state.fail(
+                PNPM_SETTINGS_ELSEWHERE,
+                format!(
+                    "{} may be a project of the pnpm workspace whose settings live in {path}: \
+                     pnpm reads `trustLockfile` only from that file, so a \
+                     pnpm-workspace.yaml created in {} would be ignored and pnpm >= 11 \
+                     would reject the hosted pins (ERR_PNPM_TARBALL_URL_MISMATCH); the \
+                     in-memory engine pins a member's lock from the workspace root `{workspace}` \
+                     only when that root's pnpm-workspace.yaml, lock and the member's \
+                     package.json say the root installs or ignores it — scan `{workspace}` \
+                     with those files, run hosted mode from the workspace root on a \
+                     checkout, or turn the trust auto-config off to pin without it; \
+                     nothing was written",
+                    state.root, state.root
+                ),
+            );
+        }
+    }
+}
+
+/// A pnpm workspace member's own `pnpm-lock.yaml` is the workspace root's
+/// to read (#492, [`confirm_pnpm_members`]): pinned beside the
+/// root's under `sharedWorkspaceLockfile: false`, a stale leftover beside a
+/// shared root lock. A member that stays a root (it holds another lock, or
+/// the caller named it) drops that lock, as a Cargo member drops its
+/// Cargo.lock ([`demote_cargo_members`]); when the workspace root is not
+/// among the roots, the lock is not scanned at all and a warning says so.
+fn demote_pnpm_members(
+    states: &mut [RootState],
+    members: &[(String, String)],
+    warnings: &mut Vec<EngineWarning>,
+) {
+    let roots: BTreeSet<String> = states.iter().map(|s| s.root.clone()).collect();
+    for (member, workspace) in members {
+        let Some(state) = states.iter_mut().find(|s| &s.root == member) else {
+            continue;
+        };
+        let Some(project) = state.project.as_mut() else {
+            continue;
+        };
+        if project.remove("pnpm-lock.yaml").is_none() {
+            continue;
+        }
+        state.unreadable.remove("pnpm-lock.yaml");
+        if roots.contains(workspace) {
+            continue;
+        }
+        let workspace = if workspace.is_empty() { "." } else { workspace };
+        warnings.push(EngineWarning::new(
+            "pnpm_member_lock_ignored",
+            format!(
+                "{member} is a project of the pnpm workspace at `{workspace}`, whose root \
+                 decides which lock pnpm installs it from; its pnpm-lock.yaml was not \
+                 scanned — scan `{workspace}` as a project root to pin it"
+            ),
+            Some(member),
+        ));
+    }
+}
+
 fn ecosystem_allowed(ecosystems: Option<&[String]>, purl: &str) -> bool {
     match ecosystems {
         None => true,
@@ -390,17 +553,22 @@ fn unrooted_unsupported_warnings<'a>(
 }
 
 /// One root's recorded view (§5.1) in memory: its `.socket/manifest.json`,
-/// the hosted pins its lockfiles name, and its vendor ledger — the disk
-/// merge's precedence. A pin is a mention of an offered uuid for the purl
-/// in one of the root's own files (a nested root's files are its own); a
-/// pin to a patch the API no longer offers reads as NEW, which costs one
-/// slot once instead of stalling.
-fn memory_recorded(
-    project: &MemoryProject,
-    root: &str,
-    roots: &[String],
-    offers: &Offers,
-) -> RecordedIndex {
+/// the hosted pins its lockfiles carry, and its vendor ledger — the disk
+/// merge's precedence. The pins are discovery's over the root's files
+/// ([`HostedPin::discover`], the one "is this pinned" answer the disk scan
+/// uses too), so a uuid a stale or inactive file merely mentions pins
+/// nothing. Pins on a patch server other than Socket's are recognized once
+/// the run's references name it ([`stage::mark_pinned`]).
+///
+/// Unlike the mention scan this replaced, a pin counts whether or not the
+/// API still offers its patch (as on disk): a re-scan re-confirms it as
+/// ALREADY instead of spending a NEW slot. A pin wired only by files under
+/// a nested root (one discovery reaches through a requirements include or
+/// a rush subspace) is that root's own and does not count here.
+///
+/// [`HostedPin::discover`]: crate::patch::redirect::upstream::HostedPin::discover
+/// [`stage::mark_pinned`]: crate::rollout::stage::mark_pinned
+async fn memory_recorded(project: &MemoryProject, root: &str, roots: &[String]) -> RecordedIndex {
     let manifest = project
         .text(select::MANIFEST_REL)
         .and_then(|text| serde_json::from_str(text).ok());
@@ -411,29 +579,34 @@ fn memory_recorded(
         .filter_map(|other| roots::strip_root(root, other).map(|rel| format!("{rel}/")))
         .filter(|rel| rel != "/")
         .collect();
-    let mut mentioned = std::collections::HashSet::new();
-    for (path, entry) in project.entries() {
-        if path.starts_with(".socket/") || nested.iter().any(|n| path.starts_with(n.as_str())) {
-            continue;
-        }
-        if let MemoryEntry::Text(text) = entry {
-            mentioned_uuids(text, &mut mentioned);
+    let own = |file: &String| !nested.iter().any(|n| file.starts_with(n.as_str()));
+    // The same discovery `HostedPin::discover_recorded` runs, kept whole so
+    // its lockless pins (never refs) count as recorded too.
+    let discovery = crate::vex::discover::discover_patched_refs_view(
+        ProjectView::Memory(project),
+        &crate::vex::DiscoverOptions::default(),
+    )
+    .await;
+    let mut pins: Vec<(String, String)> =
+        crate::patch::redirect::upstream::HostedPin::recorded(&discovery)
+            .into_iter()
+            .filter(|pin| pin.files.iter().any(own))
+            .map(|pin| (pin.purl, pin.uuid))
+            .collect();
+    // A Gemfile-only gem pin (no lock ref until the next unfrozen `bundle
+    // install`) counts as recorded too (#1224).
+    for pin in crate::vex::discover::gem_manifest_source_pins(&ProjectView::Memory(project)).await {
+        if !pins.contains(&pin) {
+            pins.push(pin);
         }
     }
-    let pins: Vec<(String, String)> = offers
-        .selected
-        .iter()
-        .filter_map(|(purl, selected)| {
-            let offered = offers.unfiltered.get(purl)?;
-            std::iter::once(selected)
-                .chain(offered.iter())
-                .find(|p| mentioned.contains(&p.uuid.to_ascii_lowercase()))
-                .map(|p| (purl.clone(), p.uuid.clone()))
-        })
-        .collect();
+    let unlocked = discovery
+        .unlocked_pins
+        .into_iter()
+        .filter(|pin| own(&pin.file.to_string_lossy().replace('\\', "/")));
     let merged =
         crate::ledgers::merge_ledger_records_for_updates(manifest.as_ref(), vendor.as_ref(), &pins);
-    RecordedIndex::new(merged.as_deref(), &pins)
+    RecordedIndex::new(merged.as_deref(), &pins).with_unlocked_pins(unlocked)
 }
 
 async fn engine(
@@ -515,13 +688,65 @@ async fn engine(
     }
     let mut policy_filtered: Vec<FilteredEntry> = Vec::new();
 
-    let root_list: Vec<String> = match &options.project_roots {
+    let mut root_list: Vec<String> = match &options.project_roots {
         Some(roots) => roots.clone(),
         None => roots::detect_roots(files.keys().map(String::as_str), ecosystems).0,
     };
     // The full policy (paths from the file too) judges every root before
     // the project limit; roots named in `projectRoots` are explicit.
     let explicit_roots = options.project_roots.is_some();
+    // pnpm workspace members' locks belong to the workspace root (#492):
+    // a confirmed member with no other lock is no root of its own, and the
+    // workspace root is one even with no lock there (pnpm 7 writes none).
+    let admitted = |root: &str| {
+        let markers = roots::root_markers(root, files.keys().map(String::as_str));
+        policy
+            .admits_root(&Root {
+                rel_dir: root,
+                markers: &markers,
+                explicit: explicit_roots,
+            })
+            .is_ok()
+    };
+    let candidates =
+        roots::pnpm_member_candidates(&root_list, |path| files.contains_key(path), ecosystems);
+    let pnpm_members = confirm_pnpm_members(&files, candidates.clone(), admitted).await;
+    let other_marker = |root: &str| {
+        roots::has_other_root_marker(root, files.keys().map(String::as_str), ecosystems)
+    };
+    if !explicit_roots {
+        root_list.retain(|root| {
+            !pnpm_members.iter().any(|(member, _)| member == root) || other_marker(root)
+        });
+        root_list.extend(pnpm_members.iter().map(|(_, workspace)| workspace.clone()));
+        root_list.sort();
+        root_list.dedup();
+    } else {
+        // Named roots are kept, with two exceptions that make a run over
+        // path selection's `roots` match the detected one: a confirmed
+        // member named beside its workspace root (and holding no other
+        // lock), and a lockless directory selection named only because a
+        // pnpm-workspace.yaml sits above candidate members, none of which
+        // it turned out to pin.
+        let named: BTreeSet<String> = root_list.iter().cloned().collect();
+        let speculative: BTreeSet<&str> = candidates
+            .iter()
+            .map(|(_, workspace)| workspace.as_str())
+            .filter(|workspace| {
+                !pnpm_members.iter().any(|(_, w)| w == workspace)
+                    && roots::root_markers(workspace, files.keys().map(String::as_str)).is_empty()
+            })
+            .collect();
+        root_list.retain(|root| {
+            if speculative.contains(root.as_str()) {
+                return false;
+            }
+            !pnpm_members
+                .iter()
+                .any(|(member, workspace)| member == root && named.contains(workspace))
+                || other_marker(root)
+        });
+    }
     let detected_roots = root_list.clone();
     let root_list: Vec<String> = root_list
         .into_iter()
@@ -586,6 +811,10 @@ async fn engine(
             error: None,
         })
         .collect();
+    demote_pnpm_members(&mut states, &pnpm_members, &mut warnings);
+    if options.trust_lockfile_config {
+        refuse_governed_pnpm_members(&files, &mut states);
+    }
     drop(files);
     demote_cargo_members(&mut states, &mut warnings);
     phases.mark("roots");
@@ -762,11 +991,14 @@ async fn engine(
             .is_some_and(|e| e.code == "patch_lookup_failed")
     });
     let roots_by_path: Vec<String> = states.iter().map(|s| s.root.clone()).collect();
-    for state in states.iter_mut().filter(|s| s.error.is_none()) {
+    for state in states.iter_mut() {
+        if state.error.is_some() {
+            continue;
+        }
         let Some(project) = state.project.as_ref() else {
             continue;
         };
-        let recorded = memory_recorded(project, &state.root, &roots_by_path, &state.offers);
+        let recorded = memory_recorded(project, &state.root, &roots_by_path).await;
         stage.incomplete |= lookup_incomplete(&recorded, &state.failed_details, batch_failed);
         let mut rows = classify(&state.offers, &recorded, &state.root);
         for row in &mut rows {
@@ -830,6 +1062,26 @@ async fn engine(
             Ok(plan) => planned.push((index, plan)),
             Err(refusal) => state.error = Some(ProjectError::from(refusal)),
         }
+    }
+    // A pin on the patch server these references name, when that is not
+    // Socket's own, is recognized only now (see `mark_pinned`).
+    for (index, plan) in &planned {
+        if !crate::rollout::stage::any_new(&states[*index].rows) {
+            continue;
+        }
+        let origins = crate::patch::redirect::upstream::foreign_dep_origins(
+            plan.candidates.iter().map(|c| &c.dep),
+            &[],
+        );
+        if origins.is_empty() {
+            continue;
+        }
+        let pins = crate::patch::redirect::upstream::HostedPin::discover_recorded(
+            ProjectView::Memory(&plan.project),
+            &origins,
+        )
+        .await;
+        mark_pinned(&mut states[*index].rows, &pins);
     }
     let wheels: BTreeSet<(String, String)> = planned
         .iter()
@@ -1376,12 +1628,14 @@ mod tests {
                 rewrite,
                 rewritten: files.iter().map(|(rel, _)| (*rel).to_string()).collect(),
                 confirmed: vec![("pkg:cargo/serde@1.0.190".into(), "u".into())],
+                unattributed: Vec::new(),
                 binary_bun: false,
                 rush_warnings: Vec::new(),
                 pnpm_warnings: Vec::new(),
                 npm_warnings: Vec::new(),
                 pnpm_rerun_only: false,
                 workspace_symlinked: false,
+                final_discovery: None,
             },
         }
     }
@@ -1663,5 +1917,47 @@ mod tests {
             &mut filtered,
         );
         assert!(filtered.is_empty());
+    }
+
+    /// REGRESSION: the in-memory recorded view counts a lockless NuGet /
+    /// Cargo pin (never a discovery ref) as recorded, so a re-scan under a
+    /// cap reads the pin it wrote as ALREADY instead of spending a NEW slot.
+    #[tokio::test]
+    async fn memory_recorded_counts_lockless_nuget_and_cargo_pins() {
+        const NUGET: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        const CARGO: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        const GRANT: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+        let key = format!("socket-patch-{NUGET}");
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "nuget.config",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+                 <add key=\"{key}\" value=\"https://patch.socket.dev/patch-registry/nuget/{GRANT}/{NUGET}/index.json\" />\n  \
+                 </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"{key}\">\n      \
+                 <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
+                 </packageSourceMapping>\n</configuration>\n"
+            ),
+        );
+        p.insert_text(
+            "Cargo.toml",
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 serde = {{ version = \"1\", registry = \"socket-patch-{CARGO}\" }}\n"
+            ),
+        );
+        p.insert_text(
+            ".cargo/config.toml",
+            format!(
+                "[registries.socket-patch-{CARGO}]\nindex = \
+                 \"sparse+https://patch.socket.dev/patch-registry/cargo/{GRANT}/{CARGO}/index/\"\n"
+            ),
+        );
+        let index = memory_recorded(&p, "", &[String::new()]).await;
+        assert_eq!(index.uuids("pkg:nuget/Newtonsoft.Json@13.0.3"), [NUGET]);
+        assert_eq!(index.uuids("pkg:cargo/serde@1.0.200"), [CARGO]);
+        assert!(index.records_package("pkg:cargo/serde@1.0.200"));
+        assert!(index.uuids("pkg:cargo/serde@2.0.0").is_empty());
+        assert!(index.uuids("pkg:nuget/Other@1.0.0").is_empty());
     }
 }

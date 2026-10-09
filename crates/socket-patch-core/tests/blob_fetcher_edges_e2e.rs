@@ -24,8 +24,7 @@ fn dummy_client() -> ApiClient {
     ApiClient::new(ApiClientOptions {
         api_url: "http://127.0.0.1:1".to_string(),
         api_token: None,
-        use_public_proxy: true,
-        org_slug: None,
+        route: socket_patch_core::api::client::ApiRoute::Proxy,
     })
 }
 
@@ -357,8 +356,7 @@ fn proxy_client(base: &str) -> ApiClient {
     ApiClient::new(ApiClientOptions {
         api_url: base.to_string(),
         api_token: None,
-        use_public_proxy: true,
-        org_slug: None,
+        route: socket_patch_core::api::client::ApiRoute::Proxy,
     })
 }
 

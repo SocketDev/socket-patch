@@ -214,14 +214,23 @@ fn copy_tree(source: &Path, target: &Path) {
 }
 
 fn find_installed_target(root: &Path) -> Option<PathBuf> {
-    fn visit(dir: &Path, seen: &mut std::collections::HashSet<PathBuf>) -> Option<PathBuf> {
+    find_installed(root, ("minimist", "1.2.2"))
+}
+
+/// The first installed copy of `(name, version)` under `root`.
+fn find_installed(root: &Path, (name, version): (&str, &str)) -> Option<PathBuf> {
+    fn visit(
+        dir: &Path,
+        target: (&str, &str),
+        seen: &mut std::collections::HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
         let canonical = dir.canonicalize().ok()?;
         if !seen.insert(canonical) {
             return None;
         }
         if let Ok(bytes) = std::fs::read(dir.join("package.json")) {
             if let Ok(package) = serde_json::from_slice::<Value>(&bytes) {
-                if package["name"] == "minimist" && package["version"] == "1.2.2" {
+                if package["name"] == target.0 && package["version"] == target.1 {
                     return Some(dir.to_path_buf());
                 }
             }
@@ -229,14 +238,14 @@ fn find_installed_target(root: &Path) -> Option<PathBuf> {
         for entry in std::fs::read_dir(dir).ok()?.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if let Some(found) = visit(&path, seen) {
+                if let Some(found) = visit(&path, target, seen) {
                     return Some(found);
                 }
             }
         }
         None
     }
-    visit(root, &mut std::collections::HashSet::new())
+    visit(root, (name, version), &mut std::collections::HashSet::new())
 }
 
 fn installed_target(root: &Path) -> PathBuf {
@@ -250,6 +259,9 @@ fn installed_target(root: &Path) -> PathBuf {
 
 struct Fixture {
     temp: tempfile::TempDir,
+    /// The patched package: minimist@1.2.2, or (`*-deps` shapes)
+    /// mkdirp@0.5.6, which has a dependency of its own.
+    target: (&'static str, &'static str),
     project: PathBuf,
     reader: PathBuf,
     legacy_reader: Option<PathBuf>,
@@ -322,6 +334,13 @@ impl Fixture {
             "alias" => json!({"alias":"npm:minimist@1.2.2", "is-number":"7.0.0"}),
             "transitive" => json!({"mkdirp":"0.5.3", "is-number":"7.0.0"}),
             "workspace" => json!({"consumer":"workspace:*", "is-number":"7.0.0"}),
+            // REGRESSION (#861): ws@8 has two optional peers nothing
+            // installs (bufferutil, utf-8-validate), so the lock holds
+            // unresolved edges, as most real locks do; the fold must still
+            // re-hoist it.
+            "workspace-adder" | "workspace-deps" | "workspace-deps-adder" => {
+                json!({"consumer":"workspace:*", "is-number":"7.0.0", "ws":"8.18.0"})
+            }
             "workspace-nested" => {
                 json!({"consumer":"workspace:*", "minimist":"1.2.8", "is-number":"7.0.0"})
             }
@@ -342,12 +361,27 @@ impl Fixture {
             package["scripts"] =
                 json!({"preinstall":"echo root-pre", "postinstall":"echo root-post"});
         }
+        let target = if shape.ends_with("-deps") || shape.ends_with("-deps-adder") {
+            ("mkdirp", "0.5.6")
+        } else {
+            ("minimist", "1.2.2")
+        };
         if shape.starts_with("workspace") || shape == "extensions" {
             package["workspaces"] = json!(["packages/*"]);
             std::fs::create_dir_all(project.join("packages/consumer")).unwrap();
             std::fs::write(
                 project.join("packages/consumer/package.json"),
-                br#"{"name":"consumer","version":"1.0.0","dependencies":{"minimist":"1.2.2"}}"#,
+                serde_json::to_vec(&json!({"name":"consumer","version":"1.0.0",
+                    "dependencies":{target.0:target.1}}))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        if shape.ends_with("-adder") {
+            std::fs::create_dir_all(project.join("packages/adder")).unwrap();
+            std::fs::write(
+                project.join("packages/adder/package.json"),
+                br#"{"name":"adder","version":"1.0.0","dependencies":{"is-number":"7.0.0"}}"#,
             )
             .unwrap();
         }
@@ -396,7 +430,9 @@ impl Fixture {
             "writer must not produce text"
         );
         let original_lock = std::fs::read(project.join("bun.lockb")).unwrap();
-        let original = std::fs::read(installed_target(&project).join("index.js")).unwrap();
+        let installed = find_installed(&project, target)
+            .unwrap_or_else(|| panic!("installed {target:?} not found"));
+        let original = std::fs::read(installed.join("index.js")).unwrap();
         let patched = [MARKER, original.as_slice()].concat();
         let bystander = std::fs::read(project.join("node_modules/is-number/index.js")).unwrap();
         eprintln!(
@@ -406,6 +442,7 @@ impl Fixture {
         );
         Some(Self {
             temp,
+            target,
             project,
             reader,
             legacy_reader: std::env::var_os("SOCKET_PATCH_BUN_LOCKB_LEGACY_READER")
@@ -416,6 +453,15 @@ impl Fixture {
             patched,
             bystander,
         })
+    }
+
+    fn purl(&self) -> String {
+        format!("pkg:npm/{}@{}", self.target.0, self.target.1)
+    }
+
+    /// The patch's tarball file name.
+    fn tgz(&self) -> String {
+        format!("{}-{}.tgz", self.target.0, self.target.1)
     }
 
     fn lock(&self) -> Vec<u8> {
@@ -430,7 +476,7 @@ impl Fixture {
         let socket = self.project.join(".socket");
         std::fs::create_dir_all(socket.join("blobs")).unwrap();
         let after = compute_git_sha256_from_bytes(&self.patched);
-        let manifest = json!({"patches":{PURL:{"uuid":UUID,
+        let manifest = json!({"patches":{self.purl():{"uuid":UUID,
             "exportedAt":"2026-01-01T00:00:00Z", "files":{"package/index.js":{
                 "beforeHash":compute_git_sha256_from_bytes(&self.original), "afterHash":after}},
             "vulnerabilities":{GHSA:{"cves":[CVE],"summary":"binary lock vuln","severity":"high","description":"d"}},
@@ -495,7 +541,7 @@ impl Fixture {
             .output()
             .unwrap();
         let output = require_success(output, label);
-        let target = find_installed_target(&checkout).unwrap_or_else(|| {
+        let target = find_installed(&checkout, self.target).unwrap_or_else(|| {
             panic!(
                 "{label}: installed target absent under {}\nstdout: {}\nstderr: {}",
                 checkout.display(),
@@ -680,41 +726,54 @@ fn file_mode(_p: &Path, name: &str) -> u32 {
 }
 
 async fn mock_api(server: &MockServer, fixture: &Fixture, _target: &str) {
-    let tgz = make_tgz_from_installed(&installed_target(&fixture.project), &fixture.patched);
-    prebuilt_common::mount_download(server, PURL, UUID, "minimist-1.2.2.tgz", &tgz).await;
+    mock_api_patch(server, fixture, UUID, &fixture.patched).await;
+}
+
+/// [`mock_api`] serving patch `uuid`, which writes `patched` as the fixture
+/// target's `index.js` (a superseding patch is a second server with a new
+/// uuid).
+async fn mock_api_patch(server: &MockServer, fixture: &Fixture, uuid: &str, patched: &[u8]) {
+    let (name, version) = fixture.target;
+    let (purl, file) = (fixture.purl(), fixture.tgz());
+    let installed = find_installed(&fixture.project, fixture.target).unwrap();
+    let tgz = make_tgz_from_installed(&installed, patched);
+    prebuilt_common::mount_download(server, &purl, uuid, &file, &tgz).await;
     std::fs::write(fixture.temp.path().join("hosted.tgz"), &tgz).unwrap();
-    let url = format!("{}/patch/npm/minimist/1.2.2/33333333-3333-4333-8333-333333333333/{UUID}/minimist-1.2.2.tgz", server.uri());
+    let url = format!(
+        "{}/patch/npm/{name}/{version}/33333333-3333-4333-8333-333333333333/{uuid}/{file}",
+        server.uri()
+    );
     let sri = format!(
         "sha512-{}",
         base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tgz))
     );
     Mock::given(method("POST")).and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages":[{
-            "purl":PURL,"patches":[{"uuid":UUID,"purl":PURL,"tier":"free","cveIds":[],"ghsaIds":[],"severity":"high","title":"binary lock patch"}]}],"canAccessPaidPatches":false})))
+            "purl":purl,"patches":[{"uuid":uuid,"purl":purl,"tier":"free","cveIds":[],"ghsaIds":[],"severity":"high","title":"binary lock patch"}]}],"canAccessPaidPatches":false})))
         .mount(server).await;
-    Mock::given(method("GET")).and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.*minimist.*$")))
+    Mock::given(method("GET")).and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.*{name}.*$")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"patches":[{
-            "uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","description":"binary lock patch","license":"MIT","tier":"free","vulnerabilities":{}}],"canAccessPaidPatches":false})))
+            "uuid":uuid,"purl":purl,"publishedAt":"2026-01-01T00:00:00Z","description":"binary lock patch","license":"MIT","tier":"free","vulnerabilities":{}}],"canAccessPaidPatches":false})))
         .mount(server).await;
     Mock::given(method("POST")).and(path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":{UUID:{
-            "status":"granted","url":url,"purl":PURL,"artifacts":[{"kind":"tarball","url":url,"integrity":{"sha512":sri}}],"registryOverride":null}}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":{uuid:{
+            "status":"granted","url":url,"purl":purl,"artifacts":[{"kind":"tarball","url":url,"integrity":{"sha512":sri}}],"registryOverride":null}}})))
         .mount(server).await;
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"uuid":UUID,"purl":PURL,
+            ResponseTemplate::new(200).set_body_json(json!({"uuid":uuid,"purl":purl,
             "publishedAt":"2026-01-01T00:00:00Z","files":{"package/index.js":{
                 "beforeHash":compute_git_sha256_from_bytes(&fixture.original),
-                "afterHash":compute_git_sha256_from_bytes(&fixture.patched),
-                "blobContent":base64::engine::general_purpose::STANDARD.encode(&fixture.patched)}},
+                "afterHash":compute_git_sha256_from_bytes(patched),
+                "blobContent":base64::engine::general_purpose::STANDARD.encode(patched)}},
             "vulnerabilities":{GHSA:{"cves":[CVE],"summary":"binary lock vuln","severity":"high","description":"d"}},
             "description":"binary lock patch","license":"MIT","tier":"free"})),
         )
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex("^/patch/npm/minimist/.*$"))
+        .and(path_regex(format!("^/patch/npm/{name}/.*$")))
         .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
         .mount(server)
         .await;
@@ -997,6 +1056,47 @@ async fn native_binary_scan_vendored() {
     fixture.frozen("reverted", &fixture.original, "minimist");
 }
 
+/// #1132: `bun remove minimist` after a vendored scan leaves neither the
+/// vendored nor the pre-vendor record in bun.lockb. `vendor --revert` must
+/// retire the entry and delete its tarball; reading the removal as drift
+/// kept both forever and left `vendor --check` red. Named outside the
+/// `native_binary_` prefix: `scripts/backtest-bun-lockb.py` pins that set.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn binary_vendored_revert_after_bun_remove() {
+    let Some(fixture) = Fixture::new("direct") else {
+        return;
+    };
+    let server = MockServer::start().await;
+    mock_api(&server, &fixture, "minimist").await;
+    let result = scan(&fixture.project, &server, "vendored", &[]);
+    assert_eq!(
+        result["vendor"]["summary"]["applied"], 1,
+        "scan vendored: {result}"
+    );
+    let mut remove = command(&fixture.reader, &fixture.project);
+    remove
+        .args(["remove", "minimist", "--ignore-scripts"])
+        .env(
+            "BUN_INSTALL_CACHE_DIR",
+            fixture.temp.path().join("remove-cache"),
+        )
+        .env("BUN_INSTALL", fixture.temp.path().join("remove-home"));
+    require_success(remove.output().unwrap(), "bun remove minimist");
+    assert!(!fixture.project.join("bun.lock").exists());
+
+    let result = cli(&fixture.project, &["vendor", "--revert"]);
+    assert_eq!(result["status"], "success", "vendor revert: {result}");
+    assert!(
+        !result.to_string().contains("vendor_lock_entry_drifted"),
+        "a removed dependency is not drift: {result}"
+    );
+    assert!(
+        !fixture.project.join(".socket/vendor").exists(),
+        "the vendored tarball must be deleted: {result}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn native_binary_alias_and_transitive() {
@@ -1075,6 +1175,308 @@ async fn native_binary_alias_and_transitive() {
         }
         cli(&fixture.project, &["vendor", "--revert"]);
         fixture.pristine();
+    }
+}
+
+/// #784: after Bun migrates a vendored `bun.lockb` to `bun.lock`
+/// (`bun install --save-text-lockfile`), `vendor --revert` and `rollback`
+/// must restore the registry tuple Bun writes when it migrates the pristine
+/// binary lock, instead of failing on the missing `bun.lockb`, and a hosted
+/// takeover must replace the vendored wiring; a fresh frozen install of the
+/// result gets the original (or, hosted, the patched) bytes. Needs a Bun >= 1.2
+/// reader (the text lock releases the vendored text path parses). Not named
+/// `native_binary_*`, like the #803 test: it runs on the 1.4.2 CI leg.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn vendored_text_migration_reverts_to_registry() {
+    for unwind in [
+        &["vendor", "--revert"][..],
+        &["rollback", "--yes"][..],
+        &["scan"][..],
+    ] {
+        let Some(fixture) = Fixture::new("direct") else {
+            return;
+        };
+        let Some((pristine, server)) = vendor_then_migrate(&fixture).await else {
+            return;
+        };
+        let project = &fixture.project;
+
+        let result = if unwind == ["scan"] {
+            // The hosted takeover reverts the vendored wiring first.
+            let hosted = scan(project, &server, "hosted", &[]);
+            assert_eq!(hosted["redirect"]["redirected"], 1, "{hosted}");
+            hosted
+        } else {
+            cli(project, unwind)
+        };
+        assert_eq!(result["status"], "success", "{unwind:?}: {result}");
+        assert!(!project.join(".socket/vendor").exists(), "{unwind:?}");
+        let expected = if unwind == ["scan"] {
+            let lock = std::fs::read_to_string(project.join("bun.lock")).unwrap();
+            assert!(lock.contains("/patch/npm/minimist/"), "{lock}");
+            &fixture.patched
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(project.join("bun.lock")).unwrap(),
+                pristine,
+                "{unwind:?} restores the registry tuple"
+            );
+            &fixture.original
+        };
+
+        assert_eq!(
+            frozen_text_install(&fixture, "reverted"),
+            *expected,
+            "{unwind:?}: a fresh frozen install"
+        );
+    }
+}
+
+/// The Bun >= 1.2 setup of the #784 tests: vendor the fixture's binary lock,
+/// then let Bun migrate it to `bun.lock` (`bun install
+/// --save-text-lockfile`). Returns what Bun writes when it migrates the
+/// pristine binary lock, and the mock server that vendored it; `None` (a
+/// skip) under a reader older than 1.2.
+async fn vendor_then_migrate(fixture: &Fixture) -> Option<(String, MockServer)> {
+    let raw = String::from_utf8_lossy(
+        &command(&fixture.reader, &fixture.project)
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let major_minor: Vec<u32> = raw
+        .split('.')
+        .take(2)
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    if major_minor.as_slice() < [1, 2].as_slice() {
+        eprintln!("SKIP vendored text migration: Bun {raw} < 1.2");
+        return None;
+    }
+    let pristine_dir = fixture.temp.path().join("pristine-migration");
+    std::fs::create_dir_all(&pristine_dir).unwrap();
+    for file in ["package.json", "bun.lockb", "bunfig.toml"] {
+        std::fs::copy(fixture.project.join(file), pristine_dir.join(file)).unwrap();
+    }
+    let pristine = migrate_to_text_lock(fixture, &pristine_dir, "pristine");
+
+    let server = MockServer::start().await;
+    mock_api(&server, fixture, "minimist").await;
+    let vendored = scan(&fixture.project, &server, "vendored", &[]);
+    assert_eq!(vendored["vendor"]["summary"]["applied"], 1, "{vendored}");
+    let migrated = migrate_to_text_lock(fixture, &fixture.project, "vendored");
+    assert!(
+        migrated.contains(&format!("minimist@.socket/vendor/npm/{UUID}/")),
+        "the migration carries the vendored tuple:\n{migrated}"
+    );
+    Some((pristine, server))
+}
+
+/// `bun install --save-text-lockfile` in `dir`: Bun deletes `bun.lockb` and
+/// writes `bun.lock`, which is returned.
+fn migrate_to_text_lock(fixture: &Fixture, dir: &Path, label: &str) -> String {
+    std::fs::remove_file(dir.join("bunfig.toml")).unwrap();
+    let _ = std::fs::remove_dir_all(dir.join("node_modules"));
+    let output = command(&fixture.reader, dir)
+        .args(["install", "--save-text-lockfile", "--ignore-scripts"])
+        .env(
+            "BUN_INSTALL_CACHE_DIR",
+            fixture.temp.path().join(format!("{label}-cache")),
+        )
+        .env(
+            "BUN_INSTALL",
+            fixture.temp.path().join(format!("{label}-home")),
+        )
+        .output()
+        .unwrap();
+    require_success(output, &format!("{label}: bun.lockb -> bun.lock migration"));
+    assert!(!dir.join("bun.lockb").exists(), "{label}");
+    std::fs::read_to_string(dir.join("bun.lock")).unwrap()
+}
+
+/// An empty-cache `bun install --frozen-lockfile` of a fresh checkout of
+/// the project's `package.json`, `bun.lock` and `.socket`: the installed
+/// minimist `index.js`.
+fn frozen_text_install(fixture: &Fixture, label: &str) -> Vec<u8> {
+    let checkout = fixture.temp.path().join(format!("{label}-checkout"));
+    std::fs::create_dir_all(&checkout).unwrap();
+    for file in ["package.json", "bun.lock"] {
+        std::fs::copy(fixture.project.join(file), checkout.join(file)).unwrap();
+    }
+    if fixture.project.join(".socket").exists() {
+        copy_tree(&fixture.project.join(".socket"), &checkout.join(".socket"));
+    }
+    let output = command(&fixture.reader, &checkout)
+        .args(["install", "--frozen-lockfile", "--ignore-scripts"])
+        .env(
+            "BUN_INSTALL_CACHE_DIR",
+            fixture.temp.path().join(format!("{label}-cache")),
+        )
+        .env(
+            "BUN_INSTALL",
+            fixture.temp.path().join(format!("{label}-home")),
+        )
+        .output()
+        .unwrap();
+    require_success(output, &format!("{label}: frozen install of bun.lock"));
+    assert!(!checkout.join("bun.lockb").exists(), "{label}");
+    std::fs::read(installed_target(&checkout).join("index.js")).unwrap()
+}
+
+/// #784, after Bun migrated a vendored `bun.lockb` to `bun.lock`:
+///
+/// - `repair` and a vendored re-run keep the project vendored (a frozen
+///   install still gets the patched bytes), and a re-run whose committed
+///   artifact is gone (a same-uuid re-pin) rebuilds it;
+/// - a superseding patch (new uuid) re-vendored on the migrated lock pins
+///   the new artifact;
+///
+/// and either way `vendor --revert` then restores the registry tuple Bun
+/// writes for the pristine binary lock, byte for byte, with no drift left
+/// behind, so a fresh frozen install gets the original bytes. Named
+/// `*text_migration*` to run on the 1.4.2 CI leg.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn vendored_text_migration_rerun_and_supersede_revert() {
+    const UUID2: &str = "c0ffee00-4da6-45f9-bba8-b888e0ffd58c";
+    for case in ["rerun", "supersede"] {
+        let Some(fixture) = Fixture::new("direct") else {
+            return;
+        };
+        let Some((pristine, server)) = vendor_then_migrate(&fixture).await else {
+            return;
+        };
+        let project = &fixture.project;
+        let migrated = std::fs::read_to_string(project.join("bun.lock")).unwrap();
+        let artifact = project.join(format!(".socket/vendor/npm/{UUID}"));
+        let expected_patched = if case == "rerun" {
+            let uri = server.uri();
+            let repair_args = ["repair", "--patch-server-url", &uri];
+            let repair = cli(project, &repair_args);
+            assert_eq!(repair["status"], "success", "{repair}");
+            let rerun = scan(project, &server, "vendored", &[]);
+            assert_eq!(rerun["status"], "success", "{rerun}");
+            // Bun 1.2 migrates the vendored tuple without its digest, which
+            // the re-run heals in place; a newer Bun's lock is kept as is.
+            let digestless = migrated
+                .lines()
+                .any(|l| l.contains("\"minimist\": [") && !l.contains("sha512-"));
+            let lock = std::fs::read_to_string(project.join("bun.lock")).unwrap();
+            assert!(
+                lock == migrated
+                    || (digestless
+                        && lock.contains(&format!("minimist@.socket/vendor/npm/{UUID}/"))),
+                "a vendored re-run keeps Bun's migrated lock:\n{migrated}\n{lock}"
+            );
+            let again = scan(project, &server, "vendored", &[]);
+            assert_eq!(again["status"], "success", "{again}");
+            assert_eq!(
+                std::fs::read_to_string(project.join("bun.lock")).unwrap(),
+                lock,
+                "a second re-run changes nothing"
+            );
+            assert_eq!(
+                frozen_text_install(&fixture, "rerun"),
+                fixture.patched,
+                "the re-run keeps the project vendored"
+            );
+            // A fresh clone that lost the artifact: repair rebuilds it.
+            std::fs::remove_dir_all(&artifact).unwrap();
+            let repair = cli(project, &repair_args);
+            assert_eq!(repair["status"], "success", "{repair}");
+            assert!(artifact.is_dir(), "repair rebuilds the artifact: {repair}");
+            assert_eq!(
+                std::fs::read_to_string(project.join("bun.lock")).unwrap(),
+                lock,
+                "repair leaves the migrated lock alone"
+            );
+            // A tuple whose digest no longer matches the artifact: the
+            // re-run re-pins the same uuid as a `bun.lock` record, next to
+            // the `bun.lockb` records the entry carries forward.
+            let line = lock
+                .lines()
+                .find(|l| l.contains("\"minimist\": ["))
+                .unwrap();
+            let digest = &line[line.find("\"sha512-").unwrap()..line.rfind('"').unwrap() + 1];
+            std::fs::write(
+                project.join("bun.lock"),
+                lock.replace(line, &line.replace(digest, "\"sha512-AAAA\"")),
+            )
+            .unwrap();
+            let repin = scan(project, &server, "vendored", &[]);
+            assert_eq!(repin["status"], "success", "{repin}");
+            assert_eq!(
+                std::fs::read_to_string(project.join("bun.lock")).unwrap(),
+                lock,
+                "the re-pin restores the artifact's digest"
+            );
+            let state = std::fs::read_to_string(project.join(".socket/vendor/state.json")).unwrap();
+            assert!(
+                state.contains("\"bun_lock_package\"") && state.contains("\"bun_lockb_package\""),
+                "the re-pin leaves a mixed entry: {state}"
+            );
+            fixture.patched.clone()
+        } else {
+            let patched2 = [
+                b"/* SOCKET SUPERSEDING PATCH */\n".as_slice(),
+                &fixture.original,
+            ]
+            .concat();
+            let server2 = MockServer::start().await;
+            mock_api_patch(&server2, &fixture, UUID2, &patched2).await;
+            let supersede = scan(project, &server2, "vendored", &[]);
+            assert_eq!(supersede["status"], "success", "{supersede}");
+            let lock = std::fs::read_to_string(project.join("bun.lock")).unwrap();
+            assert!(
+                lock.contains(&format!("minimist@.socket/vendor/npm/{UUID2}/"))
+                    && !lock.contains(UUID),
+                "the superseding patch re-pins the migrated lock:\n{lock}"
+            );
+            patched2
+        };
+        let state: Value = serde_json::from_slice(
+            &std::fs::read(project.join(".socket/vendor/state.json")).unwrap(),
+        )
+        .unwrap();
+        let wiring = state["entries"][PURL]["wiring"].as_array().unwrap();
+        assert!(
+            wiring
+                .iter()
+                .filter(|w| w["file"] == "bun.lock")
+                .all(|w| w["original"].is_string()),
+            "{case}: every bun.lock record keeps its pre-vendor original: {state}"
+        );
+        assert_eq!(
+            frozen_text_install(&fixture, &format!("{case}-vendored")),
+            expected_patched,
+            "{case}: a fresh frozen install of the re-vendored lock"
+        );
+
+        let revert = cli(project, &["vendor", "--revert"]);
+        assert_eq!(revert["status"], "success", "{case}: {revert}");
+        let revert_text = revert.to_string();
+        for code in [
+            "vendor_lock_entry_drifted",
+            "vendor_artifact_kept",
+            "vendor_revert_kept",
+        ] {
+            assert!(!revert_text.contains(code), "{case}: {revert}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(project.join("bun.lock")).unwrap(),
+            pristine,
+            "{case}: revert restores the registry tuple"
+        );
+        assert!(!project.join(".socket/vendor").exists(), "{case}");
+        assert_eq!(
+            frozen_text_install(&fixture, &format!("{case}-reverted")),
+            fixture.original,
+            "{case}: a fresh frozen install of the reverted lock"
+        );
     }
 }
 
@@ -1180,6 +1582,191 @@ async fn workspace_text_migration_heals_on_rerun() {
         std::fs::read_to_string(checkout.join("bun.lock")).unwrap(),
         healed,
         "the frozen install keeps the lock"
+    );
+}
+
+/// The `(name, resolution)` package lines of Bun's own yarn-style dump of
+/// the project's `bun.lockb`.
+fn dumped_records(fixture: &Fixture) -> Vec<String> {
+    let output = command(&fixture.reader, &fixture.project)
+        .arg("bun.lockb")
+        .output()
+        .unwrap();
+    let dump =
+        String::from_utf8_lossy(&require_success(output, "bun bun.lockb").stdout).into_owned();
+    dump.lines()
+        .filter(|line| line.trim_start().starts_with("resolved "))
+        .map(str::trim)
+        .map(str::to_string)
+        .collect()
+}
+
+/// #861: after a vendored workspace `bun.lockb`, a new dependent of the
+/// patched package (a member added later, or `bun add` in an existing
+/// member) makes Bun write a second, nested REGISTRY record of the same
+/// `name@version`, since the hoisted one is a local tarball now. The
+/// vendored re-run must not rewire that record to the same tarball: two
+/// records with one tarball resolution share one isolated store directory,
+/// and frozen installs fail intermittently with `EEXIST`. It folds the
+/// record into the existing tarball record instead, so every fresh frozen
+/// install links the patched bytes into the new dependent too. The member
+/// names hoist the late dependent after (`late`) and before (`adder`) the
+/// vendored one. Isolated linker (Bun >= 1.3); not named `native_binary_*`
+/// (the backtest matrix runs exactly those).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn workspace_late_dependent_rerun_shares_the_tarball_record() {
+    late_dependent_matrix([("workspace", "late"), ("workspace-adder", "adder")]).await;
+}
+
+/// #861, a patched package WITH dependencies of its own (mkdirp@0.5.6 ->
+/// minimist): the late registry record resolves its dependencies to the
+/// same packages as the tarball record, so it folds the same way — its
+/// edges leave the lock with it and the trees are re-hoisted as Bun
+/// hoists them — instead of being rewired to the same tarball (`EEXIST`).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn workspace_late_dependent_with_dependencies_rerun_shares_the_tarball_record() {
+    late_dependent_matrix([
+        ("workspace-deps", "late"),
+        ("workspace-deps-adder", "adder"),
+    ])
+    .await;
+}
+
+async fn late_dependent_matrix(cases: [(&str, &str); 2]) {
+    for (shape, member) in cases {
+        let Some(fixture) = Fixture::new(shape) else {
+            return;
+        };
+        let raw = String::from_utf8_lossy(
+            &command(&fixture.reader, &fixture.project)
+                .arg("--version")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let major_minor: Vec<u32> = raw
+            .split('.')
+            .take(2)
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        if major_minor.as_slice() < [1, 3].as_slice() {
+            eprintln!("SKIP late workspace dependent: Bun {raw} has no isolated linker");
+            return;
+        }
+        late_dependent_rerun(&fixture, member).await;
+    }
+}
+
+async fn late_dependent_rerun(fixture: &Fixture, member: &str) {
+    let project = &fixture.project;
+    let (name, version) = fixture.target;
+    let file = fixture.tgz();
+    std::fs::write(
+        project.join("bunfig.toml"),
+        "[install]\nsaveTextLockfile = false\nlinker = \"isolated\"\n",
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    mock_api(&server, fixture, name).await;
+    fixture.stage();
+    let first = cli(project, &["vendor", "--offline"]);
+    assert_eq!(
+        first["summary"]["applied"], 1,
+        "{member}: first vendor: {first}"
+    );
+
+    let dir = project.join("packages").join(member);
+    let mut add = if dir.exists() {
+        let mut add = command(&fixture.reader, &dir);
+        add.args(["add", &format!("{name}@{version}"), "--ignore-scripts"]);
+        add
+    } else {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(
+                r#"{{"name":"{member}","version":"1.0.0","dependencies":{{"{name}":"{version}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let mut install = command(&fixture.reader, project);
+        install.args(["install", "--ignore-scripts"]);
+        install
+    };
+    let output = add
+        .env(
+            "BUN_INSTALL_CACHE_DIR",
+            fixture.temp.path().join("late-cache"),
+        )
+        .env("BUN_INSTALL", fixture.temp.path().join("late-home"))
+        .output()
+        .unwrap();
+    require_success(output, &format!("{member}: the late dependent"));
+    let before = dumped_records(fixture);
+    assert!(
+        before
+            .iter()
+            .any(|line| line.contains(&file) && !line.contains(".socket/vendor/npm/")),
+        "{member}: Bun writes a nested registry record: {before:?}"
+    );
+
+    let rerun = cli(project, &["vendor", "--offline"]);
+    assert_eq!(
+        rerun["summary"]["applied"], 1,
+        "{member}: vendored re-run: {rerun}"
+    );
+    assert!(
+        !rerun
+            .to_string()
+            .contains("vendor_bun_lockb_duplicate_records"),
+        "{member}: the records fold, no fallback: {rerun}"
+    );
+    let after = dumped_records(fixture);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|line| line.contains(&file))
+            .collect::<Vec<_>>(),
+        [&format!("resolved \".socket/vendor/npm/{UUID}/{file}\"")],
+        "{member}: one record, the tarball: {after:?}"
+    );
+    // EEXIST was intermittent (about half the cold frozen installs).
+    for attempt in 0..6 {
+        let checkout = fixture.frozen_install(
+            &format!("{member}-{attempt}"),
+            &fixture.patched,
+            &fixture.bystander,
+            false,
+        );
+        assert_eq!(
+            std::fs::read(
+                checkout
+                    .join("packages")
+                    .join(member)
+                    .join("node_modules")
+                    .join(name)
+                    .join("index.js")
+            )
+            .unwrap(),
+            fixture.patched,
+            "{member} attempt {attempt}: the late dependent links the patched bytes"
+        );
+    }
+    let again = cli(project, &["vendor", "--offline"]);
+    assert_eq!(
+        again["summary"]["skipped"], 1,
+        "{member}: idempotent: {again}"
+    );
+    cli(project, &["vendor", "--revert"]);
+    fixture.frozen_install(
+        &format!("{member}-reverted"),
+        &fixture.original,
+        &fixture.bystander,
+        false,
     );
 }
 

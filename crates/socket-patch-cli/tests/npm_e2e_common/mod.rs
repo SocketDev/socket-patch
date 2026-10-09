@@ -32,7 +32,7 @@
 //! | 6      | lockfileVersion 1              | renames the lock            |
 //! | 7, 8   | lockfileVersion 2 (+ v1 mirror)| renames the lock            |
 //! | 9–11   | lockfileVersion 3              | renames the lock            |
-//! | 12     | lockfileVersion 3              | REMOVED; a committed shrinkwrap gets a package-lock.json twin on first install, and installs read the twin |
+//! | 12     | lockfileVersion 3              | REMOVED; npm 12 never reads npm-shrinkwrap.json — installs read package-lock.json, resolved fresh from the registry when only the shrinkwrap is committed (#899) |
 //!
 //! npm 12 also defaults `allow-remote=none`, refusing (EALLOWREMOTE) every
 //! tarball not served from the registry origin — a hosted redirect's
@@ -214,9 +214,10 @@ pub enum LockFlavor {
     /// package-lock.json only (every major's `npm install` default).
     PackageLock,
     /// A committed npm-shrinkwrap.json: npm <= 11's `npm shrinkwrap`
-    /// (renames the lock → shrinkwrap only); npm 12, which removed the
-    /// command, keeps a package-lock.json twin beside it (its default
-    /// dual-lock state, and the lock its installs read).
+    /// (renames the lock → shrinkwrap only, which npm 12 would ignore, so
+    /// VEX omits it until a package-lock.json twin exists — #899); npm 12,
+    /// which removed the command and never reads the shrinkwrap, is given
+    /// the package-lock.json twin it installs from (the dual-lock state).
     Shrinkwrap,
 }
 

@@ -167,7 +167,7 @@ pub(crate) struct LedgerSupplement {
 
 /// Vendored-ledger packages with no crawled counterpart: on a fresh clone
 /// the committed artifact IS the dependency, so these stay discoverable
-/// (updates[] detection, the table, and `scan --vendor` re-vendor/in-sync
+/// (updates[] detection, the table, and `scan --mode vendored` re-vendor/in-sync
 /// runs all keep working before any install). They are NOT "lockfile-only"
 /// — nothing needs installing; the artifact satisfies the lock. `state` is
 /// the ledger `run` already loaded (`vendor::load_state`).
@@ -1836,8 +1836,7 @@ mod tests {
             socket_patch_core::api::client::ApiClientOptions {
                 api_url: uri.to_string(),
                 api_token: None,
-                use_public_proxy: true,
-                org_slug: None,
+                route: socket_patch_core::api::client::ApiRoute::Proxy,
             },
         )
     }

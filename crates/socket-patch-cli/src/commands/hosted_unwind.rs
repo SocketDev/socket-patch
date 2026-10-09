@@ -110,6 +110,25 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
     );
     out.edited_files
         .extend(outcome.reverted_files.iter().cloned());
+    // Bun's hoisted linker keeps the patched copies of the pins it no
+    // longer pins (#764): say so, with the install that does reinstall.
+    // A dry run says it too, so the preview's reinstall note names
+    // `bun install --force` like the real run's.
+    if outcome.flush_error.is_none() {
+        use socket_patch_core::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
+        use socket_patch_core::vendor::bun_lock;
+        let bun_purls = outcome
+            .restored()
+            .filter(|pin| pin.files.iter().any(|f| f == BUN_LOCK || f == BUN_LOCKB));
+        let stale =
+            bun_lock::stale_hoisted_copies(&common.cwd, bun_purls.map(|p| p.purl.as_str())).await;
+        if !stale.is_empty() {
+            out.warnings.push((
+                "redirect_bun_reinstall_required".to_string(),
+                bun_lock::reinstall_advisory(&stale),
+            ));
+        }
+    }
     let unwound: Vec<_> = vlt_targets
         .into_iter()
         .filter(|t| out.reverted.iter().any(|p| p == &t.purl))

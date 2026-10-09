@@ -6,6 +6,11 @@
 //! refuse [`LineEndings::Mixed`] (there is no single style to restore),
 //! operate on the LF-normalized text ([`to_lf`]), and re-expand whatever is
 //! written or recorded with [`LineEndings::restore`].
+//!
+//! Writers that insert lines pick their terminator with [`terminator`] and
+//! look for what they wrote with [`respell`]; "is this still our file"
+//! checks, which a `core.autocrlf` checkout must not defeat, compare with
+//! [`eol_eq`].
 
 use std::borrow::Cow;
 
@@ -81,6 +86,58 @@ pub(crate) fn majority_terminator(text: &str) -> &'static str {
     }
 }
 
+/// The terminator a writer uses for the lines it inserts into `text`:
+/// `\r\n` for a CRLF file, `\n` for an LF file or one with no break at all,
+/// and the [`majority_terminator`] for a mixed file. Majority is stable
+/// under appending lines in its own style, so a revert that removes
+/// `{line}{terminator}` matches what the forward pass wrote.
+pub(crate) fn terminator(text: &str) -> &'static str {
+    match LineEndings::of(text) {
+        LineEndings::Crlf => "\r\n",
+        LineEndings::Mixed => majority_terminator(text),
+        LineEndings::Lf | LineEndings::None => "\n",
+    }
+}
+
+/// `text` with every line break spelled `nl` (`"\r\n"` or `"\n"`):
+/// existing `\r\n` pairs are folded first, so the result never holds
+/// `\r\r\n`. How a writer spells a recorded fragment in the
+/// [`terminator`] of the file it is looking for that fragment in.
+pub(crate) fn respell(text: &str, nl: &str) -> String {
+    let lf = to_lf(text);
+    if nl == "\r\n" {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf.into_owned()
+    }
+}
+
+/// Whether `a` and `b` are equal once every `\r\n` is read as `\n`.
+/// Nothing else is normalised: a lone `\r`, trailing whitespace or a
+/// missing final newline still differ. Bytes, not text: the files compared
+/// need not be UTF-8.
+pub(crate) fn eol_eq(a: &[u8], b: &[u8]) -> bool {
+    to_lf_bytes(a) == to_lf_bytes(b)
+}
+
+/// [`to_lf`] for bytes not known to be UTF-8.
+fn to_lf_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if !bytes.windows(2).any(|w| w == b"\r\n") {
+        return Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +175,45 @@ mod tests {
         assert_eq!(majority_terminator("a\r\nb\nc\n"), "\n");
         assert_eq!(majority_terminator("a\r\nb\n"), "\n", "a tie is LF");
         assert_eq!(majority_terminator("{}"), "\n", "no break: LF, not os.EOL");
+    }
+
+    #[test]
+    fn terminator_follows_the_file_and_the_majority_when_mixed() {
+        assert_eq!(terminator("a\nb\n"), "\n");
+        assert_eq!(terminator("a\r\nb\r\n"), "\r\n");
+        assert_eq!(terminator("a\r\nb"), "\r\n");
+        assert_eq!(terminator(""), "\n");
+        assert_eq!(terminator("one line"), "\n");
+        assert_eq!(terminator("a\r\nb\r\nc\n"), "\r\n", "CRLF majority");
+        assert_eq!(terminator("a\nb\nc\r\n"), "\n", "LF majority");
+        assert_eq!(terminator("a\r\nb\n"), "\n", "a tie is LF");
+        // A bare CR makes the file mixed; it is not counted as a break.
+        assert_eq!(terminator("a\rb\r\n"), "\r\n");
+    }
+
+    #[test]
+    fn eol_eq_ignores_only_crlf() {
+        assert!(eol_eq(b"a\nb\n", b"a\r\nb\r\n"));
+        assert!(eol_eq(b"a\r\nb", b"a\nb"));
+        assert!(eol_eq(b"", b""));
+        assert!(!eol_eq(b"a\n", b"a"));
+        assert!(!eol_eq(b"a\rb", b"a\nb"));
+        assert!(!eol_eq(b"a \n", b"a\n"));
+        // Not UTF-8: still compared byte for byte past the folding.
+        assert!(eol_eq(b"\xff\r\n", b"\xff\n"));
+        assert!(matches!(to_lf_bytes(b"a\nb"), Cow::Borrowed(_)));
+        for text in ["a\r\nb\n", "a\rb", "\r\n\r\n", "x"] {
+            assert_eq!(to_lf_bytes(text.as_bytes()), to_lf(text).as_bytes());
+        }
+    }
+
+    #[test]
+    fn respell_round_trips() {
+        assert_eq!(respell("a\nb\n", "\r\n"), "a\r\nb\r\n");
+        assert_eq!(respell("a\r\nb\n", "\r\n"), "a\r\nb\r\n");
+        assert_eq!(respell("a\r\nb\r\n", "\n"), "a\nb\n");
+        assert_eq!(respell("a", "\r\n"), "a");
+        let crlf = "x\r\ny\r\n";
+        assert_eq!(respell(&respell(crlf, "\n"), terminator(crlf)), crlf);
     }
 }

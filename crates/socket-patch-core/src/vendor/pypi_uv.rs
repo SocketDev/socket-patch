@@ -32,6 +32,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 // the first opens.
 use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::terminator;
 use crate::utils::python_lock::preserve_line_endings;
 
 use super::common::{
@@ -822,6 +823,33 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     // ALREADY-CONVERGED probes below key on it (see the LIVENESS CONTRACT
     // on `RevertOutcome::drift_skipped`).
     let needle = format!(".socket/vendor/pypi/{}", entry.uuid);
+    // REMOVED, not drift (#1140): `uv remove <pkg>` drops the dependency
+    // together with every fragment that routed through the wheel. When
+    // neither file names this entry's uuid any more, a record whose written
+    // fragment carried it has nothing left to restore; it warns
+    // `vendor_lock_entry_removed` so the revert converges. Probed once,
+    // before any record is reverted, so only the user's own edits count.
+    let uuid_lower = entry.uuid.to_ascii_lowercase();
+    let unreferenced = ![&pyproject_text, &lock_text]
+        .iter()
+        .any(|text| text.to_ascii_lowercase().contains(&uuid_lower));
+    let removed = |rec: &WiringRecord| {
+        let carried_uuid = rec
+            .new
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|new| new.to_ascii_lowercase().contains(&uuid_lower));
+        (unreferenced && carried_uuid).then(|| {
+            VendorWarning::new(
+                super::LOCK_ENTRY_REMOVED_CODE,
+                format!(
+                    "{} entry for {:?} no longer exists and nothing references {needle} any \
+                     more (the dependency was removed); nothing to restore",
+                    rec.kind, rec.key
+                ),
+            )
+        })
+    };
 
     for rec in entry.wiring.iter().rev() {
         let new_text = rec.new.as_ref().and_then(serde_json::Value::as_str);
@@ -835,6 +863,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                 match respell_original(orig, &rec.kind, key, &pyproject_text) {
                     Ok(text) => Some(text),
                     Err(reason) => {
+                        if let Some(w) = removed(rec) {
+                            warnings.push(w);
+                            continue;
+                        }
                         warnings.push(VendorWarning::new(
                             "vendor_lock_entry_drifted",
                             format!(
@@ -869,7 +901,9 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                 {
                     ArrayRevert::Reverted(t) => lock_text = t,
                     ArrayRevert::Converged => {}
-                    ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
+                    ArrayRevert::Drift => {
+                        warnings.push(removed(rec).unwrap_or_else(|| drifted("uv.lock")))
+                    }
                 }
             }
             "uv_lock_package" | "uv_lock_requires_dist" => {
@@ -894,7 +928,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         if original_text.is_some_and(|orig| haystack.contains(orig)) {
                             continue;
                         }
-                        warnings.push(drifted("uv.lock"));
+                        warnings.push(removed(rec).unwrap_or_else(|| drifted("uv.lock")));
                     }
                 }
             }
@@ -907,7 +941,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                     // A created [manifest] section was inserted with a blank
                     // separator line; a created overrides key is one line.
                     // Both were terminated with the lock's own newline.
-                    let nl = newline_of(&lock_text);
+                    let nl = terminator(&lock_text);
                     let removed = if new.starts_with("[manifest]") {
                         remove_substring(&lock_text, &format!("{new}{nl}{nl}"))
                     } else {
@@ -942,7 +976,9 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                 ) {
                     ArrayRevert::Reverted(t) => lock_text = t,
                     ArrayRevert::Converged => {}
-                    ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
+                    ArrayRevert::Drift => {
+                        warnings.push(removed(rec).unwrap_or_else(|| drifted("uv.lock")))
+                    }
                 },
             },
             "uv_sources_entry" => {
@@ -1284,7 +1320,7 @@ fn revert_array_elements(
     if !changed {
         return ArrayRevert::Converged;
     }
-    let nl = newline_of(lock_text);
+    let nl = terminator(lock_text);
     let rendered = match live.len() {
         0 => "[]".to_string(),
         1 => format!("[{}]", live[0]),
@@ -1392,18 +1428,6 @@ fn locate_lock_array(
 /// any write (uv itself writes through a link; the atomic rename would
 /// replace it) and re-verified against the pre-flight snapshot.
 const UV_PAIR: [&str; 2] = ["pyproject.toml", "uv.lock"];
-
-/// The lock's line terminator. uv writes LF, but git autocrlf on Windows
-/// hands us a CRLF file; every fragment we splice, append or remove must be
-/// built with the file's own terminator or the lock comes back with mixed
-/// endings and revert's exact-text removals miss.
-fn newline_of(text: &str) -> &'static str {
-    if text.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
 
 /// Whether a header for this `[tool.uv…]` table would be socket-patch's own
 /// bytes once a key is added: the table is absent, or exists only
@@ -1524,7 +1548,7 @@ fn rewrite_target_package_unit(
     wheel_sha256_hex: &str,
     metadata_block: Option<&str>,
 ) -> Result<(String, String), (&'static str, String)> {
-    let nl = newline_of(lock_text);
+    let nl = terminator(lock_text);
     let span = find_unit_span(lock_text, |lines| unit_has_name(lines, canon)).ok_or_else(|| {
         (
             "pypi_uv_lock_package_missing",
@@ -1888,7 +1912,7 @@ fn add_manifest_override(
     let element = format!("{{ name = \"{canon}\", path = \"{rel_wheel}\" }}");
     // Every created/spliced fragment is built with the lock's own terminator
     // (revert removes `{new}{nl}` / `{new}{nl}{nl}` with the same detection).
-    let nl = newline_of(lock_text);
+    let nl = terminator(lock_text);
     let index = line_index(lock_text);
     let manifest_line = index.iter().position(|(_, l)| l.trim_end() == "[manifest]");
 
@@ -2866,6 +2890,65 @@ wheels = [
             "requires-dist specifier restored"
         );
         assert_eq!(lock, DIRECT_REGISTRY_LOCK);
+    }
+
+    /// #1140: `uv remove six` after vendoring drops the dependency, its
+    /// `[tool.uv.sources]` line and every uv.lock fragment that routed
+    /// through the wheel. Nothing is left to restore, so the revert must not
+    /// read the vanished package unit and requires-dist element (whose
+    /// declaration is gone too) as drift: that kept the wheel and ledger
+    /// entry forever and looped `vendor --check` → `scan --prune`.
+    #[tokio::test]
+    async fn revert_after_uv_remove_is_not_drift() {
+        const REMOVED_PYPROJECT: &str = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\
+            requires-python = \">=3.10\"\ndependencies = []\n";
+        const REMOVED_LOCK: &str = "version = 1\nrevision = 3\nrequires-python = \">=3.10\"\n\n\
+            [[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\n";
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
+        )
+        .await
+        .unwrap();
+        let entry = entry_for(wiring, meta);
+
+        tokio::fs::write(tmp.path().join("pyproject.toml"), REMOVED_PYPROJECT)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), REMOVED_LOCK)
+            .await
+            .unwrap();
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, REMOVED_PYPROJECT);
+        assert_eq!(lock, REMOVED_LOCK);
+
+        // A lock that still routes through the uuid dir (a hand-edited
+        // package unit) is genuine drift and keeps everything.
+        let edited = DIRECT_PATH_LOCK.replace("version = \"1.16.0\"", "version = \"1.16.1\"");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), REMOVED_PYPROJECT)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &edited)
+            .await
+            .unwrap();
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        let (_, lock) = read_pair(tmp.path()).await;
+        assert_eq!(lock, edited);
     }
 
     #[tokio::test]
@@ -5713,6 +5796,29 @@ wheels = [
             add_manifest_override("version = 1\nrevision = 3\n", "six", REL_WHEEL).unwrap_err();
         assert_eq!(err.0, "pypi_uv_lock_parse_failed");
         assert!(err.1.contains("no [[package]] entries"), "{}", err.1);
+    }
+
+    /// A created `[manifest]` section is spelled in the lock's
+    /// `line_endings::terminator` style: the majority of a mixed lock's
+    /// breaks, LF on a tie.
+    #[test]
+    fn manifest_override_section_takes_the_majority_terminator() {
+        for (lock, nl) in [
+            (
+                "version = 1\r\nrevision = 3\n\n[[package]]\nname = \"proj\"\n",
+                "\n",
+            ),
+            (
+                "version = 1\r\nrevision = 3\n\n[[package]]\r\nname = \"proj\"\r\n",
+                "\r\n",
+            ),
+        ] {
+            let (_, text) = add_manifest_override(lock, "six", REL_WHEEL).unwrap();
+            let section = format!(
+                "[manifest]{nl}overrides = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]{nl}{nl}"
+            );
+            assert!(text.contains(&section), "{lock:?} -> {text:?}");
+        }
     }
 
     /// A truncated (unbalanced) existing `[manifest] overrides` array refuses

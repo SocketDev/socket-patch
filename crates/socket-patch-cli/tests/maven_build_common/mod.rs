@@ -167,7 +167,8 @@ impl Mvn {
         Some(Mvn { program, version })
     }
 
-    fn numeric(&self) -> Vec<u32> {
+    /// `[major, minor, patch]` (a pre-release tail such as `-rc-6` dropped).
+    pub fn numeric(&self) -> Vec<u32> {
         self.version
             .split(['.', '-'])
             .take(3)
@@ -235,8 +236,29 @@ impl Mvn {
     }
 }
 
-/// How many times the warm-up asks Maven Central before giving up.
-const WARM_ATTEMPTS: u32 = 3;
+/// How many times an online run asks Maven Central before giving up.
+const CENTRAL_ATTEMPTS: u32 = 3;
+
+/// Google's official Maven Central mirror (a separate CDN). Online retries
+/// go here: Central's own CDN rate-limits shared runner IPs with 429s,
+/// which Maven reports as an absent artifact, so retrying the same host
+/// seconds later fails the same way (CI run 37843887676).
+const CENTRAL_FALLBACK: &str = "https://maven-central.storage-download.googleapis.com/maven2";
+
+/// A user `settings.xml` that sends `central` to [`CENTRAL_FALLBACK`]. The
+/// mirror keeps the id `central`, so the local repository records the same
+/// origin as a direct fetch and later runs with plain settings reuse it.
+fn write_fallback_settings(path: &Path) {
+    std::fs::write(
+        path,
+        format!(
+            "<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\">\n  <mirrors>\n    \
+             <mirror>\n      <id>central</id>\n      <mirrorOf>central</mirrorOf>\n      \
+             <url>{CENTRAL_FALLBACK}</url>\n    </mirror>\n  </mirrors>\n</settings>\n"
+        ),
+    )
+    .unwrap();
+}
 
 /// Whether a failed Maven run failed to FETCH from the remote repository
 /// (a CDN blip that briefly serves a released plugin/artifact as absent, a
@@ -261,16 +283,71 @@ fn is_resolution_failure(out: &Output) -> bool {
 /// A user `settings.xml` with the given `(mirrorOf, url)` mirrors (none =
 /// an empty settings file that just shields the run from `~/.m2`).
 pub fn write_settings(path: &Path, mirrors: &[(&str, &str)]) {
+    let ids: Vec<String> = (0..mirrors.len())
+        .map(|i| format!("e2e-mirror-{i}"))
+        .collect();
+    let mirrors: Vec<(&str, &str, &str)> = ids
+        .iter()
+        .zip(mirrors)
+        .map(|(id, (of, url))| (id.as_str(), *of, *url))
+        .collect();
+    write_settings_with_ids(path, &mirrors);
+}
+
+/// [`write_settings`] with explicit `(id, mirrorOf, url)` mirrors. A mirror
+/// that serves Central's content should keep the id `central`: the local
+/// repository records which repository id each artifact came from and
+/// re-fetches anything cached under another id, so a differently named
+/// mirror re-downloads the whole warm plugin closure from Central.
+pub fn write_settings_with_ids(path: &Path, mirrors: &[(&str, &str, &str)]) {
     let mut body =
         String::from("<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\">\n  <mirrors>\n");
-    for (i, (of, url)) in mirrors.iter().enumerate() {
+    for (id, of, url) in mirrors {
         body.push_str(&format!(
-            "    <mirror>\n      <id>e2e-mirror-{i}</id>\n      <mirrorOf>{of}</mirrorOf>\n      \
+            "    <mirror>\n      <id>{id}</id>\n      <mirrorOf>{of}</mirrorOf>\n      \
              <url>{url}</url>\n    </mirror>\n"
         ));
     }
     body.push_str("  </mirrors>\n</settings>\n");
     std::fs::write(path, body).unwrap();
+}
+
+/// Run an online Maven step (`run(settings, extra_args)`) that fetches
+/// fixed, long-published releases from Maven Central, retrying a resolution
+/// failure with `-U` via [`CENTRAL_FALLBACK`]. Such a failure is transient:
+/// Central's CDN has served `maven-dependency-plugin` 3.6.1 as absent for a
+/// moment (CI run 36899218369) and rate-limits runners with 429s. Maven
+/// records a miss in the local repository and refuses to re-ask until the
+/// update interval elapses, so a retry must force the check with `-U`.
+///
+/// The retries use a settings file that holds only the fallback mirror, so
+/// pass a `settings` without mirrors of its own. Every step that may fetch
+/// something the warm-up did not goes through here: a runner Central is
+/// throttling stays throttled for the next online step too (CI run
+/// 37864818879: the warm-up recovered via the mirror, then the reactor's
+/// plain pre-vendor build failed on plugins only it needs).
+pub fn with_central_fallback(
+    suite: &str,
+    what: &str,
+    settings: &Path,
+    mut run: impl FnMut(&Path, &[&str]) -> Output,
+) -> Output {
+    let mut out = run(settings, &[]);
+    let fallback = settings.with_file_name("central-fallback-settings.xml");
+    for attempt in 2..=CENTRAL_ATTEMPTS {
+        if ok(&out) || !is_resolution_failure(&out) {
+            break;
+        }
+        println!(
+            "{suite}: {what} could not resolve from Maven Central; \
+             retrying with -U via {CENTRAL_FALLBACK} ({attempt}/{CENTRAL_ATTEMPTS})"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(5 * u64::from(attempt - 2)));
+        write_fallback_settings(&fallback);
+        out = run(&fallback, &["-U"]);
+    }
+    let _ = std::fs::remove_file(&fallback);
+    out
 }
 
 pub fn ok(out: &Output) -> bool {
@@ -318,24 +395,11 @@ pub fn warm_fixture(
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     std::fs::create_dir_all(proj).unwrap();
     std::fs::write(proj.join("pom.xml"), consumer_pom(VERSION)).unwrap();
-    // The warm-up is the one step that fetches from Maven Central, and it
-    // asks only for fixed, long-published releases, so a resolution failure
-    // here is transient: Central's CDN has served `maven-dependency-plugin`
-    // 3.6.1 as absent for a moment (CI run 36899218369). Maven records that
-    // miss in the local repository and refuses to re-ask until the update
-    // interval elapses, so a retry must force the check with `-U`.
-    let mut out = mvn.copy_dependencies(proj, m2, settings, "target/warm");
-    for attempt in 2..=WARM_ATTEMPTS {
-        if ok(&out) || !is_resolution_failure(&out) {
-            break;
-        }
-        println!(
-            "{suite}: fixture warm-up could not resolve from Maven Central; \
-             retrying with -U ({attempt}/{WARM_ATTEMPTS})"
-        );
-        std::thread::sleep(std::time::Duration::from_secs(5 * u64::from(attempt - 1)));
-        out = mvn.copy_dependencies_with(proj, m2, settings, "target/warm", &["-U"]);
-    }
+    // The warm-up asks only for fixed, long-published releases, so a
+    // resolution failure here is transient.
+    let out = with_central_fallback(suite, "fixture warm-up", settings, |s, extra| {
+        mvn.copy_dependencies_with(proj, m2, s, "target/warm", extra)
+    });
     if !ok(&out) {
         skip(
             suite,

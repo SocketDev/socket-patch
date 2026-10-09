@@ -729,7 +729,14 @@ async fn run_berry_capstone(driver: VendorDriver, yarnrc_extra: &str) {
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
     let out = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
         .args(args)
         .current_dir(cwd)
         .output()
@@ -810,16 +817,30 @@ fn yarn_berry_vendored_tarball_survives_a_tgz_gitignore_rule() {
     };
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
     git(&proj, &["add", "-A"]);
     git(&proj, &["commit", "-qm", "vendored"]);
     let fresh = tmp.path().join("fresh");
     git(
         tmp.path(),
-        &["clone", "-q", proj.to_str().unwrap(), fresh.to_str().unwrap()],
+        &[
+            "clone",
+            "-q",
+            proj.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
     );
     let fresh_global = tmp.path().join("fresh-yarn-global");
     let ci = corepack(
@@ -854,14 +875,26 @@ fn yarn_berry_vendor_refuses_a_gitignored_socket_dir() {
     let pkg_before = std::fs::read(proj.join("package.json")).unwrap();
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 1, "vendor must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 1,
+        "vendor must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stdout.contains("vendor_artifact_gitignored"),
         "refusal code expected:\n{stdout}"
     );
     assert_eq!(std::fs::read(proj.join("yarn.lock")).unwrap(), lock_before);
-    assert_eq!(std::fs::read(proj.join("package.json")).unwrap(), pkg_before);
+    assert_eq!(
+        std::fs::read(proj.join("package.json")).unwrap(),
+        pkg_before
+    );
     assert!(!proj.join(format!(".socket/vendor/npm/{UUID}")).exists());
 }

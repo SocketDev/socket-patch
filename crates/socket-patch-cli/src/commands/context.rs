@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use socket_patch_core::ledgers::{Ledgers, LoadedLedgers};
 use socket_patch_core::vendor::lock_inventory::{
-    DiskSnapshot, LockfileEntry, ProjectView, UnsupportedNpmLayout,
+    DiskSnapshot, LockfileEntry, ProjectView, ReadSet, UnsupportedNpmLayout,
 };
 use socket_patch_core::vex::discover::Discovery;
 use tokio::sync::OnceCell;
@@ -39,7 +39,10 @@ pub(crate) struct ProjectContext<'a> {
     snapshot: DiskSnapshot<'a>,
     ledgers: OnceCell<LoadedLedgers>,
     locks: OnceCell<LockSet>,
-    discovery: OnceCell<Discovery>,
+    /// The discovery, with the paths it read and their fingerprints
+    /// (`None` when they cannot cover what it read; see
+    /// [`DiskSnapshot::end_recording`]).
+    discovery: OnceCell<(Discovery, Option<ReadSet>)>,
 }
 
 impl<'a> ProjectContext<'a> {
@@ -53,7 +56,7 @@ impl<'a> ProjectContext<'a> {
         Self {
             common,
             root,
-            snapshot: DiskSnapshot::new(&common.cwd),
+            snapshot: DiskSnapshot::tracked(&common.cwd),
             ledgers: OnceCell::new(),
             locks: OnceCell::new(),
             discovery: OnceCell::new(),
@@ -93,8 +96,18 @@ impl<'a> ProjectContext<'a> {
 
     /// The lockfile wiring discovery of `--cwd` ([`super::discover_wiring`]).
     pub(crate) async fn discovery(&self) -> &Discovery {
+        &self.recorded_discovery().await.0
+    }
+
+    /// [`Self::discovery`] with the read set that tells whether it still
+    /// describes the project (stats only; see [`ReadSet::unchanged`]).
+    pub(crate) async fn recorded_discovery(&self) -> &(Discovery, Option<ReadSet>) {
         self.discovery
-            .get_or_init(|| super::discover_wiring_in(self.common, &self.snapshot))
+            .get_or_init(|| async {
+                self.snapshot.begin_recording();
+                let discovery = super::discover_wiring_in(self.common, &self.snapshot).await;
+                (discovery, self.snapshot.end_recording())
+            })
             .await
     }
 }

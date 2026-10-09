@@ -89,6 +89,7 @@
 #[path = "common/mod.rs"]
 mod common;
 use common::binary;
+use common::envelope::{codes_in, event_codes};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -599,27 +600,6 @@ fn packages_line(lock: &str, name: &str) -> String {
         .find(|l| l.trim_start().starts_with(&key))
         .unwrap_or_else(|| panic!("no packages entry for {name} in:\n{lock}"))
         .to_string()
-}
-
-fn warning_codes(v: &Value) -> Vec<String> {
-    v.as_array()
-        .map(|w| {
-            w.iter()
-                .filter_map(|x| x["code"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn event_codes(v: &Value) -> Vec<String> {
-    v["events"]
-        .as_array()
-        .map(|evs| {
-            evs.iter()
-                .filter_map(|e| e["errorCode"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // ── fixture ────────────────────────────────────────────────────────────────
@@ -1279,7 +1259,7 @@ fn take_over_to_hosted(fx: &Fixture, proj: &Path, api: &str, hp: &HostedPatch, t
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["status"], "success", "{env:#}");
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
-    let codes = warning_codes(&env["redirect"]["warnings"]);
+    let codes = codes_in(&env["redirect"]["warnings"]);
     assert!(
         codes
             .iter()
@@ -1749,7 +1729,7 @@ async fn bun_dry_run_previews_match_wet_outcomes() {
     );
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["redirect"]["dryRun"], true, "{env:#}");
-    let codes = warning_codes(&env["redirect"]["warnings"]);
+    let codes = codes_in(&env["redirect"]["warnings"]);
     assert!(
         codes.iter().any(|c| c == "redirect_would_revert_vendored"),
         "the hosted preview must announce the vendored takeover: {codes:?}\n{env:#}"

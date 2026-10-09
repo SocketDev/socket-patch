@@ -13,13 +13,14 @@
 //! cargo test -p socket-patch-cli --test e2e_npm -- --ignored
 //! ```
 
-use std::path::{Path, PathBuf};
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
+use std::path::Path;
 use std::process::{Command, Output};
 
-use sha2::{Digest, Sha256};
-
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -38,10 +39,6 @@ const AFTER_HASH: &str = "043f04d19e884aa5f8371428718d2a3f27a0d231afe77a2620ac63
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
 fn has_command(cmd: &str) -> bool {
     let mut probe = Command::new(cmd);
     probe.arg("--version");
@@ -51,15 +48,6 @@ fn has_command(cmd: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok()
-}
-
-/// Compute Git SHA-256: `SHA256("blob <len>\0" ++ content)`.
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn git_sha256_file(path: &Path) -> String {
@@ -288,15 +276,15 @@ fn test_npm_dry_run() {
     // Download the patch *without* applying.
     assert_run_ok(
         cwd,
-        &["get", NPM_UUID, "--mode", "agent", "--no-apply"],
-        "get --no-apply",
+        &["get", NPM_UUID, "--mode", "agent", "--save-only"],
+        "get --save-only",
     );
 
     // File should still be original.
     assert_eq!(
         git_sha256_file(&index_js),
         BEFORE_HASH,
-        "file should not change after get --no-apply"
+        "file should not change after get --save-only"
     );
 
     // Dry-run should report that the patch *would* apply, but leave the
@@ -527,7 +515,7 @@ fn test_npm_save_only() {
     let index_js = cwd.join("node_modules/minimist/index.js");
     assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
 
-    // Download with --save-only (new name for --no-apply).
+    // Download with --save-only.
     assert_run_ok(cwd, &["get", NPM_UUID, "--save-only"], "get --save-only");
 
     // File should still be original.

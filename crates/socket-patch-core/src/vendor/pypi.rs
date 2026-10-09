@@ -229,15 +229,20 @@ const SETUP_ALTERNATIVE: &str =
      install), which patches installed site-packages without lockfile edits";
 
 /// Whether the root `requirements.txt` pins the package being vendored (any
-/// spec naming it; with no target, whether the file exists at all). An
-/// unreadable file pins nothing.
+/// spec naming it; with no target, whether the file exists at all). The
+/// file is decoded as pip decodes it (a UTF-16 export from Windows
+/// PowerShell 5.1 still pins, #1120); one that exists but cannot be
+/// decoded may pin it, so it counts (fail closed). A missing or unreadable
+/// file pins nothing.
 async fn requirements_pins_target(project_root: &Path, target: Option<(&str, &str)>) -> bool {
     let path = project_root.join(crate::formats::governing_locks::PYPI_REQUIREMENTS);
     match target {
         None => tokio::fs::metadata(&path).await.is_ok(),
-        Some((name, _)) => read_regular_to_string(&path)
-            .await
-            .is_ok_and(|text| super::pypi_requirements::names_package(&text, name)),
+        Some((name, _)) => match crate::utils::fs::read_regular_to_bytes(&path).await {
+            Ok(bytes) => crate::utils::requirements::decode(&bytes)
+                .is_none_or(|text| super::pypi_requirements::names_package(&text, name)),
+            Err(_) => false,
+        },
     }
 }
 
@@ -249,7 +254,9 @@ async fn requirements_pins_target(project_root: &Path, target: Option<(&str, &st
 /// one exists (a marker alone must not block the requirements wiring):
 /// 1. `uv.lock` → uv;
 /// 2. standalone `pylock*.toml` / `*.py.lock` locks containing this package
-///    → python-lock;
+///    → python-lock — except a pylock beside a `Pipfile`, which Pipenv
+///    reads: it loses to `Pipfile.lock` (#1122) and, with no
+///    `Pipfile.lock`, refuses `pypi_pipenv_pylock_unsupported` (#912);
 /// 3. `poetry.lock` → poetry;  4. `pdm.lock` → pdm;  5. `Pipfile.lock` → pipenv;
 /// 6. lock-less `[tool.uv]`/`[tool.poetry]`/`[tool.pdm]`/`Pipfile` →
 ///    `<tool>_no_lockfile` refusal unless requirements.txt exists;
@@ -299,6 +306,42 @@ async fn detect_pypi_flavor(
         .into_iter()
         .filter(|path| path != "uv.lock")
         .collect();
+    // #912 / #1122: a pylock beside a `Pipfile` belongs to Pipenv, not to a
+    // PEP 751 installer. With a `Pipfile.lock` Pipenv installs from that
+    // and ignores the pylock; without one it reads the pylock but drops the
+    // `archive` entry the wiring writes. Either way the pylock is not the
+    // file to wire. A higher-ranked tool lock still routes as before.
+    let (pipenv_pylocks, additional_locks): (Vec<String>, Vec<String>) =
+        if has_pipfile && matches!(governing, None | Some("Pipfile.lock")) {
+            additional_locks
+                .into_iter()
+                .partition(|path| crate::utils::python_lock::is_pep751_lock_name(path))
+        } else {
+            (Vec::new(), additional_locks)
+        };
+    let pipenv_pylock_matches = if pipenv_pylocks.is_empty() {
+        false
+    } else if let Some((name, version)) = target {
+        super::pypi_lock::contains_target(project_root, &pipenv_pylocks, name, version).await?
+    } else {
+        true
+    };
+    if pipenv_pylock_matches {
+        if governing.is_none() {
+            return Err((
+                "pypi_pipenv_pylock_unsupported",
+                format!(
+                    "{} is installed by Pipenv (a Pipfile sits beside it and there is no \
+                     Pipfile.lock), and Pipenv keeps only the version and hashes of a pylock \
+                     entry, so a vendored wheel would be dropped and the upstream release \
+                     installed; run `pipenv lock` to write a Pipfile.lock and re-run vendor, \
+                     or {SETUP_ALTERNATIVE}",
+                    pipenv_pylocks.join(", ")
+                ),
+            ));
+        }
+        present.extend(pipenv_pylocks.iter().map(String::as_str));
+    }
     let mut warnings = Vec::new();
     let matching_additional_lock = if has_uv_lock {
         false
@@ -1962,8 +2005,12 @@ async fn guard_unwired_pypi_revert(
 /// named project files, the root `requirements.txt` plus every `-r` include
 /// the planner may have written a pin into, every Python lock the root
 /// directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock` with its paired
-/// script), and every other root-level `*.txt` (a `uv export -o` target, or
-/// a `requirements-dev.txt` the user moved a vendor line into). `skip`
+/// script), and every other root-level `*.txt` or `*.lock` (a `uv export -o`
+/// target such as Rye's `requirements.lock`, #1252, or a
+/// `requirements-dev.txt` the user moved a vendor line into), plus every
+/// `*.txt`, `*.lock` or Python lock in a project subdirectory
+/// ([`subdir_probe_names`]: a `requirements/dev.txt` the root never
+/// includes, #1167, or a `deploy/pylock.toml` export, #1213). `skip`
 /// names files left out of the probe (a dry run's not-yet-restored wiring).
 /// Every step fails closed: a root that cannot be listed, an include tree
 /// that cannot be read, or a listed file (a symlink included — lstat only,
@@ -2021,7 +2068,7 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
             continue;
         };
         let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
-        if !is_lock && !name.ends_with(".txt") {
+        if !is_lock && !is_export_name(&name) {
             continue;
         }
         // lstat only: a regular file or ANY symlink is probed (the read
@@ -2039,6 +2086,11 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
                 names.push(script.to_string());
             }
         }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    for name in subdir_probe_names(project_root) {
         if !names.contains(&name) {
             names.push(name);
         }
@@ -2067,6 +2119,106 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
         }
     }
     None
+}
+
+/// Whether a file that is not a Python lock name may still be a
+/// requirements-format export [`pypi_reference_clause`] must read: any
+/// `*.txt` (`pip freeze >`, `uv export -o requirements.txt`) and any
+/// `*.lock` (#1252: Rye's `requirements.lock` / `requirements-dev.lock`,
+/// which `uv export -o` and `uv pip compile -o` keep writing after a
+/// Rye -> uv move; both accept any output name).
+fn is_export_name(name: &str) -> bool {
+    name.ends_with(".txt") || name.ends_with(".lock")
+}
+
+/// Directory names [`subdir_probe_names`] never descends into: VCS metadata,
+/// socket-patch's own state, and tool or cache trees whose `*.txt` files
+/// are package payloads, not requirements files anyone installs from.
+const PROBE_SKIPPED_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".socket",
+    ".tox",
+    ".nox",
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "node_modules",
+    "site-packages",
+];
+
+/// Every `*.txt`, every `*.lock` and every Python lock (with a script
+/// lock's paired script) below the project root's subdirectories, as `/`-joined
+/// root-relative names in a stable order (#1167, #1213): `pip install -r
+/// requirements/dev.txt` installs from a file the root `-r` tree never
+/// reaches, `pip freeze > requirements/lock.txt` or `uv export -o
+/// requirements/lock.txt` writes one, and `uv export --format pylock.toml
+/// -o deploy/pylock.toml` writes a PEP 751 lock a deploy context installs
+/// from. The walk skips [`PROBE_SKIPPED_DIRS`]
+/// and any virtualenv or conda env (a dir holding `pyvenv.cfg` or
+/// `conda-meta`), and does not follow symlinked directories, so it always
+/// terminates inside the project. A subdirectory that cannot be listed is
+/// skipped rather than failing closed: pip running as the same user could
+/// not reach a requirements file in it either, and an unrelated unreadable
+/// dir (a container volume) must not pin every vendored wheel forever. A
+/// listed file that then cannot be read still fails closed in the caller.
+fn subdir_probe_names(project_root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<String> = vec![String::new()];
+    while let Some(rel) = stack.pop() {
+        let dir = if rel.is_empty() {
+            project_root.to_path_buf()
+        } else {
+            project_root.join(&rel)
+        };
+        let Ok(listing) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<(String, std::fs::FileType)> = listing
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                Some((name, entry.file_type().ok()?))
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut subdirs: Vec<String> = Vec::new();
+        for (name, ft) in entries {
+            let child = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if ft.is_dir() {
+                if PROBE_SKIPPED_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                let child_dir = project_root.join(&child);
+                if child_dir.join("pyvenv.cfg").exists() || child_dir.join("conda-meta").exists() {
+                    continue;
+                }
+                subdirs.push(child);
+            } else if !rel.is_empty() && (ft.is_file() || ft.is_symlink()) {
+                // Root-level files are the caller's own listing.
+                let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
+                if !is_lock && !is_export_name(&name) {
+                    continue;
+                }
+                if is_lock {
+                    if let Some(script) = crate::utils::python_lock::script_of_lock(&name) {
+                        out.push(format!("{rel}/{script}"));
+                    }
+                }
+                out.push(child);
+            }
+        }
+        // Reverse so the stack pops subdirectories in name order.
+        stack.extend(subdirs.into_iter().rev());
+    }
+    out
 }
 
 /// A project file's bytes as text for [`pypi_reference_clause`], in any
@@ -2262,10 +2414,11 @@ pub async fn revert_pypi_opts(
     // RESIDUAL-REFERENCE GUARD: the flavor restored only the files it
     // recorded. Any other project file that still names the uuid dir — a
     // `uv export`-ed requirements.txt or pylock.toml, a vendor line the user
-    // moved into a `-r` include or a sibling requirements file — would
-    // install from a deleted wheel. Keep the artifact and the ledger entry
-    // until nothing references it (an unwired entry already passed the same
-    // probe in `guard_unwired_pypi_revert`).
+    // moved into a `-r` include, a sibling or subdirectory requirements
+    // file (`requirements/dev.txt`, #1167) — would install from a deleted
+    // wheel. Keep the artifact and the ledger entry until nothing
+    // references it (an unwired entry already passed the same probe in
+    // `guard_unwired_pypi_revert`).
     if !entry.wiring.is_empty() {
         if let Some(clause) = pypi_reference_clause(project_root, &entry.uuid, &[]).await {
             outcome
@@ -2647,6 +2800,109 @@ mod tests {
             assert!(
                 warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
                 "{lock}: {warnings:?}"
+            );
+        }
+    }
+
+    /// A pylock `pipenv lock` writes with `[pipenv] use_pylock = true`.
+    const PIPENV_PYLOCK: &str = "lock-version = \"1.0\"\ncreated-by = \"pipenv\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\nindex = \"https://pypi.org/simple\"\nwheels = [{ name = \"six-1.16.0-py2.py3-none-any.whl\", url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hashes = { sha256 = \"8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" } }]\n\n[tool.pipenv]\ngenerated_from = \"Pipfile.lock\"\n";
+
+    /// #1122: with a `Pipfile` beside both locks, Pipenv installs from
+    /// `Pipfile.lock` and ignores the pylock, so `Pipfile.lock` is the one
+    /// wired — the pylock is named as a loud loser, not wired instead.
+    #[tokio::test]
+    async fn pipenv_pylock_beside_pipfile_lock_routes_to_pipenv() {
+        for lock in ["pylock.toml", "pylock.dev.toml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(
+                tmp.path(),
+                "Pipfile",
+                "[packages]\nsix = \"==1.16.0\"\n\n[pipenv]\nuse_pylock = true\n",
+            )
+            .await;
+            touch(tmp.path(), "Pipfile.lock", "{}").await;
+            touch(tmp.path(), lock, PIPENV_PYLOCK).await;
+            let (selected, warnings) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, PypiFlavor::Pipenv, "{lock}: {warnings:?}");
+            let loud: Vec<_> = warnings
+                .iter()
+                .filter(|w| w.code == "pypi_multiple_lockfiles")
+                .collect();
+            assert_eq!(loud.len(), 1, "{lock}: {warnings:?}");
+            assert!(
+                loud[0].detail.contains("wiring `Pipfile.lock`") && loud[0].detail.contains(lock),
+                "{lock}: {}",
+                loud[0].detail
+            );
+        }
+    }
+
+    /// #912: a pylock-only Pipenv checkout can't be vendored — Pipenv drops
+    /// the `archive` entry the wiring writes and installs the upstream
+    /// release — so it refuses with a `pipenv lock` pointer. Without a
+    /// `Pipfile` the same pylock still routes to the python-lock flavor.
+    #[tokio::test]
+    async fn pipenv_pylock_without_pipfile_lock_refuses() {
+        for lock in ["pylock.toml", "pylock.dev.toml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, PIPENV_PYLOCK).await;
+            let (selected, _) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, PypiFlavor::PythonLocks, "{lock}");
+
+            touch(tmp.path(), "Pipfile", "[packages]\nsix = \"==1.16.0\"\n").await;
+            let (code, detail) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap_err();
+            assert_eq!(code, "pypi_pipenv_pylock_unsupported", "{lock}: {detail}");
+            assert!(
+                detail.contains(lock) && detail.contains("pipenv lock"),
+                "{lock}: {detail}"
+            );
+        }
+    }
+
+    /// #1120: a `requirements.txt` exported beside the governing lock in
+    /// UTF-16 (`uv export > requirements.txt` in Windows PowerShell 5.1)
+    /// is installed by pip and uv like its UTF-8 twin, so it is a loud
+    /// loser too. A file that exists but cannot be decoded may pin the
+    /// package, so it is named as well (fail closed).
+    #[tokio::test]
+    async fn non_utf8_requirements_beside_the_governing_lock_is_a_loud_loser() {
+        let text = "attrs==23.1.0\r\nsix==1.16.0\r\n";
+        let le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        let latin1 = b"# -*- coding: latin-1 -*-\n# Jos\xe9\nsix==1.16.0\n".to_vec();
+        let undecodable = b"# Jos\xe9\nidna==3.7\n".to_vec();
+        for (case, bytes) in [
+            ("utf-16 le", le),
+            ("utf-16 be", be),
+            ("pep 263", latin1),
+            ("undecodable", undecodable),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), "uv.lock", "version = 1\n").await;
+            tokio::fs::write(tmp.path().join("requirements.txt"), &bytes)
+                .await
+                .unwrap();
+            let (selected, warnings) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, PypiFlavor::UvProject, "{case}");
+            assert!(
+                warnings.iter().any(|w| w.code == "pypi_multiple_lockfiles"
+                    && w.detail.contains("wiring `uv.lock`")
+                    && w.detail.contains("requirements.txt")),
+                "{case}: {warnings:?}"
             );
         }
     }
@@ -3897,8 +4153,7 @@ wheels = [
                 ApiClient::new(ApiClientOptions {
                     api_url: server_uri.to_string(),
                     api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-                    use_public_proxy: false,
-                    org_slug: Some("acme".into()),
+                    route: crate::api::client::ApiRoute::org("acme"),
                 })
                 .with_vendor_retry(crate::api::client::VendorRetryPolicy::none()),
             ),
@@ -5847,6 +6102,287 @@ wheels = [
         );
     }
 
+    /// #1167: a requirements file in a subdirectory that the root
+    /// `requirements.txt` does not `-r` include (`pip freeze >
+    /// requirements/lock.txt`, a vendor line moved into
+    /// `requirements/dev.txt`) still installs from the wheel. The dry run
+    /// previews the keep and the wet revert keeps the wheel and the ledger
+    /// entry; once the file stops naming the wheel the next revert cleans up.
+    #[tokio::test]
+    async fn requirements_revert_keeps_artifact_for_subdir_requirements_file() {
+        assert_revert_keeps_artifact_for(&[
+            (
+                "requirements/lock.txt",
+                "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+            (
+                "requirements/dev.txt",
+                "-r ../requirements.txt\n./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl  # socket-patch vendor: six==1.16.0\n",
+            ),
+            (
+                "deploy/requirements/prod.txt",
+                "./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+        ])
+        .await;
+    }
+
+    /// #1252: `uv export -o` and `uv pip compile -o` write any file name,
+    /// and Rye's `requirements.lock` / `requirements-dev.lock` keep being
+    /// written after a Rye -> uv move. Such an export at the root or in a
+    /// subdirectory installs from the wheel exactly like a `*.txt` one, so
+    /// the revert keeps the wheel until the export stops naming it.
+    #[tokio::test]
+    async fn requirements_revert_keeps_artifact_for_lock_named_export() {
+        assert_revert_keeps_artifact_for(&[
+            (
+                "requirements.lock",
+                "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+            (
+                "requirements-dev.lock",
+                "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+            (
+                "deploy/requirements.lock",
+                "./../.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+        ])
+        .await;
+    }
+
+    /// Wires the root `requirements.txt`, writes each `(file, content)`
+    /// export naming the wheel, and checks that the dry run and the wet
+    /// revert keep the wheel for it, and that the revert reclaims the
+    /// artifact once the export stops naming it.
+    async fn assert_revert_keeps_artifact_for(cases: &[(&str, &str)]) {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        for &(file, content) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+                .await
+                .unwrap();
+            let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+            let wiring = wire_requirements(root, "six", "1.16.0", &rel_wheel, &"0".repeat(64))
+                .await
+                .unwrap();
+            let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+            tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+            let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
+            tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+            let path = root.join(file);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, content.replace("{UUID}", UUID))
+                .await
+                .unwrap();
+
+            let entry = revert_entry("requirements", &rel_wheel, wiring);
+            let preview = revert_pypi(&entry, root, true).await;
+            assert!(preview.success, "{file}: {:?}", preview.error);
+            assert!(
+                preview.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(file)
+                }),
+                "{file}: the dry run must preview the keep: {:?}",
+                preview.warnings
+            );
+
+            let outcome = revert_pypi(&entry, root, false).await;
+            assert!(outcome.success, "{file}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(file)
+                }),
+                "{file}: {:?}",
+                outcome.warnings
+            );
+            assert!(outcome.kept_artifact, "{file}: the ledger entry must stay");
+            assert!(
+                wheel.is_file(),
+                "{file} still installs the wheel; deleting it breaks that install"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("requirements.txt"))
+                    .await
+                    .unwrap(),
+                "six==1.16.0\n",
+                "{file}: the root wiring is still restored"
+            );
+
+            tokio::fs::write(&path, "six==1.16.0\n").await.unwrap();
+            let finished = revert_pypi(&entry, root, false).await;
+            assert!(finished.success, "{file}: {:?}", finished.error);
+            assert!(!finished.kept_artifact, "{file}: {:?}", finished.warnings);
+            assert!(!uuid_dir.exists(), "{file}: the artifact must be reclaimed");
+        }
+    }
+
+    /// #1213: a PEP 751 lock exported into a subdirectory (`uv export
+    /// --format pylock.toml -o deploy/pylock.toml`, the deploy or Docker
+    /// context shape) installs from the wheel exactly like a subdirectory
+    /// requirements file. The dry run previews the keep and the wet revert
+    /// keeps the wheel and the ledger entry; once the export stops naming the
+    /// wheel the next revert cleans up.
+    #[tokio::test]
+    async fn revert_keeps_artifact_for_subdir_pylock() {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        let archive = "[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n\
+                       archive = { path = \"{UP}.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\" }\n";
+        for (file, up) in [
+            ("deploy/pylock.toml", "../"),
+            ("deploy/pylock.prod.toml", "../"),
+            ("a/b/pylock.toml", "../../"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+                .await
+                .unwrap();
+            let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+            let wiring = wire_requirements(root, "six", "1.16.0", &rel_wheel, &"0".repeat(64))
+                .await
+                .unwrap();
+            let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+            tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+            let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
+            tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+            let path = root.join(file);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, archive.replace("{UP}", up).replace("{UUID}", UUID))
+                .await
+                .unwrap();
+
+            let entry = revert_entry("requirements", &rel_wheel, wiring);
+            let preview = revert_pypi(&entry, root, true).await;
+            assert!(preview.success, "{file}: {:?}", preview.error);
+            assert!(
+                preview.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(file)
+                }),
+                "{file}: the dry run must preview the keep: {:?}",
+                preview.warnings
+            );
+
+            let outcome = revert_pypi(&entry, root, false).await;
+            assert!(outcome.success, "{file}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(file)
+                }),
+                "{file}: {:?}",
+                outcome.warnings
+            );
+            assert!(outcome.kept_artifact, "{file}: the ledger entry must stay");
+            assert!(
+                wheel.is_file(),
+                "{file} still installs the wheel; deleting it breaks that install"
+            );
+
+            tokio::fs::write(&path, "lock-version = \"1.0\"\n")
+                .await
+                .unwrap();
+            let finished = revert_pypi(&entry, root, false).await;
+            assert!(finished.success, "{file}: {:?}", finished.error);
+            assert!(!finished.kept_artifact, "{file}: {:?}", finished.warnings);
+            assert!(!uuid_dir.exists(), "{file}: the artifact must be reclaimed");
+        }
+    }
+
+    /// #1213 scope: the subdirectory walk probes every Python lock name the
+    /// root listing does, a uv script lock together with its paired script
+    /// (whose `[tool.uv.sources]` can name the wheel), and still ignores a
+    /// non-lock `*.toml` in a subdirectory.
+    #[tokio::test]
+    async fn reference_probe_reads_subdir_python_locks_and_scripts() {
+        let line = format!("../.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir_all(root.join("tools")).await.unwrap();
+        tokio::fs::write(root.join("tools/config.toml"), &line)
+            .await
+            .unwrap();
+        assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+
+        tokio::fs::write(root.join("tools/s.py"), &line)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("tools/s.py.lock"), "version = 1\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            pypi_reference_clause(root, UUID, &[]).await.as_deref(),
+            Some("tools/s.py still resolves through it")
+        );
+        tokio::fs::remove_file(root.join("tools/s.py"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("tools/s.py.lock"), &line)
+            .await
+            .unwrap();
+        assert_eq!(
+            pypi_reference_clause(root, UUID, &[]).await.as_deref(),
+            Some("tools/s.py.lock still resolves through it")
+        );
+    }
+
+    /// #1167 scope: the subdirectory walk reads `*.txt` files at any depth
+    /// but never descends into VCS, `.socket`, `node_modules`, cache or
+    /// virtualenv trees, and never follows a symlinked directory. A
+    /// reference inside one of those does not pin the wheel.
+    #[tokio::test]
+    async fn reference_probe_walks_subdirs_but_skips_tool_trees() {
+        let line = format!("./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for skipped in [
+            ".git/info/x.txt",
+            ".socket/vendor/pypi/notes.txt",
+            "node_modules/pkg/LICENSE.txt",
+            "__pycache__/x.txt",
+            ".tox/py311/x.txt",
+            "env/lib/x.txt",
+        ] {
+            let path = root.join(skipped);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, &line).await.unwrap();
+        }
+        // `env/` is a virtualenv (pyvenv.cfg), whatever its name.
+        tokio::fs::write(root.join("env/pyvenv.cfg"), "home = /usr/bin\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("docs")).await.unwrap();
+        tokio::fs::write(root.join("docs/readme.txt"), "unrelated\n")
+            .await
+            .unwrap();
+        assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            tokio::fs::write(outside.path().join("lock.txt"), &line)
+                .await
+                .unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.join("linked")).unwrap();
+            assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+        }
+
+        tokio::fs::create_dir_all(root.join("a/b/c")).await.unwrap();
+        tokio::fs::write(root.join("a/b/c/deep.txt"), &line)
+            .await
+            .unwrap();
+        assert_eq!(
+            pypi_reference_clause(root, UUID, &[]).await.as_deref(),
+            Some("a/b/c/deep.txt still resolves through it")
+        );
+    }
+
     /// LIVENESS twin of the requirements gate: a hand-RESTORED line (the
     /// vendored line replaced back with the original pin) still raises
     /// `vendor_revert_line_drifted`, but nothing references the uuid dir any
@@ -6485,6 +7021,66 @@ wheels = [
             "pipenv_lock_entry",
         )
         .await;
+    }
+
+    /// #1122: a `use_pylock = true` Pipenv project carries `Pipfile`,
+    /// `Pipfile.lock` and `pylock.toml`; Pipenv installs from `Pipfile.lock`,
+    /// so vendoring wires `Pipfile.lock` (pipenv flavor), leaves the pylock
+    /// byte-identical, and reverts cleanly.
+    #[tokio::test]
+    async fn pipenv_use_pylock_project_vendors_into_pipfile_lock() {
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(
+            &fx,
+            &[
+                (
+                    "Pipfile",
+                    "[packages]\nsix = \"==1.16.0\"\n\n[pipenv]\nuse_pylock = true\n",
+                ),
+                ("Pipfile.lock", PIPENV_LOCK_REGISTRY),
+                ("pylock.toml", PIPENV_PYLOCK),
+            ],
+        )
+        .await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = vendor_six(&fx, &sources, None).await;
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        assert_eq!(entry.flavor.as_deref(), Some("pipenv"));
+        assert_eq!(entry.wiring[0].file, "Pipfile.lock");
+        let wired = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        assert!(wired.contains(&entry.artifact.path), "{wired}");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("pylock.toml"))
+                .await
+                .unwrap(),
+            PIPENV_PYLOCK
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "pypi_multiple_lockfiles" && w.detail.contains("pylock.toml")),
+            "{warnings:?}"
+        );
+
+        let reverted = revert_pypi(&entry, &fx.root, false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+                .await
+                .unwrap(),
+            PIPENV_LOCK_REGISTRY
+        );
     }
 
     /// The `vendor_platform_locked` advisory names the file the platform

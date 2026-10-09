@@ -7,7 +7,7 @@
 //! Fixtures and helpers mirror `repair_vendor_e2e.rs` (this suite owns its
 //! own copies).
 //!
-//! A vendored run (`scan --vendor`) is manifest-free: every ledger entry is
+//! A vendored run (`scan --mode vendored`) is manifest-free: every ledger entry is
 //! `detached` with its record embedded and `.socket/manifest.json` is never
 //! written. The manifest-backed repair arms (dropped / moved-on manifest
 //! records, the `(None, None)` uuid recovery) belong to LEGACY manifest-mode projects, which the tests
@@ -406,19 +406,19 @@ fn run_cli_human(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, St
     run_cli_with(root, mock_uri, argv, false, &[])
 }
 
-/// `scan --vendor --yes` to establish a vendored npm project; returns the
+/// `scan --mode vendored --yes` to establish a vendored npm project; returns the
 /// vendored tarball path.
 fn vendor_project(root: &Path, mock_uri: &str) -> PathBuf {
-    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--vendor", "--yes"]);
+    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--mode", "vendored", "--yes"]);
     assert_eq!(code, 0, "vendor setup failed: {stdout} {stderr}");
     let tgz = root.join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
     assert!(tgz.is_file(), "setup must vendor the tarball");
     tgz
 }
 
-/// `scan --vendor --yes` the gem fixture; returns the vendored copy dir.
+/// `scan --mode vendored --yes` the gem fixture; returns the vendored copy dir.
 fn vendor_gem_project(root: &Path, mock_uri: &str, expected_after: &[u8]) -> PathBuf {
-    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--vendor", "--yes"]);
+    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--mode", "vendored", "--yes"]);
     assert_eq!(code, 0, "gem vendor setup failed: {stdout} {stderr}");
     let copy = root.join(gem_copy_rel());
     assert_eq!(
@@ -453,7 +453,7 @@ fn write_state(root: &Path, state: &serde_json::Value) {
 /// Hand-migrate the vendored fixture to the LEGACY manifest-mode shape: every
 /// ledger entry's embedded record moves into `.socket/manifest.json` (keyed
 /// by the ledger key) and the entry loses `detached` + `record` — exactly
-/// what a pre-D2 `scan --vendor` (or a standalone `vendor` from a manifest)
+/// what a pre-D2 `scan --mode vendored` (or a standalone `vendor` from a manifest)
 /// left behind. Returns the manifest path.
 fn to_legacy_manifest_mode(root: &Path) -> PathBuf {
     let mut state = read_state(root);
@@ -1082,7 +1082,7 @@ async fn repair_rebuilds_qualified_ledger_key_from_installed_copy() {
     let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
 
     // Re-key the ledger entry to the qualified spelling (`basePurl` stays
-    // bare — exactly what `scan --vendor` records for a served qualified
+    // bare — exactly what `scan --mode vendored` records for a served qualified
     // purl).
     let mut state = read_state(tmp.path());
     let entry = state["entries"]
@@ -1466,7 +1466,11 @@ async fn repair_recovers_multiple_records_by_uuid_sharing_one_client() {
         "sha512-orig==",
     );
     write_gem_fixture(tmp.path(), false);
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["scan", "--vendor", "--yes"]);
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["scan", "--mode", "vendored", "--yes"],
+    );
     assert_eq!(code, 0, "combined vendor setup failed: {stdout} {stderr}");
     let tgz = tmp
         .path()
