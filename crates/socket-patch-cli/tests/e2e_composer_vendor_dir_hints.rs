@@ -8,11 +8,12 @@
 //! install" and the installed package stays unpatched. Runs the built
 //! binary over a fabricated install; no composer and no network.
 
+#[path = "common/mod.rs"]
+mod common;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::json;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -94,15 +95,8 @@ fn write_project(root: &Path, vendor_dir: Option<&str>) {
 
 /// Run `vendor --offline` in human mode; returns (exit code, stdout).
 fn vendor(root: &Path) -> (i32, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env_remove("COMPOSER_VENDOR_DIR");
+    let mut cmd = common::hermetic::binary_command();
+    cmd.env_remove("COMPOSER_VENDOR_DIR");
     let args = ["vendor", "--offline"];
     let _fixture = prebuilt_common::prepare_command(&mut cmd, root, &args, &[]);
     let out = cmd
