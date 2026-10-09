@@ -57,8 +57,8 @@ fn unsupported_ecosystem_message(token: &str, supported: &str) -> String {
 
 /// clap value-parser for `--vendor-source` / `SOCKET_VENDOR_SOURCE`.
 ///
-/// Validates the token against [`VendorSource`] (`auto` | `service` | `build`,
-/// case-insensitive) at parse time so a typo fails the command immediately
+/// Validates the token against [`VendorSource`] (`service` or its `auto` alias,
+/// case-insensitive; `build` is rejected) at parse time so a typo fails immediately
 /// rather than at vendor time, and normalizes it to the canonical lowercase
 /// tag. Mirrors [`parse_supported_ecosystem`]'s fail-loud-on-typo posture.
 fn parse_vendor_source(s: &str) -> Result<String, String> {

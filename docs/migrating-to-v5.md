@@ -7,7 +7,11 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
 ## Defaults and stored state
 
 - Bare `scan` and `get` now patch in hosted mode. `scan` never prompts;
-  hosted and vendored `get` do not prompt either. Use `scan --dry-run` for a preview
+  hosted and vendored `get` do not prompt either. `scan` discovers patches from
+  project dependency files and writes hosted references. Supported lockfiles work
+  from a fresh checkout before installing dependencies; install or resolve first
+  where the selected [mode or ecosystem](ecosystems.md) requires it, such as agent
+  mode or sbt / scala-cli. Use `scan --dry-run` for a preview
   or `--mode agent` to retain in-place patching. Global scans and a mode-less
   `scan --prune` do not acquire new patches; `--prune` still performs cleanup.
 - Hosted state lives in dependency files. No command writes
@@ -19,8 +23,10 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
 - `rollback` now removes patch records and unused artifacts as well as restoring
   dependencies. Pass `--preserve-state` to retain local state for reuse.
 - `scan` / `get --mode vendored` need no agent manifest. Commit
-  `.socket/vendor/state.json` with the artifacts. `repair` no longer reconstructs
-  a missing ledger from lockfiles.
+  `.socket/vendor/state.json` with the artifacts. `repair` restores missing agent
+  patch data or missing/corrupt vendored artifacts using existing records. It no
+  longer reconstructs a missing vendor ledger from lockfiles; restore the ledger
+  from version control.
 - Vendored Cargo patches move into workspace-root `Cargo.toml` and use
   `<version>+socket.<uuid>` versions. Re-running vendoring or repair migrates
   older wiring. The tag is visible in `CARGO_PKG_VERSION`; see
@@ -35,6 +41,26 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
   `get --json` and `vex --json` report it as `api_auth_fallback` in `warnings[]`. Set `--org` or
   `SOCKET_ORG_SLUG` to get org patches. The org is resolved once per run, so an
   embedded `--vex` no longer resolves it again.
+
+## Service-only vendoring
+
+v4 could build patched artifacts locally, with `auto` as the default acquisition
+policy. v5 downloads new artifacts only from the patch service:
+
+- `--vendor-source build` and `SOCKET_VENDOR_SOURCE=build` are rejected as usage
+  errors (exit 2). Remove that configuration or change it to `service`.
+- `service` is the new default. `--vendor-source auto` and
+  `SOCKET_VENDOR_SOURCE=auto` remain compatibility aliases for `service`; they no
+  longer select a local build fallback.
+- Missing or pending service artifacts, network errors, and integrity mismatches
+  do not trigger a local build fallback, even when the original package is installed.
+
+Healthy committed artifacts can still be reused offline. Commit `.socket/vendor/`,
+including `state.json`, and the dependency-file changes the CLI reports. Installing
+those patched packages needs neither Socket API access nor the Socket Patch CLI;
+unpatched dependencies still need their normal registry, mirror, or cache.
+Fetching a new artifact or redownloading a missing or corrupt one requires service
+access. See [vendoring and offline installs](usage.md#vendoring-and-offline-installs).
 
 ## JSON output
 
@@ -158,6 +184,7 @@ whole root, not a `vendor_jvm_degraded` warning on mixed Maven + Gradle roots.
 | `scan --apply` | `scan --mode agent` |
 | `scan --vendor` | `scan --mode vendored` |
 | `get --no-apply` | `get --save-only` (`SOCKET_SAVE_ONLY` is unchanged) |
+| `--vendor-source build`, `SOCKET_VENDOR_SOURCE=build` | Remove the setting or use `service`; `auto` is now a service-only alias |
 | `socket-patch download` | `socket-patch get` |
 | `socket-patch gc` | `socket-patch repair` |
 | `SOCKET_FORCE` | Pass `--force` to the one command that needs it (`apply`, `vendor`, `--update`); the variable is now ignored |

@@ -6,8 +6,8 @@ vulnerabilities without waiting for an upstream release or upgrading the depende
 
 The default workflow is **scan → install → vex**:
 
-- `socket-patch scan` finds available patches and updates your dependency files to
-  use Socket-hosted patched packages.
+- `socket-patch scan` finds available patches from project dependency files and
+  updates them to use Socket-hosted patched packages.
 - Your package manager installs those packages using the updated references and
   integrity pins. Commit the files that `scan` reports.
 - `socket-patch vex` produces an OpenVEX document describing the vulnerabilities
@@ -53,12 +53,17 @@ installs, use that package manager's update command. The
 
 ## Quick start
 
-From the root of a project with dependency files:
+From the root of a project with a supported lockfile, including a fresh checkout
+before dependencies are installed:
 
 ```sh
 socket-patch scan --dry-run       # preview available patches and edits
 socket-patch scan                 # apply hosted references; never prompts
 ```
+
+Agent mode needs installed packages. Some ecosystems need build-tool resolution
+records first, such as sbt and scala-cli; see the
+[ecosystem notes](docs/ecosystems.md).
 
 Without an API token, the CLI uses Socket's public proxy for free patches.
 To use your organization's patch tier, set `SOCKET_API_TOKEN`, or sign in with the
@@ -117,6 +122,7 @@ socket-patch scan --max-new-patches 5        # introduce at most five new patche
 socket-patch scan 'apps/*'                  # scan project directories in a monorepo
 socket-patch get CVE-2024-12345              # target an advisory; hosted by default
 socket-patch vendor                        # eject an existing hosted patch set
+socket-patch repair                        # restore agent or vendored patch artifacts
 socket-patch rollback                      # restore upstream dependencies
 ```
 
