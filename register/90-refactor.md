@@ -3,7 +3,7 @@ _Last updated 2026-10-09T05:45Z · main @ f3c6313_
 
 **In flight:**
 - [#1227](https://github.com/SocketDev/socket-patch/pull/1227): `common::detect_eol`, `pypi_uv::newline_of` and the `.npmrc` splice through `line_endings::terminator`. #815 slice 2 (E16). +25/−44 prod, +93 tests; golang golden re-blessed (mixed go.sum inputs only). `state: ready`.
-- [#1221](https://github.com/SocketDev/socket-patch/pull/1221): hosted `converge_gem_lock_source` reads `formats::gem` section spans, remote lines and DEPENDENCIES entries; `GemLockSection` + `gem_lock_dependency_name` deleted. #780 hosted slice (E19). +143/−104 prod, +325 tests. `state: ready`.
+- [#1221](https://github.com/SocketDev/socket-patch/pull/1221): hosted `converge_gem_lock_source` reads `formats::gem` section spans, remote lines and DEPENDENCIES entries; `GemLockSection` + `gem_lock_dependency_name` deleted. #780 hosted slice (E19). +213/−140 prod, +325 tests; `CHECKSUMS` digests read lazily (bench gate). `state: ready`.
 - [#1217](https://github.com/SocketDev/socket-patch/pull/1217): Deno crawl scoped to `deno.lock` `jsr` keys; one `locate`, one `lock_section` (shared with VEX). #1216 (E05). +108/−43 prod, +142 tests; 48.1 → 7.5 ms (debug). `state: ready`.
 - [#1209](https://github.com/SocketDev/socket-patch/pull/1209): Go crawl scoped to `go.sum` modules; one `locate_module`. #1207 (E05). +132/−44 prod, +269 tests; 7.7 → 1.0 ms. `state: ready`.
 - [#1188](https://github.com/SocketDev/socket-patch/pull/1188): one `Pipfile.lock` writer (`formats::pipenv::splice_entry`, `formats::json`). Issue #1128 (E14). +303/−235 production. `redirect/mod.rs` wrapper `pipenv_reserialized_around_reference` left for when that file is free. `state: ready`.
@@ -31,6 +31,7 @@ _Last updated 2026-10-09T05:45Z · main @ f3c6313_
 Re-ranked 2026-10-09T05:00Z at `f3c6313` against 19 `arch-refactor/*` / `agent/fix-*` / `arch-fix/*` PRs changing 346 files; #914 skipped (`jvm_jar.rs` in #1041), #1144 (`vex.rs` in #1041). Free but lower: E16 remainder (`detect_eol` caller in `yarn_classic_lock.rs`, #1211), #1202 (`nuget_feed.rs` in #1041), #1014 (`.mill-version` needs a decision), #265 Maven crawl (no lockfile to scope by: risk H), E37 (`composer_crawler::normalize_version` ≡ `strip_leading_v`, D 1).
 
 **Notes:**
+- `bench.yml` `scan performance` gates +10% per scenario: a reader called once per patched dep (hosted converge) must stay cheap; time it in release (`cargo test --release`, background, ~12 min) against `main` before pushing.
 - Gem lock edits locate through `formats::gem::parse` since #1221: `Section::lines()` / `end`, `remote_line_nos`, `GemfileLock::dependencies` (entries with one name rule). Whitespace-only lines are blank separators. The vendored slice should read the same fields, not add a fourth walker.
 - Real bundler 4.0.18 is in the sandbox: `e2e_redirect_gem_build -- --ignored`, `e2e_vendor_gem_build -- --include-ignored` run in ~30 s.
 - `golang_rewrite.golden`'s go.sum generator injects a stray CRLF line, so its inputs are mixed even with the `line_endings` mixer off; any terminator-rule change re-blesses it.
