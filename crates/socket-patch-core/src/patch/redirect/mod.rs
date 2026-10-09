@@ -477,6 +477,7 @@ pub(crate) fn full_name(dep: &DepOverride) -> String {
 /// Canonical JSON serialization matching TS `JSON.stringify(v, null, 2) + '\n'`
 /// (2-space pretty via serde_json, key order preserved by `preserve_order`,
 /// `/` unescaped).
+#[cfg(test)]
 fn serialize_json(value: &Value) -> String {
     // A `Value` into an in-memory buffer cannot fail; swallowing an `Err`
     // into an empty string would truncate the user's lockfile to "\n".
@@ -5759,6 +5760,12 @@ fn nuget_xml_attribute(value: &str) -> String {
         .replace('\r', "&#xD;")
 }
 
+/// The synthetic candidate key carrying why the engine could not list the
+/// project's NuGet locks (an unreadable directory or project file): the
+/// rewriter then skips the nuget redirect rather than leave a lock it never
+/// saw on its upstream hash. Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
+pub const NUGET_LOCK_WALK_KEY: &str = "<socket-patch:nuget-lock-walk>";
+
 fn rewrite_nuget(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -5794,20 +5801,62 @@ fn rewrite_nuget(
     // contentHash (NU1403 on restore) and the ledger claimed the redirect.
     // Warn once and skip the whole nuget redirect before anything is planned
     // (the npm twin does the same). An ABSENT lock is fine — config-only.
-    let mut lock: Option<Value> = match files.get("packages.lock.json") {
-        None => None,
-        Some(text) => match serde_json::from_str::<Value>(text) {
-            Ok(parsed) => Some(parsed),
+    // Read past a UTF-8 BOM the way dotnet does (#623); the write below
+    // keeps it.
+    //
+    // Every lock a project under the root restores into: the root config
+    // routes them all, so each is pinned with it (#353, #514). The engine
+    // reads the project files and their locks; the same pure discovery
+    // re-derives which keys are locks here.
+    if let Some(why) = files.get(NUGET_LOCK_WALK_KEY) {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_nuget_lock_unreadable".into(),
+            detail: format!(
+                "cannot list the project's NuGet locks ({why}); nuget redirect skipped"
+            ),
+        });
+        return;
+    }
+    let projects: Vec<(String, String)> = files
+        .iter()
+        .filter(|(rel, _)| {
+            !sbt::is_synthetic_key(rel)
+                && crate::formats::nuget::lock::is_project_file(
+                    rel.rsplit('/').next().unwrap_or(rel),
+                )
+        })
+        .map(|(rel, text)| (rel.clone(), text.clone()))
+        .collect();
+    let governed =
+        crate::formats::nuget::lock::governed_locks(&projects, |rel| files.contains_key(rel));
+    if let Some((project, detail)) = governed.unresolved.first() {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_nuget_lock_path_unresolved".into(),
+            detail: format!(
+                "{project}: {detail}; the lock it restores into cannot be pinned, so nuget \
+                 redirect is skipped (set a literal NuGetLockFilePath, or remove it)"
+            ),
+        });
+        return;
+    }
+    // Read past a UTF-8 BOM the way dotnet does (#623); the write below
+    // keeps it.
+    let mut locks: Vec<(String, &String, Value, bool)> = Vec::new();
+    for rel in governed.locks {
+        let Some(text) = files.get(&rel) else {
+            continue;
+        };
+        match crate::formats::nuget::lock::parse_lock(text) {
+            Ok(parsed) => locks.push((rel, text, parsed, false)),
             Err(_) => {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_nuget_lock_unparseable".into(),
-                    detail: "packages.lock.json is not valid JSON; nuget redirect skipped".into(),
+                    detail: format!("{rel} is not valid JSON; nuget redirect skipped"),
                 });
                 return;
             }
-        },
-    };
-    let mut lock_changed = false;
+        }
+    }
 
     for dep in &nuget {
         let Some(ov) = registry_override_of_kind(dep, "nuget-v3") else {
@@ -5834,6 +5883,37 @@ fn rewrite_nuget(
             .nuget_id_lower
             .clone()
             .unwrap_or_else(|| dep.name.to_lowercase());
+
+        let version_norm = crate::vendor::nuget_feed::normalize_nuget_version(
+            ov.identifiers
+                .nuget_version_norm
+                .as_deref()
+                .unwrap_or(&dep.version),
+        );
+        // The mapping routes every version of the id to the Socket source,
+        // which serves only the patched one: a target framework that locks
+        // another version could no longer restore it, and re-pinning that
+        // entry would silently swap in the patched version (#593). Refused
+        // before anything is wired.
+        let other_version = locks.iter().find_map(|(rel, _, lock_val, _)| {
+            let others =
+                crate::formats::nuget::lock::other_versions(lock_val, &id_lower, &version_norm);
+            (!others.is_empty()).then(|| {
+                crate::formats::nuget::lock::other_versions_detail(
+                    rel,
+                    &dep.name,
+                    &version_norm,
+                    &others,
+                )
+            })
+        });
+        if let Some(detail) = other_version {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_lock_other_version".into(),
+                detail,
+            });
+            continue;
+        }
 
         let unwritable = || RewriteWarning {
             code: "redirect_nuget_config_unwritable".into(),
@@ -5878,55 +5958,34 @@ fn rewrite_nuget(
             });
         }
 
-        if let Some(lock_val) = lock.as_mut() {
-            if let Some(deps) = lock_val
-                .get_mut("dependencies")
-                .and_then(Value::as_object_mut)
+        // Only the entries at the patched version: another version of the
+        // id is a different package (#593).
+        for (rel, _, lock_val, lock_changed) in locks.iter_mut() {
+            for (id, obj) in
+                crate::formats::nuget::lock::locked_at_mut(lock_val, &id_lower, &version_norm)
             {
-                for framework in deps.values_mut() {
-                    if let Some(fw) = framework.as_object_mut() {
-                        for (id, entry) in fw.iter_mut() {
-                            if id.to_lowercase() == id_lower {
-                                if let Some(obj) = entry.as_object_mut() {
-                                    let resolved = ov
-                                        .identifiers
-                                        .nuget_version_norm
-                                        .clone()
-                                        .unwrap_or_else(|| dep.version.clone());
-                                    // Already redirected (re-run): no edit.
-                                    if obj.get("resolved").and_then(Value::as_str)
-                                        == Some(resolved.as_str())
-                                        && obj.get("contentHash").and_then(Value::as_str)
-                                            == Some(content_hash.as_str())
-                                    {
-                                        continue;
-                                    }
-                                    let original = json!({
-                                        "resolved": obj.get("resolved").cloned().unwrap_or(Value::Null),
-                                        "contentHash": obj.get("contentHash").cloned().unwrap_or(Value::Null),
-                                    });
-                                    obj.insert("resolved".into(), Value::String(resolved.clone()));
-                                    obj.insert(
-                                        "contentHash".into(),
-                                        Value::String(content_hash.clone()),
-                                    );
-                                    lock_changed = true;
-                                    result.edits.push(FileEdit {
-                                        path: "packages.lock.json".into(),
-                                        kind: "redirect_nuget_lock".into(),
-                                        action: "rewritten".into(),
-                                        key: Some(id.clone()),
-                                        original: Some(original),
-                                        new: Some(json!({
-                                            "resolved": resolved,
-                                            "contentHash": content_hash,
-                                        })),
-                                    });
-                                }
-                            }
-                        }
-                    }
+                // Already redirected (re-run): no edit.
+                if obj.get("contentHash").and_then(Value::as_str) == Some(content_hash.as_str()) {
+                    continue;
                 }
+                let resolved = obj.get("resolved").cloned().unwrap_or(Value::Null);
+                let original = json!({
+                    "resolved": resolved,
+                    "contentHash": obj.get("contentHash").cloned().unwrap_or(Value::Null),
+                });
+                obj.insert("contentHash".into(), Value::String(content_hash.clone()));
+                *lock_changed = true;
+                result.edits.push(FileEdit {
+                    path: rel.clone(),
+                    kind: "redirect_nuget_lock".into(),
+                    action: "rewritten".into(),
+                    key: Some(id.to_string()),
+                    original: Some(original),
+                    new: Some(json!({
+                        "resolved": resolved,
+                        "contentHash": content_hash,
+                    })),
+                });
             }
         }
     }
@@ -5934,11 +5993,12 @@ fn rewrite_nuget(
     if config_changed {
         result.files.insert(config_path.into(), config);
     }
-    if lock_changed {
-        if let Some(lock_val) = lock {
+    for (rel, original, lock_val, changed) in locks {
+        if changed {
+            // In the lock's own layout: its BOM, indent and line endings.
             result
                 .files
-                .insert("packages.lock.json".into(), serialize_json(&lock_val));
+                .insert(rel, serialize_json_like(&lock_val, original));
         }
     }
 }
@@ -22554,6 +22614,181 @@ packages:
             vec!["redirect_nuget_lock_unparseable"],
             "{:?}",
             r.warnings
+        );
+    }
+
+    /// #623: dotnet restores a lock that starts with a UTF-8 BOM, so hosted
+    /// wires and re-pins it like any other lock (no `unparseable` skip),
+    /// and the rewritten lock keeps its BOM and its CRLF layout.
+    #[test]
+    fn nuget_bom_lock_is_redirected_and_keeps_its_bom() {
+        let lock = "\u{feff}{\r\n  \"version\": 1,\r\n  \"dependencies\": {\r\n    \"net8.0\": {\r\n      \"Newtonsoft.Json\": {\r\n        \"type\": \"Direct\",\r\n        \"requested\": \"[13.0.3, )\",\r\n        \"resolved\": \"13.0.3\",\r\n        \"contentHash\": \"ORIGINALHASH==\"\r\n      }\r\n    }\r\n  }\r\n}";
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert("packages.lock.json".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.files.contains_key("nuget.config"), "{:?}", r.files.keys());
+        let out = r.files.get("packages.lock.json").expect("lock re-pinned");
+        assert_eq!(
+            *out,
+            lock.replace("ORIGINALHASH==", "PATCHED=="),
+            "only the hash changes; BOM and CRLF layout kept"
+        );
+    }
+
+    fn simple_lock(hash: &str) -> String {
+        format!(
+            "{{\n  \"version\": 1,\n  \"dependencies\": {{\n    \"net8.0\": {{\n      \"Newtonsoft.Json\": {{\n        \"type\": \"Direct\",\n        \"requested\": \"[13.0.3, )\",\n        \"resolved\": \"13.0.3\",\n        \"contentHash\": \"{hash}\"\n      }}\n    }}\n  }}\n}}\n"
+        )
+    }
+
+    /// #353 / #514: member-project locks and named locks the root config
+    /// governs are re-pinned under their own paths with the config.
+    #[test]
+    fn nuget_member_and_named_locks_are_repinned() {
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert("src/App/App.csproj".to_string(), "<Project />".to_string());
+        files.insert(
+            "src/App/packages.lock.json".to_string(),
+            simple_lock("ORIGINALHASH=="),
+        );
+        files.insert("src/Lib/Lib.csproj".to_string(), "<Project />".to_string());
+        files.insert(
+            "src/Lib/packages.Lib.lock.json".to_string(),
+            simple_lock("ORIGINALHASH=="),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        for rel in [
+            "src/App/packages.lock.json",
+            "src/Lib/packages.Lib.lock.json",
+        ] {
+            assert_eq!(
+                r.files.get(rel).map(String::as_str),
+                Some(simple_lock("PATCHED==").as_str()),
+                "{rel}"
+            );
+        }
+        assert!(!r.files.contains_key("src/App/App.csproj"));
+        let lock_paths: Vec<&str> = r
+            .edits
+            .iter()
+            .filter(|e| e.kind == "redirect_nuget_lock")
+            .map(|e| e.path.as_str())
+            .collect();
+        assert_eq!(
+            lock_paths,
+            [
+                "src/App/packages.lock.json",
+                "src/Lib/packages.Lib.lock.json"
+            ]
+        );
+    }
+
+    /// #514: an unresolvable `NuGetLockFilePath`, or a project tree the
+    /// engine could not list, skips the nuget redirect with nothing written.
+    #[test]
+    fn nuget_unknowable_locks_skip_the_redirect() {
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            "app.csproj".to_string(),
+            "<Project><PropertyGroup><NuGetLockFilePath>$(X)/l.json</NuGetLockFilePath></PropertyGroup></Project>"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_nuget_lock_path_unresolved"]
+        );
+
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            NUGET_LOCK_WALK_KEY.to_string(),
+            "unreadable src".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(warning_codes(&r), vec!["redirect_nuget_lock_unreadable"]);
+    }
+
+    /// #593: a multi-targeting lock resolving the patched id at another
+    /// version in some framework is refused whole: the exact-id mapping
+    /// would route that framework to a feed that serves only the patched
+    /// version, and re-pinning its entry would swap in the patched
+    /// version's bytes. Nothing is written.
+    #[test]
+    fn nuget_lock_with_the_id_at_another_version_is_refused() {
+        let lock = r#"{
+  "version": 1,
+  "dependencies": {
+    "net6.0": {
+      "Newtonsoft.Json": { "type": "Direct", "requested": "[12.0.3, )", "resolved": "12.0.3", "contentHash": "OLD12==" }
+    },
+    "net8.0": {
+      "Newtonsoft.Json": { "type": "Direct", "requested": "[13.0.3, )", "resolved": "13.0.3", "contentHash": "OLD13==" }
+    }
+  }
+}
+"#;
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert("packages.lock.json".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "nothing may land: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(warning_codes(&r), vec!["redirect_nuget_lock_other_version"]);
+        assert!(
+            r.warnings[0].detail.contains("12.0.3"),
+            "{:?}",
+            r.warnings[0]
+        );
+    }
+
+    /// #593: only the entries at the patched version are re-pinned, and
+    /// `resolved` is never rewritten (a `13.0.3.0` spelling stays).
+    #[test]
+    fn nuget_lock_repins_only_entries_at_the_patched_version() {
+        let lock = r#"{
+  "version": 1,
+  "dependencies": {
+    "net6.0": {
+      "Newtonsoft.Json": { "type": "Direct", "requested": "[13.0.3, )", "resolved": "13.0.3.0", "contentHash": "OLD13==" },
+      "Other.Pkg": { "type": "Direct", "requested": "[1.0.0, )", "resolved": "1.0.0", "contentHash": "OTHER==" }
+    },
+    "net8.0": {
+      "newtonsoft.json": { "type": "Transitive", "resolved": "13.0.3", "contentHash": "OLD13==" }
+    }
+  }
+}
+"#;
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert("packages.lock.json".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r.files.get("packages.lock.json").expect("lock re-pinned");
+        assert_eq!(
+            serde_json::from_str::<Value>(out).unwrap(),
+            serde_json::from_str::<Value>(&lock.replace("OLD13==", "PATCHED==")).unwrap()
+        );
+        let locks: Vec<&FileEdit> = r
+            .edits
+            .iter()
+            .filter(|e| e.kind == "redirect_nuget_lock")
+            .collect();
+        assert_eq!(locks.len(), 2, "{locks:?}");
+        assert_eq!(
+            locks[0].new,
+            Some(json!({"resolved": "13.0.3.0", "contentHash": "PATCHED=="}))
         );
     }
 

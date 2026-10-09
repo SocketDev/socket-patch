@@ -47,6 +47,94 @@ fn regular_file(path: &std::path::Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
+// ── project walk ──
+
+/// Directories the project walk never enters: build output, the restore's
+/// `obj/`, a legacy `packages/` folder and JS dependencies (hidden ones —
+/// `.git`, `.socket` — are skipped too). The NuGet crawler's restore scope
+/// skips the same set.
+const SKIPPED_DIRS: [&str; 4] = ["bin", "obj", "packages", "node_modules"];
+
+/// Directories the walk lists before giving up.
+const WALK_DIR_BUDGET: usize = 10_000;
+
+/// A project file larger than this is not an MSBuild project anyone wrote.
+const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Every MSBuild project file under `root` (root-relative, `/`-separated,
+/// sorted) with its text. Symlinked directories are not followed. `Err`
+/// when the walk cannot see the whole tree (an unreadable directory or
+/// project file, or more than [`WALK_DIR_BUDGET`] directories): a lock the
+/// walk missed would keep its upstream hash under the wired mapping.
+pub(crate) fn project_files(root: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    let mut pending = vec![String::new()];
+    let mut listed = 0usize;
+    while let Some(rel) = pending.pop() {
+        listed += 1;
+        if listed > WALK_DIR_BUDGET {
+            return Err(format!(
+                "more than {WALK_DIR_BUDGET} directories under the project root"
+            ));
+        }
+        let dir = if rel.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&rel)
+        };
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("unreadable {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("unreadable {}: {e}", dir.display()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let child = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if !name.starts_with('.') && !SKIPPED_DIRS.contains(&name.as_str()) {
+                    pending.push(child);
+                }
+            } else if kind.is_file() && crate::formats::nuget::lock::is_project_file(&name) {
+                let path = entry.path();
+                if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_PROJECT_BYTES) {
+                    return Err(format!("{} is too large to read", path.display()));
+                }
+                let text = crate::utils::fs::read_regular_to_string_sync(&path)
+                    .map_err(|e| format!("unreadable {}: {e}", path.display()))?;
+                out.push((child, text));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// [`crate::formats::nuget::lock::governed_locks`] of the project tree on
+/// disk under `root`.
+pub(crate) fn governed_locks_on_disk(
+    root: &std::path::Path,
+) -> Result<crate::formats::nuget::lock::GovernedLocks, String> {
+    let projects = project_files(root)?;
+    Ok(crate::formats::nuget::lock::governed_locks(
+        &projects,
+        |rel| lock_present(root, rel),
+    ))
+}
+
+/// Whether something other than a directory sits at `root/rel` (`lstat`):
+/// a FIFO or link under a lock name is then read, and refused, by the
+/// FIFO-safe reader rather than taken for an absent lock.
+pub(crate) fn lock_present(root: &std::path::Path, rel: &str) -> bool {
+    std::fs::symlink_metadata(root.join(rel)).is_ok_and(|m| !m.is_dir())
+}
+
 #[cfg(test)]
 mod tests {
     use super::same_file;
