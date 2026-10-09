@@ -63,8 +63,20 @@ const ORG: &str = "test-org";
 const PURL: &str = "pkg:maven/org.apache.commons/commons-text@1.9";
 const UUID: &str = "5b7a0000-0000-4000-8000-0000000000a1";
 const JAR: &str = "commons-text-1.9.jar";
-const CENTRAL_JAR: &str =
-    "https://repo1.maven.org/maven2/org/apache/commons/commons-text/1.9/commons-text-1.9.jar";
+/// The jar's path under a Maven Central layout, served by every mirror in
+/// [`CENTRAL_MIRRORS`].
+const CENTRAL_JAR_PATH: &str = "org/apache/commons/commons-text/1.9/commons-text-1.9.jar";
+/// Central's published `.sha1` for [`CENTRAL_JAR_PATH`]. Pinned so the jar
+/// may come from either mirror and still be the exact released bytes.
+const CENTRAL_JAR_SHA1: &str = "ba6ac8c2807490944a0a27f6f8e68fb5ed2e80e2";
+/// Maven Central itself, then Google's official Central mirror. CI saw
+/// Central's CDN answer one runner 403 for every retry while other runners
+/// fetched the same jar fine, so a second origin is what makes the fetch
+/// survive an edge that has turned the runner away.
+const CENTRAL_MIRRORS: [&str; 2] = [
+    "https://repo1.maven.org/maven2",
+    "https://maven-central.storage-download.googleapis.com/maven2",
+];
 /// The marker member the patched jar adds.
 const MARKER: &str = "SOCKET_PATCHED.txt";
 
@@ -72,8 +84,9 @@ fn hex_of<D: Digest>(bytes: &[u8]) -> String {
     hex::encode(D::digest(bytes))
 }
 
-/// The pristine jar from Maven Central (checked against Central's `.sha1`)
-/// and the patched one: every member copied raw, plus [`MARKER`].
+/// The pristine jar from Maven Central (checked against the pinned
+/// [`CENTRAL_JAR_SHA1`]) and the patched one: every member copied raw, plus
+/// [`MARKER`].
 async fn jars() -> (Vec<u8>, Vec<u8>) {
     // reqwest sends no User-Agent by default; identify the client so
     // Central's edge does not treat the fetch as anonymous traffic.
@@ -85,13 +98,8 @@ async fn jars() -> (Vec<u8>, Vec<u8>) {
         ))
         .build()
         .expect("reqwest client");
-    let get = |url: String| {
-        let client = client.clone();
-        async move { fetch_from_central(&client, &url).await }
-    };
-    let pristine = get(CENTRAL_JAR.to_string()).await;
-    let sha1 = String::from_utf8(get(format!("{CENTRAL_JAR}.sha1")).await).unwrap();
-    assert_eq!(hex_of::<Sha1>(&pristine), sha1.trim(), "Central sha1");
+    let pristine = fetch_from_central(&client, CENTRAL_JAR_PATH).await;
+    assert_eq!(hex_of::<Sha1>(&pristine), CENTRAL_JAR_SHA1, "Central sha1");
 
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(pristine.clone())).unwrap();
     let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -115,27 +123,32 @@ async fn jars() -> (Vec<u8>, Vec<u8>) {
     (pristine, patched)
 }
 
-/// GET `url` from Maven Central, retrying what a CI runner sees as a
-/// transient blip: a transport error (DNS, connect, reset, timeout) or a
-/// 403 / 404 / 429 / 5xx. Any other status fails at once. Without this, one
-/// blip failed every cell of a leg within milliseconds, before `docker run`.
-/// A 403 or 404 counts as a blip because every `url` here is a pinned,
-/// released, public artifact that Central never deletes or restricts: CI
-/// saw both from one runner's CDN edge while the other legs of the same
-/// run fetched the same jar fine (the 404 is also what `sbt-warm-seed.sh`
-/// retries).
-async fn fetch_from_central(client: &reqwest::Client, url: &str) -> Vec<u8> {
-    const ATTEMPTS: u32 = 5;
+/// GET `path` from Maven Central, alternating between [`CENTRAL_MIRRORS`]
+/// and retrying what a CI runner sees as a transient blip: a transport
+/// error (DNS, connect, reset, timeout) or a 403 / 404 / 429 / 5xx. Any
+/// other status fails at once. Without this, one blip failed every cell of
+/// a leg within milliseconds, before `docker run`. A 403 or 404 counts as a
+/// blip because `path` is a pinned, released, public artifact that Central
+/// never deletes or restricts: CI saw both from one runner's CDN edge
+/// while the other legs of the same run fetched the same jar fine (the 404
+/// is also what `sbt-warm-seed.sh` retries). The caller checks the bytes
+/// against a pinned sha1, so which mirror served them does not matter.
+async fn fetch_from_central(client: &reqwest::Client, path: &str) -> Vec<u8> {
+    const ATTEMPTS: u32 = 6;
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
+        let url = format!(
+            "{}/{path}",
+            CENTRAL_MIRRORS[(attempt as usize - 1) % CENTRAL_MIRRORS.len()]
+        );
         if attempt > 1 {
-            eprintln!("{url}: attempt {} failed ({last}); retrying", attempt - 1);
-            tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 2))).await;
+            eprintln!("{path}: attempt {} failed ({last}); retrying", attempt - 1);
+            tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 2).min(3))).await;
         }
-        let resp = match client.get(url).send().await {
+        let resp = match client.get(&url).send().await {
             Ok(resp) => resp,
             Err(e) => {
-                last = format!("{e:?}");
+                last = format!("{url}: {e:?}");
                 continue;
             }
         };
@@ -145,16 +158,16 @@ async fn fetch_from_central(client: &reqwest::Client, url: &str) -> Vec<u8> {
             || status == reqwest::StatusCode::NOT_FOUND
             || status == reqwest::StatusCode::FORBIDDEN
         {
-            last = status.to_string();
+            last = format!("{url}: {status}");
             continue;
         }
         assert!(status.is_success(), "{url}: {status}");
         match resp.bytes().await {
             Ok(body) => return body.to_vec(),
-            Err(e) => last = format!("{e:?}"),
+            Err(e) => last = format!("{url}: {e:?}"),
         }
     }
-    panic!("{url}: {ATTEMPTS} attempts failed, last: {last}");
+    panic!("{path}: {ATTEMPTS} attempts failed, last: {last}");
 }
 
 /// The authenticated patch API serving one whole-jar patch for
