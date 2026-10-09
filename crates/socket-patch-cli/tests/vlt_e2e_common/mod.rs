@@ -295,6 +295,13 @@ pub fn scalar_registry_ignored(v: VltVersion) -> bool {
     (VltVersion::rc(7)..=VltVersion::rc(29)).contains(&v)
 }
 
+/// vlt.json's `registry` (and `--registry`) is ignored: every install
+/// resolves from public npm, so a package only the harness registry serves
+/// (the launcher at an unpublished version) cannot install.
+pub fn registry_config_ignored(v: VltVersion) -> bool {
+    v <= VltVersion::zero(13)
+}
+
 /// The harness can run every install against its own registry.
 pub fn hermetic_registry(v: VltVersion) -> bool {
     !scalar_registry_ignored(v)
