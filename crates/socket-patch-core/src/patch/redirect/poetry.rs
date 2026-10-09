@@ -89,9 +89,7 @@ pub(super) fn rewrite_poetry(
                             new: Some(Value::String(new)),
                         });
                     }
-                    result
-                        .confirmed_python_lock_uuids
-                        .insert(dep.patch_uuid.clone());
+                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
                     if !stale_warned {
                         if let Some(format) =
                             *writer_format.get_or_insert_with(|| pre_1_4_writer(&content))
@@ -126,18 +124,14 @@ pub(super) fn rewrite_poetry(
                 }
                 // Already redirected to this artifact (idempotent re-scan).
                 LockStep::Unchanged => {
-                    result
-                        .confirmed_python_lock_uuids
-                        .insert(dep.patch_uuid.clone());
+                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
                 }
                 LockStep::NotFound => result.warnings.push(RewriteWarning {
                     code: "redirect_poetry_entry_not_found".into(),
                     detail: format!("no {path} entry for {}@{}", dep.name, dep.version),
                 }),
                 LockStep::Refused(detail) => {
-                    result
-                        .refused_python_lock_uuids
-                        .insert(dep.patch_uuid.clone());
+                    result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_poetry_lock_unsupported".into(),
                         detail: format!("{path}: {detail}"),

@@ -379,7 +379,8 @@ fn read_crate_cargo_toml(crate_path: &Path, dir_name: &str) -> Option<(String, S
     let content = crate::utils::fs::read_regular_to_string_sync(&cargo_toml_path).ok()?;
 
     // Fallback: parse directory name as <name>-<version>
-    package_name_version(&content).or_else(|| CargoCrawler::parse_dir_name_version(dir_name))
+    package_name_version(&content)
+        .or_else(|| CargoCrawler::parse_dir_name_version(dir_name))
 }
 
 impl Default for CargoCrawler {
