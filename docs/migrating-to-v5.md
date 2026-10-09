@@ -99,7 +99,15 @@ run `socket-patch apply` once after migration to confirm the manifest still appl
 | `SOCKET_PATCH_PROXY_URL` | `SOCKET_PROXY_URL` |
 | `SOCKET_PATCH_DEBUG` | `SOCKET_DEBUG` |
 | `SOCKET_PATCH_TELEMETRY_DISABLED` | `SOCKET_TELEMETRY_DISABLED` |
+| `scan --apply` | `scan --mode agent` |
+| `scan --vendor` | `scan --mode vendored` |
+| `get --no-apply` | `get --save-only` (`SOCKET_SAVE_ONLY` is unchanged) |
+| `socket-patch download` | `socket-patch get` |
+| `socket-patch gc` | `socket-patch repair` |
 | `SOCKET_FORCE` | Pass `--force` to the one command that needs it (`apply`, `vendor`, `--update`); the variable is now ignored |
+
+A removed spelling is a usage error (exit 2). `scan --sync` stays as the
+shorthand for `scan --mode agent --prune`.
 
 Legacy `.socket/packages/` archives are no longer read. Patch data uses diff
 archives or blobs; cleanup commands remove obsolete package archives.

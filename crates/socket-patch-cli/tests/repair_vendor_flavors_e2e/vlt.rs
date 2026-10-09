@@ -77,9 +77,9 @@ fn write_fixture(root: &Path, lock: VltLock, package_json: Option<&str>) {
     std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
 }
 
-/// `scan --vendor --yes` over the fixture; returns the artifact dir.
+/// `scan --mode vendored --yes` over the fixture; returns the artifact dir.
 fn vendor_project(root: &Path, uri: &str, lock: VltLock) -> PathBuf {
-    let (code, stdout, stderr) = run_cli(root, uri, &["scan", "--vendor", "--yes"]);
+    let (code, stdout, stderr) = run_cli(root, uri, &["scan", "--mode", "vendored", "--yes"]);
     assert_eq!(code, 0, "{lock:?}: vendor setup: {stdout}\n{stderr}");
     let dir = root.join(rel());
     assert!(dir.join("index.js").is_file(), "{lock:?}: {stdout}");

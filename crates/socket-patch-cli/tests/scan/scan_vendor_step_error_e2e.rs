@@ -73,7 +73,7 @@ fn write_fixture(root: &Path) {
 }
 
 /// Discovery (batch) plus the per-package search that selects `UUID` for
-/// `PURL` — the endpoints `scan --vendor` hits before the download phase.
+/// `PURL` — the endpoints `scan --mode vendored` hits before the download phase.
 async fn mount_discovery(mock: &MockServer) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
@@ -203,7 +203,8 @@ async fn scan_vendor_download_error_preserves_the_vendor_envelope() {
         &[
             "scan",
             "--json",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--yes",
             "--api-url",
             &mock.uri(),

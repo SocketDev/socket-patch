@@ -21,7 +21,7 @@
 //! newline style is preserved.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
@@ -842,7 +842,8 @@ pub(in crate::vendor) fn vendor_line(
 /// must never edit them. The root file is always element 0.
 async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'static str, String)> {
     let mut out: Vec<ReqFile> = Vec::new();
-    walk_requirements_tree(root, |rel, path, read| match read {
+    let view = crate::vendor::lock_inventory::ProjectView::Disk(root);
+    walk_requirements_tree(view, |rel, read| match read {
         Ok(content) => {
             // Out-of-root (`../`) and absolute includes resolve outside any
             // committable root — readable so a pin inside can refuse, never
@@ -863,12 +864,12 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
             format!(
                 "{} is not UTF-8 text (for example UTF-16, which Windows PowerShell 5.1 \
                  writes for `pip freeze > requirements.txt`); re-save it as UTF-8 and re-run",
-                path.display()
+                root.join(rel).display()
             ),
         )),
         Err(_) if out.is_empty() => Err((
             "pypi_no_requirements",
-            format!("cannot read {}", path.display()),
+            format!("cannot read {}", root.join(rel).display()),
         )),
         // A broken include is pip's error to report; vendor just can't see
         // inside it. Skip.
@@ -894,8 +895,16 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
 /// and absolute includes are never editable, so they are neither named nor
 /// followed.
 pub async fn requirements_include_names(root: &Path) -> std::io::Result<Vec<String>> {
+    requirements_include_names_in(crate::vendor::lock_inventory::ProjectView::Disk(root)).await
+}
+
+/// [`requirements_include_names`] over any project view (the disk, a
+/// snapshot of it, or an in-memory project).
+pub(crate) async fn requirements_include_names_in(
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+) -> std::io::Result<Vec<String>> {
     let mut names: Vec<String> = Vec::new();
-    walk_requirements_tree(root, |rel, _path, read| {
+    walk_requirements_tree(view, |rel, read| {
         if !is_in_root_rel(rel) {
             return Ok(false);
         }
@@ -925,29 +934,24 @@ pub(crate) fn is_in_root_rel(rel: &str) -> bool {
 /// result and answers whether to descend into its includes (`Ok(true)`), or
 /// aborts the walk with its own error.
 async fn walk_requirements_tree<E>(
-    root: &Path,
-    mut visit: impl FnMut(&str, &Path, std::io::Result<String>) -> Result<bool, E>,
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+    mut visit: impl FnMut(&str, std::io::Result<String>) -> Result<bool, E>,
 ) -> Result<(), E> {
     let mut visited: HashSet<String> = HashSet::new();
-    let mut stack: Vec<(String, PathBuf)> = vec![(
-        "requirements.txt".to_string(),
-        root.join("requirements.txt"),
-    )];
-    while let Some((rel, path)) = stack.pop() {
+    let mut stack: Vec<String> = vec!["requirements.txt".to_string()];
+    while let Some(rel) = stack.pop() {
         if !visited.insert(rel.clone()) {
             continue;
         }
-        let read = read_regular_to_string(&path).await;
+        let read = view.read_text(&rel).await;
         // Parse the includes BEFORE handing the content over (the visitor
         // takes it by value); nothing is pushed unless it asks to descend.
         let includes: Vec<String> = match &read {
             Ok(content) => requirements_includes(&rel, content),
             Err(_) => Vec::new(),
         };
-        if visit(&rel, &path, read)? {
-            for normalized in includes {
-                stack.push((normalized.clone(), root.join(&normalized)));
-            }
+        if visit(&rel, read)? {
+            stack.extend(includes);
         }
     }
     Ok(())

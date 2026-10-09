@@ -30,11 +30,14 @@ pub async fn bundled_copies(root: &Path) -> BTreeMap<String, String> {
     let Ok(lock) = vlt_lock_model(&text) else {
         return BTreeMap::new();
     };
-    store_bundled_copies(
-        root,
-        lock.nodes.iter().map(|n| (n.key.as_str(), n.name.as_str())),
-    )
-    .await
+    // Collected first: a closure-mapped iterator held across the walk's
+    // awaits would keep the caller's future from being `Send`.
+    let pairs: Vec<(&str, &str)> = lock
+        .nodes
+        .iter()
+        .map(|n| (n.key.as_str(), n.name.as_str()))
+        .collect();
+    store_bundled_copies(root, pairs).await
 }
 
 /// The scan warning detail for a bundled copy at `location` that a hosted
@@ -53,15 +56,31 @@ const BUNDLED_WALK_LIMIT: usize = 20_000;
 
 /// purl → root-relative directory of the first bundled copy of it found in
 /// the store entries of `nodes` (`(DepID key, package name)` pairs of
-/// `vlt-lock.json`).
+/// `vlt-lock.json`). The walk is one blocking task of plain syscalls (a
+/// store holds one entry per lock node, each probed several times).
 pub(crate) async fn store_bundled_copies<'n>(
     root: &Path,
     nodes: impl IntoIterator<Item = (&'n str, &'n str)>,
 ) -> BTreeMap<String, String> {
+    let root = root.to_path_buf();
+    let nodes: Vec<(String, String)> = nodes
+        .into_iter()
+        .map(|(key, name)| (key.to_string(), name.to_string()))
+        .collect();
+    tokio::task::spawn_blocking(move || store_bundled_copies_sync(&root, &nodes))
+        .await
+        .unwrap_or_else(|e| match e.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(e) => panic!("vlt store walk failed: {e}"),
+        })
+}
+
+fn store_bundled_copies_sync(root: &Path, nodes: &[(String, String)]) -> BTreeMap<String, String> {
     let mut copies = BTreeMap::new();
-    let Ok(canonical_root) = tokio::fs::canonicalize(root).await else {
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
         return copies;
     };
+    let mut real_dirs = RealDirs::default();
     let mut budget = BUNDLED_WALK_LIMIT;
     for (key, name) in nodes {
         // Both come from the lock: never let them climb out of the store.
@@ -70,14 +89,18 @@ pub(crate) async fn store_bundled_copies<'n>(
         }
         let package = format!("{VLT_STORE_DIR}/{key}/node_modules/{name}");
         // The package itself must be a real directory inside the project.
-        match tokio::fs::canonicalize(root.join(&package)).await {
-            Ok(real) if real.starts_with(&canonical_root) && real.is_dir() => {}
-            _ => continue,
+        match real_dirs.check(root, &package) {
+            Some(true) => {}
+            Some(false) => continue,
+            None => match std::fs::canonicalize(root.join(&package)) {
+                Ok(real) if real.starts_with(&canonical_root) && real.is_dir() => {}
+                _ => continue,
+            },
         }
         let mut pending = vec![format!("{package}/node_modules")];
         while let Some(dir) = pending.pop() {
-            for child in real_package_dirs(root, &dir, &mut budget).await {
-                if let Some(purl) = installed_purl(root, &child).await {
+            for child in real_package_dirs(root, &dir, &mut budget) {
+                if let Some(purl) = installed_purl(root, &child) {
                     copies.entry(purl).or_insert_with(|| child.clone());
                 }
                 pending.push(format!("{child}/node_modules"));
@@ -87,16 +110,60 @@ pub(crate) async fn store_bundled_copies<'n>(
     copies
 }
 
+/// The `lstat` answer to "does root-relative `rel` canonicalize to a
+/// directory inside the (canonical) root": `Some(true)` when every
+/// component is a real directory (the canonical path is then the canonical
+/// root joined with `rel`), `Some(false)` when a component is missing or a
+/// non-directory (canonicalizing fails, or ends at a non-directory), and
+/// `None` when a component is a symbolic link, for the caller's
+/// `canonicalize` to follow. Shared prefixes (`node_modules/.vlt`) are
+/// probed once.
+#[derive(Default)]
+struct RealDirs {
+    seen: std::collections::HashMap<String, Option<bool>>,
+}
+
+impl RealDirs {
+    fn check(&mut self, root: &Path, rel: &str) -> Option<bool> {
+        let mut prefix = String::with_capacity(rel.len());
+        for segment in rel.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            let verdict = match self.seen.get(&prefix) {
+                Some(verdict) => *verdict,
+                None => {
+                    let verdict = match std::fs::symlink_metadata(root.join(&prefix)) {
+                        Ok(meta) if meta.file_type().is_symlink() => None,
+                        Ok(meta) => Some(meta.is_dir()),
+                        Err(_) => Some(false),
+                    };
+                    self.seen.insert(prefix.clone(), verdict);
+                    verdict
+                }
+            };
+            if verdict != Some(true) {
+                return verdict;
+            }
+        }
+        Some(true)
+    }
+}
+
 /// Root-relative paths of the real (not symlinked) package directories in
 /// the `node_modules` dir `dir`, one `@scope` level deep.
-async fn real_package_dirs(root: &Path, dir: &str, budget: &mut usize) -> Vec<String> {
+fn real_package_dirs(root: &Path, dir: &str, budget: &mut usize) -> Vec<String> {
     let mut found = Vec::new();
     let mut pending = vec![(dir.to_string(), true)];
     while let Some((dir, scopes)) = pending.pop() {
-        let Ok(mut entries) = tokio::fs::read_dir(root.join(&dir)).await else {
+        let Ok(entries) = std::fs::read_dir(root.join(&dir)) else {
             continue;
         };
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                break;
+            };
             if *budget == 0 {
                 return found;
             }
@@ -105,7 +172,7 @@ async fn real_package_dirs(root: &Path, dir: &str, budget: &mut usize) -> Vec<St
                 continue;
             };
             // `DirEntry::file_type` does not follow symlinks.
-            if name.starts_with('.') || !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
+            if name.starts_with('.') || !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let rel = format!("{dir}/{name}");
@@ -121,10 +188,9 @@ async fn real_package_dirs(root: &Path, dir: &str, budget: &mut usize) -> Vec<St
 }
 
 /// The npm purl a package directory's `package.json` declares.
-async fn installed_purl(root: &Path, dir: &str) -> Option<String> {
-    let text = crate::utils::fs::read_regular_to_string(&root.join(dir).join("package.json"))
-        .await
-        .ok()?;
+fn installed_purl(root: &Path, dir: &str) -> Option<String> {
+    let text =
+        crate::utils::fs::read_regular_to_string_sync(&root.join(dir).join("package.json")).ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
     npm_purl(
         manifest.get("name")?.as_str()?,
@@ -144,5 +210,115 @@ fn is_package_name(name: &str) -> bool {
             scope.starts_with('@') && is_plain_segment(scope) && is_plain_segment(bare)
         }
         None => is_plain_segment(name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A bundled copy at `<package>/node_modules/left-pad` of the store
+    /// entry `key`.
+    fn store_entry(root: &Path, key: &str) -> String {
+        let package = format!("{VLT_STORE_DIR}/{key}/node_modules/bund");
+        write(
+            root,
+            &format!("{package}/package.json"),
+            r#"{"name":"bund","version":"1.0.0"}"#,
+        );
+        write(
+            root,
+            &format!("{package}/node_modules/left-pad/package.json"),
+            r#"{"name":"left-pad","version":"1.3.0"}"#,
+        );
+        package
+    }
+
+    /// The store's keys are what `canonical_base_purl` makes of any
+    /// spelling of the purl (the attribution gate and the scan's bundled
+    /// warning both look them up that way).
+    #[tokio::test]
+    async fn store_keys_are_canonical_base_purls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let package = format!("{VLT_STORE_DIR}/key/node_modules/bund");
+        write(
+            root,
+            &format!("{package}/package.json"),
+            r#"{"name":"bund","version":"1.0.0"}"#,
+        );
+        write(
+            root,
+            &format!("{package}/node_modules/@scope/x/package.json"),
+            r#"{"name":"@scope/x","version":"2.0.0"}"#,
+        );
+        let keys = store_bundled_copies(root, [("key", "bund")]).await;
+        for spelling in [
+            "pkg:npm/@scope/x@2.0.0",
+            "pkg:npm/%40scope/x@2.0.0",
+            "pkg:npm/%40scope/x@2.0.0?vcs_url=x",
+        ] {
+            let key = crate::utils::purl_key::canonical_base_purl(spelling);
+            assert!(keys.contains_key(&key), "{spelling} -> {key}: {keys:?}");
+        }
+    }
+
+    async fn copies(root: &Path, key: &str) -> Vec<String> {
+        store_bundled_copies(root, [(key, "bund")])
+            .await
+            .into_keys()
+            .collect()
+    }
+
+    /// The lstat shortcut answers what `canonicalize` did: real store
+    /// directories are walked; a missing entry, a file where the package
+    /// directory should be, and anything resolving outside the project are
+    /// not; a symlinked component that stays inside the project is followed.
+    #[tokio::test]
+    async fn the_store_walk_keeps_inside_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        store_entry(&root, "real");
+        assert_eq!(copies(&root, "real").await, ["pkg:npm/left-pad@1.3.0"]);
+        assert!(copies(&root, "missing").await.is_empty());
+        write(
+            &root,
+            &format!("{VLT_STORE_DIR}/file/node_modules/bund"),
+            "not a dir",
+        );
+        assert!(copies(&root, "file").await.is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tmp.path().join("outside");
+            store_entry(&outside, "away");
+            // A store entry symlinked inside the project is followed ...
+            symlink(
+                root.join(VLT_STORE_DIR).join("real"),
+                root.join(VLT_STORE_DIR).join("linked"),
+            )
+            .unwrap();
+            assert_eq!(copies(&root, "linked").await, ["pkg:npm/left-pad@1.3.0"]);
+            // ... one resolving outside it is not.
+            symlink(
+                outside.join(VLT_STORE_DIR).join("away"),
+                root.join(VLT_STORE_DIR).join("away"),
+            )
+            .unwrap();
+            assert!(copies(&root, "away").await.is_empty());
+            // Nor is any entry of a store that is itself a link outside.
+            let other = tmp.path().join("other");
+            store_entry(&other, "real");
+            std::fs::create_dir_all(other.join("x")).unwrap();
+            symlink(other.join("node_modules"), other.join("x/node_modules")).unwrap();
+            assert!(copies(&other.join("x"), "real").await.is_empty());
+        }
     }
 }

@@ -428,15 +428,15 @@ fn test_pypi_dry_run() {
     // Download without applying.
     assert_run_ok(
         cwd,
-        &["get", PYPI_UUID, "--mode", "agent", "--no-apply"],
-        "get --no-apply",
+        &["get", PYPI_UUID, "--mode", "agent", "--save-only"],
+        "get --save-only",
     );
 
     // File should be unchanged.
     assert_eq!(
         git_sha256_file(&messages_py),
         original_hash,
-        "file should not change after get --no-apply"
+        "file should not change after get --save-only"
     );
 
     // Read the manifest and snapshot the pre-apply on-disk state of EVERY

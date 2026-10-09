@@ -1,6 +1,6 @@
 //! Pure text-surgery helpers for lockfile-shaped TOML.
 //!
-//! The pypi/uv and poetry backends edit locks by TARGETED text
+//! The pypi/uv backend edits locks by TARGETED text
 //! surgery rather than a TOML re-serialize: the spike
 //! proved a surgical edit reproduces the lock generator's own serializer
 //! output byte-identically, which keeps `--check`-style validations green
@@ -52,73 +52,6 @@ where
         }
     }
     None
-}
-
-/// The unit's lines with any trailing foreign top-level section cut off.
-/// [`find_unit_span`] ends a unit at the NEXT `[[package]]` or EOF, but a
-/// trailing section (poetry's `[metadata]`) would otherwise be swallowed —
-/// truncate at the first top-level header that is not a `[package.*]`
-/// sub-table, dropping the blank separator.
-pub(super) fn package_unit_lines(unit_text: &str) -> Vec<&str> {
-    let mut unit: Vec<&str> = unit_text.lines().collect();
-    if let Some(stop) = unit
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(i, l)| (l.starts_with('[') && !l.starts_with("[package.")).then_some(i))
-    {
-        unit.truncate(stop);
-        while unit.last().is_some_and(|l| l.trim().is_empty()) {
-            unit.pop();
-        }
-    }
-    unit
-}
-
-/// Rewrite the unit's `files = [...]` array (single- or multi-line) to the
-/// single patched-wheel `{file, hash}` element, preserving every other line
-/// verbatim — the splice shape of the poetry lock. `None` when the unit has
-/// no files array (the caller fails closed rather than guess a placement).
-pub(super) fn replace_files_array(
-    unit: &[&str],
-    wheel_file_name: &str,
-    wheel_sha256_hex: &str,
-) -> Option<Vec<String>> {
-    let files_lines = [
-        "files = [".to_string(),
-        format!("    {{file = \"{wheel_file_name}\", hash = \"sha256:{wheel_sha256_hex}\"}},"),
-        "]".to_string(),
-    ];
-
-    let mut out: Vec<String> = Vec::new();
-    let mut files_done = false;
-    let mut i = 0;
-    while i < unit.len() {
-        let line = unit[i];
-        // The files array is a top-level unit key, always ahead of any
-        // `[package.*]` sub-table — a sub-table entry that happens to be
-        // keyed `files` (a dependency or extra literally named "files")
-        // must pass through verbatim, not be rewritten as a wheel array.
-        if line.starts_with("[package.") {
-            out.extend(unit[i..].iter().map(|l| (*l).to_string()));
-            break;
-        }
-        if line.starts_with("files = [") {
-            out.extend(files_lines.iter().cloned());
-            files_done = true;
-            if !line.trim_end().ends_with(']') {
-                // skip the original multi-line array body + closing bracket
-                while i + 1 < unit.len() && unit[i + 1].trim() != "]" {
-                    i += 1;
-                }
-                i += 1;
-            }
-        } else {
-            out.push(line.to_string());
-        }
-        i += 1;
-    }
-    files_done.then_some(out)
 }
 
 /// Exclusive end index of the `[` array opened at `open_idx` (quote-aware;
@@ -335,82 +268,6 @@ mod tests {
 
         // No match → None.
         assert!(find_unit_span(LOCK, |lines| lines.contains(&"name = \"absent\"")).is_none());
-    }
-
-    #[test]
-    fn package_unit_lines_truncates_trailing_foreign_section() {
-        // A [package.*] sub-table stays; a trailing [metadata] (plus its
-        // blank separator) is cut.
-        let unit = "[[package]]\nname = \"six\"\n\n[package.source]\ntype = \"file\"\n\n[metadata]\nlock-version = \"2.1\"";
-        assert_eq!(
-            package_unit_lines(unit),
-            vec![
-                "[[package]]",
-                "name = \"six\"",
-                "",
-                "[package.source]",
-                "type = \"file\""
-            ]
-        );
-        // No foreign section → untouched.
-        assert_eq!(
-            package_unit_lines("[[package]]\nname = \"six\""),
-            vec!["[[package]]", "name = \"six\""]
-        );
-    }
-
-    #[test]
-    fn replace_files_array_handles_multi_line_inline_and_absent() {
-        let multi = ["name = \"six\"", "files = [", "    {file = \"a\"},", "]"];
-        assert_eq!(
-            replace_files_array(&multi, "w.whl", "beef").unwrap(),
-            vec![
-                "name = \"six\"",
-                "files = [",
-                "    {file = \"w.whl\", hash = \"sha256:beef\"},",
-                "]"
-            ]
-        );
-        let inline = ["files = []", "summary = \"x\""];
-        assert_eq!(
-            replace_files_array(&inline, "w.whl", "beef").unwrap(),
-            vec![
-                "files = [",
-                "    {file = \"w.whl\", hash = \"sha256:beef\"},",
-                "]",
-                "summary = \"x\""
-            ]
-        );
-        assert!(replace_files_array(&["name = \"six\""], "w.whl", "beef").is_none());
-
-        // A sub-table entry keyed `files` (a dep/extra literally named
-        // "files") passes through verbatim — only the top-level array,
-        // always ahead of any `[package.*]` sub-table, is rewritten.
-        let subtable = [
-            "files = []",
-            "",
-            "[package.extras]",
-            "files = [\"files (>=1.0)\"]",
-        ];
-        assert_eq!(
-            replace_files_array(&subtable, "w.whl", "beef").unwrap(),
-            vec![
-                "files = [",
-                "    {file = \"w.whl\", hash = \"sha256:beef\"},",
-                "]",
-                "",
-                "[package.extras]",
-                "files = [\"files (>=1.0)\"]"
-            ]
-        );
-        // No TOP-LEVEL files array at all → None (fail closed), even when a
-        // sub-table line is keyed `files`.
-        assert!(replace_files_array(
-            &["name = \"six\"", "[package.extras]", "files = [\"x\"]"],
-            "w.whl",
-            "beef"
-        )
-        .is_none());
     }
 
     #[test]
