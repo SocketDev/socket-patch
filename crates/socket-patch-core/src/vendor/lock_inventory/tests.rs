@@ -2613,6 +2613,38 @@ packages:
     );
 }
 
+/// #1271: a block keyed by an empty range (`left-pad@:` from
+/// `"left-pad": ""`), alone or merged ahead of another range, is a
+/// registry package lock-only discovery sees.
+#[tokio::test]
+async fn yarn_classic_empty_range_key_is_inventoried() {
+    for key in [
+        "left-pad@:",
+        "left-pad@, left-pad@^1.3.0:",
+        "\"@scope/pkg@\":",
+    ] {
+        let name = if key.contains("@scope") {
+            "@scope/pkg"
+        } else {
+            "left-pad"
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "yarn.lock",
+            &format!(
+                "# yarn lockfile v1\n\n\n{key}\n  version \"1.3.0\"\n  \
+                 resolved \"https://registry.yarnpkg.com/{name}/-/x-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e\"\n"
+            ),
+        )
+        .await;
+        let entries = inventory_yarn_classic(tmp.path()).await.unwrap();
+        let e = entry(&entries, name);
+        assert_eq!(e.version, "1.3.0", "{key}");
+        assert!(e.resolved.is_some(), "{key}: a registry copy");
+    }
+}
+
 /// Real classic-lock degenerations: a `resolved` URL without the legacy
 /// `#sha1` fragment (registries that strip fragments) and a block with
 /// no `resolved` at all (offline-pruned locks). Both stay listed for
