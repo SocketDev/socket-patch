@@ -41,9 +41,10 @@
 //! literal version wins over `<dependencyManagement>`, so a managed Socket
 //! pin shadowed by a direct plain version (or a GA declared with several
 //! different effective versions) is diagnosed, not a ref.
-//! A hosted pin in a reactor root (`<modules>` / `<subprojects>`) is
-//! diagnosed too: a module's own literal `<version>` overrides it, and only
-//! the root pom is read here (the rewriter refuses such roots, #261). A `${property}`
+//! A hosted pin in a reactor root (`<modules>` / `<subprojects>`) stays
+//! a ref (rollback / remove find it) but marked unattested: a module's
+//! own literal `<version>` overrides it, and only the root pom is read here
+//! (the rewriter refuses such roots, #261). A `${property}`
 //! version is resolved one level from the root `<properties>`.
 //!
 //! Integrity: when the pom sha256 was known the rewriter also writes Maven
@@ -94,7 +95,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     maven_purl, names_vendor_dir, socket_patch_name_uuid, vendor_ref, vendor_uuid_dir, DiscoverCtx,
-    Discovery, PatchedRef, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
+    Discovery, PatchedRef, UnattestedKind, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::maven::{
@@ -265,18 +266,23 @@ async fn extract_hosted(
                 ))
                 .await;
         match candidates.as_slice() {
-            // A reactor root's pin may be shadowed by a module's own literal
-            // <version>, which this root-only read cannot see (#261).
-            [_] if reactor => out.diag(
-                DIAG_REF_UNATTRIBUTABLE,
-                POM,
-                format!(
-                    "{POM}: {ga} <version>{pinned}</version> is a hosted pin in a reactor root \
-                     (<modules>/<subprojects>); a module's own <version> overrides it, so it \
-                     is not attested"
-                ),
-            ),
             [uuid] => {
+                // A reactor root's pin stays a ref (rollback, remove and
+                // list must still find it) but is never attested: a
+                // module's own <version>, unread here, overrides it (#261).
+                if reactor {
+                    out.unattested(
+                        &purl,
+                        uuid,
+                        POM,
+                        format!(
+                            "{POM} declares <modules>/<subprojects>, and a module's own \
+                             <version> of {ga} overrides this root pin; hosted mode reads only \
+                             the root pom (re-patch the reactor with `scan --mode vendored`)"
+                        ),
+                        UnattestedKind::MavenReactorRoot,
+                    );
+                }
                 ties.entry(*uuid).or_default().insert((
                     purl,
                     group.clone(),
@@ -785,14 +791,16 @@ mod tests {
 
     /// A hosted pin in a reactor root is not attested (#261): a module that
     /// declares the GA with its own literal `<version>` overrides the root's
-    /// managed pin, and discovery reads only the root pom. The pin and its
-    /// repository are diagnosed instead, so `vex` never says not_affected
-    /// for a module that still resolves the upstream jar.
+    /// managed pin, and discovery reads only the root pom. It stays a ref,
+    /// so rollback / remove / list still find a pin an older release wrote,
+    /// but is marked unattested so `vex` never says not_affected for a
+    /// module that still resolves the upstream jar.
     #[tokio::test]
     async fn hosted_pin_in_a_reactor_root_is_not_attested() {
         for reactor in [
             "<modules>\n<module>child</module>\n</modules>\n",
             "<subprojects>\n<subproject>child</subproject>\n</subprojects>\n",
+            "<profiles>\n<profile>\n<id>all</id>\n<modules>\n<module>child</module>\n</modules>\n</profile>\n</profiles>\n",
         ] {
             let p = Project::new();
             p.write(
@@ -804,17 +812,20 @@ mod tests {
                 )),
             );
             let out = run(&p).await;
-            assert_refs(&out, &[]);
-            assert!(
-                out.diagnostics
-                    .iter()
-                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
-                        && d.detail.contains("org.slf4j:slf4j-api")
-                        && d.detail.contains("module")),
-                "{reactor}: {:?}",
-                out.diagnostics
-            );
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.unattested.len(), 1, "{reactor}: {:?}", out.unattested);
+            let u = &out.unattested[0];
+            assert_eq!(u.kind, UnattestedKind::MavenReactorRoot, "{reactor}");
+            assert_eq!((u.purl.as_str(), u.uuid.as_str()), (FX_PURL, UUID_A), "{reactor}");
+            assert!(u.detail.contains("org.slf4j:slf4j-api"), "{}", u.detail);
         }
+
+        // The single-module control stays attested.
+        let p = Project::new();
+        p.write("pom.xml", hosted_pom(UUID_A));
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
     }
 
     #[tokio::test]
