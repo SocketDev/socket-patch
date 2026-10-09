@@ -26,6 +26,8 @@ const ORG: &str = "test-org";
 const NAME: &str = "left-pad";
 const VERSION: &str = "1.3.0";
 const PURL: &str = "pkg:npm/left-pad@1.3.0";
+/// A manifest record no vendor ledger entry covers: agent-only state.
+const AGENT_ONLY_PURL: &str = "pkg:npm/is-odd@3.0.1";
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 const HOSTED_URL: &str = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/55555555-5555-4555-8555-555555555555/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
@@ -353,7 +355,7 @@ async fn bare_scan_keeps_an_agent_project_out_of_hosted_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_npm_project(root, "package-lock.json", 2);
-    write_manifest(root);
+    write_manifest(root, &[PURL]);
     let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
 
     // The mock serves no patch artifacts, so the agent apply step itself
@@ -380,8 +382,51 @@ async fn bare_scan_keeps_an_agent_project_out_of_hosted_mode() {
     assert!(manifest["patches"].get(PURL).is_some(), "{manifest:#}");
 }
 
-/// Agent and vendored state together: the run cannot tell which mode to
-/// keep, so it is a usage error naming `--mode`, and nothing is written.
+/// The `get --save-only` then `vendor` flow leaves the vendored record in
+/// the manifest beside its ledger entry. That project is vendored, so a
+/// bare `scan`/`get` keeps it vendored instead of failing `mode_ambiguous`.
+#[tokio::test(flavor = "multi_thread")]
+async fn bare_scan_and_get_keep_a_vendored_project_whose_manifest_holds_the_record() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vendor_project(root, &server.uri());
+    let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
+
+    for command in ["scan", "get"] {
+        write_manifest(root, &[PURL]);
+        let (code, env) = run_cmd(root, &server.uri(), command, None, &[]);
+        assert_eq!(code, 0, "{command}: {env:#}");
+        assert!(
+            !env.to_string().contains("mode_ambiguous"),
+            "{command}: a covered manifest record is not agent state: {env:#}"
+        );
+        assert!(
+            env.get("redirect").is_none(),
+            "{command}: no hosted step may run: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("package-lock.json")).unwrap(),
+            lock_before,
+            "{command}: the vendored lock is kept: {env:#}"
+        );
+        assert!(!root.join(".npmrc").exists(), "{command}: {env:#}");
+        // The vendored flow ran: it moves the record its ledger owns out
+        // of the manifest (vendored mode is manifest-free).
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(root.join(".socket/manifest.json")).unwrap())
+                .unwrap();
+        assert!(
+            manifest["patches"].get(PURL).is_none(),
+            "{command}: the vendored flow migrates the covered record: {manifest:#}"
+        );
+    }
+}
+
+/// Agent and vendored state together (a manifest record the ledger does
+/// not cover): the run cannot tell which mode to keep, so it is a usage
+/// error naming `--mode`, and nothing is written.
 #[tokio::test(flavor = "multi_thread")]
 async fn bare_scan_and_get_refuse_a_project_with_agent_and_vendored_state() {
     let server = MockServer::start().await;
@@ -389,7 +434,7 @@ async fn bare_scan_and_get_refuse_a_project_with_agent_and_vendored_state() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     vendor_project(root, &server.uri());
-    write_manifest(root);
+    write_manifest(root, &[PURL, AGENT_ONLY_PURL]);
     let before = snapshot(root);
 
     for command in ["scan", "get"] {
@@ -408,11 +453,14 @@ async fn bare_scan_and_get_refuse_a_project_with_agent_and_vendored_state() {
     }
 }
 
-/// An agent-mode manifest holding the fixture patch.
-fn write_manifest(root: &Path) {
+/// An agent-mode manifest holding the fixture patch under each of `purls`.
+fn write_manifest(root: &Path, purls: &[&str]) {
     std::fs::create_dir_all(root.join(".socket")).unwrap();
-    let record = patch_record();
-    let manifest = json!({ "patches": { PURL: record } });
+    let patches: serde_json::Map<String, Value> = purls
+        .iter()
+        .map(|purl| (purl.to_string(), patch_record()))
+        .collect();
+    let manifest = json!({ "patches": patches });
     std::fs::write(
         root.join(".socket/manifest.json"),
         serde_json::to_string_pretty(&manifest).unwrap(),
