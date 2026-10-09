@@ -127,6 +127,28 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   lockfile no longer points at a vendored entry in any ecosystem, not just
   Maven/Gradle, and reports lockfile references to `.socket/vendor/` that no
   ledger entry owns as `vendor_ledger_missing` (#725, #831).
+- Single-module Maven projects are vendored like reactors: the dependency is
+  pinned to `<version>-socket.<hex8>` and served from a committed
+  `.socket/vendor/maven2/` tree, with `.mvn/maven.config` and a fallback
+  `socket-patch-vendor` repository, replacing the same-version
+  `<repository>` wiring and `.socket/vendor/maven/<uuid>/`. A project
+  vendored by an earlier release is refused with
+  `vendor_jvm_shape_unsupported` (reason `legacy_maven_root`) and nothing
+  is written; run `vendor --revert`, then vendor again. `remove`,
+  `rollback` and hosted takeover still unwind the old wiring. VEX attests
+  the new pin from `.socket/vendor/state.json`, so commit it. Without a
+  Maven Wrapper, vendoring warns `vendor_jvm_degraded`; several
+  `vendor_maven_*` codes and `vendor_gradle_unsupported` are retired (see
+  the migration guide) (#973).
+- A token whose organization cannot be resolved (no `--org`,
+  `SOCKET_ORG_SLUG` or socket-cli `defaultOrg`, and
+  `GET /v0/organizations` fails) no longer queries `/v0/orgs/default/…`
+  while downloads go to the public proxy. The org is resolved once per run
+  and the whole run uses the public proxy anonymously (free patches only),
+  warning once; `--json` output of `scan`, `get`, `apply`, `vendor`, `vex`
+  and `repair` reports it as `api_auth_fallback` in `warnings[]`. An
+  embedded `--vex` reuses the run's org instead of resolving it again
+  (#648).
 
 ### Added
 
@@ -134,7 +156,8 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   repair, rollback, and VEX. Reactors use suffixed versions; `vendor --check`
   audits artifacts and wiring offline; `--local-repo` checks Maven cache
   conflicts and `--maven-config=none` selects the fallback file repository.
-  Single-POM vendoring is unchanged.
+  Single-module `pom.xml` projects are vendored the same way, as a reactor
+  of one (#973).
 - Full Gradle support (6.8+, Groovy and Kotlin DSL; tested on 6.9 through 9.8)
   in every mode (#646):
   - Discovery reads Gradle's `files-2.1` cache and `GRADLE_RO_DEP_CACHE`,
@@ -411,6 +434,10 @@ limits, and required install commands.
   everywhere, so `scan --prune` no longer drops a live NuGet entry whose API
   and installed spellings differ, and `remove`/`rollback` accept either
   spelling. Policy and rollout reports show the folded spelling (#1045).
+  NuGet versions are also normalized (`1.0.0.0` matches `1.0.0`), so a
+  package vendored under a 4-part `packages.config` version is no longer
+  treated as unused by VEX and `vendor --check`, or reverted by
+  `scan --prune` (#1202).
 - Yarn classic `file:`, URL and hosted-git copies are no longer repointed at
   Socket's registry artifact (hosted or vendored); they are skipped with a
   stays-unpatched warning, and rollback refuses such a pin from an older
@@ -550,6 +577,42 @@ limits, and required install commands.
   - Vendoring a scoped package into a pnpm 7/8 lock quotes its `name:`, and a
     re-vendor fixes locks written by earlier releases (#956). Quoted scoped
     aliases are refused like unscoped ones (#957).
+  - Hosted scans pin the per-member locks of a
+    `sharedWorkspaceLockfile: false` workspace from the workspace root
+    instead of reporting success with nothing pinned, and `list`, `vex`,
+    `rollback` and `remove` see those pins; an unlistable member set is
+    refused with `redirect_pnpm_member_locks_unresolved` (#492). With
+    `gitBranchLockfile` on and a `pnpm-lock.<branch>.yaml` present, hosted
+    and vendored modes refuse (`redirect_pnpm_git_branch_lockfile` /
+    `vendor_pnpm_git_branch_lockfile`) instead of pinning the stale
+    `pnpm-lock.yaml` (#556).
+  - A project under an ancestor `pnpm-workspace.yaml` whose `packages:`
+    globs do not list it (dot directories included) is patched standalone
+    again instead of being refused as a member (#1006). On pnpm 9.0–10.4,
+    where it would break `pnpm add`, the root-only `pnpm-workspace.yaml`
+    scaffold is no longer created (#734).
+  - Rush: hosted runs on pnpm 11+ give a Rush-specific trust remedy
+    (`pnpm_config_trust_lockfile=true rush install`,
+    `usePnpmFrozenLockfileForRushInstall`), re-issued on a re-run, and warn
+    `redirect_rush_repo_state_stale` for subspace `repo-state.json` files
+    (#713, #714).
+  - Hosted rollback and remove restore each entry from the registry the
+    project resolves it against (`.npmrc` `registry` / `@scope:registry`
+    and `pnpm-workspace.yaml` `registry` / `registries`, per pnpm major),
+    and write `tarball:` fields only when the installed pnpm would, warning
+    `upstream_pnpm_tarball_setting_guessed` when that is unknown (#919,
+    #902).
+  - Vendoring accepts a user's exact-version pin in `pnpm-workspace.yaml`
+    `overrides:` (quoted or commented too), edits only the project document
+    of a pnpm 11+ two-document lock (others are refused with
+    `vendor_pnpm_lock_multi_document`), and reverting a vendored package no
+    longer clobbers a vendored dependency's ref inside it (#854, #466,
+    #830). `scan`/`get --mode vendored --dry-run` preview a refused
+    hosted-to-vendored takeover as `would_refuse` (#853).
+  - Agent mode: `scan --mode agent <member-path>` finds the member's linked
+    copies (#778), `apply` and `rollback` no longer report a member-linked
+    package twice (#633), and global scans of pnpm 11+ patch every
+    `pnpm add -g` install's copy, not just one (#435).
 - PyPI:
   - `requirements.txt` includes are followed the way pip reads them: `-r` after
     other options, quoted paths, `${VAR}` expansion and UTF-16/BOM files
@@ -560,6 +623,18 @@ limits, and required install commands.
     skipped as absent by lock-only scans, and a UTF-16 export beside
     `uv.lock` is seen by vendored routing, `vendor --check` and `vex`
     instead of being attested over (#1119, #1120).
+  - A plain-ASCII `requirements.txt` whose coding line names any
+    ASCII-compatible codec Python knows (`iso-8859-15`, `cp1250`,
+    `mac-roman`, `gbk`, …) is read instead of treated as unreadable, so
+    scans no longer find nothing and `vex` and `rollback` see its hosted
+    pins (#1212).
+  - Pipenv projects with `use_pylock = true` are wired through
+    `Pipfile.lock`, which Pipenv installs from, instead of `pylock.toml`,
+    and a pylock-only Pipenv checkout is refused
+    (`redirect_pipenv_pylock_unsupported` /
+    `pypi_pipenv_pylock_unsupported`) and not attested, instead of
+    reporting success while `pipenv sync` installs the original release
+    (#912, #1122).
   - Hosted mode withholds platform-, ABI- and interpreter-bound wheels
     (`cp311-none-any`, manylinux) from cross-platform locks with
     `redirect_pypi_platform_wheel`; vendored mode gives `vendor_platform_locked`
@@ -584,14 +659,14 @@ limits, and required install commands.
     4.0.19+ no longer fail with "Your lockfile needs to be updated"; locks
     left out of order by earlier runs are healed on the next scan (#1186).
 - Project-mode crawls of a Cargo project with a `Cargo.lock`, a Go module
-  with a `go.sum` (and no `go.work` in effect), or a restored .NET project
-  (`obj/project.assets.json`) look up only the packages that project
-  resolves instead of walking the whole shared `$CARGO_HOME` registry,
-  `GOMODCACHE` or `~/.nuget/packages` cache, so agent mode no longer
-  patches, and VEX no longer attests, packages other projects downloaded.
-  Projects without a readable lock or restore, Go workspaces, `vendor/`
-  trees, solution roots and global mode keep the full walk (#1204, #1207,
-  #427).
+  with a `go.sum` (and no `go.work` in effect), a restored .NET project
+  (`obj/project.assets.json`) or a Deno project with a `deno.lock` look up
+  only the packages that project resolves instead of walking the whole
+  shared `$CARGO_HOME` registry, `GOMODCACHE`, `~/.nuget/packages` or JSR
+  cache, so scan and agent mode no longer patch, and VEX no longer
+  attests, packages other projects downloaded. Projects without a readable
+  lock or restore, Go workspaces, `vendor/` trees, solution roots and
+  global mode keep the full walk (#1204, #1207, #427, #1216).
 - `scan --mode agent --json` and `get --json` report files whose contents
   matched neither patch hash and were overwritten, as
   `content_mismatch_overwritten` entries in `warnings[]`, as `apply --json`
@@ -628,6 +703,8 @@ limits, and required install commands.
   - Hosted rollback/remove of Yarn Berry and vlt pins restore from the
     project's own registry (`npmRegistryServer`, the vlt node's registry),
     falling back to the default with `upstream_registry_fallback` (#908, #521).
+    The warning no longer includes `user:token@` credentials from the
+    registry URL.
   - Vendored npm-family tarballs are protected from `.gitignore` rules such as
     `*.tgz`; a vendor dir git would still ignore is refused up front with
     `vendor_artifact_gitignored` (#831).
