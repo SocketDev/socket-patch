@@ -39,7 +39,10 @@ Both modes retain the package version, extras, groups, markers and the
 lock unchanged (idempotent). Vendored rollback restores recorded fragments.
 Hosted rollback reconstructs
 upstream entries from registry metadata and may refuse after incompatible relocks;
-it does not keep the original lockfile bytes.
+it does not keep the original lockfile bytes. A `static_urls` lock whose project
+installs from a private index or mirror (`[[tool.pdm.source]]`, `pdm.toml`
+`pypi.url`, or mirror URLs on the lock's other packages) is refused rather than
+given PyPI's file URLs (#413): restore `pdm.lock` from version control.
 Refused before any write: a `[[package]]` locked at several versions (a marker
 fork), a user-authored `url`/`path`/VCS/`editable` source, an unsupported
 `lock_version` or `strategy`, hash-less `files`, malformed hashes, and a wheel
