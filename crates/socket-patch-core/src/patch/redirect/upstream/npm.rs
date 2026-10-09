@@ -743,6 +743,32 @@ async fn restore_berry(
         {
             lines = pinned;
         }
+        // The npm resolver's implicit `node-gyp` dependency, which the pin
+        // dropped (#737), comes back while the lock still holds the entry
+        // it resolves to; without it only `yarn install` can re-resolve
+        // that subtree.
+        if dist.node_gyp && !crate::formats::yarn::berry_entry::has_implicit_node_gyp(&lines) {
+            let resolvable = blocks.iter().any(|b| {
+                stanza_key(b).is_some_and(|k| {
+                    split_berry_key_patterns(k)
+                        .iter()
+                        .any(|p| p == "node-gyp@npm:latest")
+                })
+            });
+            if resolvable {
+                lines = crate::formats::yarn::berry_entry::with_implicit_node_gyp(&lines);
+            } else {
+                result.warnings.push((
+                    "yarn_berry_node_gyp_unresolved",
+                    format!(
+                        "{name}@{version}: yarn gives the restored registry entry an \
+                         implicit `node-gyp` dependency that {rel} no longer resolves; run \
+                         `yarn install` once to add it back (until then a hardened or \
+                         `--refresh-lockfile` install reports the lockfile as modified)"
+                    ),
+                ));
+            }
+        }
         if let Some(key) = key {
             lines[0] = format!("{key}:");
             moved.push(key);
@@ -2904,6 +2930,7 @@ mod tests {
                 tarball: tarball.to_string(),
                 integrity: None,
                 shasum: None,
+                node_gyp: false,
             },
             from_project,
         };

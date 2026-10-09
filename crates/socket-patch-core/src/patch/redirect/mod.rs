@@ -65,7 +65,8 @@ use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_lock
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::pnpm::plan_hosted;
-use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
+use crate::formats::yarn::berry_entry::{render_pinned_entry, Pin};
+use crate::formats::yarn::berry_prune::{cut_descriptors, prune_unreferenced};
 pub(crate) use crate::formats::yarn::is_berry_lock;
 pub mod gradle;
 #[cfg(test)]
@@ -4204,6 +4205,9 @@ fn rewrite_yarn_berry_with_manifests(
     // entries by key, so each one moves to its sorted position at the end.
     let mut moved_keys: Vec<String> = Vec::new();
     let mut changed = false;
+    // The dependency edges the pins cut (the registry entry's implicit
+    // `node-gyp`, #737): the entries only they reached go too.
+    let mut cut: Vec<String> = Vec::new();
     for dep in &npm {
         let fname = full_name(dep);
         // The API hands the prefixed `10c0/<hex>`; a yarn 4.0.x lock spells
@@ -4517,17 +4521,17 @@ fn rewrite_yarn_berry_with_manifests(
         // The entry yarn writes for those resolutions: the key, resolution
         // and checksum change, `bin:` comes from the served tarball's own
         // package.json when the caller fetched it (#718; yarn builds a
-        // tarball entry from it, not from the registry metadata), every
+        // tarball entry from it, not from the registry metadata), the npm
+        // resolver's implicit `node-gyp` dependency goes (#737), every
         // other field carries over, and all of them sit in yarn's order
         // (#697).
         let new_key = format!("\"{fname}@{}\"", dep.artifact_url);
         let key_line = format!("{new_key}:");
         let resolution = format!("{fname}@{}", dep.artifact_url);
-        let tarball_bin = manifests
+        let tarball_manifest = manifests
             .get(&dep.artifact_url)
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            .filter(Value::is_object)
-            .map(|manifest| manifest_bin(&manifest));
+            .filter(Value::is_object);
         let body: Vec<&str> = block.lines().skip(1).collect();
         let rewritten = render_pinned_entry(
             &body,
@@ -4535,10 +4539,11 @@ fn rewrite_yarn_berry_with_manifests(
                 key_line: &key_line,
                 resolution: &resolution,
                 checksum: checksum.as_deref(),
-                bin: tarball_bin.as_ref(),
+                manifest: tarball_manifest.as_ref(),
             },
         )
         .join("\n");
+        cut.extend(cut_descriptors(&block, &rewritten));
         for (selector, original) in pin.apply(manifest_obj, &dep.artifact_url) {
             manifest_changed = true;
             result.edits.push(FileEdit {
@@ -4575,6 +4580,42 @@ fn rewrite_yarn_berry_with_manifests(
             .confirmed_yarn_berry_uuids
             .insert(dep.patch_uuid.clone());
     }
+    if changed && !cut.is_empty() {
+        let protected: std::collections::BTreeSet<String> = manifest
+            .as_ref()
+            .and_then(|m| m.get("resolutions"))
+            .and_then(Value::as_object)
+            .map(|table| {
+                table
+                    .keys()
+                    .filter_map(|sel| {
+                        crate::formats::yarn::patterns::resolution_selector_target(sel)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for pruned in prune_unreferenced(&mut blocks, cut, &protected, &mut moved_keys) {
+            let key = stanza_key(&pruned.before)
+                .map(|k| k.trim_matches('"').to_string())
+                .unwrap_or_default();
+            result.edits.push(FileEdit {
+                path: "yarn.lock".into(),
+                kind: "redirect_yarn_berry_entry_pruned".into(),
+                action: if pruned.after.is_some() {
+                    "rewritten"
+                } else {
+                    "removed"
+                }
+                .into(),
+                key: Some(key),
+                original: Some(Value::String(doc.on_disk(&pruned.before).into_owned())),
+                new: pruned
+                    .after
+                    .map(|after| Value::String(doc.on_disk(&after).into_owned())),
+            });
+        }
+    }
     if changed {
         doc.stanzas = blocks;
         result
@@ -4596,6 +4637,7 @@ fn rewrite_yarn_berry_with_manifests(
                     result.files.remove("yarn.lock");
                     result.edits.retain(|e| {
                         e.kind != "redirect_yarn_berry_entry"
+                            && e.kind != "redirect_yarn_berry_entry_pruned"
                             && e.kind != "redirect_yarn_berry_resolution"
                     });
                     for dep in &npm {
@@ -22306,6 +22348,119 @@ packages:
             "{}",
             r.files["yarn.lock"]
         );
+    }
+
+    /// #737: a yarn 4.12.0 project depending on nan@2.22.0 and
+    /// bufferutil@4.0.8 (fixtures are yarn's own output). The registry
+    /// entries carry the npm resolver's implicit `node-gyp: "npm:latest"`,
+    /// which yarn never gives a tarball-locator entry, and with it gone the
+    /// whole node-gyp subtree is unreachable. Each pin must match the lock
+    /// yarn writes for the same `resolutions`, byte for byte.
+    #[test]
+    fn issue_737_pin_drops_the_implicit_node_gyp_and_the_subtree_only_it_reached() {
+        const BEFORE: &str =
+            include_str!("../../../tests/fixtures/yarn-berry-node-gyp-before.lock");
+        const NAN_ONLY: &str =
+            include_str!("../../../tests/fixtures/yarn-berry-node-gyp-nan-only.lock");
+        const BOTH: &str = include_str!("../../../tests/fixtures/yarn-berry-node-gyp-both.lock");
+        fn checksum_of(lock: &str, key: &str) -> String {
+            let at = lock.find(key).expect(key);
+            let line = lock[at..]
+                .lines()
+                .find(|l| l.starts_with("  checksum: "))
+                .unwrap();
+            line["  checksum: ".len()..].to_string()
+        }
+        let nan_url = berry_hosted_url("nan", "nan", "2.22.0");
+        let bu_url = berry_hosted_url("bufferutil", "bufferutil", "4.0.8");
+        let nan = berry_override(
+            "nan",
+            "2.22.0",
+            &nan_url,
+            &checksum_of(BEFORE, "\"nan@npm:2.22.0\":"),
+        );
+        let bu = berry_override(
+            "bufferutil",
+            "4.0.8",
+            &bu_url,
+            &checksum_of(BEFORE, "\"bufferutil@npm:4.0.8\":"),
+        );
+        let entries = berry_bin_entries(BEFORE);
+        assert!(berry_pin_needs_manifest(&entries, &nan));
+        assert!(berry_pin_needs_manifest(&entries, &bu));
+        let mut manifests = BTreeMap::new();
+        manifests.insert(
+            nan_url.clone(),
+            r#"{"name":"nan","version":"2.22.0","scripts":{"rebuild-tests":"node-gyp rebuild --directory test"}}"#
+                .to_string(),
+        );
+        manifests.insert(
+            bu_url.clone(),
+            r#"{"name":"bufferutil","version":"4.0.8","scripts":{"install":"node-gyp-build"},"dependencies":{"node-gyp-build":"^4.3.0"}}"#
+                .to_string(),
+        );
+        let ours = |lock: &str| {
+            lock.replace("https://registry.npmjs.org/nan/-/nan-2.22.0.tgz", &nan_url)
+                .replace(
+                    "https://registry.npmjs.org/bufferutil/-/bufferutil-4.0.8.tgz",
+                    &bu_url,
+                )
+        };
+        let files = berry_files(BEFORE.to_string(), berry_manifest());
+
+        // nan alone: bufferutil still reaches node-gyp, so only the
+        // dependency line goes.
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&nan),
+            &manifests,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.files["yarn.lock"], ours(NAN_ONLY));
+        assert!(!r
+            .edits
+            .iter()
+            .any(|e| e.kind == "redirect_yarn_berry_entry_pruned"));
+
+        // Both: nothing reaches node-gyp any more, and yarn drops its
+        // subtree (shared entries such as minipass stay while reached).
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            &[nan.clone(), bu.clone()],
+            &manifests,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.files["yarn.lock"], ours(BOTH));
+        let pruned: Vec<&FileEdit> = r
+            .edits
+            .iter()
+            .filter(|e| e.kind == "redirect_yarn_berry_entry_pruned")
+            .collect();
+        // 20 entries go; minipass's shared key first loses one descriptor
+        // (one edit), then the other (a second).
+        assert_eq!(
+            pruned.iter().filter(|e| e.action == "removed").count(),
+            20,
+            "{pruned:#?}"
+        );
+        assert_eq!(
+            pruned
+                .iter()
+                .filter(|e| e.action == "rewritten")
+                .filter_map(|e| e.key.as_deref())
+                .collect::<Vec<_>>(),
+            ["minipass@npm:^7.0.4, minipass@npm:^7.1.2"],
+            "{pruned:#?}"
+        );
+        assert!(pruned.iter().all(|e| e.original.is_some()));
+
+        // Re-running on the pinned lock is a no-op.
+        let pinned = berry_files(
+            r.files["yarn.lock"].clone(),
+            r.files["package.json"].clone(),
+        );
+        let again = rewrite_registry_redirect_with_python_metadata(&pinned, &[nan, bu], &manifests);
+        assert!(!again.files.contains_key("yarn.lock"), "{:?}", again.files);
     }
 
     /// Only an entry the berry pin would re-key, with a `bin:` map, needs the
