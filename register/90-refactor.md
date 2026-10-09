@@ -14,7 +14,7 @@ _Last updated 2026-10-09T12:45Z · main @ a80b89e_
 
 **Merged:** #1227 (E16 slice 2), #1221 (E19 hosted gem), #1230 (E93 `PurlKey`), #1217/#1209/#1205/#1183 (E05 Deno, Go, cargo, NuGet crawls); 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
 
-**Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk). Since the 2026-10-08 backlog review, standalone refactor issues are closed as `not_planned` and kept as checklist items of their tracker; rank the tracker's next unchecked item.
+**Queue** (score = 3B + 2U + 2D + S − risk). Since the 2026-10-08 backlog review, standalone refactor issues are closed as `not_planned` and kept as checklist items of their tracker; rank the tracker's next unchecked item.
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
@@ -24,7 +24,7 @@ _Last updated 2026-10-09T12:45Z · main @ a80b89e_
 | 4 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1009, #1026, #1180, #1242, #1254, #1259) |
 | 5 | #823 (C47): last 5 free `scrub_socket_env` copies onto `hermetic::command` | 0 | 0 | ≈5 | L | ≈10 | skipped: `spawn_env_hygiene.rs` (#1049) |
 
-Re-ranked 2026-10-09T12:00Z at `a80b89e` against 32 open PRs (131 production files changed). #989's remaining backends, #1220 and #675 (`scan/mod.rs` #1211, #1049) stay skipped. Also skipped by file overlap: #1114/E91 (`vendor/pypi.rs` #1026, `lock_inventory/tests.rs`), #1129/E92 (`npm_crawler.rs` #1009), #1098/E90 (`ecosystem_dispatch.rs`, `vex_consumed.rs`), E12 (`pnpm_lock.rs` #1245) and the earlier #675/#705/#794/#594/#757/#782 set. Free but low: #905 slice 4 (`npmrc.rs`, `pypi_other.rs`), E37 composer `normalize_version`, #782 slice 2 (`go_sum_edit::remove_lines`, `copy_manifest_tag`).
+Re-ranked 2026-10-09T12:00Z at `a80b89e` against 32 open PRs (131 production files changed). #989's remaining backends, #1220 and #675 (`scan/mod.rs` #1211, #1049) stay skipped. Also skipped by file overlap: #1114/E91 (`vendor/pypi.rs` #1026, `lock_inventory/tests.rs`), #1129/E92 (`npm_crawler.rs` #1009), #1098/E90 (`ecosystem_dispatch.rs`, `vex_consumed.rs`), E12 (`pnpm_lock.rs` #1245). Free but low: #905 slice 4 (`npmrc.rs`, `pypi_other.rs`), E37 composer `normalize_version`, #782 slice 2 (`go_sum_edit::remove_lines`, `copy_manifest_tag`).
 
 **Notes:**
 - Gradle line endings (#1264): `gradle::eol` is gone; Gradle writers insert with `line_endings::terminator` and find what they wrote with `line_endings::respell(text, terminator(current))`, compare owned files with `line_endings::eol_eq`. Keep forward and revert on the same rule.
