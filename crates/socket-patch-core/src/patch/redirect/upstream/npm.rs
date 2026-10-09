@@ -547,6 +547,9 @@ async fn restore_berry(
         version: String,
         key: Option<String>,
         selectors: Vec<String>,
+        /// A tarball-URL pin, whose `bin:` the pin took from the served
+        /// tarball's own manifest (#718), not the registry's.
+        url_pin: bool,
     }
     let mut hits: Vec<Hit> = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
@@ -642,6 +645,7 @@ async fn restore_berry(
             version,
             key: restored_key,
             selectors,
+            url_pin,
         });
     }
     // The registry's `dist.tarball` decides the restored locator: yarn binds
@@ -664,6 +668,7 @@ async fn restore_berry(
         version,
         key,
         selectors,
+        url_pin,
     } in hits
     {
         if result.refused.contains_key(&uuid) {
@@ -691,10 +696,9 @@ async fn restore_berry(
         let Some(dist) = dists.get(&(name.clone(), version.clone())).map(|d| &d.dist) else {
             continue;
         };
-        let resolution = format!(
-            "  resolution: \"{}\"",
-            berry_registry_locator(project_registry.as_deref(), &name, &version, &dist.tarball)
-        );
+        let locator =
+            berry_registry_locator(project_registry.as_deref(), &name, &version, &dist.tarball);
+        let resolution = format!("  resolution: \"{locator}\"");
         let mut lines = stanza_lines(&blocks[idx]);
         if let Some(pinned) = with_body_field(&lines, "resolution", &resolution) {
             lines = pinned;
@@ -703,6 +707,31 @@ async fn restore_berry(
             with_body_field(&lines, "checksum", &format!("  checksum: {checksum}"))
         {
             lines = pinned;
+        }
+        if let Some(key) = key {
+            lines[0] = format!("{key}:");
+            moved.push(key);
+        }
+        // The tarball-URL pin wrote the served tarball's `bin:` (#718);
+        // yarn writes the version document's for the `npm:` entry (#1131).
+        // Only `bin` comes from the version document here: the manifest
+        // declares `node-gyp` so `render_pinned_entry` keeps the entry's
+        // dependencies as they are, and the re-add below decides the
+        // implicit one (#737).
+        if url_pin {
+            use crate::formats::yarn::berry_entry::{render_pinned_entry, Pin};
+            lines = render_pinned_entry(
+                &lines[1..],
+                &Pin {
+                    key_line: &lines[0],
+                    resolution: &locator,
+                    checksum: None,
+                    manifest: Some(&serde_json::json!({
+                        "bin": &dist.bin,
+                        "dependencies": { "node-gyp": "" },
+                    })),
+                },
+            );
         }
         // The npm resolver's implicit `node-gyp` dependency, which the pin
         // dropped (#737), comes back while the lock still holds the entry
@@ -729,10 +758,6 @@ async fn restore_berry(
                     ),
                 ));
             }
-        }
-        if let Some(key) = key {
-            lines[0] = format!("{key}:");
-            moved.push(key);
         }
         blocks[idx] = lines.join("\n");
         if !selectors.is_empty() {
@@ -2891,6 +2916,7 @@ mod tests {
                 tarball: tarball.to_string(),
                 integrity: None,
                 shasum: None,
+                bin: Default::default(),
                 node_gyp: false,
             },
             from_project,

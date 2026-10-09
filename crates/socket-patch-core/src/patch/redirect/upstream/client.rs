@@ -21,6 +21,11 @@ pub(crate) struct NpmDist {
     pub integrity: Option<String>,
     /// The hex sha1 `dist.shasum`.
     pub shasum: Option<String>,
+    /// The version document's `bin`, as yarn reads a manifest's
+    /// ([`crate::formats::yarn::berry_entry::manifest_bin`]): what yarn
+    /// berry writes in the `bin:` section of the version's `npm:` entry
+    /// (#1131). Empty when the document declares none.
+    pub bin: std::collections::BTreeMap<String, String>,
     /// Whether yarn's npm resolver gives this version the implicit
     /// `node-gyp: "npm:latest"` dependency (see
     /// `formats::yarn::berry_entry::registry_adds_node_gyp`, #737).
@@ -299,6 +304,7 @@ impl UpstreamClient {
             tarball,
             integrity: str_field("integrity"),
             shasum: str_field("shasum"),
+            bin: crate::formats::yarn::berry_entry::manifest_bin(&doc),
             node_gyp: crate::formats::yarn::berry_entry::registry_adds_node_gyp(&doc),
         })
     }
@@ -847,6 +853,7 @@ mod tests {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: registry_sri,
                     shasum: registry_sha1,
+                    bin: Default::default(),
                     node_gyp: false,
                 }),
             );
@@ -908,6 +915,7 @@ mod tests {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: Some("sha512-other".into()),
                     shasum: None,
+                    bin: Default::default(),
                     node_gyp: false,
                 }),
             );
