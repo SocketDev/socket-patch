@@ -786,7 +786,20 @@ fn jvm_pom(arts: &[Pkg], p: &Pkg) -> String {
 pub fn build_maven(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
     let arts = jvm_universe("maven", size);
     let mut pom = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project xmlns=\"http://maven.apache.org/POM/4.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>dev.socket.bench</groupId>\n  <artifactId>bench-app</artifactId>\n  <version>1.0.0</version>\n  <packaging>jar</packaging>\n\n  <properties>\n    <maven.compiler.release>17</maven.compiler.release>\n  </properties>\n\n  <dependencies>\n");
-    for p in arts.iter().filter(|p| p.direct) {
+    // A project-mode crawl keeps only what the project's poms reach (#265),
+    // so every cached artifact the direct dependencies do not reach is
+    // declared directly too: the fixture's whole cache is the project's.
+    let mut reached = vec![false; arts.len()];
+    let mut queue: Vec<usize> = (0..arts.len()).filter(|&i| arts[i].direct).collect();
+    while let Some(i) = queue.pop() {
+        if !std::mem::replace(&mut reached[i], true) {
+            queue.extend(arts[i].deps.iter().copied());
+        }
+    }
+    for (i, p) in arts.iter().enumerate() {
+        if !p.direct && reached[i] {
+            continue;
+        }
         let (g, a) = ga(p);
         let _ = write!(pom, "    <dependency>\n      <groupId>{g}</groupId>\n      <artifactId>{a}</artifactId>\n      <version>{}</version>\n    </dependency>\n", p.version);
     }

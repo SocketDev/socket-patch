@@ -958,9 +958,26 @@ impl MavenCrawler {
             // on the walk pool so concurrently crawled ecosystems keep
             // making progress (the dedup set rides along and comes back).
             let (found, returned_seen) = run_walk(move || {
-                let scope =
-                    scope_cwd.and_then(|cwd| super::maven_scope::project_scope(&cwd, &root.path));
-                let mut found = MavenCrawler.scan_cache_root(&root, &mut seen);
+                // The scope reads a pom per reachable artifact while the scan
+                // only walks directories: run them side by side.
+                let shared = std::sync::Mutex::new(seen);
+                let mut halves = par_map(vec![false, true], |scope_half| {
+                    if scope_half {
+                        let scope = scope_cwd
+                            .as_ref()
+                            .and_then(|cwd| super::maven_scope::project_scope(cwd, &root.path));
+                        (None, scope)
+                    } else {
+                        let mut seen = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        (Some(MavenCrawler.scan_cache_root(&root, &mut seen)), None)
+                    }
+                });
+                let scope = halves.pop().and_then(|(_, scope)| scope);
+                let mut found = halves
+                    .pop()
+                    .and_then(|(found, _)| found)
+                    .unwrap_or_default();
+                let seen = shared.into_inner().unwrap_or_else(|e| e.into_inner());
                 if let Some(scope) = scope {
                     found.retain(|p| {
                         scope.admits(

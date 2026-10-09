@@ -609,6 +609,14 @@ pub fn contains_module(read: ReadFn<'_>, rel: &str) -> bool {
 
 pub(crate) type Gav = (String, String, String);
 
+/// `(groupId, artifactId, version, relativePath)` of a pom's `<parent>`.
+pub(crate) type PomParent = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// One `<dependency>` of a [`PomModel`], as written (no interpolation).
 #[derive(Debug, Clone)]
 pub(crate) struct PomDecl {
@@ -630,12 +638,7 @@ pub(crate) struct PomModel {
     pub artifact: Option<String>,
     pub version: Option<String>,
     /// `(groupId, artifactId, version, relativePath)` of `<parent>`.
-    pub parent: Option<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )>,
+    pub parent: Option<PomParent>,
     pub props: BTreeMap<String, String>,
     pub deps: Vec<PomDecl>,
     pub managed: Vec<PomDecl>,

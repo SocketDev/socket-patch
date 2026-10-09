@@ -10,9 +10,9 @@ pub mod ivy_cache;
 pub mod jvm_cache;
 mod listing;
 pub mod maven_crawler;
-pub(crate) mod maven_scope;
 #[cfg(test)]
 mod maven_pom_equivalence_tests;
+pub(crate) mod maven_scope;
 pub mod npm_crawler;
 pub mod nuget_crawler;
 #[cfg(test)]

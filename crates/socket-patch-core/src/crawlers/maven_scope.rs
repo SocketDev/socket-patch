@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::vendor::jvm::maven_reactor::{pom_model, PomDecl, PomModel};
 
@@ -81,7 +81,7 @@ pub(crate) fn project_scope(cwd: &Path, repo: &Path) -> Option<ProjectScope> {
 /// A pom and where it was read from.
 #[derive(Clone)]
 struct Node {
-    model: Rc<PomModel>,
+    model: Arc<PomModel>,
     /// The pom's file (for relative parent paths of reactor poms).
     path: PathBuf,
     /// Read from the checkout (a reactor pom or a local parent).
@@ -95,7 +95,7 @@ struct Walk<'w> {
     cwd: &'w Path,
     repo: &'w Path,
     /// Parsed poms by path (`None`: missing or unreadable).
-    models: HashMap<PathBuf, Option<Rc<PomModel>>>,
+    models: HashMap<PathBuf, Option<Arc<PomModel>>>,
     scope: ProjectScope,
     queue: VecDeque<Gav>,
     queued: HashSet<Gav>,
@@ -106,17 +106,27 @@ struct Walk<'w> {
 }
 
 impl Walk<'_> {
-    fn model(&mut self, path: &Path, include_profiles: bool) -> Option<Rc<PomModel>> {
+    fn model(&mut self, path: &Path, include_profiles: bool) -> Option<Arc<PomModel>> {
         if let Some(found) = self.models.get(path) {
             return found.clone();
         }
-        let parsed = crate::utils::fs::read_regular_to_bytes_sync(path)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|text| pom_model(&text, include_profiles).ok())
-            .map(Rc::new);
+        let parsed = read_model(path, include_profiles);
         self.models.insert(path.to_path_buf(), parsed.clone());
         parsed
+    }
+
+    /// Read and parse the repository poms of `gavs` not read yet.
+    fn prefetch(&mut self, gavs: &[Gav]) {
+        let paths: Vec<PathBuf> = gavs
+            .iter()
+            .filter_map(|gav| self.repo_pom(gav))
+            .filter(|path| !self.models.contains_key(path))
+            .collect();
+        let parsed = paths.into_iter().map(|path| {
+            let model = read_model(&path, false);
+            (path, model)
+        });
+        self.models.extend(parsed);
     }
 
     /// Whether `path` stays inside the checkout (lexically).
@@ -228,9 +238,7 @@ impl Walk<'_> {
                 if !module.ends_with(".xml") {
                     path = path.join("pom.xml");
                 }
-                if !self.inside(&path)
-                    || !seen.insert(path.clone())
-                {
+                if !self.inside(&path) || !seen.insert(path.clone()) {
                     continue;
                 }
                 if let Some(model) = self.model(&path, true) {
@@ -341,6 +349,12 @@ impl Walk<'_> {
     fn enqueue(&mut self, g: &str, a: &str, version: Option<String>) {
         match version.filter(|v| !is_range(v)) {
             Some(v) => {
+                // A hosted pin `<base>-socket.<hex8>` (written by an earlier
+                // scan) resolves the patched base release: keep the base in
+                // scope, so a rescan still sees the package it pinned.
+                if let Some((base, _)) = crate::formats::maven::split_socket_version(&v) {
+                    self.enqueue(g, a, Some(base.to_string()));
+                }
                 let gav = (g.to_string(), a.to_string(), v);
                 if self.queued.insert(gav.clone()) {
                     self.queue.push_back(gav);
@@ -378,16 +392,28 @@ impl Walk<'_> {
 
     /// Walk the queued artifacts' own dependencies.
     fn run(&mut self) -> Option<()> {
-        while let Some(gav) = self.queue.pop_front() {
+        while !self.queue.is_empty() {
+            let wave: Vec<Gav> = self.queue.drain(..).collect();
+            self.prefetch(&wave);
+            for gav in wave {
+                self.visit(gav)?;
+            }
+        }
+        Some(())
+    }
+
+    /// Admit `gav` and queue its own transitive dependencies.
+    fn visit(&mut self, gav: Gav) -> Option<()> {
+        {
             if self.scope.gavs.len() > MAX_NODES {
                 return None;
             }
             self.admit(&gav);
             let Some(path) = self.repo_pom(&gav) else {
-                continue;
+                return Some(());
             };
             let Some(model) = self.model(&path, false) else {
-                continue;
+                return Some(());
             };
             let chain = self.chain(Node {
                 model,
@@ -405,6 +431,15 @@ impl Walk<'_> {
         }
         Some(())
     }
+}
+
+/// The pom at `path` parsed, when it is readable.
+fn read_model(path: &Path, include_profiles: bool) -> Option<Arc<PomModel>> {
+    crate::utils::fs::read_regular_to_bytes_sync(path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| pom_model(&text, include_profiles).ok())
+        .map(Arc::new)
 }
 
 fn is_import(decl: &PomDecl) -> bool {
@@ -700,6 +735,33 @@ mod tests {
         assert!(scope.admits("org.example", "undefined", "2"));
         assert!(scope.admits("org.example", "ranged", "1.5"));
         assert!(!scope.admits("org.example", "other", "1"));
+    }
+
+    #[test]
+    fn a_hosted_pin_keeps_its_base_release_in_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cwd, repo) = (dir.path().join("p"), dir.path().join("m2"));
+        write(
+            &cwd,
+            "pom.xml",
+            &pom(
+                "com.example",
+                "app",
+                "1",
+                &deps(&[dep("org.example", "lib", Some("1.0-socket.4d5e6f70"), "")]),
+            ),
+        );
+        cache(
+            &repo,
+            "org.example",
+            "lib",
+            "1.0",
+            &deps(&[dep("org.example", "transitive", Some("2"), "")]),
+        );
+        cache(&repo, "org.example", "transitive", "2", "");
+        let scope = project_scope(&cwd, &repo).unwrap();
+        assert!(scope.admits("org.example", "lib", "1.0"));
+        assert!(scope.admits("org.example", "transitive", "2"));
     }
 
     #[test]
