@@ -29,6 +29,61 @@ pub fn crawl_covers_purl(purl: &str) -> bool {
     Ecosystem::from_purl(purl).is_some()
 }
 
+/// Of `purls` (manifest keys), the Cargo ones whose agent-mode in-place
+/// patch is still on disk: a copy [`find_all_packages_for_rollback`]
+/// locates (`$CARGO_HOME/registry/src`, or a `cargo vendor` dir) with at
+/// least one patched file at its record's afterHash. Sorted.
+///
+/// Cargo is the one ecosystem whose patched copy outlives the project's
+/// use of it: the registry cache is shared machine-wide and nothing
+/// deletes a crate from it when a project vendors the crate (#336) or
+/// stops locking it (#1278). Its manifest record holds the only
+/// before-blobs that can restore that copy, so callers about to drop the
+/// record must first restore the copy (`rollback`) or keep the record
+/// (`scan --prune`). Located the way rollback restores, not by the
+/// lock-scoped crawl, so a crate the lock no longer resolves is found.
+/// A vendored crate's committed copy under `.socket/vendor/` is never one
+/// of these locations.
+pub async fn cargo_copies_still_patched<'a>(
+    manifest: &socket_patch_core::manifest::schema::PatchManifest,
+    purls: impl IntoIterator<Item = &'a String>,
+    options: &CrawlerOptions,
+    blobs_path: &std::path::Path,
+) -> Vec<String> {
+    use socket_patch_core::patch::rollback::{verify_file_rollback, VerifyRollbackStatus};
+    let cargo: Vec<String> = purls
+        .into_iter()
+        .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
+        .filter(|p| manifest.patches.contains_key(p.as_str()))
+        .cloned()
+        .collect();
+    if cargo.is_empty() {
+        return Vec::new();
+    }
+    let partitioned = HashMap::from([(Ecosystem::Cargo, cargo)]);
+    let found = find_all_packages_for_rollback(&partitioned, options, true).await;
+    let mut patched = Vec::new();
+    for (purl, paths) in &found {
+        let Some(record) = manifest.patches.get(purl) else {
+            continue;
+        };
+        'copies: for path in paths {
+            for (file, info) in &record.files {
+                let v = verify_file_rollback(path, file, info, blobs_path).await;
+                if matches!(
+                    v.status,
+                    VerifyRollbackStatus::Ready | VerifyRollbackStatus::MissingBlob
+                ) {
+                    patched.push(purl.clone());
+                    break 'copies;
+                }
+            }
+        }
+    }
+    patched.sort();
+    patched
+}
+
 /// Partition PURLs by ecosystem, filtering by the `--ecosystems` flag if set.
 pub fn partition_purls(
     purls: &[String],

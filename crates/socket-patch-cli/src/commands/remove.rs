@@ -595,7 +595,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     // ── nested in-place rollback ────────────────────────────────────────
     // Vendor-owned purls are excluded from the in-place restore (the
-    // vendored leg below reverts them); an unreadable ledger degrades to
+    // vendored leg below reverts them) unless their Cargo shared-cache copy
+    // still carries an agent-mode patch (#336); an unreadable ledger degrades to
     // "nothing vendored" here and fails closed at that leg.
     let vendored_keys: HashSet<PurlKey> = vendor_state_result
         .as_ref()

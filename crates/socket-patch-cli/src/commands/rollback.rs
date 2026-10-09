@@ -1502,6 +1502,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     if vendored_excluded.contains(purl) {
                         return vendored_reverted_ok(purl);
                     }
+                    // A vendored Cargo crate whose shared-cache copy the
+                    // in-place leg restored too (#336) needs BOTH legs done.
+                    if purl_keys_cover(&vendored_keys, purl) && !vendored_reverted_ok(purl) {
+                        return false;
+                    }
                     succeeded_purls.contains(*purl)
                         || not_installed.contains(purl)
                         || superseded.contains(purl)
@@ -1947,7 +1952,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
 /// The in-place (agent) rollback engine over an already-loaded `manifest`.
 /// `vendored_keys` is the ledger's ownership set (see
 /// [`VendorState::purl_keys`]): vendor-owned purls are excluded from the
-/// in-place restore. Both `run()` and `remove`'s delegation load each
+/// in-place restore, except a vendored Cargo crate whose shared-cache copy
+/// still carries an agent-mode patch (#336). Both `run()` and `remove`'s delegation load each
 /// store once under the lock and thread it in here.
 pub(crate) async fn rollback_patches_inner(
     common: &GlobalArgs,
@@ -2018,9 +2024,28 @@ pub(crate) async fn rollback_patches_inner(
     // ledger-key / base-purl / qualifier-stripped triple; the caller
     // degrades unreadable state to "nothing vendored".
     let is_vendored = |p: &str| purl_keys_cover(vendored_keys, p);
-    let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
+    let (vendored_targets, mut patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
         .into_iter()
         .partition(|p| is_vendored(&p.purl));
+    // Except a vendored Cargo crate whose shared registry-cache copy still
+    // carries an earlier agent-mode patch (#336): vendoring never touched
+    // that copy, and the manifest record about to be dropped holds the only
+    // before-blobs that can restore it. Only a copy that is actually
+    // patched is restored — the vendored copy under `.socket/vendor/` is
+    // never a rollback location — so a plain vendored crate (cache copy
+    // absent or pristine) is skipped exactly as before.
+    let vendored_purls: Vec<String> = vendored_targets.iter().map(|p| p.purl.clone()).collect();
+    let cache_patched = crate::ecosystem_dispatch::cargo_copies_still_patched(
+        manifest,
+        &vendored_purls,
+        &common.crawler_options(),
+        &blobs_path,
+    )
+    .await;
+    let (cache_targets, vendored_targets): (Vec<_>, Vec<_>) = vendored_targets
+        .into_iter()
+        .partition(|p| cache_patched.contains(&p.purl));
+    patches_to_rollback.extend(cache_targets);
     let mut vendored_skipped: Vec<String> = vendored_targets.into_iter().map(|p| p.purl).collect();
     vendored_skipped.sort();
     if patches_to_rollback.is_empty() {
