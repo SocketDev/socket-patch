@@ -34,11 +34,15 @@ use crate::ecosystem_dispatch::{
     crawl_ecosystems, crawl_ecosystems_with_npm, find_all_packages_for_rollback_reusing,
     partition_purls,
 };
-use crate::json_envelope::{usage_error, Command as JsonCommand};
+use crate::json_envelope::{
+    usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction, PatchEvent,
+    RunWarning, VexSummary,
+};
 use crate::ui::{self, plural, print_json, StatusLine};
 
 use crate::commands::agent_download::{
-    download_and_apply_patches_with, DownloadParams, DownloadRun,
+    download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
+    ALREADY_IN_MANIFEST,
 };
 
 use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
@@ -67,16 +71,13 @@ pub(crate) use self::discovery::{
     lockfile_supplement as project_lockfile_supplement, unsupported_layout_warnings,
     vendored_ledger_supplement as project_vendored_supplement,
 };
-use self::gc::gc_json;
+use self::gc::gc_into;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
 use self::vendor_flow::{
-    boxed_vendor_interactive_path, boxed_vendor_json_path, fold_vendored_skips_into_apply,
-    partition_skipped_selected,
+    boxed_vendor_interactive_path, boxed_vendor_json_path, partition_skipped_selected,
 };
-pub(crate) use self::vendor_flow::{
-    boxed_vendor_step, preview_vendor_json, print_dry_run_refusals, VendorStep,
-};
+pub(crate) use self::vendor_flow::{boxed_vendor_step, preview_vendor, VendorStep};
 
 /// Packages per batch request on the authenticated API when `--batch-size`
 /// is not given: the server's own per-request maximum
@@ -308,20 +309,45 @@ pub struct ScanArgs {
 
 pub(crate) use socket_patch_core::policy::package_spec_matches;
 
+/// Warning code: `--vex` was requested on a `--dry-run`, which generates
+/// no document (a preview neither verifies nor writes an attestation).
+pub(super) const VEX_SKIPPED_DRY_RUN: &str = "vex_skipped_dry_run";
+
+/// The [`VEX_SKIPPED_DRY_RUN`] warning.
+pub(super) fn vex_dry_run_warning() -> RunWarning {
+    RunWarning::new(
+        VEX_SKIPPED_DRY_RUN,
+        "--vex was not generated: a dry run changes nothing to attest",
+    )
+}
+
+/// The one `--json` emitter of `scan`: every document it prints is this
+/// [`Envelope`], printed here once per run.
+pub(super) fn emit_scan(env: &Envelope) {
+    print_json(&env.to_value());
+}
+
+/// A fresh `scan` envelope (`dryRun` from the flags).
+pub(super) fn scan_envelope(common: &GlobalArgs) -> Envelope {
+    let mut env = Envelope::new(JsonCommand::Scan);
+    env.dry_run = common.dry_run;
+    env
+}
+
 /// Embedded-VEX side-effect for `scan`'s JSON terminal returns. When
 /// `--vex` was requested and `base_code` is 0, generate the OpenVEX
 /// document from the post-scan manifest and fold the outcome into
-/// `result` — a `vex` object on success, or `status: "error"` + `error`
+/// `env` — its `vex` summary on success, or `status: "error"` + `error`
 /// on failure (per the fail-the-command contract). Returns the final exit
 /// code: `base_code` when not requested / skipped / on VEX success, `1`
-/// when VEX generation failed. Caller prints `result` after this returns.
+/// when VEX generation failed. Caller prints `env` after this returns.
 async fn embed_vex_into_json(
     common: &GlobalArgs,
     vex_args: &VexEmbedArgs,
     api_client: &ApiClient,
     manifest_path: &Path,
     base_code: i32,
-    result: &mut serde_json::Value,
+    env: &mut Envelope,
     hosted: bool,
 ) -> i32 {
     if vex_args.vex.is_none() || base_code != 0 {
@@ -329,11 +355,10 @@ async fn embed_vex_into_json(
     }
     // A dry run is a non-mutating preview: generating here would verify the
     // deliberately untouched tree (failing outright on a not-yet-vendored
-    // project) and write an attestation file to disk. The marker keeps the
-    // request visible to JSON consumers instead of silently dropping it
-    // (same shape as the vendor JSON arm's early return).
+    // project) and write an attestation file to disk. The warning keeps the
+    // request visible to JSON consumers instead of silently dropping it.
     if common.dry_run {
-        result["vex"] = serde_json::json!({ "skipped": true, "reason": "dry_run" });
+        env.warnings.push(vex_dry_run_warning());
         return base_code;
     }
     let mut params = vex_args.to_build_params(Some(api_client));
@@ -342,26 +367,24 @@ async fn embed_vex_into_json(
     params.hosted_gem_mirror_check = hosted;
     match generate_vex_from_manifest_path(common, &params, manifest_path).await {
         Ok(summary) => {
-            result["vex"] = serde_json::json!({
-                "path": vex_args.vex.as_ref().expect("--vex is Some: guarded by the early return above").display().to_string(),
-                "statements": summary.statements,
-                "format": "openvex-0.2.0",
+            // `vex.warnings`: note_warning suppressed these on stderr under
+            // --json, so this is their only surviving channel.
+            env.vex = Some(VexSummary {
+                path: vex_args
+                    .vex
+                    .as_ref()
+                    .expect("--vex is Some: guarded by the early return above")
+                    .display()
+                    .to_string(),
+                statements: summary.statements,
+                format: "openvex-0.2.0".to_string(),
+                warnings: summary.warnings,
             });
-            // Same additive `warnings` key the envelope's `VexSummary`
-            // carries (skip-if-empty): note_warning suppressed these on
-            // stderr under --json, so this is their only surviving channel.
-            if !summary.warnings.is_empty() {
-                result["vex"]["warnings"] = serde_json::to_value(&summary.warnings)
-                    .expect("RunWarning is a plain string struct: serialization cannot fail");
-            }
             0
         }
         Err(e) => {
-            crate::json_envelope::set_error(
-                result,
-                crate::json_envelope::EnvelopeError::new(e.code.to_string(), e.message.clone()),
-            );
-            append_vex_error_warnings(result, &e.embedded_warnings());
+            env.mark_error(EnvelopeError::new(e.code.to_string(), e.message.clone()));
+            append_vex_error_warnings(env, &e.embedded_warnings());
             1
         }
     }
@@ -369,23 +392,11 @@ async fn embed_vex_into_json(
 
 /// Fold a failed embedded VEX's run-level advisories (the lockfile
 /// discovery diagnostics — often the only explanation of a
-/// `vendor_unwired` / `redirect_unwired` omission) into the scan JSON's
+/// `vendor_unwired` / `redirect_unwired` omission) into the envelope's
 /// top-level `warnings[]`, the channel `--json` has once stderr is
-/// silenced. Appends to an existing array (layout refusals) or creates it.
-pub(super) fn append_vex_error_warnings(
-    result: &mut serde_json::Value,
-    warnings: &[crate::json_envelope::RunWarning],
-) {
-    if warnings.is_empty() {
-        return;
-    }
-    let extra = warnings
-        .iter()
-        .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail }));
-    match result.get_mut("warnings").and_then(|w| w.as_array_mut()) {
-        Some(existing) => existing.extend(extra),
-        None => result["warnings"] = serde_json::Value::Array(extra.collect()),
-    }
+/// silenced.
+pub(super) fn append_vex_error_warnings(env: &mut Envelope, warnings: &[RunWarning]) {
+    env.warnings.extend(warnings.iter().cloned());
 }
 
 /// Embedded-VEX side-effect for `scan`'s human-readable terminal returns.
@@ -464,7 +475,7 @@ async fn discover_selected(
     warn: bool,
     detail_error_line: bool,
     telemetry: &mut PendingTelemetry,
-    json_warnings: Option<&mut serde_json::Value>,
+    json_warnings: Option<&mut Envelope>,
 ) -> Result<Discovered, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
@@ -489,32 +500,27 @@ async fn discover_selected(
     // Some queries failed, some succeeded: a `--json` run has no stderr
     // warning (`warn` is human-only), so each failed package becomes a
     // run-level `warnings[]` entry — never a silent drop from the envelope.
-    let fetched = all_search_results.len();
     let offers = select_accessible(all_search_results, can_access_paid_patches, policy);
-    if let Some(result) = json_warnings {
+    if let Some(env) = json_warnings {
         for (purl, e) in &failures {
-            push_scan_json_warning(
-                result,
+            env.warn(
                 PATCH_DETAILS_FAILED,
-                &format!("could not fetch details for {purl}: {e}"),
+                format!("could not fetch details for {purl}: {e}"),
             );
         }
-        policy.fold_into_json(result);
+        policy.fold_into_envelope(env);
     }
     Ok(Discovered {
         offers,
-        fetched,
         failed: failures,
     })
 }
 
-/// [`discover_selected`]'s result: the offers, how many records came back
-/// (before the tier filter), and each failed detail query as `(purl,
-/// error)` (a failure for a package with no recorded patch makes a capped
-/// run's data incomplete).
+/// [`discover_selected`]'s result: the offers and each failed detail
+/// query as `(purl, error)` (a failure for a package with no recorded
+/// patch makes a capped run's data incomplete).
 struct Discovered {
     offers: rollout::Offers,
-    fetched: usize,
     failed: Vec<(String, String)>,
 }
 
@@ -541,7 +547,7 @@ fn classified_rows(
     recorded: &rollout::RecordedState<'_>,
     batch_failed: bool,
     packages: &[BatchPackagePatches],
-    result: Option<&mut serde_json::Value>,
+    result: Option<&mut Envelope>,
 ) -> Vec<rollout::Row> {
     let failed: Vec<String> = discovered
         .failed
@@ -550,9 +556,9 @@ fn classified_rows(
         .collect();
     stage.incomplete = rollout::lookup_incomplete(&recorded.index, &failed, batch_failed);
     let rows = rollout::classify(&discovered.offers, &recorded.index, &stage.project);
-    if let Some(result) = result {
+    if let Some(env) = result {
         let updates = offer_updates(&rows, discovered, recorded, packages);
-        result["updates"] = serde_json::Value::Array(updates_json(&updates));
+        env.set_extra("updates", serde_json::Value::Array(updates_json(&updates)));
     }
     rows
 }
@@ -612,11 +618,11 @@ fn plan_kept_rows(
         .collect()
 }
 
-/// Fold the stage's `rollout` block and warnings into a JSON result.
-pub(super) fn finish_rollout_json(stage: &rollout::Stage, result: &mut serde_json::Value) {
-    result["rollout"] = stage.json();
+/// Fold the stage's `rollout` block and warnings into the envelope.
+pub(super) fn finish_rollout_json(stage: &rollout::Stage, env: &mut Envelope) {
+    env.set_extra("rollout", stage.json());
     for (code, detail) in stage.warnings() {
-        push_scan_json_warning(result, code, &detail);
+        env.warn(code, detail);
     }
 }
 
@@ -672,8 +678,9 @@ fn open_paragraph(opened: &mut bool) {
 /// arm treats an empty merged set as a fetch failure). The two output
 /// knobs are human-only: `show_progress` shows the status-line counter on
 /// stderr, `warn` prints a warning per failed package once the loop is
-/// done — only when some query succeeded (when every one failed, the
-/// caller's error line carries the cause instead, so nothing repeats).
+/// done — only when some query succeeded, even with no records (when
+/// every one failed, the caller's error line carries the cause instead,
+/// so nothing repeats).
 async fn fetch_patch_details(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
@@ -715,7 +722,8 @@ async fn fetch_patch_details(
         }
     }
     status.finish();
-    if warn && !results.is_empty() {
+    // Not when every query failed: the caller's error line names it.
+    if warn && failures.len() < packages.len() {
         for (purl, e) in &failures {
             eprintln!("Warning: could not fetch details for {purl}: {e}");
         }
@@ -723,22 +731,16 @@ async fn fetch_patch_details(
     (results, failures)
 }
 
-/// Fold a [`discover_selected`] failure into a JSON caller's `result` and
-/// print it. The discovery counts already in `result` stay — they were
-/// computed from the (successful) batch phase — while `status`/`error`
-/// mirror the all-batches-failed envelope so JSON consumers see one
-/// consistent scan-error schema instead of empty stdout. The code is
-/// [`PATCH_DETAILS_FAILED`]: every patch-detail query failing is the only
-/// way discovery fails.
-fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
-    crate::json_envelope::set_error(
-        result,
-        crate::json_envelope::EnvelopeError::new(PATCH_DETAILS_FAILED, message),
-    );
-    if let Some(obj) = result.as_object_mut() {
-        obj.remove("rollout");
-    }
-    print_json(result);
+/// Fold a [`discover_selected`] failure into a JSON caller's envelope and
+/// print it. The discovery payload already in it stays — it was computed
+/// from the (successful) batch phase — while `status`/`error` carry the
+/// failure. The code is [`PATCH_DETAILS_FAILED`]: every patch-detail query
+/// failing is the only way discovery fails.
+fn emit_discovery_error_json(env: &mut Envelope, message: &str) {
+    env.mark_error(EnvelopeError::new(PATCH_DETAILS_FAILED, message));
+    // The rollout block describes a successful run only.
+    env.extra.remove("rollout");
+    emit_scan(env);
 }
 
 /// The agent-flow selection split both arms (JSON + human) share. Vendor-
@@ -752,10 +754,8 @@ fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
 struct AgentSelection {
     /// What is left to download + apply.
     kept: Vec<PatchSearchResult>,
-    /// Every skip record (`vendored` + `package_not_installed`), purl-sorted,
-    /// in the `{purl, uuid, action: "skipped", errorCode}` shape the apply
-    /// report folds in.
-    skip_records: Vec<serde_json::Value>,
+    /// Every skip event (`vendored` + `package_not_installed`), purl-sorted.
+    skip_records: Vec<PatchEvent>,
     /// The vendored partition's purls alone — feeds the run-level
     /// `vendored_ownership_retained` warning and the human `[skip]` lines.
     vendored_purls: Vec<String>,
@@ -775,17 +775,14 @@ fn partition_agent_selection(
         |p| lockfile_only_contains(&lockfile_only.purls, p),
         "package_not_installed",
     );
-    let purls_of = |records: &[serde_json::Value]| -> Vec<String> {
-        records
-            .iter()
-            .filter_map(|r| r["purl"].as_str().map(str::to_string))
-            .collect()
+    let purls_of = |records: &[PatchEvent]| -> Vec<String> {
+        records.iter().filter_map(|r| r.purl.clone()).collect()
     };
     let vendored_purls = purls_of(&vendored_records);
     let not_installed_purls = purls_of(&not_installed_records);
     let mut skip_records = vendored_records;
     skip_records.extend(not_installed_records);
-    skip_records.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
+    skip_records.sort_by(|a, b| a.purl.cmp(&b.purl));
     AgentSelection {
         kept,
         skip_records,
@@ -1061,22 +1058,13 @@ pub(super) fn push_run_warning(
     });
 }
 
-/// Top-level `warnings[]` JSON for scan's envelope from `(code, detail)`
-/// pairs (see [`unsupported_layout_warnings`]). Same `{code, detail}` object
-/// shape as the run-level `warnings[]` on the unified envelope.
-fn layout_refusal_json(refusals: &[(String, String)]) -> serde_json::Value {
-    serde_json::Value::Array(
-        refusals
-            .iter()
-            .map(|(code, detail)| {
-                let mut entry = serde_json::json!({ "code": code, "detail": detail });
-                if let Some(level) = warning_level(code) {
-                    entry["level"] = serde_json::json!(level);
-                }
-                entry
-            })
-            .collect(),
-    )
+/// Top-level `warnings[]` for scan's envelope from `(code, detail)` pairs
+/// (see [`unsupported_layout_warnings`]).
+fn layout_warnings(refusals: &[(String, String)]) -> Vec<RunWarning> {
+    refusals
+        .iter()
+        .map(|(code, detail)| RunWarning::new(code.as_str(), detail.as_str()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,22 +1140,20 @@ struct GradleScan {
     locked: Option<HashSet<String>>,
 }
 
-/// The level of a run-level warning code: `info` for the Gradle advisories
-/// that need no action, `warn` for the Gradle warning, `None` (no `level`
-/// field, printed as a warning) for every other code.
-fn warning_level(code: &str) -> Option<&'static str> {
-    match code {
-        GRADLE_MAVEN_LOCAL_UNDETERMINED | GRADLE_USER_HOME_DIFFERS => Some("info"),
-        GRADLE_BUILD_IGNORES_M2 => Some("warn"),
-        _ => None,
-    }
+/// Whether a run-level warning code is an advisory that needs no action
+/// (the Gradle discovery notes), printed as `Note:` for humans.
+fn is_info_note(code: &str) -> bool {
+    matches!(
+        code,
+        GRADLE_MAVEN_LOCAL_UNDETERMINED | GRADLE_USER_HOME_DIFFERS
+    )
 }
 
 /// Print the run-level warnings to stderr: advisories as `Note:` (not
 /// under `--silent`), everything else as `Warning:`.
 fn print_layout_refusals(refusals: &[(String, String)], silent: bool) {
     for (code, detail) in refusals {
-        if warning_level(code) == Some("info") {
+        if is_info_note(code) {
             if !silent {
                 eprintln!("Note: {detail}");
             }
@@ -1408,7 +1394,7 @@ pub(super) fn vendored_ownership_retained_detail(purls: &[String]) -> String {
     )
 }
 
-/// Additive top-level `redirectState` block for the scan `--json` envelope:
+/// Top-level `redirectState` block for the scan `--json` envelope:
 /// the hosted pins the lockfiles wire — project STATE, so a descriptive
 /// block rather than a warning — plus the scanned purls among them.
 ///
@@ -1447,40 +1433,13 @@ pub(super) fn redirect_state_json(
     }))
 }
 
-/// Append one `{code, detail}` entry to the scan `--json` result's
-/// top-level `warnings` array (created on first use — the key is additive
-/// and absent when no run-level warning fired), mirroring the
-/// [`crate::json_envelope::RunWarning`] wire shape.
-fn push_scan_json_warning(result: &mut serde_json::Value, code: &str, detail: &str) {
-    let warnings = result
-        .as_object_mut()
-        .expect("scan JSON result is an object")
-        .entry("warnings")
-        .or_insert_with(|| serde_json::json!([]));
-    if let Some(arr) = warnings.as_array_mut() {
-        arr.push(serde_json::json!({ "code": code, "detail": detail }));
-    }
-}
-
-/// Print the scan error envelope for a refusal before any scanning
-/// (`--offline`): the all-batches-failed shape with every count at
-/// zero, so JSON consumers see one consistent scan-error schema.
-fn print_zero_error_envelope(code: &str, err: &str, paths: &[String]) {
-    let result = serde_json::json!({
-        "status": "error",
-        "error": { "code": code, "message": err },
-        "scannedPackages": 0,
-        "lockfileOnlyPackages": 0,
-        "packagesWithPatches": 0,
-        "totalPatches": 0,
-        "freePatches": 0,
-        "paidPatches": 0,
-        "canAccessPaidPatches": false,
-        "packages": [],
-        "updates": [],
-        "paths": paths,
-    });
-    print_json(&result);
+/// Print the scan error envelope for a failure before (or instead of) any
+/// discovery: `status: "error"`, empty `events`, zero `summary`, the coded
+/// `error`.
+fn emit_scan_error(common: &GlobalArgs, error: EnvelopeError) {
+    let mut env = scan_envelope(common);
+    env.mark_error(error);
+    emit_scan(&env);
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
@@ -1642,7 +1601,10 @@ fn scan_usage_error(args: &ScanArgs, code: &str, message: &str) -> i32 {
 /// Print a policy file that cannot be honored (fail closed, exit 1).
 fn report_policy_error(err: &socket_patch_core::policy::PolicyError, args: &ScanArgs) -> i32 {
     if args.common.json {
-        print_json(&policy::policy_error_json(err, &args.paths));
+        emit_scan_error(
+            &args.common,
+            EnvelopeError::new(err.code(), err.to_string()),
+        );
     } else {
         eprintln!("Error ({}): {err}", err.code());
     }
@@ -1748,9 +1710,7 @@ async fn run_scan(
         let err = "scan requires network access to query the patch API and cannot run with \
                    --offline/SOCKET_OFFLINE (strict airgap)";
         if args.common.json {
-            // Mirror the all-batches-failed error envelope shape so JSON
-            // consumers see one consistent scan-error schema.
-            print_zero_error_envelope("offline_unsupported", err, path_scope.raw());
+            emit_scan_error(&args.common, EnvelopeError::new("offline_unsupported", err));
         } else {
             eprintln!("Error: {err}");
         }
@@ -1922,6 +1882,25 @@ async fn run_scan(
 
     // Read existing manifest once for update detection.
     let existing_manifest = ctx.ledgers().await.manifest;
+    // A manifest that exists but cannot be loaded (rule shared by every
+    // command: `manifest_invalid` / `manifest_unreadable`). Agent mode
+    // reads and rewrites it (its dry run previews against it), so it fails
+    // closed before any query, in both outputs; every other mode only
+    // reads it for update detection and the GC, so it warns and goes on
+    // without it (never silently as "no manifest").
+    if let Err(e) = &ctx.loaded().await.manifest {
+        let err = crate::json_envelope::manifest_load_error(&manifest_path, e);
+        if apply {
+            status.finish();
+            if args.common.json {
+                emit_scan_error(&args.common, err);
+            } else {
+                eprintln!("Error: {}", err.message);
+            }
+            return 1;
+        }
+        layout_refusals.push((err.code, err.message));
+    }
     // Hosted mode records its patches ONLY in the lockfiles (v5 keeps no
     // hosted ledger) and vendored mode ONLY in its ledger, so the hosted
     // pins and the vendor ledger's purl→uuid records are folded into update
@@ -2149,45 +2128,28 @@ async fn run_scan(
             // GC is intentionally skipped when the crawl finds nothing:
             // pruning every manifest entry is too destructive (`repair`
             // does full cleanup explicitly).
-            let mut result = serde_json::json!({
-                "status": "success",
-                "scannedPackages": 0,
-                "lockfileOnlyPackages": 0,
-                "packagesWithPatches": 0,
-                "totalPatches": 0,
-                "freePatches": 0,
-                "paidPatches": 0,
-                "canAccessPaidPatches": false,
-                "packages": [],
-                "updates": [],
-                "paths": path_scope.raw(),
-                "rollout": stage.json(),
-            });
-            // Layout refusals: additive top-level `warnings` (omitted when
-            // empty) so a consumer can tell an unscannable project from an
-            // empty one.
-            if !layout_refusals.is_empty() {
-                result["warnings"] = layout_refusal_json(&layout_refusals);
-            }
+            let mut env = scan_envelope(&args.common);
+            env.set_extra("scannedPackages", serde_json::json!(0));
+            env.set_extra("lockfileOnlyPackages", serde_json::json!(0));
+            env.set_extra("canAccessPaidPatches", serde_json::json!(false));
+            env.set_extra("packages", serde_json::json!([]));
+            env.set_extra("updates", serde_json::json!([]));
+            env.set_extra("paths", serde_json::json!(path_scope.raw()));
+            env.set_extra("rollout", stage.json());
+            // Layout refusals ride `warnings` so a consumer can tell an
+            // unscannable project from an empty one.
+            env.warnings.extend(layout_warnings(&layout_refusals));
             if let Some(gc) = &unwired_gc {
-                result["gc"] = gc.to_json(args.common.dry_run);
+                gc.record_into(&mut env, args.common.dry_run);
             }
-            policy.fold_into_json(&mut result);
-            // Hosted mode: a no-op `redirect` block keeps the envelope
-            // schema-consistent with the ≥1-package path.
+            policy.fold_into_envelope(&mut env);
+            // Hosted mode: the same `redirect` block as the ≥1-package
+            // path (nothing rewritten).
             if hosted {
-                let mut warnings: Vec<serde_json::Value> = Vec::new();
                 if prune {
-                    warnings.push(hosted::prune_ignored_warning());
+                    env.warnings.push(hosted::prune_ignored_warning());
                 }
-                result["redirect"] = hosted::redirect_json_block(
-                    &[],
-                    &[],
-                    Vec::new(),
-                    &[],
-                    warnings,
-                    args.common.dry_run,
-                );
+                env.set_extra("redirect", hosted::redirect_block(Vec::new()));
             } else if !vendor {
                 // `redirectState` rides the empty-discovery envelope too
                 // (same rule as the ≥1-package path). `wiringLive` is empty
@@ -2199,7 +2161,7 @@ async fn run_scan(
                         ),
                     ));
                 if let Some(state) = redirect_state_json(redirect_state.as_ref(), &[]) {
-                    result["redirectState"] = state;
+                    env.set_extra("redirectState", state);
                 }
             }
             let code = embed_vex_into_json(
@@ -2208,11 +2170,11 @@ async fn run_scan(
                 &api_client,
                 &manifest_path,
                 0,
-                &mut result,
+                &mut env,
                 hosted,
             )
             .await;
-            print_json(&result);
+            emit_scan(&env);
             return code;
         } else if !args.common.silent {
             // A project the policy skipped as a whole is not an empty one.
@@ -2397,21 +2359,15 @@ async fn run_scan(
         // The failure prints right away: nothing to overlap the send with.
         telemetry.flush().await;
         if args.common.json {
-            let result = serde_json::json!({
-                "status": "error",
-                "error": { "code": API_BATCH_FAILED, "message": err },
-                "scannedPackages": package_count,
-                "lockfileOnlyPackages": lockfile_only.purls.len(),
-                "packagesWithPatches": 0,
-                "totalPatches": 0,
-                "freePatches": 0,
-                "paidPatches": 0,
-                "canAccessPaidPatches": false,
-                "packages": [],
-                "updates": [],
-                "paths": path_scope.raw(),
-            });
-            print_json(&result);
+            let mut env = scan_envelope(&args.common);
+            env.set_extra("scannedPackages", serde_json::json!(package_count));
+            env.set_extra(
+                "lockfileOnlyPackages",
+                serde_json::json!(lockfile_only.purls.len()),
+            );
+            env.set_extra("paths", serde_json::json!(path_scope.raw()));
+            env.mark_error(EnvelopeError::new(API_BATCH_FAILED, err));
+            emit_scan(&env);
         } else {
             eprintln!("{}", render::all_batches_failed(total_batches, &err));
         }
@@ -2477,36 +2433,42 @@ async fn run_scan(
     // packages this run covered), unlike the PRE-filter `scanned_purls`
     // the GC prune uses.
 
+    // Count downloadable patches: a free-tier org whose every offer is
+    // paid-tier has nothing any mode could select. Shared by both outputs.
+    let downloadable_count = if can_access_paid_patches {
+        all_packages_with_patches.len()
+    } else {
+        all_packages_with_patches
+            .iter()
+            .filter(|pkg| pkg.patches.iter().any(|p| p.tier == "free"))
+            .count()
+    };
+    // Whether this run fetches the by-package detail records — ONE decision
+    // both outputs read (#1062): every mode that selects needs them, and so
+    // does report-only whenever a patch is downloadable (its listing and
+    // `updates[]` come from the same records the other modes act on). Only
+    // `discover_selected`'s own `Err` (every query failed) fails the run;
+    // queries that succeed with no records leave nothing to select.
+    let fetch_details = downloadable_count > 0;
+
     if args.common.json {
-        let mut result = serde_json::json!({
-            "status": "success",
-            "scannedPackages": package_count,
-            "lockfileOnlyPackages": lockfile_only.purls.len(),
-            "packagesWithPatches": all_packages_with_patches.len(),
-            "totalPatches": total_patches,
-            "freePatches": free_patches,
-            "paidPatches": paid_patches,
-            "canAccessPaidPatches": can_access_paid_patches,
-            "packages": all_packages_with_patches,
-            "paths": path_scope.raw(),
-            "updates": updates_json(&updates),
-            "rollout": stage.json(),
-        });
-        // Layout refusals ride the non-empty envelope too (additive,
-        // omitted when empty).
-        if !layout_refusals.is_empty() {
-            result["warnings"] = layout_refusal_json(&layout_refusals);
-        }
-        // One warning per failed batch (status and exit unchanged).
-        for (batch, err) in &failed_batches {
-            let line = render::batch_failed_warning(*batch, total_batches, err);
-            let detail = line.strip_prefix("Warning: ").unwrap_or(&line);
-            push_scan_json_warning(&mut result, API_BATCH_FAILED, detail);
-        }
-        policy.fold_into_json(&mut result);
-        // Flag lockfile-only packages (additive; absent means installed),
-        // with the same predicate as the `[NOT INSTALLED]` marker.
-        if let Some(packages) = result["packages"].as_array_mut() {
+        let mut env = scan_envelope(&args.common);
+        env.set_extra("scannedPackages", serde_json::json!(package_count));
+        env.set_extra(
+            "lockfileOnlyPackages",
+            serde_json::json!(lockfile_only.purls.len()),
+        );
+        env.set_extra(
+            "canAccessPaidPatches",
+            serde_json::json!(can_access_paid_patches),
+        );
+        // Flag lockfile-only packages (absent means installed), with the
+        // same predicate as the `[NOT INSTALLED]` marker, and Gradle-cached
+        // packages with whether the build's lock files name them (an
+        // annotation, never a filter).
+        let mut packages =
+            serde_json::to_value(&all_packages_with_patches).expect("batch packages serialize");
+        if let Some(packages) = packages.as_array_mut() {
             for pkg in packages {
                 let is_lockfile_only = pkg["purl"]
                     .as_str()
@@ -2514,8 +2476,6 @@ async fn run_scan(
                 if is_lockfile_only {
                     pkg["notInstalled"] = serde_json::json!(true);
                 }
-                // Gradle-cached packages: whether the build's lock files
-                // name them (additive; an annotation, never a filter).
                 if let Some(base) = pkg["purl"]
                     .as_str()
                     .map(canonical_base_purl)
@@ -2527,9 +2487,21 @@ async fn run_scan(
                 }
             }
         }
+        env.set_extra("packages", packages);
+        env.set_extra("paths", serde_json::json!(path_scope.raw()));
+        env.set_extra("updates", serde_json::Value::Array(updates_json(&updates)));
+        env.set_extra("rollout", stage.json());
+        env.warnings.extend(layout_warnings(&layout_refusals));
+        // One warning per failed batch (status and exit unchanged).
+        for (batch, err) in &failed_batches {
+            let line = render::batch_failed_warning(*batch, total_batches, err);
+            let detail = line.strip_prefix("Warning: ").unwrap_or(&line);
+            env.warn(API_BATCH_FAILED, detail);
+        }
+        policy.fold_into_envelope(&mut env);
 
-        // Hosted mode: NEST the redirect result under `redirect` in the scan
-        // object above (like vendored mode's `vendor` block).
+        // Hosted mode: the redirect engine records its events into this
+        // envelope and prints it.
         if hosted {
             return run_redirect(
                 &args,
@@ -2537,22 +2509,23 @@ async fn run_scan(
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 &policy,
-                Some(result),
+                Some(env),
                 telemetry,
                 npm_crawl.as_ref(),
                 &recorded,
                 batch_error_count > 0,
                 &mut stage,
                 prior_discovery,
+                prune,
             )
             .await;
         }
 
-        // The additive `redirectState` block rides every report-only and
-        // agent `--json` envelope. Hosted and vendored runs are excluded:
-        // both may rewrite the ledger mid-run, so a pre-run snapshot would
-        // go stale. The live-wiring probe runs ONCE here and is shared with
-        // the agent-flow warning below.
+        // `redirectState` rides every report-only and agent `--json`
+        // envelope. Hosted and vendored runs are excluded: both may rewrite
+        // the lockfiles mid-run, so a pre-run snapshot would go stale. The
+        // live-wiring probe runs ONCE here and is shared with the agent-flow
+        // warning below.
         let hosted_retained = if vendor {
             Vec::new()
         } else {
@@ -2560,19 +2533,20 @@ async fn run_scan(
         };
         if !vendor {
             if let Some(state) = redirect_state_json(redirect_state, &hosted_retained) {
-                result["redirectState"] = state;
+                env.set_extra("redirectState", state);
             }
         }
 
         let dry = args.common.dry_run;
         let mut apply_code = 0i32;
 
-        // A report-only run selects nothing, but a severity floor or
-        // `enabled: false` still hides candidates; report them like the
-        // human arm does (the detail fetch runs only then).
-        if !apply && !vendor && policy.reports_selection() && !all_packages_with_patches.is_empty()
-        {
-            if let Err((code, message)) = discover_selected(
+        // Report-only: select nothing, but fetch the details exactly when
+        // the human arm does (`fetch_details`), so a total detail failure
+        // fails both outputs alike and `updates[]` comes from the same
+        // records; a severity floor or `enabled: false` still reports the
+        // candidates it hides.
+        if !apply && !vendor && fetch_details {
+            match discover_selected(
                 &api_client,
                 &all_packages_with_patches,
                 can_access_paid_patches,
@@ -2581,12 +2555,24 @@ async fn run_scan(
                 false,
                 false,
                 telemetry,
-                Some(&mut result),
+                Some(&mut env),
             )
             .await
             {
-                emit_discovery_error_json(&mut result, &message);
-                return code;
+                Ok(discovered) => {
+                    classified_rows(
+                        &mut stage,
+                        &discovered,
+                        &recorded,
+                        batch_error_count > 0,
+                        &all_packages_with_patches,
+                        Some(&mut env),
+                    );
+                }
+                Err((code, message)) => {
+                    emit_discovery_error_json(&mut env, &message);
+                    return code;
+                }
             }
         }
 
@@ -2601,13 +2587,13 @@ async fn run_scan(
                 false,
                 false,
                 telemetry,
-                Some(&mut result),
+                Some(&mut env),
             )
             .await
             {
                 Ok(d) => d,
                 Err((code, message)) => {
-                    emit_discovery_error_json(&mut result, &message);
+                    emit_discovery_error_json(&mut env, &message);
                     return code;
                 }
             };
@@ -2617,12 +2603,12 @@ async fn run_scan(
                 &recorded,
                 batch_error_count > 0,
                 &all_packages_with_patches,
-                Some(&mut result),
+                Some(&mut env),
             );
 
             // Vendor-owned and lockfile-only purls leave the selection as
-            // skip records BEFORE download (see `partition_agent_selection`);
-            // they cannot land, so they hold no rollout slot either.
+            // skips BEFORE download (see `partition_agent_selection`); they
+            // cannot land, so they hold no rollout slot either.
             let AgentSelection {
                 kept,
                 skip_records: vendored_records,
@@ -2630,97 +2616,71 @@ async fn run_scan(
                 ..
             } = partition_agent_selection(writers_of(&rows), &vendor_owned_purls, &lockfile_only);
             let selected = plan_kept_rows(&mut stage, rows, kept);
+            for event in vendored_records {
+                env.record(event);
+            }
 
             if dry {
-                // Synthesize the per-patch outcome without touching disk.
+                // Preview each patch without touching disk: `verified` for
+                // what a wet run would record (`oldUuid` on a replacement),
+                // `skipped` / `already_in_manifest` for the rest.
                 let empty_manifest = PatchManifest::new();
                 let manifest_for_preview = existing_manifest.unwrap_or(&empty_manifest);
-                let mut patches: Vec<serde_json::Value> = selected
-                    .iter()
-                    .map(|p| {
-                        match crate::commands::agent_download::decide_patch_action(
-                            manifest_for_preview,
-                            &p.purl,
-                            &p.uuid,
-                        ) {
-                            crate::commands::agent_download::PatchAction::Added => {
-                                serde_json::json!({
-                                    "purl": p.purl, "uuid": p.uuid, "action": "added",
-                                })
-                            }
-                            crate::commands::agent_download::PatchAction::Updated { old_uuid } => {
-                                serde_json::json!({
-                                    "purl": p.purl, "uuid": p.uuid,
-                                    "action": "updated", "oldUuid": old_uuid,
-                                })
-                            }
-                            crate::commands::agent_download::PatchAction::Skipped => {
-                                serde_json::json!({
-                                    "purl": p.purl, "uuid": p.uuid, "action": "skipped",
-                                })
-                            }
+                for p in &selected {
+                    let event = match crate::commands::agent_download::decide_patch_action(
+                        manifest_for_preview,
+                        &p.purl,
+                        &p.uuid,
+                    ) {
+                        crate::commands::agent_download::PatchAction::Added => {
+                            PatchEvent::new(PatchAction::Verified, p.purl.as_str())
                         }
-                    })
-                    .collect();
-                patches.extend(vendored_records.iter().cloned());
-                let added = patches.iter().filter(|p| p["action"] == "added").count();
-                let updated = patches.iter().filter(|p| p["action"] == "updated").count();
-                let skipped = patches.iter().filter(|p| p["action"] == "skipped").count();
-                result["apply"] = serde_json::json!({
-                    "found": selected.len() + vendored_records.len(),
-                    "downloaded": 0,
-                    "skipped": skipped,
-                    "failed": 0,
-                    "applied": 0,
-                    "updated": updated,
-                    "added": added,
-                    "patches": patches,
-                    "dryRun": true,
-                });
-            } else if selected.is_empty() {
-                // Nothing left to download: a stable-shape `apply` carrying
-                // any skips, then fall through to GC if requested.
-                result["apply"] = serde_json::json!({
-                    "found": vendored_records.len(),
-                    "downloaded": 0,
-                    "skipped": vendored_records.len(),
-                    "failed": 0, "applied": 0, "updated": 0,
-                    "patches": vendored_records,
-                });
-            } else {
+                        crate::commands::agent_download::PatchAction::Updated { old_uuid } => {
+                            PatchEvent::new(PatchAction::Verified, p.purl.as_str())
+                                .with_old_uuid(old_uuid)
+                        }
+                        crate::commands::agent_download::PatchAction::Skipped => {
+                            PatchEvent::new(PatchAction::Skipped, p.purl.as_str())
+                                .with_reason(ALREADY_IN_MANIFEST, "already in manifest")
+                        }
+                    };
+                    env.record(event.with_uuid(p.uuid.as_str()));
+                }
+            } else if !selected.is_empty() {
                 let params = download_params(
                     &args, /*save_only=*/ false, /*json=*/ true, /*silent=*/ true,
                 );
-                let (code, apply_json) = download_and_apply_patches_with(
+                // The engine records into `env` and never prints: one JSON
+                // document per run, a hard engine error included.
+                apply_code = download_and_apply_patches_into(
                     &selected,
                     &params,
                     &download_run(&args, &api_client),
+                    &mut env,
                 )
                 .await;
-                apply_code = code;
-                let mut apply_obj = apply_json;
-                fold_vendored_skips_into_apply(&mut apply_obj, &vendored_records);
-                result["apply"] = apply_obj;
-                if apply_code != 0 {
-                    result["status"] = serde_json::json!("partial_failure");
+                if env.error.is_some() {
+                    env.extra.remove("rollout");
+                    emit_scan(&env);
+                    return apply_code;
                 }
             }
 
-            // Cross-mode visibility: additive run-level warnings, never a
-            // status or exit-code change.
+            // Cross-mode visibility: run-level warnings, never a status or
+            // exit-code change.
             if !vendored_skip_purls.is_empty() {
                 let detail = vendored_ownership_retained_detail(&vendored_skip_purls);
                 if !args.common.silent {
                     eprintln!("Warning: {detail}");
                 }
-                push_scan_json_warning(&mut result, VENDORED_OWNERSHIP_RETAINED, &detail);
+                env.warn(VENDORED_OWNERSHIP_RETAINED, detail);
             }
             if !hosted_retained.is_empty() {
                 let detail = hosted_wiring_retained_detail(&hosted_retained);
                 if !args.common.silent {
                     eprintln!("Warning: {detail}");
                 }
-                push_scan_json_warning(&mut result, HOSTED_WIRING_RETAINED, &detail);
+                env.warn(HOSTED_WIRING_RETAINED, detail);
             }
         // --- Vendor path (if requested; --sync selects agent instead) ---
         } else if vendor {
@@ -2737,7 +2697,7 @@ async fn run_scan(
                 batch_error_count > 0,
                 &mut stage,
                 &policy,
-                &mut result,
+                &mut env,
                 &manifest_path,
                 &socket_dir,
                 &scanned_purls,
@@ -2751,35 +2711,35 @@ async fn run_scan(
         }
 
         // The GC and the VEX build below can write to stderr; the report-
-        // only arm has not flushed the scan event yet (the agent arm
-        // did, in `discover_selected`).
+        // only arm may not have flushed the scan event yet.
         telemetry.flush().await;
 
         // --- GC (post-apply, or standalone --prune GC-sweep) -------------
         if prune {
-            result["gc"] = gc_json(
+            gc_into(
                 &args.common,
                 &manifest_path,
                 &socket_dir,
                 &scanned_purls,
                 &vendored_purls,
                 dry,
+                &mut env,
             )
             .await;
         }
 
-        finish_rollout_json(&stage, &mut result);
+        finish_rollout_json(&stage, &mut env);
         let final_code = embed_vex_into_json(
             &args.common,
             &args.vex,
             &api_client,
             &manifest_path,
             apply_code,
-            &mut result,
+            &mut env,
             hosted,
         )
         .await;
-        print_json(&result);
+        emit_scan(&env);
         return final_code;
     }
 
@@ -2791,15 +2751,18 @@ async fn run_scan(
     let silent = args.common.silent;
 
     // Every human-path exit that did not fail: the `--prune` GC first
-    // (not vendored, which runs its own, nor hosted, which runs none), then
-    // the embedded VEX. An early "nothing to apply" exit still runs the GC.
+    // (not hosted, which runs none), then the embedded VEX. An early
+    // "nothing to apply" exit still runs the GC, vendored mode included:
+    // its wet vendor step runs its own GC and never reaches this closure,
+    // but the early exits (nothing patched, paid-only, nothing selected,
+    // `--dry-run`) reconcile and preview like the JSON arm (#1127, #1062).
     let (args_ref, manifest_ref, socket_ref) = (&args, &manifest_path, &socket_dir);
     let client_ref: &ApiClient = &api_client;
     let (scanned_ref, vendored_ref) = (&scanned_purls, &vendored_purls);
     let policy_ref: &ScanPolicy = &policy;
     let finish_human = move |code: i32| async move {
         policy_ref.print_human(silent, verbose);
-        if prune && !vendor && !hosted && code == 0 {
+        if prune && !hosted && code == 0 {
             gc::run_human_gc(
                 &args_ref.common,
                 manifest_ref,
@@ -2829,26 +2792,19 @@ async fn run_scan(
         return finish_human(0).await;
     }
 
-    // Count downloadable patches: a free-tier org whose every offer is
+    // `downloadable_count` (above): a free-tier org whose every offer is
     // paid-tier has nothing any mode could select, so every human arm stops
     // below the table with the same paid-subscription line.
-    let downloadable_count = if can_access_paid_patches {
-        all_packages_with_patches.len()
-    } else {
-        all_packages_with_patches
-            .iter()
-            .filter(|pkg| pkg.patches.iter().any(|p| p.tier == "free"))
-            .count()
-    };
 
     // The by-package records every arm selects from, fetched before the
     // table so its `[UPDATE]` markers are the same UPGRADE rows the
-    // selection acts on (§5.1). Discovery said these packages HAVE
-    // patches, so an empty merged set is a fetch failure.
-    // A failed discovery still prints the table first; its exit code is
-    // returned below it.
+    // selection acts on (§5.1). Only `discover_selected`'s own `Err` (every
+    // query failed) is a fetch failure: queries that succeed with no
+    // records leave nothing to select, in every arm and in `--json` alike
+    // (#1062). A failed discovery still prints the table first; its exit
+    // code is returned below it.
     let mut discovery_failure: Option<i32> = None;
-    let rows: Vec<rollout::Row> = if downloadable_count == 0 {
+    let rows: Vec<rollout::Row> = if !fetch_details {
         Vec::new()
     } else {
         match discover_selected(
@@ -2864,13 +2820,6 @@ async fn run_scan(
         )
         .await
         {
-            // The agent / vendored / report-only arms need records to show:
-            // an empty merged set is a fetch failure there.
-            Ok(discovered) if !hosted && discovered.fetched == 0 => {
-                eprintln!("{}", render::fetch_details_failed(&discovered.failed));
-                discovery_failure = Some(1);
-                Vec::new()
-            }
             Ok(discovered) => {
                 let rows = classified_rows(
                     &mut stage,
@@ -3205,7 +3154,7 @@ async fn run_scan(
                 )
                 .await;
                 Some(
-                    preview_vendor_json(
+                    preview_vendor(
                         &args.common.cwd,
                         &selected,
                         &crate::commands::hosted_unwind::patch_server_origins(&args.common),
@@ -3216,15 +3165,10 @@ async fn run_scan(
             } else {
                 None
             };
-            let refused = preview
-                .as_ref()
-                .and_then(|p| p["patches"].as_array())
-                .map_or(0, |a| {
-                    a.iter().filter(|p| p["action"] == "would_refuse").count()
-                });
+            let refused = preview.as_ref().map_or(0, |p| p.refused_count());
             println!("{}", render::dry_run_line(plan, refused));
             if let Some(preview) = &preview {
-                print_dry_run_refusals(preview);
+                preview.print_refusals();
             }
         }
         print_rollout_human(&stage, true, silent);
@@ -4994,29 +4938,18 @@ mod tests {
         );
     }
 
-    /// A failed embedded VEX's discovery diagnostics reach the scan JSON:
-    /// appended after existing `warnings[]` (layout refusals), or creating
-    /// the array; an empty list leaves the object untouched.
+    /// A failed embedded VEX's discovery diagnostics reach the scan
+    /// envelope's top-level `warnings[]`, after any already there; an empty
+    /// list adds nothing.
     #[test]
     fn vex_error_warnings_append_to_scan_json() {
-        let w = crate::json_envelope::RunWarning {
-            code: "lockfile_unparseable".to_string(),
-            detail: "pnpm-lock.yaml: bad".to_string(),
-        };
-        let mut fresh = serde_json::json!({ "status": "error" });
-        append_vex_error_warnings(&mut fresh, &[]);
-        assert!(fresh.get("warnings").is_none());
-        append_vex_error_warnings(&mut fresh, std::slice::from_ref(&w));
-        assert_eq!(fresh["warnings"][0]["code"], "lockfile_unparseable");
-
-        let mut existing = serde_json::json!({ "warnings": [{ "code": "pnp", "detail": "d" }] });
-        append_vex_error_warnings(&mut existing, &[w]);
-        let codes: Vec<&str> = existing["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v["code"].as_str().unwrap())
-            .collect();
+        let w = RunWarning::new("lockfile_unparseable", "pnpm-lock.yaml: bad");
+        let mut env = Envelope::new(JsonCommand::Scan);
+        append_vex_error_warnings(&mut env, &[]);
+        assert!(env.to_value().get("warnings").is_none());
+        env.warn("pnp", "d");
+        append_vex_error_warnings(&mut env, std::slice::from_ref(&w));
+        let codes: Vec<&str> = env.warnings.iter().map(|w| w.code.as_str()).collect();
         assert_eq!(codes, ["pnp", "lockfile_unparseable"]);
     }
 }

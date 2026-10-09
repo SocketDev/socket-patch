@@ -28,6 +28,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
+use crate::commands::agent_download::tag_mode;
 use crate::commands::agent_download::{
     download_patch_records_reusing, DetachedDownload, DownloadParams,
 };
@@ -39,14 +40,18 @@ use crate::commands::vendor::{
 use crate::commands::vendored_backend::{records_manifest, ApplyRequest, VendoredBackend};
 use crate::commands::vlt_preflight::{vlt_refusal_for, vlt_vendor_preflight_selected};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
-use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
-use crate::ui::{plural, print_json};
+use crate::json_envelope::{
+    Command as EnvelopeCommand, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning,
+    Status,
+};
+use crate::ui::plural;
 
-use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
+use super::gc::{gc_into, print_gc_vendored_line, run_apply_gc};
 use super::rollout::Stage;
 use super::{
     classified_rows, discover_selected, download_params, embed_vex_into_json,
-    emit_discovery_error_json, finish_rollout_json, push_run_warning, writers_of, ScanArgs,
+    emit_discovery_error_json, emit_scan, finish_rollout_json, push_run_warning, writers_of,
+    ScanArgs,
 };
 
 /// Run-level warning: a `.socket/manifest.json` record for a purl the
@@ -66,33 +71,127 @@ type VendorStepError = (&'static str, String, Option<Box<Envelope>>);
 /// [`VendorStepError`].
 type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 
+/// One selected patch's verdict in the vendored dry-run preview.
+#[derive(Debug, Clone)]
+pub(crate) enum PreviewVerdict {
+    /// The wet run's preflight would refuse it before any download.
+    WouldRefuse { code: String, detail: String },
+    /// The vendor ledger already holds it at this uuid.
+    AlreadyVendored,
+    /// The ledger holds the purl at another uuid: a re-vendor.
+    WouldRevendor { old_uuid: String },
+    /// Not vendored yet.
+    WouldVendor,
+}
+
+/// One row of [`VendorPreview`].
+#[derive(Debug, Clone)]
+pub(crate) struct PreviewRow {
+    pub(crate) purl: String,
+    pub(crate) uuid: String,
+    pub(crate) verdict: PreviewVerdict,
+    /// Symlinked wiring files the wet run's commit refuses to rename over
+    /// (see [`symlinked_wiring_warnings`]); only on vendor/revendor rows.
+    pub(crate) warnings: Vec<RunWarning>,
+}
+
+/// The vendored dry-run preview, purl-sorted (see [`preview_vendor`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VendorPreview {
+    pub(crate) rows: Vec<PreviewRow>,
+}
+
+impl VendorPreview {
+    /// How many rows the wet run would refuse.
+    pub(crate) fn refused_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| matches!(r.verdict, PreviewVerdict::WouldRefuse { .. }))
+            .count()
+    }
+
+    /// Record the preview into a dry-run envelope, every event carrying
+    /// `details.mode: "vendored"`: `verified` for a patch the wet run would
+    /// vendor (`oldUuid` on a re-vendor), `skipped` / `already_vendored`
+    /// for one in sync, and `skipped` with the preflight's code for one the
+    /// wet run would refuse (never a status or exit change). Each symlink
+    /// advisory joins the top-level `warnings`, prefixed with its purl.
+    pub(crate) fn record_into(&self, env: &mut Envelope) {
+        for row in &self.rows {
+            let event = match &row.verdict {
+                PreviewVerdict::WouldRefuse { code, detail } => {
+                    PatchEvent::new(PatchAction::Skipped, row.purl.as_str())
+                        .with_reason(code.as_str(), detail.as_str())
+                }
+                PreviewVerdict::AlreadyVendored => {
+                    PatchEvent::new(PatchAction::Skipped, row.purl.as_str()).with_reason(
+                        "already_vendored",
+                        "artifact and wiring already in sync for this patch uuid",
+                    )
+                }
+                PreviewVerdict::WouldRevendor { old_uuid } => {
+                    PatchEvent::new(PatchAction::Verified, row.purl.as_str())
+                        .with_old_uuid(old_uuid.as_str())
+                }
+                PreviewVerdict::WouldVendor => {
+                    PatchEvent::new(PatchAction::Verified, row.purl.as_str())
+                }
+            };
+            env.record(tag_mode(
+                event.with_uuid(row.uuid.as_str()),
+                Some("vendored"),
+            ));
+            env.warnings.extend(
+                row.warnings.iter().map(|w| {
+                    RunWarning::new(w.code.as_str(), format!("{}: {}", row.purl, w.detail))
+                }),
+            );
+        }
+    }
+
+    /// Human rendering of the preview's refusals and symlink advisories:
+    /// the count line above it still says "would download and vendor", so
+    /// name what the wet run would refuse and why. Shared by `scan --mode
+    /// vendored --dry-run` and `get … --mode vendored --dry-run` so the two
+    /// cannot drift. Callers gate it on `--silent`.
+    pub(crate) fn print_refusals(&self) {
+        for row in &self.rows {
+            if let PreviewVerdict::WouldRefuse { code, detail } = &row.verdict {
+                println!("  [would-refuse] {} ({code}): {detail}", row.purl);
+            }
+        }
+        for row in &self.rows {
+            for w in &row.warnings {
+                println!("  [warning] {} ({}): {}", row.purl, w.code, w.detail);
+            }
+        }
+    }
+}
+
 /// Dry-run preview for `scan --mode vendored` (and `get … --mode vendored
 /// --dry-run`): classify each selected patch against the vendor ledger
-/// without writing anything or touching the network beyond discovery.
-/// Action values are part of the CLI contract: `would_vendor` (no ledger
-/// entry), `already_vendored` (entry at this uuid), `would_revendor` +
-/// `oldUuid` (entry at an older uuid), and — additive — `would_refuse` +
-/// `errorCode` + `error` for npm purls the wet run's Bun, vlt or npm
-/// package-lock preflight
+/// without writing anything or touching the network beyond discovery
+/// (see [`PreviewVerdict`]): would-refuse for npm purls the wet run's Bun,
+/// vlt or npm package-lock preflight
 /// ([`crate::commands::bun_preflight::BunVendorRefusal`],
 /// [`crate::commands::vlt_preflight`], [`npm_lock_refusal`]) would refuse
 /// before any download, or whose hosted pnpm pin the takeover would fail
 /// to replace ([`hosted_pnpm_refusals`]: the pnpm backend's lock-text
 /// refusal, #853). `origins` are the run's `--patch-server-url` origins.
 /// The preview stays a ledger classification otherwise (engine refusals
-/// outside the preflights are not predicted), and `would_refuse` never
+/// outside the preflights are not predicted), and a would-refuse never
 /// flips the run's status or exit code. The preflights (the only disk
 /// access besides the ledger) run only when the selection holds an npm purl.
 /// `takeover_refusals` adds the hosted→vendored takeover refusals the
 /// caller resolved (the gem gates of
 /// [`crate::commands::vendor::gem_takeover_preview_refusals`]), keyed by
-/// the selected purl, as `would_refuse` rows too.
-pub(crate) async fn preview_vendor_json(
+/// the selected purl, as would-refuse rows too.
+pub(crate) async fn preview_vendor(
     cwd: &Path,
     selected: &[PatchSearchResult],
     origins: &[String],
     takeover_refusals: &HashMap<String, (&'static str, String)>,
-) -> serde_json::Value {
+) -> VendorPreview {
     // The ledger load outcome reaches the preflight AS a result, so an
     // unreadable ledger previews as `vendor_state_unreadable` rather than
     // as an empty ledger.
@@ -104,82 +203,92 @@ pub(crate) async fn preview_vendor_json(
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
     let state = state.unwrap_or_default();
     let pnpm_refusals = hosted_pnpm_refusals(cwd, selected, origins, &state).await;
-    let mut patches: Vec<serde_json::Value> = selected
+    let refuse = |code: &str, detail: &str| PreviewVerdict::WouldRefuse {
+        code: code.to_string(),
+        detail: detail.to_string(),
+    };
+    let mut rows: Vec<PreviewRow> = selected
         .iter()
-        .map(|p| match lookup_entry(&state.entries, &p.purl) {
-            // Refusal takes priority: a preserved ledger can name this
-            // UUID even after rollback has removed its live wiring.
-            _ if refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl)) => {
-                let r = refusal.as_ref().expect("checked by the guard");
-                serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
-                    "errorCode": r.code, "error": r.detail,
-                })
+        .map(|p| {
+            let verdict = match lookup_entry(&state.entries, &p.purl) {
+                // Refusal takes priority: a preserved ledger can name this
+                // UUID even after rollback has removed its live wiring.
+                _ if refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl)) => {
+                    let r = refusal.as_ref().expect("checked by the guard");
+                    refuse(r.code, &r.detail)
+                }
+                _ if vlt_refusal_for(&vlt_refusals, &p.purl).is_some() => {
+                    let r = vlt_refusal_for(&vlt_refusals, &p.purl).expect("checked by the guard");
+                    refuse(r.code, &r.detail)
+                }
+                _ if pnpm_refusals.contains_key(&p.purl) => {
+                    let (code, detail) = &pnpm_refusals[&p.purl];
+                    refuse(code, detail)
+                }
+                _ if p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some() => {
+                    let (code, detail) = npm_lock_refusal.as_ref().expect("checked by the guard");
+                    refuse(code, detail)
+                }
+                _ if takeover_refusals.contains_key(&p.purl) => {
+                    let (code, detail) = &takeover_refusals[&p.purl];
+                    refuse(code, detail)
+                }
+                Some(e) if e.uuid == p.uuid => PreviewVerdict::AlreadyVendored,
+                Some(e) => PreviewVerdict::WouldRevendor {
+                    old_uuid: e.uuid.clone(),
+                },
+                None => PreviewVerdict::WouldVendor,
+            };
+            let warnings = match verdict {
+                PreviewVerdict::WouldRevendor { .. } | PreviewVerdict::WouldVendor => {
+                    symlinked_wiring_warnings(cwd, &p.purl)
+                        .into_iter()
+                        .map(|w| RunWarning::new(w.code, w.detail))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            PreviewRow {
+                purl: p.purl.clone(),
+                uuid: p.uuid.clone(),
+                verdict,
+                warnings,
             }
-            _ if vlt_refusal_for(&vlt_refusals, &p.purl).is_some() => {
-                let r = vlt_refusal_for(&vlt_refusals, &p.purl).expect("checked by the guard");
-                serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
-                    "errorCode": r.code, "error": r.detail,
-                })
-            }
-            _ if pnpm_refusals.contains_key(&p.purl) => {
-                let (code, detail) = &pnpm_refusals[&p.purl];
-                serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
-                    "errorCode": code, "error": detail,
-                })
-            }
-            _ if p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some() => {
-                let (code, detail) = npm_lock_refusal.as_ref().expect("checked by the guard");
-                serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
-                    "errorCode": code, "error": detail,
-                })
-            }
-            _ if takeover_refusals.contains_key(&p.purl) => {
-                let (code, detail) = &takeover_refusals[&p.purl];
-                serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
-                    "errorCode": code, "error": detail,
-                })
-            }
-            Some(e) if e.uuid == p.uuid => serde_json::json!({
-                "purl": p.purl, "uuid": p.uuid, "action": "already_vendored",
-            }),
-            Some(e) => with_symlink_warnings(
-                cwd,
-                &p.purl,
-                serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid,
-                    "action": "would_revendor", "oldUuid": e.uuid,
-                }),
-            ),
-            None => with_symlink_warnings(
-                cwd,
-                &p.purl,
-                serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "would_vendor",
-                }),
-            ),
         })
         .collect();
-    patches.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
-    serde_json::json!({ "dryRun": true, "patches": patches })
+    rows.sort_by(|a, b| a.purl.cmp(&b.purl));
+    VendorPreview { rows }
 }
 
-/// A `would_vendor` / `would_revendor` preview row, plus a `warnings` list
-/// naming each symlinked wiring file the wet run's commit refuses to rename
-/// over (see [`symlinked_wiring_warnings`]); no key when there are none.
-fn with_symlink_warnings(cwd: &Path, purl: &str, mut row: serde_json::Value) -> serde_json::Value {
-    let warnings: Vec<serde_json::Value> = symlinked_wiring_warnings(cwd, purl)
-        .into_iter()
-        .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail }))
-        .collect();
-    if !warnings.is_empty() {
-        row["warnings"] = serde_json::Value::Array(warnings);
+/// Fold the vendor engine's envelope into a `scan` / `get` envelope (no
+/// nested envelope): its events — each tagged `details.mode: "vendored"`
+/// — are appended with their summary counts as the engine counted them
+/// (its per-package advisories are uncounted `skipped` events, as in
+/// `vendor`), its warnings and sidecars join the outer ones, and a failed
+/// or partially failed engine run marks the outer run `partialFailure`.
+/// The engine's own top-level error (if any) is the caller's to report.
+pub(crate) fn merge_vendor_envelope(env: &mut Envelope, venv: Envelope) {
+    let (to, from) = (&mut env.summary, &venv.summary);
+    to.discovered += from.discovered;
+    to.downloaded += from.downloaded;
+    to.applied += from.applied;
+    to.updated += from.updated;
+    to.skipped += from.skipped;
+    to.failed += from.failed;
+    to.removed += from.removed;
+    to.verified += from.verified;
+    to.rebuilt += from.rebuilt;
+    to.rolled_back += from.rolled_back;
+    env.events.extend(
+        venv.events
+            .into_iter()
+            .map(|e| tag_mode(e, Some("vendored"))),
+    );
+    env.warnings.extend(venv.warnings);
+    env.sidecars.extend(venv.sidecars);
+    if venv.summary.failed > 0 || matches!(venv.status, Status::PartialFailure | Status::Error) {
+        env.mark_partial_failure();
     }
-    row
 }
 
 /// The purls of `selected` the wet run's Bun, vlt or npm package-lock
@@ -269,36 +378,6 @@ async fn hosted_pnpm_refusals(
         return HashMap::new();
     }
     socket_patch_core::vendor::pnpm_takeover_lock_text_refusals(cwd, &candidates).await
-}
-
-/// Human rendering of the vendored dry-run preview's `would_refuse` records
-/// (see [`preview_vendor_json`]): the count line above it still says
-/// "would download and vendor", so name what the wet run would refuse and
-/// why. Shared by `scan --mode vendored --dry-run` and
-/// `get … --mode vendored --dry-run` so the two cannot drift. Callers gate
-/// it on `--silent`.
-pub(crate) fn print_dry_run_refusals(preview: &serde_json::Value) {
-    let Some(patches) = preview["patches"].as_array() else {
-        return;
-    };
-    for p in patches.iter().filter(|p| p["action"] == "would_refuse") {
-        println!(
-            "  [would-refuse] {} ({}): {}",
-            p["purl"].as_str().unwrap_or_default(),
-            p["errorCode"].as_str().unwrap_or_default(),
-            p["error"].as_str().unwrap_or_default()
-        );
-    }
-    for p in patches {
-        for w in p["warnings"].as_array().into_iter().flatten() {
-            println!(
-                "  [warning] {} ({}): {}",
-                p["purl"].as_str().unwrap_or_default(),
-                w["code"].as_str().unwrap_or_default(),
-                w["detail"].as_str().unwrap_or_default()
-            );
-        }
-    }
 }
 
 /// Everything the vendor step takes: the in-memory `records` to vendor
@@ -575,8 +654,8 @@ async fn migrate_legacy_manifest_records(
 }
 
 /// The `scan --mode vendored` JSON path: discovery → (dry-run preview | download
-/// → vendor engine → GC → embedded VEX) → print `result` → exit code.
-/// The dry-run arm skips the VEX embed (emitting a `vex.skipped` marker
+/// → vendor engine → GC → embedded VEX) → print `env` → exit code.
+/// The dry-run arm skips the VEX embed (a `vex_skipped_dry_run` warning
 /// instead): a dry run vendors nothing, so there is no state to attest.
 ///
 /// Extracted from `run` (and called through `Box::pin`) so its temporaries
@@ -593,7 +672,7 @@ async fn run_vendor_json_path(
     batch_failed: bool,
     stage: &mut Stage,
     policy: &super::policy::ScanPolicy,
-    result: &mut serde_json::Value,
+    env: &mut Envelope,
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
@@ -618,13 +697,13 @@ async fn run_vendor_json_path(
         false,
         false,
         telemetry,
-        Some(&mut *result),
+        Some(&mut *env),
     )
     .await
     {
         Ok(d) => d,
         Err((code, message)) => {
-            emit_discovery_error_json(result, &message);
+            emit_discovery_error_json(env, &message);
             return code;
         }
     };
@@ -634,7 +713,7 @@ async fn run_vendor_json_path(
         recorded,
         batch_failed,
         all_packages_with_patches,
-        Some(&mut *result),
+        Some(&mut *env),
     );
     // The planning pass: a patch the preflight refuses holds no slot (it
     // still reaches the engine, which reports the refusal).
@@ -647,47 +726,51 @@ async fn run_vendor_json_path(
         .into_iter()
         .filter(|p| !deferred.contains(&(p.purl.clone(), p.uuid.clone())))
         .collect();
-    finish_rollout_json(stage, result);
+    finish_rollout_json(stage, env);
 
     if args.common.dry_run {
         // No downloads, no backends: classify against the ledger
-        // and preview the GC, exactly like agent mode's dry run.
+        // and preview the GC, exactly like agent mode's dry run (and the
+        // human arm, which previews the same GC through `finish_human`).
         let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
             &args.common,
             selected.iter().map(|p| p.purl.as_str()),
         )
         .await;
-        result["vendor"] =
-            preview_vendor_json(&args.common.cwd, &selected, &origins, &takeover).await;
+        preview_vendor(&args.common.cwd, &selected, &origins, &takeover)
+            .await
+            .record_into(env);
         if prune {
-            result["gc"] = gc_json(
+            gc_into(
                 &args.common,
                 manifest_path,
                 socket_dir,
                 scanned_purls,
                 vendored_purls,
                 true,
+                env,
             )
             .await;
         }
         // Embedded VEX is skipped on a dry run (nothing was vendored to
-        // attest); the marker keeps the request visible to JSON consumers.
+        // attest); the warning keeps the request visible.
         if args.vex.vex.is_some() {
-            result["vex"] = serde_json::json!({ "skipped": true, "reason": "dry_run" });
+            env.warnings.push(super::vex_dry_run_warning());
         }
-        print_json(result);
+        emit_scan(env);
         return 0;
     }
 
-    // 1) Download phase: fetch the selected records in memory. The
-    //    manifest is never written; `download.detached: true` stays on
-    //    the sub-object for consumers that keyed on it.
+    // 1) Download phase: fetch the selected records in memory (the
+    //    manifest is never written); its events join the envelope with
+    //    `details.mode: "vendored"`.
     let params = download_params(
         args, /*save_only=*/ true, /*json=*/ true, /*silent=*/ true,
     );
-    let (dl_code, dl_json, records) =
-        boxed_download_patch_records(&selected, &params, api_client, HashMap::new(), prior).await;
-    result["download"] = dl_json;
+    let (dl_code, _, records) =
+        boxed_download_patch_records(&selected, &params, api_client, HashMap::new(), prior)
+            .await
+            .into_envelope(env);
 
     // 2) The vendor engine, under the same lock as apply/vendor (a no-op
     //    that creates nothing when there is nothing to vendor).
@@ -704,31 +787,24 @@ async fn run_vendor_json_path(
     .await
     {
         Ok((has_errors, venv)) => {
-            result["vendor"] =
-                serde_json::to_value(&venv).unwrap_or_else(|_| serde_json::json!({}));
+            merge_vendor_envelope(env, venv);
             i32::from(has_errors)
         }
         Err((code, message, venv)) => {
             // A step that ran (and died at staging) hands back its demoted
-            // envelope; it must reach the JSON consumer even though the run
-            // aborts here. A lock failure carries none — no `vendor` key.
+            // envelope; its events must reach the JSON consumer even though
+            // the run aborts here. A lock failure carries none.
             if let Some(venv) = venv {
-                result["vendor"] =
-                    serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
+                merge_vendor_envelope(env, *venv);
             }
-            crate::json_envelope::set_error(
-                result,
-                crate::json_envelope::EnvelopeError::new(code, message),
-            );
-            if let Some(obj) = result.as_object_mut() {
-                obj.remove("rollout");
-            }
-            print_json(result);
+            env.mark_error(EnvelopeError::new(code, message));
+            env.extra.remove("rollout");
+            emit_scan(env);
             return 1;
         }
     };
     if vendor_code != 0 {
-        result["status"] = serde_json::json!("partial_failure");
+        env.mark_partial_failure();
     }
 
     // 3) GC AFTER the vendor step (when --prune), like the apply arm: the
@@ -736,13 +812,14 @@ async fn run_vendor_json_path(
     //    prune, and running it last lets the sweep reclaim what this run
     //    orphaned (a migrated legacy record's blobs, a superseded uuid dir).
     if prune {
-        result["gc"] = gc_json(
+        gc_into(
             &args.common,
             manifest_path,
             socket_dir,
             scanned_purls,
             vendored_purls,
             false,
+            env,
         )
         .await;
     }
@@ -753,11 +830,11 @@ async fn run_vendor_json_path(
         api_client,
         manifest_path,
         vendor_code,
-        result,
+        env,
         false,
     )
     .await;
-    print_json(result);
+    emit_scan(env);
     final_code
 }
 
@@ -791,10 +868,11 @@ async fn run_vendor_interactive_path(
             plural(selected.len(), "patch", "patches")
         );
     }
-    let (dl_code, dl_json, records) =
+    let download =
         boxed_download_patch_records(selected, params, api_client, prefetched, prior).await;
+    let (dl_code, records) = (download.code, download.records);
     // Patches the download phase could not get (it reported each one).
-    let download_failed = dl_json["failed"].as_u64().unwrap_or(0);
+    let download_failed = download.failed as u64;
     // The vendor step is a silent no-op on an empty record set (it can't
     // know why it is empty); this arm can.
     let nothing_to_vendor = records.is_empty();
@@ -877,8 +955,8 @@ pub(crate) fn format_vendor_step_error(code: &str, message: &str) -> String {
     out
 }
 
-/// Partition purls matching `skip` out of the selected set and pre-render
-/// their skip records (sorted by purl) with the contract `error_code`.
+/// Partition purls matching `skip` out of the selected set and build their
+/// `skipped` events (sorted by purl) with the contract `error_code`.
 /// Two skip classes ride this, both removed BEFORE download:
 ///
 /// * `"vendored"` — the patch is consumed from the committed artifact, and
@@ -895,45 +973,22 @@ pub(super) fn partition_skipped_selected(
     selected: Vec<PatchSearchResult>,
     skip: impl Fn(&str) -> bool,
     error_code: &str,
-) -> (Vec<PatchSearchResult>, Vec<serde_json::Value>) {
+) -> (Vec<PatchSearchResult>, Vec<PatchEvent>) {
+    let reason = match error_code {
+        "vendored" => "managed by `socket-patch vendor`; skipped before download",
+        _ => "not installed (lockfile-only); `scan --mode vendored` fetches it pristine",
+    };
     let (skipped, kept): (Vec<_>, Vec<_>) = selected.into_iter().partition(|p| skip(&p.purl));
-    let mut records: Vec<serde_json::Value> = skipped
+    let mut records: Vec<PatchEvent> = skipped
         .iter()
         .map(|p| {
-            serde_json::json!({
-                "purl": p.purl, "uuid": p.uuid,
-                "action": "skipped", "errorCode": error_code,
-            })
+            PatchEvent::new(PatchAction::Skipped, p.purl.as_str())
+                .with_uuid(p.uuid.as_str())
+                .with_reason(error_code, reason)
         })
         .collect();
-    records.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
+    records.sort_by(|a, b| a.purl.cmp(&b.purl));
     (kept, records)
-}
-
-/// Fold the pre-download vendored skips into the apply report returned by
-/// `download_and_apply_patches_with`: they were "found" by discovery and
-/// skipped here, never downloaded. Also strips the inner `status` (scan
-/// recomputes its own). Plain fn for the same poll-frame reason as
-/// [`partition_skipped_selected`].
-pub(super) fn fold_vendored_skips_into_apply(
-    apply_obj: &mut serde_json::Value,
-    vendored_records: &[serde_json::Value],
-) {
-    let Some(obj) = apply_obj.as_object_mut() else {
-        return;
-    };
-    obj.remove("status");
-    if vendored_records.is_empty() {
-        return;
-    }
-    let n = vendored_records.len() as u64;
-    for key in ["found", "skipped"] {
-        let bumped = obj.get(key).and_then(|v| v.as_u64()).unwrap_or(0) + n;
-        obj.insert(key.to_string(), serde_json::json!(bumped));
-    }
-    if let Some(patches) = obj.get_mut("patches").and_then(|p| p.as_array_mut()) {
-        patches.extend(vendored_records.iter().cloned());
-    }
 }
 
 /// Construct the (large) vendor-JSON-path future on THIS transient frame
@@ -952,7 +1007,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
     batch_failed: bool,
     stage: &'a mut Stage,
     policy: &'a super::policy::ScanPolicy,
-    result: &'a mut serde_json::Value,
+    env: &'a mut Envelope,
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     scanned_purls: &'a HashSet<String>,
@@ -972,7 +1027,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
         batch_failed,
         stage,
         policy,
-        result,
+        env,
         manifest_path,
         socket_dir,
         scanned_purls,
@@ -1294,10 +1349,91 @@ mod migration_tests {
 
 #[cfg(test)]
 mod preview_tests {
-    use super::preview_vendor_json;
+    use super::{preview_vendor, PreviewVerdict};
+    use crate::json_envelope::{Command, Envelope};
     use socket_patch_core::api::types::PatchSearchResult;
     use std::collections::HashMap;
     use std::path::Path;
+
+    /// The typed preview as a compact classification document: one row per
+    /// selected patch, its verdict as `action` (`would_refuse` +
+    /// `errorCode`/`error`, `already_vendored`, `would_revendor` +
+    /// `oldUuid`, `would_vendor`) and its symlink advisories as `warnings`
+    /// — test scaffolding that pins the verdicts; the envelope the preview
+    /// records is pinned by `preview_records_verdicts_as_vendored_events`.
+    async fn preview_vendor_json(
+        cwd: &Path,
+        selected: &[PatchSearchResult],
+        origins: &[String],
+        takeover: &HashMap<String, (&'static str, String)>,
+    ) -> serde_json::Value {
+        let preview = preview_vendor(cwd, selected, origins, takeover).await;
+        let patches: Vec<serde_json::Value> = preview
+            .rows
+            .iter()
+            .map(|r| {
+                let mut row = match &r.verdict {
+                    PreviewVerdict::WouldRefuse { code, detail } => serde_json::json!({
+                        "purl": r.purl, "uuid": r.uuid, "action": "would_refuse",
+                        "errorCode": code, "error": detail,
+                    }),
+                    PreviewVerdict::AlreadyVendored => serde_json::json!({
+                        "purl": r.purl, "uuid": r.uuid, "action": "already_vendored",
+                    }),
+                    PreviewVerdict::WouldRevendor { old_uuid } => serde_json::json!({
+                        "purl": r.purl, "uuid": r.uuid, "action": "would_revendor",
+                        "oldUuid": old_uuid,
+                    }),
+                    PreviewVerdict::WouldVendor => serde_json::json!({
+                        "purl": r.purl, "uuid": r.uuid, "action": "would_vendor",
+                    }),
+                };
+                if !r.warnings.is_empty() {
+                    row["warnings"] = serde_json::to_value(&r.warnings).unwrap();
+                }
+                row
+            })
+            .collect();
+        serde_json::json!({ "dryRun": true, "patches": patches })
+    }
+
+    /// The preview recorded into a dry-run envelope: every verdict is an
+    /// event tagged `details.mode: "vendored"` (`verified` to vendor,
+    /// `skipped` in sync or refused, with the code), counted in `summary`,
+    /// and never a failure.
+    #[tokio::test]
+    async fn preview_records_verdicts_as_vendored_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_entry(tmp.path(), NPM, UUID);
+        let preview = preview_vendor(
+            tmp.path(),
+            &[sel(UUID, NPM), sel(UUID, PYPI)],
+            &[],
+            &HashMap::from([(
+                PYPI.to_string(),
+                ("vendor_test_refusal", "refused".to_string()),
+            )]),
+        )
+        .await;
+        let mut env = Envelope::new(Command::Scan);
+        env.dry_run = true;
+        preview.record_into(&mut env);
+        let v = env.to_value();
+        assert_eq!(
+            v["events"],
+            serde_json::json!([
+                {"action": "skipped", "purl": NPM, "uuid": UUID,
+                 "reason": "artifact and wiring already in sync for this patch uuid",
+                 "errorCode": "already_vendored", "details": {"mode": "vendored"}},
+                {"action": "skipped", "purl": PYPI, "uuid": UUID, "reason": "refused",
+                 "errorCode": "vendor_test_refusal", "details": {"mode": "vendored"}},
+            ]),
+            "{v}"
+        );
+        assert_eq!(v["summary"]["skipped"], 2);
+        assert_eq!(v["status"], "success");
+        assert_eq!(preview.refused_count(), 1);
+    }
 
     const UUID: &str = "11111111-1111-4111-8111-111111111111";
     const OLD_UUID: &str = "00000000-0000-4000-8000-000000000000";
@@ -1635,107 +1771,6 @@ mod preview_tests {
     }
 }
 
-#[cfg(test)]
-mod fold_vendored_skips_tests {
-    use super::fold_vendored_skips_into_apply;
-
-    /// A pre-rendered vendored-skip record, shaped exactly like
-    /// [`super::partition_skipped_selected`]'s output.
-    fn record(purl: &str) -> serde_json::Value {
-        serde_json::json!({
-            "purl": purl,
-            "uuid": "11111111-1111-4111-8111-111111111111",
-            "action": "skipped",
-            "errorCode": "vendored",
-        })
-    }
-
-    /// The count-consistency contract: every pre-download vendored skip
-    /// was "found" by discovery and "skipped" here, so both counters bump
-    /// by the record count, the records land appended after the download
-    /// phase's own entries, and every other counter is left alone.
-    #[test]
-    fn fold_bumps_found_and_skipped_and_appends_records() {
-        let mut apply_obj = serde_json::json!({
-            "status": "partialFailure",
-            "found": 2,
-            "downloaded": 1,
-            "skipped": 1,
-            "failed": 1,
-            "applied": 1,
-            "patches": [{ "purl": "pkg:npm/a@1.0.0" }],
-        });
-        let records = [record("pkg:npm/b@1.0.0"), record("pkg:npm/c@1.0.0")];
-
-        fold_vendored_skips_into_apply(&mut apply_obj, &records);
-
-        let obj = apply_obj.as_object().expect("still an object");
-        assert!(
-            !obj.contains_key("status"),
-            "the inner status is scan's to recompute: {apply_obj}"
-        );
-        assert_eq!(apply_obj["found"], 4, "{apply_obj}");
-        assert_eq!(apply_obj["skipped"], 3, "{apply_obj}");
-        assert_eq!(apply_obj["downloaded"], 1, "untouched: {apply_obj}");
-        assert_eq!(apply_obj["failed"], 1, "untouched: {apply_obj}");
-        assert_eq!(apply_obj["applied"], 1, "untouched: {apply_obj}");
-        let patches = apply_obj["patches"].as_array().expect("patches array");
-        assert_eq!(patches.len(), 3, "{apply_obj}");
-        assert_eq!(patches[0]["purl"], "pkg:npm/a@1.0.0", "{apply_obj}");
-        assert_eq!(patches[1], records[0], "appended in order: {apply_obj}");
-        assert_eq!(patches[2], records[1], "appended in order: {apply_obj}");
-    }
-
-    /// Missing counters default to zero before the bump (the
-    /// `unwrap_or(0)` fallback) — the keys are CREATED, not skipped, so a
-    /// minimal download report still ends up count-consistent.
-    #[test]
-    fn fold_missing_counts_default_to_zero() {
-        let mut apply_obj = serde_json::json!({ "patches": [] });
-        let records = [record("pkg:npm/b@1.0.0")];
-
-        fold_vendored_skips_into_apply(&mut apply_obj, &records);
-
-        assert_eq!(apply_obj["found"], 1, "{apply_obj}");
-        assert_eq!(apply_obj["skipped"], 1, "{apply_obj}");
-        let patches = apply_obj["patches"].as_array().expect("patches array");
-        assert_eq!(patches.len(), 1, "{apply_obj}");
-        assert_eq!(patches[0], records[0], "{apply_obj}");
-    }
-
-    /// A non-object report (defensive arm) is left byte-identical — no
-    /// panic, no partial mutation.
-    #[test]
-    fn fold_non_object_report_is_a_noop() {
-        let mut apply_obj = serde_json::json!("nope");
-        fold_vendored_skips_into_apply(&mut apply_obj, &[record("pkg:npm/b@1.0.0")]);
-        assert_eq!(apply_obj, serde_json::json!("nope"));
-    }
-
-    /// With zero records the fold only strips the inner `status`: counts
-    /// and patches stay exactly as the download phase reported them.
-    #[test]
-    fn fold_empty_records_only_strips_status() {
-        let mut apply_obj = serde_json::json!({
-            "status": "success",
-            "found": 2,
-            "skipped": 1,
-            "patches": [{ "purl": "pkg:npm/a@1.0.0" }],
-        });
-        fold_vendored_skips_into_apply(&mut apply_obj, &[]);
-        assert_eq!(
-            apply_obj,
-            serde_json::json!({
-                "found": 2,
-                "skipped": 1,
-                "patches": [{ "purl": "pkg:npm/a@1.0.0" }],
-            }),
-            "only the status may change on the zero-record fold"
-        );
-    }
-}
-
-/// Exact-string tests for the scan-driven vendor step's human lines.
 #[cfg(test)]
 mod ui_format_tests {
     use super::{format_nothing_vendored, format_vendor_step_error};

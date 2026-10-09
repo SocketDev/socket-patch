@@ -702,12 +702,12 @@ pub(crate) fn print_legacy_error(code: &str, message: &str) {
 
 /// Whether `command` still prints its legacy (non-[`Envelope`]) JSON shape.
 fn is_legacy_shape(command: Command) -> bool {
-    matches!(command, Command::Scan | Command::Get | Command::Rollback)
+    matches!(command, Command::Rollback)
 }
 
 /// The JSON a self-enforced usage error prints under `--json`: a full
 /// [`Envelope`] for commands already on it, the legacy error shape for
-/// `scan` / `get` / `rollback`.
+/// `rollback`.
 pub(crate) fn usage_error_json(
     command: Command,
     dry_run: bool,
@@ -818,11 +818,13 @@ mod tests {
 
     #[test]
     fn usage_error_json_legacy_vs_envelope() {
-        for cmd in [Command::Scan, Command::Get, Command::Rollback] {
+        for cmd in [Command::Rollback] {
             let v = usage_error_json(cmd, true, "invalid_args", "bad");
             assert_eq!(v, legacy_error("invalid_args", "bad"), "{cmd:?}");
         }
         for cmd in [
+            Command::Scan,
+            Command::Get,
             Command::Apply,
             Command::List,
             Command::Remove,
