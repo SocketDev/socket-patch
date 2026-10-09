@@ -24,6 +24,9 @@
 //! `--offline` INTO the env, which every test here wants anyway), so none
 //! need `#[serial]` — each runs in its own tempdir.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -356,15 +359,14 @@ async fn preserve_state_unwires_but_keeps_artifact_and_ledger() {
     assert_eq!(code, 0, "preserve rollback exits 0: {env:#}");
     assert_eq!(env["status"], "success", "{env:#}");
     assert_eq!(
-        env["vendoredPreserved"],
+        rollback_json::vendored_preserved(&env),
         json!([PURL]),
         "the unwired-but-kept purl rides vendoredPreserved: {env:#}"
     );
-    assert_eq!(env["vendoredReverted"], json!([]), "{env:#}");
-    assert_eq!(env["vendoredKept"], json!([]), "{env:#}");
-    assert_eq!(env["manifest"]["preserved"], json!(true), "{env:#}");
-    assert_eq!(env["manifest"]["removedEntries"], json!([]), "{env:#}");
-    assert_eq!(env["gc"], json!({ "skipped": true }), "{env:#}");
+    assert_eq!(rollback_json::vendored_reverted(&env), json!([]), "{env:#}");
+    assert_eq!(rollback_json::vendored_kept(&env), json!([]), "{env:#}");
+    assert_eq!(rollback_json::manifest_removed(&env), json!([]), "{env:#}");
+    assert!(env.get("gc").is_none(), "{env:#}");
     assert_eq!(fx2.lock_bytes(), fx2.original_lock, "lock restored");
     assert!(fx2.tgz_path().is_file(), "artifact kept");
     assert!(
@@ -538,8 +540,9 @@ async fn drift_keep_exits_partial_failure_and_holds_manifest() {
     // in the top-level `failed` (#1066).
     assert_eq!(env["status"], "error", "{env:#}");
     assert_eq!(env["error"]["code"], "rollback_failed", "{env:#}");
-    assert_eq!(env["failed"], 1, "{env:#}");
-    let kept = env["vendoredKept"].as_array().expect("vendoredKept array");
+    assert_eq!(env["summary"]["failed"], 1, "{env:#}");
+    let kept_view = rollback_json::vendored_kept(&env);
+    let kept = kept_view.as_array().expect("vendoredKept array");
     assert_eq!(kept.len(), 1, "{env:#}");
     assert_eq!(kept[0]["purl"], DRIFT_PURL, "{env:#}");
     assert!(
@@ -548,9 +551,9 @@ async fn drift_keep_exits_partial_failure_and_holds_manifest() {
             .is_some_and(|r| r.contains("drifted")),
         "the kept reason must name the drift: {env:#}"
     );
-    assert_eq!(env["vendoredReverted"], json!([]), "{env:#}");
+    assert_eq!(rollback_json::vendored_reverted(&env), json!([]), "{env:#}");
     assert_eq!(
-        env["manifest"]["removedEntries"],
+        rollback_json::manifest_removed(&env),
         json!([]),
         "a drift-kept purl's manifest entry is never removed: {env:#}"
     );
@@ -603,14 +606,14 @@ async fn detached_entries_reverted_by_unscoped_default() {
     assert_eq!(code, 0, "detached revert exits 0: {env:#}");
     assert_eq!(env["status"], "success", "{env:#}");
     assert_eq!(
-        env["vendoredReverted"],
+        rollback_json::vendored_reverted(&env),
         json!([PURL]),
         "the detached entry must ride vendoredReverted: {env:#}"
     );
-    assert_eq!(env["vendoredPreserved"], json!([]), "{env:#}");
-    assert_eq!(env["vendoredKept"], json!([]), "{env:#}");
+    assert_eq!(rollback_json::vendored_preserved(&env), json!([]), "{env:#}");
+    assert_eq!(rollback_json::vendored_kept(&env), json!([]), "{env:#}");
     assert_eq!(
-        env["manifest"]["removedEntries"],
+        rollback_json::manifest_removed(&env),
         json!([]),
         "detached entries have no manifest record to remove: {env:#}"
     );

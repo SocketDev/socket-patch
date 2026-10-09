@@ -1313,10 +1313,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         if args.common.json {
             let mut env = error_envelope(
                 args.common.dry_run,
-                EnvelopeError::new(
-                    "manifest_not_found",
-                    format!("Manifest not found at {}", manifest_path.display()),
-                ),
+                EnvelopeError::new("manifest_not_found", "Manifest not found"),
             );
             env.set_extra("path", serde_json::json!(manifest_path.display().to_string()));
             println!("{}", env.to_pretty_json());
