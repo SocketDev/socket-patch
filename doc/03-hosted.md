@@ -203,7 +203,7 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
 ### New findings since the review
 
 - {{E50}}: hosted `rewrite_nuget` and upstream restore rewrite every `packages.lock.json` entry of the patched id, in every target framework, whatever its `resolved` version; vendored `locked_at` only touches entries at the patched version. `packages.lock.json` has four walkers (hosted, restore, vendored, VEX).
-- {{E52}}: `vendor/go_sum_edit.rs` keeps free `upsert_module_lines` / `has_module_version` / `remove_exact_module_version_lines` with no production caller, re-implemented by the `GoSumEditor` the hosted Go rewriter uses; the free copies survive only as a test oracle, and the pure hosted codec lives in `vendor/`.
+- {{E52}}: every go.sum edit goes through the `GoSumEditor` the hosted Go rewriter uses; the free oracle-only copies were deleted (#1103). The pure hosted codec still lives in `vendor/go_sum_edit.rs`, not `formats/`.
 - {{E15}}: the hosted cargo planner `plan_cargo_toml` is a line scanner, gated by a second `toml_edit` classifier of the same declarations. It refuses `serde = { version = "1", features = [⏎ "derive",⏎] }` as "inline table does not close on its line", although cargo and `toml_edit` accept it, so hosted skips a crate that vendored mode handles. Upstream restore unpins with a third, line-level grammar.
 - {{E58}}: the hosted-vlt ledger helpers left without a caller by #277 were deleted (#1141); `UpstreamClient::seed_rubygems_sha256` is still a test helper compiled into production.
 - {{E73}} October 7: "is this hosted patch pinned" is decided four ways (`confirm`, `mark_pinned`, `memory_recorded`, discovery); lockless NuGet/Cargo pins are attested in-run then reported contested forever (PR #1058).
