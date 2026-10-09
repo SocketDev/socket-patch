@@ -1,10 +1,9 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T14:30Z · main @ e782c9a_
+_Last updated 2026-10-09T15:00Z · main @ 0ce8d6c_
 
 **In flight:**
 - [#1277](https://github.com/SocketDev/socket-patch/pull/1277): 7 more files read the leading BOM through `formats::text` (`npm_crawler`, `governing_root`, `npmrc`, `upstream/npm`, `vex/discover/{npm,pypi_other}`, `pnpm/workspace`); 2 double skips removed. #905 slice 4 (E64). +29/−31 prod, +157/−7 tests. `state: ready`.
 - [#1272](https://github.com/SocketDev/socket-patch/pull/1272): `tests/common/envelope.rs` owns the `--json` envelope readers (parse, `events`, `find_event`, event/warning codes); ~25 private copies in 24 test files deleted, ratchet `cli/envelope_helper_copies.rs`. #1089 child 1 helpers (C32). 0 prod. `state: ready`.
-- [#1264](https://github.com/SocketDev/socket-patch/pull/1264): Gradle (vendored + hosted) and the Maven reactor pick inserted-line terminators through `line_endings::terminator`; `gradle/eol.rs` deleted (`eol_eq` and `respell` in `line_endings`). #815 slice 3 (E16). +67/−97 prod, +67/−37 tests. `state: ready`.
 - [#1262](https://github.com/SocketDev/socket-patch/pull/1262): the OpenVEX document is written through `utils::fs::write_user_output` (stage + rename; links through, devices in place). #1144 (C77). +57/−1 prod, +185 tests; CI green, Bugbot clean. `state: ready`.
 - [#1258](https://github.com/SocketDev/socket-patch/pull/1258): 40 more CLI test files import `tests/common`'s `binary()` / `git_sha256` (31 + 25 copies deleted). #824 children 2–3 slice 2 (C30). +142/−401 tests, 0 prod. `state: ready`.
 - [#1245](https://github.com/SocketDev/socket-patch/pull/1245): `vendor::revert::finish` + `KeepPolicy` (`OnDrift`, `OnDriftWhileReferenced`, `NpmFamily`); gem, composer, Maven legacy, NuGet and pnpm finish through it. #989 item 1 slice (E24). +133/−157 prod (helper 90), +271 tests. `state: ready`.
@@ -13,7 +12,7 @@ _Last updated 2026-10-09T14:30Z · main @ e782c9a_
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - Maintainer draft: #1049 (#792).
 
-**Merged:** #1253 (C51 agent-mode jar streaming; `vendor/common.rs` caller and a size-mismatch test remain), #1227 (E16 slice 2), #1221 (E19 hosted gem), #1230 (E93 `PurlKey`), #1217/#1209/#1205/#1183 (E05 Deno, Go, cargo, NuGet crawls); 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
+**Merged:** #1264 (E16 slice 3, +67/−97 prod), #1253 (C51 agent-mode jar streaming; `vendor/common.rs` caller and a size-mismatch test remain), #1227 (E16 slice 2), #1221 (E19 hosted gem), #1230 (E93 `PurlKey`), #1217/#1209/#1205/#1183 (E05 Deno, Go, cargo, NuGet crawls); 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
 
 **Queue** (score = 3B + 2U + 2D + S − risk). Standalone refactor issues closed `not_planned` live on as tracker checklist items; rank the tracker's next item.
 

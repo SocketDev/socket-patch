@@ -158,7 +158,7 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - `utils/lock_fragments` (Poetry and PDM) re-terminates spliced lines with `majority_terminator` (#703) {{E54}};
   - `cargo_manifest` aligns lines with an LCS diff.
 
-  Since #1227, `common` and `pypi_uv` pick through `utils::line_endings::terminator` (`detect_eol` and `pypi_uv::newline_of` are gone). Ad-hoc rules remain in `gradle::newline_of` (a different, first-line rule) plus inline any-CRLF copies in `maven_reactor.rs` (×2) and `pypi_pipenv.rs`. One classifier is the target. {{E16}}
+  Since #1227, `common` and `pypi_uv` pick through `utils::line_endings::terminator` (`detect_eol` and `pypi_uv::newline_of` are gone). Since #1264, Gradle (vendored and hosted) and the Maven reactor pick through it too (`gradle/eol.rs` and its first-line rule are gone; `eol_eq` and `respell` live in `utils::line_endings`). `pypi_pipenv.rs` keeps an any-CRLF flag for its whole-lock re-serialization. One classifier is the target. {{E16}}
 - **Per-backend copies:**
   - `cleanup_failed_stage` is byte-identical in cargo and gem, and one line different in composer; golang has its own `cleanup_failed_service_stage`.
   - `<eco>_service_copy` (fetch → settle → claim_prestaged-or-extract → afterHash check → swap) is repeated for cargo, composer, gem and golang (`go_service_redirect`): about 500 lines, with the layout-mismatch message spelled four times. No drift proven yet. {{E25}}
