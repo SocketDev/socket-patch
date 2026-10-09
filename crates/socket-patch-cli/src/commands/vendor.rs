@@ -3858,7 +3858,11 @@ fn print_vendor_closing(
                 &common.cwd.join("composer.lock"),
             ) {
                 let packages = super::composer_hints::vendored_composer_packages(&lock);
-                extra.extend(super::composer_hints::vendored_reinstall_hints(&packages));
+                let vendor_dir = super::composer_hints::vendor_dir_label(&common.cwd);
+                extra.extend(super::composer_hints::vendored_reinstall_hints(
+                    &packages,
+                    &vendor_dir,
+                ));
             }
         }
         for line in crate::ui::next_steps(&commit, &reinstall, &extra) {
