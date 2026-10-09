@@ -113,6 +113,10 @@ pub(crate) fn package_content_hash(nupkg: &[u8]) -> Result<String, String> {
             return Err(truncated(local_offset + entry_size));
         }
         let header_size = 46 + name_len + extra_len + comment_len;
+        // The whole record is hashed below: it must lie inside the archive.
+        if at + header_size > nupkg.len() {
+            return Err(truncated(at + header_size));
+        }
         records.push(Record {
             position: at,
             header_size,
@@ -134,6 +138,8 @@ pub(crate) fn package_content_hash(nupkg: &[u8]) -> Result<String, String> {
         return Err("the package holds nothing but its signature".to_string());
     }
 
+    let inconsistent =
+        || "the package's signature entry is inconsistent with its directory".to_string();
     let mut hash = Sha512::new();
     rest.sort_by_key(|r| r.local_offset);
     hash.update(&nupkg[..rest[0].local_offset]);
@@ -148,14 +154,26 @@ pub(crate) fn package_content_hash(nupkg: &[u8]) -> Result<String, String> {
         } else {
             r.local_offset
         };
-        hash.update((offset as u32).to_le_bytes());
+        hash.update(
+            u32::try_from(offset)
+                .map_err(|_| inconsistent())?
+                .to_le_bytes(),
+        );
         hash.update(&nupkg[r.position + 46..r.position + r.header_size]);
     }
     hash.update(&nupkg[eocd..eocd + 8]);
     hash.update((entries_disk - 1).to_le_bytes());
     hash.update((entries - 1).to_le_bytes());
-    hash.update((cd_size - sig_header_size as u32).to_le_bytes());
-    hash.update((cd_offset - sig_entry_size as u32).to_le_bytes());
+    let cd_size = u32::try_from(sig_header_size)
+        .ok()
+        .and_then(|n| cd_size.checked_sub(n))
+        .ok_or_else(inconsistent)?;
+    let cd_offset = u32::try_from(sig_entry_size)
+        .ok()
+        .and_then(|n| cd_offset.checked_sub(n))
+        .ok_or_else(inconsistent)?;
+    hash.update(cd_size.to_le_bytes());
+    hash.update(cd_offset.to_le_bytes());
     hash.update(&nupkg[eocd + 20..]);
     Ok(base64::engine::general_purpose::STANDARD.encode(hash.finalize()))
 }
@@ -259,6 +277,15 @@ mod tests {
         assert!(package_content_hash(b"not a zip at all, just some bytes").is_err());
         let mut bytes = zip(&FILES, true);
         bytes.truncate(bytes.len() / 2);
+        assert!(package_content_hash(&bytes).is_err());
+        // A central-directory record whose extra/comment lengths run past
+        // the end of the archive is refused, not sliced out of bounds.
+        let mut with_sig: Vec<(&str, &[u8])> = FILES.to_vec();
+        with_sig.push((".signature.p7s", b"sig"));
+        let mut bytes = zip(&with_sig, true);
+        let eocd = find_eocd(&bytes).unwrap();
+        let cd = u32_at(&bytes, eocd + 16).unwrap() as usize;
+        bytes[cd + 32..cd + 34].copy_from_slice(&u16::MAX.to_le_bytes());
         assert!(package_content_hash(&bytes).is_err());
     }
 }
