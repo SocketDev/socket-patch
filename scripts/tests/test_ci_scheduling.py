@@ -103,9 +103,21 @@ class Scheduling(unittest.TestCase):
         self.assertIn("actions: read", "\n".join(JOBS["clippy"]))
         self.assertIn("steps.merge-queue.outputs.reuse", "\n".join(JOBS["clippy"]))
         self.assertNotIn("cargo build --workspace", "\n".join(JOBS["test"]))
-        addon = reader.step(JOBS["test"], "Build Node addon")
-        self.assertIn("if: matrix.shard == 1", addon)
-        self.assertIn("cargo build --locked -p socket-patch-node", addon)
+        self.assertNotIn("socket-patch-node", "\n".join(JOBS["test"]))
+
+    def test_addon_platform_links_run_in_parallel_with_test_shards(self):
+        addon = "\n".join(JOBS["node-addon"])
+        self.assertEqual(dependencies("node-addon"), {"clippy"})
+        self.assertEqual(dependencies("test"), {"clippy"})
+        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", addon)
+        self.assertIn("github.event_name == 'pull_request' && 'macos-latest' || ''", addon)
+        self.assertIn("shared-key: addon-${{ matrix.os }}", addon)
+        build = reader.step(JOBS["node-addon"], "Build addon")
+        self.assertIn("SOCKET_PATCH_NODE_CARGO_PROFILE: dev", build)
+        self.assertIn("node crates/socket-patch-node/npm/scripts/build-addon.mjs", build)
+        self.assertNotIn("if:", build)
+        smoke = reader.step(JOBS["node-addon"], "Smoke-test addon")
+        self.assertIn("matrix.os == 'ubuntu-latest'", smoke)
 
     def test_gradle_boundaries_run_on_prs_and_middle_lines_gate_the_queue(self):
         pr = [r for r in reader.matrix_include(JOBS["e2e"]) if r.get("gradle")]

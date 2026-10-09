@@ -105,12 +105,20 @@ jobs:
         # linking hundreds of executables or waiting for the E2E fan-out.
         run: cargo check --locked --workspace --all-targets --all-features
 
-  # The napi addon is only ever loaded by Node, so cargo's own tests never
-  # exercise its JS loader or the engine/provider boundary.
+  # Cargo's tests do not link the addon's test=false cdylib. Build it once
+  # per OS alongside the test shards; serializing it ahead of shard 1 left
+  # that shard waiting on a separate production-profile compilation.
+  # Linux also exercises the JS loader and engine/provider boundary.
   node-addon:
     if: github.event.pull_request.draft != true
     needs: clippy
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        exclude:
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -124,7 +132,10 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: dev-ubuntu-latest
+          # The addon uses production features; the test shards enable dev
+          # features. Keep both cache writers instead of racing to save a
+          # partial dependency set under one key.
+          shared-key: addon-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
@@ -138,7 +149,7 @@ jobs:
         run: node crates/socket-patch-node/npm/scripts/build-addon.mjs
 
       - name: Smoke-test addon
-        if: needs.clippy.outputs.reuse != 'true'
+        if: matrix.os == 'ubuntu-latest' && needs.clippy.outputs.reuse != 'true'
         run: node --test crates/socket-patch-node/npm/test/smoke.mjs
 
   # Check the standalone installer, release scripts, and native installer
@@ -319,12 +330,6 @@ jobs:
         with:
           shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # cargo test builds the CLI/bench executables itself. The addon is a
-      # cdylib with test=false, so retain its platform link check once per OS.
-      - name: Build Node addon
-        if: matrix.shard == 1
-        run: cargo build --locked -p socket-patch-node
 
       - name: Warm the test cache after merge-queue validation
         if: needs.clippy.outputs.reuse == 'true'
