@@ -15601,6 +15601,162 @@ mod tests {
         );
     }
 
+    /// A superseding patch (new uuid) refreshes an existing patch-registry
+    /// section's remote — and must then move that section to where bundler
+    /// writes it. Bundler sorts the rubygems `GEM` sections by identifier,
+    /// so with a sibling patch-registry section in between, an in-place
+    /// refresh leaves the lock out of order and every frozen install on
+    /// bundler 4.0.19+ exits 16 (#1186).
+    #[test]
+    fn gem_superseded_remote_moves_section_to_sorted_position() {
+        fn ov(name: &str, uuid: &str) -> DepOverride {
+            let mut o = gem_override(name, "1.0.0");
+            o.patch_uuid = uuid.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/tok/{uuid}/");
+            }
+            o
+        }
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"vuln-gem\", \"1.0.0\"\n";
+        for eol in ["\n", "\r\n"] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.replace('\n', eol));
+            files.insert(
+                "Gemfile.lock".to_string(),
+                format!(
+                    "GEM\n  remote: https://rubygems.org/\n  specs:\n    tiny-dep (1.0.0)\n    \
+                     vuln-gem (1.0.0)\n      tiny-dep\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  \
+                     vuln-gem (= 1.0.0)\n\nCHECKSUMS\n  tiny-dep (1.0.0) sha256={a}\n  \
+                     vuln-gem (1.0.0) sha256={a}\n\nBUNDLED WITH\n   4.0.22\n",
+                    a = "2".repeat(64)
+                )
+                .replace('\n', eol),
+            );
+            let gen1 = [ov("vuln-gem", "10000000"), ov("tiny-dep", "80000000")];
+            let first = rewrite_registry_redirect(&files, &gen1);
+            for (name, content) in first.files {
+                files.insert(name, content);
+            }
+            let remotes = |lock: &str| -> Vec<String> {
+                lock.lines()
+                    .filter_map(|l| l.trim_end_matches('\r').strip_prefix("  remote: "))
+                    .map(str::to_string)
+                    .collect()
+            };
+            assert_eq!(
+                remotes(&files["Gemfile.lock"]),
+                [
+                    "https://patch.test/gem/tok/10000000/",
+                    "https://patch.test/gem/tok/80000000/",
+                    "https://rubygems.org/",
+                ],
+                "generation 1 inserts sorted: {}",
+                files["Gemfile.lock"]
+            );
+
+            let gen2 = [ov("vuln-gem", "9a9a9a9a"), ov("tiny-dep", "80000000")];
+            let second = rewrite_registry_redirect(&files, &gen2);
+            let lock = second.files.get("Gemfile.lock").expect("lock refreshed");
+            assert_eq!(
+                remotes(lock),
+                [
+                    "https://patch.test/gem/tok/80000000/",
+                    "https://patch.test/gem/tok/9a9a9a9a/",
+                    "https://rubygems.org/",
+                ],
+                "refreshed section re-placed in bundler's order ({eol:?}): {lock}"
+            );
+            let expected_sections = format!(
+                "GEM\n  remote: https://patch.test/gem/tok/80000000/\n  specs:\n    \
+                 tiny-dep (1.0.0)\n\nGEM\n  remote: https://patch.test/gem/tok/9a9a9a9a/\n  \
+                 specs:\n    vuln-gem (1.0.0)\n      tiny-dep\n\nGEM\n  remote: \
+                 https://rubygems.org/\n  specs:\n\nPLATFORMS\n"
+            )
+            .replace('\n', eol);
+            assert!(
+                lock.starts_with(&expected_sections),
+                "sections move whole, endings kept ({eol:?}): {lock}"
+            );
+            assert!(
+                second
+                    .edits
+                    .iter()
+                    .any(|e| e.kind == "redirect_gemfile_lock_source_url"
+                        && e.original
+                            == Some(Value::String("https://patch.test/gem/tok/10000000/".into()))),
+                "refresh still recorded: {:?}",
+                second.edits
+            );
+
+            // Converged: a re-run is a no-op.
+            for (name, content) in second.files {
+                files.insert(name, content);
+            }
+            let third = rewrite_registry_redirect(&files, &gen2);
+            assert!(
+                third.files.is_empty(),
+                "re-run after the move must be a no-op: {:?}",
+                third.files
+            );
+        }
+    }
+
+    /// A converged lock an earlier run left out of bundler's section order
+    /// (#1186) is healed by the next run even though the remote is
+    /// unchanged — here by moving the patch section after a sibling that
+    /// sorts first, to the end of the `GEM` sections.
+    #[test]
+    fn gem_out_of_order_patch_section_is_healed_on_rerun() {
+        let index = "https://z.test/gem/tok/uuid/";
+        let mut o = gem_override("rails", "7.0.0");
+        if let Some(r) = o.registry_override.as_mut() {
+            r.index_url = index.into();
+        }
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&o));
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let sorted = files["Gemfile.lock"].clone();
+        let rails = format!("GEM\n  remote: {index}\n  specs:\n    rails (7.0.0)\n\n");
+        let upstream = "GEM\n  remote: https://rubygems.org/\n  specs:\n\n";
+        assert!(
+            sorted.starts_with(&format!("{upstream}{rails}PLATFORMS\n")),
+            "fresh insert sorts the patch section last: {sorted}"
+        );
+        // An out-of-order lock as an earlier run could leave it.
+        files.insert(
+            "Gemfile.lock".to_string(),
+            sorted.replacen(
+                &format!("{upstream}{rails}"),
+                &format!("{rails}{upstream}"),
+                1,
+            ),
+        );
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&o));
+        assert_eq!(
+            second.files.get("Gemfile.lock"),
+            Some(&sorted),
+            "re-run restores bundler's order"
+        );
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_lock_section_order"),
+            "the move is recorded: {:?}",
+            second.edits
+        );
+    }
+
     /// A TRANSITIVE redirected dep (undeclared in the Gemfile, appended as a
     /// source block) becomes a direct source-pinned dependency, so the
     /// converged lock must gain its `<name> (= <ver>)!` DEPENDENCIES entry —
