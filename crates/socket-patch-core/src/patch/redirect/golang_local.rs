@@ -19,7 +19,7 @@
 //!
 //! The copy is produced by **delegating to the hardened
 //! [`apply_package_patch`] pipeline** pointed at the fresh copy, reusing all the
-//! verify → package/diff/blob → atomic-write machinery unchanged.
+//! verify → blob → atomic-write machinery unchanged.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -175,7 +175,6 @@ pub async fn apply_go_redirect<'a>(
     base_rel: &str,
     files: &HashMap<String, PatchFileInfo>,
     sources: &PatchSources<'_>,
-    uuid: Option<&str>,
     dry_run: bool,
     policy: MismatchPolicy,
 ) -> ApplyResult {
@@ -244,7 +243,7 @@ pub async fn apply_go_redirect<'a>(
         // "would patch" report, without creating the copy or editing go.mod.
         let pristine_src = pristine_src.path();
         let mut result =
-            apply_package_patch(purl, pristine_src, files, sources, uuid, true, policy).await;
+            apply_package_patch(purl, pristine_src, files, sources, true, policy).await;
         result.package_path = copy_dir.display().to_string();
         result.sidecar = None; // a replace copy is not the cache (no go.sum advisory)
         return result;
@@ -284,8 +283,7 @@ pub async fn apply_go_redirect<'a>(
     }
 
     // Delegate to the hardened pipeline, pointed at the copy.
-    let mut result =
-        apply_package_patch(purl, &copy_dir, files, sources, uuid, false, policy).await;
+    let mut result = apply_package_patch(purl, &copy_dir, files, sources, false, policy).await;
     result.package_path = copy_dir.display().to_string();
     // The golang sidecar advisory ("go mod verify will fail against go.sum")
     // is about in-cache patching; a `replace` copy bypasses go.sum entirely, so
@@ -803,7 +801,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -843,7 +840,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -939,7 +935,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -959,7 +954,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -995,7 +989,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1013,7 +1006,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1039,7 +1031,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             true,
             MismatchPolicy::Warn,
         )
@@ -1074,7 +1065,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1112,7 +1102,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1140,7 +1129,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &empty_sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1175,7 +1163,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1199,7 +1186,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1242,7 +1228,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1278,7 +1263,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1318,7 +1302,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1352,7 +1335,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1390,7 +1372,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1426,7 +1407,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1471,7 +1451,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1518,7 +1497,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1571,7 +1549,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1623,7 +1600,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1657,7 +1633,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1701,7 +1676,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1742,7 +1716,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1778,7 +1751,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1837,7 +1809,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1918,7 +1889,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1971,7 +1941,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -2025,7 +1994,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -2066,7 +2034,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -2308,7 +2275,6 @@ mod tests {
             GO_PATCHES_DIR,
             &files,
             &sources,
-            None,
             false,
             MismatchPolicy::Warn,
         )
