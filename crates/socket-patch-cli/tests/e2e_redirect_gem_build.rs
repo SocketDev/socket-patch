@@ -3111,3 +3111,203 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
     };
     manifestless_vex_matrix(&rotated, &fresh).await;
 }
+
+/// `scan --mode hosted --json --yes --max-new-patches <cap>`: one capped
+/// gradual-rollout run. Returns the parsed envelope.
+fn run_capped_hosted_scan(proj: &Path, api: &str, cap: &str) -> serde_json::Value {
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--max-new-patches",
+            cap,
+            "--cwd",
+            proj.to_str().expect("utf8 tmp path"),
+            "--api-url",
+            api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "capped scan (--max-new-patches {cap}) failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    serde_json::from_str(&stdout).expect("capped scan envelope JSON")
+}
+
+/// The rollout counts of a capped scan envelope, as `(new, upgrade,
+/// already, deferred)`.
+fn rollout_counts(env: &serde_json::Value) -> (u64, u64, u64, u64) {
+    let c = &env["rollout"]["counts"];
+    let n = |k: &str| c[k].as_u64().unwrap_or_else(|| panic!("counts.{k}: {env}"));
+    (n("new"), n("upgrade"), n("already"), n("deferred"))
+}
+
+/// #1224: on a lock with no CHECKSUMS section (bundler < 2.6, or an older
+/// lock bundler 4 keeps without one) the hosted redirect wires only the
+/// Gemfile's `source "<patch registry>" do` block and leaves the lock for
+/// the next unfrozen install. A capped re-scan must still count that pin as
+/// ALREADY: `--max-new-patches 0` must not defer it, and under a cap of 1
+/// the run after the first must spend its slot on the NEXT gem instead of
+/// re-counting the wired one as NEW forever.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_capped_rescan_counts_a_gemfile_only_pin_as_already() {
+    let Some(fx) = redirect_scanned_project(
+        "capped-gemfile-only",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let api = fx._server.uri();
+    let lock_path = fx.proj.join(fx.lock_name);
+    let gemfile_path = fx.proj.join(fx.gemfile_name);
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        !lock.contains("CHECKSUMS") && !lock.contains(&fx.index_url),
+        "the fixture must leave the CHECKSUMS-less lock mixed (Gemfile-only pin):\n{lock}"
+    );
+
+    // Single gem, already wired in the Gemfile: "upgrade existing patches
+    // only" must read it as ALREADY, not defer it as NEW.
+    let env = run_capped_hosted_scan(&fx.proj, &api, "0");
+    assert_eq!(rollout_counts(&env), (0, 0, 1, 0), "cap 0 re-scan: {env}");
+    let deferred = env["skipped"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|s| s["reason"] == "rollout_deferred");
+    assert!(!deferred, "a wired gem must not be rollout_deferred: {env}");
+
+    // Two patchable gems under a cap of 1, from the pristine pair: run 1
+    // wires one, run 2 must wire the other, run 3 finds both in place.
+    const TINY_GEN2: &str = "80000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let stage = fx.tmp.path().join("generation-stage");
+    let vuln = GenerationGem {
+        name: DEP,
+        uuid: UUID,
+        deps: vec![format!("{TRANSITIVE}:>= 0")],
+        lib_file: "vuln_gem.rb",
+        orig: orig_lib(),
+        patched: patched_lib(),
+        gem: build_gem(
+            &stage.join("vuln"),
+            DEP,
+            DEP_VERSION,
+            "vuln_gem.rb",
+            &patched_lib(),
+            &[TRANSITIVE],
+        ),
+    };
+    let tiny_patched = TINY_LIB.replace("tiny-ok", "tiny-patched");
+    let tiny = GenerationGem {
+        name: TRANSITIVE,
+        uuid: TINY_GEN2,
+        deps: vec![],
+        lib_file: "tiny_dep.rb",
+        orig: TINY_LIB.to_string(),
+        patched: tiny_patched.clone(),
+        gem: build_gem(
+            &stage.join("tiny"),
+            TRANSITIVE,
+            "1.0.0",
+            "tiny_dep.rb",
+            &tiny_patched,
+            &[],
+        ),
+    };
+    mount_patch_generation(&fx._server, 1, &[vuln, tiny]).await;
+    std::fs::write(&gemfile_path, &fx.pristine_gemfile).unwrap();
+    std::fs::write(&lock_path, &fx.pristine_lock).unwrap();
+    let registry = |uuid: &str| format!("{api}/patch-registry/gem/{TOKEN}/{uuid}/");
+
+    let env = run_capped_hosted_scan(&fx.proj, &api, "1");
+    assert_eq!(rollout_counts(&env), (1, 0, 0, 1), "run 1: {env}");
+    let env = run_capped_hosted_scan(&fx.proj, &api, "1");
+    assert_eq!(
+        rollout_counts(&env),
+        (1, 0, 1, 0),
+        "run 2 must count the gem run 1 wired as ALREADY and add the other: {env}"
+    );
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    for (gem, patch) in [(DEP, UUID), (TRANSITIVE, TINY_GEN2)] {
+        assert!(
+            gemfile.contains(&registry(patch)),
+            "run 2 must leave both gems wired ({gem} missing)"
+        );
+    }
+    let env = run_capped_hosted_scan(&fx.proj, &api, "1");
+    assert_eq!(rollout_counts(&env), (0, 0, 2, 0), "run 3: {env}");
+    assert_eq!(
+        std::fs::read_to_string(&gemfile_path).unwrap(),
+        gemfile,
+        "run 3 must leave the Gemfile byte-identical"
+    );
+}
+
+/// #1224 (superseding shape): a newer patch for the same gem version, new
+/// uuid, over a Gemfile-only pin. `--max-new-patches 0` ("upgrade existing
+/// patches only") must see the recorded pin and UPGRADE it to the new uuid,
+/// as it does on a CHECKSUMS lock, instead of deferring it as NEW and
+/// leaving the Gemfile on the superseded patch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_cap_zero_upgrades_a_superseded_gemfile_only_pin() {
+    let Some(fx) = redirect_scanned_project(
+        "cap-zero-supersede",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let api = fx._server.uri();
+    const VULN_GEN2: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let gen2_lib = patched_lib().replace("PATCHED", "PATCHED-GEN2");
+    let stage = fx.tmp.path().join("generation-stage");
+    let vuln = GenerationGem {
+        name: DEP,
+        uuid: VULN_GEN2,
+        deps: vec![format!("{TRANSITIVE}:>= 0")],
+        lib_file: "vuln_gem.rb",
+        orig: orig_lib(),
+        patched: gen2_lib.clone(),
+        gem: build_gem(
+            &stage.join(VULN_GEN2),
+            DEP,
+            DEP_VERSION,
+            "vuln_gem.rb",
+            &gen2_lib,
+            &[TRANSITIVE],
+        ),
+    };
+    mount_patch_generation(&fx._server, 1, &[vuln]).await;
+
+    let env = run_capped_hosted_scan(&fx.proj, &api, "0");
+    assert_eq!(rollout_counts(&env), (0, 1, 0, 0), "cap 0 re-scan: {env}");
+    let gemfile = std::fs::read_to_string(fx.proj.join(fx.gemfile_name)).unwrap();
+    assert!(
+        gemfile.contains(&format!("{api}/patch-registry/gem/{TOKEN}/{VULN_GEN2}/"))
+            && !gemfile.contains(&fx.index_url),
+        "the Gemfile must move to the superseding patch:\n{gemfile}"
+    );
+}
