@@ -535,7 +535,9 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
 /// Bundler records a dependency declared there with a `!` source pin in the
 /// lock's `DEPENDENCIES`, whichever URL the block names (#1056). A line-level
 /// `do` / `end` count, like [`declaration_prefix`]'s: a block opened and
-/// closed on one line nets out.
+/// closed on one line nets out. Keyword constructs (`if`, `case`, `def`, …)
+/// that start a line are counted too, so their `end` does not close an
+/// enclosing `source … do` block.
 fn in_source_block(text: &str, at: usize) -> bool {
     let mut open: Vec<bool> = Vec::new();
     for line in text[..at].lines() {
@@ -549,11 +551,27 @@ fn in_source_block(text: &str, at: usize) -> bool {
                 .strip_prefix("source")
                 .is_some_and(|rest| rest.starts_with([' ', '\t', '(']));
             open.push(source);
+        } else if opens_keyword_block(code) {
+            open.push(false);
         } else if code == "end" || code.starts_with("end ") || code.starts_with("end.") {
             open.pop();
         }
     }
     open.contains(&true)
+}
+
+/// Whether the (comment-stripped, trimmed) line opens a keyword construct
+/// that Ruby closes with `end`: one that starts the line, not a modifier
+/// (`gem "x" if cond`), and not closed on the same line.
+fn opens_keyword_block(code: &str) -> bool {
+    let first = code
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .next()
+        .unwrap_or_default();
+    matches!(
+        first,
+        "if" | "unless" | "while" | "until" | "case" | "begin" | "def" | "class" | "module"
+    ) && !(code.ends_with(" end") || code.ends_with(";end"))
 }
 
 /// How the gem comes back into the manifest.
@@ -1381,6 +1399,19 @@ mod tests {
         assert!(!at(
             "source \"https://x\" do gem \"a\" end\ngem \"rails\"\n"
         ));
+        // The `end` of an `if`/`case`/`def` inside the source block does
+        // not close it.
+        assert!(at(
+            "source \"https://x\" do\n  if ENV[\"A\"]\n    gem \"a\"\n  end\n  gem \"rails\"\nend\n"
+        ));
+        assert!(at(
+            "source \"https://x\" do\n  case RUBY_ENGINE\n  when \"jruby\" then gem \"a\"\n  end\n  def x; end\n  gem \"rails\"\nend\n"
+        ));
+        // A modifier `if` opens nothing.
+        assert!(!at(
+            "source \"https://x\" do\n  gem \"a\" if true\nend\ngem \"rails\"\n"
+        ));
+        assert!(!at("if true\n  gem \"a\"\nend\ngem \"rails\"\n"));
     }
 
     /// A hosted Gemfile + lock pair for `rails 7.0.0` (a direct gem), from
