@@ -43,12 +43,21 @@ concurrency:
   group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Linux jobs run on Depot's runners (depot-ubuntu-*-4: 4 vCPU, like GitHub's
+# public-repo ubuntu-latest), which don't draw on the org's shared GitHub-hosted
+# concurrency pool, where merge-queue jobs used to wait behind PR CI. Matrix
+# values stay `ubuntu-latest`/`ubuntu-22.04`, so job names, cache keys and
+# scripts are unchanged; only `runs-on` maps them. Kill switch: set the
+# repository variable DISABLE_DEPOT_RUNNERS=true to fall back to GitHub-hosted
+# runners (the same switch depscan uses). The compatibility workflows follow
+# the same mapping. Release, publish and merge-queue workflows stay
+# GitHub-hosted (provenance / write tokens).
 jobs:
   # Required independently of ci-ok so the merge queue sees a compile/lint
   # failure immediately. Expensive jobs also depend on this preflight.
   clippy:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -92,7 +101,7 @@ jobs:
   node-addon:
     if: github.event.pull_request.draft != true
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -126,7 +135,7 @@ jobs:
   # test harnesses.
   lint-ecosystems:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -218,7 +227,7 @@ jobs:
   #     tag doesn't already exist.
   release-readiness:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -273,7 +282,7 @@ jobs:
         exclude:
           # macOS legs run on main, the merge queue and nightly, not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 50
     env:
       VEXCTL_VERSION: v0.3.0
@@ -434,7 +443,7 @@ jobs:
     # queue already skips this job because each constituent PR ran it.
     if: github.event.pull_request.draft != true && github.event_name != 'merge_group'
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     strategy:
       fail-fast: false
       matrix:
@@ -486,7 +495,7 @@ jobs:
     # numbers are report-only so contributors get visibility without flaky
     # CI when coverage shifts naturally with test edits. A failing TEST
     # fails the job: this is the Linux leg of `test`.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 35
     permissions:
       contents: read
@@ -594,7 +603,7 @@ jobs:
   docker-base:
     if: github.event.pull_request.draft != true
     needs: clippy
-    runs-on: ubuntu-22.04
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -650,7 +659,7 @@ jobs:
     # container ships fails to load. ubuntu-22.04's older glibc is
     # the highest base that's forward-compatible with debian:12.
     needs: docker-base
-    runs-on: ubuntu-22.04
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     # sbt's image bakes three JDKs and warm sbt / Mill / scala-cli caches.
     timeout-minutes: ${{ matrix.ecosystem == 'sbt' && 45 || 30 }}
     permissions:
@@ -775,7 +784,7 @@ jobs:
     # single lcov.info. lcov(1) handles the union — same files are
     # summed line-by-line so a line covered by ANY test counts.
     needs: [coverage, coverage-docker]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -838,7 +847,7 @@ jobs:
 
   dispatch-tests:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -880,7 +889,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     env: &e2e-build-env
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -938,7 +947,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     env: *e2e-build-env
     steps: *e2e-build-steps
@@ -950,7 +959,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     env: *e2e-build-env
     steps: *e2e-build-steps
@@ -1276,7 +1285,7 @@ jobs:
           # deno; VEX must attest nothing), one leg per major.
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '1.46.3'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '2.9.7'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
     # hatch), hence more than the 25 minutes the older legs needed.
@@ -1782,7 +1791,7 @@ jobs:
           - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: gradle, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     env: *e2e-env
     steps: *e2e-steps
@@ -1833,7 +1842,7 @@ jobs:
           - {os: macos-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
           - {os: macos-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: macos-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
     # hatch), hence more than the 25 minutes the older legs needed.
@@ -1884,7 +1893,7 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '7'}
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '9'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
     # legs launch the test binaries themselves.
@@ -1916,7 +1925,7 @@ jobs:
     # pull_request runs of its PR into main) run it too.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease'
     needs: docker-base
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: ${{ matrix.ecosystem == 'sbt' && 45 || 35 }}
     permissions:
       contents: read
@@ -2002,7 +2011,7 @@ jobs:
     # Only wait for the clippy preflight.
     if: github.event.pull_request.draft != true
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -2056,7 +2065,7 @@ jobs:
           - {os: ubuntu-latest, yarn: '4.1.0'}
           - {os: ubuntu-latest, yarn: '4.18.0'}
           - {os: windows-latest, yarn: '4.12.0'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 30
     steps: &yarn-berry-steps
       - name: Checkout
@@ -2098,7 +2107,7 @@ jobs:
         # of the spread (4.6.0, 4.12.0 on ubuntu) is yarn-berry-full.
         include:
           - {os: macos-latest, yarn: '4.12.0'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 30
     steps: *yarn-berry-steps
 
@@ -2113,7 +2122,7 @@ jobs:
         include:
           - {os: ubuntu-latest, yarn: '4.6.0'}
           - {os: ubuntu-latest, yarn: '4.12.0'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 30
     steps: *yarn-berry-steps
 
@@ -2130,7 +2139,7 @@ jobs:
     # e2e-build only (its binaries; only the matching OS build is needed);
     # see yarn-classic-matrix on test/coverage.
     needs: [e2e-build]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
     # legs launch the test binaries themselves.
@@ -2210,7 +2219,7 @@ jobs:
   cargo-vex-matrix-windows:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     needs: [e2e-build-windows]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     env: *e2e-env
     strategy:
@@ -2226,7 +2235,7 @@ jobs:
     if: github.event_name != 'pull_request'
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     needs: [e2e-build-macos]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
     # legs launch the test binaries themselves.
@@ -2247,7 +2256,7 @@ jobs:
     # merge_group runs the pull_request tier: the queue gates on ci-ok.
     if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
     needs: [e2e-build]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
     # legs launch the test binaries themselves.
@@ -2287,7 +2296,7 @@ jobs:
     # Only wait for the clippy preflight.
     if: github.event.pull_request.draft != true
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -2351,7 +2360,7 @@ jobs:
     name: hosted-e2e            # may be a required check; do not rename
     if: github.event.pull_request.draft != true
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     permissions:
       contents: read
     timeout-minutes: 30
@@ -2556,7 +2565,7 @@ jobs:
     name: ci-ok                 # registered as a required check; do not rename
     if: always()
     needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, e2e-build-windows, e2e-build-macos, e2e, e2e-windows, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-windows, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 5
     steps:
       - name: Check every needed job
