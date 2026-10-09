@@ -972,16 +972,24 @@ fn jar_declaration(doc: &Doc, g: &str, a: &str) -> Option<(usize, bool)> {
         .map(|dep| (dep, false))
 }
 
-/// The raw `(groupId, artifactId, version)` of each top-level
-/// `<scope>import</scope>` BOM in `doc`, in order.
+/// The raw `(groupId, artifactId, version)` of each
+/// `<scope>import</scope>` BOM in `doc`, in order: the project's own, then
+/// each profile's (Maven appends an active profile's management after the
+/// project's). Profile activation is not evaluated, so every profile counts:
+/// a BOM that might apply is weighed rather than letting a root pin override
+/// it.
 fn imports_of(doc: &Doc) -> Vec<(String, String, String)> {
-    let Some(deps) = doc
-        .child(doc.project, "dependencyManagement")
-        .and_then(|dm| doc.child(dm, "dependencies"))
-    else {
-        return Vec::new();
-    };
-    doc.children(deps, "dependency")
+    let profiles = doc
+        .child(doc.project, "profiles")
+        .into_iter()
+        .flat_map(|ps| doc.children(ps, "profile"));
+    std::iter::once(doc.project)
+        .chain(profiles)
+        .filter_map(|model| {
+            doc.child(model, "dependencyManagement")
+                .and_then(|dm| doc.child(dm, "dependencies"))
+        })
+        .flat_map(|deps| doc.children(deps, "dependency"))
         .filter(|d| {
             doc.child_text(*d, "scope").as_deref() == Some("import")
                 && doc.child_text(*d, "type").as_deref() == Some("pom")
@@ -3160,6 +3168,29 @@ mod tests {
                 Some(bom("corp-bom", "2", &dep("1.11.0"))),
             ),
         ]);
+        let plan = run_external(&files, &repo).0.unwrap();
+        assert!(
+            reasons(&plan).contains(&"conflicting_managed_version".to_string()),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!root_pinned(&plan, &files), "the root must not be pinned");
+    }
+
+    #[test]
+    fn a_profile_bom_import_is_weighed() {
+        let profile = format!(
+            "<profiles><profile><id>corp</id><activation><activeByDefault>true\
+             </activeByDefault></activation>{IMPORT_BOM}</profile></profiles>"
+        );
+        let files = external_reactor(
+            "<properties><bom.version>2</bom.version></properties>",
+            &profile,
+        );
+        let repo = ExternalPoms::from([(
+            corp("corp-bom", "2"),
+            Some(bom("corp-bom", "2", &dep("1.11.0"))),
+        )]);
         let plan = run_external(&files, &repo).0.unwrap();
         assert!(
             reasons(&plan).contains(&"conflicting_managed_version".to_string()),
