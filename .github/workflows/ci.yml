@@ -710,24 +710,18 @@ jobs:
           tags: socket-patch-test-${{ matrix.ecosystem }}:latest
           load: true
 
-      - name: Build instrumented socket-patch binary
-        # Source `cargo llvm-cov show-env` into the current shell so this
-        # `cargo build` picks up RUSTC_WRAPPER=cargo-llvm-cov and the
-        # same RUSTFLAGS that the subsequent `cargo llvm-cov` test step
-        # will use. The bin we build ends up byte-compatible with the
-        # test binaries — same source hashes → unified coverage map at
-        # report time. Env stays scoped to this step (intentional;
-        # cargo llvm-cov manages its own env in the test step).
-        run: |
-          eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null)"
-          cargo build --bin socket-patch
-
       - name: Configure docker-e2e coverage hooks
+        # Mount the instrumented socket-patch that the test step's own
+        # `cargo llvm-cov` builds for the integration tests (cargo builds
+        # a package's bins before running its integration tests), and
+        # write the in-container profraws next to the test processes'
+        # ones. `cargo llvm-cov report` reads only
+        # target/llvm-cov-target/*.profraw and objects built there, so a
+        # separately built binary or profraws elsewhere in target/ never
+        # reach the lcov.
         run: |
-          echo "SOCKET_PATCH_COV_BIN=$PWD/target/debug/socket-patch" >> "$GITHUB_ENV"
-          # Profraw files from the in-container binary land here.
-          # cargo-llvm-cov scans target/ for *.profraw at report time.
-          echo "SOCKET_PATCH_COV_PROFRAW_DIR=$PWD/target" >> "$GITHUB_ENV"
+          echo "SOCKET_PATCH_COV_BIN=$PWD/target/llvm-cov-target/debug/socket-patch" >> "$GITHUB_ENV"
+          echo "SOCKET_PATCH_COV_PROFRAW_DIR=$PWD/target/llvm-cov-target" >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.ecosystem }} Docker e2e test with coverage
         run: |
