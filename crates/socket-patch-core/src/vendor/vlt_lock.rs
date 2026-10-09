@@ -711,6 +711,9 @@ pub async fn vlt_vendor_preflight(
     purl: &str,
     uuid: &str,
 ) -> Result<(), Refusal> {
+    if let Some(refusal) = super::npm_flavor::member_stray_lock_refusal(project_root).await {
+        return Err(refusal);
+    }
     let Some((name, version)) = super::npm_common::parse_npm_purl(purl) else {
         return Err((
             "unsafe_coordinates",

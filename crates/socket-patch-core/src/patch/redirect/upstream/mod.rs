@@ -90,6 +90,25 @@ impl HostedPin {
         Self::from_refs(discovery.refs.iter().chain(&discovery.shadowed))
     }
 
+    /// Every hosted pin the project RECORDS: [`HostedPin::all`] plus the
+    /// pins discovery withheld because another copy of the same version
+    /// that a re-run can rewire still resolves elsewhere
+    /// ([`Discovery::rewirable`]: an `npm:` alias added after the pin, an
+    /// unpinned twin lock). Such a pin attests nothing and the management
+    /// commands do not act on it, but it is still the project's patch for
+    /// that package, so the rollout's recorded view reads it as ALREADY (or
+    /// an UPGRADE), never NEW: a capped re-scan then rewires the other copy
+    /// instead of deferring it forever (#1195).
+    pub fn recorded(discovery: &Discovery) -> Vec<HostedPin> {
+        Self::from_refs(
+            discovery
+                .refs
+                .iter()
+                .chain(&discovery.shadowed)
+                .chain(&discovery.rewirable),
+        )
+    }
+
     /// THE "is this patch pinned" answer: the attributable hosted pins
     /// lockfile discovery reads through `view` (the disk, a snapshot of it
     /// overlaid with a pending rewrite, or an in-memory project), with
@@ -102,10 +121,26 @@ impl HostedPin {
         view: crate::vendor::lock_inventory::ProjectView<'_>,
         origins: &[String],
     ) -> Vec<HostedPin> {
+        Self::all(&Self::discovery(view, origins).await)
+    }
+
+    /// [`HostedPin::discover`]'s rollout twin: the pins the project records
+    /// ([`HostedPin::recorded`]), rewirable ones included.
+    pub async fn discover_recorded(
+        view: crate::vendor::lock_inventory::ProjectView<'_>,
+        origins: &[String],
+    ) -> Vec<HostedPin> {
+        Self::recorded(&Self::discovery(view, origins).await)
+    }
+
+    async fn discovery(
+        view: crate::vendor::lock_inventory::ProjectView<'_>,
+        origins: &[String],
+    ) -> Discovery {
         let opts = crate::vex::DiscoverOptions {
             patch_server_origins: origins.to_vec(),
         };
-        Self::all(&crate::vex::discover::discover_patched_refs_view(view, &opts).await)
+        crate::vex::discover::discover_patched_refs_view(view, &opts).await
     }
 
     /// `(name, version)` of the purl, percent-decoded.

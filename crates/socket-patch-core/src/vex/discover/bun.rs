@@ -585,6 +585,7 @@ impl Unwired {
                     r.purl,
                 ),
             );
+            out.withhold_rewirable(r);
         }
     }
 }
@@ -873,6 +874,9 @@ mod tests {
             let out = run(&p).await;
             assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
             assert_eq!(contests(&out), 1, "{label}: {:#?}", out.diagnostics);
+            // Still a pin the lock records (#1195).
+            let rewirable: Vec<_> = out.rewirable.iter().map(|r| r.uuid.as_str()).collect();
+            assert_eq!(rewirable, [UUID_A], "{label}");
 
             let p = Project::new();
             p.write(
@@ -888,6 +892,7 @@ mod tests {
             let out = run(&p).await;
             assert_eq!(out.refs.len(), 1, "{label} control: {:#?}", out.refs);
             assert_eq!(contests(&out), 0, "{label} control: {:#?}", out.diagnostics);
+            assert!(out.rewirable.is_empty(), "{label} control");
         }
     }
 

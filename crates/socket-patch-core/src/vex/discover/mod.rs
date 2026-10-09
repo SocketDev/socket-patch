@@ -570,6 +570,19 @@ pub struct Discovery {
     /// so the management commands (rollback, remove, list, the vendored
     /// takeover) still see and unwind it (#828). Validated like `refs`.
     pub shadowed: Vec<PatchedRef>,
+    /// Refs withheld from `refs` because another copy of the same
+    /// `name@version` that a re-run CAN rewire still resolves elsewhere:
+    /// another entry of the same lock (an `npm:` alias added after the
+    /// pin), the npm twin lock, another manager's lock
+    /// ([`Discovery::contest_across_locks`]), npm 6's legacy mirror, a Bun
+    /// registry entry. Each is diagnosed [`DIAG_REF_UNATTRIBUTABLE`] and is
+    /// neither attested nor unwound by the management commands, but it is
+    /// still a pin a live lock records: the rollout's recorded view counts
+    /// it ([`HostedPin::recorded`]), so the re-scan that rewires the other
+    /// copy is not capped as NEW (#1195). Validated and sorted like `refs`.
+    ///
+    /// [`HostedPin::recorded`]: crate::patch::redirect::upstream::HostedPin::recorded
+    pub rewirable: Vec<PatchedRef>,
     /// The bundled copies (purl → root-relative directory) the vlt
     /// extractor found in the installed store for the lock's nodes, exactly
     /// as [`crate::vendor::vlt_bundled::bundled_copies`] reports them: the
@@ -639,6 +652,18 @@ impl Discovery {
         if let Some(r) = self.validated(r) {
             if !self.shadowed.contains(&r) {
                 self.shadowed.push(r);
+            }
+        }
+    }
+
+    /// Withhold the wired `r` from attestation because another copy of its
+    /// `name@version` that a re-run can rewire resolves elsewhere
+    /// ([`Discovery::rewirable`]). The caller diagnoses why. Validated
+    /// exactly like [`Discovery::push`].
+    pub(crate) fn withhold_rewirable(&mut self, r: PatchedRef) {
+        if let Some(r) = self.validated(r) {
+            if !self.rewirable.contains(&r) {
+                self.rewirable.push(r);
             }
         }
     }
@@ -901,6 +926,7 @@ impl Discovery {
                     other.display()
                 ),
             );
+            self.withhold_rewirable(r);
         }
     }
 
@@ -1056,7 +1082,7 @@ impl Discovery {
         self.unattested.dedup();
         self.contested.sort();
         self.contested.dedup();
-        for refs in [&mut self.refs, &mut self.shadowed] {
+        for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
             refs.sort_by(|a, b| {
                 (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
                     &b.source_file,
@@ -1145,6 +1171,7 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     // Each extractor's reads are tagged with the vendor ecosystem it reads
     // for ([`Discovery::read`]).
     ctx.ecosystem = "npm";
+    ignore_member_stray_locks(&mut ctx, &mut out).await;
     npm::extract(&ctx, &mut out).await;
     yarn::extract(&ctx, &mut out).await;
     bun::extract(&ctx, &mut out).await;
@@ -1177,6 +1204,50 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     out
 }
 
+/// A workspace member's own npm, Bun or vlt lock that its package manager
+/// never reads (npm #1094, Bun #1101, vlt #1134: the member installs from
+/// the workspace root's lock, see
+/// [`crate::hosted::governing_root::member_stray_lock`]) is read as absent,
+/// as it is by the install: nothing in it is wiring, so its pins attest
+/// nothing. Its Socket identities are still recognized (rule 11), so a
+/// ledger claim it alone mentions is dead, and one diagnostic says why.
+/// Disk runs only: an in-memory project has no ancestors.
+async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discovery) {
+    // Declares the project files the check reads; the rest are above the
+    // project, which no overlay of the project's files changes.
+    let Some(root) =
+        ctx.disk_root_reading(crate::hosted::governing_root::member_stray_lock_own_files())
+    else {
+        return;
+    };
+    let Some(stray) = crate::hosted::governing_root::member_stray_lock(root).await else {
+        return;
+    };
+    for rel in &stray.ignored {
+        let mentions = match ctx.view.read_bytes(rel).await {
+            Ok(bytes) => {
+                !socket_identities(&String::from_utf8_lossy(&bytes), ctx.patch_server_origins)
+                    .is_empty()
+            }
+            Err(_) => false,
+        };
+        ctx.recognize_ignored(rel).await;
+        if mentions {
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                rel,
+                format!(
+                    "{}, so the Socket references in {rel} are not attested; run socket-patch \
+                     from {} (the workspace root)",
+                    stray.detail,
+                    stray.root.display()
+                ),
+            );
+        }
+    }
+    ctx.ignored = stray.ignored;
+}
+
 /// A PEP 723 script lock (`<script>.py.lock`).
 fn is_script_lock(file: &Path) -> bool {
     crate::utils::python_lock::is_script_lock_name(&file.to_string_lossy())
@@ -1189,6 +1260,10 @@ pub(crate) struct DiscoverCtx<'a> {
     /// snapshot of it, or an in-memory project.
     pub(crate) view: crate::vendor::lock_inventory::ProjectView<'a>,
     patch_server_origins: &'a [String],
+    /// Root-relative lock files the package manager never reads here (a
+    /// workspace member's stray lock, see [`ignore_member_stray_locks`]):
+    /// the guarded reads see them as absent.
+    ignored: Vec<&'static str>,
     /// What the guarded reads have recognized so far (rule 11) — collected
     /// here, not in the extractor's `&mut Discovery`, so a read into a
     /// scratch `Discovery` (a file parsed only to explain it) still counts.
@@ -1218,6 +1293,7 @@ impl<'a> DiscoverCtx<'a> {
         DiscoverCtx {
             view,
             patch_server_origins,
+            ignored: Vec::new(),
             recognized: Mutex::new(BTreeSet::new()),
             hosted_hosts: std::sync::OnceLock::new(),
             ecosystem: "",
@@ -1356,7 +1432,12 @@ impl<'a> DiscoverCtx<'a> {
     /// Whether `rel` exists (lstat — a dangling symlink still "exists", the
     /// read then fails and diagnoses).
     pub(crate) async fn exists(&self, rel: &str) -> bool {
-        self.view.exists_no_follow(rel).await
+        !self.is_ignored(rel) && self.view.exists_no_follow(rel).await
+    }
+
+    /// Whether `rel` is a lock the package manager never reads here.
+    fn is_ignored(&self, rel: &str) -> bool {
+        self.ignored.contains(&rel)
     }
 
     /// Guarded UTF-8 read of root-relative `rel`: `None` when missing
@@ -1365,6 +1446,9 @@ impl<'a> DiscoverCtx<'a> {
     /// parsing (rule 11) — so a file that then fails to parse, or an entry
     /// the extractor rejects or skips, is still recognized.
     pub(crate) async fn read_text(&self, rel: &str, out: &mut Discovery) -> Option<String> {
+        if self.is_ignored(rel) {
+            return None;
+        }
         match self.view.read_text(rel).await {
             Ok(text) => {
                 self.log_read(rel, true);
@@ -1448,6 +1532,9 @@ impl<'a> DiscoverCtx<'a> {
     /// left in `bun.lockb`'s append-only pool names a DEAD patch, which is
     /// exactly what recognition should say about it.
     pub(crate) async fn read_bytes(&self, rel: &str, out: &mut Discovery) -> Option<Vec<u8>> {
+        if self.is_ignored(rel) {
+            return None;
+        }
         match self.view.read_bytes(rel).await {
             Ok(bytes) => {
                 self.log_read(rel, true);
@@ -5005,5 +5092,111 @@ mod tests {
         let out = p.discover().await;
         assert!(out.refs.is_empty(), "{:?}", out.refs);
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+}
+
+#[cfg(test)]
+mod member_stray_lock_tests {
+    use super::testing::fixture_path;
+    use super::*;
+
+    fn copy_dir(src: &Path, dest: &Path) {
+        for entry in std::fs::read_dir(src).unwrap() {
+            let path = entry.unwrap().path();
+            let target = dest.join(path.file_name().unwrap());
+            if path.is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                copy_dir(&path, &target);
+            } else {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    /// #1101 (Bun), #1134 (vlt), #1094 (npm): a workspace member's own
+    /// hosted-pinned lock is one its package manager never reads (the
+    /// member installs from the workspace root's lock), so lock-only VEX
+    /// from the member must not attest its pins. The lock is read as
+    /// absent, its uuid stays recognized (a ledger claim on it is dead),
+    /// and one diagnostic names it. The same lock outside a workspace is
+    /// read as usual.
+    #[tokio::test]
+    async fn a_member_lock_its_manager_ignores_attests_nothing() {
+        for (fixture, lock, uuid, root_files) in [
+            (
+                "redirect/npm/bun/basic/expected",
+                "bun.lock",
+                "77777777-7777-7777-7777-777777777777",
+                &[
+                    (
+                        "package.json",
+                        r#"{"private":true,"workspaces":["packages/*"]}"#,
+                    ),
+                    ("bun.lockb", "binary"),
+                ][..],
+            ),
+            (
+                "redirect/npm/vlt/basic/expected",
+                "vlt-lock.json",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &[
+                    ("vlt.json", r#"{"workspaces":"packages/*"}"#),
+                    ("vlt-lock.json", "{}"),
+                ][..],
+            ),
+            (
+                "redirect/npm/package-lock-v3/basic/expected",
+                "package-lock.json",
+                "22222222-2222-2222-2222-222222222222",
+                &[
+                    (
+                        "package.json",
+                        r#"{"private":true,"workspaces":["packages/*"]}"#,
+                    ),
+                    ("package-lock.json", "{}"),
+                ][..],
+            ),
+        ] {
+            let ws = tempfile::tempdir().unwrap();
+            let member = ws.path().join("packages/a");
+            copy_dir(&fixture_path(fixture), &member);
+            std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+
+            // Control: not a workspace member yet, so the pin is wiring.
+            let out = discover_patched_refs(&member).await;
+            assert!(
+                out.refs.iter().any(|r| r.uuid == uuid),
+                "{fixture}: {:?}",
+                out.refs
+            );
+
+            for (rel, text) in root_files {
+                std::fs::write(ws.path().join(rel), text).unwrap();
+            }
+            let out = discover_patched_refs(&member).await;
+            assert!(
+                out.refs.is_empty(),
+                "{fixture}: a stray member lock wires nothing: {:?}",
+                out.refs
+            );
+            assert!(
+                out.recognized
+                    .iter()
+                    .any(|r| r.uuid == uuid && r.file == Path::new(lock)),
+                "{fixture}: {:?}",
+                out.recognized
+            );
+            let diag = out
+                .diagnostics
+                .iter()
+                .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.file == Path::new(lock))
+                .unwrap_or_else(|| panic!("{fixture}: {:?}", out.diagnostics));
+            assert!(
+                diag.detail.contains("ignores") && diag.detail.contains("not attested"),
+                "{fixture}: {}",
+                diag.detail
+            );
+        }
     }
 }
