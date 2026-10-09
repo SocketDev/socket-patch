@@ -53,13 +53,13 @@ use super::{
     maven_purl, DiscoverCtx, Discovery, PatchedRef, UnattestedKind, DIAG_LOCKFILE_UNPARSEABLE,
     DIAG_REF_INVALID,
 };
-use crate::gradle::eol::eol_eq;
 use crate::gradle::locks;
 use crate::patch::redirect::gradle::{
     apply_line_digest, graph_of, index_digest, is_settings_lock, lockfile_paths, parse_index,
     settings_targets, GradleFiles, PinnedRowChecks, HOSTED_INDEX_REL, HOSTED_SCRIPT,
     HOSTED_SCRIPT_REL, MAX_ROUNDS,
 };
+use crate::utils::line_endings::eol_eq;
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Some(index) = ctx.read_text(HOSTED_INDEX_REL, out).await else {
