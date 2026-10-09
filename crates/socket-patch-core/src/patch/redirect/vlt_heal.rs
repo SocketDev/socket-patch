@@ -490,7 +490,6 @@ mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
-    use crate::patch::redirect::FileEdit;
     use std::collections::HashMap;
 
     const ID: &str = "~npm~left-pad@1.3.0";

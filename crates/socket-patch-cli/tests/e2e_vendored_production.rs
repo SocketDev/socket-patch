@@ -1493,8 +1493,9 @@ fn berry_skip_code(env: &serde_json::Value) -> String {
 
 /// Manifest-less VEX against PRODUCTION for the berry vendored leg, on the
 /// fresh checkout the real yarn just installed from the committed artifact:
-/// with the manifest deleted (ledger online + `--offline`), with the
-/// ledger deleted too (lockfile + artifact, record from the public proxy),
+/// with no manifest (v5 vendored mode writes none; ledger online +
+/// `--offline`), with the ledger deleted too (lockfile + artifact, record
+/// from the public proxy),
 /// `--offline` with nothing local (`record_unavailable`), and a copy whose
 /// lock + package.json are reverted to the registry while the ledger and
 /// artifact stay (`vendor_unwired`, even with `--no-verify`).
@@ -1508,7 +1509,12 @@ fn yarn_berry_vendored_manifestless_vex(
     let manifest = fresh.join(".socket/manifest.json");
     let ledger_path = fresh.join(".socket/vendor/state.json");
     let ledger = std::fs::read(&ledger_path).expect("vendor ledger");
-    std::fs::remove_file(&manifest).expect("scan --mode vendored writes a manifest");
+    // v5.0 vendored mode is manifest-free: the ledger embeds each entry's
+    // record, so the checkout is already manifest-less.
+    assert!(
+        !manifest.exists(),
+        "{LEG}: scan --mode vendored writes no .socket/manifest.json"
+    );
 
     let (code, env, doc) = yarn_berry_vex(fresh, &[]);
     assert_berry_vendored_attestation(code, &env, doc, &format!("{LEG}: ledger, online"));

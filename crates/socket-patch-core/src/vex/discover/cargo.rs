@@ -179,6 +179,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         .unwrap_or_default();
 
     hosted_from_lock(ctx, &lock, decls.as_ref(), &definitions, out);
+    unpatched_twins(ctx, &lock, out);
     if let (Some(decls), Some(doc)) = (&decls, &manifest) {
         unresolved_manifest_pins(ctx, &lock, decls, doc, &definitions, out);
     }
@@ -529,6 +530,56 @@ fn hosted_from_lock(
                 true,
             ));
         }
+    }
+}
+
+/// Record every lock block that resolves a Socket-hosted crate's
+/// `name@version` from another source ([`Discovery::unpatched_copy`]).
+/// Cargo never unifies packages of different sources, so a dependency that
+/// locks its own crates.io (or git) copy beside the hosted pin, typically
+/// one added after the scan (#679), compiles that copy unpatched. The hosted
+/// ref is then withheld from attestation, though rollback / remove still
+/// unwind it. A re-scan cannot rewire the other copy (the rewriter refuses
+/// a crate a transitive dependent resolves from crates.io,
+/// `redirect_cargo_transitive_dependents`), so it is a shadow, not a
+/// rewirable ref.
+fn unpatched_twins(ctx: &DiscoverCtx<'_>, lock: &Lock, out: &mut Discovery) {
+    let packages = lock.packages();
+    let hosted: Vec<&LockedPackage> = packages
+        .iter()
+        .filter(|p| {
+            p.source
+                .as_deref()
+                .is_some_and(|s| source_uuid(ctx, s).is_some())
+        })
+        .collect();
+    if hosted.is_empty() {
+        return;
+    }
+    for pkg in packages {
+        let Some(source) = pkg.source.as_deref() else {
+            // A sourceless block is a workspace member, a path dependency or
+            // a vendored copy (tagged, so another version): not this crate.
+            continue;
+        };
+        if source_uuid(ctx, source).is_some()
+            || !hosted
+                .iter()
+                .any(|h| h.name == pkg.name && h.version == pkg.version)
+        {
+            continue;
+        }
+        out.unpatched_copy(
+            CARGO_LOCK,
+            simple_purl("cargo", &pkg.name, &pkg.version),
+            &format!("{} {} ({source})", pkg.name, pkg.version),
+            &format!(
+                "resolves the same crate version from another source, which cargo builds \
+                 beside the Socket copy for the dependents that lock it (`cargo tree -i \
+                 {}@{}` lists them)",
+                pkg.name, pkg.version
+            ),
+        );
     }
 }
 
@@ -939,6 +990,66 @@ mod tests {
     }
 
     // ── hosted: shapes ───────────────────────────────────────────────
+
+    /// #679: a dependency added after the hosted pin resolves its own
+    /// crates.io copy of the same cfg-if 1.0.4 (cargo cannot unify the two
+    /// sources), so the build compiles the unpatched copy too. The ref is
+    /// withheld from attestation, diagnosed, and kept as `shadowed` so
+    /// rollback / remove still unwind the pin.
+    #[tokio::test]
+    async fn crates_io_twin_of_the_hosted_crate_withholds_the_ref() {
+        for other in [
+            CRATES_IO.to_string(),
+            "git+https://github.com/rust-lang/cfg-if?rev=1#abc".to_string(),
+        ] {
+            let p = Project::new();
+            p.write("Cargo.toml", manifest(&pinned("cfg-if", "1.0.4", UUID_A)));
+            p.write(
+                "Cargo.lock",
+                lock(&[
+                    ("cfg-if", "1.0.4", Some(&other), Some(CKSUM)),
+                    ("cfg-if", "1.0.4", Some(&index(UUID_A)), Some(CKSUM)),
+                    ("crc32fast", "1.5.0", Some(CRATES_IO), Some(CKSUM)),
+                ]),
+            );
+            p.write(".cargo/config.toml", registry_block(UUID_A));
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert_eq!(
+                out.shadowed
+                    .iter()
+                    .map(|r| (r.purl.as_str(), r.uuid.as_str()))
+                    .collect::<Vec<_>>(),
+                [("pkg:cargo/cfg-if@1.0.4", UUID_A)],
+                "{other}"
+            );
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("cfg-if")
+                        && d.detail.contains("UNPATCHED")),
+                "{other}: {:#?}",
+                out.diagnostics
+            );
+        }
+        // Another VERSION from crates.io is a different package: no effect.
+        let p = Project::new();
+        p.write("Cargo.toml", manifest(&pinned("cfg-if", "1.0.4", UUID_A)));
+        p.write(
+            "Cargo.lock",
+            lock(&[
+                ("cfg-if", "0.1.10", Some(CRATES_IO), Some(CKSUM)),
+                ("cfg-if", "1.0.4", Some(&index(UUID_A)), Some(CKSUM)),
+            ]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(out.shadowed.is_empty());
+    }
 
     #[tokio::test]
     async fn workspace_and_target_tables_carry_the_pin() {
