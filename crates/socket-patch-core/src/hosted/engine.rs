@@ -1080,10 +1080,11 @@ pub fn wheel_metadata_unavailable(dep: &DepOverride, detail: &str) -> SkippedPat
 /// The npm candidates whose yarn berry pin needs the served tarball's own
 /// `package.json`, in candidate order: yarn builds a tarball entry's `bin:`
 /// from that manifest, not from the registry metadata the locked `npm:`
-/// entry came from, and the two spell bin paths differently (#718). Only an
-/// entry the pin would re-key that carries a `bin:` map needs it (see
-/// `berry_pin_needs_manifest`; a fork alias never counts), so a berry
-/// project without bins fetches nothing.
+/// entry came from, and the two spell bin paths differently (#718); only the
+/// npm resolver adds an implicit `node-gyp` dependency (#737). Only an entry
+/// the pin would re-key that carries a `bin:` map or that dependency needs it
+/// (see `berry_pin_needs_manifest`; a fork alias never counts), so a berry
+/// project with neither fetches nothing.
 pub fn yarn_berry_manifest_targets<'a>(
     candidates: &'a [Candidate],
     files: &BTreeMap<String, String>,

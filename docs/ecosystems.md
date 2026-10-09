@@ -153,7 +153,15 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   `"left-pad@catalog:<name>"`). Yarn then fetches it without npm registry credentials and
   hardened mode accepts it. The re-keyed entry is written the way yarn writes
   it, with its fields in yarn's order and its `bin:` map taken from the served
-  tarball's own `package.json`. For an entry that has a `bin:` map, the scan
+  tarball's own `package.json`. Yarn's npm resolver gives a package that runs
+  `node-gyp` in a script (every package shipping a `binding.gyp`: nan,
+  bufferutil, utf-8-validate, …) an implicit `node-gyp: "npm:latest"`
+  dependency, which yarn never gives a tarball entry, so the pin drops it and,
+  when nothing else needs node-gyp, the lock entries only it reached; vendored
+  mode does the same, and `vendor --revert` puts them back. Hosted `rollback`
+  puts the dependency back while the lock still resolves node-gyp; otherwise it
+  warns `yarn_berry_node_gyp_unresolved` (run `yarn install` once). For an entry
+  that has a `bin:` map or that implicit dependency, the scan
   downloads the served tarball to read it. If that download fails, the patch
   is skipped as `npm_manifest_unavailable`. A user-authored `resolutions` entry for the package
   is never overwritten (`redirect_yarn_berry_resolutions_conflict`), and

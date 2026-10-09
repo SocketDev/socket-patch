@@ -21,6 +21,10 @@ pub(crate) struct NpmDist {
     pub integrity: Option<String>,
     /// The hex sha1 `dist.shasum`.
     pub shasum: Option<String>,
+    /// Whether yarn's npm resolver gives this version the implicit
+    /// `node-gyp: "npm:latest"` dependency (see
+    /// `formats::yarn::berry_entry::registry_adds_node_gyp`, #737).
+    pub node_gyp: bool,
 }
 
 /// A Go module version's two go.sum hashes.
@@ -295,6 +299,7 @@ impl UpstreamClient {
             tarball,
             integrity: str_field("integrity"),
             shasum: str_field("shasum"),
+            node_gyp: crate::formats::yarn::berry_entry::registry_adds_node_gyp(&doc),
         })
     }
 
@@ -840,6 +845,7 @@ mod tests {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: registry_sri,
                     shasum: registry_sha1,
+                    node_gyp: false,
                 }),
             );
             for _ in 0..2 {
@@ -900,6 +906,7 @@ mod tests {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: Some("sha512-other".into()),
                     shasum: None,
+                    node_gyp: false,
                 }),
             );
             assert!(
