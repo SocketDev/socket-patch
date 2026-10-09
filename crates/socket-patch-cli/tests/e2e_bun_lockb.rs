@@ -138,10 +138,7 @@ fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &
     assert_eq!(env["error"]["code"], "rollback_failed", "{env}");
     assert_eq!(env["summary"]["failed"], 1, "{env}");
     let failed_view = rollback_json::hosted_failed(&env);
-    let failed = failed_view
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let failed = failed_view.as_array().cloned().unwrap_or_default();
     assert!(
         failed.iter().any(|f| f["purl"] == PURL
             && f["error"]

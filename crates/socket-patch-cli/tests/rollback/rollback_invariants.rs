@@ -205,10 +205,16 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     assert_eq!(entry["errorCode"], "missing_blob");
     assert_eq!(entry["purl"], "pkg:npm/__rollback_test__@1.0.0");
     assert!(
-        !entry["details"]["path"].as_str().expect("path string").is_empty(),
+        !entry["details"]["path"]
+            .as_str()
+            .expect("path string")
+            .is_empty(),
         "a blob-gated package is installed, so its path must be reported; stdout=\n{stdout}"
     );
-    assert!(entry.get("files").is_none(), "nothing was restored on the bail");
+    assert!(
+        entry.get("files").is_none(),
+        "nothing was restored on the bail"
+    );
     // The error names the remedy; the per-file record names the blob.
     let err = entry["error"].as_str().expect("error message string");
     assert!(
@@ -396,8 +402,10 @@ fn assert_only_not_installed_envelope(code: i32, stdout: &str) {
          is a skip, not a failure; stdout=\n{stdout}"
     );
     assert_eq!(v["summary"]["skipped"], 1, "stdout=\n{stdout}");
-    let skipped: Vec<&serde_json::Value> =
-        events(&v).iter().filter(|e| e["action"] == "skipped").collect();
+    let skipped: Vec<&serde_json::Value> = events(&v)
+        .iter()
+        .filter(|e| e["action"] == "skipped")
+        .collect();
     assert_eq!(
         skipped.len(),
         1,
@@ -570,7 +578,10 @@ fn rollback_mixed_installed_gated_and_not_installed_entries() {
     assert_eq!(entry["action"], "failed");
     assert_eq!(entry["purl"], "pkg:npm/installed-target@1.0.0");
     assert!(
-        !entry["details"]["path"].as_str().expect("path string").is_empty(),
+        !entry["details"]["path"]
+            .as_str()
+            .expect("path string")
+            .is_empty(),
         "the gated package is installed — path must be reported; stdout=\n{stdout}"
     );
     // The pinned missing-blob abort survives for the installed package:
@@ -653,8 +664,16 @@ fn rollback_json_shape_has_documented_keys() {
     assert!(v.get("warnings").is_none_or(|w| w.is_array()));
     // summary == the event counts.
     for action in [
-        "discovered", "downloaded", "applied", "updated", "skipped", "failed", "removed",
-        "verified", "rebuilt", "rolledBack",
+        "discovered",
+        "downloaded",
+        "applied",
+        "updated",
+        "skipped",
+        "failed",
+        "removed",
+        "verified",
+        "rebuilt",
+        "rolledBack",
     ] {
         let n = events(&v).iter().filter(|e| e["action"] == action).count();
         assert_eq!(v["summary"][action], n, "summary.{action}: {v:#}");
@@ -930,9 +949,18 @@ fn rollback_dry_run_does_not_modify_file() {
     assert_eq!(v["status"], "success", "dry-run status; stdout={stdout}");
     assert_eq!(v["dryRun"], true, "dry-run must set dryRun=true");
     // Nothing is actually written in a dry run: previews are `verified`.
-    assert_eq!(v["summary"]["rolledBack"], 0, "dry-run must not roll anything back");
-    assert_eq!(v["summary"]["removed"], 0, "dry-run must not remove anything");
-    assert_eq!(v["summary"]["failed"], 0, "dry-run must not record failures");
+    assert_eq!(
+        v["summary"]["rolledBack"], 0,
+        "dry-run must not roll anything back"
+    );
+    assert_eq!(
+        v["summary"]["removed"], 0,
+        "dry-run must not remove anything"
+    );
+    assert_eq!(
+        v["summary"]["failed"], 0,
+        "dry-run must not record failures"
+    );
     // The would-be restore lists the file the engine confirmed it COULD
     // restore (current hash matches the patched AFTER state, before blob
     // available) — it genuinely walked the rollback path, just stopping
@@ -1005,7 +1033,10 @@ fn rollback_honors_manifest_path_override() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(v["summary"]["rolledBack"], 0);
-    assert_eq!(v["summary"]["failed"], 0, "not-installed is a skip, not a failure");
+    assert_eq!(
+        v["summary"]["failed"], 0,
+        "not-installed is a skip, not a failure"
+    );
     assert_eq!(
         event_for(&v, "skipped", "pkg:npm/__rollback_test__@1.0.0")["errorCode"],
         "package_not_installed",

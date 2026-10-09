@@ -420,10 +420,7 @@ async fn rollback_and_offline_vendor_refuse_with_the_checkout_remedy() {
     let (code, env) = p.run_json(&["rollback", "--yes"]);
     assert_eq!(code, 1, "{env:#}");
     let failed_view = rollback_json::hosted_failed(&env);
-    let failed = failed_view
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let failed = failed_view.as_array().cloned().unwrap_or_default();
     assert!(
         failed.iter().any(|f| f["purl"] == PURL
             && f["error"]

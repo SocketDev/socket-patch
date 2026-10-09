@@ -132,7 +132,11 @@ fn get_usage_errors_print_the_coded_error() {
 
 #[test]
 fn rollback_usage_error_prints_the_coded_error() {
-    assert_envelope_usage(&["rollback", "x[", "--json"], "rollback", "path_glob_invalid");
+    assert_envelope_usage(
+        &["rollback", "x[", "--json"],
+        "rollback",
+        "path_glob_invalid",
+    );
     // JSON carries the verbatim message; only stderr is capitalized.
     let tmp = tempfile::tempdir().unwrap();
     let (_, stdout, _) = run(tmp.path(), &["rollback", "x[", "--json"], &[]);

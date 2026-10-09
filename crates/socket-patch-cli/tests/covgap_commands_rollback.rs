@@ -584,7 +584,11 @@ fn blobs_path_as_file_yields_legacy_error_envelope() {
     assert_eq!(v["summary"]["rolledBack"], 0, "stdout=\n{stdout}");
     assert_eq!(v["summary"]["failed"], 0, "stdout=\n{stdout}");
     assert_eq!(v["command"], "rollback", "stdout=\n{stdout}");
-    assert_eq!(v["events"], json!([]), "a full error envelope; stdout=\n{stdout}");
+    assert_eq!(
+        v["events"],
+        json!([]),
+        "a full error envelope; stdout=\n{stdout}"
+    );
 
     // ── human: bare Error line ──
     let tmp = build();
@@ -941,9 +945,7 @@ fn vendored_unknown_ecosystem_fails_leg_in_both_modes() {
     assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
     assert_eq!(v["summary"]["failed"], 1, "stdout=\n{stdout}");
     let failed_view = rollback_json::vendored_failed(&v);
-    let failed = failed_view
-        .as_array()
-        .expect("vendoredFailed array");
+    let failed = failed_view.as_array().expect("vendoredFailed array");
     assert_eq!(failed.len(), 1, "stdout=\n{stdout}");
     assert_eq!(failed[0]["purl"], V_PURL, "stdout=\n{stdout}");
     assert!(
@@ -1319,9 +1321,7 @@ fn vendored_ledger_save_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
     assert_eq!(v["summary"]["failed"], 1, "stdout=\n{stdout}");
     let failed_view = rollback_json::vendored_failed(&v);
-    let failed = failed_view
-        .as_array()
-        .expect("vendoredFailed array");
+    let failed = failed_view.as_array().expect("vendoredFailed array");
     assert_eq!(failed.len(), 1, "stdout=\n{stdout}");
     assert_eq!(failed[0]["purl"], V_PURL, "stdout=\n{stdout}");
     assert!(
@@ -1821,10 +1821,15 @@ fn legacy_ledger_beside_a_live_pin_is_never_the_revert_source() {
     assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
     assert_eq!(v["summary"]["failed"], 1, "stdout=\n{stdout}");
     assert_eq!(
-        rollback_json::hosted_failed(&v)[0]["purl"], LP_PURL,
+        rollback_json::hosted_failed(&v)[0]["purl"],
+        LP_PURL,
         "stdout=\n{stdout}"
     );
-    assert_eq!(rollback_json::hosted_reverted(&v), json!([]), "stdout=\n{stdout}");
+    assert_eq!(
+        rollback_json::hosted_reverted(&v),
+        json!([]),
+        "stdout=\n{stdout}"
+    );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_redirected_block()),
@@ -2624,7 +2629,10 @@ fn manifest_deleted_under_held_lock_fails_with_manifest_not_found() {
         assert_eq!(v["status"], "error", "stdout=\n{stdout}");
         // Both interleavings are `manifest_not_found` (v5.0); the read
         // under the lock names the path, the pre-lock probe does not.
-        assert_eq!(v["error"]["code"], "manifest_not_found", "stdout=\n{stdout}");
+        assert_eq!(
+            v["error"]["code"], "manifest_not_found",
+            "stdout=\n{stdout}"
+        );
         match v["error"]["message"].as_str() {
             Some(m) if m.starts_with("Manifest not found at ") => return, // target interleaving reached
             Some("Manifest not found") => continue, // probed after the delete — retry

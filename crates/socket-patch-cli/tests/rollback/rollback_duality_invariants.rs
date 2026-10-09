@@ -291,7 +291,10 @@ fn preserve_state_keeps_everything() {
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
-    assert_eq!(v["summary"]["rolledBack"], 1, "the file restore still happens");
+    assert_eq!(
+        v["summary"]["rolledBack"], 1,
+        "the file restore still happens"
+    );
     assert_eq!(
         crate::rollback_json::manifest_removed(&v),
         serde_json::json!([]),

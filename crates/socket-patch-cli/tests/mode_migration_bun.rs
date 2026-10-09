@@ -1820,7 +1820,11 @@ async fn bun_scoped_rollback_and_remove_unwind_one_of_two_hosted_records() {
     assert_eq!(code, 0, "scoped rollback must succeed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(rollback_json::hosted_reverted(&env), json!([DEP_A.purl]), "{env:#}");
+    assert_eq!(
+        rollback_json::hosted_reverted(&env),
+        json!([DEP_A.purl]),
+        "{env:#}"
+    );
     assert_eq!(rollback_json::hosted_failed(&env), json!([]), "{env:#}");
     assert_only_a_unwound(&fx, &by_rollback, b, "scoped-rollback");
     // Then the unscoped rollback restores the remaining pin ⇒ pristine.

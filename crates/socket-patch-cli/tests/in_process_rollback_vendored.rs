@@ -610,7 +610,11 @@ async fn detached_entries_reverted_by_unscoped_default() {
         json!([PURL]),
         "the detached entry must ride vendoredReverted: {env:#}"
     );
-    assert_eq!(rollback_json::vendored_preserved(&env), json!([]), "{env:#}");
+    assert_eq!(
+        rollback_json::vendored_preserved(&env),
+        json!([]),
+        "{env:#}"
+    );
     assert_eq!(rollback_json::vendored_kept(&env), json!([]), "{env:#}");
     assert_eq!(
         rollback_json::manifest_removed(&env),

@@ -390,7 +390,9 @@ fn rollback_global_prefix_uses_explicit_path() {
     let r = results[0];
     assert_eq!(r["purl"], PREFIX_PURL, "envelope={v}");
     assert_ne!(r["action"], "failed", "envelope={v}");
-    let path = r["details"]["path"].as_str().expect("result must carry a path");
+    let path = r["details"]["path"]
+        .as_str()
+        .expect("result must carry a path");
     assert!(
         Path::new(path).starts_with(&global_dir),
         "result path must live inside the explicit prefix {}; got {path}; envelope={v}",

@@ -556,7 +556,11 @@ async fn vlt_heal_follows_the_restored_pin_when_another_pin_refuses() {
         serde_json::json!([PURL]),
         "{doc:#}"
     );
-    assert_eq!(crate::rollback_json::hosted_failed(&doc)[0]["purl"], OTHER_PURL, "{doc:#}");
+    assert_eq!(
+        crate::rollback_json::hosted_failed(&doc)[0]["purl"],
+        OTHER_PURL,
+        "{doc:#}"
+    );
     assert_eq!(
         read(root, "vlt-lock.json"),
         vlt_lock(Era::V1, &[restored_node(TILDE_ID), other_pinned]),

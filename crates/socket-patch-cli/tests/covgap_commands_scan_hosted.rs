@@ -1411,9 +1411,7 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
     assert_eq!(doc["error"]["code"], "rollback_failed", "{doc:#}");
     assert_eq!(doc["summary"]["failed"], 1, "{doc:#}");
     let failed_view = rollback_json::hosted_failed(&doc);
-    let failed = failed_view
-        .as_array()
-        .unwrap_or_else(|| panic!("{doc:#}"));
+    let failed = failed_view.as_array().unwrap_or_else(|| panic!("{doc:#}"));
     assert_eq!(failed.len(), 1, "{doc:#}");
     assert_eq!(failed[0]["purl"], purl, "{doc:#}");
     let error = failed[0]["error"].as_str().unwrap_or_default();

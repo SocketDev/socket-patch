@@ -1056,7 +1056,8 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
     }
     for (purl, error) in &leg.failed {
         let event = if purl == HOSTED_WRITE_FAILURE_KEY {
-            PatchEvent::artifact(PatchAction::Failed).with_error("hosted_write_failed", error.clone())
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_error("hosted_write_failed", error.clone())
         } else {
             with_uuid(
                 PatchEvent::new(PatchAction::Failed, purl.clone())
@@ -1133,7 +1134,11 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
             env.mark_error(EnvelopeError::new("rollback_failed", message));
         }
     } else {
-        debug_assert_eq!(env.status, Status::Success, "a failed event on a success run");
+        debug_assert_eq!(
+            env.status,
+            Status::Success,
+            "a failed event on a success run"
+        );
     }
     env
 }
@@ -1315,7 +1320,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 args.common.dry_run,
                 EnvelopeError::new("manifest_not_found", "Manifest not found"),
             );
-            env.set_extra("path", serde_json::json!(manifest_path.display().to_string()));
+            env.set_extra(
+                "path",
+                serde_json::json!(manifest_path.display().to_string()),
+            );
             println!("{}", env.to_pretty_json());
         } else {
             // Errors print even under --silent ("errors only", never
@@ -2193,8 +2201,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
             if args.common.json {
                 println!(
                     "{}",
-                    error_envelope(args.common.dry_run, EnvelopeError::new("rollback_failed", e))
-                        .to_pretty_json()
+                    error_envelope(
+                        args.common.dry_run,
+                        EnvelopeError::new("rollback_failed", e)
+                    )
+                    .to_pretty_json()
                 );
             } else {
                 // Errors print even under --silent ("errors only", never
@@ -5731,8 +5742,20 @@ mod tests {
     fn assert_envelope_invariants(v: &serde_json::Value) {
         assert_eq!(v["command"], "rollback", "{v}");
         let allowed = [
-            "command", "status", "dryRun", "events", "summary", "error", "sidecars", "warnings",
-            "vex", "gc", "hosted", "paths", "path", "legacyRedirectLedgerRemoved",
+            "command",
+            "status",
+            "dryRun",
+            "events",
+            "summary",
+            "error",
+            "sidecars",
+            "warnings",
+            "vex",
+            "gc",
+            "hosted",
+            "paths",
+            "path",
+            "legacyRedirectLedgerRemoved",
         ];
         for key in v.as_object().unwrap().keys() {
             assert!(allowed.contains(&key.as_str()), "unexpected key {key}: {v}");
@@ -5741,8 +5764,16 @@ mod tests {
         assert!(!v["status"].as_str().unwrap().contains('_'), "{v}");
         let events = v["events"].as_array().unwrap();
         for action in [
-            "discovered", "downloaded", "applied", "updated", "skipped", "failed", "removed",
-            "verified", "rebuilt", "rolledBack",
+            "discovered",
+            "downloaded",
+            "applied",
+            "updated",
+            "skipped",
+            "failed",
+            "removed",
+            "verified",
+            "rebuilt",
+            "rolledBack",
         ] {
             let n = events.iter().filter(|e| e["action"] == action).count();
             assert_eq!(v["summary"][action], n, "summary.{action}: {v}");
@@ -5757,7 +5788,12 @@ mod tests {
             .insert("pkg:npm/a@1.0.0".to_string(), make_record("uuid-a"));
         let results = vec![
             rb("pkg:npm/a@1.0.0", "/p/a", VerifyRollbackStatus::Ready, true),
-            rb("pkg:npm/o@1.0.0", "/p/o", VerifyRollbackStatus::AlreadyOriginal, false),
+            rb(
+                "pkg:npm/o@1.0.0",
+                "/p/o",
+                VerifyRollbackStatus::AlreadyOriginal,
+                false,
+            ),
             failed_rb("pkg:npm/bad@1.0.0"),
         ];
         let vendored = VendoredLegOutcome {
@@ -5775,7 +5811,10 @@ mod tests {
             reverted: vec!["pkg:npm/h@1.0.0".to_string()],
             failed: vec![
                 ("pkg:npm/hf@1.0.0".to_string(), "refused".to_string()),
-                (HOSTED_WRITE_FAILURE_KEY.to_string(), "disk full".to_string()),
+                (
+                    HOSTED_WRITE_FAILURE_KEY.to_string(),
+                    "disk full".to_string(),
+                ),
             ],
             edited_files: ["package-lock.json".to_string()].into(),
             ..Default::default()
@@ -5801,7 +5840,10 @@ mod tests {
         assert!(v.get("error").is_none());
         assert_eq!(v["summary"]["rolledBack"], 4, "a, v, vp, h: {v}");
         assert_eq!(v["summary"]["failed"], 5, "bad, vk, vf, hf, files: {v}");
-        assert_eq!(v["summary"]["skipped"], 2, "already original + not installed");
+        assert_eq!(
+            v["summary"]["skipped"], 2,
+            "already original + not installed"
+        );
         assert_eq!(v["summary"]["removed"], 1);
         assert_eq!(v["summary"]["bytesFreed"], 42);
         assert_eq!(v["gc"]["removedBlobs"], 1);
@@ -5820,7 +5862,10 @@ mod tests {
         assert_eq!(a["uuid"], "uuid-a");
         assert_eq!(a["files"][0]["path"], "index.js");
         assert_eq!(a["details"]["path"], "/p/a");
-        assert!(a["details"].get("mode").is_none(), "agent events carry no mode");
+        assert!(
+            a["details"].get("mode").is_none(),
+            "agent events carry no mode"
+        );
         assert_eq!(
             find("skipped", "pkg:npm/o@1.0.0")["errorCode"],
             "already_original"
@@ -5832,13 +5877,25 @@ mod tests {
             find("skipped", "pkg:npm/gone@1.0.0")["errorCode"],
             "package_not_installed"
         );
-        assert_eq!(find("rolledBack", "pkg:npm/v@1.0.0")["details"]["mode"], "vendored");
+        assert_eq!(
+            find("rolledBack", "pkg:npm/v@1.0.0")["details"]["mode"],
+            "vendored"
+        );
         let vp = find("rolledBack", "pkg:npm/vp@1.0.0");
         assert_eq!(vp["details"]["mode"], "vendored");
         assert_eq!(vp["details"]["preserved"], true);
-        assert_eq!(find("failed", "pkg:npm/vk@1.0.0")["errorCode"], "vendor_revert_kept");
-        assert_eq!(find("failed", "pkg:npm/vf@1.0.0")["errorCode"], "vendor_revert_failed");
-        assert_eq!(find("rolledBack", "pkg:npm/h@1.0.0")["details"]["mode"], "hosted");
+        assert_eq!(
+            find("failed", "pkg:npm/vk@1.0.0")["errorCode"],
+            "vendor_revert_kept"
+        );
+        assert_eq!(
+            find("failed", "pkg:npm/vf@1.0.0")["errorCode"],
+            "vendor_revert_failed"
+        );
+        assert_eq!(
+            find("rolledBack", "pkg:npm/h@1.0.0")["details"]["mode"],
+            "hosted"
+        );
         assert_eq!(
             find("failed", "pkg:npm/hf@1.0.0")["errorCode"],
             "hosted_restore_refused"
@@ -5855,7 +5912,12 @@ mod tests {
     #[test]
     fn envelope_dry_run_previews_are_verified() {
         let manifest = PatchManifest::new();
-        let results = vec![rb("pkg:npm/a@1.0.0", "/p/a", VerifyRollbackStatus::Ready, false)];
+        let results = vec![rb(
+            "pkg:npm/a@1.0.0",
+            "/p/a",
+            VerifyRollbackStatus::Ready,
+            false,
+        )];
         let vendored = VendoredLegOutcome {
             reverted: vec!["pkg:npm/v@1.0.0".to_string()],
             ..Default::default()
@@ -5918,7 +5980,12 @@ mod tests {
     #[test]
     fn envelope_contested_wiring_is_an_artifact_failure() {
         let manifest = PatchManifest::new();
-        let results = vec![rb("pkg:npm/a@1.0.0", "/p/a", VerifyRollbackStatus::Ready, true)];
+        let results = vec![rb(
+            "pkg:npm/a@1.0.0",
+            "/p/a",
+            VerifyRollbackStatus::Ready,
+            true,
+        )];
         let vendored = VendoredLegOutcome::default();
         let hosted = HostedLegOutcome::default();
         let v = build_rollback_envelope(&RollbackReport {
@@ -5948,7 +6015,10 @@ mod tests {
 
     #[test]
     fn failure_codes_follow_the_blocking_file() {
-        assert_eq!(rollback_failure_code(&failed_rb("pkg:npm/x@1")), "hash_mismatch");
+        assert_eq!(
+            rollback_failure_code(&failed_rb("pkg:npm/x@1")),
+            "hash_mismatch"
+        );
         let mut r = failed_rb("pkg:npm/x@1");
         r.files_verified[0].status = VerifyRollbackStatus::MissingBlob;
         assert_eq!(rollback_failure_code(&r), "missing_blob");

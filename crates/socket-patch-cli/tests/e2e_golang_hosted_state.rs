@@ -421,7 +421,11 @@ async fn hosted_rollback_restores_go_sum_byte_for_byte() {
         "offline must refuse\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(rollback_json::hosted_failed(&doc)[0]["purl"], UPURL, "{doc}");
+    assert_eq!(
+        rollback_json::hosted_failed(&doc)[0]["purl"],
+        UPURL,
+        "{doc}"
+    );
     assert!(
         rollback_json::hosted_failed(&doc)[0]["error"]
             .as_str()

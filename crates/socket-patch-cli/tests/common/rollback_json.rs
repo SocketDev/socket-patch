@@ -85,7 +85,10 @@ pub fn skipped_with(v: &Value, code: &str) -> Value {
 
 /// How many packages were already original (`skipped` `already_original`).
 pub fn already_original(v: &Value) -> usize {
-    skipped_with(v, "already_original").as_array().unwrap().len()
+    skipped_with(v, "already_original")
+        .as_array()
+        .unwrap()
+        .len()
 }
 
 /// In-scope manifest entries with no installed package.

@@ -734,7 +734,10 @@ async fn npm_hosted_round_trip_envelope() {
         envelope["hosted"]["editedFiles"].as_u64().unwrap_or(0) >= 1,
         "at least the lockfile was rewritten: {envelope}"
     );
-    assert_eq!(rollback_json::hosted_failed(&envelope), serde_json::json!([]));
+    assert_eq!(
+        rollback_json::hosted_failed(&envelope),
+        serde_json::json!([])
+    );
     assert_eq!(
         rollback_json::manifest_removed(&envelope),
         serde_json::json!([]),
@@ -998,7 +1001,10 @@ async fn scoped_rollback_restores_only_the_named_pin() {
         serde_json::json!([LP_PURL]),
         "only the named pin is restored: {envelope}"
     );
-    assert_eq!(rollback_json::hosted_failed(&envelope), serde_json::json!([]));
+    assert_eq!(
+        rollback_json::hosted_failed(&envelope),
+        serde_json::json!([])
+    );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&format!(
@@ -1122,7 +1128,10 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
     assert_eq!(envelope["error"]["code"], "rollback_failed", "{envelope}");
     assert_eq!(envelope["summary"]["failed"], 2, "{envelope}");
     assert_eq!(envelope["summary"]["rolledBack"], 0, "{envelope}");
-    assert_eq!(rollback_json::hosted_reverted(&envelope), serde_json::json!([]));
+    assert_eq!(
+        rollback_json::hosted_reverted(&envelope),
+        serde_json::json!([])
+    );
     let failed_view = rollback_json::hosted_failed(&envelope);
     let failed: Vec<&str> = failed_view
         .as_array()
@@ -1153,9 +1162,13 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
     // The top-level counters span the hosted leg (#1066): they were 0/0.
     assert_eq!(envelope["summary"]["rolledBack"], 1, "{envelope}");
     assert_eq!(envelope["summary"]["failed"], 1, "{envelope}");
-    assert_eq!(rollback_json::hosted_reverted(&envelope), serde_json::json!([IO_PURL]));
     assert_eq!(
-        rollback_json::hosted_failed(&envelope)[0]["purl"], LP_PURL,
+        rollback_json::hosted_reverted(&envelope),
+        serde_json::json!([IO_PURL])
+    );
+    assert_eq!(
+        rollback_json::hosted_failed(&envelope)[0]["purl"],
+        LP_PURL,
         "{envelope}"
     );
     assert_eq!(
@@ -1195,11 +1208,16 @@ async fn a_git_pattern_hosted_pin_is_refused_not_restored_to_the_registry() {
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(code, 1, "{envelope}");
     assert_eq!(envelope["status"], "partialFailure", "{envelope}");
-    assert_eq!(rollback_json::hosted_reverted(&envelope), serde_json::json!([IO_PURL]));
+    assert_eq!(
+        rollback_json::hosted_reverted(&envelope),
+        serde_json::json!([IO_PURL])
+    );
     // Discovery already refuses to attribute the git-wired entry, so the
     // pin fails closed as contested wiring before any restore is planned.
     assert_eq!(
-        rollback_json::hosted_failed(&envelope).as_array().map(Vec::len),
+        rollback_json::hosted_failed(&envelope)
+            .as_array()
+            .map(Vec::len),
         Some(1),
         "{envelope}"
     );
@@ -1247,7 +1265,10 @@ async fn a_non_registry_keyed_hosted_pin_is_refused_not_restored_to_the_registry
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(code, 1, "{envelope}");
     assert_eq!(envelope["status"], "partialFailure", "{envelope}");
-    assert_eq!(rollback_json::hosted_reverted(&envelope), serde_json::json!([IO_PURL]));
+    assert_eq!(
+        rollback_json::hosted_reverted(&envelope),
+        serde_json::json!([IO_PURL])
+    );
     assert!(
         rollback_json::hosted_failed(&envelope)[0]["error"]
             .as_str()
