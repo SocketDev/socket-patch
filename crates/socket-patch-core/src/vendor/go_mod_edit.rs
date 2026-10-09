@@ -412,8 +412,7 @@ pub fn module_path(text: &str) -> Option<String> {
 /// Anything else is left verbatim (and so never parses as ours). Writers
 /// edit the raw text instead.
 pub(crate) fn normalize_for_read(text: &str) -> String {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    unquote_tokens(text)
+    unquote_tokens(crate::formats::text::strip_bom(text))
 }
 
 fn unquote_tokens(text: &str) -> String {
@@ -895,6 +894,21 @@ fn join_preserving_trailing_newline(lines: &[String], original: &str) -> String 
 mod tests {
     use super::*;
     use tokio::fs;
+
+    /// The read-only go.mod parsers drop exactly one leading BOM
+    /// (`formats::text::strip_bom`); a second one stays content.
+    #[test]
+    fn normalize_for_read_drops_one_leading_bom_only() {
+        assert_eq!(normalize_for_read("module \"a/b\"\n"), "module a/b\n");
+        assert_eq!(
+            normalize_for_read("\u{feff}module \"a/b\"\n"),
+            "module a/b\n"
+        );
+        assert_eq!(
+            normalize_for_read("\u{feff}\u{feff}module a/b\n"),
+            "\u{feff}module a/b\n"
+        );
+    }
 
     // ── path ownership ───────────────────────────────────────────────
     #[test]

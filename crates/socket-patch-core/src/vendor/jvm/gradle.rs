@@ -34,6 +34,7 @@ use super::{
 };
 
 use super::layout::{self, safe_coordinates};
+use crate::formats::text::{split_bom, strip_bom};
 use crate::formats::xml::{self, Element};
 
 /// The owned settings script. Its bytes change only with a CLI release.
@@ -1512,7 +1513,7 @@ fn newline_of(text: &str) -> &'static str {
 fn append_line(text: &str, line: &str) -> String {
     let nl = newline_of(text);
     let mut out = text.to_string();
-    if !out.is_empty() && !out.ends_with('\n') && out != "\u{feff}" {
+    if !strip_bom(&out).is_empty() && !out.ends_with('\n') {
         out.push_str(nl);
     }
     out.push_str(line);
@@ -1858,7 +1859,7 @@ fn first_statement_offset(text: &str, toks: &[Token]) -> usize {
         }
     }
     // Never in front of a byte-order mark.
-    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let bom = split_bom(text).0.len();
     match toks.get(i) {
         Some(t) => text[..t.start].rfind('\n').map_or(0, |j| j + 1).max(bom),
         None => text.len(),
@@ -2472,6 +2473,25 @@ mod tests {
     const UUID: &str = "5e6f7081-92a3-4b4c-8d5e-6f708192a3b4";
     const GSON_POM: &[u8] =
         b"<project><parent><groupId>com.google.code.gson</groupId><artifactId>gson-parent</artifactId><version>2.10.1</version></parent></project>\n";
+
+    /// `append_line` and `first_statement_offset` treat exactly one
+    /// leading BOM as encoding (`formats::text`): a file holding only a
+    /// BOM gets no separator line, and nothing is inserted in front of it.
+    #[test]
+    fn appended_and_inserted_lines_skip_one_leading_bom() {
+        assert_eq!(append_line("", "x"), "x\n");
+        assert_eq!(append_line("\u{feff}", "x"), "\u{feff}x\n");
+        assert_eq!(append_line("a", "x"), "a\nx\n");
+        assert_eq!(
+            append_line("\u{feff}\u{feff}", "x"),
+            "\u{feff}\u{feff}\nx\n"
+        );
+        let offset = |text: &str| first_statement_offset(text, &dsl::tokens(text, Dsl::Groovy));
+        assert_eq!(offset("plugins {}\n"), 0);
+        assert_eq!(offset("\u{feff}plugins {}\n"), 3);
+        assert_eq!(offset("import a.B\nplugins {}\n"), 11);
+        assert_eq!(offset("\u{feff}import a.B\nplugins {}\n"), 14);
+    }
 
     fn patch() -> JvmPatch<'static> {
         JvmPatch {
