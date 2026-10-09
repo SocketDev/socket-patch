@@ -11,7 +11,7 @@
 //! view and the store entry byte-identical.
 //!
 //! Fixture: minimist@1.2.2 + its Socket patch (UUID
-//! `80630680-4da6-45f9-bba8-b888e0ffd58c`, CVE-2021-44906) — same
+//! `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb`, CVE-2021-44906) — same
 //! pair `e2e_npm.rs` uses, so the BEFORE/AFTER hashes are known.
 //!
 //! Network: yes (pnpm install + socket-patch get). Toolchain: pnpm.
@@ -24,12 +24,12 @@ mod common;
 
 use common::{assert_run_ok, git_sha256_file, has_command, pnpm_run, write_package_json};
 
-const NPM_UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+const NPM_UUID: &str = "642d7f02-ebc1-4ab0-99e2-07f5dd8463cb";
 
 /// Git-SHA-256 of the *unpatched* `index.js` shipped with minimist 1.2.2.
 const BEFORE_HASH: &str = "311f1e893e6eac502693fad8617dcf5353a043ccc0f7b4ba9fe385e838b67a10";
 /// Git-SHA-256 of the *patched* `index.js` after the security fix.
-const AFTER_HASH: &str = "043f04d19e884aa5f8371428718d2a3f27a0d231afe77a2620ac6312f80aaa28";
+const AFTER_HASH: &str = "ec956dcafb886f14315570bf3981d44aa12c561716abb46eed8b067aaa1f6bdf";
 
 // ── Setup helpers ─────────────────────────────────────────────────────
 
