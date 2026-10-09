@@ -525,6 +525,11 @@ limits, and required install commands.
     other options, quoted paths, `${VAR}` expansion and UTF-16/BOM files
     (#1028, #994, #721). A non-UTF-8 candidate file refuses hosted runs with
     `candidate_file_unreadable` instead of reporting success.
+  - `requirements.txt` files are decoded the way pip decodes them (BOM, then
+    a PEP 263 coding line, then UTF-8). A Latin-1/cp1252 file is no longer
+    skipped as absent by lock-only scans, and a UTF-16 export beside
+    `uv.lock` is seen by vendored routing, `vendor --check` and `vex`
+    instead of being attested over (#1119, #1120).
   - Hosted mode withholds platform-, ABI- and interpreter-bound wheels
     (`cp311-none-any`, manylinux) from cross-platform locks with
     `redirect_pypi_platform_wheel`; vendored mode gives `vendor_platform_locked`
