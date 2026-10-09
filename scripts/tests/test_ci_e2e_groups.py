@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -56,6 +57,17 @@ class Groups(unittest.TestCase):
                 for case in cases:
                     for key, value in groups.settings(case).items():
                         self.assertEqual(row[key], value)
+
+    def test_only_the_four_gradle_agent_legs_opt_into_parallel_suites(self):
+        reader = groups.reader()
+        jobs = reader.jobs((ROOT / ".github/workflows/ci.yml").read_text())
+        parallel = [case for job in groups.FAMILIES for case in reader.matrix_include(jobs[job])
+                    if case.get("parallel_suites") == "true"]
+        self.assertEqual({case["gradle"] for case in parallel}, {"6.9.4", "7.6.6", "8.14.3", "9.8.0"})
+        self.assertEqual(len(parallel), 4)
+        for case in parallel:
+            self.assertEqual(case["suite"].split(), ["e2e_gradle_discovery_build", "e2e_gradle_agent_build",
+                                                   "e2e_redirect_gradle_build"])
 
 
 class Runner(unittest.TestCase):
@@ -136,6 +148,31 @@ class Runner(unittest.TestCase):
             with patch.object(runner, "run_binary", side_effect=[FileNotFoundError(), 0]) as execute:
                 self.assertEqual(runner.run_cases(cases, root, {}), 1)
                 self.assertEqual(execute.call_count, 2)
+
+    def test_parallel_suites_overlap_and_preserve_all_failure_verdicts(self):
+        barrier = threading.Barrier(3, timeout=5)
+        logs = []
+
+        def execute(args, env, cwd, log):
+            # A serial implementation cannot reach this barrier three times.
+            barrier.wait()
+            name = Path(args[0]).stem
+            logs.append(log)
+            count = 0 if name == "empty" else 1
+            log.write_text(f"test result: ok. {count} passed; 0 failed;\n")
+            return 1 if name == "broken" else 0
+
+        for suites, expected in (("broken passing last", 1), ("empty passing last", 1),
+                                 ("first passing last", 0)):
+            with self.subTest(suites=suites), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "target").mkdir()
+                logs.clear()
+                with patch.object(runner, "run_binary", side_effect=execute) as run:
+                    result = runner.run_cases({"suite": suites, "parallel_suites": "true"}, root, {})
+                self.assertEqual(result, expected)
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual(len(set(logs)), 3)
 
 
 if __name__ == "__main__":

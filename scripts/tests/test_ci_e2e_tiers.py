@@ -175,6 +175,8 @@ class GradleRows(unittest.TestCase):
             for suite, test_filter in (*AGENT_HOSTED, VENDOR):
                 row = {"os": "ubuntu-latest", "suite": suite, "jvm_tool": "gradle", "gradle": line,
                        "java": java, "test_filter": test_filter}
+                if "e2e_gradle_agent_build" in suite.split():
+                    row["parallel_suites"] = "true"
                 # The allowance lasts only while a suite of the row is unlanded.
                 if not all(bundle.landed(s) for s in suite.split()):
                     row["allow_empty"] = "true"
@@ -182,7 +184,7 @@ class GradleRows(unittest.TestCase):
         want.append({"os": "windows-latest", "suite": "e2e_vendor_jvm_build", "jvm_tool": "gradle",
                      "gradle": "8.14.3", "java": "17", "test_filter": "--ignored gradle_multi_project"})
         self.assertEqual(len(gradle), 17)
-        self.assertEqual(sorted(map(str, gradle)), sorted(map(str, want)))
+        self.assertCountEqual(gradle, want)
         self.assertFalse([r for r in rows("e2e-full") if "gradle" in r or "jvm_tool" in r])
 
     def test_jvm_tool_marks_every_jvm_row(self):

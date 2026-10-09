@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,49 +65,67 @@ def run_binary(args, env, cwd, log):
         with subprocess.Popen(args, env=env, cwd=cwd, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace") as process:
             for line in process.stdout:
-                print(line, end="", flush=True)
+                # Parallel Gradle suites keep raw, separate logs while the
+                # Actions stream always identifies the emitting binary.
+                print(f"[{Path(args[0]).stem}] {line}", end="", flush=True)
                 output.write(line)
             return process.wait()
 
 
-def run_cases(row, root=ROOT, base=None):
-    base = os.environ if base is None else base
+def run_suite(case, index, suite, root, base, grouped=True):
     cli = root / "crates/socket-patch-cli"
     suffix = ".exe" if sys.platform == "win32" else ""
+    if not re.fullmatch(r"[A-Za-z0-9_]+", suite):
+        raise ValueError(f"Invalid test suite: {suite}")
+    if case.get("allow_empty") == "true" and not any(
+            path.is_file() for path in (cli / f"tests/{suite}.rs", cli / f"tests/{suite}/main.rs")):
+        print(f"::notice::{suite} has not landed yet; skipped (allow_empty)")
+        return 0
+    filters = shlex.split(case.get("test_filter") or "--ignored")
+    log = root / f"target/e2e-{index}-{suite}.log"
+    env = environment(case, suite, base, root)
+    marker = "::group::" if grouped else "Starting "
+    print(f"{marker}{suite} {case.get('test_filter', '--ignored')}", flush=True)
+    try:
+        failed = run_binary([str(root / f"target/e2e-bin/{suite}{suffix}"), *filters],
+                            env, cli, log) != 0
+        passed = re.search(r"^test result: .*? (\d+) passed;", log.read_text(encoding="utf-8"), re.M)
+        if not passed or int(passed[1]) == 0:
+            print(f"::error::{suite} ran no tests; check its filters.")
+            failed = True
+        if case.get("vlt"):
+            checker = subprocess.run([sys.executable, str(root / "scripts/check-vlt-legs.py"),
+                                      "--binary", suite, "--manifest",
+                                      str(cli / "tests/vlt-leg-manifest.json"), str(log)],
+                                     cwd=root, env=env)
+            failed |= checker.returncode != 0
+        if failed:
+            print(f"::error::{suite} failed (row {index}, filters: {' '.join(filters)}).")
+        return int(failed)
+    except OSError as error:
+        print(f"::error::{suite} could not run: {error}")
+        return 1
+    finally:
+        if grouped:
+            print("::endgroup::", flush=True)
+
+
+def run_cases(row, root=ROOT, base=None):
+    base = os.environ if base is None else base
     status = 0
     for index, case in enumerate(members(row)):
-        for suite in case["suite"].split():
-            if not re.fullmatch(r"[A-Za-z0-9_]+", suite):
-                raise ValueError(f"Invalid test suite: {suite}")
-            if case.get("allow_empty") == "true" and not any(
-                    path.is_file() for path in (cli / f"tests/{suite}.rs", cli / f"tests/{suite}/main.rs")):
-                print(f"::notice::{suite} has not landed yet; skipped (allow_empty)")
-                continue
-            filters = shlex.split(case.get("test_filter") or "--ignored")
-            log = root / f"target/e2e-{index}-{suite}.log"
-            env = environment(case, suite, base, root)
-            print(f"::group::{suite} {case.get('test_filter', '--ignored')}", flush=True)
-            try:
-                failed = run_binary([str(root / f"target/e2e-bin/{suite}{suffix}"), *filters],
-                                    env, cli, log) != 0
-                passed = re.search(r"^test result: .*? (\d+) passed;", log.read_text(encoding="utf-8"), re.M)
-                if not passed or int(passed[1]) == 0:
-                    print(f"::error::{suite} ran no tests; check its filters.")
-                    failed = True
-                if case.get("vlt"):
-                    checker = subprocess.run([sys.executable, str(root / "scripts/check-vlt-legs.py"),
-                                              "--binary", suite, "--manifest",
-                                              str(cli / "tests/vlt-leg-manifest.json"), str(log)],
-                                             cwd=root, env=env)
-                    failed |= checker.returncode != 0
-                if failed:
-                    print(f"::error::{suite} failed (row {index}, filters: {' '.join(filters)}).")
-                    status = 1
-            except OSError as error:
-                print(f"::error::{suite} could not run: {error}")
-                status = 1
-            finally:
-                print("::endgroup::", flush=True)
+        suites = case["suite"].split()
+        if case.get("parallel_suites") == "true":
+            # Opt in only the Gradle agent/discovery/hosted-3/4/5 leg.
+            # Cases in packed short-job bins remain sequential.
+            with ThreadPoolExecutor(max_workers=min(3, len(suites))) as pool:
+                futures = [pool.submit(run_suite, case, index, suite, root, base, False)
+                           for suite in suites]
+                for future in futures:
+                    status |= future.result()
+        else:
+            for suite in suites:
+                status |= run_suite(case, index, suite, root, base)
     return status
 
 

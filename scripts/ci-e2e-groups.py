@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
 FAMILIES = ("e2e", "e2e-windows", "e2e-macos", "e2e-full", "e2e-gradle-mid")
-CASE_KEYS = {"suite", "test_filter", "npm_required", "vlt_store_linker", "allow_empty"}
+CASE_KEYS = {"suite", "test_filter", "npm_required", "vlt_store_linker", "allow_empty", "parallel_suites"}
 BUDGET_SECONDS = 360
 ESTIMATES = {
     "e2e_safety_pnpm": 30, "e2e_redirect_npm_build": 90, "e2e_redirect_rush_sim": 30,
