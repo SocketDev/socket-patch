@@ -352,6 +352,20 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub bundled_skipped_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuid → the yarn.lock keys of the `npm:` alias entries of its
+    /// package the rewriter left untouched (`redirect_yarn_classic_alias_skipped`,
+    /// `redirect_yarn_berry_alias_skipped`): that copy keeps installing the
+    /// unpatched artifact even when a direct entry of the same uuid is
+    /// pinned. A confirmation of the uuid is then a PARTIAL pin, so the
+    /// in-run VEX never assumes it applied (#1081), and a vendored → hosted
+    /// takeover that would un-wire a vendored alias copy is retracted
+    /// (#1158). Serialized only when non-empty, like the set above.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")
+    )]
+    pub alias_skipped_entries:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     /// [`vlt::vlt_drives`] over the rewriter's input files and the
     /// caller's `bun_lockb_present`.
     pub vlt_drives: bool,
@@ -818,6 +832,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_vlt_uuids,
         vlt_foreign_uuids,
         bundled_skipped_uuids,
+        alias_skipped_entries,
         vlt_drives: _,
         gradle_uuids,
         confirmed_gradle_uuids,
@@ -867,6 +882,13 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_gradle_uuids.extend(confirmed_gradle_uuids);
     result.refused_gradle_uuids.extend(refused_gradle_uuids);
     result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
+    for (uuid, keys) in alias_skipped_entries {
+        result
+            .alias_skipped_entries
+            .entry(uuid)
+            .or_default()
+            .extend(keys);
+    }
     result.confirmed_sbt_uuids.extend(confirmed_sbt_uuids);
     result.refused_sbt_uuids.extend(refused_sbt_uuids);
 }
@@ -3908,6 +3930,11 @@ fn rewrite_yarn_classic_with(
                 .any(|p| split_pattern(p).is_some_and(|(n, _)| n == fname))
             {
                 alias_skipped = true;
+                result
+                    .alias_skipped_entries
+                    .entry(dep.patch_uuid.clone())
+                    .or_default()
+                    .insert(key.clone());
                 result.warnings.push(RewriteWarning {
                     code: "redirect_yarn_classic_alias_skipped".into(),
                     detail: format!(
@@ -4237,6 +4264,11 @@ fn rewrite_yarn_berry_with_manifests(
                 }) && locks_version(block)
                 {
                     alias_skipped = true;
+                    result
+                        .alias_skipped_entries
+                        .entry(dep.patch_uuid.clone())
+                        .or_default()
+                        .insert(raw_key.to_string());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_yarn_berry_alias_skipped".into(),
                         detail: format!(
@@ -11613,6 +11645,13 @@ mod tests {
         rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty() && r.edits.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_yarn_berry_alias_skipped");
+        assert_eq!(
+            r.alias_skipped_entries.get(&ovr.patch_uuid),
+            Some(&std::collections::BTreeSet::from([
+                "\"safe-pad@npm:left-pad@^1.3.0\"".to_string()
+            ])),
+            "the skipped alias entry is recorded for its uuid (#1081)"
+        );
         assert!(
             !r.warnings
                 .iter()
@@ -11620,6 +11659,58 @@ mod tests {
             "the alias warning replaces the generic not-found: {:?}",
             r.warnings
         );
+    }
+
+    /// #1081 / #1158: yarn 1.22.22 locks a direct dep and an `npm:` alias
+    /// of it as two blocks. The direct block is pinned and the alias block
+    /// skipped, and the result records that skipped block's key for the
+    /// uuid, so a confirmation of it reads as a PARTIAL pin.
+    #[test]
+    fn yarn_classic_alias_beside_direct_records_the_skipped_block() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\n\n\
+             left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n\n\
+             \"lp@npm:left-pad@1.3.0\":\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n"
+                .to_string(),
+        );
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(
+            r.edits.len(),
+            1,
+            "the direct block is pinned: {:?}",
+            r.edits
+        );
+        assert_eq!(
+            r.alias_skipped_entries.get(&ovr.patch_uuid),
+            Some(&std::collections::BTreeSet::from([
+                "\"lp@npm:left-pad@1.3.0\"".to_string()
+            ])),
+        );
+        // A lock with no alias block records nothing.
+        let direct_only = files["yarn.lock"]
+            .split("\n\n\"lp@")
+            .next()
+            .unwrap()
+            .to_string()
+            + "\n";
+        let files = BTreeMap::from([("yarn.lock".to_string(), direct_only)]);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1);
+        assert!(r.alias_skipped_entries.is_empty());
     }
 
     fn bun_lock_file(entry: &str, version: u64) -> String {
