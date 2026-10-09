@@ -86,7 +86,19 @@ pub(crate) fn project_files(root: &std::path::Path) -> Result<Vec<(String, Strin
             std::fs::read_dir(&dir).map_err(|e| format!("unreadable {}: {e}", dir.display()))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("unreadable {}: {e}", dir.display()))?;
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            let raw = entry.file_name();
+            let Some(name) = raw.to_str().map(str::to_string) else {
+                // A project (or a directory that may hold one) this walk
+                // cannot name is a lock it would miss: fail closed.
+                let lossy = raw.to_string_lossy();
+                if crate::formats::nuget::lock::is_project_file(&lossy)
+                    || entry.file_type().is_ok_and(|k| k.is_dir())
+                {
+                    return Err(format!(
+                        "{} has a name that is not UTF-8",
+                        dir.join(&raw).display()
+                    ));
+                }
                 continue;
             };
             let child = if rel.is_empty() {
@@ -94,14 +106,21 @@ pub(crate) fn project_files(root: &std::path::Path) -> Result<Vec<(String, Strin
             } else {
                 format!("{rel}/{name}")
             };
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("unreadable {}: {e}", entry.path().display()))?;
+            // A symlinked directory is not entered (it may lead outside the
+            // tree, or back into it); a symlinked project file is read
+            // through the link, like MSBuild opens it.
+            let is_project = crate::formats::nuget::lock::is_project_file(&name)
+                && (kind.is_file()
+                    || (kind.is_symlink()
+                        && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_file())));
             if kind.is_dir() {
                 if !name.starts_with('.') && !SKIPPED_DIRS.contains(&name.as_str()) {
                     pending.push(child);
                 }
-            } else if kind.is_file() && crate::formats::nuget::lock::is_project_file(&name) {
+            } else if is_project {
                 let path = entry.path();
                 if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_PROJECT_BYTES) {
                     return Err(format!("{} is too large to read", path.display()));
@@ -166,5 +185,39 @@ mod tests {
         let dir = tmp.path().join("nuget.config");
         std::fs::create_dir(&dir).unwrap();
         assert_eq!(same_file(&dir, &dir).await, cfg!(unix));
+    }
+
+    /// The walk reads a symlinked project file, never enters build output
+    /// or hidden dirs, and finds projects at any depth.
+    #[cfg(unix)]
+    #[test]
+    fn project_walk_follows_project_links_and_skips_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for dir in ["src/App/obj", "src/Lib", ".git", "shared"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("src/App/App.csproj"), "<Project />").unwrap();
+        std::fs::write(root.join("src/App/obj/Gen.csproj"), "<Project />").unwrap();
+        std::fs::write(root.join(".git/X.csproj"), "<Project />").unwrap();
+        std::fs::write(root.join("shared/Lib.csproj"), "<Project>lib</Project>").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("shared/Lib.csproj"),
+            root.join("src/Lib/Lib.csproj"),
+        )
+        .unwrap();
+        let found: Vec<String> = super::project_files(root)
+            .unwrap()
+            .into_iter()
+            .map(|(rel, _)| rel)
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "shared/Lib.csproj",
+                "src/App/App.csproj",
+                "src/Lib/Lib.csproj"
+            ]
+        );
     }
 }

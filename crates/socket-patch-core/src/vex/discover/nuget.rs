@@ -74,8 +74,8 @@ use serde_json::Value;
 
 use super::{
     parse_json, simple_purl, socket_patch_name_uuid, vendor_ref, vendor_uuid_dir, DiscoverCtx,
-    Discovery, PatchedRef, UnlockedPin, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
-    DIAG_REF_UNATTRIBUTABLE,
+    Discovery, PatchedRef, UnlockedPin, WiringMode, DIAG_LOCKFILE_UNPARSEABLE,
+    DIAG_LOCKFILE_UNREADABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::nuget::lock::nuget_lock_entries;
 use crate::formats::nuget::{parse_config, NugetConfig};
@@ -292,11 +292,32 @@ enum Lock {
 async fn load_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> Lock {
     let mut rels = vec![PACKAGES_LOCK.to_string()];
     if let Some(root) = ctx.disk_root() {
-        if let Ok(governed) = crate::vendor::nuget_config::governed_locks_on_disk(root) {
-            for rel in governed.locks {
-                if !rels.contains(&rel) {
-                    rels.push(rel);
+        // The writers refuse a tree whose locks they cannot all find; a
+        // reader that fell back to the root lock alone would take a pinned
+        // member lock for no lock at all, so it is unusable here too.
+        match crate::vendor::nuget_config::governed_locks_on_disk(root) {
+            Ok(governed) => {
+                if let Some((project, detail)) = governed.unresolved.first() {
+                    out.diag(
+                        DIAG_LOCKFILE_UNREADABLE,
+                        project,
+                        format!("{project}: {detail}; its NuGet lock cannot be located"),
+                    );
+                    return Lock::Unusable;
                 }
+                for rel in governed.locks {
+                    if !rels.contains(&rel) {
+                        rels.push(rel);
+                    }
+                }
+            }
+            Err(why) => {
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    PACKAGES_LOCK,
+                    format!("cannot list the project's NuGet locks: {why}"),
+                );
+                return Lock::Unusable;
             }
         }
     }
@@ -1439,6 +1460,25 @@ mod tests {
             );
             assert!(out.refs[0].lockfile_basis_ok(), "{lock_rel}");
         }
+        // A project whose lock cannot be located: no ref is read off a
+        // partial lock set (the writers refuse such a tree too).
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(
+            "app.csproj",
+            "<Project><PropertyGroup><NuGetLockFilePath>$(X).json</NuGetLockFilePath></PropertyGroup></Project>",
+        );
+        p.write(
+            "packages.lock.json",
+            lock(&[("net8.0", "Newtonsoft.Json", "13.0.1", Some(HASH))]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert!(
+            diag_codes(&out).contains(&DIAG_LOCKFILE_UNREADABLE),
+            "{:?}",
+            diag_codes(&out)
+        );
     }
 
     /// Two Socket sources mapping the same id are both emitted — precedence

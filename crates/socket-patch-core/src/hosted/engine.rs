@@ -633,32 +633,32 @@ pub async fn read_candidate_files(
     }
 
     // NuGet: the root config routes every project under the root, so each
-    // project's lock is pinned with it (#353, #514). The project files ride
-    // along as advisory input (never rewritten) so the pure rewriter
-    // re-derives which keys are locks; a walk that cannot see the whole
-    // tree rides a synthetic key and the rewriter skips the redirect.
-    // NuGet is disk-only (the in-memory engine refuses it).
+    // project's lock is pinned with it (#353, #514). The walk's answer rides
+    // a synthetic key (the lock paths, an unevaluable NuGetLockFilePath, or
+    // why the tree could not be listed) and every lock is read. The project
+    // files themselves stay out of the candidate texts. NuGet is disk-only
+    // (the in-memory engine refuses it).
     if candidates.iter().any(|c| c.dep.ecosystem == "nuget") {
         if let Some(root) = view.disk_root() {
-            match crate::vendor::nuget_config::project_files(root) {
-                Ok(projects) => {
-                    let governed = crate::formats::nuget::lock::governed_locks(&projects, |rel| {
-                        crate::vendor::nuget_config::lock_present(root, rel)
-                    });
-                    for (rel, text) in projects {
-                        out.files.entry(rel).or_insert(text);
+            let mut lines: Vec<String> = Vec::new();
+            match crate::vendor::nuget_config::governed_locks_on_disk(root) {
+                Ok(governed) => {
+                    for (project, detail) in &governed.unresolved {
+                        lines.push(format!("unresolved\t{project}\t{detail}"));
                     }
                     for rel in governed.locks {
                         if !out.files.contains_key(&rel) {
                             out.read(view, unreadable, &rel).await;
                         }
+                        lines.push(format!("lock\t{rel}"));
                     }
                 }
-                Err(why) => {
-                    out.files
-                        .insert(crate::patch::redirect::NUGET_LOCK_WALK_KEY.to_string(), why);
-                }
+                Err(why) => lines.push(format!("error\t{why}")),
             }
+            out.files.insert(
+                crate::patch::redirect::NUGET_LOCKS_KEY.to_string(),
+                lines.join("\n"),
+            );
         }
     }
 
