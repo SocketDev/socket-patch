@@ -230,6 +230,31 @@ impl Bundled {
         }
     }
 
+    /// Record a `bun.lockb` record Bun shares between a regular and a
+    /// bundled install: it is classified as the regular install, so a ref
+    /// it makes is kept for [`Bundled::contest`] to shadow (never attested,
+    /// but still a pin list / rollback / remove / the vendored takeover can
+    /// unwind), and its `name@version` is recorded as a bundled copy.
+    fn share(&mut self, ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Discovery) {
+        let (label, name) = (entry.label.to_string(), entry.name);
+        let recorded = entry.recorded_version;
+        let mut alone = Discovery::default();
+        classify(ctx, file, entry, &mut alone);
+        out.diagnostics.extend(alone.diagnostics);
+        let mut purls: Vec<String> = alone.elsewhere.into_iter().map(|e| e.purl).collect();
+        for r in alone.refs {
+            purls.push(r.purl.clone());
+            out.push(r);
+        }
+        if purls.is_empty() {
+            purls.extend(recorded.and_then(|version| npm_purl(name, version)));
+        }
+        for purl in purls {
+            out.resolved_elsewhere(file, Some(purl.clone()));
+            self.copies.entry(purl).or_insert_with(|| label.clone());
+        }
+    }
+
     /// Withdraw every ref of `file` whose `name@version` a bundled copy in
     /// the same lock also installs: that copy stays unpatched beside it.
     fn contest(&self, file: &str, out: &mut Discovery) {
@@ -302,9 +327,13 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         // A record some bundled edge reaches installs (also) as a copy
         // unpacked from that parent's tarball. Bun keeps ONE record for a
         // regular and a bundled install of the same version, so even a
-        // record a regular edge also reaches is never attested.
-        if p.bundled {
+        // record a regular edge also reaches is never attested; its ref is
+        // still the pin the hosted writer wired for that regular install
+        // (#1243), so it is shadowed rather than dropped.
+        if p.bundled_only {
             bundled.record(ctx, BUN_LOCKB, classified, out);
+        } else if p.bundled {
+            bundled.share(ctx, BUN_LOCKB, classified, out);
         } else {
             let user_tarball =
                 p.version.is_none() && user_tarball_version(&p.name, &p.resolution).is_some();
@@ -1725,6 +1754,20 @@ mod tests {
                 "{shape}: {:?}",
                 diag_codes(&out)
             );
+            // REGRESSION (#1243): a record Bun shares with a regular install
+            // is the pin the hosted writer wired for that install, so it is
+            // shadowed (visible to list / rollback / remove / the vendored
+            // takeover), like the text lock's regular entry beside a bundled
+            // one. A record only bundled edges reach wires nothing.
+            let shadowed: Vec<_> = out
+                .shadowed
+                .iter()
+                .map(|r| (r.purl.as_str(), r.uuid.as_str()))
+                .collect();
+            match shape {
+                "both" => assert_eq!(shadowed, [("pkg:npm/is-number@7.0.0", UUID_A)], "{shape}"),
+                _ => assert!(shadowed.is_empty(), "{shape}: {shadowed:?}"),
+            }
         }
     }
 

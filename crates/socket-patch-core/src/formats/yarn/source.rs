@@ -1,7 +1,7 @@
 //! Where yarn 1 installs a classic lock block's copy from, decided once for
 //! every mode that reads or rewrites the block.
 
-use super::patterns::split_pattern;
+use super::patterns::split_classic_pattern;
 use crate::vendor::npm_origin::npm_spec_is_registry;
 
 /// Where yarn 1 installs a lock block's copy from: the ONE classifier every
@@ -48,7 +48,7 @@ pub(crate) enum CopySource {
 /// [`CopySource`] of a classic block from its key patterns and `resolved`.
 pub(crate) fn classic_copy_source(patterns: &[String], resolved: Option<&str>) -> CopySource {
     for pattern in patterns {
-        let range = split_pattern(pattern).map(|(_, r)| r).unwrap_or("");
+        let range = split_classic_pattern(pattern).map(|(_, r)| r).unwrap_or("");
         if range.starts_with("link:") {
             return CopySource::Link;
         }
@@ -66,7 +66,7 @@ pub(crate) fn classic_copy_source(patterns: &[String], resolved: Option<&str>) -
     };
     let registry_ranges = patterns
         .iter()
-        .all(|p| split_pattern(p).is_some_and(|(_, range)| npm_spec_is_registry(range)));
+        .all(|p| split_classic_pattern(p).is_some_and(|(_, range)| npm_spec_is_registry(range)));
     if registry_ranges && !is_codeload_tarball(resolved) {
         CopySource::Registry
     } else {
@@ -81,7 +81,7 @@ pub(crate) fn classic_copy_source(patterns: &[String], resolved: Option<&str>) -
 /// a path that leaves the root.
 pub(crate) fn classic_file_directory(patterns: &[String]) -> Option<String> {
     patterns.iter().find_map(|p| {
-        let path = split_pattern(p)?.1.strip_prefix("file:")?;
+        let path = split_classic_pattern(p)?.1.strip_prefix("file:")?;
         let path = path.split('#').next().unwrap_or_default();
         if is_tarball_path(path) {
             return None;
@@ -180,9 +180,9 @@ fn is_codeload_tarball(resolved: &str) -> bool {
 /// here: yarn locks them to a codeload tarball and fetches that as one.
 pub(crate) fn classic_block_is_git(patterns: &[String], resolved: Option<&str>) -> bool {
     patterns.iter().any(|p| {
-        split_pattern(p).is_some_and(|(_, range)| {
+        split_classic_pattern(p).is_some_and(|(_, range)| {
             let range = match range.strip_prefix("npm:") {
-                Some(aliased) => split_pattern(aliased).map_or("", |(_, r)| r),
+                Some(aliased) => split_classic_pattern(aliased).map_or("", |(_, r)| r),
                 None => range,
             };
             yarn_classic_range_is_git(range)
