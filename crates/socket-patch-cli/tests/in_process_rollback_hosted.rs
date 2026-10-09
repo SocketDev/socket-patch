@@ -177,6 +177,15 @@ fn scrubbed_cli() -> std::process::Command {
         .env_remove("SOCKET_ECOSYSTEMS")
         .env_remove("SOCKET_MANIFEST_PATH")
         .env_remove("SOCKET_PRESERVE_STATE");
+    // A registry exported by npm (`npm_config_registry`) or Bun would
+    // steer the Bun restores off the fixtures' registry.
+    for key in [
+        "BUN_CONFIG_REGISTRY",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+    ] {
+        cmd.env_remove(key);
+    }
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"

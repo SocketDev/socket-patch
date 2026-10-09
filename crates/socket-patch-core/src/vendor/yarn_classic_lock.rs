@@ -36,9 +36,10 @@ use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::terminator;
 use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{detect_eol, refused};
+use super::common::refused;
 use super::npm_common::{
     guard_revert_uuid_dir, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend, NpmStagedPack,
     NpmVendorRequest, WireCx,
@@ -145,7 +146,7 @@ impl NpmLockBackend for YarnClassicBackend {
         let resolved_value = format!("file:./{}#{}", staged.rel_tgz, staged.packed.sha1_hex);
 
         // ── 8. Lock rewrite: splice each candidate block, byte-preserving ─
-        let eol = detect_eol(&text);
+        let eol = terminator(&text);
         let mut new_text = text;
         let mut wiring: Vec<WiringRecord> = Vec::new();
         for key in &candidate_keys {
@@ -2272,6 +2273,16 @@ left-pad@^1.3.0:
         let last = "x:\r\n  v: 1\r\n\r\ny:";
         let blocks = scan_blocks(last);
         assert_eq!(block_eol(last, &blocks[1]), "\r\n");
+        // In a mixed lock that fallback is the majority break, the same
+        // `line_endings::terminator` the forward splice uses.
+        for (mixed, eol) in [
+            ("x:\r\n  v: 1\n\ny:", "\n"),
+            ("x:\r\n  v: 1\r\n\ny:", "\r\n"),
+        ] {
+            let blocks = scan_blocks(mixed);
+            assert_eq!(block_eol(mixed, &blocks[1]), eol, "{mixed:?}");
+            assert_eq!(terminator(mixed), eol, "{mixed:?}");
+        }
     }
 
     /// A second canonical uuid, distinct from [`UUID`], for re-vendor tests.

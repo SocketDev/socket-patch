@@ -1343,6 +1343,128 @@ fn vendored_live_tree_out_of_sync_warns_but_attests() {
     );
 }
 
+/// REGRESSION (#599, with #635): Bun never prunes `node_modules/.bun`.
+/// After the in-place `bun install` that consumes a vendored tarball, the
+/// pre-vendor `lodash@4.17.21` registry entry stays on disk, pristine, while
+/// the importer and the `.bun/node_modules` hoist link now point at the
+/// tarball's entry (`lodash@.socket+vendor+npm+<uuid>+lodash-4.17.21.tgz`,
+/// the name real Bun 1.4.2 gives a `file:` tarball). Nothing can load the
+/// orphan, so it is no installed copy: no `vendored_tree_out_of_sync`
+/// warning, which re-running the install could never clear. Both the
+/// project-local store and the global store (`globalStore = true`: every
+/// `.bun` entry an absolute link into `<cache>/links/<entry>-<hash>`) are
+/// covered, each with a control whose live copy is unpatched and must
+/// still warn.
+#[cfg(unix)]
+#[test]
+fn vendored_bun_orphaned_store_entry_is_not_out_of_sync() {
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a";
+    let patched = b"patched npm bytes\n";
+    let pristine = b"original unpatched bytes\n";
+    for (global, live_patched) in [(false, true), (false, false), (true, true), (true, false)] {
+        let label = format!("global store {global}, live copy patched {live_patched}");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cwd = &tmp.path().join("app");
+        std::fs::create_dir_all(cwd).unwrap();
+
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+        let sha256 = sha256_hex(&write_member_tgz(
+            &cwd.join(&rel),
+            "package/index.js",
+            patched,
+        ));
+        let record = make_record(
+            uuid,
+            "package/index.js",
+            &after_hash,
+            "GHSA-sync-aaaa",
+            &["CVE-2026-10"],
+        );
+        let wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
+        let mut state = VendorState::new();
+        state.entries.insert(
+            purl.to_string(),
+            detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+        );
+        std::fs::write(
+            cwd.join(".socket/vendor/state.json"),
+            serde_json::to_string_pretty(&state).expect("serialize vendor state"),
+        )
+        .expect("write vendor state.json");
+
+        let store = cwd.join("node_modules/.bun");
+        let live_entry = format!("lodash@.socket+vendor+npm+{uuid}+lodash-4.17.21.tgz");
+        for (entry, hash, bytes) in [
+            ("lodash@4.17.21", "6a490709ba3c5c8f", &pristine[..]),
+            (
+                live_entry.as_str(),
+                "2fdd36c28041169b",
+                if live_patched {
+                    &patched[..]
+                } else {
+                    &pristine[..]
+                },
+            ),
+        ] {
+            let dir = if global {
+                tmp.path().join(format!("bun-cache/links/{entry}-{hash}"))
+            } else {
+                store.join(entry)
+            };
+            let pkg = dir.join("node_modules/lodash");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                r#"{"name":"lodash","version":"4.17.21"}"#,
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), bytes).unwrap();
+            if global {
+                std::fs::create_dir_all(&store).unwrap();
+                std::os::unix::fs::symlink(&dir, store.join(entry)).unwrap();
+            }
+        }
+        std::fs::create_dir_all(store.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(
+            format!("../{live_entry}/node_modules/lodash"),
+            store.join("node_modules/lodash"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            format!(".bun/{live_entry}/node_modules/lodash"),
+            cwd.join("node_modules/lodash"),
+        )
+        .unwrap();
+
+        let vex_path = cwd.join("out.vex.json");
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+                "--output",
+                vex_path.to_str().unwrap(),
+                "--product",
+                "pkg:npm/app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+        assert!(out.status.success(), "{label}: {env}");
+        assert_eq!(env["status"], "success", "{label}: {env}");
+        let out_of_sync = env["warnings"].as_array().is_some_and(|ws| {
+            ws.iter().any(|w| {
+                w["code"] == "vendored_tree_out_of_sync"
+                    && w["detail"].as_str().is_some_and(|d| d.contains(purl))
+            })
+        });
+        assert_eq!(out_of_sync, !live_patched, "{label}: {env}");
+    }
+}
+
 /// REGRESSION (#325): the lock rewires the hoisted `lodash@4.17.21` to the
 /// vendored tarball, but a parent package also BUNDLES `lodash@4.17.21`
 /// (`inBundle: true`). npm unpacks that copy from the parent's tarball, so

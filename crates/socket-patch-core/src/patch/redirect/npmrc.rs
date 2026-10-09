@@ -736,7 +736,7 @@ pub fn plan_npmrc_allow_remote_with(existing: Option<&str>, outer: &OuterAllowRe
         Some(rest) => (&text[..BOM.len_utf8()], rest),
         None => ("", text),
     };
-    let crlf = body.contains("\r\n");
+    let crlf = crate::utils::line_endings::terminator(body) == "\r\n";
     let line = if crlf {
         format!("{NPMRC_ALLOW_REMOTE_LINE}\r")
     } else {
@@ -901,6 +901,26 @@ mod tests {
             panic!("append expected");
         };
         assert_eq!(text, "\u{feff}[x]\nallow-remote=all\n[sec]\ny=1\n");
+    }
+
+    /// The spliced line takes `line_endings::terminator`'s style: the
+    /// majority of a mixed file's breaks, LF on a tie.
+    #[test]
+    fn spliced_line_takes_the_majority_terminator_of_a_mixed_npmrc() {
+        for (existing, want) in [
+            ("a=1\r\nb=2\n", "a=1\r\nb=2\nallow-remote=all\n"),
+            ("a=1\r\nb=2\nc=3\n", "a=1\r\nb=2\nc=3\nallow-remote=all\n"),
+            (
+                "a=1\r\nb=2\r\nc=3\n",
+                "a=1\r\nb=2\r\nc=3\nallow-remote=all\r\n",
+            ),
+            ("a=1\r\nb=2\r\n", "a=1\r\nb=2\r\nallow-remote=all\r\n"),
+        ] {
+            let NpmrcPlan::Append(text) = plan_npmrc_allow_remote(Some(existing)) else {
+                panic!("append expected for {existing:?}");
+            };
+            assert_eq!(text, want, "{existing:?}");
+        }
     }
 
     fn cfg_env(vars: &[(&str, &str)]) -> NpmConfigEnv {

@@ -1,5 +1,8 @@
 //! Native binary Bun vendoring. Package records are edited without re-resolving
 //! dependencies or requiring a Bun executable.
+use super::bun_lock_text::{
+    decode_json_string, packages_bounds, parse_entry_line, split_name_spec, user_tarball_version,
+};
 use super::bun_lockb::{BinaryPackage, BunLockb};
 use super::common::refused;
 use super::npm_common::{
@@ -12,17 +15,88 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::manifest::schema::PatchRecord;
 #[cfg(test)]
 use crate::patch::apply::PatchSources;
-use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes_sync};
+use crate::utils::fs::{
+    atomic_write_bytes_preserving_mode, read_regular_to_bytes_sync, read_regular_to_string,
+};
 use std::path::{Path, PathBuf};
 
 pub(crate) const LOCK: &str = "bun.lockb";
 pub(crate) const KIND: &str = "bun_lockb_package";
 const MIRROR_KIND: &str = "bun_lockb_workspace_artifact";
+const TEXT_LOCK: &str = "bun.lock";
 
 fn is_ours(package: &BinaryPackage, name: &str, leaf: &str) -> bool {
     package.name == name
         && parse_vendor_path(&package.resolution).is_some_and(|p| p.eco == "npm")
         && package.resolution.ends_with(&format!("/{leaf}"))
+}
+
+/// A record vendoring `coords` rewires: the exact `name@version`, or one of
+/// our own tarballs for it.
+fn is_target(package: &BinaryPackage, coords: &NpmCoords, leaf: &str) -> bool {
+    (package.name == coords.name && package.version.as_deref() == Some(&coords.version))
+        || is_ours(package, &coords.name, leaf)
+}
+
+/// Bun's writer keeps one package record per resolution, but after a project
+/// is vendored a new dependent of the package (a member added later, `bun
+/// add` in a member) gets a second, nested registry record of the same
+/// `name@version`, because the hoisted one is a local tarball now. Rewiring
+/// it to the same tarball gives two records one isolated store directory,
+/// and frozen installs then fail intermittently with `EEXIST` (#861). So
+/// such records are folded into ONE kept record (the one already at
+/// `target`, else one of ours, else the first), as Bun's own re-save
+/// would, whether or not the package has dependencies of its own. A record
+/// some bundled edge reaches is left to the rewrite: its parent's tarball
+/// ships that copy. Where the records cannot fold exactly
+/// ([`BunLockb::merge_packages`]: their dependencies resolve differently,
+/// or the lock's hoisting is not one this codec reproduces) they are all
+/// rewritten as before, with a warning. Returns the records left to
+/// rewrite, re-read after renumbering, and whether the lock changed.
+fn merge_duplicates(
+    lock: &mut BunLockb,
+    matches: Vec<BinaryPackage>,
+    target: &str,
+    coords: &NpmCoords,
+    leaf: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<(Vec<BinaryPackage>, bool), String> {
+    let mut candidates: Vec<_> = matches.iter().filter(|p| !p.bundled).collect();
+    candidates.sort_by_key(|p| {
+        (
+            p.resolution != target,
+            !is_ours(p, &coords.name, leaf),
+            p.id,
+        )
+    });
+    let Some((kept, duplicates)) = candidates.split_first() else {
+        return Ok((matches, false));
+    };
+    if duplicates.is_empty() {
+        return Ok((matches, false));
+    }
+    let duplicates: Vec<usize> = duplicates.iter().map(|p| p.id).collect();
+    if !lock.merge_packages(kept.id, &duplicates)? {
+        warnings.push(VendorWarning::new(
+            "vendor_bun_lockb_duplicate_records",
+            format!(
+                "{LOCK} has {} records of {}@{} that cannot be folded into one, so each is \
+                 rewired to the same tarball; Bun's isolated linker can fail to install two \
+                 records with one tarball (EEXIST); the hoisted linker \
+                 (`[install] linker = \"hoisted\"` in bunfig.toml) installs it",
+                duplicates.len() + 1,
+                coords.name,
+                coords.version
+            ),
+        ));
+        return Ok((matches, false));
+    }
+    let matches = lock
+        .packages()?
+        .into_iter()
+        .filter(|p| is_target(p, coords, leaf) && !p.bundled_only)
+        .collect();
+    Ok((matches, true))
 }
 
 /// [`BunBinaryBackend`] through the shared driver, under the signature the
@@ -90,7 +164,14 @@ impl NpmLockBackend for BunBinaryBackend {
             matches,
             mirrors,
             bundled,
+            user_tarballs,
         } = preflight_package(&project, root, coords, &leaf)?;
+        warnings.extend(super::bun_lock::default_trust_warning(
+            project.manifest.as_deref(),
+            None,
+            &coords.name,
+            &coords.version,
+        ));
         for package in bundled {
             // LOUD: this copy ships inside its PARENT's tarball, which we do
             // not repack — it stays the unpatched bytes after vendor (#469).
@@ -104,6 +185,18 @@ impl NpmLockBackend for BunBinaryBackend {
                     coords.name,
                     coords.version,
                     if package.bundled_only { "" } else { "also " },
+                ),
+            ));
+        }
+        for package in user_tarballs {
+            // LOUD: bun installs this copy from its own URL / `file:`
+            // resolution, which vendoring does not touch (#497).
+            warnings.push(VendorWarning::new(
+                "vendor_non_registry_entry_skipped",
+                super::bun_lock::user_tarball_detail(
+                    &format!("{LOCK} package #{}", package.id),
+                    &coords.name,
+                    &coords.version,
                 ),
             ));
         }
@@ -121,7 +214,7 @@ impl NpmLockBackend for BunBinaryBackend {
         plan: BunBinaryPlan,
         cx: &WireCx<'_>,
         staged: &mut NpmStagedPack,
-        _warnings: &mut Vec<VendorWarning>,
+        warnings: &mut Vec<VendorWarning>,
     ) -> Result<Option<NpmCommit>, String> {
         let BunBinaryPlan {
             mut lock,
@@ -131,6 +224,8 @@ impl NpmLockBackend for BunBinaryBackend {
         } = plan;
         let (root, coords) = (cx.project_root, cx.coords);
         let mut wiring = Vec::new();
+        let (matches, merged) =
+            merge_duplicates(&mut lock, matches, &staged.rel_tgz, coords, &leaf, warnings)?;
         for package in matches {
             if package.resolution == staged.rel_tgz
                 && package.integrity.as_deref() == Some(&staged.packed.integrity)
@@ -168,7 +263,7 @@ impl NpmLockBackend for BunBinaryBackend {
         // locations as well as the canonical root artifact.
         let artifact = read_regular_to_bytes_sync(&root.join(&staged.rel_tgz))
             .map_err(|e| format!("cannot read staged tarball: {e}"))?;
-        let lock_changed = !wiring.is_empty();
+        let lock_changed = merged || !wiring.is_empty();
         let mut mirror_backups: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
         for (workspace, rel) in &mirrors {
             let path = root.join(rel);
@@ -234,6 +329,8 @@ pub(super) struct BinaryProject {
     packages: Vec<BinaryPackage>,
     /// The project's own `patchedDependencies` keys (#367).
     user_patched: Vec<String>,
+    /// The root `package.json` text, `None` when unreadable.
+    manifest: Option<String>,
 }
 
 /// Read the lock, refusing (before any write) a symlinked, unreadable,
@@ -259,11 +356,13 @@ pub(super) async fn read_project(root: &Path) -> Result<BinaryProject, Box<Vendo
         Ok(v) => v,
         Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
     };
-    let user_patched = super::bun_lock::read_user_patched(root, None).await;
+    let manifest = super::bun_lock::read_manifest(root).await;
+    let user_patched = super::bun_lock_text::patched_dependency_keys(manifest.as_deref(), None);
     Ok(BinaryProject {
         lock,
         packages,
         user_patched,
+        manifest,
     })
 }
 
@@ -275,6 +374,9 @@ pub(super) struct BinaryTargets {
     /// Matching records some bundled edge reaches (#469): each one's
     /// bundled copy stays unpatched, which vendoring reports loudly.
     bundled: Vec<BinaryPackage>,
+    /// User URL / `file:` tarball records of the same version (#497): bun
+    /// installs them from their own resolution, so they stay unpatched.
+    user_tarballs: Vec<BinaryPackage>,
 }
 
 /// The per-package pre-flight against an already-read lock: the records
@@ -292,16 +394,25 @@ pub(super) fn preflight_package(
     let (bundled_only, matches): (Vec<_>, Vec<_>) = project
         .packages
         .iter()
-        .filter(|p| {
-            (p.name == coords.name && p.version.as_deref() == Some(&coords.version))
-                || is_ours(p, &coords.name, leaf)
-        })
+        .filter(|p| is_target(p, coords, leaf))
         .cloned()
         .partition(|p| p.bundled_only);
     let bundled: Vec<_> = matches
         .iter()
         .filter(|p| p.bundled)
         .chain(&bundled_only)
+        .cloned()
+        .collect();
+    let user_tarballs: Vec<_> = project
+        .packages
+        .iter()
+        .filter(|p| {
+            p.name == coords.name
+                && p.version.is_none()
+                && !p.bundled_only
+                && user_tarball_version(&coords.name, &p.resolution)
+                    == Some(coords.version.as_str())
+        })
         .cloned()
         .collect();
     if matches.is_empty() && !bundled_only.is_empty() {
@@ -315,6 +426,22 @@ pub(super) fn preflight_package(
                  cannot be rewritten — those copies stay UNPATCHED and `bun install` will not \
                  help; vendor or update the bundling parent to cover them",
                 coords.name, coords.version
+            ),
+        )));
+    }
+    if matches.is_empty() && !user_tarballs.is_empty() {
+        // The package IS locked, from a URL / `file:` resolution bun
+        // installs as written (#497): "run `bun install`" would not help.
+        let ids: Vec<String> = user_tarballs.iter().map(|p| format!("#{}", p.id)).collect();
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_rewritable",
+            format!(
+                "every {LOCK} record for {}@{} ({}) installs it from a URL or local tarball, \
+                 not the registry, and cannot be rewritten — those copies stay UNPATCHED and \
+                 `bun install` will not help; depend on the registry release to vendor it",
+                coords.name,
+                coords.version,
+                ids.join(", ")
             ),
         )));
     }
@@ -349,6 +476,7 @@ pub(super) fn preflight_package(
         matches,
         mirrors,
         bundled,
+        user_tarballs,
     })
 }
 
@@ -384,47 +512,81 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
         );
     }
     let mut outcome = RevertOutcome::ok();
-    let original_bytes = match read_regular_to_bytes_sync(&root.join(LOCK)) {
-        Ok(v) => v,
+    let (mut lock, original_bytes) = match read_regular_to_bytes_sync(&root.join(LOCK)) {
+        Ok(bytes) => match BunLockb::parse(&bytes) {
+            Ok(v) => (RevertLock::Binary(v), bytes),
+            Err(e) => return RevertOutcome::failed(e),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if entry.wiring.is_empty() && opts.keep_artifact {
                 return outcome;
             }
-            return RevertOutcome::failed(format!(
-                "{LOCK} is missing; cannot safely revert the binary lock"
-            ));
+            // `bun install --save-text-lockfile` deletes bun.lockb and
+            // carries the vendored tuples into bun.lock (#784): restore the
+            // recorded registry packages there instead.
+            match read_regular_to_string(&root.join(TEXT_LOCK)).await {
+                Ok(text) => (
+                    RevertLock::Migrated(text.split('\n').map(str::to_string).collect()),
+                    text.into_bytes(),
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return RevertOutcome::failed(format!(
+                        "{LOCK} is missing; cannot safely revert the binary lock"
+                    ));
+                }
+                Err(e) => return RevertOutcome::failed(format!("cannot read {TEXT_LOCK}: {e}")),
+            }
         }
         Err(e) => return RevertOutcome::failed(format!("cannot read {LOCK}: {e}")),
     };
-    let mut lock = match BunLockb::parse(&original_bytes) {
-        Ok(v) => v,
-        Err(e) => return RevertOutcome::failed(e),
-    };
     if !entry.wiring.iter().any(|rec| rec.kind == KIND) && !opts.keep_artifact {
-        match lock.packages() {
-            Ok(packages)
-                if !packages.iter().any(|p| {
-                    parse_vendor_path(&p.resolution).is_some_and(|p| p.uuid == entry.uuid)
-                }) => {}
-            _ => {
-                return RevertOutcome::failed(format!(
-                    "{LOCK} still references {} but the original wiring is missing",
-                    entry.uuid
-                ))
-            }
+        let referenced = match &lock {
+            RevertLock::Binary(lock) => lock.packages().map(|packages| {
+                packages
+                    .iter()
+                    .any(|p| parse_vendor_path(&p.resolution).is_some_and(|p| p.uuid == entry.uuid))
+            }),
+            RevertLock::Migrated(lines) => Ok(lines
+                .iter()
+                .any(|line| migrated_vendor_uuid(line).as_deref() == Some(entry.uuid.as_str()))),
+        };
+        if referenced != Ok(false) {
+            return RevertOutcome::failed(format!(
+                "{} still references {} but the original wiring is missing",
+                lock.file(),
+                entry.uuid
+            ));
         }
     }
+    // Several binary records can carry different registry originals, which
+    // the migration collapsed into the same text entries: never guess which
+    // one each entry had.
+    let originals: Vec<_> = entry
+        .wiring
+        .iter()
+        .filter(|rec| rec.kind == KIND)
+        .filter_map(|rec| rec.original.as_ref())
+        .collect();
+    let ambiguous_migration = matches!(lock, RevertLock::Migrated(_))
+        && originals.windows(2).any(|pair| {
+            ["name", "version", "resolution", "integrity"]
+                .iter()
+                .any(|key| pair[0].get(key) != pair[1].get(key))
+        });
     // REMOVED, not drift (#1132): `bun remove <pkg>` (or an upgrade off the
     // patched version) leaves neither snapshot in the lock. When no package
     // resolves through this uuid dir any more, there is nothing to restore
     // and nothing an install needs the artifact for. Probed once, before any
     // record is restored; an unreadable package table fails closed (drift).
     let uuid_lower = entry.uuid.to_ascii_lowercase();
-    let unreferenced = lock.packages().is_ok_and(|packages| {
-        !packages
-            .iter()
-            .any(|p| p.resolution.to_ascii_lowercase().contains(&uuid_lower))
-    });
+    let unreferenced = match &lock {
+        RevertLock::Binary(lock) => lock.packages().is_ok_and(|packages| {
+            !packages
+                .iter()
+                .any(|p| p.resolution.to_ascii_lowercase().contains(&uuid_lower))
+        }),
+        RevertLock::Migrated(_) => false,
+    };
     let mut mirrors_to_remove = Vec::new();
     for rec in entry.wiring.iter().rev() {
         if rec.kind == MIRROR_KIND {
@@ -476,6 +638,22 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
         }
         // `Ok(true)`: the record left the lock (see `unreferenced`).
         let restore = (|| {
+            // A same-uuid re-vendor on the migrated bun.lock re-pins our own
+            // tuple as a text record next to the binary records it carried
+            // forward (#784): restore it like the text revert does.
+            if let RevertLock::Migrated(lines) = &mut lock {
+                if rec.file == TEXT_LOCK && rec.kind == super::bun_lock::KIND_LOCK_PACKAGE {
+                    let mut dirty = false;
+                    super::bun_lock::revert_one_record(
+                        lines,
+                        rec,
+                        &entry.uuid,
+                        &mut dirty,
+                        &mut outcome.warnings,
+                    );
+                    return Ok(false);
+                }
+            }
             if rec.file != LOCK || rec.kind != KIND {
                 return Err("unexpected binary wiring file or kind".to_string());
             }
@@ -488,6 +666,27 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
                 .original
                 .as_ref()
                 .ok_or("missing pre-vendor binary package snapshot")?;
+            let lock = match &mut lock {
+                RevertLock::Binary(lock) => lock,
+                RevertLock::Migrated(_) if ambiguous_migration => {
+                    return Err(format!(
+                        "binary package #{id} has a different registry original than another \
+                         record of this package, and {TEXT_LOCK} no longer tells them apart"
+                    ));
+                }
+                RevertLock::Migrated(lines) => {
+                    if !restore_migrated(lines, original, &entry.uuid)? {
+                        outcome.warnings.push(VendorWarning::new(
+                            super::LOCK_ENTRY_REMOVED_CODE,
+                            format!(
+                                "{TEXT_LOCK} has no entry for binary package #{id}; nothing to \
+                                 restore"
+                            ),
+                        ));
+                    }
+                    return Ok(false);
+                }
+            };
             let new = rec
                 .new
                 .as_ref()
@@ -525,13 +724,28 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
     if opts.dry_run {
         return outcome;
     }
-    let bytes = lock.bytes();
+    let bytes = match &lock {
+        RevertLock::Binary(lock) => lock.bytes(),
+        RevertLock::Migrated(lines) => lines.join("\n").into_bytes(),
+    };
     if bytes != original_bytes {
-        if let Err(e) = atomic_write_bytes_preserving_mode(&root.join(LOCK), &bytes).await {
-            return RevertOutcome::failed(format!("cannot write {LOCK}: {e}"));
+        if let Err(e) = atomic_write_bytes_preserving_mode(&root.join(lock.file()), &bytes).await {
+            return RevertOutcome::failed(format!("cannot write {}: {e}", lock.file()));
         }
     }
     if !opts.keep_artifact {
+        if matches!(lock, RevertLock::Migrated(_))
+            && super::npm_flavor::keep_artifact_while_lock_references_it(
+                &mut outcome,
+                root,
+                &[TEXT_LOCK],
+                &entry.uuid,
+                &dir,
+            )
+            .await
+        {
+            return outcome;
+        }
         for mirror in mirrors_to_remove {
             if let Err(e) = remove_mirror(&mirror).await {
                 return RevertOutcome::failed(format!(
@@ -555,6 +769,110 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
         }
     }
     outcome
+}
+
+/// The lock a binary entry's wiring is reverted in.
+enum RevertLock {
+    Binary(BunLockb),
+    /// The `bun.lock` Bun migrated the binary lock to, as lines (#784).
+    Migrated(Vec<String>),
+}
+
+impl RevertLock {
+    fn file(&self) -> &'static str {
+        match self {
+            RevertLock::Binary(_) => LOCK,
+            RevertLock::Migrated(_) => TEXT_LOCK,
+        }
+    }
+}
+
+/// The vendor uuid a `bun.lock` package line's local tarball tuple points
+/// into, if it is one.
+fn migrated_vendor_uuid(line: &str) -> Option<String> {
+    let entry = parse_entry_line(line).ok()?;
+    if !matches!(entry.elems.len(), 2 | 3) || !entry.elems[1].starts_with('{') {
+        return None;
+    }
+    let spec = decode_json_string(&entry.elems[0])?;
+    let vendored = parse_vendor_path(split_name_spec(&spec)?.1)?;
+    (vendored.eco == "npm").then_some(vendored.uuid)
+}
+
+/// The registry tuple Bun writes in `bun.lock` for the binary `original`
+/// snapshot, in place of `line`: that package's vendored tuple in a
+/// `bun.lock` Bun migrated from the binary lock (#784). The key, indent,
+/// dependency object and trailing comma stay verbatim, as Bun carried them
+/// over. Bun leaves the registry slot empty for a tarball under its default
+/// registry and writes the full URL for any other.
+pub(crate) fn migrated_registry_line(line: &str, original: &serde_json::Value) -> Option<String> {
+    let entry = parse_entry_line(line).ok()?;
+    if !matches!(entry.elems.len(), 2 | 3) || !entry.elems[1].starts_with('{') {
+        return None;
+    }
+    let field = |key| original.get(key).and_then(serde_json::Value::as_str);
+    let (name, version) = (field("name")?, field("version")?);
+    let (resolution, integrity) = (field("resolution")?, field("integrity")?);
+    let spec = decode_json_string(&entry.elems[0])?;
+    let (spec_name, path) = split_name_spec(&spec)?;
+    let vendored = parse_vendor_path(path)?;
+    if spec_name != name || vendored.eco != "npm" || vendored.leaf != tgz_rel_leaf(name, version) {
+        return None;
+    }
+    let slot = if resolution.starts_with("https://registry.npmjs.org") {
+        ""
+    } else {
+        resolution
+    };
+    let json = |s: &str| serde_json::to_string(s).expect("a str serializes to JSON");
+    Some(format!(
+        "{indent}{key}: [{spec}, {slot}, {deps}, {integrity}]{comma}{cr}",
+        indent = entry.indent,
+        key = entry.key_raw,
+        spec = json(&format!("{name}@{version}")),
+        slot = json(slot),
+        deps = entry.elems[1],
+        integrity = json(integrity),
+        comma = if entry.trailing_comma { "," } else { "" },
+        cr = if line.ends_with('\r') { "\r" } else { "" },
+    ))
+}
+
+/// Put `original` back over every migrated `bun.lock` entry that still
+/// resolves into `uuid`'s artifact. `false` when no entry does and none
+/// already holds the restored tuple either (Bun dropped the package).
+fn restore_migrated(
+    lines: &mut [String],
+    original: &serde_json::Value,
+    uuid: &str,
+) -> Result<bool, String> {
+    let (start, end) =
+        packages_bounds(lines).ok_or(format!("{TEXT_LOCK} has no packages section"))?;
+    let restored = |line: &str| {
+        let entry = parse_entry_line(line).ok()?;
+        let integrity = original.get("integrity")?.as_str()?;
+        let spec = format!(
+            "{}@{}",
+            original.get("name")?.as_str()?,
+            original.get("version")?.as_str()?
+        );
+        (entry.elems.len() == 4
+            && decode_json_string(&entry.elems[0]) == Some(spec)
+            && decode_json_string(&entry.elems[3]).as_deref() == Some(integrity))
+        .then_some(())
+    };
+    let mut found = false;
+    for line in &mut lines[start + 1..end] {
+        if migrated_vendor_uuid(line).as_deref() == Some(uuid) {
+            *line = migrated_registry_line(line, original).ok_or_else(|| {
+                format!("{TEXT_LOCK} entry for {uuid} no longer matches its binary original")
+            })?;
+            found = true;
+        } else if restored(line).is_some() {
+            found = true;
+        }
+    }
+    Ok(found)
 }
 
 /// Mirrors are confined to a workspace's own Socket artifact directory.
@@ -783,9 +1101,13 @@ mod rebuild_tests {
     }
 
     pub(super) async fn flip_fixture() -> Fixture {
+        fixture_with(ORIGINAL)
+    }
+
+    fn fixture_with(lock: &[u8]) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        std::fs::write(root.join(LOCK), ORIGINAL).unwrap();
+        std::fs::write(root.join(LOCK), lock).unwrap();
         let installed = root.join("node_modules/minimist");
         std::fs::create_dir_all(&installed).unwrap();
         std::fs::write(installed.join("package.json"), PACKAGE).unwrap();
@@ -1122,6 +1444,266 @@ mod rebuild_tests {
         }
     }
 
+    // ── bun.lockb migrated to bun.lock (#784) ─────────────────────────────
+
+    const MIGRATED_LOCKB: &[u8] = include_bytes!("../../tests/fixtures/bun-lockb/1.2.23/bun.lockb");
+    /// `(migrating Bun, pristine bun.lock, vendored bun.lock)`: the 1.2.23
+    /// fixture lock migrated by `bun install --save-text-lockfile` before
+    /// and after vendoring (see that fixture directory's README).
+    const MIGRATIONS: [(&str, &str, &str); 2] = [
+        (
+            "1.2.23",
+            include_str!("../../tests/fixtures/bun-lockb/1.2.23-migrated/pristine-1.2.23.lock"),
+            include_str!("../../tests/fixtures/bun-lockb/1.2.23-migrated/vendored-1.2.23.lock"),
+        ),
+        (
+            "1.4.2",
+            include_str!("../../tests/fixtures/bun-lockb/1.2.23-migrated/pristine-1.4.2.lock"),
+            include_str!("../../tests/fixtures/bun-lockb/1.2.23-migrated/vendored-1.4.2.lock"),
+        ),
+    ];
+
+    /// Vendor the binary fixture, then migrate it as `bun` would: bun.lockb
+    /// is gone and bun.lock carries the vendored tuple.
+    async fn vendored_then_migrated(vendored: &str) -> (Fixture, VendorEntry) {
+        let fx = fixture_with(MIGRATED_LOCKB);
+        let (result, entry, _) = ts::expect_done(flip_run(&fx, None).await);
+        assert!(result.success, "{result:?}");
+        let entry = entry.expect("vendoring rewires bun.lockb");
+        ts::persist(fx.root(), PURL, entry.clone()).await;
+        let integrity = entry.wiring[0].new.as_ref().unwrap()["integrity"]
+            .as_str()
+            .unwrap();
+        if vendored.matches("sha512-").count() == 2 {
+            assert!(
+                vendored.contains(integrity),
+                "the fixture was captured from this packing"
+            );
+        }
+        std::fs::remove_file(fx.root().join(LOCK)).unwrap();
+        std::fs::write(fx.root().join(TEXT_LOCK), vendored).unwrap();
+        (fx, entry)
+    }
+
+    /// After Bun migrates a vendored bun.lockb to bun.lock, revert restores
+    /// the registry tuple Bun itself writes for the pristine binary lock,
+    /// instead of failing on the missing bun.lockb.
+    #[tokio::test]
+    async fn revert_restores_registry_tuple_after_text_lock_migration() {
+        for (bun, pristine, vendored) in MIGRATIONS {
+            let (fx, entry) = vendored_then_migrated(vendored).await;
+            let dry =
+                super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(true))
+                    .await;
+            // The preview's only advisory is the reinstall one the real
+            // revert also gives for the fixture's hoisted copy (#764).
+            let dry_codes: Vec<&str> = dry.warnings.iter().map(|w| w.code).collect();
+            assert!(
+                dry.success && dry_codes == [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {dry:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
+                vendored
+            );
+            let outcome =
+                super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(false))
+                    .await;
+            assert!(outcome.success, "{bun}: {outcome:?}");
+            // The fixture's hoisted node_modules/minimist is the only
+            // advisory: Bun keeps it after the restore (#764).
+            let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+            assert_eq!(
+                codes,
+                [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
+                pristine,
+                "{bun}"
+            );
+            assert!(!fx.root().join(LOCK).exists());
+            assert!(!fx.root().join(".socket/vendor/npm").exists(), "{bun}");
+        }
+    }
+
+    /// A superseding patch vendored on the migrated bun.lock rewrites our
+    /// own tuple, so it records no original itself: the ledger must carry
+    /// the binary record's registry original over to it, and revert must
+    /// then restore the pristine tuple.
+    #[tokio::test]
+    async fn superseding_vendor_after_migration_keeps_the_registry_original() {
+        const UUID2: &str = "22222222-2222-4222-8222-222222222222";
+        for (bun, pristine, vendored) in MIGRATIONS {
+            let (fx, _) = vendored_then_migrated(vendored).await;
+            let record = PatchRecord {
+                uuid: UUID2.to_string(),
+                ..fx.record.clone()
+            };
+            let blobs = fx.root().join(".socket/blobs");
+            let (result, entry, _) = ts::expect_done(
+                crate::vendor::test_support::vendor_bun(
+                    PURL,
+                    &fx.installed(),
+                    fx.root(),
+                    &record,
+                    &PatchSources::blobs_only(&blobs),
+                    "",
+                    false,
+                    false,
+                    None,
+                )
+                .await,
+            );
+            assert!(result.success, "{bun}: {result:?}");
+            ts::persist(fx.root(), PURL, entry.expect("re-pinned")).await;
+            let state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+            let entry = state.entries[PURL].clone();
+            let minimist = pristine
+                .lines()
+                .find(|l| l.contains("\"minimist\": ["))
+                .unwrap();
+            assert_eq!(
+                entry.wiring[0].original,
+                Some(serde_json::Value::String(minimist.to_string())),
+                "{bun}"
+            );
+            let outcome =
+                super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(false))
+                    .await;
+            assert!(outcome.success, "{bun}: {outcome:?}");
+            // The fixture's hoisted node_modules/minimist is the only
+            // advisory: Bun keeps it after the restore (#764).
+            let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+            assert_eq!(
+                codes,
+                [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
+                pristine,
+                "{bun}"
+            );
+        }
+    }
+
+    /// A same-uuid re-run on the migrated bun.lock (artifact missing, or the
+    /// tuple's digest changed) re-pins our own tuple as a text record, and
+    /// the ledger carries the binary records forward beside it. Revert must
+    /// restore the pristine tuple from that mixed entry, not report the text
+    /// record as drift and leave the project vendored.
+    #[tokio::test]
+    async fn same_uuid_repin_after_migration_reverts_the_mixed_entry() {
+        for (bun, pristine, vendored) in MIGRATIONS {
+            let (fx, first) = vendored_then_migrated(vendored).await;
+            std::fs::remove_dir_all(fx.root().join(".socket/vendor/npm")).unwrap();
+            let integrity = first.wiring[0].new.as_ref().unwrap()["integrity"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            if vendored.contains(&integrity) {
+                // Force a re-pin of the digest-carrying tuple too.
+                let lock = vendored.replace(&integrity, "sha512-AAAA");
+                std::fs::write(fx.root().join(TEXT_LOCK), lock).unwrap();
+            }
+            let blobs = fx.root().join(".socket/blobs");
+            let (result, entry, _) = ts::expect_done(
+                crate::vendor::test_support::vendor_bun(
+                    PURL,
+                    &fx.installed(),
+                    fx.root(),
+                    &fx.record,
+                    &PatchSources::blobs_only(&blobs),
+                    "",
+                    false,
+                    false,
+                    None,
+                )
+                .await,
+            );
+            assert!(result.success, "{bun}: {result:?}");
+            ts::persist(fx.root(), PURL, entry.expect("re-pinned")).await;
+            let state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+            let entry = state.entries[PURL].clone();
+            let kinds: Vec<_> = entry.wiring.iter().map(|r| r.kind.as_str()).collect();
+            assert!(
+                kinds.contains(&"bun_lock_package") && kinds.contains(&KIND),
+                "{bun}: {kinds:?}"
+            );
+            let dry =
+                super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(true))
+                    .await;
+            // The preview's only advisory is the reinstall one the real
+            // revert also gives for the fixture's hoisted copy (#764).
+            let dry_codes: Vec<&str> = dry.warnings.iter().map(|w| w.code).collect();
+            assert!(
+                dry.success && dry_codes == [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {dry:?}"
+            );
+            let outcome =
+                super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(false))
+                    .await;
+            assert!(outcome.success, "{bun}: {outcome:?}");
+            // The fixture's hoisted node_modules/minimist is the only
+            // advisory: Bun keeps it after the restore (#764).
+            let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+            assert_eq!(
+                codes,
+                [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
+                pristine,
+                "{bun}"
+            );
+            assert!(!fx.root().join(".socket/vendor/npm").exists(), "{bun}");
+        }
+    }
+
+    /// Bun writes the full tarball URL for any registry but its default one,
+    /// and the rebuilt tuple keeps the vendored line's spelling.
+    #[test]
+    fn migrated_registry_line_spells_the_registry_slot_like_bun() {
+        let original = |resolution: &str| {
+            serde_json::json!({
+                "name": "@s/p", "version": "1.0.0", "resolution": resolution,
+                "integrity": "sha512-AA==",
+            })
+        };
+        let line = format!(
+            "    \"x/@s/p\": [\"@s/p@.socket/vendor/npm/{UUID}/@s/p-1.0.0.tgz\", {{ \"bin\": {{}} }}],\r"
+        );
+        assert_eq!(
+            migrated_registry_line(
+                &line,
+                &original("https://registry.npmjs.org/@s/p/-/p-1.0.0.tgz")
+            ),
+            Some(
+                "    \"x/@s/p\": [\"@s/p@1.0.0\", \"\", { \"bin\": {} }, \"sha512-AA==\"],\r"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            migrated_registry_line(&line, &original("http://127.0.0.1:4873/@s/p/-/p-1.0.0.tgz")),
+            Some(
+                "    \"x/@s/p\": [\"@s/p@1.0.0\", \"http://127.0.0.1:4873/@s/p/-/p-1.0.0.tgz\", { \"bin\": {} }, \"sha512-AA==\"],\r"
+                    .to_string()
+            )
+        );
+        let other = serde_json::json!({
+            "name": "@s/p", "version": "2.0.0",
+            "resolution": "https://registry.npmjs.org/@s/p/-/p-2.0.0.tgz", "integrity": "sha512-AA==",
+        });
+        assert_eq!(
+            migrated_registry_line(&line, &other),
+            None,
+            "another version's tarball"
+        );
+    }
+
     /// #920: the `package.json` advisory is emitted once, by the run that
     /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
     /// AlreadyPatched (and the run that wires says it once).
@@ -1165,5 +1747,107 @@ mod rebuild_tests {
         };
         assert!(result.success && entry.is_none(), "{result:?}");
         assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::vendor::test_support as ts;
+
+    /// The uuid the fixtures were first vendored under.
+    const UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+    const BEFORE: &[u8] = b"module.exports = 'original';\n";
+    const AFTER: &[u8] = b"module.exports = 'patched';\n";
+
+    /// REGRESSION (#861): the vendored re-run after Bun gave a late
+    /// dependent its own registry record of minimist@1.2.2, or of
+    /// mkdirp@0.5.6 with its own dependency on minimist (`deps`; see
+    /// `bun_lockb::tests::LATE_DEPENDENT`) leaves ONE record, the tarball,
+    /// that every dependency edge resolves to — never two records with one
+    /// tarball resolution, which the isolated linker installs into the same
+    /// store directory (`EEXIST`). (The e2e `workspace_late_dependent_*`
+    /// test reverts it through the first run's ledger.)
+    #[tokio::test]
+    async fn rerun_folds_the_late_registry_copy_into_the_tarball_record() {
+        for name in [
+            "1.3.9-late",
+            "1.3.9-adder",
+            "1.4.2-late",
+            "1.4.2-adder",
+            "1.3.9-deps-late",
+            "1.3.9-deps-adder",
+            "1.4.2-deps-late",
+            "1.4.2-deps-adder",
+        ] {
+            let (package, version) = if name.contains("-deps-") {
+                ("mkdirp", "0.5.6")
+            } else {
+                ("minimist", "1.2.2")
+            };
+            let purl = format!("pkg:npm/{package}@{version}");
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let fixture = format!(
+                "{}/tests/fixtures/bun-lockb/late-dependent/{name}.lockb",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            std::fs::copy(&fixture, root.join(LOCK)).unwrap();
+            let installed = root.join("node_modules").join(package);
+            std::fs::create_dir_all(&installed).unwrap();
+            std::fs::write(
+                installed.join("package.json"),
+                format!(r#"{{"name":"{package}","version":"{version}"}}"#),
+            )
+            .unwrap();
+            std::fs::write(installed.join("index.js"), BEFORE).unwrap();
+            let blobs = root.join(".socket/blobs");
+            std::fs::create_dir_all(&blobs).unwrap();
+            let after_hash = compute_git_sha256_from_bytes(AFTER);
+            std::fs::write(blobs.join(&after_hash), AFTER).unwrap();
+            let record: PatchRecord = serde_json::from_value(serde_json::json!({
+                "uuid": UUID, "exportedAt": "", "files": {"package/index.js": {
+                    "beforeHash": compute_git_sha256_from_bytes(BEFORE), "afterHash": after_hash,
+                }}, "vulnerabilities": {}, "description": "", "license": "MIT", "tier": "free",
+            }))
+            .unwrap();
+            let (result, entry, warnings) = ts::expect_done(
+                ts::vendor_bun(
+                    &purl,
+                    &installed,
+                    root,
+                    &record,
+                    &PatchSources::blobs_only(&blobs),
+                    "",
+                    false,
+                    false,
+                    None,
+                )
+                .await,
+            );
+            assert!(result.success, "{name}: {result:?}");
+            assert!(
+                !ts::has_warning(&warnings, "vendor_bun_lockb_duplicate_records"),
+                "{name}: {warnings:?}"
+            );
+            let entry = entry.expect("the lock changed");
+            let lock = BunLockb::parse(&std::fs::read(root.join(LOCK)).unwrap()).unwrap();
+            lock.validate_mutation().unwrap();
+            let copies: Vec<_> = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.name == package)
+                .collect();
+            assert_eq!(
+                copies
+                    .iter()
+                    .map(|p| p.resolution.as_str())
+                    .collect::<Vec<_>>(),
+                [entry.artifact.path.as_str()],
+                "{name}: one record per tarball resolution"
+            );
+        }
     }
 }

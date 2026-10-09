@@ -1897,7 +1897,7 @@ replace (
     /// output, and joining with bare `\n` LF-normalizes EVERY line — churning
     /// the user's whole file and breaking the byte-identical ensure→drop
     /// round-trip pinned above. Same contract as `setup/pypi/edit.rs`'s
-    /// CRLF preservation (shared `detect_eol`).
+    /// CRLF preservation (shared `line_endings::terminator`).
     /// #815: on a mixed go.mod the appended directive takes the file's
     /// majority line ending, not CRLF because one line has it.
     #[test]
