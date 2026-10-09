@@ -1419,6 +1419,27 @@ pub(crate) async fn run_locked(
                     })
             }));
 
+            // Cargo keys a registry / `cargo vendor` crate's compiled
+            // artifacts on its package id, never its source bytes: a
+            // project built before this apply would keep linking the
+            // pre-patch rlib (#387). Invalidate this project's compiled
+            // copies of every crate whose bytes just changed.
+            if !args.common.dry_run {
+                let rewritten = results.iter().filter(|r| {
+                    r.success
+                        && !r.files_patched.is_empty()
+                        && r.package_path != VENDOR_OWNED_MARKER
+                });
+                run_warnings.extend(
+                    socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                        &args.common.cwd,
+                        rewritten.map(|r| r.package_key.as_str()),
+                    )
+                    .into_iter()
+                    .map(|(code, detail)| RunWarning { code, detail }),
+                );
+            }
+
             // Run-level advisories + best-effort fallback-home skips on the
             // human path: one gated stderr line each. `--silent` is
             // errors-only, and under `--json` the envelope copies below are

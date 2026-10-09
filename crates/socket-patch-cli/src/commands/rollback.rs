@@ -2660,6 +2660,20 @@ pub(crate) async fn rollback_patches_inner(
         results.push(result);
     }
 
+    // The restored crates' compiled copies in this project's build cache
+    // still hold the patched code cargo keyed on the package id (#387).
+    if !common.dry_run {
+        warnings.extend(
+            socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                &common.cwd,
+                results
+                    .iter()
+                    .filter(|r| r.success && !r.files_rolled_back.is_empty())
+                    .map(|r| r.package_key.as_str()),
+            ),
+        );
+    }
+
     superseded_left.sort();
     superseded_left.dedup();
     Ok(RollbackOutcome {

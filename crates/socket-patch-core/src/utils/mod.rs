@@ -1,3 +1,4 @@
+pub mod cargo_build_cache;
 pub mod cargo_workspace;
 pub mod composer_version;
 pub mod concurrent;
