@@ -508,6 +508,19 @@ fn gitignored_refusal(rel_dir: &str, rules: &str) -> VendorOutcome {
     refused(GITIGNORED, gitignored_detail(rel_dir, rules))
 }
 
+/// The `vendor_artifact_gitignored` refusal for a vendored artifact root
+/// (`dir_rel`, project-relative) that git ignores as a directory: a
+/// `.socket/` or `.socket/vendor/` rule no `.gitignore` inside the root can
+/// override (#831, #1061). `None` when git would look inside it, so the
+/// root's own `!*` `.gitignore` re-includes file rules such as `*.jar`.
+pub(crate) async fn ignored_root_refusal(
+    project_root: &Path,
+    dir_rel: &str,
+) -> Option<VendorOutcome> {
+    let rules = gitignored(project_root, &[format!("{dir_rel}/")]).await?;
+    Some(gitignored_refusal(dir_rel, &rules))
+}
+
 pub(crate) const GITIGNORED: &str = "vendor_artifact_gitignored";
 
 /// The vendored dir was written, but git could not say whether it would

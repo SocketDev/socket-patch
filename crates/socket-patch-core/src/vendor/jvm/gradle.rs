@@ -46,6 +46,9 @@ pub const SCRIPT_REL: &str = ".socket/gradle/socket-patch.settings.gradle";
 use super::layout::GRADLE_TREE as TREE_ROOT;
 /// The tree root's `.gitattributes`, shared by every Gradle patch.
 pub const GITATTRIBUTES_REL: &str = ".socket/vendor/gradle/.gitattributes";
+/// The tree root's `.gitignore` (`!*`): re-includes the vendored jars
+/// against a user's `*.jar` rule (Java.gitignore), #620 / #1061.
+pub const GITIGNORE_REL: &str = ".socket/vendor/gradle/.gitignore";
 /// `.socket/gradle/`'s `.gitattributes` (`* -text`): the settings scripts
 /// there stay byte-exact on a `core.autocrlf` checkout (#429). Shared with
 /// the hosted script.
@@ -511,6 +514,12 @@ pub fn plan(
     records.push(created_or_adopted(SCRIPT_REL, read(SCRIPT_REL).is_some()));
     writes.push(text_write(SCRIPT_REL, SCRIPT.as_bytes().to_vec()));
     records.push(owned_file(read, GITATTRIBUTES_REL, &mut writes));
+    records.push(super::owned_file_with(
+        read,
+        GITIGNORE_REL,
+        super::coursier_tree::GITIGNORE.as_bytes(),
+        &mut writes,
+    ));
     records.push(owned_file(read, SCRIPT_GITATTRIBUTES_REL, &mut writes));
     records.push(vendor_gitattributes(read, &mut writes));
 
@@ -1071,6 +1080,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         for (rel, expected) in [
             (SCRIPT_REL, SCRIPT),
             (GITATTRIBUTES_REL, super::TREE_GITATTRIBUTES),
+            (GITIGNORE_REL, super::coursier_tree::GITIGNORE),
             (SCRIPT_GITATTRIBUTES_REL, super::TREE_GITATTRIBUTES),
         ] {
             if rel == SCRIPT_GITATTRIBUTES_REL && hosted_left {
@@ -2609,6 +2619,7 @@ mod tests {
                 (".socket/vendor/.gitattributes", false),
                 (".socket/vendor/gradle-index.tsv", false),
                 (".socket/vendor/gradle/.gitattributes", false),
+                (".socket/vendor/gradle/.gitignore", false),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar", true),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/gson-2.10.1.pom", true),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/socket-patch.vendor.json", true),
@@ -2638,6 +2649,7 @@ mod tests {
             text_of(&plan, ".socket/vendor/gradle/.gitattributes"),
             "* -text\n"
         );
+        assert_eq!(text_of(&plan, GITIGNORE_REL), "!*\n");
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
