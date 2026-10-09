@@ -1657,6 +1657,94 @@ async fn gem_inventory_memory_view_reads_the_lock_bundler_loads() {
     assert_eq!(gem_purls(&entries), vec!["pkg:gem/rack@2.0.0"]);
 }
 
+/// #749 / #751: a gem project whose lock bundler loads is none
+/// socket-patch reads (a custom `BUNDLE_LOCKFILE`, an unsupported
+/// `BUNDLE_GEMFILE`, a `Gemfile` + `gems.rb` twin)
+/// yields no gem entries AND a `gem_lock_unsupported` diagnosis, so a
+/// lockfile-only scan says the gems were not scanned instead of reporting
+/// none. Supported layouts, and projects without gem files, stay quiet.
+#[tokio::test]
+async fn gem_inventory_diagnoses_a_lock_it_cannot_read() {
+    let diagnosed = |project: &MemoryProject| {
+        let project = project.clone();
+        async move {
+            let (entries, unsupported) =
+                inventory_project_diagnosed_in(&ProjectView::Memory(&project)).await;
+            let codes: Vec<&str> = unsupported.iter().map(|d| d.code).collect();
+            let detail = unsupported
+                .iter()
+                .find(|d| d.code == "gem_lock_unsupported")
+                .map(|d| d.detail.clone());
+            (gem_purls(&entries), codes, detail)
+        }
+    };
+    let lock =
+        |bundled: &str| rack_lock("https://rubygems.org/", "2.2.8").replace("2.6.9", bundled);
+
+    let mut custom = MemoryProject::new();
+    custom.insert_text("Gemfile", "gem \"rack\"\n");
+    custom.insert_text("Gemfile.lock", lock("2.6.2"));
+    custom.insert_text("custom.lock", lock("2.6.2"));
+    custom.insert_text(".bundle/config", "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n");
+    let (purls, codes, detail) = diagnosed(&custom).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+    let detail = detail.unwrap();
+    assert!(
+        detail.contains("NOT scanned") && detail.contains("custom.lock"),
+        "{detail}"
+    );
+
+    let mut gemfile = MemoryProject::new();
+    gemfile.insert_text("Gemfile.lock", lock("2.6.2"));
+    gemfile.insert_text(".bundle/config", "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n");
+    let (purls, codes, _) = diagnosed(&gemfile).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+
+    let mut twin = MemoryProject::new();
+    twin.insert_text("Gemfile", "gem \"rack\"\n");
+    twin.insert_text("gems.rb", "gem \"rack\"\n");
+    twin.insert_text("Gemfile.lock", lock("1.17.3"));
+    twin.insert_text("gems.locked", lock("2.6.2"));
+    let (purls, codes, detail) = diagnosed(&twin).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+    assert!(detail.unwrap().contains("gems.rb"));
+    // Locks that agree on the major still leave the installing bundler
+    // unknown: a twin is never read.
+    let mut bundler1 = twin.clone();
+    bundler1.insert_text("gems.locked", lock("1.17.3"));
+    let (purls, codes, _) = diagnosed(&bundler1).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+
+    // A symlinked spelling (a git mode-120000 entry, whose target the
+    // memory view doesn't carry) may still be a file to bundler, so the
+    // twin stays unread (security review on #768).
+    for linked in ["gems.rb", "Gemfile"] {
+        let mut symlinked = twin.clone();
+        symlinked.insert(linked, MemoryEntry::Symlink);
+        let (purls, codes, _) = diagnosed(&symlinked).await;
+        assert!(purls.is_empty(), "{linked}: {purls:?}");
+        assert_eq!(codes, vec!["gem_lock_unsupported"], "{linked}");
+    }
+
+    // Supported layouts: entries, no diagnosis.
+    let mut plain = MemoryProject::new();
+    plain.insert_text("Gemfile", "gem \"rack\"\n");
+    plain.insert_text("Gemfile.lock", lock("2.6.2"));
+    let (purls, codes, _) = diagnosed(&plain).await;
+    assert_eq!(purls, vec!["pkg:gem/rack@2.2.8"]);
+    assert!(codes.is_empty(), "{codes:?}");
+
+    // No gem files: a stray bundler setting is not a gem project.
+    let mut npm = MemoryProject::new();
+    npm.insert_text(".bundle/config", "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n");
+    let (_, codes, _) = diagnosed(&npm).await;
+    assert!(codes.is_empty(), "{codes:?}");
+}
+
 /// #736: ledger recovery's GEM remote set comes from the lock bundler
 /// loads too, never from an ignored twin's sources.
 #[tokio::test]
@@ -3505,6 +3593,56 @@ async fn requirements_utf16_files_are_inventoried() {
                 ("six".to_string(), "1.16.0".to_string()),
             ],
             "le={le}: {entries:?}"
+        );
+
+        let mut project = MemoryProject::new();
+        project.insert("requirements.txt", MemoryEntry::Binary(root_bytes.into()));
+        project.insert(
+            "requirements/base.txt",
+            MemoryEntry::Binary(base_bytes.into()),
+        );
+        let in_memory = super::pypi::inventory_pypi_locks_in(&ProjectView::Memory(&project))
+            .await
+            .unwrap();
+        assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
+    }
+}
+
+/// #1119: with no BOM, pip decodes a requirements file through a PEP 263
+/// coding line, so a Latin-1 root file and a Latin-1 include are
+/// inventoried on a fresh checkout instead of reading as "no requirements",
+/// on disk and in memory.
+#[tokio::test]
+async fn requirements_pep_263_files_are_inventoried() {
+    let latin1 = |pins: &str| {
+        let mut bytes = b"# -*- coding: latin-1 -*-\n# Maintainer: Jos\xe9\n".to_vec();
+        bytes.extend_from_slice(pins.as_bytes());
+        bytes
+    };
+    for (root_bytes, base_bytes) in [
+        // The root file itself.
+        (
+            latin1("-r requirements/base.txt\nidna==3.7\n"),
+            b"six==1.16.0\n".to_vec(),
+        ),
+        // Only the include.
+        (
+            b"-r requirements/base.txt\nidna==3.7\n".to_vec(),
+            latin1("six==1.16.0\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("requirements")).unwrap();
+        std::fs::write(tmp.path().join("requirements.txt"), &root_bytes).unwrap();
+        std::fs::write(tmp.path().join("requirements/base.txt"), &base_bytes).unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![
+                ("idna".to_string(), "3.7".to_string()),
+                ("six".to_string(), "1.16.0".to_string()),
+            ],
+            "{entries:?}"
         );
 
         let mut project = MemoryProject::new();

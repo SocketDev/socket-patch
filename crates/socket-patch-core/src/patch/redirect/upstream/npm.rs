@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::client::NpmDist;
 use super::{Ctx, FormatResult, HostedPin, View};
-use crate::vendor::lock_inventory::npm_legacy_identity;
+use crate::vendor::lock_inventory::{npm_lock_entries, NpmLockEntry};
 
 /// The pins by uuid.
 pub(super) fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
@@ -140,86 +140,25 @@ struct NpmHit {
     version: String,
 }
 
+/// Every hosted entry of an npm lock: the installed `packages` entries
+/// (never the root or a workspace member) and every node of the legacy
+/// `dependencies` tree, an alias node restoring its target's registry dist
+/// (#432).
 fn npm_lock_hits(lock: &Value, ctx: &Ctx<'_>) -> Vec<NpmHit> {
-    let mut hits = Vec::new();
-    if let Some(packages) = lock.get("packages").and_then(Value::as_object) {
-        for (key, entry) in packages {
-            let Some((_, key_name)) = key.rsplit_once("node_modules/") else {
-                continue;
-            };
-            let Some(uuid) = entry
-                .get("resolved")
-                .and_then(Value::as_str)
-                .and_then(|u| ctx.hosted_uuid(u))
-            else {
-                continue;
-            };
-            let name = entry
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(key_name)
-                .to_string();
-            let Some(version) = entry.get("version").and_then(Value::as_str) else {
-                continue;
-            };
-            hits.push(NpmHit {
-                pointer: format!("/packages/{}", json_pointer_escape(key)),
+    npm_lock_entries(lock)
+        .into_iter()
+        .filter(NpmLockEntry::is_dependency)
+        .filter_map(|entry| {
+            let uuid = entry.node.resolved.and_then(|u| ctx.hosted_uuid(u))?;
+            let version = entry.node.version?;
+            Some(NpmHit {
+                pointer: entry.pointer,
                 uuid,
-                name,
+                name: entry.node.name.to_string(),
                 version: version.to_string(),
-            });
-        }
-    }
-    if let Some(deps) = lock.get("dependencies").and_then(Value::as_object) {
-        v2_hits(deps, "/dependencies", ctx, &mut hits, 0);
-    }
-    hits
-}
-
-fn v2_hits(
-    deps: &serde_json::Map<String, Value>,
-    prefix: &str,
-    ctx: &Ctx<'_>,
-    hits: &mut Vec<NpmHit>,
-    depth: usize,
-) {
-    if depth > 64 {
-        return;
-    }
-    for (name, entry) in deps {
-        let pointer = format!("{prefix}/{}", json_pointer_escape(name));
-        // An alias node (`"lp": {"version": "npm:left-pad@1.3.0"}`) restores
-        // its target's registry dist (#432).
-        let (node_name, node_version) =
-            npm_legacy_identity(name, entry.get("version").and_then(Value::as_str));
-        if let (Some(uuid), Some(version)) = (
-            entry
-                .get("resolved")
-                .and_then(Value::as_str)
-                .and_then(|u| ctx.hosted_uuid(u)),
-            node_version,
-        ) {
-            hits.push(NpmHit {
-                pointer: pointer.clone(),
-                uuid,
-                name: node_name.to_string(),
-                version: version.to_string(),
-            });
-        }
-        if let Some(nested) = entry.get("dependencies").and_then(Value::as_object) {
-            v2_hits(
-                nested,
-                &format!("{pointer}/dependencies"),
-                ctx,
-                hits,
-                depth + 1,
-            );
-        }
-    }
-}
-
-fn json_pointer_escape(key: &str) -> String {
-    key.replace('~', "~0").replace('/', "~1")
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn restore_npm_locks(

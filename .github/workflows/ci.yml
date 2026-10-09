@@ -44,6 +44,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Required independently of ci-ok so the merge queue sees a compile/lint
+  # failure immediately. Expensive jobs also depend on this preflight.
   clippy:
     if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
@@ -67,18 +69,28 @@ jobs:
         # smaller), which keeps this repo's total cache footprint inside
         # GitHub's 10 GiB budget (a raw target/ cache let every PR save evict
         # main's caches). save-if restricts writes to main so PR branches
-        # restore without churning the budget.
+        # restore without churning the budget. Compatible build jobs use
+        # shared-key by profile + runner image (not job or package-manager
+        # version). rust-cache also hashes the toolchain, Cargo manifests
+        # and Rust environment. Check/coverage/release keep separate caches.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-features -- -D warnings
+
+      - name: Check every test target before starting expensive jobs
+        # Clippy above checks the shipped targets. This catches errors in
+        # cfg(test), integration tests and feature-gated targets without
+        # linking hundreds of executables or waiting for the E2E fan-out.
+        run: cargo check --locked --workspace --all-targets --all-features
 
   # The napi addon is only ever loaded by Node, so cargo's own tests never
   # exercise its JS loader or the engine/provider boundary.
   node-addon:
     if: github.event.pull_request.draft != true
+    needs: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -93,6 +105,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
@@ -242,6 +255,7 @@ jobs:
 
   test:
     if: github.event.pull_request.draft != true
+    needs: clippy
     # No ubuntu-latest leg: `coverage` runs this same `cargo test
     # --workspace` (debug, default features, plus Go and vexctl) on ubuntu,
     # instrumented, and fails on any test failure. A plain ubuntu leg ran
@@ -250,6 +264,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
+        # Two legs per OS (scripts/ci-test-shard.py): one leg linked ~240
+        # test binaries and ran them serially for ~26 min, the merge queue's
+        # critical path. Shard 1 = unit tests + doctests + a third of the
+        # integration targets; shard 2 = the rest.
+        shard: [1, 2]
         exclude:
           # macOS legs run on main, the merge queue and nightly, not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
@@ -275,6 +294,7 @@ jobs:
         # step in this file.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
@@ -400,11 +420,20 @@ jobs:
           # `zip`, and assert the pinned release.
           SOCKET_PATCH_GO_E2E_REQUIRED: '1'
           SOCKET_PATCH_GO_E2E_VERSION: '1.24'
+          TEST_SHARD: ${{ matrix.shard }}
+        # This leg's share of `cargo test --workspace --no-fail-fast`; the
+        # shards together run exactly that selection (test_ci_test_shard.py).
         run: |
-          cargo test --workspace --no-fail-fast
+          python3 scripts/ci-test-shard.py "$TEST_SHARD" 2
 
   test-release:
-    if: github.event.pull_request.draft != true
+    # Not in the merge queue: each PR's head already ran this, and so did
+    # every PR ahead of it, so a merge group would re-spend ~30 min (23 of it
+    # compiling) on the same release-mode suite while the queue waits. It
+    # still runs on every PR and on main after each merge; `ci-ok` counts a
+    # skipped job as passing.
+    if: github.event.pull_request.draft != true && github.event_name != 'merge_group'
+    needs: clippy
     runs-on: ubuntu-latest
     # Every tests/ target is its own optimized link (~240 test binaries).
     # The manifest-less VEX suites share two multi-module binaries
@@ -440,6 +469,7 @@ jobs:
 
   coverage:
     if: github.event.pull_request.draft != true
+    needs: clippy
     # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
     # Reports as a markdown table in the job summary and uploads the raw
     # lcov.info file as a workflow artifact. No threshold gating — the
@@ -553,6 +583,7 @@ jobs:
   # no cache. Build it once per run and hand the image to every docker leg.
   docker-base:
     if: github.event.pull_request.draft != true
+    needs: clippy
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -832,27 +863,25 @@ jobs:
           npm test
           node --test --test-name-pattern="npm package contents" bin/socket-patch.test.mjs
 
-  # Compiles the CLI and every CLI test target once per OS (--all-features,
-  # so this is also the feature-gated suites' compile-rot check) and uploads
-  # the binaries the e2e, e2e-full and cargo-vex legs run. The legs run the
+  # Independent OS producers compile the CLI and every CLI test target
+  # once per OS (--all-features, so this also checks feature-gated suites)
+  # and upload the binaries the e2e, e2e-full and cargo-vex legs run.
+  # The legs run the
   # test binaries directly from the same checkout path, so `CARGO_BIN_EXE_*`
   # and `CARGO_MANIFEST_DIR` resolve as they did under `cargo test`.
   e2e-build:
     if: github.event.pull_request.draft != true
+    needs: clippy
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        exclude:
-          # macOS legs run on main, the merge queue and nightly, not per PR push.
-          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    # Windows compiles the same ~240 targets ~1.6x slower (see `test`).
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 45 }}
-    env:
+    timeout-minutes: 45
+    env: &e2e-build-env
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
-    steps:
+    steps: &e2e-build-steps
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -864,7 +893,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: e2e-build
+          shared-key: e2e-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Compile the CLI and every CLI test target
@@ -879,12 +908,47 @@ jobs:
           BUNDLE_OS: ${{ matrix.os }}
         run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/e2e-bin
 
+      - name: Compress the e2e binaries
+        # Compress the bundle as one stream so identical Rust code across
+        # test binaries shares a dictionary. Zstd is on every runner image.
+        # The 128 MiB window cuts the Linux artifact from ~200 MB to ~94 MB;
+        # ZIP compresses each binary separately and repeats the common code.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C target/e2e-bin -cf - . | zstd -q -f -10 --long=27 -o target/e2e-bin.tar.zst
+
       - uses: ./.github/actions/upload-artifact
         with:
           name: e2e-bin-${{ matrix.os }}
-          path: target/e2e-bin/
+          path: target/e2e-bin.tar.zst
+          compression-level: 0
           if-no-files-found: error
           retention-days: 3
+
+  e2e-build-windows:
+    if: github.event.pull_request.draft != true
+    needs: clippy
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env: *e2e-build-env
+    steps: *e2e-build-steps
+
+  e2e-build-macos:
+    if: github.event_name != 'pull_request'
+    needs: clippy
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env: *e2e-build-env
+    steps: *e2e-build-steps
 
   e2e:
     # These jobs consume e2e-build's binaries and can run alongside unit tests.
@@ -978,8 +1042,6 @@ jobs:
           # follow-up (`std::fs::Metadata` doesn't expose nlink on
           # Windows; needs `GetFileInformationByHandle` via
           # `windows-sys`).
-          - os: windows-latest
-            suite: e2e_safety_pnpm
           # Wall-bound real-package-manager redirect capstones (~150s and
           # ~70s of network installs + bootstrap resolutions — profile-
           # insensitive, measured identical in debug and release). They ran
@@ -995,12 +1057,7 @@ jobs:
           - os: ubuntu-latest
             suite: e2e_redirect_npm_build
             npm_required: '1'
-          - os: windows-latest
-            suite: e2e_redirect_npm_build
-            npm_required: '1'
           - os: ubuntu-latest
-            suite: e2e_redirect_rush_sim
-          - os: windows-latest
             suite: e2e_redirect_rush_sim
           # Hermetic real-bun capstones (wiremock patch service, real `bun
           # install`): hosted (`e2e_redirect_bun_build`), vendored
@@ -1030,10 +1087,6 @@ jobs:
             suite: e2e_redirect_bun_build
             bun: '1.4.2'
             test_filter: --include-ignored
-          - os: windows-latest
-            suite: e2e_redirect_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
           - os: ubuntu-latest
             suite: e2e_redirect_bun_build
             bun: '1.1.45'
@@ -1046,10 +1099,6 @@ jobs:
             suite: e2e_vendor_bun_build
             bun: '1.4.2'
             test_filter: --include-ignored
-          - os: windows-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
           - os: ubuntu-latest
             suite: e2e_vendor_bun_build
             bun: '1.1.45'
@@ -1059,10 +1108,6 @@ jobs:
             bun: '1.2.23'
             test_filter: --include-ignored
           - os: ubuntu-latest
-            suite: mode_migration_bun
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: windows-latest
             suite: mode_migration_bun
             bun: '1.4.2'
             test_filter: --include-ignored
@@ -1095,7 +1140,6 @@ jobs:
           # 0.0.0-32, B rc.12/rc.14 (rc.14 legs reach public npm), C rc.32,
           # D 1.0.4/1.0.7, E 1.1.1, F 1.2.0.
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-16', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
@@ -1103,38 +1147,30 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.1.1', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix, vlt_upgrade: '1.2.0'}
-          - {os: windows-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
           # Linux `auto` hardlinks from the global store; every OS gets the
           # explicit hardlink linker.
           - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
-          - {os: windows-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
           # rc.12 gets the definite no-hook advisory; windows rc.14 runs the
           # legacy DepIDs on NTFS with pre-junction symlinks.
           - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.12', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.7', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
           # The named corepack pnpm hosted legs (pnpm 7-11, get-uuid,
           # zero-touch, --trust-lockfile). `#[ignore]`d; the pinned matrix
           # inside the same suite runs in pnpm-compatibility.yml, hence the
           # skip. Node 24 (step below): the
           # corepack pnpm@10/11 legs require it.
           - {os: ubuntu-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
-          - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
           # Real-uv hosted/vendored capstones ending in manifest-less VEX:
           # the oldest and newest line + the 0.5.x boundary (0.5.4 still
           # re-resolves a transitive override / rejects a repointed
@@ -1206,7 +1242,6 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '4.0.0-rc-6', test_filter: '--ignored maven_reactor'}
-          - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           # Real-Gradle capstones, PR tier: one leg per Gradle line x {agent +
           # hosted, vendor + multi-project} on ubuntu, each on its line's LTS
           # JDK. Every other OS x line x mode cell (and the JDK-ceiling,
@@ -1218,15 +1253,28 @@ jobs:
           # way): a missing suite fails the leg, and every suite must run at
           # least one test on its own. Maven is installed only where a
           # selected test needs it (gradle_vendor_395's mixed root).
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_'}
+          # The hosted suite (~43 real-Gradle builds, ~31 min serially) is
+          # split into three legs per line so it stops being the merge-queue
+          # critical path: the agent suites plus `gradle_hosted_[345]`, the
+          # `gradle_hosted_[b-p]` names, and a catch-all that `--skip`s
+          # exactly those words, so a new test always lands in some leg
+          # (test_ci_gradle_prefixes.py keeps the skip list in sync).
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_ gradle_hosted_'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: gradle, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
           # Real-sbt hosted (socket-patch.sbt) + vendored
           # (socket-patch-vendor.sbt) capstones on the current 1.x line. The
           # other sbt lines, JDK 21, the agent cells beyond coverage-docker's,
@@ -1249,7 +1297,7 @@ jobs:
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
     # legs launch the test binaries themselves.
-    env:
+    env: &e2e-env
       SOCKET_NO_CONFIG: '1'
       SOCKET_NO_UPDATE_CHECK: '1'
       SOCKET_TELEMETRY_DISABLED: '1'
@@ -1265,7 +1313,20 @@ jobs:
         with:
           pattern: e2e-bin-${{ matrix.os }}*
           merge-multiple: true
-          path: target/e2e-bin
+          path: target/e2e-archive
+
+      - name: Unpack the e2e binaries
+        shell: bash
+        # Decompress to a file, not into `| tar -xf -`: a tar that exits at
+        # the end-of-archive marker without draining stdin (macOS's does)
+        # leaves zstd writing into a closed pipe, and pipefail turns its
+        # "Broken pipe" into a failed leg that evicts the queue entry.
+        run: |
+          set -euo pipefail
+          mkdir -p target/e2e-bin
+          zstd -q -d -f target/e2e-archive/e2e-bin.tar.zst -o target/e2e-bin.tar
+          tar -xf target/e2e-bin.tar -C target/e2e-bin
+          rm target/e2e-bin.tar
 
       - name: Stage the CLI where the test binaries expect it
         # `CARGO_BIN_EXE_socket-patch` was baked in at compile time as
@@ -1470,17 +1531,23 @@ jobs:
 
       - name: Install Maven ${{ matrix.maven || '3.9.16' }}
         if: steps.jvm.outputs.maven == 'true'
-        # Straight from the Apache archive (sha512-verified), so a leg gets
-        # exactly the release it names rather than the runner's Maven.
-        # --ssl-revoke-best-effort: see the `test` job's vexctl step.
+        # The exact release a leg names rather than the runner's Maven. The
+        # tarball comes from Maven Central's CDN (well under a second);
+        # archive.apache.org throttles bulk downloads to 1.5-5.5 minutes per
+        # leg. Its sha512 still comes from the Apache archive (Central has
+        # none for 3.6.3/3.8.9), so the bytes are checked against a digest
+        # from a second origin. --ssl-revoke-best-effort: see the `test`
+        # job's vexctl step.
         shell: bash
         env:
           MAVEN_VERSION: ${{ matrix.maven || '3.9.16' }}
         run: |
           major="${MAVEN_VERSION%%.*}"
-          url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          file="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          url="https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/${file}"
+          sha_url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/${file}.sha512"
           curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$sha_url" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           # Python accepts native Windows paths for both archive and destination.
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
@@ -1493,15 +1560,8 @@ jobs:
         shell: bash
         env:
           GRADLE_VERSION: ${{ matrix.gradle }}
-        run: |
-          url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/gradle.zip"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
-          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
-          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
-          launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"
-          if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.bat"; fi
-          echo "SOCKET_PATCH_GRADLE_E2E_GRADLE=$launcher" >> "$GITHUB_ENV"
+        # Pinned digest, GitHub-release origin: see the script.
+        run: scripts/install-gradle.sh "$GRADLE_VERSION" "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Setup .NET SDK
         if: matrix.dotnet != ''
@@ -1695,13 +1755,55 @@ jobs:
   # v5 landings, the nightly schedule and dispatch run them with the `e2e`
   # steps.
 
-  # The macOS rows of `e2e`: they run on main, the merge queue and
-  # nightly, not on every PR push, so PRs stop queueing on the small
-  # macOS runner pool.
+  # Each OS consumes only its own build. A queued macOS runner must not
+  # delay Linux or Windows, and a Windows compile must not delay Gradle.
+  e2e-windows:
+    needs: [e2e-build-windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            suite: e2e_safety_pnpm
+          - os: windows-latest
+            suite: e2e_redirect_npm_build
+            npm_required: '1'
+          - os: windows-latest
+            suite: e2e_redirect_rush_sim
+          - os: windows-latest
+            suite: e2e_redirect_bun_build
+            bun: '1.4.2'
+            test_filter: --include-ignored
+          - os: windows-latest
+            suite: e2e_vendor_bun_build
+            bun: '1.4.2'
+            test_filter: --include-ignored
+          - os: windows-latest
+            suite: mode_migration_bun
+            bun: '1.4.2'
+            test_filter: --include-ignored
+          - {os: windows-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
+          - {os: windows-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
+          - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: gradle, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env: *e2e-env
+    steps: *e2e-steps
+
+  # The macOS rows run on main, the merge queue and nightly, not on every
+  # PR push, so PRs stop queueing on the small macOS runner pool.
   e2e-macos:
     if: github.event_name != 'pull_request'
     # These jobs consume e2e-build's binaries and can run alongside unit tests.
-    needs: [e2e-build]
+    needs: [e2e-build-macos]
     strategy:
       fail-fast: false
       matrix:
@@ -1759,7 +1861,7 @@ jobs:
   e2e-full:
     # merge_group runs the pull_request tier: the queue gates on ci-ok.
     if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
-    needs: [test, coverage, e2e-build]
+    needs: [e2e-build]
     strategy:
       fail-fast: false
       matrix:
@@ -1904,7 +2006,14 @@ jobs:
   # ----------------------------------------------------------------------
   yarn-classic-matrix:
     name: yarn-classic ${{ matrix.release }}
-    needs: [test, coverage]
+    # No `needs: [test, coverage]`: nothing here consumes their outputs,
+    # and waiting on the ~30 min windows `test` leg made this the merge
+    # queue's critical path.
+    # Dropping that `needs` also dropped the draft skip it inherited, so
+    # gate on draft here directly (push/merge_group/schedule still run).
+    # Only wait for the clippy preflight.
+    if: github.event.pull_request.draft != true
+    needs: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -1924,7 +2033,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: yarn-classic-${{ matrix.release }}
+          shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -1940,7 +2049,14 @@ jobs:
 
   yarn-berry-e2e:
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
-    needs: [test, coverage]
+    # No `needs: [test, coverage]`: nothing here consumes their outputs,
+    # and waiting on the ~30 min windows `test` leg made this the merge
+    # queue's critical path.
+    # Dropping that `needs` also dropped the draft skip it inherited, so
+    # gate on draft here directly (push/merge_group/schedule still run).
+    # Only wait for the clippy preflight.
+    if: github.event.pull_request.draft != true
+    needs: clippy
     strategy:
       fail-fast: false
       matrix:
@@ -1964,7 +2080,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: yarn-berry-${{ matrix.yarn }}
+          shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Enable corepack
         run: corepack enable
@@ -1984,7 +2100,7 @@ jobs:
   yarn-berry-e2e-macos:
     if: github.event_name != 'pull_request'
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
-    needs: [test, coverage]
+    needs: clippy
     strategy:
       fail-fast: false
       matrix:
@@ -2001,7 +2117,7 @@ jobs:
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
     # merge_group runs the pull_request tier: the queue gates on ci-ok.
     if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
-    needs: [test, coverage]
+    needs: clippy
     strategy:
       fail-fast: false
       matrix:
@@ -2022,7 +2138,9 @@ jobs:
   # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    needs: [test, coverage, e2e-build]
+    # e2e-build only (its binaries; only the matching OS build is needed);
+    # see yarn-classic-matrix on test/coverage.
+    needs: [e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -2040,8 +2158,6 @@ jobs:
           - {os: ubuntu-latest, toolchain: stable, lock: '2'}
           - {os: ubuntu-latest, toolchain: '1.82.0', lock: '3'}
           - {os: ubuntu-latest, toolchain: '1.93.1', lock: '4'}
-          - {os: windows-latest, toolchain: stable, lock: '1'}
-          - {os: windows-latest, toolchain: '1.93.1', lock: ''}
     steps: &cargo-vex-steps
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -2052,7 +2168,19 @@ jobs:
         with:
           pattern: e2e-bin-${{ matrix.os }}*
           merge-multiple: true
-          path: target/e2e-bin
+          path: target/e2e-archive
+      - name: Unpack the e2e binaries
+        shell: bash
+        # Decompress to a file, not into `| tar -xf -`: a tar that exits at
+        # the end-of-archive marker without draining stdin (macOS's does)
+        # leaves zstd writing into a closed pipe, and pipefail turns its
+        # "Broken pipe" into a failed leg that evicts the queue entry.
+        run: |
+          set -euo pipefail
+          mkdir -p target/e2e-bin
+          zstd -q -d -f target/e2e-archive/e2e-bin.tar.zst -o target/e2e-bin.tar
+          tar -xf target/e2e-bin.tar -C target/e2e-bin
+          rm target/e2e-bin.tar
       - name: Install Rust
         run: rustup show
       - name: Install the cargo under test
@@ -2089,13 +2217,25 @@ jobs:
           "../../target/e2e-bin/e2e_safety_cargo_build$exe" --ignored || status=1
           exit "$status"
 
-  # The macOS rows of `cargo-vex-matrix`: they run on main, the merge queue and
-  # nightly, not on every PR push, so PRs stop queueing on the small
-  # macOS runner pool.
+  cargo-vex-matrix-windows:
+    name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
+    needs: [e2e-build-windows]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env: *e2e-env
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: windows-latest, toolchain: stable, lock: '1'}
+          - {os: windows-latest, toolchain: '1.93.1', lock: ''}
+    steps: *cargo-vex-steps
+
+  # The macOS rows run on main, the merge queue and nightly, not per PR push.
   cargo-vex-matrix-macos:
     if: github.event_name != 'pull_request'
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    needs: [test, coverage, e2e-build]
+    needs: [e2e-build-macos]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -2116,7 +2256,7 @@ jobs:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     # merge_group runs the pull_request tier: the queue gates on ci-ok.
     if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
-    needs: [test, coverage, e2e-build]
+    needs: [e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -2149,7 +2289,14 @@ jobs:
   # available; this leg pulls both images and requires them.
   cargo-old-toolchains:
     name: cargo old toolchains (manifest [patch])
-    needs: [test, coverage]
+    # No `needs: [test, coverage]`: nothing here consumes their outputs,
+    # and waiting on the ~30 min windows `test` leg made this the merge
+    # queue's critical path.
+    # Dropping that `needs` also dropped the draft skip it inherited, so
+    # gate on draft here directly (push/merge_group/schedule still run).
+    # Only wait for the clippy preflight.
+    if: github.event.pull_request.draft != true
+    needs: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2166,7 +2313,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: cargo-old-toolchains
+          shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Vendored manifest [patch] on old cargo
         shell: bash
@@ -2213,6 +2360,7 @@ jobs:
   hosted-e2e:
     name: hosted-e2e            # may be a required check; do not rename
     if: github.event.pull_request.draft != true
+    needs: clippy
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -2269,7 +2417,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: hosted-e2e
+          shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
@@ -2411,13 +2559,13 @@ jobs:
           echo "::error title=hosted-e2e::the vendored vlt production proof failed on all 3 attempts"
           exit 1
 
-  # The single required status check for the merge queue (and PRs). It needs
+  # The aggregate required status check for the merge queue (and PRs). It needs
   # every job above, so adding a job here is how it becomes merge-blocking.
   # Skipped jobs (the nightly `full` tier) pass; failed or cancelled ones fail.
   ci-ok:
     name: ci-ok                 # registered as a required check; do not rename
     if: always()
-    needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, e2e, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
+    needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, e2e-build-windows, e2e-build-macos, e2e, e2e-windows, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-windows, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

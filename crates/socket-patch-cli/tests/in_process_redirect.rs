@@ -58,10 +58,8 @@ fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
@@ -1912,7 +1910,7 @@ async fn symlinked_bun_lockb_refuses_before_editing_including_dry_run() {
         let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(output.status.code(), Some(1), "{env:#}");
         assert_eq!(
-            env["errorCode"], "redirect_symlinked_file_unsupported",
+            env["error"]["code"], "redirect_symlinked_file_unsupported",
             "{env:#}"
         );
         assert_eq!(
@@ -2191,10 +2189,10 @@ async fn directory_at_the_legacy_ledger_path_does_not_block_the_run() {
 }
 
 /// A MID-RUN lockfile write failure (second of two locks unwritable) exits
-/// 1; the first lock landed, the failed lock stays byte-untouched (atomic
-/// stage+rename, no truncation), and no ledger is written (v5: a landed
-/// hosted pin is undone by `rollback`'s upstream restore, which needs no
-/// recorded originals).
+/// 1 and changes NOTHING: the run's writes are one commit, so the lock
+/// already replaced is put back, the failed lock stays byte-untouched
+/// (atomic stage+rename, no truncation), and no ledger is written. Before,
+/// the first lock stayed redirected while the second did not.
 ///
 /// unix-only: a read-only directory does not block file creation on Windows.
 #[cfg(unix)]
@@ -2214,6 +2212,8 @@ async fn partial_lockfile_write_failure_exits_1_and_writes_no_ledger() {
     // (common/config/rush/…) is written before the subspace lock
     // (common/config/subspaces/…).
     write_rush_project(tmp.path(), false);
+    let common_path = tmp.path().join("common/config/rush/pnpm-lock.yaml");
+    let before_common = std::fs::read_to_string(&common_path).unwrap();
     let subspace_dir = tmp.path().join("common/config/subspaces/frontend");
     let before_subspace = std::fs::read_to_string(subspace_dir.join("pnpm-lock.yaml")).unwrap();
     std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -2223,12 +2223,11 @@ async fn partial_lockfile_write_failure_exits_1_and_writes_no_ledger() {
     std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(code, 1, "a mid-run lockfile write failure must exit 1");
 
-    // The first lock landed before the failure…
-    let common =
-        std::fs::read_to_string(tmp.path().join("common/config/rush/pnpm-lock.yaml")).unwrap();
-    assert!(
-        common.contains(HOSTED_URL),
-        "the common lock was written before the subspace failure; got:\n{common}"
+    // The first lock was put back when the second failed…
+    assert_eq!(
+        std::fs::read_to_string(&common_path).unwrap(),
+        before_common,
+        "the common lock is restored after the subspace failure"
     );
     vlt_hosted_common::assert_no_ledger(tmp.path());
 
@@ -3517,7 +3516,9 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
             "{leg}: envelope status; stdout=\n{stdout}"
         );
         assert!(
-            v["error"].as_str().is_some_and(|m| !m.is_empty()),
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty()),
             "{leg}: envelope must carry the error message; stdout=\n{stdout}"
         );
         assert_eq!(
@@ -3621,7 +3622,9 @@ fn assert_write_failure_envelope(out: &std::process::Output, leg: &str) {
     });
     assert_eq!(v["status"], "error", "{leg}: status; stdout=\n{stdout}");
     assert!(
-        v["error"].as_str().is_some_and(|m| !m.is_empty()),
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
         "{leg}: envelope must carry the error message; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -5063,11 +5066,11 @@ async fn cargo_hosted_scan_from_workspace_member_refuses() {
     assert_eq!(out.status.code(), Some(1), "{doc}");
     assert_eq!(doc["status"], "error", "{doc}");
     assert_eq!(
-        doc["errorCode"], "cargo_manifest_not_workspace_root",
+        doc["error"]["code"], "cargo_manifest_not_workspace_root",
         "{doc}"
     );
     assert!(
-        doc["error"]
+        doc["error"]["message"]
             .as_str()
             .is_some_and(|m| m.contains("workspace root") && m.contains("nothing was written")),
         "{doc}"

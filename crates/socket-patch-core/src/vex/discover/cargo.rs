@@ -88,8 +88,9 @@
 //! `[patch] crates-io = { … }` forms). The path must be root-anchored
 //! ([`vendor_ref`]: a `../` or absolute spelling consumes some OTHER
 //! checkout's copy), the leaf a single `<name>-<version>` directory for the
-//! entry's crate. Same liveness truth source as
-//! `vendor::cargo::vendored_entry_in_use`: when a `Cargo.lock` parses, it
+//! entry's crate. The lock is the liveness truth source (the prune GC's
+//! in-use verdict, `Discovery::vendor_entry_in_use`, reads it from these
+//! refs): when a `Cargo.lock` parses, it
 //! must hold a SOURCELESS `[[package]]` for that name + version — an entry
 //! with a registry source (re-resolved, or a hosted takeover) or none at
 //! all means the copy is not what builds, and so does a
@@ -97,7 +98,7 @@
 //! a `[patch]` left out of the graph — e.g. by the user's path dependency,
 //! whose lock entry is sourceless too), so no ref ([`DIAG_REF_INVALID`]).
 //! No lock (first build pending) or an unparseable one (cargo refuses to
-//! build) keeps the ref, like `vendored_entry_in_use`. A manifest entry
+//! build) keeps the ref. A manifest entry
 //! cargo ignores is no ref ([`DIAG_REF_INVALID`]) either: cargo lets a
 //! project-config `[patch]` item with the same key replace it (unless that
 //! item wires the same path — the half-migrated shape, attested through the
@@ -118,11 +119,11 @@ use super::{
     Discovery, PatchedRef, TomlDiag, UnlockedPin, VendorRef, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::formats::cargo::{CargoLock, CopyClaim, LockedPackage};
+use crate::formats::cargo::{is_registry_source, CargoLock, CopyClaim, LockedPackage};
 use crate::patch::redirect::generation::{hosted_pin_name, PIN_NAME_PREFIX};
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
-    effective_config_rel, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
+    effective_config_rel_in, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
     CONFIG_TOML,
 };
 use crate::vendor::cargo_manifest::{crates_io_url_alias_tables, is_crates_io_source};
@@ -313,7 +314,7 @@ fn parse_toml(file: &str, text: &str, out: &mut Discovery) -> Option<DocumentMut
     toml_or_diag(file, text, TomlDiag::TrimEnd, out)
 }
 
-/// The config file cargo actually reads ([`effective_config_rel`]), parsed,
+/// The config file cargo actually reads ([`effective_config_rel_in`]), parsed,
 /// with its root-relative name. When `.cargo/config` exists cargo ignores
 /// `.cargo/config.toml` entirely (and warns); Socket-shaped wiring left in
 /// the ignored file is diagnosed so a "why is my patch not attested" has an
@@ -322,7 +323,7 @@ async fn read_config(
     ctx: &DiscoverCtx<'_>,
     out: &mut Discovery,
 ) -> Option<(&'static str, DocumentMut)> {
-    if effective_config_rel(ctx.root).await == CONFIG_TOML {
+    if effective_config_rel_in(ctx.view).await == CONFIG_TOML {
         return read_toml(ctx, CONFIG_TOML, out)
             .await
             .map(|doc| (CONFIG_TOML, doc));
@@ -426,11 +427,10 @@ fn dependency_entries(doc: &DocumentMut) -> Vec<DepEntry> {
 /// The patch uuid a Cargo.lock `source` routes to, when it is a registry
 /// source on a Socket patch server.
 fn source_uuid(ctx: &DiscoverCtx<'_>, source: &str) -> Option<String> {
-    let s = source.trim();
-    if !(s.starts_with("sparse+") || s.starts_with("registry+")) {
+    if !is_registry_source(source) {
         return None; // git / path / local-registry sources are never ours
     }
-    ctx.hosted_uuid(s)
+    ctx.hosted_uuid(source.trim())
 }
 
 fn hosted_from_lock(
@@ -600,6 +600,7 @@ fn unresolved_manifest_pins(
                             uuid: uuid.clone(),
                             file: CARGO_TOML.into(),
                             version_reqs,
+                            index_url: definitions.get(reg.as_str()).cloned(),
                         });
                     }
                     format!("there is no {CARGO_LOCK} to fix its version")
@@ -667,7 +668,7 @@ async fn vendored_from_patches(
     file: &str,
     doc: &DocumentMut,
     lock: &Lock,
-    shadowed: &dyn Fn(&CargoPatchEntry<'_>) -> Option<String>,
+    shadowed: &(dyn Fn(&CargoPatchEntry<'_>) -> Option<String> + Sync),
     out: &mut Discovery,
 ) {
     for entry in patch_entries(doc) {
@@ -739,7 +740,10 @@ async fn vendored_from_patches(
         }
         let copy_tagged = matches!(tag, CopyTag::Tagged(_) | CopyTag::Unreadable);
         if let Lock::Parsed(lock) = lock {
-            let why = match lock.vendored_in_use(name, version, &vref.uuid, copy_tagged) {
+            let claim = lock.vendored_in_use(name, version, &vref.uuid, copy_tagged);
+            let relock_pending =
+                matches!(claim, CopyClaim::OtherTag(_) | CopyClaim::UntaggedOverride);
+            let why = match claim {
                 CopyClaim::Consumed => None,
                 CopyClaim::OtherTag(other) => Some(format!(
                     "{CARGO_LOCK} builds the copy tagged for patch {other} ({name} {})",
@@ -756,6 +760,16 @@ async fn vendored_from_patches(
                 )),
             };
             if let Some(why) = why {
+                // The manifest still routes the crate to this copy and the
+                // lock entry is detached: only the lock's generation lags,
+                // and the next unlocked build consumes the copy.
+                if relock_pending {
+                    out.withheld.push(super::Recognized {
+                        uuid: vref.uuid.clone(),
+                        mode: super::WiringMode::Vendored,
+                        file: std::path::PathBuf::from(file),
+                    });
+                }
                 out.diag(
                     DIAG_REF_INVALID,
                     file,

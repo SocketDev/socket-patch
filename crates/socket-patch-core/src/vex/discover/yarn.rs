@@ -90,12 +90,12 @@ use super::{
     DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::yarn::blocks::{berry_field, classic_field};
+use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::{
     classic_key_real_name, pattern_real_name, resolution_selector_target, split_resolved_sha1,
     BerryLocator,
 };
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
-use crate::formats::yarn::is_berry_lock;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
     berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,
@@ -1199,6 +1199,18 @@ mod tests {
             p.write("yarn.lock", classic(&blocks));
             let out = run(&p).await;
             assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            // The registry wiring beside the git copy is withheld, not lost:
+            // rollback / remove / the takeover still unwind it (#828).
+            let shadowed = out
+                .shadowed
+                .iter()
+                .any(|r| r.purl == "pkg:npm/left-pad@1.3.0");
+            assert_eq!(
+                shadowed,
+                case.starts_with("registry"),
+                "{case}: {:#?}",
+                out.shadowed
+            );
             assert!(
                 out.diagnostics
                     .iter()

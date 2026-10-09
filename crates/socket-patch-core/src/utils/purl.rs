@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
+use crate::patch::path_safety::{
+    is_safe_multi_segment, is_safe_name_version, is_safe_single_segment,
+};
 use crate::utils::purl_key::PurlKey;
 
 /// Strip the trailing `?qualifiers` and `#subpath` components from a PURL,
@@ -426,17 +428,14 @@ pub fn npm_purl(name: &str, version: &str) -> Option<String> {
 /// `pkg:pypi/<canonical name>@<version>`.
 pub fn pypi_purl(name: &str, version: &str) -> Option<String> {
     let name = canonicalize_pypi_name(name);
-    (is_safe_single_segment(&name) && is_safe_single_segment(version))
-        .then(|| format!("pkg:pypi/{name}@{version}"))
+    is_safe_name_version(&name, version).then(|| format!("pkg:pypi/{name}@{version}"))
 }
 
 /// `pkg:<ty>/<name>@<version>` for the single-segment-name ecosystems
 /// (`cargo`, `gem`, `nuget`).
 pub fn simple_purl(ty: &str, name: &str, version: &str) -> Option<String> {
-    (matches!(ty, "cargo" | "gem" | "nuget")
-        && is_safe_single_segment(name)
-        && is_safe_single_segment(version))
-    .then(|| format!("pkg:{ty}/{name}@{version}"))
+    (matches!(ty, "cargo" | "gem" | "nuget") && is_safe_name_version(name, version))
+        .then(|| format!("pkg:{ty}/{name}@{version}"))
 }
 
 /// `pkg:golang/<module>@<version>` (module path multi-segment, version one
@@ -462,7 +461,7 @@ pub fn composer_purl(name: &str, version: &str) -> Option<String> {
 /// artifact and the version each a safe single segment — an empty group
 /// fails as one empty segment).
 pub fn maven_purl(group: &str, artifact: &str, version: &str) -> Option<String> {
-    crate::crawlers::maven_crawler::is_safe_maven_coordinate(group, artifact, version)
+    crate::vendor::jvm::layout::is_path_safe(group, artifact, version)
         .then(|| build_maven_purl(group, artifact, version))
 }
 

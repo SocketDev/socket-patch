@@ -9,11 +9,13 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::formats::text::strip_bom;
 use crate::utils::purl::{percent_decode_purl_component, pypi_purl};
 use crate::utils::python_lock::{lock_package_collection, package_artifacts, UvSource};
 use crate::utils::requirements::archive_filename_coords;
 
 use crate::utils::digest::{sha256_hex, sha256_prefixed};
+use crate::vendor::pypi_distribution::is_portable_wheel_url;
 
 use super::view::ProjectView;
 use super::{dedup_prefer_integrity, http_url, LockIntegrity, LockfileEntry, SourceKind};
@@ -76,11 +78,12 @@ impl<'a> PipfileLockEntry<'a> {
     }
 }
 
-/// Parse a `Pipfile.lock`. Leading UTF-8 BOMs (Windows editors) are not
-/// JSON and are skipped — the one BOM policy of every Pipfile.lock reader
+/// Parse a `Pipfile.lock`. A leading UTF-8 BOM (Windows editors) is not
+/// JSON and is skipped ([`strip_bom`]: one BOM is encoding, a second is
+/// content) — the one BOM policy of every Pipfile.lock reader
 /// (this inventory, the hosted Pipenv rewriter, lockfile discovery).
 pub(crate) fn parse_pipfile_lock(text: &str) -> serde_json::Result<Value> {
-    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+    serde_json::from_str(strip_bom(text))
 }
 
 /// Every package entry of a parsed `Pipfile.lock` (pipfile-spec 6): each
@@ -205,7 +208,7 @@ pub(crate) fn replaceable_hosted_pin(
 }
 
 /// Inventory the pypi lock the project carries. Fetchable resolution
-/// (URL + sha256 of a pure `-none-any` wheel) comes from `uv.lock` and
+/// (URL + sha256 of a portable wheel) comes from `uv.lock` and
 /// PEP 751 / PEP 723 script locks; `poetry.lock` entries carry the pure
 /// wheel's sha256 when the lock lists one (resolved through PyPI's JSON API
 /// at fetch time), else stay discovery-only; exact `==` `requirements.txt`
@@ -227,8 +230,8 @@ pub(super) async fn inventory_pypi_locks_in(view: &ProjectView<'_>) -> Option<Ve
 /// on disk; the in-memory project's root-level names otherwise), sorted.
 pub(crate) fn python_lock_paths_in(view: &ProjectView<'_>) -> std::io::Result<Vec<String>> {
     match view {
-        ProjectView::Disk(root)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let root = view.disk_root().expect("a disk view has a root");
             crate::utils::python_lock::python_lock_paths(root)
         }
         ProjectView::Memory(project) => Ok(project
@@ -301,16 +304,21 @@ pub(super) async fn inventory_pypi_locks_raw_in(
     found.then_some(out)
 }
 
-/// The first fetchable pure-Python wheel of a lock package — `archive`,
-/// then `wheels[]` / `wheel` (read with the shared lock model,
-/// [`crate::utils::python_lock::package_artifacts`]): an http(s) url ending
-/// `-none-any.whl` with a sha256 pin, as `(url, sha256)`.
-fn python_package_archive(package: &dyn TableLike) -> Option<(String, String)> {
-    package_artifacts(package, &["archive", "wheels", "wheel"])
+/// The first hash-pinned, portable, http(s) wheel among a lock package's
+/// `keys` artifacts (read with the shared lock model, [`package_artifacts`]),
+/// as `(url, sha256)`. Each url is paired with **that artifact's** hash, and
+/// portability is the shared [`is_portable_wheel_url`] rule vendored and
+/// hosted mode use. The one pure-wheel pick of the uv / PEP 751 inventory
+/// and of ledger recovery.
+pub(super) fn portable_wheel_artifact(
+    package: &dyn TableLike,
+    keys: &[&str],
+) -> Option<(String, String)> {
+    package_artifacts(package, keys)
         .into_iter()
         .find_map(|artifact| {
             let url = artifact.url?;
-            if !url.split(['?', '#']).next()?.ends_with("-none-any.whl") {
+            if !is_portable_wheel_url(url) {
                 return None;
             }
             Some((http_url(url)?, artifact.sha256?))
@@ -358,10 +366,11 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
         if !remote {
             continue;
         }
-        let (resolved, integrity) = match python_package_archive(package) {
-            Some((url, sha)) => (Some(url), LockIntegrity::Sha256Hex(sha)),
-            None => (None, LockIntegrity::None),
-        };
+        let (resolved, integrity) =
+            match portable_wheel_artifact(package, &["archive", "wheels", "wheel"]) {
+                Some((url, sha)) => (Some(url), LockIntegrity::Sha256Hex(sha)),
+                None => (None, LockIntegrity::None),
+            };
         out.push(LockfileEntry {
             ecosystem: "pypi",
             source_kind: SourceKind::Unspecified,
@@ -377,7 +386,7 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 
 /// poetry.lock: `[[package]]` tables with `name`/`version`. The lock records
 /// file hashes but no URLs and no platform choice, so an entry carries the
-/// sha256 of the package's pure-Python (`-none-any.whl`) wheel when the lock
+/// sha256 of the package's portable wheel ([`is_portable_wheel_url`]) when the lock
 /// lists one — its own `files = [...]` (lock 2.x) or its `[metadata.files]`
 /// entry (lock 1.0/1.1), read through the shared poetry lock helpers — and
 /// the pypi fetcher then resolves the matching file through PyPI's JSON
@@ -390,7 +399,7 @@ async fn inventory_poetry_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEnt
     let pure_wheel_sha = |files: Vec<&dyn TableLike>| {
         files.into_iter().find_map(|entry| {
             let file = entry.get("file")?.as_str()?;
-            if !file.ends_with("-none-any.whl") {
+            if !is_portable_wheel_url(file) {
                 return None;
             }
             sha256_prefixed(entry.get("hash")?.as_str()?)
@@ -753,3 +762,26 @@ async fn requirements_tree(view: &ProjectView<'_>) -> Option<Vec<String>> {
     }
     Some(files)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pipfile_lock;
+
+    /// Every Pipfile.lock reader parses through here: one leading BOM is
+    /// encoding and skipped, a second is content (not JSON), as
+    /// `formats::text` rules for every reader.
+    #[test]
+    fn pipfile_lock_reads_past_one_bom_only() {
+        let lock = r#"{"default": {}}"#;
+        let plain = parse_pipfile_lock(lock).unwrap();
+        assert_eq!(
+            parse_pipfile_lock(&format!("\u{feff}{lock}")).unwrap(),
+            plain
+        );
+        assert!(parse_pipfile_lock(&format!("\u{feff}\u{feff}{lock}")).is_err());
+    }
+}
+
+#[cfg(test)]
+#[path = "pypi_wheel_tests.rs"]
+mod wheel_tests;

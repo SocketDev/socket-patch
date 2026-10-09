@@ -1291,7 +1291,7 @@ fn cargo_vendored_f_lock_tag_for_another_uuid_never_attests() {
 }
 
 /// a (first build pending): no Cargo.lock yet — the `[patch]` wiring is
-/// what cargo will build, so it attests (the `vendored_entry_in_use` rule).
+/// what cargo will build, so it attests (the prune GC keeps it in use).
 #[test]
 fn cargo_vendored_a_attests_before_the_first_lock() {
     let fx = Fx::new();

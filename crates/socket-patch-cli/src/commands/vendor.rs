@@ -77,7 +77,6 @@ pub struct VendorArgs {
     #[arg(
         short = 'f',
         long,
-        env = "SOCKET_FORCE",
         default_value_t = false,
         value_parser = crate::args::parse_bool_flag,
     )]
@@ -111,7 +110,78 @@ pub struct VendorArgs {
 /// request is still fully satisfied when these are the only non-successes.
 fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
+        // An older vendored patch kept in force (see [`keep_older_vendored_patch`]).
+        || matches!(code, vendor::VENDOR_PREBUILT_PENDING | vendor::VENDOR_PREBUILT_UNAVAILABLE)
         || socket_patch_core::vendor::jvm::sbt_gate::SKIP_CODES.contains(&code)
+}
+
+/// #954: the patch service has no artifact for `uuid` yet (still building)
+/// or at all (`build_failed`, `not_found`, …) — the backend's failed `Done`
+/// carries [`vendor::VENDOR_PREBUILT_PENDING`] /
+/// [`vendor::VENDOR_PREBUILT_UNAVAILABLE`] — while the ledger already holds
+/// `purl` vendored at another patch. The backend touched nothing, so that
+/// older vendoring is still in force: like hosted mode, which keeps its pin
+/// and skips the upgrade, the package is a benign skip under the unserved
+/// code instead of a failure that would fail every re-run until the server
+/// builds the artifact. Only an older vendoring whose wiring is still live
+/// (the [`Discovery::vendor_entry_live`] verdict `vendor --check` and `vex`
+/// use) is in force: once a relock dropped its `.socket/vendor/` reference
+/// the package is patched in neither mode, so the unserved upgrade stays a
+/// failure. Any other outcome passes through, a failure minus the unserved
+/// marker (its error already says it).
+///
+/// [`Discovery::vendor_entry_live`]: socket_patch_core::vex::discover::Discovery::vendor_entry_live
+async fn keep_older_vendored_patch(
+    outcome: Option<VendorOutcome>,
+    state: &VendorState,
+    purl: &str,
+    uuid: &str,
+    common: &GlobalArgs,
+) -> Option<VendorOutcome> {
+    let Some(VendorOutcome::Done {
+        result,
+        entry,
+        mut warnings,
+    }) = outcome
+    else {
+        return outcome;
+    };
+    if !result.success {
+        if let Some(i) = warnings.iter().position(|w| {
+            matches!(
+                w.code,
+                vendor::VENDOR_PREBUILT_PENDING | vendor::VENDOR_PREBUILT_UNAVAILABLE
+            )
+        }) {
+            let unserved = warnings.remove(i);
+            if let Some(kept) = lookup_entry(&state.entries, purl).filter(|e| e.uuid != uuid) {
+                let root = common.project_root();
+                if !crate::commands::discover_wiring(common, &root)
+                    .await
+                    .vendor_entry_live(&root, kept)
+                    .await
+                {
+                    return Some(VendorOutcome::Done {
+                        result,
+                        entry,
+                        warnings,
+                    });
+                }
+                return Some(VendorOutcome::Refused {
+                    code: unserved.code,
+                    detail: format!(
+                        "kept the vendored patch {}: {} for patch {uuid}",
+                        kept.uuid, unserved.detail
+                    ),
+                });
+            }
+        }
+    }
+    Some(VendorOutcome::Done {
+        result,
+        entry,
+        warnings,
+    })
 }
 
 /// The `vendor_dir_symlink_unsupported` detail when `purl`'s vendor dir
@@ -372,7 +442,7 @@ pub(crate) async fn dispatch_revert_one_opts(
     {
         return RevertOutcome::failed(vendor::path::vendor_dir_symlink_detail(&link));
     }
-    match entry.ecosystem.as_str() {
+    match vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) {
         "npm" => vendor::npm_flavor::revert_npm_any_opts(entry, project_root, opts).await,
         "pypi" => vendor::pypi::revert_pypi_opts(entry, project_root, opts).await,
         "gem" => vendor::gem::revert_gem_opts(entry, project_root, opts).await,
@@ -380,7 +450,7 @@ pub(crate) async fn dispatch_revert_one_opts(
         "golang" => vendor::golang::revert_go_vendor_opts(entry, project_root, opts).await,
         "composer" => vendor::composer_lock::revert_composer_opts(entry, project_root, opts).await,
         "nuget" => vendor::nuget_feed::revert_nuget_opts(entry, project_root, opts).await,
-        "maven" | "jvm" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
+        "maven" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
         other => RevertOutcome::failed(format!(
             "this build has no vendor backend for ecosystem `{other}`"
         )),
@@ -395,9 +465,9 @@ pub(crate) async fn dispatch_revert_one_opts(
 ///   same version from the registry beside a wired `yarn.lock`): name both
 ///   locks; re-vendoring changes nothing;
 /// * the dependency left the lock (upgraded or uninstalled): the in-use
-///   probe the prune GC reverts by says so and no lock resolves the
-///   package any more, so `scan --prune` is the fix, as `scan`'s own
-///   `vendor_ledger_entry_unwired` hint says;
+///   verdict the prune GC reverts by ([`Discovery::vendor_entry_in_use`])
+///   says so and no lock resolves the package any more, so `scan --prune`
+///   is the fix, as `scan`'s own `vendor_ledger_entry_unwired` hint says;
 /// * otherwise a relock dropped the reference while the package stayed.
 async fn unwired_check_failure(
     discovery: &socket_patch_core::vex::discover::Discovery,
@@ -422,7 +492,7 @@ async fn unwired_check_failure(
     // prove the dependency is gone rather than unreadable.
     if matches!(entry.ecosystem.as_str(), "npm" | "pypi")
         && !discovery.resolves_package(&entry.base_purl)
-        && dispatch_in_use_one(entry, root).await == Some(false)
+        && discovery.vendor_entry_in_use(root, entry).await == Some(false)
     {
         return format!(
             "dependency removed: no lockfile resolves {} any more (it was upgraded or \
@@ -435,23 +505,6 @@ async fn unwired_check_failure(
         "wiring missing: no lockfile or config references {dir} any more, so a fresh install \
          gets the unpatched package; re-run `socket-patch vendor` to rewire it"
     )
-}
-
-/// Is this vendored entry still consumed by its project's lockfile
-/// dependency graph? `None` = cannot determine — callers must keep the
-/// entry (fail-safe): ecosystems other than npm, cargo and pypi (whose
-/// probe covers the requirements flavor only) have no in-use probe yet,
-/// and a missing/unreadable lockfile proves nothing.
-pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    match entry.ecosystem.as_str() {
-        "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
-        // Cargo probes the lock entry's shape: detached + `[patch]` pointing
-        // at this entry's copy = in use; a registry source (crates.io
-        // re-resolve or a hosted takeover) or a missing entry = reclaimable.
-        "cargo" => vendor::cargo::vendored_entry_in_use(entry, project_root).await,
-        "pypi" => vendor::pypi::vendored_entry_in_use(entry, project_root).await,
-        _ => None,
-    }
 }
 
 /// What the orphan sweep did with the uuid dirs no ledger entry owns.
@@ -523,8 +576,11 @@ fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
         .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid))
 }
 
-/// Does `eco` fall inside this run's `--ecosystems` scope?
+/// Does `eco` fall inside this run's `--ecosystems` scope? A vendor-ledger
+/// name counts as the package ecosystem it stands for (a `jvm` entry is
+/// `maven`, [`vendor::jvm::layout::ledger_ecosystem`]).
 pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
+    let eco = vendor::jvm::layout::ledger_ecosystem(eco);
     match socket_patch_core::crawlers::Ecosystem::all()
         .iter()
         .find(|e| e.cli_name() == eco)
@@ -885,15 +941,13 @@ pub async fn run(args: VendorArgs) -> i32 {
     // Usage errors exit 2, like scan's and get's global mode guard. Checked
     // before anything reads or locks the project.
     if let Some(message) = global_scope_conflict(&args) {
-        if args.common.json {
-            let mut env = Envelope::new(Command::Vendor);
-            env.dry_run = args.common.dry_run;
-            env.mark_error(EnvelopeError::new("global_scope_unsupported", message));
-            println!("{}", env.to_pretty_json());
-        } else {
-            eprintln!("Error: {message}");
-        }
-        return 2;
+        return crate::json_envelope::usage_error(
+            Command::Vendor,
+            args.common.json,
+            args.common.dry_run,
+            "global_scope_unsupported",
+            &message,
+        );
     }
     if args.check {
         return run_check(&args).await;
@@ -1137,18 +1191,22 @@ async fn run_check(args: &VendorArgs) -> i32 {
             return emit_eject_refusal(&args.common, "vendor_state_unreadable", &e.to_string())
         }
     };
-    if state.entries.is_empty()
-        && [
-            ".socket/vendor/maven2",
-            ".socket/vendor/gradle",
-            ".socket/vendor/gradle-index.tsv",
-            socket_patch_core::vendor::jvm::sbt::BUILD_FILE,
-        ]
-        .iter()
-        .chain(socket_patch_core::vendor::jvm::coursier_tree::ORPHAN_PATHS)
-        .any(|rel| root.join(rel).exists())
-    {
-        return emit_eject_refusal(&args.common, "vendor_ledger_missing", "JVM artifacts exist without a vendor ledger; restore .socket/vendor/state.json from version control");
+    // JVM trees are not `.socket/vendor/<eco>/<uuid>` dirs the reference
+    // scan below can name, so their layout is checked against the ledger's
+    // JVM entries directly: present with none of them is an orphan, whatever
+    // other ecosystems the ledger records.
+    let jvm_orphan = (!state.entries.values().any(vendor::jvm::apply::is_jvm_entry))
+        .then(|| {
+            vendor::jvm::layout::LEDGER_OWNED_PATHS
+                .iter()
+                .copied()
+                .find(|rel| root.join(rel).exists())
+        })
+        .flatten();
+    const JVM_ORPHAN_DETAIL: &str = "JVM artifacts exist without a vendor ledger entry; restore \
+                                     .socket/vendor/state.json from version control";
+    if state.entries.is_empty() && jvm_orphan.is_some() {
+        return emit_eject_refusal(&args.common, "vendor_ledger_missing", JVM_ORPHAN_DETAIL);
     }
     let manifest_path = args.common.resolved_manifest_path();
     let manifest = match read_manifest(&manifest_path).await {
@@ -1230,12 +1288,21 @@ async fn run_check(args: &VendorArgs) -> i32 {
             "patch has no vendored ledger entry",
         ));
     }
+    if let Some(rel) = jvm_orphan {
+        if !args.common.json {
+            eprintln!("vendor_ledger_missing: {JVM_ORPHAN_DETAIL}");
+        }
+        env.record(
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_error("vendor_ledger_missing", JVM_ORPHAN_DETAIL)
+                .with_details(serde_json::json!({ "ecosystem": "maven", "path": rel })),
+        );
+    }
     // A project file still wired to a vendored artifact the ledger does not
     // know (the ledger was ignored or dropped from the commit along with the
     // manifest) leaves every fresh install failing; the manifest keys above
     // cannot see it, so the references are read from the wiring itself.
-    let references =
-        crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    let references = crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
     for (eco, uuid, rel) in references {
         let ledgered = state
             .entries
@@ -1326,7 +1393,7 @@ pub(crate) async fn gem_takeover_preview_refusals<'a>(
         gems.into_iter(),
         &pins,
         common.offline,
-        crate::commands::rollback::patch_server_origins(common),
+        crate::commands::hosted_unwind::patch_server_origins(common),
     )
     .await
 }
@@ -1460,7 +1527,7 @@ impl EjectSnapshot {
             ));
         }
         planned.extend(
-            socket_patch_core::vendor::jvm::coursier_tree::CAPTURED_FILES
+            socket_patch_core::vendor::jvm::layout::CAPTURED_FILES
                 .iter()
                 .map(|s| s.to_string()),
         );
@@ -1635,7 +1702,8 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         };
         match view {
             Ok(Some(patch)) => {
-                let (_, record) = crate::commands::get::record_from_patch_response(&patch);
+                let (_, record) =
+                    socket_patch_core::manifest::records::record_from_patch_response(&patch);
                 records.insert(pin.purl.clone(), record);
             }
             Ok(None) => fetch_failures.push((
@@ -1682,7 +1750,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     // Plan the upstream restore before touching anything: every pin must
     // re-resolve to its registry entry (a dry resolve), or the eject is
     // refused whole with each pin's remedy.
-    let origins = crate::commands::rollback::patch_server_origins(common);
+    let origins = crate::commands::hosted_unwind::patch_server_origins(common);
     let plan = socket_patch_core::patch::redirect::upstream::restore_upstream(
         &common.cwd,
         &pins,
@@ -1827,16 +1895,16 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         .next()
         .or_else(|| restore.flush_error.clone());
     // Every file the vendored apply's group commit wrote, with its bytes
-    // from before: the rollback's scope beyond the restore's own files.
-    let mut committed: Vec<CommittedFile> = Vec::new();
+    // from before (the rollback's scope beyond the restore's own files),
+    // and the flavors it wired for the close printed below.
+    let mut capture = EjectCapture::default();
+    // The vendored apply's events start here: a rollback retracts them.
+    let events_start = env.events.len();
     let mut exit: i32;
     if let Some(why) = restore_failure {
         env.mark_error(EnvelopeError::new("redirect_revert_failed", why.clone()));
         if !common.json {
-            eprintln!(
-                "Error: {}",
-                crate::commands::rollback::capitalize_first(&why)
-            );
+            eprintln!("Error: {}", crate::ui::sentence_case(&why));
         }
         exit = 1;
     } else {
@@ -1860,7 +1928,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                     detached: true,
                     force: false,
                     prior: None,
-                    committed: Some(&mut committed),
+                    eject: Some(&mut capture),
                 },
                 &mut env,
             )
@@ -1895,19 +1963,33 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             }
         }
     }
+    let committed = &capture.committed;
     if exit != 0 {
-        match snapshot.restore(&restore.reverted_files, &committed).await {
-            Ok(()) => env.warnings.push(RunWarning {
-                code: "eject_rolled_back".to_string(),
-                detail: "the eject did not complete, so every file it touched was restored: the \
-                         project is still hosted, exactly as before"
-                    .to_string(),
-            }),
+        match snapshot.restore(&restore.reverted_files, committed).await {
+            Ok(()) => {
+                let detail = "the eject did not complete, so every file it touched was \
+                              restored: the project is still hosted, exactly as before";
+                // Nothing the vendored apply did survives the rollback: a
+                // package it vendored is still hosted, not applied (#1005).
+                env.retract_applied(
+                    events_start,
+                    PatchAction::Skipped,
+                    "eject_rolled_back",
+                    "vendored, then rolled back with the rest of the eject: still hosted",
+                );
+                if !common.json && !common.silent {
+                    eprintln!("Warning: {detail}");
+                }
+                env.warnings.push(RunWarning {
+                    code: "eject_rolled_back".to_string(),
+                    detail: detail.to_string(),
+                });
+            }
             Err(e) => {
                 let detail = format!(
                     "the eject did not complete and restoring the pre-eject files failed ({e}); \
                      restore them from version control (`git checkout -- {}`)",
-                    snapshot.files_hint(&restore.reverted_files, &committed)
+                    snapshot.files_hint(&restore.reverted_files, committed)
                 );
                 if !common.json {
                     eprintln!("Error: {detail}");
@@ -1918,6 +2000,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if env.error.is_none() {
             env.mark_partial_failure();
         }
+    } else {
+        // The vendored summary and its "Next steps:", deferred until the
+        // eject is known to stand: a failed one is rolled back (or needs
+        // the manual restore its error names), so neither applies.
+        print_vendor_closing(common, &env, 0, &capture.wired_flavors, true);
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
     drop(guard);
@@ -2060,7 +2147,7 @@ async fn run_vendor(
                 detached: false,
                 force: args.force,
                 prior: None,
-                committed: None,
+                eject: None,
             },
             env,
         )
@@ -2543,9 +2630,13 @@ pub(crate) async fn vendor_records_reusing(
     service: Option<&VendorServiceConfig>,
     ledger: std::io::Result<VendorState>,
     prior: Option<&NpmCrawlSnapshot>,
-    committed: Option<&mut Vec<CommittedFile>>,
+    mut eject: Option<&mut EjectCapture>,
 ) -> bool {
     let mut has_errors = false;
+    // This run's events start here (`scan --mode vendored` hands over an
+    // envelope that already holds its own): the ones a refused commit
+    // retracts.
+    let events_start = env.events.len();
     // Lockfile flavors the backends wired THIS run (from the returned ledger
     // entries, not the whole ledger — an old pnpm entry must not re-flavor
     // the hints of a run that vendored only cargo). Drives the human
@@ -2765,6 +2856,21 @@ pub(crate) async fn vendor_records_reusing(
     // line prints on a clean line.
     let mut status = StatusLine::stderr(common.json, common.silent);
     let total = all_packages.len();
+    // The vendored artifact dirs before this run wrote any: a commit the
+    // symlink check refuses (or that fails with nothing written) removes
+    // the ones the loop added, so it leaves no orphan artifact behind
+    // (#898). A dir the pre-run ledger
+    // already names (an artifact redownloaded in place) is kept: it needs
+    // no commit to be referenced.
+    let vendor_dirs_before = (!common.dry_run).then(|| VendorDirsBefore {
+        dirs: EjectSnapshot::vendor_dir_set(&common.cwd),
+        referenced: state
+            .entries
+            .values()
+            .map(|e| common.cwd.join(&e.artifact.path))
+            .collect(),
+    });
+
     // Service downloads, fetched ahead of this serial loop (the wiring and
     // every write stay here, in order). The plan is EXACT — only the
     // records the loop will ask the service for (see
@@ -2939,7 +3045,7 @@ pub(crate) async fn vendor_records_reusing(
             // once it does (see `TakeoverUndo`).
             let mut takeover_undo: Option<TakeoverUndo> = None;
             if let Some(pin) = hosted_pin_of(candidate) {
-                let origins = crate::commands::rollback::patch_server_origins(common);
+                let origins = crate::commands::hosted_unwind::patch_server_origins(common);
                 let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
                     dry_run: common.dry_run,
                     offline: common.offline,
@@ -3284,6 +3390,8 @@ pub(crate) async fn vendor_records_reusing(
                 }
             }
 
+            let outcome =
+                keep_older_vendored_patch(outcome, &state, candidate, &record.uuid, common).await;
             match outcome {
                 None => {
                     env.record(
@@ -3442,9 +3550,9 @@ pub(crate) async fn vendor_records_reusing(
             // restored registry pin.
             if let Some(targets) = vlt_takeover_targets.remove(candidate) {
                 let detail = if vendored {
-                    crate::commands::scan::vlt_takeover_heal(common, &targets).await
+                    crate::commands::vlt_heal::takeover_heal(common, &targets).await
                 } else {
-                    crate::commands::scan::vlt_rollback_heal(common, &targets)
+                    crate::commands::vlt_heal::rollback_heal(common, &targets)
                         .await
                         .into_iter()
                         .map(|(_, detail)| detail)
@@ -3475,31 +3583,48 @@ pub(crate) async fn vendor_records_reusing(
     // others failed — a failed package's backend already put back what it
     // had touched, in the captured state — so a completed run ends exactly
     // where committing after every package would have left it.
+    let mut commit_failed = false;
     if let Some(group) = group {
         socket_patch_core::utils::failpoint::hit("vendor_group_commit");
         match group.commit_changes().await {
             Ok(changes) => {
-                if let Some(committed) = committed {
-                    committed.extend(changes);
+                if let Some(capture) = eject.as_deref_mut() {
+                    capture.committed.extend(changes);
                 }
                 for stale in stale_artifacts {
                     sweep_stale_artifact(common, env, &state, stale).await;
                 }
             }
             Err(e) if socket_patch_core::utils::group_commit::symlinked_target(&e).is_some() => {
-                // Refused before anything was written: the hosted refusal,
-                // same code and wording.
+                // Refused before any lockfile, manifest or ledger was
+                // written: the hosted refusal, same code and wording. The
+                // artifacts the loop already downloaded are removed, and
+                // the packages it vendored are reported as refused, not
+                // applied — nothing of them was committed (#898).
                 has_errors = true;
+                commit_failed = true;
                 let linked = socket_patch_core::utils::group_commit::symlinked_target(&e)
                     .unwrap_or_default();
                 let refusal = socket_patch_core::hosted::engine::symlink_refusal(linked);
-                if !common.json {
-                    eprintln!("Error: {}", refusal.message);
+                let mut message = refusal.message;
+                let leftovers = remove_new_vendor_dirs(common, vendor_dirs_before.as_ref()).await;
+                if !leftovers.is_empty() {
+                    message = format!(
+                        "{} (except the downloaded artifacts that could not be removed: {}; \
+                         `socket-patch vendor --revert` removes them)",
+                        message,
+                        leftovers.join("; ")
+                    );
                 }
-                env.mark_error(EnvelopeError::new(refusal.code, refusal.message));
+                env.retract_applied(events_start, PatchAction::Failed, &refusal.code, &message);
+                if !common.json {
+                    eprintln!("Error: {message}");
+                }
+                env.mark_error(EnvelopeError::new(refusal.code, message));
             }
             Err(e) => {
                 has_errors = true;
+                commit_failed = true;
                 let detail = if socket_patch_core::utils::group_commit::is_pending(&e) {
                     // Some files were replaced and could not be put back:
                     // the journal left behind makes the next locked command
@@ -3510,11 +3635,30 @@ pub(crate) async fn vendor_records_reusing(
                          this project finishes it"
                     )
                 } else {
-                    format!(
+                    // Nothing was committed: like the symlink refusal
+                    // (#898), the artifacts the loop downloaded are removed
+                    // and its packages are reported failed, not applied.
+                    let mut detail = format!(
                         "could not commit the vendored lockfile, manifest and ledger edits: \
                          {e}; the project's lockfiles and .socket/vendor/state.json are \
                          unchanged"
-                    )
+                    );
+                    let leftovers =
+                        remove_new_vendor_dirs(common, vendor_dirs_before.as_ref()).await;
+                    if !leftovers.is_empty() {
+                        detail = format!(
+                            "{detail} (except the downloaded artifacts that could not be \
+                             removed: {}; `socket-patch vendor --revert` removes them)",
+                            leftovers.join("; ")
+                        );
+                    }
+                    env.retract_applied(
+                        events_start,
+                        PatchAction::Failed,
+                        "vendor_commit_failed",
+                        &detail,
+                    );
+                    detail
                 };
                 if !common.json {
                     eprintln!("Error: {detail}");
@@ -3623,68 +3767,128 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
-    if !common.json && !common.silent {
-        let tally = VendorTally::from_envelope(env, common.dry_run, dry_in_sync);
-        println!("{}", format_vendor_summary(common.dry_run, &tally));
-        if env.summary.applied > 0 && !common.dry_run {
-            // pnpm >=11 reads `overrides` ONLY from pnpm-workspace.yaml (the
-            // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
-            // runs must name that file among the committables: a checkout
-            // that loses it silently unvendors on the next install.
-            let commit = commit_hint(&wired_flavors);
-            let mut installs: Vec<&str> = wired_flavors
-                .iter()
-                .filter_map(|f| flavor_install_command(f))
-                .collect();
-            installs.sort_unstable();
-            installs.dedup();
-            let jvm_only = !installs.is_empty()
-                && wired_flavors
-                    .iter()
-                    .filter(|f| flavor_install_command(f).is_some())
-                    .all(|f| JVM_TOOLS.contains(&f.as_str()));
-            let reinstall = if jvm_only {
-                let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
-                format!(
-                    "Run {} so the build resolves the vendored artifacts (the generated root \
-                     file points it at .socket/vendor/)",
-                    cmds.join(" and ")
-                )
-            } else if installs.is_empty() {
-                "Reinstall from the updated lockfile so the installed packages pick up the \
-                 vendored artifacts"
-                    .to_string()
-            } else {
-                let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
-                format!(
-                    "Run {} to update the installed tree (vendoring rewires the lockfile \
-                     only; the current install keeps the unpatched bytes until reinstalled)",
-                    cmds.join(" and ")
-                )
-            };
-            let mut extra = Vec::new();
-            if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {
-                extra.push(
-                    "For binary Bun workspaces, also commit the workspace members' \
-                     .socket/vendor/ tarballs recorded in the vendor ledger."
-                        .to_string(),
-                );
-            }
-            if wired_flavors.contains("composer") {
-                if let Ok(lock) = socket_patch_core::utils::fs::read_regular_to_string_sync(
-                    &common.cwd.join("composer.lock"),
-                ) {
-                    let packages = super::composer_hints::vendored_composer_packages(&lock);
-                    extra.extend(super::composer_hints::vendored_reinstall_hints(&packages));
-                }
-            }
-            for line in crate::ui::next_steps(&commit, &reinstall, &extra) {
-                println!("{line}");
-            }
-        }
+    // A rolled-back eject's summary would describe a vendoring that was
+    // undone: the eject prints it itself once it knows the outcome (#1005).
+    match eject {
+        Some(capture) => capture.wired_flavors = wired_flavors,
+        None => print_vendor_closing(common, env, dry_in_sync, &wired_flavors, !commit_failed),
     }
 
     has_errors
+}
+
+/// The human close of a vendor run: the summary line, then — when
+/// something was vendored and `next_steps` (the run's commit landed) — the
+/// commit and reinstall "Next steps:" for the lockfile flavors the run
+/// wired.
+fn print_vendor_closing(
+    common: &GlobalArgs,
+    env: &Envelope,
+    dry_in_sync: u32,
+    wired_flavors: &HashSet<String>,
+    next_steps: bool,
+) {
+    if common.json || common.silent {
+        return;
+    }
+    let tally = VendorTally::from_envelope(env, common.dry_run, dry_in_sync);
+    println!("{}", format_vendor_summary(common.dry_run, &tally));
+    if env.summary.applied > 0 && !common.dry_run && next_steps {
+        // pnpm >=11 reads `overrides` ONLY from pnpm-workspace.yaml (the
+        // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
+        // runs must name that file among the committables: a checkout
+        // that loses it silently unvendors on the next install.
+        let commit = commit_hint(wired_flavors);
+        let mut installs: Vec<&str> = wired_flavors
+            .iter()
+            .filter_map(|f| flavor_install_command(f))
+            .collect();
+        installs.sort_unstable();
+        installs.dedup();
+        let jvm_only = !installs.is_empty()
+            && wired_flavors
+                .iter()
+                .filter(|f| flavor_install_command(f).is_some())
+                .all(|f| JVM_TOOLS.contains(&f.as_str()));
+        let reinstall = if jvm_only {
+            let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
+            format!(
+                "Run {} so the build resolves the vendored artifacts (the generated root \
+                 file points it at .socket/vendor/)",
+                cmds.join(" and ")
+            )
+        } else if installs.is_empty() {
+            "Reinstall from the updated lockfile so the installed packages pick up the \
+             vendored artifacts"
+                .to_string()
+        } else {
+            let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
+            format!(
+                "Run {} to update the installed tree (vendoring rewires the lockfile \
+                 only; the current install keeps the unpatched bytes until reinstalled)",
+                cmds.join(" and ")
+            )
+        };
+        let mut extra = Vec::new();
+        if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {
+            extra.push(
+                "For binary Bun workspaces, also commit the workspace members' \
+                 .socket/vendor/ tarballs recorded in the vendor ledger."
+                    .to_string(),
+            );
+        }
+        if wired_flavors.contains("composer") {
+            if let Ok(lock) = socket_patch_core::utils::fs::read_regular_to_string_sync(
+                &common.cwd.join("composer.lock"),
+            ) {
+                let packages = super::composer_hints::vendored_composer_packages(&lock);
+                extra.extend(super::composer_hints::vendored_reinstall_hints(&packages));
+            }
+        }
+        for line in crate::ui::next_steps(&commit, &reinstall, &extra) {
+            println!("{line}");
+        }
+    }
+}
+
+/// The vendored artifact dirs a run started with (see
+/// [`EjectSnapshot::vendor_dir_set`]), and the artifact paths its ledger
+/// named then.
+struct VendorDirsBefore {
+    dirs: std::collections::BTreeSet<std::path::PathBuf>,
+    referenced: Vec<std::path::PathBuf>,
+}
+
+/// Remove the vendored artifact dirs that appeared since `before`, except
+/// one holding an artifact the pre-run ledger names (redownloaded in place,
+/// referenced without any commit), returning what could not be removed.
+async fn remove_new_vendor_dirs(
+    common: &GlobalArgs,
+    before: Option<&VendorDirsBefore>,
+) -> Vec<String> {
+    let Some(before) = before else {
+        return Vec::new();
+    };
+    let mut leftovers = Vec::new();
+    for dir in EjectSnapshot::vendor_dir_set(&common.cwd).difference(&before.dirs) {
+        if before.referenced.iter().any(|p| p.starts_with(dir)) {
+            continue;
+        }
+        if let Err(e) = remove_tree_and_prune(dir, &common.cwd.join(SOCKET_DIR)).await {
+            leftovers.push(format!("{}: {e}", dir.display()));
+        }
+    }
+    leftovers
+}
+
+/// What a hosted→vendored eject's vendored apply hands back instead of
+/// printing its own close: every project file its group commit wrote (with
+/// the bytes from before, for the rollback) and the lockfile flavors it
+/// wired (for the "Next steps:" the eject prints only when it completes).
+#[derive(Default)]
+pub(crate) struct EjectCapture {
+    pub(crate) committed: Vec<CommittedFile>,
+    pub(crate) wired_flavors: HashSet<String>,
 }
 
 /// The pseudo-flavors of vendored JVM builds whose wiring is a generated
@@ -4013,7 +4217,7 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
                 .filter(|pin| reverted.contains(&PurlKey::new(&pin.purl)))
                 .collect();
         if !rehosted.is_empty() {
-            let leg = crate::commands::rollback::run_hosted_leg(common, &rehosted).await;
+            let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &rehosted).await;
             for purl in &leg.reverted {
                 record_warning(
                     env,
@@ -4172,10 +4376,11 @@ pub(crate) fn unused_vendored_manifest_keys<V>(
 ///
 /// (a) revert entries whose patch was dropped from the manifest (same
 ///     stale test as [`reconcile_dropped`], shared with the vendor flows);
-/// (b) revert entries whose dependency is no longer in the lockfile graph
-///     ([`dispatch_in_use_one`] == `Some(false)`; `None` keeps, fail-safe)
-///     and drop their manifest entries so the caller's manifest prune +
-///     blob sweep reclaims the rest in the same pass;
+/// (b) revert entries the project no longer consumes
+///     ([`Discovery::vendor_entry_in_use`] == `Some(false)`, the liveness
+///     discovery `vendor --check` and `vex` judge by; `None` keeps,
+///     fail-safe) and drop their manifest entries so the caller's manifest
+///     prune + blob sweep reclaims the rest in the same pass;
 /// (c) sweep orphan uuid dirs.
 ///
 /// A drift-skipped revert ([`RevertOutcome::kept_artifact`]) keeps the
@@ -4246,8 +4451,11 @@ pub(crate) async fn run_vendor_gc(
         }
     }
 
-    // (b) lockfile-unused entries — detached ones included: the probe asks
-    // the live lockfile wiring, which a detached entry has like any other.
+    // (b) lockfile-unused entries — detached ones included: the verdict
+    // reads the live lockfile wiring, which a detached entry has like any
+    // other. Every verdict is taken from ONE discovery of the project as
+    // (a) left it, before (b) reverts anything: a revert rewrites locks,
+    // and the entries still to judge must not see a half-pruned state.
     let mut manifest_dirty = false;
     let candidates: Vec<String> = state
         .entries
@@ -4257,11 +4465,19 @@ pub(crate) async fn run_vendor_gc(
         })
         .map(|(purl, _)| purl.clone())
         .collect();
-    for purl in candidates {
-        let entry = state.entries.get(&purl).cloned().expect("listed above");
-        if dispatch_in_use_one(&entry, &common.cwd).await != Some(false) {
-            continue; // in use, or cannot determine — keep
+    let mut unused: Vec<String> = Vec::new();
+    if !candidates.is_empty() {
+        let discovery = crate::commands::discover_wiring(common, &common.cwd).await;
+        for purl in candidates {
+            let entry = state.entries.get(&purl).expect("listed above");
+            // In use, or cannot determine — keep.
+            if discovery.vendor_entry_in_use(&common.cwd, entry).await == Some(false) {
+                unused.push(purl);
+            }
         }
+    }
+    for purl in unused {
+        let entry = state.entries.get(&purl).cloned().expect("listed above");
         if dry_run {
             out.unused_reverted.push(purl);
             continue;
@@ -5213,7 +5429,7 @@ mod gc_tests {
         tokio::fs::write(
             root.join("package-lock.json"),
             format!(
-                "{{\"packages\":{{\"node_modules/left-pad\":{{\"resolved\":\"file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"}}}}}}"
+                "{{\"packages\":{{\"node_modules/left-pad\":{{\"version\":\"1.3.0\",\"resolved\":\"file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"}}}}}}"
             ),
         )
         .await
@@ -5235,7 +5451,53 @@ mod gc_tests {
         let out = run_vendor_gc(&common, &manifest_path, false).await;
         assert!(out.dropped_reverted.is_empty(), "{out:?}");
         assert!(out.unused_reverted.is_empty(), "{out:?}");
+        assert!(
+            out.failed.is_empty(),
+            "an in-use entry is never reverted: {out:?}"
+        );
         assert_eq!(out.orphan_dirs, 0);
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
+    }
+
+    /// An attestation drop is not a liveness verdict: a lockfileVersion 2
+    /// lock still installs `node_modules/left-pad` from the vendored tarball
+    /// (npm 7+) while its legacy `dependencies` mirror (npm <= 6) resolves
+    /// the registry. Discovery refuses to attest that wiring, but the GC
+    /// must not unwire a patch npm 7+ still installs.
+    #[tokio::test]
+    async fn vendor_gc_keeps_an_entry_whose_wiring_is_only_unattributable() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        tokio::fs::write(
+            tmp.path().join("package-lock.json"),
+            serde_json::json!({
+                "lockfileVersion": 2,
+                "packages": {
+                    "": {"dependencies": {"left-pad": "1.3.0"}},
+                    "node_modules/left-pad": {
+                        "version": "1.3.0",
+                        "resolved": format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+                    },
+                },
+                "dependencies": {
+                    "left-pad": {
+                        "version": "1.3.0",
+                        "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        for dry_run in [true, false] {
+            let out = run_vendor_gc(&common, &manifest_path, dry_run).await;
+            assert!(out.unused_reverted.is_empty(), "dry_run={dry_run}: {out:?}");
+            assert!(out.failed.is_empty(), "dry_run={dry_run}: {out:?}");
+        }
         assert!(load_state(tmp.path())
             .await
             .unwrap()
@@ -5476,9 +5738,100 @@ mod gc_tests {
         assert!(wet.unused_reverted.is_empty(), "{wet:?}");
     }
 
+    /// B19: a vendored COMPOSER entry whose dependency was bumped to a
+    /// registry release in composer.lock is reclaimed by the GC — composer
+    /// (like gem, golang, nuget, maven and most pypi flavors) used to have
+    /// no in-use probe, so the GC kept it forever — while the same entry is
+    /// kept as long as the lock installs from its vendored path dist.
+    #[tokio::test]
+    async fn vendor_gc_reclaims_unused_composer_entry_and_keeps_a_wired_one() {
+        const COMPOSER_PURL: &str = "pkg:composer/monolog/monolog@3.0.0";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let leaf = format!(".socket/vendor/composer/{UUID}/monolog/monolog@3.0.0");
+        tokio::fs::create_dir_all(root.join(&leaf)).await.unwrap();
+        tokio::fs::write(root.join(&leaf).join("composer.json"), b"{}")
+            .await
+            .unwrap();
+        let mut state = VendorState::default();
+        let mut entry = entry(true);
+        entry.ecosystem = "composer".into();
+        entry.base_purl = COMPOSER_PURL.into();
+        entry.flavor = None;
+        entry.artifact.path = leaf.clone();
+        state.entries.insert(COMPOSER_PURL.to_string(), entry);
+        save_state(root, &state).await.unwrap();
+        let common = GlobalArgs {
+            cwd: root.to_path_buf(),
+            json: true,
+            silent: true,
+            ..GlobalArgs::default()
+        };
+        let manifest_path = root.join(".socket/manifest.json");
+
+        // The lock installs from the vendored path dist: in use, kept.
+        tokio::fs::write(
+            root.join("composer.lock"),
+            serde_json::json!({
+                "packages": [{
+                    "name": "monolog/monolog",
+                    "version": "3.0.0",
+                    "dist": {"type": "path", "url": leaf, "reference": UUID},
+                    "transport-options": {"symlink": false},
+                }],
+                "packages-dev": [],
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(out.unused_reverted.is_empty(), "{out:?}");
+        assert!(load_state(root)
+            .await
+            .unwrap()
+            .entries
+            .contains_key(COMPOSER_PURL));
+
+        // Bumped to a registry release: nothing installs the vendored copy.
+        tokio::fs::write(
+            root.join("composer.lock"),
+            serde_json::json!({
+                "packages": [{
+                    "name": "monolog/monolog",
+                    "version": "3.1.0",
+                    "dist": {
+                        "type": "zip",
+                        "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc",
+                        "reference": "abc",
+                    },
+                }],
+                "packages-dev": [],
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(
+            out.unused_reverted,
+            vec![COMPOSER_PURL.to_string()],
+            "{out:?}"
+        );
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(load_state(root).await.unwrap().entries.is_empty());
+        assert!(
+            !root
+                .join(format!(".socket/vendor/composer/{UUID}"))
+                .exists(),
+            "the reclaimed entry's artifact is removed"
+        );
+    }
+
     /// A vendored CARGO entry displaced by a hosted takeover (its lock entry
     /// re-sourced to a socket-patch sparse index) is reclaimable by the GC
-    /// through `dispatch_in_use_one`'s cargo probe, which drops the
+    /// through the discovery in-use verdict (the cargo extractor's lock
+    /// shape rule), which drops the
     /// build-breaking `[patch.crates-io]` entry.
     #[tokio::test]
     async fn vendor_gc_reclaims_cargo_entry_displaced_by_hosted_takeover() {
@@ -6164,6 +6517,20 @@ mod scope_and_hint_tests {
         let golang = with_scope(Some(&["golang"]));
         assert!(ecosystem_in_scope(&golang, "golang"));
     }
+
+    /// A v5 JVM-backend ledger entry is recorded as `jvm`, which is no
+    /// `--ecosystems` name: `--ecosystems maven` must still scope it in
+    /// (the GC passes, rollback's vendored leg and repair all filter ledger
+    /// entries by this), and another ecosystem's scope must leave it out.
+    #[test]
+    fn jvm_ledger_entries_are_in_the_maven_scope() {
+        let maven = with_scope(Some(&["maven"]));
+        assert!(ecosystem_in_scope(&maven, "jvm"));
+        assert!(ecosystem_in_scope(&maven, "maven"));
+        let npm_only = with_scope(Some(&["npm"]));
+        assert!(!ecosystem_in_scope(&npm_only, "jvm"));
+        assert!(ecosystem_in_scope(&with_scope(None), "jvm"));
+    }
 }
 
 #[cfg(test)]
@@ -6243,22 +6610,30 @@ mod revert_dispatch_tests {
         );
     }
 
-    /// [`dispatch_in_use_one`]'s fail-safe arm: every ecosystem without an
-    /// in-use probe (everything but npm/cargo), and a pypi entry of a flavor
-    /// without one (here the pre-flavor `None`), reports `None` — "cannot
-    /// determine" — which all callers must treat as KEEP.
+    /// [`Discovery::vendor_entry_in_use`]'s fail-safe arm: with no file of
+    /// the entry's ecosystem to read (no lock), every ecosystem — and an
+    /// unknown one — reports `None`, "cannot determine", which all callers
+    /// must treat as KEEP.
     #[tokio::test]
-    async fn in_use_probe_is_none_for_unprobed_ecosystems() {
+    async fn in_use_is_none_without_a_lock() {
         let tmp = tempfile::tempdir().unwrap();
+        let discovery = socket_patch_core::vex::discover_patched_refs(tmp.path()).await;
         for (eco, purl) in [
+            ("npm", "pkg:npm/left-pad@1.3.0"),
+            ("cargo", "pkg:cargo/cfg-if@1.0.4"),
             ("gem", "pkg:gem/rails@6.0.3"),
             ("pypi", "pkg:pypi/foo@1.0.0"),
+            ("composer", "pkg:composer/monolog/monolog@3.0.0"),
+            ("golang", "pkg:golang/github.com/pkg/errors@v0.9.1"),
+            ("nuget", "pkg:nuget/Newtonsoft.Json@13.0.1"),
             ("frobnicate", "pkg:frobnicate/x@1.0.0"),
         ] {
             assert_eq!(
-                dispatch_in_use_one(&entry_for(eco, purl), tmp.path()).await,
+                discovery
+                    .vendor_entry_in_use(tmp.path(), &entry_for(eco, purl))
+                    .await,
                 None,
-                "`{eco}` has no in-use probe — must report undeterminable (keep)"
+                "`{eco}` with no lock must report undeterminable (keep)"
             );
         }
     }
@@ -6866,7 +7241,7 @@ mod eject_snapshot_tests {
     #[tokio::test]
     async fn snapshot_fails_closed_on_a_fifo() {
         let tmp = tempfile::tempdir().unwrap();
-        let rel = socket_patch_core::vendor::jvm::coursier_tree::CAPTURED_FILES[0];
+        let rel = socket_patch_core::vendor::jvm::layout::CAPTURED_FILES[0];
         let path = tmp.path().join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();

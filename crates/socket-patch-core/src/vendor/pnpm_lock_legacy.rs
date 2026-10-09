@@ -3281,6 +3281,39 @@ packages:
         );
     }
 
+    /// #920: the `package.json` advisory is emitted once, by the run that
+    /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
+    /// AlreadyPatched.
+    #[tokio::test]
+    async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
+        let mut fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let after: &[u8] = br#"{"name":"left-pad","version":"1.3.0","sideEffects":false}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash,
+            },
+        );
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code.starts_with("vendor_dep_manifest"))
+                .count()
+        };
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_none(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
+    }
+
     /// A non-object package.json refuses before any write.
     #[tokio::test]
     async fn non_object_package_json_refuses() {

@@ -16,8 +16,8 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::fetch_stage::files_diffs_cannot_cover;
 use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
-use crate::commands::rollback::sweep_failure;
 use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, Status};
+use crate::ui::sweep_failure;
 
 #[derive(Args)]
 pub struct RepairArgs {
@@ -47,14 +47,13 @@ pub async fn run(args: RepairArgs) -> i32 {
     // --offline implies strict airgap: no network calls. `--download-only`
     // is the inverse (network-only). The two are now mutually exclusive.
     if args.common.offline && args.download_only {
-        let msg = "--offline and --download-only are mutually exclusive";
-        if args.common.json {
-            let env = error_envelope(Command::Repair, args.common.dry_run, "invalid_args", msg);
-            println!("{}", env.to_pretty_json());
-        } else {
-            eprintln!("Error: {msg}");
-        }
-        return 2;
+        return crate::json_envelope::usage_error(
+            Command::Repair,
+            args.common.json,
+            args.common.dry_run,
+            "invalid_args",
+            "--offline and --download-only are mutually exclusive",
+        );
     }
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -470,7 +469,7 @@ async fn repair_inner(
     // stays a hard error.
     let manifest = read_manifest(manifest_path)
         .await
-        .map_err(|e| crate::commands::list::manifest_error_message(manifest_path, &e))?;
+        .map_err(|e| crate::ui::manifest_error_message(manifest_path, &e))?;
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &args.common.cwd);
     let blobs_path = socket_dir.join("blobs");

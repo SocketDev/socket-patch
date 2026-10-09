@@ -152,6 +152,65 @@ impl Envelope {
         self.events.push(event);
     }
 
+    /// Re-tag every `Applied` event recorded at or after index `since` as
+    /// `action` (`Skipped` or `Failed`) with `code` and `message`, keeping
+    /// the summary in step: for packages a later step of the same run
+    /// undid (a refused group commit, a rolled-back eject), which must not
+    /// be reported or counted as applied. Their file lists are dropped (the
+    /// files are no longer there). The `skipped` advisories recorded for a
+    /// retracted package in the same span (`vendor_prebuilt_downloaded`
+    /// "vendored … from the patch service", `vendor_artifact_reused`, …)
+    /// describe that undone vendoring, so they are dropped too: the
+    /// re-tagged event is the package's one account. Returns how many
+    /// events were re-tagged.
+    pub fn retract_applied(
+        &mut self,
+        since: usize,
+        action: PatchAction,
+        code: &str,
+        message: &str,
+    ) -> usize {
+        let since = since.min(self.events.len());
+        let retracted_purls: std::collections::HashSet<String> = self.events[since..]
+            .iter()
+            .filter(|e| e.action == PatchAction::Applied)
+            .filter_map(|e| e.purl.clone())
+            .collect();
+        let mut index = 0;
+        let summary = &mut self.summary;
+        self.events.retain(|e| {
+            let keep = index < since
+                || e.action != PatchAction::Skipped
+                || !e.purl.as_ref().is_some_and(|p| retracted_purls.contains(p));
+            index += 1;
+            if !keep {
+                summary.skipped = summary.skipped.saturating_sub(1);
+            }
+            keep
+        });
+        let mut retracted = 0;
+        for event in self.events.iter_mut().skip(since) {
+            if event.action != PatchAction::Applied {
+                continue;
+            }
+            self.summary.applied = self.summary.applied.saturating_sub(1);
+            self.summary.bump(action);
+            event.action = action;
+            event.files.clear();
+            event.error_code = Some(code.to_string());
+            if action == PatchAction::Failed {
+                event.error = Some(message.to_string());
+            } else {
+                event.reason = Some(message.to_string());
+            }
+            retracted += 1;
+        }
+        if retracted > 0 && action == PatchAction::Failed {
+            self.mark_partial_failure();
+        }
+        retracted
+    }
+
     /// Mark the run as a partial failure. Idempotent.
     pub fn mark_partial_failure(&mut self) {
         if !matches!(self.status, Status::Error) {
@@ -463,6 +522,96 @@ impl EnvelopeError {
     }
 }
 
+/// The `{code, message}` object every `--json` failure carries as its
+/// top-level `error` — the serialized form of an [`EnvelopeError`].
+pub(crate) fn error_object(err: &EnvelopeError) -> serde_json::Value {
+    serde_json::json!({ "code": err.code, "message": err.message })
+}
+
+/// Mark a legacy (`scan` / `get` / `rollback`) JSON result as a top-level
+/// failure: `status: "error"` plus `error: {code, message}`. Any older
+/// top-level `errorCode` sibling is removed — the code lives in
+/// `error.code` (v5.0). Per-record `errorCode`s inside arrays are untouched.
+pub(crate) fn set_error(value: &mut serde_json::Value, err: EnvelopeError) {
+    // `status` first, so a fresh object reads `{status, error}`.
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("status".into(), serde_json::json!("error"));
+    }
+    set_error_keep_status(value, err);
+}
+
+/// [`set_error`] without touching `status`, for results whose status is
+/// itself the routing signal (get's `selection_required`).
+pub(crate) fn set_error_keep_status(value: &mut serde_json::Value, err: EnvelopeError) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("errorCode");
+        obj.insert("error".into(), error_object(&err));
+    }
+}
+
+/// The minimal legacy failure shape: `{status: "error", error: {code,
+/// message}}`.
+pub(crate) fn legacy_error(code: &str, message: &str) -> serde_json::Value {
+    let mut v = serde_json::json!({});
+    set_error(&mut v, EnvelopeError::new(code, message));
+    v
+}
+
+/// Print [`legacy_error`] on stdout.
+pub(crate) fn print_legacy_error(code: &str, message: &str) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&legacy_error(code, message)).expect("json serialize")
+    );
+}
+
+/// Whether `command` still prints its legacy (non-[`Envelope`]) JSON shape.
+fn is_legacy_shape(command: Command) -> bool {
+    matches!(command, Command::Scan | Command::Get | Command::Rollback)
+}
+
+/// The JSON a self-enforced usage error prints under `--json`: a full
+/// [`Envelope`] for commands already on it, the legacy error shape for
+/// `scan` / `get` / `rollback`.
+pub(crate) fn usage_error_json(
+    command: Command,
+    dry_run: bool,
+    code: &str,
+    message: &str,
+) -> serde_json::Value {
+    if is_legacy_shape(command) {
+        legacy_error(code, message)
+    } else {
+        let mut env = Envelope::new(command);
+        env.dry_run = dry_run;
+        env.mark_error(EnvelopeError::new(code, message));
+        serde_json::to_value(&env).expect("envelope serialize")
+    }
+}
+
+/// Report a usage error a command enforces itself (clap's own parse errors
+/// never reach here) and return its exit code, 2. Under `--json` the coded
+/// error goes to stdout so a consumer always gets parseable output;
+/// otherwise `Error: <message>` goes to stderr.
+pub(crate) fn usage_error(
+    command: Command,
+    json: bool,
+    dry_run: bool,
+    code: &str,
+    message: &str,
+) -> i32 {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&usage_error_json(command, dry_run, code, message))
+                .expect("json serialize")
+        );
+    } else {
+        eprintln!("Error: {message}");
+    }
+    2
+}
+
 /// One run-level advisory (see [`Envelope::warnings`]). Same `code`/`detail`
 /// vocabulary as per-event reasons, but scoped to the whole project/run.
 #[derive(Debug, Clone, Serialize)]
@@ -481,6 +630,175 @@ pub struct RunWarning {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_error_writes_object_and_drops_error_code() {
+        let mut v = serde_json::json!({
+            "status": "success",
+            "errorCode": "lock_held",
+            "error": "old",
+            "patches": [{ "errorCode": "apply_failed", "error": "per-record" }],
+        });
+        set_error(&mut v, EnvelopeError::new("lock_held", "held"));
+        assert_eq!(v["status"], "error");
+        assert_eq!(
+            v["error"],
+            serde_json::json!({"code": "lock_held", "message": "held"})
+        );
+        assert!(v.get("errorCode").is_none(), "{v}");
+        // Per-record keys are out of scope and untouched.
+        assert_eq!(v["patches"][0]["errorCode"], "apply_failed");
+        assert_eq!(v["patches"][0]["error"], "per-record");
+    }
+
+    #[test]
+    fn set_error_keep_status_leaves_status() {
+        let mut v = serde_json::json!({ "status": "selection_required" });
+        set_error_keep_status(&mut v, EnvelopeError::new("selection_required", "pick"));
+        assert_eq!(v["status"], "selection_required");
+        assert_eq!(v["error"]["code"], "selection_required");
+        assert_eq!(v["error"]["message"], "pick");
+    }
+
+    #[test]
+    fn legacy_error_has_minimal_shape() {
+        let v = legacy_error("manifest_unreadable", "bad json");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "status": "error",
+                "error": { "code": "manifest_unreadable", "message": "bad json" },
+            })
+        );
+    }
+
+    #[test]
+    fn usage_error_json_legacy_vs_envelope() {
+        for cmd in [Command::Scan, Command::Get, Command::Rollback] {
+            let v = usage_error_json(cmd, true, "invalid_args", "bad");
+            assert_eq!(v, legacy_error("invalid_args", "bad"), "{cmd:?}");
+        }
+        for cmd in [
+            Command::Apply,
+            Command::List,
+            Command::Remove,
+            Command::Repair,
+            Command::Vendor,
+            Command::Vex,
+        ] {
+            let v = usage_error_json(cmd, true, "invalid_args", "bad");
+            assert_eq!(v["command"], serde_json::to_value(cmd).unwrap());
+            assert_eq!(v["status"], "error");
+            assert_eq!(v["dryRun"], true);
+            assert_eq!(v["events"], serde_json::json!([]));
+            assert_eq!(v["error"]["code"], "invalid_args");
+            assert_eq!(v["error"]["message"], "bad");
+        }
+    }
+
+    #[test]
+    fn usage_error_returns_two() {
+        assert_eq!(
+            usage_error(Command::Scan, false, false, "invalid_args", "x"),
+            2
+        );
+        assert_eq!(
+            usage_error(Command::Remove, true, false, "invalid_args", "x"),
+            2
+        );
+    }
+
+    /// Every `src/commands/**/*.rs` file, with its path relative to the
+    /// crate root.
+    fn command_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src/commands") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        walk(&root.join("src/commands"), &mut files);
+        files.sort();
+        assert!(!files.is_empty(), "no command sources found");
+        files
+            .into_iter()
+            .map(|p| {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, std::fs::read_to_string(&p).expect("read source"))
+            })
+            .collect()
+    }
+
+    /// Guard (#704): a command's self-enforced usage error goes through
+    /// [`usage_error`], which prints the coded error under `--json` and
+    /// returns 2. A bare `return 2;` would bypass that.
+    #[test]
+    fn no_bare_exit_two_in_commands() {
+        const ALLOW: &[&str] = &["src/commands/hosted_bundle.rs"];
+        let mut offenders = Vec::new();
+        for (rel, src) in command_sources() {
+            if ALLOW.contains(&rel.as_str()) {
+                continue;
+            }
+            for (i, line) in src.lines().enumerate() {
+                if line.trim() == "return 2;" {
+                    offenders.push(format!("{rel}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use json_envelope::usage_error for exit-2 usage errors: {offenders:?}"
+        );
+    }
+
+    /// Guard (#704): a `"status": "error"` JSON literal carries `error` as a
+    /// `{code, message}` object and no top-level `"errorCode"`. Checks the
+    /// keys at the same indentation as `"status": "error"`, so per-record
+    /// keys nested deeper are not flagged.
+    #[test]
+    fn error_json_literals_use_the_object_shape() {
+        let mut offenders = Vec::new();
+        for (rel, src) in command_sources() {
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.trim() != r#""status": "error","# {
+                    continue;
+                }
+                let indent = line.len() - line.trim_start().len();
+                for next in &lines[i + 1..] {
+                    let trimmed = next.trim_start();
+                    let next_indent = next.len() - trimmed.len();
+                    if trimmed.is_empty() || next_indent < indent {
+                        break;
+                    }
+                    if next_indent > indent {
+                        continue;
+                    }
+                    let bad = trimmed.starts_with(r#""errorCode":"#)
+                        || (trimmed.starts_with(r#""error":"#)
+                            && !trimmed[r#""error":"#.len()..].trim_start().starts_with('{'));
+                    if bad {
+                        offenders.push(format!("{rel}:{}: {}", i + 1, trimmed));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "top-level `error` must be {{code, message}} with no `errorCode`: {offenders:?}"
+        );
+    }
 
     #[test]
     fn action_tags_round_trip() {
@@ -535,6 +853,52 @@ mod tests {
         assert_eq!(env.summary.downloaded, 1);
         assert_eq!(env.summary.skipped, 1);
         assert_eq!(env.events.len(), 3);
+    }
+
+    #[test]
+    fn retract_applied_retags_only_later_applied_events() {
+        let mut env = Envelope::new(Command::Vendor);
+        env.record(PatchEvent::new(PatchAction::Applied, "pkg:npm/early@1.0.0"));
+        let since = env.events.len();
+        env.record(PatchEvent::new(PatchAction::Applied, "pkg:npm/a@1.0.0"));
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, "pkg:npm/a@1.0.0")
+                .with_reason("vendor_prebuilt_downloaded", "advisory"),
+        );
+        // An advisory for a package that was NOT retracted is kept.
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, "pkg:npm/other@1.0.0")
+                .with_reason("vendor_bundled_instance_skipped", "advisory"),
+        );
+        let n = env.retract_applied(since, PatchAction::Skipped, "eject_rolled_back", "undone");
+        assert_eq!(n, 1);
+        assert_eq!(env.summary.applied, 1, "the earlier event is kept");
+        // The retracted package's "vendored … from the patch service"
+        // advisory described the undone vendoring (#898, #1005): dropped.
+        assert_eq!(env.events.len(), 3, "{:?}", env.events);
+        assert_eq!(env.summary.skipped, 2);
+        assert!(!env
+            .events
+            .iter()
+            .any(|e| e.error_code.as_deref() == Some("vendor_prebuilt_downloaded")));
+        assert_eq!(
+            env.events[2].error_code.as_deref(),
+            Some("vendor_bundled_instance_skipped")
+        );
+        assert_eq!(env.events[1].action, PatchAction::Skipped);
+        assert_eq!(
+            env.events[1].error_code.as_deref(),
+            Some("eject_rolled_back")
+        );
+        assert_eq!(env.events[1].reason.as_deref(), Some("undone"));
+        assert_eq!(env.status, Status::Success);
+
+        let n = env.retract_applied(0, PatchAction::Failed, "refused", "boom");
+        assert_eq!(n, 1);
+        assert_eq!(env.summary.applied, 0);
+        assert_eq!(env.summary.failed, 1);
+        assert_eq!(env.events[0].error.as_deref(), Some("boom"));
+        assert_eq!(env.status, Status::PartialFailure);
     }
 
     #[test]

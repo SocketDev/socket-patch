@@ -164,7 +164,10 @@ async fn vlt_rollback_after_a_relock_has_no_hosted_state_left() {
 
         let what = format!("flags={flags} version={version}");
         assert_eq!(code, 1, "{what}: {doc:#}\n{stderr}");
-        assert_eq!(doc["error"], "Manifest not found", "{what}: {doc:#}");
+        assert_eq!(
+            doc["error"]["message"], "Manifest not found",
+            "{what}: {doc:#}"
+        );
         assert_eq!(read(root, "vlt-lock.json"), relocked, "{what}");
         assert!(
             store_dir(root, TILDE_ID).join("index.js").exists(),

@@ -371,7 +371,8 @@ pub(super) fn check_target_guards(
             let detail = if path.contains(".socket/vendor/pypi/") {
                 format!(
                     "[tool.uv.sources] already routes {key} to a socket-patch vendored wheel; \
-                     run `socket-patch vendor --revert` before re-vendoring"
+                     {remedy}",
+                    remedy = super::common::REVERT_ALL_AND_REVENDOR,
                 )
             } else {
                 format!(
@@ -483,7 +484,7 @@ pub(super) async fn wire_uv(
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, UvMeta, Vec<VendorWarning>), (&'static str, String)> {
     // Before ANY write: a symlinked half would be replaced by the rename.
-    refuse_symlinked(root, &UV_PAIR, "pypi_uv_symlink_unsupported").await?;
+    refuse_symlinked(root, &UV_PAIR).await?;
     match check_target_guards(p, canon_name, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -795,9 +796,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     let lock_path = root.join("uv.lock");
     // A symlinked half would be replaced by the rename-over write: keep the
     // artifact (the wiring still routes through it) and fail the revert.
-    if let Err((code, detail)) =
-        refuse_symlinked(root, &UV_PAIR, "pypi_uv_symlink_unsupported").await
-    {
+    if let Err((code, detail)) = refuse_symlinked(root, &UV_PAIR).await {
         return RevertOutcome {
             kept_artifact: true,
             success: false,
@@ -823,6 +822,33 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     // ALREADY-CONVERGED probes below key on it (see the LIVENESS CONTRACT
     // on `RevertOutcome::drift_skipped`).
     let needle = format!(".socket/vendor/pypi/{}", entry.uuid);
+    // REMOVED, not drift (#1140): `uv remove <pkg>` drops the dependency
+    // together with every fragment that routed through the wheel. When
+    // neither file names this entry's uuid any more, a record whose written
+    // fragment carried it has nothing left to restore; it warns
+    // `vendor_lock_entry_removed` so the revert converges. Probed once,
+    // before any record is reverted, so only the user's own edits count.
+    let uuid_lower = entry.uuid.to_ascii_lowercase();
+    let unreferenced = ![&pyproject_text, &lock_text]
+        .iter()
+        .any(|text| text.to_ascii_lowercase().contains(&uuid_lower));
+    let removed = |rec: &WiringRecord| {
+        let carried_uuid = rec
+            .new
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|new| new.to_ascii_lowercase().contains(&uuid_lower));
+        (unreferenced && carried_uuid).then(|| {
+            VendorWarning::new(
+                super::LOCK_ENTRY_REMOVED_CODE,
+                format!(
+                    "{} entry for {:?} no longer exists and nothing references {needle} any \
+                     more (the dependency was removed); nothing to restore",
+                    rec.kind, rec.key
+                ),
+            )
+        })
+    };
 
     for rec in entry.wiring.iter().rev() {
         let new_text = rec.new.as_ref().and_then(serde_json::Value::as_str);
@@ -836,6 +862,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                 match respell_original(orig, &rec.kind, key, &pyproject_text) {
                     Ok(text) => Some(text),
                     Err(reason) => {
+                        if let Some(w) = removed(rec) {
+                            warnings.push(w);
+                            continue;
+                        }
                         warnings.push(VendorWarning::new(
                             "vendor_lock_entry_drifted",
                             format!(
@@ -870,7 +900,9 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                 {
                     ArrayRevert::Reverted(t) => lock_text = t,
                     ArrayRevert::Converged => {}
-                    ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
+                    ArrayRevert::Drift => {
+                        warnings.push(removed(rec).unwrap_or_else(|| drifted("uv.lock")))
+                    }
                 }
             }
             "uv_lock_package" | "uv_lock_requires_dist" => {
@@ -895,7 +927,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         if original_text.is_some_and(|orig| haystack.contains(orig)) {
                             continue;
                         }
-                        warnings.push(drifted("uv.lock"));
+                        warnings.push(removed(rec).unwrap_or_else(|| drifted("uv.lock")));
                     }
                 }
             }
@@ -943,7 +975,9 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                 ) {
                     ArrayRevert::Reverted(t) => lock_text = t,
                     ArrayRevert::Converged => {}
-                    ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
+                    ArrayRevert::Drift => {
+                        warnings.push(removed(rec).unwrap_or_else(|| drifted("uv.lock")))
+                    }
                 },
             },
             "uv_sources_entry" => {
@@ -2867,6 +2901,65 @@ wheels = [
             "requires-dist specifier restored"
         );
         assert_eq!(lock, DIRECT_REGISTRY_LOCK);
+    }
+
+    /// #1140: `uv remove six` after vendoring drops the dependency, its
+    /// `[tool.uv.sources]` line and every uv.lock fragment that routed
+    /// through the wheel. Nothing is left to restore, so the revert must not
+    /// read the vanished package unit and requires-dist element (whose
+    /// declaration is gone too) as drift: that kept the wheel and ledger
+    /// entry forever and looped `vendor --check` → `scan --prune`.
+    #[tokio::test]
+    async fn revert_after_uv_remove_is_not_drift() {
+        const REMOVED_PYPROJECT: &str = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\
+            requires-python = \">=3.10\"\ndependencies = []\n";
+        const REMOVED_LOCK: &str = "version = 1\nrevision = 3\nrequires-python = \">=3.10\"\n\n\
+            [[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\n";
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
+        )
+        .await
+        .unwrap();
+        let entry = entry_for(wiring, meta);
+
+        tokio::fs::write(tmp.path().join("pyproject.toml"), REMOVED_PYPROJECT)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), REMOVED_LOCK)
+            .await
+            .unwrap();
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, REMOVED_PYPROJECT);
+        assert_eq!(lock, REMOVED_LOCK);
+
+        // A lock that still routes through the uuid dir (a hand-edited
+        // package unit) is genuine drift and keeps everything.
+        let edited = DIRECT_PATH_LOCK.replace("version = \"1.16.0\"", "version = \"1.16.1\"");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), REMOVED_PYPROJECT)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &edited)
+            .await
+            .unwrap();
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        let (_, lock) = read_pair(tmp.path()).await;
+        assert_eq!(lock, edited);
     }
 
     #[tokio::test]
@@ -6285,7 +6378,7 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
     /// renames over it: a symlinked pyproject.toml / uv.lock would be
     /// REPLACED by a regular file (target left stale, git shows a
     /// typechange). Wire refuses before ANY write with
-    /// `pypi_uv_symlink_unsupported` naming the file; revert keeps the
+    /// `redirect_symlinked_file_unsupported` naming the file; revert keeps the
     /// artifact and fails. The link stays a link, its target keeps its bytes,
     /// and nothing under `.socket/` appears.
     #[cfg(unix)]
@@ -6321,7 +6414,11 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             )
             .await
             .unwrap_err();
-            assert_eq!(code, "pypi_uv_symlink_unsupported", "{linked}: {detail}");
+            assert_eq!(
+                code,
+                crate::hosted::engine::SYMLINK_REFUSAL,
+                "{linked}: {detail}"
+            );
             assert!(detail.contains(linked), "{linked}: {detail}");
             let meta = tokio::fs::symlink_metadata(tmp.path().join(linked))
                 .await
@@ -6357,7 +6454,7 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             assert!(outcome.kept_artifact, "{linked}: artifact must be kept");
             let error = outcome.error.unwrap_or_default();
             assert!(
-                error.contains("pypi_uv_symlink_unsupported") && error.contains(linked),
+                error.contains(crate::hosted::engine::SYMLINK_REFUSAL) && error.contains(linked),
                 "{linked}: {error}"
             );
             let meta = tokio::fs::symlink_metadata(tmp.path().join(linked))

@@ -58,6 +58,7 @@ use super::{
     bare_sha256_hex, registry_override_of_kind, DepOverride, FileEdit, RewriteResult,
     RewriteWarning,
 };
+use crate::formats::text::{split_bom, strip_bom};
 use crate::gradle::dsl::{self, is_ident, is_punct, Dsl, Tok, Token};
 use crate::gradle::eol::{eol_eq, newline_of, to_lf};
 use crate::gradle::graph::{
@@ -67,6 +68,7 @@ use crate::gradle::locks;
 use crate::gradle::selector::{admits, gradle_version_cmp, parse_selector, Selector};
 use crate::patch::path_safety::is_canonical_uuid;
 use crate::vendor::jvm::gradle as vendored;
+use crate::vendor::jvm::layout::GRADLE_ROOT_FILES;
 
 /// The owned hosted settings script. Its bytes change only with a CLI
 /// release.
@@ -91,14 +93,6 @@ const REPO_NAME_PREFIX: &str = "socketPatchHosted";
 const VENDORED_INDEX_REL: &str = vendored::INDEX_REL;
 const VERIFICATION_REL: &str = vendored::VERIFICATION_REL;
 const WRAPPER_PROPERTIES_REL: &str = "gradle/wrapper/gradle-wrapper.properties";
-
-/// Root-level files whose presence makes the checkout a Gradle build.
-pub const GRADLE_ROOT_FILES: &[&str] = &[
-    "settings.gradle",
-    "settings.gradle.kts",
-    "build.gradle",
-    "build.gradle.kts",
-];
 
 /// Whether `rel` is a settings-classpath lock (`settings-gradle.lockfile`
 /// of any build). Gradle resolves that classpath before any settings
@@ -181,7 +175,7 @@ impl HostedRow {
     /// whitespace and two lowercase sha256s.
     pub fn valid(&self) -> bool {
         let hex64 = |s: &str| crate::utils::digest::is_hex64_lower(s);
-        vendored::safe_coordinates(&self.group, &self.artifact, &self.base)
+        crate::vendor::jvm::layout::safe_coordinates(&self.group, &self.artifact, &self.base)
             && self.base.chars().any(|c| c != '.')
             && is_canonical_uuid(&self.uuid)
             && self.uuid == self.uuid.to_ascii_lowercase()
@@ -388,7 +382,7 @@ pub fn with_apply_line(
     let line = apply_line(dsl, prefix, digest, created);
     let nl = newline_of(text);
     let mut out = text.to_string();
-    if !out.is_empty() && !out.ends_with('\n') && out != "\u{feff}" {
+    if !strip_bom(&out).is_empty() && !out.ends_with('\n') {
         out.push_str(nl);
     }
     out.push_str(&line);
@@ -403,14 +397,10 @@ pub fn without_apply_line(text: &str, dsl: Dsl, prefix: &str) -> Option<String> 
     let (start, end) = apply_line_span(text, dsl, prefix)?;
     let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
     let lead = &text[line_start..start];
-    if !lead.trim_start_matches('\u{feff}').trim().is_empty() {
+    let (keep_bom, lead) = split_bom(lead);
+    if !lead.trim().is_empty() {
         return None;
     }
-    let keep_bom = if lead.starts_with('\u{feff}') {
-        "\u{feff}"
-    } else {
-        ""
-    };
     let mut cut_end = end;
     if text[cut_end..].starts_with("\r\n") {
         cut_end += 2;
@@ -655,6 +645,7 @@ pub fn lockfile_paths(graph: &ScriptGraph, files: &BTreeMap<String, String>) -> 
 // ── the planner ──────────────────────────────────────────────────────────
 
 /// A refusal: nothing is written for the dep.
+#[derive(Clone)]
 struct Refusal {
     code: &'static str,
     detail: String,
@@ -1015,28 +1006,48 @@ fn ga_refusal(
     None
 }
 
-/// Why the hosted wiring of `row` no longer holds in the build `files`
+/// Why the hosted wiring of a row no longer holds in the build `files`
 /// holds, by the planner's own build- and GA-level refusals (see
 /// [`ga_refusal`]): `(code, detail)`. Discovery's re-check of a pin made
-/// before the build changed.
-pub(crate) fn pinned_row_refusal(
-    files: &BTreeMap<String, String>,
-    graph: &ScriptGraph,
-    row: &HostedRow,
-) -> Option<(&'static str, String)> {
-    let lock_paths = lockfile_paths(graph, files);
-    project_refusal(files, graph, &Ok(Vec::new()))
-        .or_else(|| {
-            ga_refusal(
-                files,
-                graph,
-                &lock_paths,
-                &row.group,
-                &row.artifact,
-                &row.base,
+/// before the build changed. The build-level half (the project refusal and
+/// the lock paths) depends on no row, so it is worked out once, on the
+/// first row that asks.
+pub(crate) struct PinnedRowChecks<'a> {
+    files: &'a BTreeMap<String, String>,
+    graph: &'a ScriptGraph,
+    build: std::sync::OnceLock<(Vec<String>, Option<Refusal>)>,
+}
+
+impl<'a> PinnedRowChecks<'a> {
+    pub(crate) fn new(files: &'a BTreeMap<String, String>, graph: &'a ScriptGraph) -> Self {
+        Self {
+            files,
+            graph,
+            build: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn refusal(&self, row: &HostedRow) -> Option<(&'static str, String)> {
+        let (lock_paths, project) = self.build.get_or_init(|| {
+            (
+                lockfile_paths(self.graph, self.files),
+                project_refusal(self.files, self.graph, &Ok(Vec::new())),
             )
-        })
-        .map(|r| (r.code, r.detail))
+        });
+        project
+            .clone()
+            .or_else(|| {
+                ga_refusal(
+                    self.files,
+                    self.graph,
+                    lock_paths,
+                    &row.group,
+                    &row.artifact,
+                    &row.base,
+                )
+            })
+            .map(|r| (r.code, r.detail))
+    }
 }
 
 /// Whether `version` orders above `base` (Gradle's ordering): a newer
@@ -1059,56 +1070,6 @@ fn may_admit_above(sel: &Selector, base: &str) -> bool {
         }
         Selector::Latest(_) | Selector::Unknown => true,
     }
-}
-
-/// Whether the hosted planner would refuse `dep` in the build `files`
-/// holds once its vendored Gradle wiring is reverted: every refusal of
-/// [`rewrite_gradle_hosted`] except the vendored-index conflict, which the
-/// takeover's revert clears. The vendored backend serves the original GAV
-/// and leaves lock files alone, so the lock checks hold before the revert
-/// too. A takeover runs this before reverting anything, so a refused purl
-/// keeps its working vendored patch. `None` when there is no Gradle build.
-pub fn takeover_refusal(
-    files: &BTreeMap<String, String>,
-    unreadable: &BTreeSet<String>,
-    dep: &DepOverride,
-) -> Option<RewriteWarning> {
-    if !gradle_build_present(files) {
-        return None;
-    }
-    let (group, artifact) = coords_of(dep);
-    let warning = |r: Refusal| RewriteWarning {
-        code: r.code.into(),
-        detail: format!(
-            "{}; the vendored patch of {group}:{artifact}:{} stays in place (NOT switched to \
-             hosted)",
-            r.detail, dep.version
-        ),
-    };
-    if registry_override_of_kind(dep, "maven2").is_none() {
-        return Some(warning(refusal(
-            "redirect_gradle_override_invalid",
-            "the hosted grant carries no maven2 repository",
-        )));
-    }
-    let graph = graph_of(files);
-    let lock_paths = lockfile_paths(&graph, files);
-    let index = files
-        .get(HOSTED_INDEX_REL)
-        .map_or(Ok(Vec::new()), |t| parse_index(t));
-    let project = unreadable_refusal(unreadable).or_else(|| project_refusal(files, &graph, &index));
-    let rows = index.unwrap_or_default();
-    plan_dep(
-        dep,
-        files,
-        &graph,
-        &lock_paths,
-        &rows,
-        &BTreeSet::new(),
-        project.as_ref(),
-    )
-    .err()
-    .map(warning)
 }
 
 /// `(groupId, artifactId)` of a maven dep.
@@ -1928,6 +1889,18 @@ mod tests {
             with_apply_line(kts, Dsl::Kotlin, "", "4567", true).as_deref(),
             Some("\u{feff}apply(from = \".socket/gradle/socket-patch.hosted.settings.gradle\") // socket-patch-hosted 4567\r\nrootProject.name = \"x\"\r\n")
         );
+        // A second BOM is content (#905): the apply line shares its line
+        // with it, so it is not cut out.
+        let two = format!("\u{feff}{kts}");
+        assert_eq!(without_apply_line(&two, Dsl::Kotlin, ""), None);
+        // A file holding only a BOM gets no blank line before the apply line.
+        assert_eq!(
+            with_apply_line("\u{feff}", Dsl::Kotlin, "", "4567", true)
+                .unwrap()
+                .split_once("apply(")
+                .map(|(head, _)| head),
+            Some("\u{feff}")
+        );
     }
 
     /// buildSrc and a literal included build get their own apply line (one
@@ -2399,103 +2372,6 @@ mod tests {
             dep(),
             "redirect_gradle_version_conflict",
         );
-    }
-
-    /// The takeover preflight refuses what the planner would refuse once
-    /// the vendored wiring is gone, and ignores the vendored index itself.
-    #[test]
-    fn takeover_refusal_mirrors_the_planner_except_the_vendored_index() {
-        let vendored = (
-            ".socket/vendor/gradle-index.tsv",
-            "#socket-patch-gradle-index 1\ncom.socketfixture:victim:1.10.0\tx\ty\tz\n",
-        );
-        let s = ("settings.gradle", "rootProject.name = 'app'\n");
-        let none = BTreeSet::new();
-        assert!(takeover_refusal(&files(&[s, vendored]), &none, &dep()).is_none());
-        assert!(takeover_refusal(&files(&[("pom.xml", "<project/>")]), &none, &dep()).is_none());
-        // A build file that exists but cannot be read refuses the takeover.
-        let unreadable: BTreeSet<String> = ["settings.gradle".to_string()].into();
-        assert_eq!(
-            takeover_refusal(
-                &files(&[("build.gradle", ""), vendored]),
-                &unreadable,
-                &dep()
-            )
-            .map(|w| w.code)
-            .as_deref(),
-            Some(UNREADABLE_REFUSAL_CODE)
-        );
-        let code = |input: &[(&str, &str)], d: DepOverride| {
-            takeover_refusal(&files(input), &none, &d).map(|w| w.code)
-        };
-        assert_eq!(
-            code(
-                &[
-                    s,
-                    vendored,
-                    (
-                        "build.gradle",
-                        "dependencyLocking { lockFile = file('x.lockfile') }\n"
-                    )
-                ],
-                dep()
-            )
-            .as_deref(),
-            Some("redirect_gradle_lock_location_unknown")
-        );
-        let mut legacy = dep();
-        legacy
-            .registry_override
-            .as_mut()
-            .unwrap()
-            .identifiers
-            .maven_suffixed_version = None;
-        assert_eq!(
-            code(&[s, vendored], legacy).as_deref(),
-            Some("redirect_gradle_same_gav_unsupported")
-        );
-        let mut no_sha = dep();
-        no_sha.integrity.sha256 = None;
-        assert_eq!(
-            code(&[s, vendored], no_sha).as_deref(),
-            Some("redirect_gradle_override_invalid")
-        );
-        let mut no_override = dep();
-        no_override.registry_override = None;
-        assert_eq!(
-            code(&[s, vendored], no_override).as_deref(),
-            Some("redirect_gradle_override_invalid")
-        );
-        assert_eq!(
-            code(
-                &[
-                    s,
-                    vendored,
-                    (
-                        "settings-gradle.lockfile",
-                        "com.socketfixture:victim:1.10.0=classpath\n"
-                    ),
-                ],
-                dep()
-            )
-            .as_deref(),
-            Some("redirect_gradle_settings_classpath")
-        );
-        let w = takeover_refusal(
-            &files(&[
-                s,
-                vendored,
-                (
-                    "gradle.lockfile",
-                    "com.socketfixture:victim:1.9=runtimeClasspath\n",
-                ),
-            ]),
-            &none,
-            &dep(),
-        )
-        .unwrap();
-        assert_eq!(w.code, "redirect_gradle_lock_conflict");
-        assert!(w.detail.contains("stays in place"), "{}", w.detail);
     }
 
     /// The files a restore can touch: every build's settings (a missing

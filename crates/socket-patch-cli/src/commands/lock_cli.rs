@@ -36,10 +36,15 @@ use crate::json_envelope::{Command, Envelope, EnvelopeError};
 /// unlinks `apply.lock` while still holding the lock, releases it, and
 /// prunes an otherwise-empty `.socket/` — so no command leaves a lock
 /// file (or a bare `.socket/`) behind, and this wrapper never has to
-/// touch the file. A leftover from a crashed run never contends: the
-/// kernel released the dead holder's advisory lock along with its file
-/// handle, so the acquire reclaims the file in place and removes it on
-/// exit. `Held` therefore always means a *live* process.
+/// touch the file. An interrupted run removes the file too: the
+/// `interrupt` handlers (SIGINT/SIGTERM/SIGHUP, Windows console ctrl)
+/// clean up the held lock before the signal ends the process. Only an
+/// uncatchable kill (SIGKILL, power loss) can leave it, and such a
+/// leftover never contends: the kernel released the dead holder's
+/// advisory lock along with its file handle, so the acquire reclaims the
+/// file in place and removes it on exit. `Held` therefore always means a
+/// *live* process. socket-patch never keeps a persistent lock file in the
+/// project; one that is ever needed lives outside it.
 pub(crate) fn acquire_or_emit(
     socket_dir: &Path,
     command: Command,
@@ -214,11 +219,7 @@ fn emit(command: Command, json: bool, dry_run: bool, code: &str, message: &str, 
 /// capitalized; the envelope keeps the message verbatim), then the
 /// indented hint when there is one.
 fn format_human_error(message: &str, hint: &str) -> String {
-    let mut chars = message.chars();
-    let message: String = match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    };
+    let message = crate::ui::sentence_case(message);
     if hint.is_empty() {
         format!("Error: {message}\n")
     } else {

@@ -11,10 +11,14 @@
 //! artifact, rebuilds it and wires the project exactly as an uninterrupted
 //! run would have.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::{json, Value};
@@ -24,13 +28,6 @@ const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 const PURL: &str = "pkg:npm/left-pad@1.3.0";
 const ORIG_INDEX: &[u8] = b"module.exports = () => 'orig';\n";
 const PATCHED_INDEX: &[u8] = b"module.exports = () => 'patched';\n";
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn rel_tgz() -> String {
     format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")
@@ -89,10 +86,6 @@ fn npm_project() -> tempfile::TempDir {
     )
     .unwrap();
     tmp
-}
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
 /// `vendor --json --offline` through the built binary, optionally crashing

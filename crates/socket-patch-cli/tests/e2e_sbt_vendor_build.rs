@@ -31,6 +31,10 @@
 //! VERSION,REQUIRED,SEED}` (`sbt_vendor_build_common`). Scratch trees go
 //! under `TMPDIR`.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "maven_build_common/mod.rs"]
@@ -68,10 +72,6 @@ fn purl((g, a, v): (&str, &str, &str)) -> String {
 
 fn hex8(uuid: &str) -> &str {
     &uuid[..8]
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
 /// One warmed fixture: the build at `proj`, its isolated `home` (whose

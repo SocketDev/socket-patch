@@ -42,6 +42,10 @@
 //! `scripts/yarn-berry-vex-matrix.sh`); `SOCKET_PATCH_YARN_E2E_REQUIRED=1`
 //! turns every soft-skip into a failure.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -86,10 +90,6 @@ macro_rules! skip {
 }
 
 // ── self-contained helpers (convention: e2e test files stay standalone) ─
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Probe corepack from a NEUTRAL temp dir (see the redirect sibling: an
 /// ancestor `packageManager` field would make corepack refuse other PMs).
@@ -224,11 +224,6 @@ fn assert_member_resolves_patched(root: &Path, patched: &[u8]) {
         bytes, patched,
         "member-resolved bytes must be byte-identical to the patched content"
     );
-}
-
-/// Git-blob SHA-256 for the offline vendor manifest.
-fn git_sha256(content: &[u8]) -> String {
-    compute_git_sha256_from_bytes(content)
 }
 
 /// Write `.socket/manifest.json` + the after-hash blob so vendor runs fully

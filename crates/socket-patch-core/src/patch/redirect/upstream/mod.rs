@@ -82,9 +82,30 @@ impl HostedPin {
             .collect()
     }
 
-    /// Every hosted pin a discovery holds.
+    /// Every hosted pin a discovery holds: its refs, plus the refs it
+    /// withholds from attestation only because an unreachable unpatched
+    /// copy installs beside them ([`Discovery::shadowed`], #828) — that
+    /// wiring is still one package version's pin, so it is restorable.
     pub fn all(discovery: &Discovery) -> Vec<HostedPin> {
-        Self::from_refs(&discovery.refs)
+        Self::from_refs(discovery.refs.iter().chain(&discovery.shadowed))
+    }
+
+    /// THE "is this patch pinned" answer: the attributable hosted pins
+    /// lockfile discovery reads through `view` (the disk, a snapshot of it
+    /// overlaid with a pending rewrite, or an in-memory project), with
+    /// `origins` counting as patch servers besides Socket's own. The
+    /// forward rewrite's confirmation, the rollout's recorded view (disk
+    /// and in memory) and the management commands' [`HostedInventory`] all
+    /// read pins through discovery, so none of them can call a uuid pinned
+    /// that another one calls unpinned or contested.
+    pub async fn discover(
+        view: crate::vendor::lock_inventory::ProjectView<'_>,
+        origins: &[String],
+    ) -> Vec<HostedPin> {
+        let opts = crate::vex::DiscoverOptions {
+            patch_server_origins: origins.to_vec(),
+        };
+        Self::all(&crate::vex::discover::discover_patched_refs_view(view, &opts).await)
     }
 
     /// `(name, version)` of the purl, percent-decoded.
@@ -108,6 +129,11 @@ pub struct ContestedWiring {
     pub files: Vec<String>,
     /// Discovery's own findings for those files (`code: detail`), if any.
     pub details: Vec<String>,
+    /// The ecosystems (`cargo`, `nuget`) of a LOCKLESS pin among this
+    /// wiring: a registry pin no lockfile records a version for. Nothing
+    /// the lockfiles hold can attribute it, so its remedy is to create the
+    /// lockfile, not to reconcile one.
+    pub lockless: BTreeSet<String>,
 }
 
 /// The project's hosted state as raw wiring: the attributable pins (what
@@ -154,16 +180,23 @@ impl HostedInventory {
         // is excused in a file that also names the pin's own patch uuid.
         let pin_tokens: BTreeMap<String, BTreeSet<&str>> = {
             let mut tokens: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-            for r in &discovery.refs {
-                if r.mode != WiringMode::Hosted {
-                    continue;
-                }
-                let Some(url) = r.url.as_deref() else {
-                    continue;
-                };
+            // A lockless pin's index url carries its token the same way.
+            let urls = discovery
+                .refs
+                .iter()
+                .chain(&discovery.shadowed)
+                .filter(|r| r.mode == WiringMode::Hosted)
+                .filter_map(|r| Some((r.url.as_deref()?, r.uuid.as_str())))
+                .chain(
+                    discovery
+                        .unlocked_pins
+                        .iter()
+                        .filter_map(|p| Some((p.index_url.as_deref()?, p.uuid.as_str()))),
+                );
+            for (url, uuid) in urls {
                 for token in url_uuid_segments(url) {
-                    if token != r.uuid {
-                        tokens.entry(token).or_default().insert(r.uuid.as_str());
+                    if token != uuid {
+                        tokens.entry(token).or_default().insert(uuid);
                     }
                 }
             }
@@ -183,6 +216,7 @@ impl HostedInventory {
             })
         };
         let mut contested: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut lockless: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for r in &discovery.recognized {
             let file = norm(&r.file);
             if r.mode == WiringMode::Hosted
@@ -202,6 +236,10 @@ impl HostedInventory {
                     .entry(pin.uuid.clone())
                     .or_default()
                     .insert(norm(&pin.file));
+                lockless
+                    .entry(pin.uuid.clone())
+                    .or_default()
+                    .insert(pin.ecosystem.clone());
             }
         }
         let contested = contested
@@ -216,6 +254,7 @@ impl HostedInventory {
                     .into_iter()
                     .collect();
                 ContestedWiring {
+                    lockless: lockless.remove(&uuid).unwrap_or_default(),
                     uuid,
                     files: files.into_iter().collect(),
                     details,
@@ -249,24 +288,109 @@ impl HostedInventory {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let lockless: BTreeSet<&str> = self
+            .contested
+            .iter()
+            .flat_map(|c| c.lockless.iter().map(String::as_str))
+            .collect();
+        let all_lockless = self.contested.iter().all(|c| !c.lockless.is_empty());
         // Files, not uuids: a hosted URL also carries its grant token as a
         // uuid-shaped segment, so the recognized set over-names patches.
         let mut msg = format!(
             "{} wire(s) Socket-hosted patches that cannot be attributed to one package \
-             version (the lockfiles disagree, or the reference is malformed), so socket-patch \
-             cannot manage them safely",
-            files.join(", ")
+             version ({}), so socket-patch cannot manage them safely",
+            files.join(", "),
+            if all_lockless {
+                "no lockfile records which version the pin resolves"
+            } else if lockless.is_empty() {
+                "the lockfiles disagree, or the reference is malformed"
+            } else {
+                "the lockfiles disagree, the reference is malformed, or no lockfile records \
+                 the pinned version"
+            }
         );
         if !details.is_empty() {
             msg.push_str(&format!(" ({})", details.join("; ")));
         }
-        msg.push_str(&format!(
-            "; reconcile the lockfiles (re-run `socket-patch scan --mode hosted`) or restore \
-             them from version control (`git checkout -- {}`)",
+        // A lockless pin is attributed once its lockfile exists: re-running
+        // the hosted scan alone would only write the same pin again.
+        let mut remedies: Vec<String> = Vec::new();
+        if !all_lockless {
+            remedies.push(
+                "reconcile the lockfiles (re-run `socket-patch scan --mode hosted`)".to_string(),
+            );
+        }
+        for eco in &lockless {
+            match *eco {
+                "nuget" => remedies.push(
+                    "create packages.lock.json (`dotnet restore --use-lock-file`)".to_string(),
+                ),
+                "cargo" => {
+                    remedies.push("create Cargo.lock (`cargo generate-lockfile`)".to_string())
+                }
+                _ => {}
+            }
+        }
+        remedies.push(format!(
+            "restore them from version control (`git checkout -- {}`)",
             files.join(" ")
         ));
+        msg.push_str(&format!("; {}", remedies.join(" or ")));
         Some(msg)
     }
+}
+
+/// The origins (`scheme://host[:port]`) of the patch servers `deps` are
+/// served from — their artifact and registry index urls, a `sparse+` /
+/// `registry+` kind prefix dropped — sorted and deduplicated. Passed as
+/// discovery's extra origins, they let it recognize the pins a run writes
+/// for them when the server is not the configured one.
+pub fn dep_origins<'a>(deps: impl IntoIterator<Item = &'a super::DepOverride>) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for dep in deps {
+        let index = dep.registry_override.as_ref().map(|r| r.index_url.as_str());
+        for url in std::iter::once(dep.artifact_url.as_str()).chain(index) {
+            out.extend(dep_origins_of_url(url));
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// `scheme://host[:port]` of `url` (a `kind+` scheme prefix dropped, the
+/// default port omitted), or `None` when it does not parse.
+fn dep_origins_of_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    let (scheme, _) = url.split_once("://")?;
+    let text = match scheme.rsplit_once('+') {
+        Some((kind, _)) => &url[kind.len() + 1..],
+        None => url,
+    };
+    let parsed = reqwest::Url::parse(text).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
+/// [`dep_origins`] less the ones discovery already counts: Socket's own
+/// patch server and `configured` (the operator's `--patch-server-url`). An
+/// empty answer means a discovery over `configured` already recognizes
+/// every pin these deps could have.
+pub fn foreign_dep_origins<'a>(
+    deps: impl IntoIterator<Item = &'a super::DepOverride>,
+    configured: &[String],
+) -> Vec<String> {
+    dep_origins(deps)
+        .into_iter()
+        .filter(|origin| {
+            let known = std::iter::once(format!("https://{}", super::SOCKET_PATCH_SERVER_HOST))
+                .chain(configured.iter().cloned());
+            !known
+                .into_iter()
+                .any(|k| dep_origins_of_url(&k).as_deref() == Some(origin.as_str()))
+        })
+        .collect()
 }
 
 /// The canonical-uuid path segments of a hosted URL discovery already

@@ -1,4 +1,4 @@
-//! The vendored-mode (`--mode vendored` / `--vendor`) flow driven by
+//! The vendored-mode (`--mode vendored`) flow driven by
 //! `scan`: the shared download → vendor-engine → GC step, its JSON and
 //! interactive arms, the pre-download skip partitions, and the `boxed_*`
 //! transient-frame constructors that keep the never-taken vendor branches
@@ -28,8 +28,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
+use crate::commands::agent_download::{
+    download_patch_records_reusing, DetachedDownload, DownloadParams,
+};
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
-use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, symlinked_wiring_warnings, track_outcomes_for_vendor,
@@ -64,7 +66,7 @@ type VendorStepError = (&'static str, String, Option<Box<Envelope>>);
 /// [`VendorStepError`].
 type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 
-/// Dry-run preview for `scan --vendor` (and `get … --mode vendored
+/// Dry-run preview for `scan --mode vendored` (and `get … --mode vendored
 /// --dry-run`): classify each selected patch against the vendor ledger
 /// without writing anything or touching the network beyond discovery.
 /// Action values are part of the CLI contract: `would_vendor` (no ledger
@@ -376,7 +378,7 @@ async fn vendor_under_lock(
                 detached: true,
                 force: false,
                 prior,
-                committed: None,
+                eject: None,
             },
             &mut env,
         )
@@ -521,7 +523,7 @@ async fn migrate_legacy_manifest_records(
     }
 }
 
-/// The `scan --vendor` JSON path: discovery → (dry-run preview | download
+/// The `scan --mode vendored` JSON path: discovery → (dry-run preview | download
 /// → vendor engine → GC → embedded VEX) → print `result` → exit code.
 /// The dry-run arm skips the VEX embed (emitting a `vex.skipped` marker
 /// instead): a dry run vendors nothing, so there is no state to attest.
@@ -554,7 +556,7 @@ async fn run_vendor_json_path(
     // The npm half of scan's crawl, for the vendor engine to reuse.
     prior: Option<&NpmCrawlSnapshot>,
 ) -> i32 {
-    // Same discovery as `--apply`. Vendored purls are NOT filtered here —
+    // Same discovery as agent mode. Vendored purls are NOT filtered here —
     // re-vendoring a stale uuid is the point of the flag (same-uuid re-runs
     // land on the backend's `already_vendored` skip).
     let discovered = match discover_selected(
@@ -598,7 +600,7 @@ async fn run_vendor_json_path(
 
     if args.common.dry_run {
         // No downloads, no backends: classify against the ledger
-        // and preview the GC, exactly like `--apply`'s dry run.
+        // and preview the GC, exactly like agent mode's dry run.
         let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
             &args.common,
             selected.iter().map(|p| p.purl.as_str()),
@@ -663,11 +665,10 @@ async fn run_vendor_json_path(
                 result["vendor"] =
                     serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
             }
-            result["status"] = serde_json::json!("error");
-            result["error"] = serde_json::json!({
-                "code": code,
-                "message": message,
-            });
+            crate::json_envelope::set_error(
+                result,
+                crate::json_envelope::EnvelopeError::new(code, message),
+            );
             if let Some(obj) = result.as_object_mut() {
                 obj.remove("rollout");
             }
@@ -708,7 +709,7 @@ async fn run_vendor_json_path(
     final_code
 }
 
-/// The `scan --vendor` interactive arm: download → vendor engine → GC,
+/// The `scan --mode vendored` interactive arm: download → vendor engine → GC,
 /// with human-readable output. `prefetched` holds the views the pre-download
 /// baseline check already fetched (uuid-keyed), so the download phase
 /// serves those records from memory. Extracted + boxed for the same
@@ -812,11 +813,7 @@ fn format_nothing_vendored(download_failed: u64) -> String {
 /// step: `Error (<code>): <Message>.`. The code and message are the ones
 /// the JSON envelope carries.
 pub(crate) fn format_vendor_step_error(code: &str, message: &str) -> String {
-    let mut chars = message.trim_end_matches('.').chars();
-    let message: String = match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    };
+    let message = crate::ui::sentence_case(message.trim_end_matches('.'));
     let mut out = if message.is_empty() {
         format!("Error ({code}).")
     } else {

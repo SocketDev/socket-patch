@@ -57,7 +57,7 @@ fn assert_error_envelope(v: &serde_json::Value, needle: &str) {
         v["status"], "error",
         "expected status=error envelope, got: {v}"
     );
-    let msg = v["error"]
+    let msg = v["error"]["message"]
         .as_str()
         .unwrap_or_else(|| panic!("error field must be a string, got: {v}"));
     assert!(!msg.is_empty(), "error message must not be empty: {v}");

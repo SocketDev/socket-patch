@@ -93,19 +93,20 @@ fn refuse_takeovers(
     skipped: &mut Vec<SkippedPatch>,
     pre_warnings: &mut Vec<crate::patch::redirect::RewriteWarning>,
 ) {
-    let takeover_capable = |p: &str| {
-        p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
-    };
-    if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
+    use super::super::takeover;
+    if !takeover::any_takeover_ecosystem(candidates.iter().map(|c| c.purl.as_str())) {
         return;
     }
     let vendored = vendored_entries(project);
     let mut refused: BTreeSet<String> = BTreeSet::new();
-    for candidate in candidates.iter().filter(|c| takeover_capable(&c.purl)) {
-        let has_entry = vendored.as_ref().is_some_and(|s| {
+    for candidate in candidates.iter() {
+        let entry = vendored.as_ref().and_then(|s| {
             crate::vendor::lookup_entry(&s.entries, strip_purl_qualifiers(&candidate.purl))
-                .is_some()
         });
+        if !takeover::in_reach(&candidate.purl, entry) {
+            continue;
+        }
+        let has_entry = entry.is_some();
         let cargo_wired = !has_entry
             && candidate.purl.starts_with("pkg:cargo/")
             && cargo_vendored_wiring(project, &candidate.dep.name, &candidate.dep.version);
@@ -316,7 +317,6 @@ pub(crate) async fn rewrite(
         &candidates,
         python_metadata,
         &vlt_preflight.withheld_from_vlt,
-        &[],
         RewriteOptions {
             dry_run: options.dry_run,
             targets_pipenv_lock,
@@ -335,6 +335,9 @@ pub(crate) async fn rewrite(
             npm_outer: &npm_outer,
             yarn_classic_outer: &yarn_classic_outer,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         },
     )
     .await;
@@ -344,6 +347,7 @@ pub(crate) async fn rewrite(
             skipped: skipped_before,
         });
     }
+    skipped.extend(done.unattributed.iter().cloned());
     let unconfirmed = engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped);
     Ok(Rewritten {
         project,

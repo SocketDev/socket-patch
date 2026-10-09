@@ -446,7 +446,8 @@ async fn gem_prelude(
             return Err(refused(
                 "vendor_stale_lock_checksum",
                 format!(
-                    "Gemfile.lock already wires `{name}` to {copy_rel} but its CHECKSUMS entry is not bundler's bare path-gem form (an earlier socket-patch left the registry line in place); run `vendor --revert` for {purl} and re-vendor to repair it"
+                    "Gemfile.lock already wires `{name}` to {copy_rel} but its CHECKSUMS entry is not bundler's bare path-gem form (an earlier socket-patch left the registry line in place); {remedy} to repair {purl}",
+                    remedy = super::common::REVERT_ALL_AND_REVENDOR,
                 ),
             ));
         }
@@ -2966,6 +2967,43 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
             GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(".socket/vendor").exists());
+    }
+
+    /// #749: bundler 4's `bundle config set lockfile custom.lock` makes
+    /// bundler read `custom.lock`, which vendored mode never wires: wiring
+    /// `Gemfile.lock` would leave the lock bundler installs from untouched.
+    /// Refused before any write.
+    #[tokio::test]
+    async fn a_bundler4_custom_lockfile_is_refused() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        tokio::fs::write(root.join("custom.lock"), LOCK_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(".bundle/config"),
+            "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n",
+        )
+        .await
+        .unwrap();
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "gemfile_not_loaded");
+        assert!(detail.contains("custom.lock"), "{detail}");
+        assert!(
+            detail.contains("bundle config unset --local lockfile"),
+            "{detail}"
         );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))

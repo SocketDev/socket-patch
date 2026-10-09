@@ -246,11 +246,19 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 /// resolved elsewhere (another lock's wiring of the same version is
 /// contested, as for npm's `inBundle` copies).
 async fn contest_bundled_copies(ctx: &DiscoverCtx<'_>, nodes: &[VltLockNode], out: &mut Discovery) {
-    let copies = store_bundled_copies(
-        ctx.root,
-        nodes.iter().map(|n| (n.key.as_str(), n.name.as_str())),
-    )
-    .await;
+    // The store is an installed tree: only a disk has one.
+    let Some(root) = ctx.disk_root() else {
+        return;
+    };
+    // Collected first: a closure-mapped iterator held across the walk's
+    // awaits would keep the future from being `Send` (the in-memory engine
+    // awaits discovery).
+    let pairs: Vec<(&str, &str)> = nodes
+        .iter()
+        .map(|n| (n.key.as_str(), n.name.as_str()))
+        .collect();
+    let copies = store_bundled_copies(root, pairs).await;
+    out.vlt_bundled_copies = Some(copies.clone());
     if copies.is_empty() {
         return;
     }
@@ -275,6 +283,7 @@ async fn contest_bundled_copies(ctx: &DiscoverCtx<'_>, nodes: &[VltLockNode], ou
                 r.purl,
             ),
         );
+        out.shadow(r);
     }
     for purl in copies.into_keys() {
         out.resolved_elsewhere(VLT_LOCK, Some(purl));
@@ -1023,6 +1032,13 @@ mod tests {
                     format!(r#"{{"name":"left-pad","version":"{bundled_version}"}}"#),
                 );
                 let out = p.run(|c, o| Box::pin(super::extract(c, o))).await;
+                // The store copies discovery read are recorded exactly as
+                // the vlt heal's store probe reports them.
+                assert_eq!(
+                    out.vlt_bundled_copies.as_ref(),
+                    Some(&crate::vendor::vlt_bundled::bundled_copies(p.root()).await)
+                );
+                assert_eq!(out.vlt_bundled_copies.as_ref().map(|c| c.len()), Some(1));
                 if contested {
                     assert_refs(&out, &[]);
                     assert_eq!(

@@ -23,7 +23,7 @@
 //! | golang | the REPLACEMENT module `$GOMODCACHE/patch.socket.dev/gopatch/<uuid>@<sver>` (the ref's `url`, else go.mod's hosted `replace`) | the original `M@v` |
 //! | cargo | `registry/src/<host>-<hash>/<name>-<version>` for the lock source's host; several such registries (one per patch uuid) are narrowed to the one whose cached `.crate` has the lock's pinned checksum. A `vendor/` source tree or `--global-prefix` is taken as given | crates.io's / any other registry's extraction |
 //! | maven | `<repo>/<g>/<a>/<base>-socket.<hex8>/` (the version the pom or the hosted Gradle wiring pins) in `~/.m2` and every Gradle `files-2.1` holding it (hash dirs expanded), its artifact files matched under the suffixed name | the `<base>` version dir |
-//! | npm | every `node_modules` copy the crawler finds (pnpm and vlt store copies included), every peer / modifier / registry variant of those in the same `.pnpm` / `.vlt` store, plus alias installs (`node_modules/<alias>` holding the package) in the root's and every workspace member's tree | — each serves some dependent: ALL must verify |
+//! | npm | every `node_modules` copy the crawler finds (pnpm and vlt store copies included), every peer / modifier / registry variant of those in the same `.pnpm` / `.vlt` store, alias installs (`node_modules/<alias>` holding the package) in the root's and every workspace member's tree included | — each serves some dependent: ALL must verify |
 //! | pypi | every copy in the crawler's environment set (the project's venvs when it has any, else the interpreters) | — any may be the one that runs the project: ALL must verify |
 //! | gem | every copy in bundler's gem path | — bundler loads whichever `Gem.path` home it hits first: ALL must verify |
 //!
@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies;
 use socket_patch_core::crawlers::{
-    CargoCrawler, CrawlerOptions, Ecosystem, GoCrawler, MavenCrawler, NpmCrawler,
+    CargoCrawler, CrawlerOptions, Ecosystem, GoCrawler, MavenCrawler,
 };
 use socket_patch_core::utils::purl::purl_parts;
 use socket_patch_core::vendor::go_mod_edit::{
@@ -68,8 +68,8 @@ use crate::ecosystem_dispatch::{
 /// variants. The shared-location ecosystems read it instead of crawling
 /// the tree a second time. `prior`
 /// (embedded hosted `scan --vex` only) is scan's npm crawl of the same
-/// tree: the alias walk takes its `node_modules` roots and the identity
-/// fallback its packages instead of walking the tree again.
+/// tree: the identity fallback takes its packages instead of crawling the
+/// tree again.
 pub(crate) async fn hosted_consumed_copies(
     common: &GlobalArgs,
     hosted: &BTreeMap<String, HostedWiring>,
@@ -96,55 +96,16 @@ pub(crate) async fn hosted_consumed_copies(
             .flatten()
             .filter_map(|purl| Some((purl.clone(), installed.get(purl)?.clone())))
             .collect();
-        let mut aliases = match shared.get(&Ecosystem::Npm) {
-            Some(npm) => npm_alias_copies_reusing(&options, npm, prior).await,
-            None => HashMap::new(),
-        };
-        npm_identity_fallback_reusing(
-            shared.get(&Ecosystem::Npm),
-            &options,
-            &mut all,
-            &aliases,
-            prior,
-        )
-        .await;
+        npm_identity_fallback_reusing(shared.get(&Ecosystem::Npm), &options, &mut all, prior).await;
         let npm: Vec<&String> = shared.get(&Ecosystem::Npm).into_iter().flatten().collect();
         for purl in shared.values().flatten() {
             let mut paths = all.remove(purl).unwrap_or_default();
-            // The installed-tree lookup already resolves importer-tree
-            // aliases, so most of the walk's finds are in `paths` already.
-            let extra: Vec<PathBuf> = aliases
-                .remove(purl)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|alias| !paths.contains(alias))
-                .collect();
-            if npm.contains(&purl) && installed.get(purl).is_some_and(|p| !p.is_empty()) {
-                // The installed lookup already expanded these copies.
-                // Expanding its N variants again scans the store N times.
-                // Only aliases are new; expand them before merging so a
-                // different alias/store can still contribute more copies.
-                if !extra.is_empty() {
-                    let added = with_store_peer_variant_copies(extra).await;
-                    let mut seen = std::collections::HashSet::new();
-                    for path in &paths {
-                        seen.insert(tokio::fs::canonicalize(path).await.unwrap_or(path.clone()));
-                    }
-                    for path in added {
-                        let canonical =
-                            tokio::fs::canonicalize(&path).await.unwrap_or(path.clone());
-                        if seen.insert(canonical) {
-                            paths.push(path);
-                        }
-                    }
-                }
-            } else if npm.contains(&purl) {
-                // No installed copies: the identity fallback and aliases
-                // have not had their store variants enumerated yet.
-                paths.extend(extra);
+            // The installed lookup already resolved every copy, importer
+            // tree aliases included, and expanded their store variants.
+            // Without installed copies the identity fallback's have not
+            // had their store variants enumerated yet.
+            if npm.contains(&purl) && installed.get(purl).is_none_or(Vec::is_empty) {
                 paths = with_store_peer_variant_copies(paths).await;
-            } else {
-                paths.extend(extra);
             }
             out.insert(
                 purl.clone(),
@@ -176,142 +137,12 @@ fn not_installed() -> HostedCopies {
     HostedCopies::default()
 }
 
-// ── npm aliases ──────────────────────────────────────────────────────────
+// ── npm identity fallback ────────────────────────────────────────────────
 
-/// Upper bound on the package dirs [`npm_alias_copies`] inspects: a
-/// pathological (or hostile) tree cannot turn one `vex` run into an
-/// unbounded walk.
-const ALIAS_WALK_MAX_DIRS: usize = 200_000;
-
-/// ALIAS installs of the hosted npm `purls`, keyed by purl: a dependency
-/// declared `"mm": "npm:minimist@1.2.2"` (npm, yarn and bun alike) lands in
-/// `node_modules/mm`, a dir the crawler's name-keyed lookup never probes
-/// (it matches `node_modules/<name>` by design, so apply cannot patch the
-/// wrong package). For a hosted ref that copy is what the aliased import
-/// loads, so it is consumed evidence like any other (otherwise an alias
-/// that is the ONLY copy reads as "not installed" and attests from the lock
-/// pin alone).
-///
-/// Walks EVERY importer `node_modules` tree the crawler resolves the
-/// installed copies from ([`NpmCrawler::get_node_modules_paths`]: the
-/// root's AND each workspace member's in a project, the prefix under
-/// `--global-prefix`) once, matching each package dir's `package.json`
-/// `(name, version)`; only dirs whose on-disk key DIFFERS from the
-/// package's name are aliases (the crawler already returns the rest).
-/// Member trees matter because the identity fallback only fills purls with
-/// NO copy, so a member alias beside a root copy is found only here.
-/// Hidden entries (`.bin`, pnpm's `.pnpm` and vlt's `.vlt` stores — the
-/// crawler probes them) and symlinks (pnpm's and vlt's importer links,
-/// `npm link` targets) are not traversed. Under vlt EVERY importer entry,
-/// an alias included, is a link into `.vlt/<DepID>/node_modules/<name>`,
-/// so this walk finds no vlt alias at all: the store copy is named after
-/// the real package, and the crawler's store pass resolves it (the
-/// identity fallback covers the rest). A plain `--global` run is not
-/// walked: its roots come from spawning every package manager again, and
-/// the identity fallback covers an alias that is the only global copy.
-#[cfg(test)]
-async fn npm_alias_copies(
-    options: &CrawlerOptions,
-    purls: &[String],
-) -> HashMap<String, Vec<PathBuf>> {
-    npm_alias_copies_reusing(options, purls, None).await
-}
-
-/// [`npm_alias_copies`], taking the importer `node_modules` roots from
-/// `prior` when it was crawled with `options` (the same roots
-/// `NpmCrawler::get_node_modules_paths` returns) instead of walking the tree
-/// for them; the per-root BFS below is unchanged.
-async fn npm_alias_copies_reusing(
-    options: &CrawlerOptions,
-    purls: &[String],
-    prior: Option<&NpmCrawlSnapshot>,
-) -> HashMap<String, Vec<PathBuf>> {
-    let wanted: HashMap<(String, String), &String> = purls
-        .iter()
-        .filter_map(|purl| {
-            let (ty, name, version) = purl_parts(purl)?;
-            (ty == "npm").then_some(((name, version), purl))
-        })
-        .collect();
-    let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    if wanted.is_empty() {
-        return out;
-    }
-    if options.global && options.global_prefix.is_none() {
-        return out;
-    }
-    let roots = match prior.and_then(|p| p.roots_for(options)) {
-        Some(roots) => roots.to_vec(),
-        None => NpmCrawler::new()
-            .get_node_modules_paths(options)
-            .await
-            .unwrap_or_default(),
-    };
-    let mut queue = std::collections::VecDeque::from(roots);
-    let mut visited = 0usize;
-    while let Some(nm) = queue.pop_front() {
-        // (package dir, the key it is installed under)
-        let mut packages: Vec<(PathBuf, String)> = Vec::new();
-        for (path, name) in real_subdirs(&nm).await {
-            if name.starts_with('@') {
-                for (pkg, bare) in real_subdirs(&path).await {
-                    packages.push((pkg, format!("{name}/{bare}")));
-                }
-            } else {
-                packages.push((path, name));
-            }
-        }
-        for (pkg, key) in packages {
-            visited += 1;
-            if visited > ALIAS_WALK_MAX_DIRS {
-                return out;
-            }
-            let found = socket_patch_core::crawlers::npm_crawler::read_package_json(
-                &pkg.join("package.json"),
-            )
-            .await;
-            if let Some((name, version)) = found {
-                if name != key {
-                    if let Some(purl) = wanted.get(&(name, version)) {
-                        let copies = out.entry((*purl).clone()).or_default();
-                        if !copies.contains(&pkg) {
-                            copies.push(pkg.clone());
-                        }
-                    }
-                }
-            }
-            queue.push_back(pkg.join("node_modules"));
-        }
-    }
-    out
-}
-
-/// `(path, name)` of the non-hidden, non-symlink directories directly in
-/// `dir` (empty when `dir` is missing or unreadable).
-async fn real_subdirs(dir: &Path) -> Vec<(PathBuf, String)> {
-    let mut out = Vec::new();
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return out;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        // `DirEntry::file_type` does not follow symlinks: a link is skipped.
-        if entry.file_type().await.is_ok_and(|t| t.is_dir()) {
-            out.push((entry.path(), name));
-        }
-    }
-    out
-}
-
-/// Last-resort identity lookup for an npm purl that neither the targeted
-/// resolver nor the [`npm_alias_copies`] walk found. An npm ALIAS dependency
-/// (`"lp": "npm:left-pad@1.3.0"`) is installed under its dependency key
-/// (`node_modules/lp`), not its package name, so the targeted resolver —
-/// which probes `node_modules/<name>` — reports it not installed, and the
-/// walk skips symlinked importer entries (yarn's pnpm linker, a global
+/// Last-resort identity lookup for an npm purl the targeted resolver did
+/// not find. The resolver takes real alias dirs (`node_modules/lp` holding
+/// `left-pad@1.3.0`) as copies, but not an alias reached through a symlinked
+/// importer entry (yarn's pnpm linker, `npm link`, a global
 /// `--global-prefix` tree). For a hosted purl "not installed" is exactly what
 /// the lockfile basis excuses, so such a copy must still be hash-verified
 /// ("installed evidence wins"). Resolve every npm purl the targeted lookup
@@ -322,9 +153,8 @@ async fn npm_identity_fallback(
     npm: Option<&Vec<String>>,
     options: &CrawlerOptions,
     all: &mut HashMap<String, Vec<PathBuf>>,
-    aliases: &HashMap<String, Vec<PathBuf>>,
 ) {
-    npm_identity_fallback_reusing(npm, options, all, aliases, None).await
+    npm_identity_fallback_reusing(npm, options, all, None).await
 }
 
 /// [`npm_identity_fallback`], answering from `prior`'s crawled packages
@@ -334,15 +164,12 @@ async fn npm_identity_fallback_reusing(
     npm: Option<&Vec<String>>,
     options: &CrawlerOptions,
     all: &mut HashMap<String, Vec<PathBuf>>,
-    aliases: &HashMap<String, Vec<PathBuf>>,
     prior: Option<&NpmCrawlSnapshot>,
 ) {
     let missing: Vec<&String> = npm
         .into_iter()
         .flatten()
-        .filter(|purl| {
-            all.get(*purl).is_none_or(Vec::is_empty) && aliases.get(*purl).is_none_or(Vec::is_empty)
-        })
+        .filter(|purl| all.get(*purl).is_none_or(Vec::is_empty))
         .collect();
     match prior.and_then(|p| p.packages_for(options)) {
         Some(installed) => all.extend(npm_paths_by_identity_in(installed, &missing)),
@@ -619,6 +446,7 @@ async fn maven_copies(options: &CrawlerOptions, purl: &str, wiring: &HostedWirin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use socket_patch_core::crawlers::NpmCrawler;
 
     tokio::task_local! {
         // Observe real expansion work only in the regression's own task;
@@ -654,6 +482,17 @@ mod tests {
             .await
     }
 
+    /// The installed-tree lookup `vex` hands [`hosted_consumed_copies`].
+    async fn installed_copies(common: &GlobalArgs, purl: &str) -> HashMap<String, Vec<PathBuf>> {
+        crate::ecosystem_dispatch::find_manifest_package_copies_reusing(
+            &[purl.to_string()],
+            common,
+            true,
+            None,
+        )
+        .await
+    }
+
     #[cfg(unix)]
     fn peer_copies(store: &Path, count: usize) -> Vec<PathBuf> {
         (0..count)
@@ -680,13 +519,7 @@ mod tests {
             ..GlobalArgs::default()
         };
         let purl = "pkg:npm/left-pad@1.3.0".to_string();
-        let installed = crate::ecosystem_dispatch::find_manifest_package_copies_reusing(
-            std::slice::from_ref(&purl),
-            &common,
-            true,
-            None,
-        )
-        .await;
+        let installed = installed_copies(&common, &purl).await;
         assert_eq!(installed[&purl].len(), peers.len());
         let (paths, calls) = tracked_npm_hosted(&common, &installed).await;
         assert_eq!(paths, installed[&purl]);
@@ -695,53 +528,42 @@ mod tests {
             "already-expanded copies were rescanned: {calls:?}"
         );
 
-        // A real alias is absent from the name-keyed installed set. Its
-        // store variants overlap that set canonically, including the
-        // importer link's physical copy; keep the alias once and preserve
-        // the original importer-first path choices.
+        // The resolver takes a real alias as a copy and expands its store
+        // variants, which overlap the set canonically (the importer link's
+        // physical copy included): the alias is listed once, the importer
+        // link stays first, and nothing is expanded again.
         let alias = nm.join("lp");
         pkg(&alias, "left-pad", "1.3.0");
-        let (paths, calls) = tracked_npm_hosted(&common, &installed).await;
-        assert_eq!(calls, vec![vec![alias.clone()]]);
+        let with_alias = installed_copies(&common, &purl).await;
+        let (paths, calls) = tracked_npm_hosted(&common, &with_alias).await;
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(paths, with_alias[&purl]);
+        assert_eq!(paths[0], installed[&purl][0]);
         let mut expected = installed[&purl].clone();
         expected.push(alias);
-        assert_eq!(paths, expected);
+        expected.sort();
+        assert_eq!(sorted(paths), expected);
 
-        // An alias beneath a real nested host can reach another store.
-        // The installed root copy makes the name-keyed resolver skip
-        // those peers, so alias expansion must still add them even when
-        // installed copies are already present.
+        // An alias beneath a real nested host can reach another store. The
+        // installed root copy does not keep the resolver from that store's
+        // peers.
         let host = nm.join("host");
         pkg(&host, "host", "1.0.0");
         let host_nm = host.join("node_modules");
         let nested_peers = peer_copies(&host_nm.join(".pnpm"), 2);
         let nested_alias = host_nm.join("lp");
         pkg(&nested_alias, "left-pad", "1.3.0");
-        let installed_again = crate::ecosystem_dispatch::find_manifest_package_copies_reusing(
-            std::slice::from_ref(&purl),
-            &common,
-            true,
-            None,
-        )
-        .await;
-        // Since #605 the name-keyed resolver probes bundled trees itself, so
-        // it already returns the aliases and the nested store's peers. Feed
-        // the earlier, alias-free set to keep exercising alias expansion;
-        // the resolver's own set is checked against the same result below.
-        let (paths, calls) = tracked_npm_hosted(&common, &installed).await;
-        assert_eq!(calls.len(), 1);
-        let mut inputs = calls[0].clone();
-        inputs.sort();
-        let mut aliases = vec![nm.join("lp"), nested_alias.clone()];
-        aliases.sort();
-        assert_eq!(inputs, aliases);
-        assert_eq!(&paths[..installed[&purl].len()], installed[&purl]);
+        let installed_again = installed_copies(&common, &purl).await;
+        let (paths, calls) = tracked_npm_hosted(&common, &installed_again).await;
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(paths, installed_again[&purl]);
+        assert_eq!(paths[0], installed[&purl][0]);
         expected.push(nested_alias);
         expected.extend(nested_peers);
         let mut actual = paths.clone();
         actual.sort();
         expected.sort();
-        assert_eq!(actual, expected);
+        assert_eq!(actual, expected, "the resolver's own copy set");
         assert_eq!(
             paths
                 .iter()
@@ -750,9 +572,6 @@ mod tests {
                 .len(),
             paths.len()
         );
-        let (mut resolved, _) = tracked_npm_hosted(&common, &installed_again).await;
-        resolved.sort();
-        assert_eq!(resolved, expected, "the resolver's own copy set");
     }
 
     #[cfg(unix)]
@@ -776,16 +595,10 @@ mod tests {
             ..GlobalArgs::default()
         };
         let purl = "pkg:npm/left-pad@1.3.0".to_string();
-        let installed = crate::ecosystem_dispatch::find_manifest_package_copies_reusing(
-            std::slice::from_ref(&purl),
-            &common,
-            true,
-            None,
-        )
-        .await;
-        // Since #605 the name-keyed resolver reaches the alias and its
-        // sibling peers on its own. An alias-only set (what an alias-blind
-        // resolver returns) must still expand to the same copies.
+        let installed = installed_copies(&common, &purl).await;
+        // The resolver reaches the alias and its sibling peers on its own.
+        // With no installed set, the identity fallback's alias copy must
+        // still expand to the same copies.
         let (mut paths, calls) = tracked_npm_hosted(&common, &HashMap::new()).await;
         assert_eq!(calls, vec![vec![alias.clone()]]);
         let mut expected = peers;
@@ -819,11 +632,11 @@ mod tests {
             ..GlobalArgs::default()
         };
         let purl = "pkg:npm/left-pad@1.3.0".to_string();
-        assert!(
-            npm_alias_copies(&common.crawler_options(), std::slice::from_ref(&purl))
-                .await
-                .is_empty()
-        );
+        // The resolver never takes a link as a copy.
+        assert!(installed_copies(&common, &purl)
+            .await
+            .get(&purl)
+            .is_none_or(Vec::is_empty));
         let installed = HashMap::from([(purl, Vec::new())]);
         let (mut paths, calls) = tracked_npm_hosted(&common, &installed).await;
         assert_eq!(calls, vec![vec![alias.clone()]]);
@@ -872,7 +685,7 @@ mod tests {
             "pkg:npm/absent@2.0.0".to_string(),
         ];
         let mut all: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        npm_identity_fallback(Some(&purls), &options, &mut all, &HashMap::new()).await;
+        npm_identity_fallback(Some(&purls), &options, &mut all).await;
         assert_eq!(
             all.get("pkg:npm/left-pad@1.3.0"),
             Some(&vec![tmp.path().join("node_modules/lp")])
@@ -883,20 +696,14 @@ mod tests {
         // fallback only fills misses).
         let found = tmp.path().join("node_modules/left-pad");
         let mut all = HashMap::from([(purls[0].clone(), vec![found.clone()])]);
-        npm_identity_fallback(Some(&purls), &options, &mut all, &HashMap::new()).await;
+        npm_identity_fallback(Some(&purls), &options, &mut all).await;
         assert_eq!(all[&purls[0]], vec![found.clone()]);
-
-        // A purl the alias walk already found is not re-resolved.
-        let mut all: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        let walked = HashMap::from([(purls[0].clone(), vec![found.clone()])]);
-        npm_identity_fallback(Some(&purls), &options, &mut all, &walked).await;
-        assert!(!all.contains_key(&purls[0]), "{all:?}");
     }
 
     /// The identity fallback answered from the crawl snapshot finds the
     /// same copies as crawling again — here an alias installed through a
-    /// symlink (yarn's pnpm linker, `npm link`), which neither the targeted
-    /// lookup nor the alias walk (it skips symlinks) finds, among other
+    /// symlink (yarn's pnpm linker, `npm link`), which the targeted lookup
+    /// does not take as a copy (it skips symlinks), among other
     /// crawled packages so it is not the snapshot's first entry.
     #[cfg(unix)]
     #[tokio::test]
@@ -921,10 +728,18 @@ mod tests {
             "pkg:npm/is-odd@1.3.0".to_string(),
             "pkg:npm/absent@2.0.0".to_string(),
         ];
-        let aliases = npm_alias_copies(&options, &purls).await;
+        let resolved = installed_copies(
+            &GlobalArgs {
+                cwd: root.to_path_buf(),
+                ecosystems: Some(vec!["npm".to_string()]),
+                ..GlobalArgs::default()
+            },
+            &purls[0],
+        )
+        .await;
         assert!(
-            aliases.is_empty(),
-            "the alias walk skips symlinks: {aliases:?}"
+            resolved.get(&purls[0]).is_none_or(Vec::is_empty),
+            "the resolver skips symlinks: {resolved:?}"
         );
 
         let (_, _, _, snapshot) =
@@ -936,16 +751,9 @@ mod tests {
         );
 
         let mut walked: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        npm_identity_fallback(Some(&purls), &options, &mut walked, &aliases).await;
+        npm_identity_fallback(Some(&purls), &options, &mut walked).await;
         let mut reused: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        npm_identity_fallback_reusing(
-            Some(&purls),
-            &options,
-            &mut reused,
-            &aliases,
-            Some(&snapshot),
-        )
-        .await;
+        npm_identity_fallback_reusing(Some(&purls), &options, &mut reused, Some(&snapshot)).await;
         assert_eq!(reused, walked);
         for purl in &purls[..2] {
             assert_eq!(
@@ -957,9 +765,23 @@ mod tests {
         assert!(!reused.contains_key("pkg:npm/absent@2.0.0"), "{reused:?}");
     }
 
-    /// Only dirs whose install key differs from the package name are
-    /// aliases; scoped keys, nested trees and scoped targets are walked;
-    /// hidden dirs, other versions and symlinks are not copies.
+    fn npm_scope(root: &Path) -> GlobalArgs {
+        GlobalArgs {
+            cwd: root.to_path_buf(),
+            ecosystems: Some(vec!["npm".to_string()]),
+            ..GlobalArgs::default()
+        }
+    }
+
+    fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        paths.sort();
+        paths
+    }
+
+    /// The installed lookup `vex` judges hosted npm purls by takes alias
+    /// installs as copies beside the own-name one: scoped keys, nested trees
+    /// and scoped targets count; hidden dirs, other versions and symlinks do
+    /// not (#856: no second alias walk backs it up).
     #[tokio::test]
     async fn npm_alias_copies_finds_only_alias_installs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -983,23 +805,29 @@ mod tests {
             "pkg:npm/minimist@1.2.2".to_string(),
             "pkg:npm/%40scope/pkg@1.0.0".to_string(),
         ];
-        let found = npm_alias_copies(&local(root), &purls).await;
-        let mut got: Vec<PathBuf> = found["pkg:npm/minimist@1.2.2"].clone();
-        got.sort();
-        let mut want = vec![
-            nm.join("@me/mm"),
-            nm.join("dep/node_modules/deep"),
-            nm.join("mm"),
-        ];
-        want.sort();
-        assert_eq!(got, want);
+        let found = crate::ecosystem_dispatch::find_manifest_package_copies_reusing(
+            &purls,
+            &npm_scope(root),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            sorted(found["pkg:npm/minimist@1.2.2"].clone()),
+            sorted(vec![
+                nm.join("@me/mm"),
+                nm.join("dep/node_modules/deep"),
+                nm.join("minimist"),
+                nm.join("mm"),
+            ])
+        );
         assert_eq!(found["pkg:npm/%40scope/pkg@1.0.0"], vec![nm.join("sc")]);
     }
 
     /// A workspace member's alias install is a consumed copy even when the
-    /// root holds the package under its own name. Every importer tree the
-    /// crawler enumerates is walked; `--global-prefix` walks the prefix; a
-    /// plain `--global` run walks nothing (the fallback covers it).
+    /// root holds the package under its own name: every importer tree the
+    /// crawler enumerates is searched, and `--global-prefix` searches the
+    /// prefix.
     #[tokio::test]
     async fn npm_alias_copies_walks_every_workspace_members_tree() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1020,43 +848,35 @@ mod tests {
             "left-pad",
             "1.3.0",
         );
-        // Not an alias: the member's own-name copy is the crawler's.
         pkg(
             &root.join("apps/web/node_modules/left-pad"),
             "left-pad",
             "1.3.0",
         );
 
-        let purls = vec!["pkg:npm/left-pad@1.3.0".to_string()];
-        let mut got =
-            npm_alias_copies(&local(root), &purls).await["pkg:npm/left-pad@1.3.0"].clone();
-        got.sort();
-        let mut want = vec![
-            root.join("apps/web/node_modules/@me/lp"),
-            root.join("packages/a/node_modules/dep/node_modules/deep"),
-            root.join("packages/a/node_modules/lp"),
-        ];
-        want.sort();
-        assert_eq!(got, want);
-
-        let prefix = root.join("packages/a/node_modules");
-        let under_prefix = CrawlerOptions {
-            global_prefix: Some(prefix.clone()),
-            ..local(root)
-        };
-        let mut got =
-            npm_alias_copies(&under_prefix, &purls).await["pkg:npm/left-pad@1.3.0"].clone();
-        got.sort();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        let got = installed_copies(&npm_scope(root), purl).await;
         assert_eq!(
-            got,
-            vec![prefix.join("dep/node_modules/deep"), prefix.join("lp")]
+            sorted(got[purl].clone()),
+            sorted(vec![
+                root.join("apps/web/node_modules/@me/lp"),
+                root.join("apps/web/node_modules/left-pad"),
+                root.join("node_modules/left-pad"),
+                root.join("packages/a/node_modules/dep/node_modules/deep"),
+                root.join("packages/a/node_modules/lp"),
+            ])
         );
 
-        let global = CrawlerOptions {
-            global: true,
-            ..local(root)
+        let prefix = root.join("packages/a/node_modules");
+        let under_prefix = GlobalArgs {
+            global_prefix: Some(prefix.clone()),
+            ..npm_scope(root)
         };
-        assert!(npm_alias_copies(&global, &purls).await.is_empty());
+        let got = installed_copies(&under_prefix, purl).await;
+        assert_eq!(
+            sorted(got[purl].clone()),
+            vec![prefix.join("dep/node_modules/deep"), prefix.join("lp")]
+        );
     }
 
     #[cfg(unix)]
@@ -1099,7 +919,7 @@ mod tests {
     }
 
     /// vlt twin of the `.pnpm` case: every importer entry is a link into
-    /// the `.vlt` store (the alias `lp` too), so the alias walk yields
+    /// the `.vlt` store (the alias `lp` too), so no importer dir is an alias
     /// nothing, while the crawler resolves the alias's package from its
     /// store copy, which is named after the real package. That store copy
     /// is the consumed evidence.
@@ -1128,7 +948,6 @@ mod tests {
         .unwrap();
 
         let purls = vec!["pkg:npm/left-pad@1.1.3".to_string()];
-        assert!(npm_alias_copies(&local(root), &purls).await.is_empty());
 
         let found = NpmCrawler::new().find_by_purls(&nm, &purls).await.unwrap();
         assert_eq!(
@@ -1140,7 +959,7 @@ mod tests {
         );
 
         let mut all: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        npm_identity_fallback(Some(&purls), &local(root), &mut all, &HashMap::new()).await;
+        npm_identity_fallback(Some(&purls), &local(root), &mut all).await;
         assert_eq!(all.get(&purls[0]), Some(&vec![nm.join("lp")]));
     }
 

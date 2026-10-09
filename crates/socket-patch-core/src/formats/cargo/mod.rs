@@ -21,9 +21,12 @@
 //! * the vendored planner (`vendor::cargo_lock`) edits the same document
 //!   with `toml_edit`;
 //!
+//! [`manifest`] is the one reader of a `Cargo.toml`'s `[package]` identity.
+//!
 //! Everything here is pure; the callers own the reads.
 
 pub(crate) mod hosted;
+pub mod manifest;
 
 use std::ops::Range;
 
@@ -58,6 +61,23 @@ pub(crate) struct LockedPackage {
     /// The `dependencies` references as spelled (`"name"`, `"name
     /// version"`, `"name version (source)"`; see [`parse_ref`]).
     pub(crate) dependencies: Vec<String>,
+}
+
+impl LockedPackage {
+    /// Whether the package comes from a registry index (`registry+…` or
+    /// `sparse+…`), the only sources cargo extracts under
+    /// `$CARGO_HOME/registry/src/` (git, path and local-registry sources
+    /// never are).
+    pub(crate) fn is_from_registry(&self) -> bool {
+        self.source.as_deref().is_some_and(is_registry_source)
+    }
+}
+
+/// Whether a `Cargo.lock` `source` names a registry index (`registry+…` or
+/// `sparse+…`).
+pub(crate) fn is_registry_source(source: &str) -> bool {
+    let s = source.trim();
+    s.starts_with("sparse+") || s.starts_with("registry+")
 }
 
 /// Every `[[package]]` of `doc` (lock formats v1–v4), in lock order; an

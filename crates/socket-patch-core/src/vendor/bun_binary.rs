@@ -1,18 +1,16 @@
 //! Native binary Bun vendoring. Package records are edited without re-resolving
 //! dependencies or requiring a Bun executable.
 use super::bun_lockb::{BinaryPackage, BunLockb};
-use super::common::{already_patched_result, refused};
+use super::common::refused;
 use super::npm_common::{
-    done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
-    stage_patch_pack, tgz_rel_leaf, NpmCoords,
+    gate_packages, guard_revert_uuid_dir, refusal_code, tgz_rel_leaf, NpmCommit, NpmCoords,
+    NpmLockBackend, NpmStagedPack, WireCx,
 };
 use super::path::parse_vendor_path;
-use super::source::PackageSource;
-use super::state::{
-    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
-};
+use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::manifest::schema::PatchRecord;
+#[cfg(test)]
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes_sync};
 use std::path::{Path, PathBuf};
@@ -27,238 +25,203 @@ fn is_ours(package: &BinaryPackage, name: &str, leaf: &str) -> bool {
         && package.resolution.ends_with(&format!("/{leaf}"))
 }
 
+/// [`BunBinaryBackend`] through the shared driver, under the signature the
+/// suite below calls it by.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor(
     purl: &str,
-    installed_dir: PackageSource<'_>,
+    installed_dir: super::source::PackageSource<'_>,
     root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    sources: &crate::patch::apply::PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
-    let coords = match guard_coordinates(purl, record) {
-        Ok(v) => v,
-        Err(o) => return *o,
-    };
-    let project = match read_project(root).await {
-        Ok(v) => v,
-        Err(o) => return *o,
-    };
-    let leaf = tgz_rel_leaf(&coords.name, &coords.version);
-    let BinaryTargets {
-        matches,
-        mirrors,
-        bundled,
-    } = match preflight_package(&project, root, &coords, &leaf) {
-        Ok(v) => v,
-        Err(o) => return *o,
-    };
-    let BinaryProject { mut lock, .. } = project;
-    let mut warnings = Vec::new();
-    for package in bundled {
-        // LOUD: this copy ships inside its PARENT's tarball, which we do not
-        // repack — it stays the unpatched bytes after vendor (#469).
-        warnings.push(super::VendorWarning::new(
-            "vendor_bundled_instance_skipped",
-            format!(
-                "{LOCK} package #{} ({}@{}) is {}bundled inside its parent's tarball and \
-                 CANNOT be rewritten there — that copy stays UNPATCHED; vendor or update the \
-                 bundling parent to cover it",
-                package.id,
-                coords.name,
-                coords.version,
-                if package.bundled_only { "" } else { "also " },
-            ),
-        ));
-    }
-    let preexisted = root.join(&coords.uuid_dir_rel).exists();
-    let (staged, result) = match stage_patch_pack(
-        purl,
-        installed_dir,
-        root,
-        record,
-        sources,
-        dry_run,
-        force,
-        &mut warnings,
-        service,
+    super::npm_common::vendor_npm_family(
+        &BunBinaryBackend,
+        super::npm_common::NpmVendorRequest {
+            purl,
+            installed_dir,
+            project_root: root,
+            record,
+            sources,
+            vendored_at,
+            dry_run,
+            force,
+            service,
+        },
     )
     .await
-    {
-        Ok(v) => v,
-        Err(o) => return *o,
-    };
-    let Some(staged) = staged else {
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
-    };
-    let mut wiring = Vec::new();
-    for package in matches {
-        if package.resolution == staged.rel_tgz
-            && package.integrity.as_deref() == Some(&staged.packed.integrity)
-        {
-            continue;
+}
+
+/// The `bun.lockb` half of [`super::bun_lock::vendor_bun`], for a project
+/// whose installs the binary lock drives (driven by
+/// [`super::npm_common::vendor_npm_family`]).
+pub(super) struct BunBinaryBackend;
+
+/// [`BunBinaryBackend`]'s pre-flight product: the parsed lock and the
+/// records and workspace mirrors to rewrite.
+pub(super) struct BunBinaryPlan {
+    lock: BunLockb,
+    leaf: String,
+    matches: Vec<BinaryPackage>,
+    mirrors: Vec<(String, String)>,
+}
+
+impl NpmLockBackend for BunBinaryBackend {
+    type Plan = BunBinaryPlan;
+
+    fn flavor(&self) -> Option<&'static str> {
+        Some("bun")
+    }
+
+    async fn preflight(
+        &self,
+        root: &Path,
+        coords: &NpmCoords,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<BunBinaryPlan, Box<VendorOutcome>> {
+        let project = read_project(root).await?;
+        let leaf = tgz_rel_leaf(&coords.name, &coords.version);
+        let BinaryTargets {
+            matches,
+            mirrors,
+            bundled,
+        } = preflight_package(&project, root, coords, &leaf)?;
+        for package in bundled {
+            // LOUD: this copy ships inside its PARENT's tarball, which we do
+            // not repack — it stays the unpatched bytes after vendor (#469).
+            warnings.push(VendorWarning::new(
+                "vendor_bundled_instance_skipped",
+                format!(
+                    "{LOCK} package #{} ({}@{}) is {}bundled inside its parent's tarball and \
+                     CANNOT be rewritten there — that copy stays UNPATCHED; vendor or update the \
+                     bundling parent to cover it",
+                    package.id,
+                    coords.name,
+                    coords.version,
+                    if package.bundled_only { "" } else { "also " },
+                ),
+            ));
         }
-        let mutation = (|| {
+        let BinaryProject { lock, .. } = project;
+        Ok(BunBinaryPlan {
+            lock,
+            leaf,
+            matches,
+            mirrors,
+        })
+    }
+
+    async fn wire(
+        &self,
+        plan: BunBinaryPlan,
+        cx: &WireCx<'_>,
+        staged: &mut NpmStagedPack,
+        _warnings: &mut Vec<VendorWarning>,
+    ) -> Result<Option<NpmCommit>, String> {
+        let BunBinaryPlan {
+            mut lock,
+            leaf,
+            matches,
+            mirrors,
+        } = plan;
+        let (root, coords) = (cx.project_root, cx.coords);
+        let mut wiring = Vec::new();
+        for package in matches {
+            if package.resolution == staged.rel_tgz
+                && package.integrity.as_deref() == Some(&staged.packed.integrity)
+            {
+                continue;
+            }
             let original = lock.snapshot(package.id)?;
             lock.set_package(package.id, &staged.rel_tgz, &staged.packed.integrity)?;
-            Ok::<_, String>((original, lock.snapshot(package.id)?))
-        })();
-        let (original, mut new) = match mutation {
-            Ok(v) => v,
-            Err(e) => {
-                return done_failure_unstage(purl, e, root, &coords.uuid_dir_rel, preexisted).await
+            let mut new = lock.snapshot(package.id)?;
+            if is_ours(&package, &coords.name, &leaf) {
+                // Bun may renumber packages on re-save. Preserve the semantic
+                // predecessor so ledger carry-forward can recover the correct
+                // pristine original even after the numeric key has changed.
+                new["previous"] = serde_json::json!({
+                    "name": original["name"], "version": original["version"],
+                    "resolution": original["resolution"], "integrity": original["integrity"],
+                });
             }
-        };
-        if is_ours(&package, &coords.name, &leaf) {
-            // Bun may renumber packages on re-save. Preserve the semantic
-            // predecessor so ledger carry-forward can recover the correct
-            // pristine original even after the numeric key has changed.
-            new["previous"] = serde_json::json!({
-                "name": original["name"], "version": original["version"],
-                "resolution": original["resolution"], "integrity": original["integrity"],
+            wiring.push(WiringRecord {
+                file: LOCK.into(),
+                kind: KIND.into(),
+                action: WiringAction::Rewritten,
+                key: Some(package.id.to_string()),
+                original: if is_ours(&package, &coords.name, &leaf) {
+                    None
+                } else {
+                    Some(original)
+                },
+                new: Some(new),
             });
         }
-        wiring.push(WiringRecord {
-            file: LOCK.into(),
-            kind: KIND.into(),
-            action: WiringAction::Rewritten,
-            key: Some(package.id.to_string()),
-            original: if is_ours(&package, &coords.name, &leaf) {
-                None
-            } else {
-                Some(original)
-            },
-            new: Some(new),
-        });
-    }
-    // Bun 0.5.9–1.3 resolves workspace local tarballs relative to the
-    // declaring member. Preserve the same portable resolution for every
-    // consumer by committing identical tarballs at those member-relative
-    // locations as well as the canonical root artifact.
-    let artifact = match read_regular_to_bytes_sync(&root.join(&staged.rel_tgz)) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("cannot read staged tarball: {e}"),
-                root,
-                &coords.uuid_dir_rel,
-                preexisted,
-            )
-            .await
-        }
-    };
-    let lock_changed = !wiring.is_empty();
-    let mut mirror_backups: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
-    for (workspace, rel) in &mirrors {
-        let path = root.join(rel);
-        let before = match read_regular_to_bytes_sync(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                undo_mirrors(&mirror_backups).await;
-                return done_failure_unstage(
-                    purl,
-                    format!("cannot read workspace tarball {rel}: {e}"),
-                    root,
-                    &coords.uuid_dir_rel,
-                    preexisted,
-                )
-                .await;
+        // Bun 0.5.9–1.3 resolves workspace local tarballs relative to the
+        // declaring member. Preserve the same portable resolution for every
+        // consumer by committing identical tarballs at those member-relative
+        // locations as well as the canonical root artifact.
+        let artifact = read_regular_to_bytes_sync(&root.join(&staged.rel_tgz))
+            .map_err(|e| format!("cannot read staged tarball: {e}"))?;
+        let lock_changed = !wiring.is_empty();
+        let mut mirror_backups: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+        for (workspace, rel) in &mirrors {
+            let path = root.join(rel);
+            let before = match read_regular_to_bytes_sync(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    undo_mirrors(&mirror_backups).await;
+                    return Err(format!("cannot read workspace tarball {rel}: {e}"));
+                }
+            };
+            wiring.push(WiringRecord {
+                file: rel.clone(),
+                kind: MIRROR_KIND.into(),
+                action: WiringAction::Added,
+                key: Some(workspace.clone()),
+                original: None,
+                new: Some(serde_json::Value::String(staged.packed.sha256_hex.clone())),
+            });
+            if before.as_deref() == Some(artifact.as_slice()) {
+                continue;
             }
-        };
-        wiring.push(WiringRecord {
-            file: rel.clone(),
-            kind: MIRROR_KIND.into(),
-            action: WiringAction::Added,
-            key: Some(workspace.clone()),
-            original: None,
-            new: Some(serde_json::Value::String(staged.packed.sha256_hex.clone())),
-        });
-        if before.as_deref() == Some(artifact.as_slice()) {
-            continue;
+            if let Err(e) = tokio::fs::create_dir_all(path.parent().expect("mirror parent")).await {
+                undo_mirrors(&mirror_backups).await;
+                return Err(format!("cannot create workspace vendor directory: {e}"));
+            }
+            if let Err(e) = atomic_write_bytes_preserving_mode(&path, &artifact).await {
+                undo_mirrors(&mirror_backups).await;
+                return Err(format!("cannot write workspace tarball {rel}: {e}"));
+            }
+            mirror_backups.push((path, before));
         }
-        if let Err(e) = tokio::fs::create_dir_all(path.parent().expect("mirror parent")).await {
+        if !lock_changed && mirror_backups.is_empty() {
+            return Ok(None);
+        }
+        if let Err(e) = atomic_write_bytes_preserving_mode(&root.join(LOCK), &lock.bytes()).await {
             undo_mirrors(&mirror_backups).await;
-            return done_failure_unstage(
-                purl,
-                format!("cannot create workspace vendor directory: {e}"),
-                root,
-                &coords.uuid_dir_rel,
-                preexisted,
-            )
-            .await;
+            return Err(format!("cannot write {LOCK}: {e}"));
         }
-        if let Err(e) = atomic_write_bytes_preserving_mode(&path, &artifact).await {
-            undo_mirrors(&mirror_backups).await;
-            return done_failure_unstage(
-                purl,
-                format!("cannot write workspace tarball {rel}: {e}"),
-                root,
-                &coords.uuid_dir_rel,
-                preexisted,
-            )
-            .await;
-        }
-        mirror_backups.push((path, before));
-    }
-    if !lock_changed && mirror_backups.is_empty() {
-        return VendorOutcome::Done {
-            result: already_patched_result(purl, &root.join(&staged.rel_tgz), &record.files),
-            entry: None,
-            warnings,
-        };
-    }
-    if staged.staged_pkg_json.is_some() {
-        warnings.push(VendorWarning::new("vendor_dep_manifest_stale", format!("the patch changes package.json; {LOCK} dependency edges were preserved — run bun install if dependency ranges changed")));
-    }
-    if let Err(e) = atomic_write_bytes_preserving_mode(&root.join(LOCK), &lock.bytes()).await {
-        undo_mirrors(&mirror_backups).await;
-        return done_failure_unstage(
-            purl,
-            format!("cannot write {LOCK}: {e}"),
-            root,
-            &coords.uuid_dir_rel,
-            preexisted,
-        )
-        .await;
-    }
-    let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
-    write_marker_or_warn(&root.join(&coords.uuid_dir_rel), &marker, &mut warnings).await;
-    VendorOutcome::Done {
-        result,
-        warnings,
-        entry: Some(VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: coords.base_purl,
-            uuid: record.uuid.clone(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: staged.rel_tgz,
-                sha256: staged.packed.sha256_hex,
-                size: Some(staged.packed.size),
-                platform_locked: None,
-                file_inventory: None,
-            },
+        Ok(Some(NpmCommit {
             wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: Some("bun".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }),
+            ..NpmCommit::default()
+        }))
+    }
+
+    fn manifest_warning(&self, _name: &str, _version: &str) -> VendorWarning {
+        VendorWarning::new(
+            "vendor_dep_manifest_stale",
+            format!(
+                "the patch changes package.json; {LOCK} dependency edges were preserved — run \
+                 bun install if dependency ranges changed"
+            ),
+        )
     }
 }
 
@@ -451,6 +414,17 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             }
         }
     }
+    // REMOVED, not drift (#1132): `bun remove <pkg>` (or an upgrade off the
+    // patched version) leaves neither snapshot in the lock. When no package
+    // resolves through this uuid dir any more, there is nothing to restore
+    // and nothing an install needs the artifact for. Probed once, before any
+    // record is restored; an unreadable package table fails closed (drift).
+    let uuid_lower = entry.uuid.to_ascii_lowercase();
+    let unreferenced = lock.packages().is_ok_and(|packages| {
+        !packages
+            .iter()
+            .any(|p| p.resolution.to_ascii_lowercase().contains(&uuid_lower))
+    });
     let mut mirrors_to_remove = Vec::new();
     for rec in entry.wiring.iter().rev() {
         if rec.kind == MIRROR_KIND {
@@ -500,6 +474,7 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             }
             continue;
         }
+        // `Ok(true)`: the record left the lock (see `unreferenced`).
         let restore = (|| {
             if rec.file != LOCK || rec.kind != KIND {
                 return Err("unexpected binary wiring file or kind".to_string());
@@ -522,15 +497,25 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             // original never makes this record appear already reverted.
             let id = match lock.find_snapshot_id(id, new)? {
                 Some(id) => id,
-                None if lock.find_snapshot_id(id, original)?.is_some() => return Ok(()),
+                None if lock.find_snapshot_id(id, original)?.is_some() => return Ok(false),
+                None if unreferenced => return Ok(true),
                 None => return Err("binary package resolution has drifted".into()),
             };
-            lock.restore(id, original)
+            lock.restore(id, original).map(|()| false)
         })();
-        if let Err(e) = restore {
-            outcome
+        match restore {
+            Ok(true) => outcome.warnings.push(VendorWarning::new(
+                super::LOCK_ENTRY_REMOVED_CODE,
+                format!(
+                    "{LOCK} no longer resolves {} through {dir} (the dependency was removed or \
+                     re-resolved); nothing to restore",
+                    entry.base_purl
+                ),
+            )),
+            Ok(false) => {}
+            Err(e) => outcome
                 .warnings
-                .push(VendorWarning::new("vendor_lock_entry_drifted", e));
+                .push(VendorWarning::new("vendor_lock_entry_drifted", e)),
         }
     }
     if outcome.drift_skipped() {
@@ -548,13 +533,12 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
     }
     if !opts.keep_artifact {
         for mirror in mirrors_to_remove {
-            if let Err(e) = tokio::fs::remove_file(&mirror).await {
+            if let Err(e) = remove_mirror(&mirror).await {
                 return RevertOutcome::failed(format!(
                     "cannot remove workspace tarball {}: {e}",
                     mirror.display()
                 ));
             }
-            prune_mirror_parents(&mirror).await;
         }
         // The last npm-family entry leaves `.socket/vendor/npm/` (and
         // `.socket/vendor/`) empty: the shared helper prunes them so a
@@ -616,6 +600,24 @@ pub(super) fn validate_mirror_path(root: &Path, rel: &str) -> Result<PathBuf, St
         }
     }
     Ok(path)
+}
+
+/// Remove a reverted workspace tarball and prune its emptied parents
+/// through the workspace's `.socket/`, or queue both for after the commit
+/// of a staged hosted takeover (see `group_commit::defer_removal`).
+pub(super) async fn remove_mirror(path: &Path) -> std::io::Result<()> {
+    let bound = path
+        .ancestors()
+        .skip(1)
+        .take(5)
+        .find(|dir| dir.file_name().is_some_and(|name| name == ".socket"))
+        .unwrap_or(path);
+    if crate::utils::group_commit::defer_removal(path, bound) {
+        return Ok(());
+    }
+    tokio::fs::remove_file(path).await?;
+    prune_mirror_parents(path).await;
+    Ok(())
 }
 
 pub(super) async fn prune_mirror_parents(path: &Path) {
@@ -997,6 +999,58 @@ mod rebuild_tests {
         assert_eq!(ts::request_count(&server).await, 0);
     }
 
+    /// #1132: once `bun remove minimist` (or `bun add minimist@1.2.8`)
+    /// moves the vendored record off its vendored resolution, neither the
+    /// rewritten nor the pre-vendor snapshot is in bun.lockb and nothing
+    /// resolves through the uuid dir. There is nothing to restore, so the
+    /// revert warns `vendor_lock_entry_removed` and finishes; reading it as
+    /// drift kept the tarball and ledger entry forever and looped
+    /// `vendor --check` → `scan --prune`.
+    #[tokio::test]
+    async fn revert_after_package_left_the_lock_is_not_drift() {
+        use base64::Engine as _;
+        let fx = flip_fixture().await;
+        let root = fx.root();
+        let VendorOutcome::Done {
+            result,
+            entry: Some(entry),
+            ..
+        } = flip_run(&fx, None).await
+        else {
+            panic!("vendoring must wire the binary lock");
+        };
+        assert!(result.success, "{result:?}");
+        let binary = entry.wiring.iter().find(|r| r.kind == KIND).unwrap();
+        let id: usize = binary.key.as_ref().unwrap().parse().unwrap();
+        let mut lock = BunLockb::parse(&std::fs::read(root.join(LOCK)).unwrap()).unwrap();
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode([7u8; 64])
+        );
+        lock.set_registry_package(
+            id,
+            "1.2.8",
+            "https://registry.npmjs.org/minimist/-/minimist-1.2.8.tgz",
+            &integrity,
+        )
+        .unwrap();
+        let relocked = lock.bytes();
+        assert!(!lock
+            .packages()
+            .unwrap()
+            .iter()
+            .any(|p| p.resolution.contains(UUID)));
+        std::fs::write(root.join(LOCK), &relocked).unwrap();
+
+        let outcome = revert(&entry, root, RevertOpts::new(false)).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(!outcome.drift_skipped(), "{outcome:?}");
+        assert!(outcome.lock_entry_removed(), "{outcome:?}");
+        assert!(!outcome.kept_artifact, "{outcome:?}");
+        assert_eq!(std::fs::read(root.join(LOCK)).unwrap(), relocked);
+        assert!(!root.join(&entry.artifact.path).exists());
+    }
+
     /// With the canonical tarball GONE, an outage switches the same UUID
     /// from a prebuilt archive to a locally packed one. Different archive
     /// bytes must advance the integrity snapshot without losing the pristine
@@ -1066,5 +1120,50 @@ mod rebuild_tests {
         for mirror in entry.wiring.iter().filter(|r| r.kind == MIRROR_KIND) {
             assert!(!root.join(&mirror.file).exists());
         }
+    }
+
+    /// #920: the `package.json` advisory is emitted once, by the run that
+    /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
+    /// AlreadyPatched (and the run that wires says it once).
+    #[tokio::test]
+    async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
+        let mut fx = flip_fixture().await;
+        let patched: &[u8] = br#"{"name":"minimist","version":"1.2.2","sideEffects":false}"#;
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        std::fs::write(fx.root().join(".socket/blobs").join(&after_hash), patched).unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            crate::manifest::schema::PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(PACKAGE),
+                after_hash,
+            },
+        );
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code.starts_with("vendor_dep_manifest"))
+                .count()
+        };
+        let VendorOutcome::Done {
+            result,
+            entry: Some(entry),
+            warnings,
+        } = flip_run(&fx, None).await
+        else {
+            panic!("the first run wires");
+        };
+        assert!(result.success, "{result:?}");
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+        ts::persist(fx.root(), PURL, entry).await;
+
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = flip_run(&fx, None).await
+        else {
+            panic!("expected Done");
+        };
+        assert!(result.success && entry.is_none(), "{result:?}");
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
     }
 }

@@ -167,22 +167,26 @@ pub(crate) struct LedgerSupplement {
 
 /// Vendored-ledger packages with no crawled counterpart: on a fresh clone
 /// the committed artifact IS the dependency, so these stay discoverable
-/// (updates[] detection, the table, and `scan --vendor` re-vendor/in-sync
+/// (updates[] detection, the table, and `scan --mode vendored` re-vendor/in-sync
 /// runs all keep working before any install). They are NOT "lockfile-only"
 /// — nothing needs installing; the artifact satisfies the lock. `state` is
 /// the ledger `run` already loaded (`vendor::load_state`).
 ///
 /// That holds only while the lock still wires the artifact. An entry the
-/// lockfile in-use probe (the one the prune GC reverts by) answers
-/// `Some(false)` for is the dependency having left the lock — bumped or
+/// project no longer consumes ([`Discovery::vendor_entry_in_use`] is
+/// `Some(false)` — the verdict the prune GC reverts by, read from `ctx`'s
+/// discovery) is the dependency having left the lock — bumped or
 /// uninstalled — and is reported in [`LedgerSupplement::unwired`] instead:
 /// re-vendoring it would fail against a lock that no longer has it. `None`
-/// (no probe for the ecosystem, or no readable lock) keeps the entry.
+/// (no readable lock for the ecosystem) keeps the entry.
+///
+/// [`Discovery::vendor_entry_in_use`]: socket_patch_core::vex::discover::Discovery::vendor_entry_in_use
 pub(crate) async fn vendored_ledger_supplement(
-    common: &GlobalArgs,
+    ctx: &crate::commands::context::ProjectContext<'_>,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     state: &std::io::Result<VendorState>,
 ) -> LedgerSupplement {
+    let common = ctx.common;
     let mut out = LedgerSupplement::default();
     if common.is_global() {
         return out;
@@ -226,7 +230,12 @@ pub(crate) async fn vendored_ledger_supplement(
             continue;
         }
         if let Some(entry) = entry {
-            if crate::commands::vendor::dispatch_in_use_one(entry, &common.cwd).await == Some(false)
+            if ctx
+                .discovery()
+                .await
+                .vendor_entry_in_use(&common.cwd, entry)
+                .await
+                == Some(false)
             {
                 out.unwired.push(ledger_key.clone());
                 continue;
@@ -1120,9 +1129,13 @@ mod tests {
             ..GlobalArgs::default()
         };
         let state = socket_patch_core::vendor::load_state(root).await;
-        vendored_ledger_supplement(&args, crawled, &state)
-            .await
-            .packages
+        vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args),
+            crawled,
+            &state,
+        )
+        .await
+        .packages
     }
 
     /// A ledger entry vendored as `@3.0.2.0` is the crawled composer
@@ -1148,18 +1161,26 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             ..GlobalArgs::default()
         };
-        let out = vendored_ledger_supplement(&args, &[crawled], &Ok(state.clone()))
-            .await
-            .packages;
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args),
+            &[crawled],
+            &Ok(state.clone()),
+        )
+        .await
+        .packages;
         assert!(
             out.is_empty(),
             "{:?}",
             out.iter().map(|p| &p.purl).collect::<Vec<_>>()
         );
 
-        let out = vendored_ledger_supplement(&args, &[], &Ok(state))
-            .await
-            .packages;
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args),
+            &[],
+            &Ok(state),
+        )
+        .await
+        .packages;
         assert_eq!(
             out.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
             vec!["pkg:composer/psr/log@3.0.2.0"]
@@ -1229,7 +1250,12 @@ mod tests {
         })
         .to_string();
         let state = npm_ledger_with_lock(tmp.path(), Some(&bumped)).await;
-        let out = vendored_ledger_supplement(&args(tmp.path()), &[], &state).await;
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args(tmp.path())),
+            &[],
+            &state,
+        )
+        .await;
         assert!(out.packages.is_empty(), "{:?}", out.packages);
         assert_eq!(out.unwired, vec!["pkg:npm/left-pad@1.3.0".to_string()]);
 
@@ -1237,9 +1263,67 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let removed = r#"{"name":"app","lockfileVersion":3,"packages":{"":{"name":"app"}}}"#;
         let state = npm_ledger_with_lock(tmp.path(), Some(removed)).await;
-        let out = vendored_ledger_supplement(&args(tmp.path()), &[], &state).await;
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args(tmp.path())),
+            &[],
+            &state,
+        )
+        .await;
         assert!(out.packages.is_empty(), "{:?}", out.packages);
         assert_eq!(out.unwired, vec!["pkg:npm/left-pad@1.3.0".to_string()]);
+    }
+
+    /// B19: the supplement and the prune GC share one in-use verdict for
+    /// every ecosystem, not only npm/cargo/pypi-requirements. A COMPOSER
+    /// entry whose dependency composer.lock bumped to a registry release is
+    /// unwired — before, it was resurrected as a discovered package forever.
+    #[tokio::test]
+    async fn ledger_supplement_reports_a_bumped_composer_entry_unwired() {
+        const COMPOSER_PURL: &str = "pkg:composer/monolog/monolog@3.0.0";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let leaf = format!(".socket/vendor/composer/{VENDORED_UUID}/monolog/monolog@3.0.0");
+        let entry: socket_patch_core::vendor::VendorEntry =
+            serde_json::from_value(serde_json::json!({
+                "ecosystem": "composer",
+                "basePurl": COMPOSER_PURL,
+                "uuid": VENDORED_UUID,
+                "artifact": {"path": leaf, "sha256": ""},
+                "wiring": [],
+                "detached": true,
+            }))
+            .unwrap();
+        let mut state = VendorState::default();
+        state.entries.insert(COMPOSER_PURL.to_string(), entry);
+        std::fs::write(
+            root.join("composer.lock"),
+            serde_json::json!({
+                "packages": [{
+                    "name": "monolog/monolog",
+                    "version": "3.1.0",
+                    "dist": {
+                        "type": "zip",
+                        "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc",
+                        "reference": "abc",
+                    },
+                }],
+                "packages-dev": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = GlobalArgs {
+            cwd: root.to_path_buf(),
+            ..GlobalArgs::default()
+        };
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args),
+            &[],
+            &Ok(state),
+        )
+        .await;
+        assert!(out.packages.is_empty(), "{:?}", out.packages);
+        assert_eq!(out.unwired, vec![COMPOSER_PURL.to_string()]);
     }
 
     /// The fresh-clone case the supplement exists for: the lock still
@@ -1260,7 +1344,12 @@ mod tests {
                 ..GlobalArgs::default()
             };
             let state = npm_ledger_with_lock(tmp.path(), lock.as_deref()).await;
-            let out = vendored_ledger_supplement(&args, &[], &state).await;
+            let out = vendored_ledger_supplement(
+                &crate::commands::context::ProjectContext::new(&args),
+                &[],
+                &state,
+            )
+            .await;
             assert_eq!(
                 out.packages
                     .iter()

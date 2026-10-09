@@ -17,7 +17,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
-| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
+| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ single-POM repository, suffixed Maven reactor repository, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
@@ -40,8 +40,15 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 ## npm hosted-mode notes
 
 - **npm (package-lock.json / npm-shrinkwrap.json)** — every present npm lock is
-  rewritten (npm 12 installs from the package-lock.json twin it keeps beside a
-  committed shrinkwrap). npm 12 defaults `allow-remote=none` and refuses the
+  rewritten (npm <= 11 installs from a committed shrinkwrap, npm 12 only from
+  package-lock.json). npm 12 never reads npm-shrinkwrap.json: on a
+  shrinkwrap-only project it resolves the tree from the registry and writes a
+  fresh package-lock.json, so the patch reaches npm <= 11 only. Hosted and
+  vendored runs still rewire the shrinkwrap but warn
+  (`redirect_npm_shrinkwrap_only` / `vendor_npm_shrinkwrap_only`), and `vex`
+  omits those patches (`vex_npm_shrinkwrap_only`) while `list`, `rollback` and
+  `remove` still manage them; rename the lock to package-lock.json (or commit
+  a copy under that name) and re-run. npm 12 defaults `allow-remote=none` and refuses the
   redirected tarballs (EALLOWREMOTE) unless the project `.npmrc` sets
   `allow-remote=all`, so the hosted run writes it (new file, or one appended
   line; once `rollback` / `remove` / the vendored takeover has restored the last
@@ -53,8 +60,18 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   overridden) — in the project `.npmrc`, the user / global / builtin npm config,
   or an `npm_config_allow_remote` environment variable — and
   `--no-npm-allow-remote-config` opts out (install with
-  `npm ci --allow-remote=all`). Vendored `file:` tarballs are unaffected (npm
-  gates them by `allow-file`, default `all`). npm 6 ignores `resolved` for registry
+  `npm ci --allow-remote=all`). Vendored `file:` tarballs are unaffected by
+  `allow-remote`: npm >= 11.14 gates them by `allow-file` (default `all`). An
+  explicit `allow-file=none`, or `allow-file=root` while a vendored copy is
+  transitive, makes every install fail EALLOWFILE; the vendored run keeps the
+  setting, warns `vendor_npm_allow_file` with the remedy (`allow-file=all` in
+  `.npmrc`, or `npm ci --allow-file=all`), and `vendor --check` fails. npm >= 8's
+  `replace-registry-host` set to `always` (or to the hosted patch host) makes npm
+  rewrite the hosted pins to the configured registry, so every install fails
+  E404: the hosted run reads it from the same env / project / user / global /
+  builtin layers and warns `redirect_npm_replace_registry_host` (set
+  `replace-registry-host=npmjs` in the project `.npmrc`, or use vendored mode).
+  npm 6 ignores `resolved` for registry
   dependencies, so a redirected lockfileVersion 1 lock fails closed with
   EINTEGRITY under npm 6 (`redirect_npm_legacy_client`) and installs under npm
   >= 7. A lockfileVersion 2 lock's legacy `dependencies` mirror is rewired with
@@ -63,7 +80,11 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   whatever its `resolved` says, so under npm 6 an aliased hosted pin in a v2
   lock fails closed with EINTEGRITY too (`redirect_npm_legacy_alias_client`).
   Lockfile-only `vex` attests nothing for a package whose `packages` entry is
-  wired while the v2 mirror still resolves it from the registry. Vendoring
+  wired while the v2 mirror still resolves it from the registry. A mirror
+  node with no `resolved` but the patched `integrity` (what npm 7–12
+  `npm install` leaves on a vendored v2 lock, since npm never writes a
+  `file:` `resolved` there) still counts as wired for `vex` and
+  `vendor --check`: npm 6 fails closed on that pin. Vendoring
   needs a lockfileVersion 2/3 lock (npm 6 still installs a vendored v2 lock
   from its legacy mirror, alias nodes included) and rewires both locks in npm
   12's dual-lock state. Majors 6–12 are measured in
@@ -247,8 +268,10 @@ to first-party source: an npm, Yarn, pnpm or Bun workspace member, a
 `file:` or `link:` directory dependency, or an `npm link` target. That
 source is not an installed copy of the registry package, and no reinstall
 restores it, so it is never overwritten. Patch it directly instead (vendored
-mode refuses it the same way, with `vendor_workspace_member`). Links into a
-store inside a `node_modules` tree, including a workspace member's link
+mode refuses it the same way, with `vendor_workspace_member`; when an npm lock
+also holds a registry copy of the same `name@version`, that copy is still
+vendored and the local source is skipped with `vendor_workspace_member_skipped`).
+Links into a store inside a `node_modules` tree, including a workspace member's link
 into the root `node_modules/.pnpm`, are patched as usual. So are links into
 Yarn's pnpm-linker store relocated outside `node_modules`, but only for an
 active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with
@@ -949,7 +972,8 @@ version = "1.0.4+socket.<uuid>"
   has a `[patch."https://github.com/rust-lang/crates.io-index"]` table,
   which cargo lets replace `[patch.crates-io]` wholesale — move its entries
   under `[patch.crates-io]`. Also `cargo_manifest_unreadable`,
-  `cargo_manifest_unparseable`, `cargo_manifest_symlink_unsupported`.
+  `cargo_manifest_unparseable`, and `redirect_symlinked_file_unsupported` for a
+  symlinked `Cargo.toml` (the one symlink code every mode uses).
 - **Formatting.** Comments, ordering, CRLF / mixed line endings, a UTF-8
   BOM and the trailing-newline state are preserved; a revert with nothing
   else changed restores `Cargo.toml` byte for byte, and keeps your own

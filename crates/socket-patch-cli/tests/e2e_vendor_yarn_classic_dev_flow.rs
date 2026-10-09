@@ -40,13 +40,15 @@
 //! cannot reach the registry — unless `SOCKET_PATCH_YARN_E2E_REQUIRED=1`;
 //! every assertion after that is HARD.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
-
-use sha2::{Digest, Sha256};
 
 /// Canonical lowercase patch uuid (a dedicated path level under
 /// `.socket/vendor/npm/`).
@@ -112,10 +114,6 @@ fn patch_api(purl: &str, patched: &[u8]) -> vex_e2e_common::PatchApi {
 
 // ── self-contained helpers (convention: e2e test files stay standalone) ─
 
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
 /// Run `corepack <pm> <args>` in `cwd` with the given extra env, the download
 /// prompt disabled, and every `SOCKET_*` var scrubbed.
 ///
@@ -150,14 +148,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
-}
-
-/// Git-blob SHA-256 (`sha256("blob <len>\0" ++ bytes)`).
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Write `.socket/manifest.json` + the after-hash blob so vendor runs fully

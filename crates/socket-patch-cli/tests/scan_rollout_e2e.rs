@@ -795,7 +795,15 @@ async fn a_malformed_env_cap_is_a_usage_error_unless_the_flag_overrides_it() {
         .env("SOCKET_MAX_NEW_PATCHES", "lots");
     let out = cmd.output().unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("SOCKET_MAX_NEW_PATCHES"));
+    // Under --json the coded usage error goes to stdout (#704).
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "invalid_env", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("SOCKET_MAX_NEW_PATCHES")),
+        "{v}"
+    );
 
     // A flag overrides the env value without reading it.
     let mut with_flag = Command::new(binary());
@@ -1052,4 +1060,117 @@ async fn a_failed_detail_lookup_for_an_applied_package_does_not_freeze_new_rows(
         pinned(tmp.path()).contains(&"roll-e".to_string()),
         "the pin stays"
     );
+}
+
+/// #954: a vendored package gains a superseding patch whose prebuilt
+/// artifact the service has not built (`pending_build`) or cannot serve
+/// (`not_found`). `scan --mode vendored` keeps the vendored patch and
+/// reports the upgrade as a skip, exit 0, the way hosted mode keeps its pin:
+/// before the fix every re-run failed (`partial_failure`, exit 1) until the
+/// server built the artifact.
+#[tokio::test]
+async fn vendored_upgrade_without_a_served_artifact_keeps_the_vendored_patch() {
+    let newer = "0000000e-2222-4222-8222-00000000000e";
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    for (status, code) in [
+        ("pending_build", "vendor_prebuilt_pending"),
+        ("not_found", "vendor_prebuilt_unavailable"),
+    ] {
+        let first = MockServer::start().await;
+        mount_api(&first, |_| Grant::Granted).await;
+        for (name, severities) in PACKAGES {
+            let view = json!({
+                "uuid": uuid(name), "purl": purl(name), "publishedAt": "2026-01-01T00:00:00Z",
+                "files": { "package/index.js": { "beforeHash": git_sha256(&before(name)), "afterHash": git_sha256(&after(name)), "blobContent": b64(&after(name)) } },
+                "vulnerabilities": vulns(name, severities), "description": name, "license": "MIT", "tier": "free"
+            });
+            prebuilt_common::mount_view(&first, &view, None).await;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path(), &names9);
+        run_json(tmp.path(), &first, &["--mode", "vendored"]);
+        let state_path = tmp.path().join(".socket/vendor/state.json");
+        let state_before = std::fs::read(&state_path).unwrap();
+        let lock_before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+
+        // A fresh API: roll-e's newer patch is offered and viewable, but
+        // the service has no artifact for it.
+        let second = MockServer::start().await;
+        mount_api(&second, |_| Grant::Granted).await;
+        let sevs = PACKAGES.iter().find(|(n, _)| *n == "roll-e").unwrap().1;
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.*roll-e(%40|@)1\\.0\\.0$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [
+                    { "uuid": newer, "purl": purl("roll-e"), "publishedAt": "2026-06-01T00:00:00Z",
+                      "description": "newer", "license": "MIT", "tier": "free",
+                      "vulnerabilities": vulns("roll-e", sevs) },
+                    { "uuid": uuid("roll-e"), "purl": purl("roll-e"), "publishedAt": "2026-01-01T00:00:00Z",
+                      "description": "roll-e", "license": "MIT", "tier": "free",
+                      "vulnerabilities": vulns("roll-e", sevs) }
+                ],
+                "canAccessPaidPatches": false,
+            })))
+            .with_priority(1)
+            .mount(&second)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{newer}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "uuid": newer, "purl": purl("roll-e"),
+                "publishedAt": "2026-06-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": git_sha256(&before("roll-e")),
+                    "afterHash": git_sha256(&after("roll-e")),
+                    "blobContent": b64(&after("roll-e")),
+                }},
+                "vulnerabilities": vulns("roll-e", sevs),
+                "description": "newer", "license": "MIT", "tier": "free",
+            })))
+            .mount(&second)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "results": { newer: { "status": status } } })),
+            )
+            .with_priority(1)
+            .mount(&second)
+            .await;
+
+        for _ in 0..2 {
+            let (exit, stdout, stderr) =
+                run(tmp.path(), &second, &["--json", "--mode", "vendored"]);
+            assert_eq!(exit, 0, "{status}: stdout={stdout}\nstderr={stderr}");
+            let v: Value = serde_json::from_str(stdout.trim()).unwrap();
+            assert_eq!(v["status"], "success", "{status}: {v:#}");
+            assert_eq!(v["vendor"]["summary"]["failed"], 0, "{status}: {v:#}");
+            let vendor = v["vendor"].to_string();
+            assert!(
+                vendor.contains(code) && vendor.contains(newer),
+                "{status}: the upgrade is a `{code}` skip: {v:#}"
+            );
+            assert_eq!(
+                std::fs::read(&state_path).unwrap(),
+                state_before,
+                "{status}"
+            );
+            assert_eq!(
+                std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+                lock_before,
+                "{status}: the vendored wiring stays"
+            );
+        }
+
+        // Human mode: no "Failed to vendor", exit 0.
+        let (exit, stdout, stderr) = run(tmp.path(), &second, &["--mode", "vendored"]);
+        assert_eq!(exit, 0, "{status}: stdout={stdout}\nstderr={stderr}");
+        assert!(
+            !stderr.contains("Failed to vendor") && !stdout.contains("failed"),
+            "{status}: stdout={stdout}\nstderr={stderr}"
+        );
+    }
 }

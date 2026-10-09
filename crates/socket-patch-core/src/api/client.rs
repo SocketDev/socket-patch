@@ -5658,6 +5658,17 @@ mod vendor_retry_tests {
                 "{error:?}"
             );
             assert!(retryable, "body timeout keeps the retry hint");
+            // The client can give up on an attempt before this
+            // single-threaded runtime polls the server task that reads and
+            // counts its request (a starved runner fires the 100 ms timer
+            // first). The request bytes are already in the socket buffer,
+            // so wait for the server to count both attempts.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while requests.load(Ordering::Relaxed) - before < 2
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert_eq!(requests.load(Ordering::Relaxed) - before, 2);
         }
     }

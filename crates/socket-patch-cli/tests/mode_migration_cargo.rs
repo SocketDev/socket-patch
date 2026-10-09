@@ -624,6 +624,26 @@ fn read(proj: &Path, rel: &str) -> String {
     std::fs::read_to_string(proj.join(rel)).unwrap_or_default()
 }
 
+/// Every project file outside `target/` (relative path → bytes).
+fn project_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if std::fs::symlink_metadata(&p).unwrap().is_dir() {
+                if p != root.join("target") {
+                    walk(root, &p, out);
+                }
+            } else {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
 fn vendor_ledger_claims(proj: &Path, purl: &str) -> bool {
     read(proj, ".socket/vendor/state.json").contains(purl)
 }
@@ -666,25 +686,38 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
     let crate_bytes =
         build_patched_crate(&tmp.path().join("stage"), &crate_dir, &version, &patched);
     mount_hosted_mocks(&server, &purl, &version, &crate_bytes, &orig, &patched).await;
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "scan",
-            "--mode",
-            "hosted",
-            "--json",
-            "--yes",
-            "--cwd",
-            proj.to_str().unwrap(),
-            "--api-url",
-            &server.uri(),
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
-        ],
-        &cargo_home,
+    let uri = server.uri();
+    let hosted_args = [
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    // The dry run stages the same takeover in memory and drops it: every
+    // project byte, `.socket/` and the committed crate copy included, stays.
+    let before = project_snapshot(&proj);
+    let dry: Vec<&str> = hosted_args.iter().copied().chain(["--dry-run"]).collect();
+    let (code, stdout, stderr) = run_socket(&proj, &dry, &cargo_home);
+    assert_eq!(code, 0, "hosted dry run failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("redirect_would_revert_vendored"),
+        "the takeover is previewed: {stdout}"
     );
+    assert!(
+        project_snapshot(&proj) == before,
+        "a dry-run takeover changes nothing: {stdout}"
+    );
+
+    let (code, stdout, stderr) = run_socket(&proj, &hosted_args, &cargo_home);
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
     assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");

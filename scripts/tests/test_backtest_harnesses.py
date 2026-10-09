@@ -753,9 +753,9 @@ class VltReleaseTests(unittest.TestCase):
         for version in vlt.VERSIONS:
             self.assertEqual(vlt.release_status(version, self.supported, self.excluded),
                              'supported')
-        self.assertEqual(vlt.release_status('1.3.0', self.supported, self.excluded), 'unlisted')
-        self.assertEqual(vlt.unlisted_releases(['1.2.0', '0.0.0-22', '1.3.0', '0.0.0-0.17'],
-                                               self.supported, self.excluded), ['1.3.0'])
+        self.assertEqual(vlt.release_status('9.9.9', self.supported, self.excluded), 'unlisted')
+        self.assertEqual(vlt.unlisted_releases(['1.3.7', '0.0.0-22', '9.9.9', '0.0.0-0.17'],
+                                               self.supported, self.excluded), ['9.9.9'])
 
     def test_main_refuses_an_excluded_release(self):
         with self.assertRaises(SystemExit), patch('sys.stderr'):
@@ -770,9 +770,10 @@ class VltReleaseTests(unittest.TestCase):
                                    '1.2.0'])
         eras = {v: vlt.era_of(v) for v in ('0.0.0-18', '0.0.0-19', '1.0.0-rc.8', '1.0.0-rc.9',
                                            '1.0.0-rc.14', '1.0.0-rc.15', '1.0.0-rc.32',
-                                           '1.0.0-rc.33', '1.0.7', '1.0.8', '1.1.1', '1.2.0')}
+                                           '1.0.0-rc.33', '1.0.7', '1.0.8', '1.1.1', '1.2.0',
+                                           '1.3.7')}
         self.assertEqual(list(eras.values()),
-                         ['A0', 'A', 'A', 'B', 'B', 'C', 'C', 'D', 'D', 'E', 'E', 'F'])
+                         ['A0', 'A', 'A', 'B', 'B', 'C', 'C', 'D', 'D', 'E', 'E', 'F', 'F'])
 
     def test_pinned_integrity_covers_every_supported_release(self):
         pinned = json.loads(vlt.HISTORICAL_INTEGRITY.read_text())
@@ -912,6 +913,50 @@ class VltRetryTests(unittest.TestCase):
         self.assertFalse(vlt.transient({'cliStderrTail': 'API request failed with status 404: not found'}))
         self.assertFalse(vlt.transient({'serveProbe': {'curlExit': 0, 'status': 200},
                                         'failingChecks': ['freshCi']}))
+
+    def test_a_preflight_transport_failure_retries(self):
+        def refusal(reason):
+            return {'serveProbe': {'curlExit': 0, 'status': 200}, 'safeRefusal': True,
+                    'preflightFailures': [f'vlt would fail to verify https://h/<redacted>/u/a.tgz: '
+                                          f'{reason}; nothing was written for pkg:npm/a@1']}
+        for reason in ('http 502', 'http 504', 'fetch error error sending request',
+                       'fetch error no response within 60s', 'fetch error no response',
+                       'fetch error hosted artifact body not received within 300s'):
+            with self.subTest(reason=reason):
+                self.assertTrue(vlt.transient(refusal(reason)))
+        for reason in ('http 404', 'http 403', 'content-encoding gzip', 'sha512 mismatch',
+                       'offline', 'fetch error refusing a non-http(s) artifact URL',
+                       'fetch error hosted artifact too large (5 bytes > 4)'):
+            with self.subTest(reason=reason):
+                self.assertFalse(vlt.transient(refusal(reason)))
+
+    def test_a_vlt_network_drop_retries(self):
+        for err in ("vlt install exited 1: Timeout { code: 'ETIMEDOUT', syscall: 'connect' }",
+                    'vlt install exited 1: read ECONNRESET', 'getaddrinfo EAI_AGAIN registry',
+                    'vlt install exited 1: socket hang up'):
+            with self.subTest(err=err):
+                self.assertTrue(vlt.transient({'error': f'RuntimeError: {err}'}))
+        for err in ('getaddrinfo ENOTFOUND h', 'connect ECONNREFUSED 127.0.0.1:1', 'EINTEGRITY'):
+            with self.subTest(err=err):
+                self.assertFalse(vlt.transient({'error': f'RuntimeError: {err}'}))
+
+    def test_a_successful_runs_preflight_reasons_reach_the_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cell = vlt.Cell({'out': Path(temp), 'record': {}, 'cli': 'socket-patch',
+                             'cli_env': {}}, '1.2.0', 'hosted', 'direct')
+            cell.project.mkdir(parents=True)
+            row = dict(cell=cell.name, expectedVerdict='patched', passed=False, checks={},
+                       safeRefusal=True)
+            detail = 'vlt would fail to verify https://h/a.tgz: http 503; nothing was written for x'
+            envelope = {'status': 'success', 'redirect': {'warnings': [
+                {'code': 'redirect_vlt_artifact_unverifiable', 'detail': detail}]}}
+            with patch.object(vlt, 'run', return_value=(0, json.dumps(envelope), '')):
+                cell.patch_run('hosted')
+            with patch('sys.stdout'):
+                cell.finish(row, row['checks'], vlt.time.time())
+            captured = json.loads((cell.case / 'result.json').read_text())
+            self.assertEqual(captured['preflightFailures'], [detail])
+            self.assertTrue(vlt.transient(captured))
 
     def test_a_transport_failure_reruns_from_scratch(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -677,8 +677,8 @@ async fn takeover_refuses_symlinked_wiring_file_before_reverting() {
             "dry_run={dry_run}: a symlinked revert target fails the run: {doc:#}"
         );
         assert_eq!(doc["status"], "error", "dry_run={dry_run}: {doc:#}");
-        assert_eq!(doc["errorCode"], CODE, "dry_run={dry_run}: {doc:#}");
-        let error = doc["error"].as_str().unwrap_or_default();
+        assert_eq!(doc["error"]["code"], CODE, "dry_run={dry_run}: {doc:#}");
+        let error = doc["error"]["message"].as_str().unwrap_or_default();
         assert!(
             error.starts_with("package-lock.json is a symbolic link")
                 && error.ends_with("nothing was written"),
@@ -704,7 +704,7 @@ async fn takeover_refuses_symlinked_wiring_file_before_reverting() {
 /// `scan --mode hosted` takes the same `.socket/apply.lock` every other
 /// mutating command holds — but only when it could write. A WET run with a
 /// granted reference refuses a held lock with `lock_held` (the hosted
-/// envelope's top-level `errorCode`, the shared contention message, exit 1)
+/// envelope's top-level `error.code`, the shared contention message, exit 1)
 /// BEFORE the ledger load or any file write; the human arm prints the
 /// shared `Error: Another socket-patch process …` line plus the
 /// `--lock-timeout` hint. A `--dry-run`,
@@ -737,9 +737,9 @@ async fn hosted_lock_held_refuses_before_any_write() {
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
     assert_eq!(code, 1, "a held lock refuses the wet run: {doc:#}");
     assert_eq!(doc["status"], "error", "{doc:#}");
-    assert_eq!(doc["errorCode"], "lock_held", "{doc:#}");
+    assert_eq!(doc["error"]["code"], "lock_held", "{doc:#}");
     assert_eq!(
-        doc["error"], HELD,
+        doc["error"]["message"], HELD,
         "no --lock-timeout: no waited clause; {doc:#}"
     );
     assert_eq!(
@@ -847,7 +847,7 @@ async fn zero_grant_wet_run_ignores_a_malformed_pre_v5_ledger() {
             .unwrap();
     let (code, doc) = scan_hosted_json(root, &no_grant.uri(), &[], &[]);
     assert_ne!(
-        doc["errorCode"], "lock_held",
+        doc["error"]["code"], "lock_held",
         "a zero-grant run never contends: {doc:#}"
     );
     assert_ignored(code, &doc, "held lock");
@@ -872,8 +872,8 @@ async fn zero_grant_wet_run_ignores_a_malformed_pre_v5_ledger() {
 /// The hosted `lock_io` envelope (CLI_CONTRACT.md "Lock lifecycle (v5.0)" and
 /// the hosted-mode "Lock (v5.0)" clause): a regular file
 /// squatting on `.socket/` makes the wet run's lock acquire fail with an I/O
-/// fault, not contention — top-level `errorCode: "lock_io"`, a string
-/// `error` naming the squatting path, `redirect: {mode: "hosted"}` retained,
+/// fault, not contention — top-level `error.code: "lock_io"`, an
+/// `error.message` naming the squatting path, `redirect: {mode: "hosted"}` retained,
 /// exit 1, refused BEFORE the ledger is read or written. The human arm prints
 /// the shared `Error: Failed to open lock file at …` line WITHOUT the
 /// `--lock-timeout` hint (that is a live-holder remedy). The squatting file is never removed or truncated.
@@ -896,8 +896,8 @@ async fn hosted_lock_io_when_a_file_squats_on_socket_dir() {
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
     assert_eq!(code, 1, "{doc:#}");
     assert_eq!(doc["status"], "error", "{doc:#}");
-    assert_eq!(doc["errorCode"], "lock_io", "{doc:#}");
-    let error = doc["error"].as_str().unwrap_or_default();
+    assert_eq!(doc["error"]["code"], "lock_io", "{doc:#}");
+    let error = doc["error"]["message"].as_str().unwrap_or_default();
     assert!(
         error.starts_with("failed to open lock file at ") && error.contains(".socket"),
         "the fault names the squatting path: {error}"
@@ -2146,16 +2146,13 @@ async fn human_rush_run_prints_the_repo_state_stale_warning_line() {
 
 // ───────── ledger save failure after a successful revert ─────────
 
-/// save_state failure AFTER a successful takeover revert: the wiring is gone
-/// but the vendored ledger still claims it, so the purl must fail CLOSED —
-/// `redirect_vendored_revert_failed` with the could-not-be-updated detail, a
-/// `vendored_revert_failed` skip, and no redirect — and, since the package
-/// is now unpatched in both modes, `redirect_takeover_unpatched` with
-/// `partial_failure` and exit 1. Reached by making
-/// `.socket/vendor` itself read-only (0o555): the entry's empty wiring
-/// reverts trivially and its artifact dir under the still-writable
-/// `.socket/vendor/npm/` is removed, but persisting the now-empty ledger
-/// needs a write in `.socket/vendor` and fails.
+/// The vendored ledger cannot be updated (`.socket/vendor` itself is
+/// read-only, 0o555): the takeover's revert, the hosted pin and the ledger
+/// are one commit, which then fails before it replaces anything. The run
+/// fails (exit 1) and NOTHING changed — the lock, the ledger and the
+/// artifact are byte-identical, so the package stays vendored and patched.
+/// Before the staged takeover, the revert was already on disk, leaving the
+/// package unpatched in both modes.
 #[cfg(unix)]
 #[tokio::test]
 async fn ledger_save_failure_after_successful_revert_fails_closed() {
@@ -2185,6 +2182,7 @@ async fn ledger_save_failure_after_successful_revert_fails_closed() {
     std::fs::create_dir_all(&artifact_dir).unwrap();
     std::fs::write(artifact_dir.join(format!("{NAME}-{VERSION}.tgz")), b"tgz").unwrap();
     let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
+    let state_before = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
 
     let vendor_dir = root.join(".socket/vendor");
     std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -2198,36 +2196,24 @@ async fn ledger_save_failure_after_successful_revert_fails_closed() {
 
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
 
-    // The vendored wiring and artifact are already gone, so the package is
-    // unpatched in both modes: a stranded takeover, never a success.
-    assert_eq!(code, 1, "a stranded takeover exits 1: {doc:#}");
-    assert_eq!(doc["status"], "partial_failure", "envelope: {doc:#}");
-    assert!(
-        warning_detail(&doc, "redirect_takeover_unpatched").contains(PURL),
-        "the stranded package is named: {doc:#}"
-    );
-    let detail = warning_detail(&doc, "redirect_vendored_revert_failed");
-    assert!(
-        detail.contains("could not be updated"),
-        "the post-revert ledger-save failure must be named: {detail}"
-    );
-    assert!(
-        doc["redirect"]["skipped"].as_array().is_some_and(|s| s
-            .iter()
-            .any(|e| e["purl"] == PURL && e["reason"] == "vendored_revert_failed")),
-        "the refusal must be accounted as skipped: {doc:#}"
-    );
-    assert_eq!(doc["redirect"]["redirected"], 0, "envelope: {doc:#}");
-    let lock_after = std::fs::read(root.join("package-lock.json")).unwrap();
+    assert_eq!(code, 1, "the failed commit fails the run: {doc:#}");
+    assert_eq!(doc["status"], "error", "envelope: {doc:#}");
+    let text = doc.to_string();
+    assert!(text.contains("nothing was changed"), "{doc:#}");
+    assert!(!text.contains("redirect_takeover_unpatched"), "{doc:#}");
     assert_eq!(
-        lock_after, lock_before,
-        "no redirect may land when the ledger cannot record the takeover"
+        std::fs::read(root.join("package-lock.json")).unwrap(),
+        lock_before,
+        "no redirect lands"
     );
-    // Fail-closed residue this warning exists to explain: the wiring/artifact
-    // are reverted but the ledger still claims the entry.
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        state_before,
+        "the ledger still claims the package"
+    );
     assert!(
-        root.join(".socket/vendor/state.json").exists(),
-        "the stale ledger survives (the warning tells the user to fix it)"
+        artifact_dir.join(format!("{NAME}-{VERSION}.tgz")).exists(),
+        "the artifact is kept"
     );
 }
 
@@ -2493,10 +2479,9 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
 
 // ───────────────────────────── vlt ─────────────────────────────
 
-/// A vendored vlt entry is never reverted for a hosted takeover the vlt
-/// rewriter would then refuse: the lock-level refusal (here a BOM) is known
-/// first, the purl is skipped with that code, and the vendored ledger and
-/// the lock stay byte-identical.
+/// A vendored vlt entry over a lock vlt cannot read (here a BOM) is never
+/// taken over: the staged revert refuses the unreadable lock itself, so the
+/// purl is skipped and the vendored ledger and the lock stay byte-identical.
 #[tokio::test]
 async fn vlt_takeover_refusal_before_revert() {
     let server = MockServer::start().await;
@@ -2521,11 +2506,11 @@ async fn vlt_takeover_refusal_before_revert() {
     assert!(
         doc["redirect"]["skipped"].as_array().is_some_and(|s| s
             .iter()
-            .any(|e| e["purl"] == PURL && e["reason"] == "redirect_vlt_lock_unsupported")),
+            .any(|e| e["purl"] == PURL && e["reason"] == "vendored_revert_failed")),
         "{doc:#}"
     );
-    assert!(warning_detail(&doc, "redirect_vlt_lock_unsupported").contains("BOM"));
-    assert!(!warning_codes(&doc).contains(&"redirect_vendored_revert_failed".to_string()));
+    assert!(warning_detail(&doc, "redirect_vendored_revert_failed").contains("vlt-lock.json"));
+    assert!(!warning_codes(&doc).contains(&"redirect_takeover_reverted_vendored".to_string()));
     assert_eq!(
         std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
         state_before
@@ -2618,6 +2603,91 @@ async fn vlt_decides_before_binary_bun_and_a_refused_uuid_is_never_confirmed() {
 
     let (confirmed, _tmp) = run(false);
     assert_eq!(confirmed["redirect"]["redirected"], 1, "{confirmed:#}");
+}
+
+/// REGRESSION (#899): npm 12 never reads npm-shrinkwrap.json. A project
+/// whose only npm lock is the shrinkwrap is still redirected (npm <= 11
+/// installs from it), but the run warns `redirect_npm_shrinkwrap_only` —
+/// in `--json` and on human stderr — and the in-run `--vex` attests nothing
+/// for it (`vex_npm_shrinkwrap_only`), as a lockfile-only `vex` does.
+#[tokio::test]
+async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    mock_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+    std::fs::rename(
+        tmp.path().join("package-lock.json"),
+        tmp.path().join("npm-shrinkwrap.json"),
+    )
+    .unwrap();
+
+    let (code, doc) = scan_hosted_json(
+        tmp.path(),
+        &server.uri(),
+        &[
+            "--vex",
+            "out.vex.json",
+            "--vex-product",
+            "pkg:npm/consumer@0.0.0",
+            "--patch-server-url",
+            "http://patch.test",
+        ],
+        &[],
+    );
+    // Still redirected: npm <= 11 installs from the shrinkwrap.
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    let lock = std::fs::read_to_string(tmp.path().join("npm-shrinkwrap.json")).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    assert!(
+        !tmp.path().join("package-lock.json").exists(),
+        "no package-lock.json is invented"
+    );
+    let detail = warning_detail(&doc, "redirect_npm_shrinkwrap_only");
+    for needle in ["covgap-hosted@1.0.0", "npm >= 12", "no package-lock.json"] {
+        assert!(detail.contains(needle), "{needle}: {detail}");
+    }
+    // The in-run VEX omits it, so the requested VEX fails the run.
+    assert_eq!(code, 1, "{doc:#}");
+    assert_eq!(doc["error"]["code"], "no_applicable_patches", "{doc:#}");
+    assert!(
+        doc["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "vex_npm_shrinkwrap_only"
+                && w["detail"].as_str().is_some_and(|d| d.contains(PURL)))),
+        "{doc:#}"
+    );
+    assert!(!tmp.path().join("out.vex.json").exists());
+
+    // With the package-lock.json twin npm 12 reads, the re-run rewires it
+    // too, the warning is gone and the in-run VEX attests.
+    std::fs::copy(
+        tmp.path().join("npm-shrinkwrap.json"),
+        tmp.path().join("package-lock.json"),
+    )
+    .unwrap();
+    let (code, doc) = scan_hosted_json(
+        tmp.path(),
+        &server.uri(),
+        &[
+            "--vex",
+            "out.vex.json",
+            "--vex-product",
+            "pkg:npm/consumer@0.0.0",
+            "--patch-server-url",
+            "http://patch.test",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(
+        !warning_codes(&doc).contains(&"redirect_npm_shrinkwrap_only".to_string()),
+        "{doc:#}"
+    );
+    assert_eq!(doc["vex"]["statements"], 1, "{doc:#}");
 }
 
 // ───────────────── yarn classic berry-migration advisory ─────────────────

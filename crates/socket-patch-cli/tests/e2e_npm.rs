@@ -288,15 +288,15 @@ fn test_npm_dry_run() {
     // Download the patch *without* applying.
     assert_run_ok(
         cwd,
-        &["get", NPM_UUID, "--mode", "agent", "--no-apply"],
-        "get --no-apply",
+        &["get", NPM_UUID, "--mode", "agent", "--save-only"],
+        "get --save-only",
     );
 
     // File should still be original.
     assert_eq!(
         git_sha256_file(&index_js),
         BEFORE_HASH,
-        "file should not change after get --no-apply"
+        "file should not change after get --save-only"
     );
 
     // Dry-run should report that the patch *would* apply, but leave the
@@ -527,7 +527,7 @@ fn test_npm_save_only() {
     let index_js = cwd.join("node_modules/minimist/index.js");
     assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
 
-    // Download with --save-only (new name for --no-apply).
+    // Download with --save-only.
     assert_run_ok(cwd, &["get", NPM_UUID, "--save-only"], "get --save-only");
 
     // File should still be original.

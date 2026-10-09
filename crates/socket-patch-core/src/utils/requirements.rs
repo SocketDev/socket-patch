@@ -14,15 +14,20 @@
 //! `--hash=sha256:ab#cd` are data. Exactly one leading BOM is encoding, not
 //! data (pip decodes with utf-8-sig; uv strips it too).
 
+use crate::formats::text::{strip_bom, strip_bom_bytes};
+
 /// Decode a requirements file the way pip's `auto_decode` does: a UTF-16
-/// or UTF-32 byte-order mark selects that encoding and is dropped; anything
+/// or UTF-32 byte-order mark selects that encoding and is dropped; a
+/// mark-less file with a PEP 263 coding line (`# -*- coding: latin-1 -*-`)
+/// in its first two lines is decoded in that encoding (#1119); anything
 /// else is UTF-8, its one leading BOM kept for [`logical_lines`] to drop.
 /// Windows PowerShell 5.1 writes `pip freeze > requirements.txt` as UTF-16
 /// LE with a BOM, and pip installs from it (#721). pip tries the UTF-16
 /// marks first, so a UTF-32 LE mark (`FF FE 00 00`) reads as UTF-16 LE, as
-/// it does for pip. `None` when the bytes are not valid in that encoding.
-/// (pip's last resort, the locale's encoding for a mark-less non-UTF-8
-/// file, is machine-dependent and not modelled.)
+/// it does for pip. `None` when the bytes are not valid in that encoding,
+/// or the coding line names a codec this reader does not model (see
+/// [`coding_line_codec`]). (pip's last resort, the locale's encoding for a
+/// mark-less non-UTF-8 file, is machine-dependent and not modelled.)
 pub(crate) fn decode(bytes: &[u8]) -> Option<String> {
     fn utf16(body: &[u8], unit: fn([u8; 2]) -> u16) -> Option<String> {
         if !body.len().is_multiple_of(2) {
@@ -47,7 +52,93 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<String> {
             .map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
             .collect();
     }
+    if strip_bom_bytes(bytes).len() == bytes.len() {
+        if let Some(name) = coding_line(bytes) {
+            return match coding_line_codec(&name)? {
+                Codec::Utf8 => String::from_utf8(bytes.to_vec()).ok(),
+                Codec::Ascii => bytes
+                    .is_ascii()
+                    .then(|| String::from_utf8_lossy(bytes).into_owned()),
+                Codec::Latin1 => Some(bytes.iter().map(|&b| char::from(b)).collect()),
+                Codec::Cp1252 => bytes.iter().map(|&b| cp1252_char(b)).collect(),
+            };
+        }
+    }
     String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// The codecs a PEP 263 coding line may select that [`decode`] models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    Utf8,
+    Ascii,
+    Latin1,
+    Cp1252,
+}
+
+/// The encoding name of pip's PEP 263 check: the first of the file's first
+/// two lines that starts with `#` and matches `coding[:=]\s*([-\w.]+)`.
+fn coding_line(bytes: &[u8]) -> Option<String> {
+    bytes.split(|&b| b == b'\n').take(2).find_map(|line| {
+        if line.first() != Some(&b'#') {
+            return None;
+        }
+        line.windows(6)
+            .enumerate()
+            .filter(|(_, w)| *w == b"coding")
+            .find_map(|(at, _)| {
+                let rest = &line[at + 6..];
+                let rest = rest
+                    .strip_prefix(b":")
+                    .or_else(|| rest.strip_prefix(b"="))?;
+                let start = rest.iter().position(|b| !b.is_ascii_whitespace())?;
+                let name: Vec<u8> = rest[start..]
+                    .iter()
+                    .copied()
+                    .take_while(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                    .collect();
+                (!name.is_empty()).then(|| String::from_utf8_lossy(&name).into_owned())
+            })
+    })
+}
+
+/// Python's codec lookup for the names [`decode`] models: case-folded,
+/// `-` and ` ` read as `_`, then Python's alias table for UTF-8, ASCII,
+/// Latin-1 and cp1252. Any other codec (pip would use it) is `None`, so
+/// the file reads as undecodable rather than being guessed at.
+fn coding_line_codec(name: &str) -> Option<Codec> {
+    let name = name.to_ascii_lowercase().replace(['-', ' '], "_");
+    Some(match name.as_str() {
+        "utf_8" | "utf8" | "u8" | "utf" | "utf8_ucs2" | "utf8_ucs4" | "cp65001" | "utf_8_sig" => {
+            Codec::Utf8
+        }
+        "ascii" | "646" | "us_ascii" | "us" | "cp367" | "csascii" | "ibm367" | "iso646_us"
+        | "iso_ir_6" | "ansi_x3.4_1968" | "ansi_x3_4_1968" | "ansi_x3.4_1986"
+        | "iso_646.irv_1991" => Codec::Ascii,
+        "latin_1" | "latin1" | "latin" | "l1" | "8859" | "cp819" | "csisolatin1" | "ibm819"
+        | "iso8859" | "iso8859_1" | "iso_8859_1" | "iso_8859_1_1987" | "iso_ir_100" => {
+            Codec::Latin1
+        }
+        "cp1252" | "windows_1252" | "1252" => Codec::Cp1252,
+        _ => return None,
+    })
+}
+
+/// One cp1252 byte as Python decodes it: Latin-1 outside `0x80..=0x9F`,
+/// Windows punctuation inside it, and five bytes Python leaves undefined.
+fn cp1252_char(b: u8) -> Option<char> {
+    const HIGH: [u16; 32] = [
+        0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039,
+        0x0152, 0, 0x017D, 0, 0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC,
+        0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+    ];
+    match b {
+        0x80..=0x9F => match HIGH[usize::from(b - 0x80)] {
+            0 => None,
+            unit => char::from_u32(u32::from(unit)),
+        },
+        _ => Some(char::from(b)),
+    }
 }
 
 /// One logical requirements line.
@@ -74,7 +165,7 @@ pub(crate) fn logical_lines(content: &str) -> Vec<LogicalLine> {
         // hide that line's comment either.
         let comment = |i: usize| {
             let line = if i == 0 {
-                lines[0].strip_prefix('\u{feff}').unwrap_or(lines[0])
+                strip_bom(lines[0])
             } else {
                 lines[i]
             };
@@ -97,9 +188,7 @@ pub(crate) fn logical_lines(content: &str) -> Vec<LogicalLine> {
         // stays raw, so a rewrite records (and a revert restores) the
         // original bytes.
         if start == 0 {
-            if let Some(stripped) = text.strip_prefix('\u{feff}') {
-                text = stripped.to_string();
-            }
+            text = strip_bom(&text).to_string();
         }
         out.push(LogicalLine {
             start,
@@ -391,6 +480,48 @@ mod tests {
         assert_eq!(decode(&with(&[0xFF, 0xFE], &le[1..])), None);
         assert_eq!(decode(&with(&[0xFF, 0xFE], &[0x00, 0xD8])), None);
         assert_eq!(decode(&[b's', 0xC3, 0x28]), None);
+    }
+
+    /// #1119: with no BOM, pip honours a PEP 263 coding line in the
+    /// file's first two lines (`auto_decode`), so a Latin-1 file with a
+    /// non-ASCII comment installs. Codecs this reader does not model stay
+    /// unreadable instead of guessed.
+    #[test]
+    fn decode_follows_pips_pep_263_coding_line() {
+        let latin1 = b"# -*- coding: latin-1 -*-\n# Maintainer: Jos\xe9\nsix==1.16.0\n";
+        assert_eq!(
+            decode(latin1).as_deref(),
+            Some("# -*- coding: latin-1 -*-\n# Maintainer: Jos\u{e9}\nsix==1.16.0\n")
+        );
+        // The second line counts; every alias spelling Python accepts.
+        for coding in ["ISO-8859-1", "iso8859_1", "latin1", "L1", "cp819"] {
+            let text = format!("# deps\n# vim: set fileencoding={coding} :\nsix==1.16.0 # Jos");
+            let mut bytes = text.into_bytes();
+            bytes.push(0xE9);
+            assert!(
+                decode(&bytes).is_some_and(|t| t.ends_with("Jos\u{e9}")),
+                "{coding}"
+            );
+        }
+        // cp1252's Windows punctuation, and its bytes Python leaves undefined.
+        assert_eq!(
+            decode(b"# coding=cp1252\n# \x93six\x94\nsix==1.16.0\n").as_deref(),
+            Some("# coding=cp1252\n# \u{201c}six\u{201d}\nsix==1.16.0\n")
+        );
+        assert_eq!(decode(b"# coding: windows-1252\n# \x81\n"), None);
+        // A UTF-8 coding line still requires UTF-8.
+        assert_eq!(decode(b"# coding: utf-8\n# Jos\xe9\n"), None);
+        assert_eq!(decode(b"# coding: ascii\n# Jos\xe9\n"), None);
+        // A coding line on the third line, or not in a comment, is data.
+        assert_eq!(decode(b"# a\n# b\n# coding: latin-1\n# \xe9\n"), None);
+        assert_eq!(decode(b"six==1.16.0  # coding: latin-1 \xe9\n"), None);
+        // A codec this reader does not model is unreadable, never guessed.
+        assert_eq!(decode(b"# coding: koi8-r\n# \xe9\n"), None);
+        // A BOM wins over a coding line, as in pip.
+        assert_eq!(
+            decode(b"\xef\xbb\xbf# coding: latin-1\nsix==1.16.0\n").as_deref(),
+            Some("\u{feff}# coding: latin-1\nsix==1.16.0\n")
+        );
     }
 
     #[test]

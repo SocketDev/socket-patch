@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::args::{apply_env_toggles, is_local_go, GlobalArgs};
 use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome, StagedSources};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{
@@ -84,6 +84,25 @@ fn mismatch_event_detail(file: &str, dry_run: bool) -> String {
         "{file} did not match the patch's expected original content; the full verified \
          patched content {what} applied"
     )
+}
+
+/// One `content_mismatch_overwritten` run warning per mismatch-overwritten
+/// file across `results`, in the event detail's words prefixed with the
+/// package purl — what a nested apply hands back to `get` / `scan --mode
+/// agent` (#1004).
+fn mismatch_overwrite_warnings(results: &[ApplyResult], dry_run: bool) -> Vec<RunWarning> {
+    results
+        .iter()
+        .flat_map(|r| {
+            let purl = normalize_purl(&r.package_key);
+            mismatch_overwritten_files(r)
+                .into_iter()
+                .map(move |file| RunWarning {
+                    code: "content_mismatch_overwritten".to_string(),
+                    detail: format!("{purl}: {}", mismatch_event_detail(&file, dry_run)),
+                })
+        })
+        .collect()
 }
 
 /// `1 mismatched file` / `2 mismatched files`, with the verb agreeing.
@@ -361,7 +380,6 @@ pub struct ApplyArgs {
     #[arg(
         short = 'f',
         long,
-        env = "SOCKET_FORCE",
         default_value_t = false,
         value_parser = crate::args::parse_bool_flag,
     )]
@@ -413,14 +431,6 @@ impl ApplyArgs {
 // ── local-go redirect helpers ────────────────────────────────────────────────
 // In local mode a `pkg:golang/…` PURL redirects to a project-local patched copy under `.socket/go-patches/` wired via
 // a `go.mod` `replace` directive.
-
-/// True for a golang PURL in local mode (no `--global` / `--global-prefix`).
-/// Shared with `rollback`, which drops the same redirects this creates.
-pub(crate) fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
-    !common.global
-        && common.global_prefix.is_none()
-        && Ecosystem::from_purl(purl) == Some(Ecosystem::Golang)
-}
 
 /// Whether this run can touch `eco`'s LOCAL install tree at all: local mode
 /// (a `--global` / `--global-prefix` run crawls a different tree, so the
@@ -1228,15 +1238,20 @@ pub(crate) struct ApplyRunReport {
     /// failed run's caller can count exactly what applied. Filled only
     /// when `code != 0`.
     pub applied: Vec<String>,
+    /// Non-fatal per-file warnings the caller's envelope must carry: one
+    /// `content_mismatch_overwritten` per file the default mismatch policy
+    /// overwrote (#1004). A nested apply never prints JSON and is silent
+    /// for a JSON caller, so this is their only channel. Filled whenever
+    /// the apply loop ran, whatever the exit code.
+    pub warnings: Vec<RunWarning>,
 }
 
 impl ApplyRunReport {
     fn run_failure(code: i32, error_code: &str, error: impl Into<String>) -> Self {
         Self {
             code,
-            failures: Vec::new(),
             run_error: Some((error_code.to_string(), error.into())),
-            applied: Vec::new(),
+            ..Self::default()
         }
     }
 }
@@ -1636,10 +1651,16 @@ pub(crate) async fn run_locked(
                 .await;
             }
 
+            // The mismatch overwrites, for a nested caller's envelope (the
+            // JSON events above are the standalone apply's copy).
+            let warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
             // A requested-but-failed VEX flips an otherwise-successful
             // apply to a non-zero exit (fail-the-command contract).
             if success && !vex_failed {
-                return ApplyRunReport::default();
+                return ApplyRunReport {
+                    warnings,
+                    ..ApplyRunReport::default()
+                };
             }
             let failures = if success {
                 Vec::new()
@@ -1677,6 +1698,7 @@ pub(crate) async fn run_locked(
                 failures,
                 run_error,
                 applied,
+                warnings,
             }
         }
         Err(e) => {
@@ -1711,7 +1733,7 @@ async fn report_apply_failure(
         env.mark_error(EnvelopeError::new("apply_failed", error.to_string()));
         println!("{}", env.to_pretty_json());
     } else {
-        eprintln!("Error: {}", super::rollback::capitalize_first(error));
+        eprintln!("Error: {}", crate::ui::sentence_case(error));
     }
     1
 }
@@ -2001,7 +2023,7 @@ fn format_results_block(results: &[ApplyResult], dry_run: bool, cwd: &Path) -> V
             .copied()
             .unwrap_or(0)
             > 1)
-        .then(|| super::rollback::display_copy_path(&result.package_path, cwd));
+        .then(|| crate::ui::display_copy_path(&result.package_path, cwd));
         lines.push(format_patched_line(
             &normalize_purl(&result.package_key),
             copy.as_deref(),
@@ -3258,7 +3280,7 @@ const LOCKFILE_ONLY_DETAIL: &str =
 /// this host — an `os`/`cpu`-gated optional dependency (`fsevents`,
 /// `@esbuild/<os>-<cpu>`), a devDependency under `npm ci --omit=dev`. The
 /// tree is in its correct end state, so they are calm skips, as `scan
-/// --apply` treats lockfile-only packages. Global runs have no project
+/// --mode agent` treats lockfile-only packages. Global runs have no project
 /// lock, so nothing is lockfile-resolved there.
 async fn lockfile_resolved(common: &GlobalArgs, unmatched: &[String]) -> HashSet<String> {
     if unmatched.is_empty() || common.is_global() {

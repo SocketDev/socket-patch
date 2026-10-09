@@ -21,8 +21,8 @@ name: Gradle patch compatibility
 #
 # 9.8.0 is the current release on services.gradle.org (re-checked
 # 2026-10-02; bump it here and in ci.yml together when a newer 9.x ships).
-# 7.6.6 is the last 7.x. Every distribution is sha256-checked against
-# services.gradle.org before use.
+# 7.6.6 is the last 7.x. scripts/install-gradle.sh pins every
+# distribution's sha256; add the new version's digest there too.
 #
 # Each mode runs its suites' `#[ignore]` tests by name prefix (the contract
 # scripts/ci-e2e-bundle.py --check enforces): agent = e2e_gradle_discovery_build
@@ -44,6 +44,7 @@ on:
     paths:
       - '.github/workflows/gradle-compatibility.yml'
       - 'scripts/ci-e2e-bundle.py'
+      - 'scripts/install-gradle.sh'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'crates/*/Cargo.toml'
@@ -125,7 +126,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: gradle-compat
+          shared-key: e2e-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check the Gradle test-name prefixes
@@ -256,9 +257,13 @@ jobs:
           # TLS handshake with CRYPT_E_REVOCATION_OFFLINE whenever the CA's
           # revocation server is unreachable. A revoked certificate still fails;
           # the body is checked against a digest right after. A no-op elsewhere.
-          url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          # Tarball from Maven Central's CDN, digest from the Apache archive,
+          # which throttles the tarball itself to minutes (ci.yml's copy).
+          file="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          url="https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/${file}"
+          sha_url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${file}.sha512"
           curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$sha_url" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
@@ -273,16 +278,8 @@ jobs:
         shell: bash
         env:
           GRADLE_VERSION: ${{ matrix.gradle }}
-        run: |
-          # Download flags: see the Maven step above.
-          url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/gradle.zip"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
-          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
-          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
-          launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"
-          if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.bat"; fi
-          echo "SOCKET_PATCH_GRADLE_E2E_GRADLE=$launcher" >> "$GITHUB_ENV"
+        # Pinned digest, GitHub-release origin: see the script.
+        run: scripts/install-gradle.sh "$GRADLE_VERSION" "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Run the ${{ matrix.mode }} suites
         shell: bash
