@@ -3,7 +3,6 @@ _Last updated 2026-10-09T15:26Z · main @ 0ce8d6c_
 
 **In flight:**
 - [#1288](https://github.com/SocketDev/socket-patch/pull/1288): vendored `nuget.config` writer takes keys and anchors from `formats::nuget::parse_config`; `blank_comments`, `parse_config_source_keys`, `attr_value`, `self_closing_package_sources`, `insert_at_line` deleted. #594 vendored slice (E10), fixes #685. +128/−150 prod, +207/−58 tests. `state: ready`.
-- [#1277](https://github.com/SocketDev/socket-patch/pull/1277): 7 more files read the leading BOM through `formats::text` (`npm_crawler`, `governing_root`, `npmrc`, `upstream/npm`, `vex/discover/{npm,pypi_other}`, `pnpm/workspace`); 2 double skips removed. #905 slice 4 (E64). +29/−31 prod, +157/−7 tests. `state: ready`.
 - [#1272](https://github.com/SocketDev/socket-patch/pull/1272): `tests/common/envelope.rs` owns the `--json` envelope readers; ~25 private copies deleted, ratchet `cli/envelope_helper_copies.rs`. #1089 child 1 (C32). 0 prod. `state: ready`.
 - [#1262](https://github.com/SocketDev/socket-patch/pull/1262): OpenVEX written through `utils::fs::write_user_output`. #1144 (C77). +57/−1 prod, +185 tests. `state: ready`.
 - [#1258](https://github.com/SocketDev/socket-patch/pull/1258): 40 more CLI tests import `common`'s `binary()` / `git_sha256`. #824 children 2–3 slice 2 (C30). +142/−401 tests. `state: ready`.
@@ -12,7 +11,7 @@ _Last updated 2026-10-09T15:26Z · main @ 0ce8d6c_
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - Maintainer draft: #1049 (#792).
 
-**Merged:** #1264 (E16 slice 3, +67/−97 prod), #1239 (E93 crawler lookup), #1253 (C51 agent-mode jar streaming; `vendor/common.rs` caller and a size-mismatch test remain), #1227 (E16 slice 2), #1221 (E19 hosted gem), #1230 (E93 `PurlKey`), #1217/#1209/#1205/#1183 (E05 Deno, Go, cargo, NuGet crawls); 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
+**Merged:** #1277 (E64 slice 4, +29/−31 prod, +157/−7 tests), #1264 (E16 slice 3, +67/−97 prod), #1239 (E93 crawler lookup), #1253 (C51 agent-mode jar streaming; `vendor/common.rs` caller and a size-mismatch test remain), #1227 (E16 slice 2), #1221 (E19 hosted gem), #1230 (E93 `PurlKey`), #1217/#1209/#1205/#1183 (E05 Deno, Go, cargo, NuGet crawls); 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
 
 **Queue** (score = 3B + 2U + 2D + S − risk). Standalone refactor issues closed `not_planned` live on as tracker checklist items; rank the tracker's next item.
 
