@@ -225,8 +225,17 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              intact, so re-running `scan` / `vendor` does not change this (drop the entry from \
              deno.lock if Deno does not install this project's npm dependencies)",
         ),
+        UnattestedKind::NpmShrinkwrapOnly => (
+            NOTE_NPM_SHRINKWRAP_ONLY,
+            "not attested until a package-lock.json wires it",
+        ),
     }
 }
+
+/// Omission tag and note: the patch is wired only in a root
+/// `npm-shrinkwrap.json` with no `package-lock.json` twin, which npm >= 12
+/// never reads (`vex::Unattested`, #899).
+pub(crate) const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
 
 fn note(code: &'static str, detail: String) -> PlanNote {
     PlanNote { code, detail }
@@ -363,8 +372,10 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
     let superseded = attach_discovered(&mut cands, &discovery, &vendor, &conflicts);
     // Wired, but a build bypasses the pin (`Unattested`: a Gradle lock
     // above the hosted base resolves the newer upstream release, a pnpm
-    // bundled copy, a deno.lock copy): the ref keeps rollback, remove,
-    // list and the ledgers' liveness working, and the patch is omitted.
+    // bundled copy, a deno.lock copy, an npm shrinkwrap with no
+    // package-lock.json twin, which npm >= 12 ignores): the ref keeps
+    // rollback, remove, list and the ledgers' liveness working, and the
+    // patch is omitted.
     cands.retain(|c| {
         let pkg = canonical_base_purl(&c.key);
         let Some(u) = discovery

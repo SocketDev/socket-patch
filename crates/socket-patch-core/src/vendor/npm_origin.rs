@@ -407,6 +407,42 @@ pub(crate) fn npm_non_registry_entries(
     out
 }
 
+/// Every `packages` key installed beneath a package that ships its own
+/// `npm-shrinkwrap.json` (the lock marks that ancestor `"hasShrinkwrap":
+/// true`, e.g. `firebase-tools`, `netlify-cli`), mapped to the outermost
+/// such ancestor's key (#753). npm 7–11 install that subtree from the
+/// dependency's own shrinkwrap at reify time and ignore the root lock's
+/// entries for it, so a rewrite of one of them installs nothing (npm 12
+/// honors the root lock, but the files cannot tell which npm installs).
+/// The rewriters skip these entries loudly and lockfile discovery never
+/// attests them. Empty for a lock without `packages`: a lockfileVersion 1
+/// lock does not record `hasShrinkwrap`.
+pub(crate) fn npm_shrinkwrapped_entries(lock: &Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
+        return out;
+    };
+    let ships_shrinkwrap = |key: &str| {
+        packages
+            .get(key)
+            .and_then(|entry| entry.get("hasShrinkwrap"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    };
+    for key in packages.keys() {
+        // Each `/node_modules/` segment closes an enclosing package's path,
+        // outermost first.
+        let ancestor = key
+            .match_indices("/node_modules/")
+            .map(|(at, _)| &key[..at])
+            .find(|prefix| ships_shrinkwrap(prefix));
+        if let Some(ancestor) = ancestor {
+            out.insert(key.clone(), ancestor.to_string());
+        }
+    }
+    out
+}
+
 /// The `packages` key node's module lookup picks for `dep_name` required
 /// from the package at `from`: `<from>/node_modules/<dep>`, then the same
 /// under each ancestor directory, up to the project root.
@@ -448,10 +484,10 @@ fn resolved_is_non_registry(resolved: &str) -> bool {
         return true;
     }
     match resolved.strip_prefix("file:") {
-        Some(path) => {
-            let path = path.trim_start_matches("./");
-            !path.starts_with(&format!("{SOCKET_DIR}/vendor/"))
-        }
+        Some(path) => !path
+            .trim_start_matches("./")
+            .strip_prefix(SOCKET_DIR)
+            .is_some_and(|rest| rest.starts_with("/vendor/")),
         None => false,
     }
 }
@@ -479,8 +515,11 @@ pub(crate) fn npm_spec_is_registry(spec: &str) -> bool {
     if spec.starts_with('.') {
         return false;
     }
-    let lower = spec.to_ascii_lowercase();
-    !(lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar"))
+    let has_suffix = |suffix: &str| {
+        spec.len() >= suffix.len()
+            && spec.as_bytes()[spec.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    };
+    !(has_suffix(".tgz") || has_suffix(".tar.gz") || has_suffix(".tar"))
 }
 
 #[cfg(test)]
@@ -488,6 +527,45 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// #753: every entry under a `hasShrinkwrap` package maps to that
+    /// (outermost) package; the package itself, its siblings and workspace
+    /// members' own entries do not.
+    #[test]
+    fn shrinkwrapped_entries_are_the_descendants_of_a_has_shrinkwrap_package() {
+        let lock = json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": {},
+                "node_modules/@bh/sw": { "version": "1.0.0", "hasShrinkwrap": true },
+                "node_modules/@bh/sw/node_modules/left-pad": { "version": "1.3.0" },
+                "node_modules/@bh/sw/node_modules/a": { "version": "1.0.0", "hasShrinkwrap": true },
+                "node_modules/@bh/sw/node_modules/a/node_modules/b": { "version": "1.0.0" },
+                "node_modules/left-pad": { "version": "1.1.3" },
+                "node_modules/other": { "version": "1.0.0", "hasShrinkwrap": false },
+                "node_modules/other/node_modules/left-pad": { "version": "1.3.0" },
+                "packages/ws": { "version": "1.0.0" },
+                "packages/ws/node_modules/left-pad": { "version": "1.3.0" }
+            }
+        });
+        let got = npm_shrinkwrapped_entries(&lock);
+        let want: BTreeMap<String, String> = [
+            (
+                "node_modules/@bh/sw/node_modules/left-pad",
+                "node_modules/@bh/sw",
+            ),
+            ("node_modules/@bh/sw/node_modules/a", "node_modules/@bh/sw"),
+            (
+                "node_modules/@bh/sw/node_modules/a/node_modules/b",
+                "node_modules/@bh/sw",
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(got, want);
+        assert!(npm_shrinkwrapped_entries(&json!({"dependencies": {}})).is_empty());
+    }
 
     #[test]
     fn registry_specs_are_recognized() {
@@ -529,6 +607,9 @@ mod tests {
             "/abs/left-pad",
             "~/left-pad",
             "left-pad-1.3.0.tgz",
+            "left-pad-1.3.0.TGZ",
+            "left-pad-1.3.0.Tar.Gz",
+            "left-pad-1.3.0.tar",
             "C:\\pkgs\\left-pad.tgz",
             "npm:left-pad@github:stevemao/left-pad",
         ] {
@@ -536,6 +617,29 @@ mod tests {
                 !npm_spec_is_registry(spec),
                 "{spec:?} is not a registry spec"
             );
+        }
+    }
+
+    /// socket-patch's own vendored wiring (with or without `./`) is not a
+    /// local source; any other `file:` path, git and git hosts are.
+    #[test]
+    fn non_registry_resolved_spares_only_socket_vendor_paths() {
+        for resolved in [
+            "file:.socket/vendor/npm/u/left-pad-1.3.0.tgz",
+            "file:./.socket/vendor/npm/u/left-pad-1.3.0.tgz",
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        ] {
+            assert!(!resolved_is_non_registry(resolved), "{resolved:?}");
+        }
+        for resolved in [
+            "file:.socketx/vendor/left-pad-1.3.0.tgz",
+            "file:.socket/vendorx/left-pad-1.3.0.tgz",
+            "file:.socket",
+            "file:../left-pad",
+            "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba",
+            "github:stevemao/left-pad",
+        ] {
+            assert!(resolved_is_non_registry(resolved), "{resolved:?}");
         }
     }
 

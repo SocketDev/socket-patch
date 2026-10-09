@@ -152,6 +152,65 @@ impl Envelope {
         self.events.push(event);
     }
 
+    /// Re-tag every `Applied` event recorded at or after index `since` as
+    /// `action` (`Skipped` or `Failed`) with `code` and `message`, keeping
+    /// the summary in step: for packages a later step of the same run
+    /// undid (a refused group commit, a rolled-back eject), which must not
+    /// be reported or counted as applied. Their file lists are dropped (the
+    /// files are no longer there). The `skipped` advisories recorded for a
+    /// retracted package in the same span (`vendor_prebuilt_downloaded`
+    /// "vendored … from the patch service", `vendor_artifact_reused`, …)
+    /// describe that undone vendoring, so they are dropped too: the
+    /// re-tagged event is the package's one account. Returns how many
+    /// events were re-tagged.
+    pub fn retract_applied(
+        &mut self,
+        since: usize,
+        action: PatchAction,
+        code: &str,
+        message: &str,
+    ) -> usize {
+        let since = since.min(self.events.len());
+        let retracted_purls: std::collections::HashSet<String> = self.events[since..]
+            .iter()
+            .filter(|e| e.action == PatchAction::Applied)
+            .filter_map(|e| e.purl.clone())
+            .collect();
+        let mut index = 0;
+        let summary = &mut self.summary;
+        self.events.retain(|e| {
+            let keep = index < since
+                || e.action != PatchAction::Skipped
+                || !e.purl.as_ref().is_some_and(|p| retracted_purls.contains(p));
+            index += 1;
+            if !keep {
+                summary.skipped = summary.skipped.saturating_sub(1);
+            }
+            keep
+        });
+        let mut retracted = 0;
+        for event in self.events.iter_mut().skip(since) {
+            if event.action != PatchAction::Applied {
+                continue;
+            }
+            self.summary.applied = self.summary.applied.saturating_sub(1);
+            self.summary.bump(action);
+            event.action = action;
+            event.files.clear();
+            event.error_code = Some(code.to_string());
+            if action == PatchAction::Failed {
+                event.error = Some(message.to_string());
+            } else {
+                event.reason = Some(message.to_string());
+            }
+            retracted += 1;
+        }
+        if retracted > 0 && action == PatchAction::Failed {
+            self.mark_partial_failure();
+        }
+        retracted
+    }
+
     /// Mark the run as a partial failure. Idempotent.
     pub fn mark_partial_failure(&mut self) {
         if !matches!(self.status, Status::Error) {
@@ -794,6 +853,52 @@ mod tests {
         assert_eq!(env.summary.downloaded, 1);
         assert_eq!(env.summary.skipped, 1);
         assert_eq!(env.events.len(), 3);
+    }
+
+    #[test]
+    fn retract_applied_retags_only_later_applied_events() {
+        let mut env = Envelope::new(Command::Vendor);
+        env.record(PatchEvent::new(PatchAction::Applied, "pkg:npm/early@1.0.0"));
+        let since = env.events.len();
+        env.record(PatchEvent::new(PatchAction::Applied, "pkg:npm/a@1.0.0"));
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, "pkg:npm/a@1.0.0")
+                .with_reason("vendor_prebuilt_downloaded", "advisory"),
+        );
+        // An advisory for a package that was NOT retracted is kept.
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, "pkg:npm/other@1.0.0")
+                .with_reason("vendor_bundled_instance_skipped", "advisory"),
+        );
+        let n = env.retract_applied(since, PatchAction::Skipped, "eject_rolled_back", "undone");
+        assert_eq!(n, 1);
+        assert_eq!(env.summary.applied, 1, "the earlier event is kept");
+        // The retracted package's "vendored … from the patch service"
+        // advisory described the undone vendoring (#898, #1005): dropped.
+        assert_eq!(env.events.len(), 3, "{:?}", env.events);
+        assert_eq!(env.summary.skipped, 2);
+        assert!(!env
+            .events
+            .iter()
+            .any(|e| e.error_code.as_deref() == Some("vendor_prebuilt_downloaded")));
+        assert_eq!(
+            env.events[2].error_code.as_deref(),
+            Some("vendor_bundled_instance_skipped")
+        );
+        assert_eq!(env.events[1].action, PatchAction::Skipped);
+        assert_eq!(
+            env.events[1].error_code.as_deref(),
+            Some("eject_rolled_back")
+        );
+        assert_eq!(env.events[1].reason.as_deref(), Some("undone"));
+        assert_eq!(env.status, Status::Success);
+
+        let n = env.retract_applied(0, PatchAction::Failed, "refused", "boom");
+        assert_eq!(n, 1);
+        assert_eq!(env.summary.applied, 0);
+        assert_eq!(env.summary.failed, 1);
+        assert_eq!(env.events[0].error.as_deref(), Some("boom"));
+        assert_eq!(env.status, Status::PartialFailure);
     }
 
     #[test]

@@ -548,14 +548,13 @@ impl NpmRootsCrawler<'_> {
 
 /// The installed copy of each npm purl in `purls`, found by its
 /// `package.json` identity (a full npm crawl) instead of its install path.
-/// An npm ALIAS dependency (`"lp": "npm:left-pad@1.3.0"`) is installed under
-/// its dependency key (`node_modules/lp`), which the name-keyed resolvers
-/// above never probe; callers use this as the last lookup before calling a
+/// An npm ALIAS dependency (`"lp": "npm:left-pad@1.3.0"`) reached through a
+/// symlinked importer entry is one the name-keyed resolvers above never
+/// take as a copy; callers use this as the last lookup before calling a
 /// package missing (`vendor`, and `vex` for a purl nothing else found).
 /// The crawl dedups by name@version, so this yields ONE copy per purl — the
 /// first the crawl reaches — never every alias beside a normal install
-/// (`vex`'s per-dir alias walk, `vex_consumed::npm_alias_copies`, finds
-/// those). Keyed by the caller's spelling; a purl with no copy has no
+/// (the core resolver's alias pass returns those). Keyed by the caller's spelling; a purl with no copy has no
 /// entry. No crawl runs when `purls` is empty.
 pub(crate) async fn npm_paths_by_identity(
     options: &CrawlerOptions,

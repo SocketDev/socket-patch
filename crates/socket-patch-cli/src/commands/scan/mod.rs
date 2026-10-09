@@ -874,7 +874,7 @@ pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
      `scan --mode vendored --prune` to garbage-collect";
 
 /// The PURLs claimed by BOTH a hosted pin (`redirect`, the lockfiles'
-/// hosted state — see [`crate::commands::hosted_state_from_lockfiles`]) and
+/// hosted state — see [`crate::commands::hosted_state_from_pins`]) and
 /// the vendored state ledger (`.socket/vendor/state.json`), sorted. A
 /// non-empty result means one of the two is stale for each PURL (a
 /// lockfile entry can point only one way). `None`, an empty vendor ledger,
@@ -920,19 +920,29 @@ pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -
     // A malformed vendor ledger classifies like a missing one (this path
     // only feeds takeover warnings; corruption is a hard error on the
     // write/attest paths).
+    let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
+    // Nothing vendored, nothing to overlap: skip the lockfile walk (#993).
+    let Some(vendor) = vendor.filter(|v| !v.entries.is_empty()) else {
+        return OverlapTakeover::default();
+    };
     let discovery = crate::commands::discover_wiring(common, cwd).await;
     let redirect = crate::commands::hosted_state_from_pins(
         &socket_patch_core::patch::redirect::upstream::HostedPin::all(&discovery),
     );
-    let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
-    classify_overlap_takeover_with(cwd, Some(&redirect), vendor.as_ref(), &discovery).await
+    classify_overlap_takeover_with(cwd, Some(&redirect), Some(&vendor), &discovery).await
 }
 
 /// [`classify_overlap_takeover`] over already-loaded state (the hosted
 /// engine classifies against its post-takeover vendor ledger) and
 /// `discovery`, the lockfile discovery of `cwd` as it is now
-/// ([`crate::commands::discover_wiring`]). `None` for either state yields
-/// no overlap.
+/// ([`crate::commands::discover_wiring`]). `None` for either state, or an
+/// empty vendored ledger, yields no overlap.
+///
+/// Callers hand in a discovery they already hold and should skip
+/// discovering at all when the vendored ledger has no entries: discovery
+/// re-walks every lockfile of the project, which is a real share of a
+/// hosted scan's time (#993), and a project that never vendored (the
+/// hosted common case) has nothing for it to decide.
 pub(super) async fn classify_overlap_takeover_with(
     cwd: &Path,
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
@@ -940,7 +950,7 @@ pub(super) async fn classify_overlap_takeover_with(
     discovery: &socket_patch_core::vex::discover::Discovery,
 ) -> OverlapTakeover {
     let mut out = OverlapTakeover::default();
-    let Some(vendor) = vendor else {
+    let Some(vendor) = vendor.filter(|v| !v.entries.is_empty()) else {
         return out;
     };
     let overlap = overlap_from_states(redirect, vendor);
@@ -1296,7 +1306,7 @@ async fn gradle_scan(
 
 /// The scanned purls whose HOSTED redirect wiring is still live: a hosted
 /// pin names the purl (`redirect_state`, the lockfiles' hosted state — see
-/// [`crate::commands::hosted_state_from_lockfiles`]) AND lockfile discovery
+/// [`crate::commands::hosted_state_from_pins`]) AND lockfile discovery
 /// proves the current lockfile still routes it to that hosted patch — core
 /// `Discovery::redirect_record_live`, the same liveness rule `vex` gates
 /// hosted attestations on.
@@ -1693,6 +1703,15 @@ async fn run_scan(
         explicit,
         args.common.is_global(),
     ));
+    // Agent and report-only scans patch the crawled copies in place, so a
+    // copy under a nested project's `node_modules` is judged by that
+    // project's root (#554). Hosted and vendored scans only rewire this
+    // root's lockfiles.
+    if !args.common.is_global()
+        && !matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
+    {
+        policy.judge_nested_roots(invocation, &args.common.cwd);
+    }
 
     // Positional PATH globs (see `ScanArgs::paths`). An unparseable glob
     // is a usage error, same exit-2 shape as the mode conflicts.
@@ -1995,10 +2014,16 @@ async fn run_scan(
 
     // The socket.yml root/ecosystem/package filters, after the flags
     // (which only narrow further) and after the prune-universe capture.
-    let filtered_crawled: Vec<_> = filtered_crawled
-        .into_iter()
-        .filter(|pkg| policy.admit_crawled(&pkg.purl))
-        .collect();
+    if policy.judges_nested_roots() && args.common.ecosystem_selected(Ecosystem::Npm) {
+        let nm_roots = socket_patch_core::crawlers::NpmCrawler::new()
+            .get_node_modules_paths(&crawler_options)
+            .await
+            .unwrap_or_default();
+        policy
+            .locate_nested_copies(&nm_roots, &filtered_crawled)
+            .await;
+    }
+    let filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
 
     // Gradle discovery notes (m2 gating, the user home) ride the run-level
     // warnings; the lock set only annotates `packages[]` below.
@@ -4437,6 +4462,43 @@ mod tests {
             vec!["pkg:npm/minimist@1.2.2".to_string()]
         );
         assert!(takeover.vendored.is_empty(), "{takeover:?}");
+    }
+
+    /// The takeover classifier runs after every hosted rewrite, so it must
+    /// not re-walk the lockfiles when no vendored ledger entry could
+    /// overlap (the hosted common case), and walks them once otherwise
+    /// (#993: it used to discover twice — once for the hosted pins, once
+    /// for liveness — and even with no vendored ledger at all).
+    #[tokio::test]
+    async fn takeover_classifier_discovers_at_most_once() {
+        let discoveries = || crate::commands::DISCOVERIES.with(|n| n.get());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_lock_pointing_at_hosted(root, "minimist", "1.2.2").await;
+
+        // No vendored ledger, then an empty one: nothing to overlap.
+        for write_empty in [false, true] {
+            if write_empty {
+                socket_patch_core::vendor::save_state(root, &VendorState::new())
+                    .await
+                    .unwrap();
+            }
+            let before = discoveries();
+            assert_eq!(
+                classify_overlap_takeover(&common_at(root), root).await,
+                OverlapTakeover::default()
+            );
+            assert_eq!(discoveries(), before, "no vendored entry, no discovery");
+        }
+
+        write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
+        let before = discoveries();
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
+        assert_eq!(discoveries(), before + 1, "one discovery serves both sides");
+        assert_eq!(
+            takeover.redirect,
+            vec!["pkg:npm/minimist@1.2.2".to_string()]
+        );
     }
 
     #[tokio::test]

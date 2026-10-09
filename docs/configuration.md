@@ -125,6 +125,13 @@ socket-patch scan 'apps/*' --mode hosted
 Each PATH in hosted or vendored mode is a project directory. Paths outside the
 repository are rejected. For JSON output, scan one project per invocation.
 
+An agent-mode scan from the repository root also patches nested projects'
+`node_modules`. Each installed copy follows its own project root (the nearest
+directory with a lockfile), so these filters skip nested projects too. A package
+an included project also installs is patched in every copy, because patches are
+recorded per package version; the scan warns `policy_shared_copy` when that reaches
+a skipped project.
+
 ### Gradual rollout
 
 ```sh
