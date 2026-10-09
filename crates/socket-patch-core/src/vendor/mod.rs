@@ -197,6 +197,47 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
     ))
 }
 
+/// Advisory probe (#691): does this yarn classic workspaces project carry
+/// vendored wiring that installs from a workspace member directory cannot
+/// fetch?
+///
+/// Vendored mode wires `resolved "file:./.socket/vendor/…"`, relative to
+/// the workspace root that holds `yarn.lock`. Yarn 1 resolves a relative
+/// `file:` tarball against the directory it runs in, so on a cold cache
+/// every `yarn install` / `yarn add` run from a member directory (and
+/// `yarn workspace <name> …`, which runs there) fails with "Tarball is not
+/// in network and can not be located in cache", whether or not the member
+/// depends on the patched package. No relative spelling works from both
+/// (measured on yarn 1.7.0, 1.10.1 and 1.22.22). Returns the warning when
+/// `yarn.lock` is classic with such a `file:./` resolution and the root
+/// `package.json` declares workspaces. State-based, like
+/// [`yarn_classic_berry_migration_risk`].
+pub fn yarn_classic_workspace_member_risk(project_root: &Path) -> Option<VendorWarning> {
+    let lock = read_regular_to_string_sync(&project_root.join("yarn.lock")).ok()?;
+    if !lock.contains("# yarn lockfile v1") || !lock.contains("\"file:./.socket/vendor/") {
+        return None;
+    }
+    let manifest = read_regular_to_string_sync(&project_root.join("package.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(crate::formats::text::strip_bom(&manifest)).ok()?;
+    let workspaces = manifest.get("workspaces")?;
+    let globs = workspaces
+        .as_array()
+        .or_else(|| workspaces.get("packages").and_then(serde_json::Value::as_array))?;
+    if globs.is_empty() {
+        return None;
+    }
+    Some(VendorWarning::new(
+        "yarn_classic_workspace_member_install_risk",
+        "yarn.lock is yarn-classic (v1) in a workspaces project and its vendored entries \
+         resolve `file:./.socket/vendor/…` tarballs, which yarn 1 looks up relative to the \
+         directory it runs in: on a cold yarn cache, `yarn install`, `yarn add` or `yarn \
+         workspace <name> …` run from a workspace member directory fails (\"Tarball is not \
+         in network\"). Run `yarn install` from the workspace root (which also warms the \
+         cache for later member-directory commands), or patch this project with `--mode \
+         hosted`.",
+    ))
+}
+
 /// Whether a root `package.json` text pins yarn classic through corepack's
 /// `packageManager: yarn@1…`, which makes a stray yarn 2+ (berry) install
 /// refuse instead of migrating a classic `yarn.lock` and dropping its
@@ -2030,6 +2071,43 @@ mod berry_migration_risk_tests {
         let fifo = tmp.path().join("package.json");
         super::harvest_tests::mkfifo(&fifo);
         assert!(probe_with_timeout(tmp.path(), &fifo).is_some());
+    }
+
+    /// #691: yarn 1 resolves a relative `file:` tarball in `resolved`
+    /// against the directory it runs in, not the one holding yarn.lock, so
+    /// in a workspaces project every cold-cache install run from a member
+    /// directory fails once vendoring wires one. Measured on yarn 1.7.0,
+    /// 1.10.1 and 1.22.22; no relative spelling installs from both.
+    #[test]
+    fn issue_691_wired_classic_workspaces_warn_about_member_dir_installs() {
+        for workspaces in [r#"["a","b"]"#, r#"{"packages":["packages/*"]}"#] {
+            let pkg = format!(r#"{{"name":"root","private":true,"workspaces":{workspaces}}}"#);
+            let tmp = project(Some(WIRED_V1), Some(&pkg));
+            let w = yarn_classic_workspace_member_risk(tmp.path()).expect("must warn");
+            assert_eq!(w.code, "yarn_classic_workspace_member_install_risk");
+            assert!(
+                w.detail.contains("member directory") && w.detail.contains("workspace root"),
+                "detail names the trap and the remedy: {}",
+                w.detail
+            );
+        }
+        // No workspaces, empty workspaces, an unwired or berry lock, or
+        // no manifest: nothing installs from a member directory through
+        // our wiring.
+        for (lock, pkg) in [
+            (Some(WIRED_V1), Some(r#"{"name":"x"}"#)),
+            (Some(WIRED_V1), Some(r#"{"name":"x","workspaces":[]}"#)),
+            (Some(WIRED_V1), Some(r#"{"name":"x","workspaces":{"packages":[]}}"#)),
+            (Some(WIRED_V1), None),
+            (Some(UNWIRED_V1), Some(r#"{"name":"x","workspaces":["a"]}"#)),
+            (None, Some(r#"{"name":"x","workspaces":["a"]}"#)),
+        ] {
+            let tmp = project(lock, pkg);
+            assert!(
+                yarn_classic_workspace_member_risk(tmp.path()).is_none(),
+                "{lock:?} {pkg:?}"
+            );
+        }
     }
 
     #[test]

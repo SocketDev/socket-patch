@@ -538,7 +538,10 @@ the model is **not uniform** today:
   vlt.json `workspaces` — a glob, a list, or named groups of either — or vlt <= 0.0.0-12's
   `vlt-workspaces.json`; vlt's declaration wins over the others and vlt never reads package.json
   `workspaces`). One repo-root invocation discovers every member. A member that is itself a
-  workspace root is recursed into (bounded depth).
+  workspace root is recursed into (bounded depth). Vendored yarn classic wiring is root-relative (`file:./.socket/vendor/…`), which yarn 1
+  reads relative to the directory it runs in: a cold-cache yarn command run from a member
+  directory cannot fetch it, and the run warns `yarn_classic_workspace_member_install_risk`
+  (#691; see docs/ecosystems.md).
 - **cwd-only (single project):** gem, pypi, composer. The crawler inspects only the project
   rooted at `--cwd` (pypi first takes the env the project's manager records: PDM's `.pdm-python` interpreter, meaning its venv or, for a base interpreter, PEP 582 `__pypackages__/<X.Y>/lib`, and uv's `UV_PROJECT_ENVIRONMENT`. Otherwise it looks at `$VIRTUAL_ENV`, `<cwd>/.venv` / `venv`, then a Poetry project's out-of-tree virtualenv(s) under Poetry's `virtualenvs.path`; composer at the vendor tree); it does **not**
   descend into sibling subprojects. A monorepo with several independent lockfiles in subdirectories

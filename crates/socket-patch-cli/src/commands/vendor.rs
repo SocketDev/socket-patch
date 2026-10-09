@@ -893,28 +893,33 @@ fn format_revert_install_hint(cmd: &str) -> String {
     )
 }
 
-/// Run-level advisory shared by the `vendor` command and the scan-driven
+/// Run-level advisories shared by the `vendor` command and the scan-driven
 /// vendor step: warn (once, at the envelope level — not per package) when
 /// the project's classic `yarn.lock` carries vendored wiring that a stray
-/// yarn 2+ install would silently drop. The probe is state-based (it reads
-/// the on-disk lockfile), so callers invoke it unconditionally at
-/// envelope-finalize time — unwired projects and fully-reverted runs stay
-/// silent, and dry runs report the risk that already exists on disk.
+/// yarn 2+ install would silently drop, or that installs run from a
+/// workspace member directory cannot fetch (#691). The probes are
+/// state-based (they read the on-disk lockfile), so callers invoke them
+/// unconditionally at envelope-finalize time — unwired projects and
+/// fully-reverted runs stay silent, and dry runs report the risk that
+/// already exists on disk.
 pub(crate) fn note_classic_migration_risk(
     env: &mut Envelope,
     project_root: &Path,
     common: &GlobalArgs,
 ) {
-    let Some(w) = vendor::yarn_classic_berry_migration_risk(project_root) else {
-        return;
-    };
-    if !common.silent && !common.json {
-        eprintln!("Warning: {}", w.detail);
+    let warnings = [
+        vendor::yarn_classic_berry_migration_risk(project_root),
+        vendor::yarn_classic_workspace_member_risk(project_root),
+    ];
+    for w in warnings.into_iter().flatten() {
+        if !common.silent && !common.json {
+            eprintln!("Warning: {}", w.detail);
+        }
+        env.warnings.push(RunWarning {
+            code: w.code.to_string(),
+            detail: w.detail,
+        });
     }
-    env.warnings.push(RunWarning {
-        code: w.code.to_string(),
-        detail: w.detail,
-    });
 }
 
 /// The usage error for `vendor` under global scope, or `None` for a
