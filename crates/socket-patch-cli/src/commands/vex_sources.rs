@@ -246,6 +246,11 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_NPM_SHRINKWRAP_ONLY,
             "not attested until a package-lock.json wires it",
         ),
+        UnattestedKind::MavenReactorRoot => (
+            NOTE_MAVEN_REACTOR_ROOT,
+            "not attested while the root declares modules (roll it back and re-patch the \
+             reactor with `scan --mode vendored`)",
+        ),
     }
 }
 
@@ -253,6 +258,9 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
 /// `npm-shrinkwrap.json` with no `package-lock.json` twin, which npm >= 12
 /// never reads (`vex::Unattested`, #899).
 pub(crate) const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
+/// Omission tag and note: a hosted Maven pin sits in a reactor root, where a
+/// module's own `<version>` may override it (`vex::Unattested`, #261).
+pub(crate) const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 
 fn note(code: &'static str, detail: String) -> PlanNote {
     PlanNote { code, detail }

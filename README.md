@@ -90,13 +90,15 @@ VEX-aware vulnerability scanner.
 
 | Mode | Command | What to commit | What installs need |
 | --- | --- | --- | --- |
-| Hosted (default) | `socket-patch scan` | Changed lockfiles, manifests, and registry configuration | Access to Socket's patch server |
+| Hosted (default for a new project) | `socket-patch scan` | Changed lockfiles, manifests, and registry configuration | Access to Socket's patch server |
 | Vendored | `socket-patch scan --mode vendored` | Changed dependency files and `.socket/vendor/` (artifacts and ledger) | The committed patched packages |
 | Agent | `socket-patch scan --mode agent` | `.socket/manifest.json` and patch data; Go also uses a committed patched tree | `socket-patch apply` after dependency installs |
 
 Vendored mode stores **patched dependencies**, not the entire dependency graph.
 Other dependencies still need their normal registry, mirror, or offline cache.
 Hosted and vendored installs do not need an install hook or the Socket Patch CLI.
+Once a project holds vendored or agent-mode patches, a bare `scan` or `get` keeps
+that mode; pass `--mode` to switch.
 
 The CLI supports npm, PyPI, Cargo, Go, RubyGems, Maven (including sbt, Mill and
 scala-cli builds), Composer, NuGet, and Deno.

@@ -39,6 +39,7 @@ use crate::patch::redirect::{
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
+use crate::utils::redact::url_host;
 use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
@@ -51,7 +52,7 @@ use super::guidance::{
     pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_not_needed_detail,
     pnpm_trust_policy_preamble, pnpm_trust_rush_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    url_host, TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
+    TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
     PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
@@ -1066,14 +1067,36 @@ pub fn wheel_targets<'a>(
     out
 }
 
+/// `text` about one hosted artifact made safe to show: every URL in it
+/// through [`crate::utils::redact::redact_urls_in`], and then the grant
+/// token of `artifact_url` wherever it is still spelled as a path level.
+/// The second pass is what knowing the artifact adds: its token is the
+/// level before `patch_uuid`, so a URL served under a root the shape-based
+/// redactor does not recognise (a custom `--api-url` server) or with a
+/// non-canonical patch id is still covered.
+pub fn redact_artifact_text(text: &str, artifact_url: &str, patch_uuid: &str) -> String {
+    let text = crate::utils::redact::redact_urls_in(text);
+    match crate::patch::redirect::grant_token_path_segment(artifact_url, patch_uuid) {
+        Some(token) if token != crate::utils::redact::REDACTED => text.replace(
+            &format!("/{token}/"),
+            &format!("/{}/", crate::utils::redact::REDACTED),
+        ),
+        _ => text.into_owned(),
+    }
+}
+
 /// The skip recorded for a pypi dep whose wheel metadata could not be
-/// fetched (the grant token in `detail` is redacted to `<hosted artifact>`).
+/// fetched (`detail` redacted by [`redact_artifact_text`]).
 pub fn wheel_metadata_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
     SkippedPatch {
         purl: format!("pkg:pypi/{}@{}", dep.name, dep.version),
         uuid: dep.patch_uuid.clone(),
         reason: "python_metadata_unavailable".to_string(),
-        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+        detail: Some(redact_artifact_text(
+            detail,
+            &dep.artifact_url,
+            &dep.patch_uuid,
+        )),
     }
 }
 
@@ -1109,8 +1132,7 @@ pub fn yarn_berry_manifest_targets<'a>(
 }
 
 /// The skip recorded for an npm dep whose served `package.json` could not
-/// be fetched (the grant token in `detail` is redacted to `<hosted
-/// artifact>`).
+/// be fetched (`detail` redacted by [`redact_artifact_text`]).
 pub fn npm_manifest_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
     SkippedPatch {
         purl: format!(
@@ -1120,7 +1142,11 @@ pub fn npm_manifest_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch
         ),
         uuid: dep.patch_uuid.clone(),
         reason: "npm_manifest_unavailable".to_string(),
-        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+        detail: Some(redact_artifact_text(
+            detail,
+            &dep.artifact_url,
+            &dep.patch_uuid,
+        )),
     }
 }
 
@@ -2788,6 +2814,67 @@ pub fn warning(code: &str, detail: impl Into<String>) -> RewriteWarning {
 mod tests {
     use super::*;
     use crate::vendor::lock_inventory::MemoryProject;
+
+    const GRANT: &str = "GRANTTOKEN0123";
+    const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+
+    fn grant_dep(ecosystem: &str, artifact_url: String) -> DepOverride {
+        DepOverride {
+            ecosystem: ecosystem.into(),
+            name: "left-pad".into(),
+            namespace: None,
+            version: "1.3.0".into(),
+            token: GRANT.into(),
+            patch_uuid: PATCH_UUID.into(),
+            artifact_url,
+            registry_override: None,
+            integrity: crate::patch::redirect::Integrity::default(),
+        }
+    }
+
+    /// The hosted skip details reach `--json`: neither the grant token nor
+    /// any userinfo survives, however reqwest re-renders the URL (a
+    /// trailing `/`, a different quoting) and under whatever root the
+    /// server serves it (a custom `--api-url` with no `/patch/` level).
+    #[test]
+    fn hosted_skip_details_never_carry_the_grant_token() {
+        for (url, uuid) in [
+            (
+                format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{GRANT}/{PATCH_UUID}/left-pad-1.3.0.tgz"),
+                PATCH_UUID,
+            ),
+            (
+                format!("https://u:pw@api.corp.example/serve/{GRANT}/{PATCH_UUID}/left-pad-1.3.0.tgz"),
+                PATCH_UUID,
+            ),
+            // A non-canonical patch id: the shape-based redactor cannot
+            // tell its level is a uuid, the dep can.
+            (
+                format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{GRANT}/patch-42/x.tgz"),
+                "patch-42",
+            ),
+        ] {
+            let mut dep = grant_dep("npm", url.clone());
+            dep.patch_uuid = uuid.into();
+            let detail = format!(
+                "error sending request for url ({url}?x=1): connection refused (proxy https://p:pw@proxy:3128)"
+            );
+            for skip in [
+                npm_manifest_unavailable(&dep, &detail),
+                wheel_metadata_unavailable(&dep, &detail),
+            ] {
+                let got = skip.detail.unwrap();
+                assert!(!got.contains(GRANT), "{url}: {got}");
+                assert!(!got.contains("u:pw") && !got.contains("p:pw"), "{got}");
+                assert!(got.contains("connection refused"), "{got}");
+            }
+        }
+        let dep = grant_dep("npm", format!("https://h/serve/{GRANT}/{PATCH_UUID}/a.tgz"));
+        assert_eq!(
+            redact_artifact_text("no url here", &dep.artifact_url, &dep.patch_uuid),
+            "no url here"
+        );
+    }
 
     fn reference(value: serde_json::Value) -> PackageVendorResult {
         serde_json::from_value(value).unwrap()
