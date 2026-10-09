@@ -2274,7 +2274,8 @@ fn residual_reference_warning(uuid: &str, clause: &str) -> VendorWarning {
         format!(
             "kept .socket/vendor/pypi/{uuid}/: {clause}, and deleting the vendored wheel would \
              make every install from it fail; point that file back at the registry release \
-             (or re-export it from the restored lock) and re-run `vendor --revert`"
+             (or re-export it from the restored lock) and re-run the revert (`vendor \
+             --revert`, `remove` or `rollback`)"
         ),
     )
 }
@@ -2395,14 +2396,18 @@ pub async fn revert_pypi_opts(
         || outcome
             .warnings
             .iter()
-            .any(|w| w.code == "vendor_revert_residual_reference")
+            .any(|w| w.code == super::RESIDUAL_REFERENCE_CODE)
     {
         // Display-only path: with a non-canonical uuid nothing below would
         // have been deleted anyway, but the drift-keep must still be
         // surfaced so the ledger entry survives.
         let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
             .unwrap_or_else(|| format!(".socket/vendor/pypi/{:?}", entry.uuid));
-        outcome.keep_artifact(&uuid_dir_rel);
+        if outcome.drift_skipped() {
+            outcome.keep_artifact(&uuid_dir_rel);
+        } else {
+            outcome.keep_artifact_for_reference(&uuid_dir_rel);
+        }
         return outcome;
     }
     // `--preserve-state` (`keep_artifact`): the wiring restore above already
@@ -2426,7 +2431,7 @@ pub async fn revert_pypi_opts(
                 .push(residual_reference_warning(&entry.uuid, &clause));
             let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
                 .unwrap_or_else(|| format!(".socket/vendor/pypi/{:?}", entry.uuid));
-            outcome.keep_artifact(&uuid_dir_rel);
+            outcome.keep_artifact_for_reference(&uuid_dir_rel);
             return outcome;
         }
     }
