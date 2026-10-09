@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-08T18:49Z · main @ cf8b164_
+_Last updated 2026-10-09T00:58Z · main @ 03b9418_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -28,15 +28,15 @@ _Last updated 2026-10-08T18:49Z · main @ cf8b164_
 | E24 | 2 | There are nine revert mechanisms (~3.5K lines). Target: one splice-record revert engine, with legacy ledger kinds adapted at load. | 2.1; 5.3; 5.8 | #989 | filed #989; #990 folded into #989 |
 | E25 | 3 | Per-backend copies: `cleanup_failed_stage` and `<eco>_service_copy` (cargo, composer, gem, golang). | 5.4; 5.8 | #906 | rejected; closed not planned 2026-10-08 (no failing behavior) |
 | E26 | 3 | JVM has two Maven backends. Target: merge `maven_repo.rs` into `jvm/` as `Shape::Single`; its three artifact roots don't follow `<eco>/<uuid>`. | 5.7 | #971, #972, #973 | in PR #1036; decided #973 (one Maven backend) |
-| E27 | 3 | The per-package call model needs ~3K lines of compensating machinery (`group_commit`, `durability`, `prestage`, `vendor_prefetch`, 22 `ParseMemo` statics, `ledger_snapshots`). Target: batched pure planners, after E21 and E24. | 2.4; 5.7 | | to verify |
+| E27 | 3 | ~3K lines of per-package compensating machinery (`group_commit`, `prestage`, 22 `ParseMemo`s). Target: batched planners. | 2.4; 5.7 | | rejected; deferred under the 2026-10-08 backlog bar (no behavior defect); revisit with #959/#989 |
 | E28 | 2 | Dead vendored scaffolding: one-variant `VendorSource`/`PackageSource`, an unreachable `SERVICE_ECOSYSTEMS` refusal, `ServicePolicy::new` ignoring its config, an unused `vend_installed!`. | 5.6; R11 | #782 | filed #782; #800, #746 folded into #782 |
 | E29 | 3 | `registry_fetch.rs` (1.5K lines) is really archive extraction, integrity checks and the hosted-restore HTTP client, so it is misnamed and in the wrong place. | 5.6 | #959, #833 | filed #959, #833; #1012 folded into them |
 | E30 | 2 | Split `redirect/mod.rs` (21.9K lines at `db83f01`: 7.6K prod, 14.3K inline tests) mechanically: `model`, `driver`, one file per ecosystem, `hosted_url`, sibling test files. | 3.7 #1 | #1010 | filed #1010; #1011 folded into #1010 |
 | E31 | 2 | Tracking: `trait HostedRewriter` + `Outcome { per_dep }`. It replaces 27 `RewriteResult` uuid sets, `merge_group_delta` and the 25-outcome `confirm()`. | 2.1; 3.7 #2 | #1075 | filed #1075; #1076 folded into #1075 |
-| E32 | 2 | There are two hosted orchestrators, disk (`run_redirect_selected`) and in-memory (`hosted/memory`), kept equal by parity tests. Target: one pipeline. Depends on E44. | 3.3; 3.7 #4 | | to verify |
+| E32 | 2 | There are two hosted orchestrators, disk (`run_redirect_selected`) and in-memory (`hosted/memory`), kept equal by parity tests. Target: one pipeline. Depends on E44. | 3.3; 3.7 #4 | | to verify; blocked on decision #1200 (E44) |
 | E33 | 3 | Upstream restore rebuilds originals from the network (~8.8K production lines at `1c6c509`, ignores mirrors, re-pins integrity from the registry: B72). Target: an originals sidecar or a narrowed restore. Depends on E45. | 2.3; 3.5 | | to verify |
 | E34 | 3 | Per-PM auto-config costs more than it's worth: npm `allow-remote` (~900 lines re-implementing npm config), pnpm `trustLockfile`, the vlt warm-tree heal, and the unbenchmarked parallel rewriter groups. | 3.6; 3.7 #7 | #782 | to verify; dead vlt ledger helpers in #782 (E58) |
-| E35 | 3 | Retire the refactor oracles: the redirect equivalence suites and 252 KB of goldens, the crawler oracles (3K lines), and the telescoping entry points (use one `RewriteOptions`). | 3.7 #9; 6.6 | | to verify |
+| E35 | 3 | Retire the refactor oracles (equivalence goldens, crawler oracles) and telescoping entry points. | 3.7 #9; 6.6 | | rejected; deferred under the 2026-10-08 backlog bar (test-only maintenance) |
 | E36 | 2 | Tracking: one `Inventory`. Today's four discovery systems are merged by fabricating `CrawledPackage`s with fake `node_modules/<name>` paths. Rename `vex::discover` (it is the hosted-state store). | 2.1; 6.2; 6.7 | #1112 | filed #1112; #1113 folded into #1112 |
 | E37 | 2 | `is_safe_{cargo,gem,nuget}_coordinate` are byte-identical and duplicate `simple_purl`'s check. `composer_crawler::normalize_version` duplicates `strip_leading_v`. | 6.4 | #630, #748 | filed #630 (consolidated into #748); coordinate guards fixed (#1153); composer `normalize_version` remains (waits on #1108's file) |
 | E38 | 2 | The product-manifest probe table is copied three times and has drifted: `vex.rs` lacks the csproj and gemspec probes. The probes don't reuse the format parsers. | new finding; 6.5 | #816 | rejected; closed not planned 2026-10-08 (#816 fails safely) |
@@ -45,19 +45,19 @@ _Last updated 2026-10-08T18:49Z · main @ cf8b164_
 | E41 | 2 | Dead discovery code: `lock_inventory/wired.rs` has no production caller. | 6.4; 6.5; R11 | #782 | filed #782; #801 folded into #782 |
 | E42 | 2 | The embedded `--vex` glue is copied per command (scan, apply, and vendor ×3), each with caller-injected bypass sets. Target: one `EmbeddedVex` helper. | 6.5; R13 | #966 | decision #966; whether `--vex` stays embedded (Q2) is undecided |
 | E43 | 2 | Fail closed on unmodeled resolution config in one shared place. | 2.2 #3 | #458 | partly fixed; `gradle.lockfile`, `BUNDLE_GEMFILE`, `virtualStoreDir` and mirrors are modelled, npm linked-store alias fixed (#987); `go.work` remains (#458, E81) |
-| E44 | 2 | Decide: the napi addon and in-memory engine. Will depscan adopt it (then delete the TS rewriters), or should it be deleted (−4.8K prod)? | §6 Q1; 3.7 #6 | | decision pending; no decision issue filed yet |
+| E44 | 2 | Decide: is the napi addon + in-memory engine a supported product (one pipeline), or deleted (−4.5K prod)? | §6 Q1; 3.7 #6 | #1200 | decision #1200; contract L670 (#1029) names a future GitHub App as the caller |
 | E45 | 2 | Decide: hosted rollback. Is an originals sidecar acceptable, or should restore be narrowed to formats whose original is a pure function of registry data? | §6 Q5; 2.3 | #1130 | decision #1130 |
 | E46 | 2 | Decide: VEX evidence. Should `not_affected` require consumed evidence by default, so that wired-only evidence (`lockfile_basis_ok`) needs an opt-in? About 46 open false-attestation issues (B05). | §6 Q4; 2.2; 6.5 | #1099 | decision #1099 |
 | E47 | 3 | Decide: support tiers for `bun.lockb` writes, vendored pnpm 7/8, vlt pre-1.0 encodings and hosted pnpm ≤ 6, and whether hosted JVM ships as beta. | §5; §6 Q3; 4.6 | #1156 | decision #1156 |
 | E48 | 3 | Discovery re-implements package-manager layouts (venv-name hashing, global prefixes, the pnpm store). Target: ask the package manager (`poetry env info -p`, `pipenv --venv`, `npm query`, …). | 2.2 #2; 6.6 |  | rejected; not adopted (#1000) |
 | E50 | 2 | Hosted `rewrite_nuget` and upstream restore rewrite `packages.lock.json` entries of the patched id at other versions (every framework); vendored `locked_at` filters by version. Four lock walkers. | new finding | #593 | filed #593 |
-| E52 | 3 | `vendor/go_sum_edit.rs`: free go.sum helpers have no production caller and are re-implemented by `GoSumEditor`; the pure hosted codec lives in `vendor/`. | new finding | #631 | partly fixed (#1103): the oracle-only free helpers are deleted and every go.sum edit goes through `GoSumEditor`; the move to `formats/golang/sum.rs` remains |
+| E52 | 3 | `vendor/go_sum_edit.rs`: free go.sum helpers have no production caller and are re-implemented by `GoSumEditor`; the pure hosted codec lives in `vendor/`. | new finding | #631 | partly fixed (#1103); #631 closed; the move to `formats/golang/sum.rs` is maintenance-only and deferred |
 | E53 | 2 | Vendored pnpm wrote the root `package.json` with `serialize_json`. | new finding | #662 | fixed (#810) |
 | E54 | 3 | Poetry and PDM restored line endings with two rules. | new finding | #695 | fixed (#703) |
 | E56 | 2 | Lock inventory ignored `gems.locked`. | new finding | #736 | fixed (#750) |
 | E58 | 3 | Production `pub fn`s with no production caller, orphaned by #277 (`committed_artifact_intact`, `go_sum_edit::remove_lines`, hosted-vlt ledger helpers, three test-only helpers). | new finding; 3.6 | #782 | partly fixed (#1141: hosted-vlt ledger helpers, `read_project_file` gated); `committed_artifact_intact`, `remove_lines`, `seed_rubygems_sha256`, `copy_manifest_tag` remain in open-PR files |
 | E59 | 2 | Vendored gem `edit_lock` searched only the first `GEM` section. | new finding | #779 | fixed (#805) |
-| E61 | 2 | The vendored-reference scan missed NuGet, Maven and `hatch.toml` wiring. | new finding | #832, #958 | fixed (#1015) |
+| E61 | 2 | Vendored-reference scan missed NuGet/Maven/hatch wiring. | new finding | #832, #958 | fixed (#1015) |
 | E63 | 2 | Hosted Maven splices the API `maven_suffixed_version` into `pom.xml` unchecked, while hosted Gradle refuses a malformed suffix; four suffix builders (executed twice). | new finding | #882 | filed #882 |
 | E64 | 2 | No shared BOM helper (4 `strip_bom` copies, ~50 inline strips); `formats::pnpm`'s `lockfileVersion` readers skipped it (executed twice). Symptoms #903, #904, #623. | new finding; 4.4 | #905 | partly fixed (#909, #1117, #1160): `formats::text` helper, pnpm readers and 19 inline strips moved; 15 files remain on `PENDING_INLINE_BOMS`; slice 3 (4 files) in PR #1191 |
 | E65 | 3 | Every vendored sink discards `force`/`sources`, yet `vendor --force` docs promise a tolerance and a warning nothing emits (executed twice). | new finding; 5.2 | #923 | filed #923 |
@@ -67,7 +67,7 @@ _Last updated 2026-10-08T18:49Z · main @ cf8b164_
 | E70 | 1 | The vendored→hosted takeover reverted before it planned (B03, B14, B15, B37). | audit B03, B14, B15, B37 | #945, #723 | fixed (#1039); dry-run residuals #668, #891 open |
 | E71 | 1 | The supersede/re-pin lifecycle had no owned-pin generation model: older generations' wiring survived a re-pin or remove. | audit B07 | #999, #864, #682, #266 | partly fixed (#1035, #943); vendored/agent supersede policy remains (#954, in PR #1008) |
 | E72 | 1 | VEX attests `not_affected` from wiring the package manager doesn't consume: yarn Plug'n'Play loaders, pnpm bundled copies and deno.lock npm copies. | audit B04, B05 | #519, #406 | partly fixed (#1033); #406 in-run `scan --vex` path open, Maven `integrity_required` waits on E46 |
-| E73 | 2 | "Is this hosted patch pinned" is decided four ways (`confirm`, `mark_pinned`, `memory_recorded`, discovery); lockless NuGet/Cargo pins are reported contested forever. | audit B13, B58 | #567, #260 | in PR #1058; lockless pins wait on E45 |
+| E73 | 2 | "Is this hosted patch pinned" was decided four ways. | audit B13, B58 | #567, #260 | fixed (#1058); lockless NuGet/Cargo pins are still written, now warned (`redirect_pin_lockless`) |
 | E74 | 2 | "Is this vendored entry still in use" had four answers. | audit B19, B61, B62 |  | fixed (#1050) |
 | E75 | 2 | Which lockfile governs installs is decided in ≥8 places; vendored and hosted patch different PyPI locks and a takeover restores the losers unpatched. | audit B31 | #612 | partly fixed (#1044); #612 takeover restore scope, `pdm_drives` vs pylock and the inventory PyPI order (E91) remain |
 | E76 | 2 | Hosted yarn classic replaced `file:`/URL copies with the Socket artifact. | audit B16 |  | fixed (#1057) |
@@ -83,13 +83,14 @@ _Last updated 2026-10-08T18:49Z · main @ cf8b164_
 | E86 | 3 | Vendored JVM fetches upstream artifacts and checksums only from Central or `SOCKET_MAVEN_REGISTRY`, ignoring mirrors and the build's repositories. | audit B63 | #1069 | filed #1069 |
 | E87 | 2 | VEX product detection has no Gradle or sbt probe, and `scan --vex` resolves the product only after writing. | audit B64 | #1064 | filed #1064 |
 | E88 | 3 | Small duplicates: hosted patch origins, max-severity ordering, "ecosystem filter is empty", and the inventory matching vendored-router refusal-code strings (#975). | audit §3.A, §3.B | #975 | rejected; maintenance-only per the 2026-10-08 backlog review; #975 fixed (#978) |
-| E89 | 3 | Pure-wheel rule written 4× (inventory and recovery skip `wheel_platform_from_filename`); recovery pairs a hashless pure wheel with another wheel's hash (executed twice). | new finding | #1079, #1150 | fixed (#1121, #1151) |
+| E89 | 3 | Pure-wheel rule was written 4×. | new finding | #1079, #1150 | fixed (#1121, #1151) |
 | E90 | 2 | Which gem homes Bundler loads has two answers: `vex` and agent `apply` use `get_gem_paths` (keeps `gem env` homes under an explicit `path`), only the stale guard uses `bundler_install_homes` (executed twice). | new finding | #1098 | filed #1098 |
 | E91 | 3 | PyPI tool-lock precedence is written twice since #1044: the inventory keys on "yielded entries", the vendored router on presence. A package-less `poetry.lock`/`pdm.lock` beside `requirements.txt` makes scan offer a package vendored refuses (`pypi_poetry_lock_package_missing`; executed twice). | new finding | #1114 | filed #1114 |
 | E92 | 3 | pnpm `modulesDir` is honored by the crawler but not by `pkg_managers`: `node-linker=pnp` + `modulesDir` is classified yarn PnP, so apply refuses (`yarn_pnp_unsupported`), vendored gives the yarn remedy and VEX reads the wrong loader (real pnpm 10.28, executed twice). | new finding | #1129 | filed #1129 |
+| E93 | 3 | NuGet version identity: vendor normalizes (`normalize_nuget_version`), `PurlKey`/crawler only lowercase; a vendored `@13.0.3.0` is judged unused, so `scan --prune` reverts it (executed 3×). | new finding | #1202 | filed #1202 |
 
 **Handed off:** none yet.
 
-**Rejected / not a defect:** E18, E23, E25, E38, E39, E85, E88 (closed not planned in the 2026-10-08 maintainer backlog review: no user-visible defect, or cosmetic); E48 (not adopted, #1000). E02, in part: the `bun.lockb` format-1 URL synthesized at `bun_lockb.rs:235` is lock semantics and never fetched; the duplicate spellings were folded into #562.
+**Rejected / not a defect:** E18, E23, E25, E38, E39, E85, E88 (closed not planned in the 2026-10-08 maintainer backlog review: no user-visible defect, or cosmetic); E48 (not adopted, #1000); E27, E35 (deferred 2026-10-09 under the same bar: maintenance-only). E02, in part: the `bun.lockb` format-1 URL synthesized at `bun_lockb.rs:235` is lock semantics and never fetched; the duplicate spellings were folded into #562.
 
 **Already fixed:** none.

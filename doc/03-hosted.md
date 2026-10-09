@@ -2,7 +2,7 @@
 
 ## Part 3: Hosted mode (redirect, hosted engine, upstream restore, Node addon)
 
-_Last checked against main @ cf8b164 on 2026-10-08 by audit-ecosystems (hosted Maven suffix splice re-checked for #882; the NuGet writer note after #1068 was closed). Earlier: `e2d9633` on 2026-10-08 by audit-ecosystems (3.2 yarn writers after #1057; 3.5 restore size and `FileEdit` count re-checked for the E45 decision); older checks are in the run entries. Owner: audit-ecosystems._
+_Last checked against main @ 03b9418 on 2026-10-09 by audit-ecosystems (3.6 in-memory engine sizes and gaps re-measured for decision #1200; the pinned-check bullet rewritten for #1058). Earlier: `cf8b164` on 2026-10-08 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `patch/redirect/**`, `hosted/**`, `crates/socket-patch-node/**`, CLI `scan/hosted.rs`, `scan/hosted/*`, `hosted_bundle.rs`.
 
@@ -170,7 +170,7 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
 | npm `allow-remote` auto-config | ~900 + 514 tests | `npmrc.rs` re-implements npm's `ini` tokenizer and its user/global/builtin/env config layering, all to decide whether to append one line to `.npmrc`. |
 | pnpm `trustLockfile` auto-config | ~450 | Heal-on-rerun, takeover previews, legacy and Rush special cases. Open issues #400, #401, #402 (quoted keys, flow style, duplicate keys) are all here. |
 | Parallel rewriter groups | ~260 + 451 equivalence tests | Parallelizes CPU work over a handful of texts that is already single-pass. Benchmark it, or delete it. |
-| In-memory engine + napi addon + `hosted-bundle` | ~4.8K + ~4.6K tests | `npm/package.json` is `"private": true`; CI only builds and smoke-tests it. **Worth it only if the depscan backend actually replaces its TypeScript rewriters with it.** Otherwise there are three implementations: TS, disk and memory. |
+| In-memory engine + napi addon + `hosted-bundle` | ~4.5K (memory 3,660, addon 649, `hosted-bundle` 183, plus 75 `ProjectView::Memory` arms elsewhere) + ~4.7K tests | `npm/package.json` is `"private": true`; CI only builds and smoke-tests it. The contract now says it "remain[s] supported for callers such as the future GitHub App" (#1029). Maven, NuGet and sbt never pin in memory, vlt is preflighted offline, and takeovers are refused. Whether it is a supported product is decision #1200. {{E44}} |
 | bun.lockb hosted | ~260 on top of the 2.25K shared codec | Legacy format. |
 | Equivalence-test scaffolding | 2,592 lines + 252 KB goldens | Refactor oracles ("blessed while the previous rewriter still ran beside it"), now frozen as snapshots. |
 | Warning vocabulary | ~130 distinct codes in this slice; 89 `RewriteWarning {` literals in `mod.rs`; no enum | Families repeat per ecosystem: missing-integrity ×15, entry/package-not-found ×13, no-lockfile/manifest ×7. |
@@ -193,9 +193,9 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
    - Cargo.toml (regex scanner → `toml_edit`).
 
    Move the neutral types (`Edit`, `Warning`, `LockfileEntry`) into `formats` to break the cycles.
-4. **One hosted pipeline for disk and memory** (about −800 lines; the parity suites become ordinary tests).
+4. **One hosted pipeline for disk and memory** (about −800 lines; the parity suites become ordinary tests) Blocked on decision #1200. {{E32}}
 5. **Narrow upstream restore, or replace it with an originals sidecar** (about −3.3K production lines). This also fixes a whole family of open rollback bugs.
-6. **Decide the addon's fate.** If depscan adopts it, delete the TS rewriters and relax the `JSON.stringify(…, 2)` golden contract, which unblocks indent preservation. If not, delete the addon, `hosted-bundle` and the memory-only branches (about −4.8K production, −4.6K test).
+6. **Decide the addon's fate** (decision #1200). If it is a supported engine, make it the one hosted pipeline (recommendation 4) and close or tier its coverage gaps. If not, delete the addon, `hosted-bundle` and the memory-only branches (about −4.5K production, −4.7K test). {{E44}}
 7. **Simplify the npm `allow-remote` handling** to project-file-only planning plus a warning (about −700). Drop the parallel groups unless benchmarks justify them, and delete the dead vlt ledger helpers.
 8. **Make warning codes typed:** `enum Reason { MissingIntegrity, EntryNotFound, NoLockfile, … } × Ecosystem`, serializing to today's strings.
 9. **Retire the refactor-oracle equivalence suites** (2.6K lines + 252 KB goldens) and the telescoping entry points; use one `RewriteOptions` struct instead.
@@ -206,7 +206,7 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
 - {{E52}}: every go.sum edit goes through the `GoSumEditor` the hosted Go rewriter uses; the free oracle-only copies were deleted (#1103). The pure hosted codec still lives in `vendor/go_sum_edit.rs`, not `formats/`.
 - {{E15}}: the hosted cargo planner `plan_cargo_toml` is a line scanner, gated by a second `toml_edit` classifier of the same declarations. It refuses `serde = { version = "1", features = [⏎ "derive",⏎] }` as "inline table does not close on its line", although cargo and `toml_edit` accept it, so hosted skips a crate that vendored mode handles. Upstream restore unpins with a third, line-level grammar.
 - {{E58}}: the hosted-vlt ledger helpers left without a caller by #277 were deleted (#1141); `UpstreamClient::seed_rubygems_sha256` is still a test helper compiled into production.
-- {{E73}} October 7: "is this hosted patch pinned" is decided four ways (`confirm`, `mark_pinned`, `memory_recorded`, discovery); lockless NuGet/Cargo pins are attested in-run then reported contested forever (PR #1058).
+- {{E73}} "Is this hosted patch pinned" is now decided by lockfile discovery alone, in one gate shared by the disk and memory engines (#1058). `confirm()`'s needles only pre-check that a write landed. A lockless NuGet/Cargo pin is still written, now with a `redirect_pin_lockless` warning and a refusal remedy that names the lockfile to create.
 - {{E85}} The NuGet lock writer and its restore drop CRLF and BOM (`serialize_json`), unlike every other hosted JSON writer. A maintainer closed #1068 as cosmetic on 2026-10-08; the reader's BOM refusal stays open as #623.
 - {{E63}}: hosted Maven splices the API's `maven_suffixed_version` into every matching `pom.xml` `<version>` without checking it (proven with `-socket.DEADBEEF`, `-patched` and markup), while the hosted Gradle planner (#646) refuses the same grant unless it is `<base>-socket.<uuid[..8]>`. The suffix grammar has four builders (vendored `jvm::Coords`, hosted Gradle, the CLI `vex_consumed` copy and the server) and no shared validator.
 
