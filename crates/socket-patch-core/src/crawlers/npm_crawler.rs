@@ -672,6 +672,48 @@ fn live_bun_store_entries_sync(
     walk(None, None)
 }
 
+/// The packages pnpm's current lockfile (`<virtual store>/lock.yaml`,
+/// rewritten on every install) says the install uses; `None` when there
+/// is none or it cannot be read in full, and then no entry is dropped.
+fn pnpm_current_lockfile_sync(
+    store_path: &Path,
+) -> Option<crate::formats::pnpm::InstalledPackages> {
+    let text = crate::utils::fs::read_regular_to_string_sync(&store_path.join("lock.yaml")).ok()?;
+    crate::formats::pnpm::InstalledPackages::from_lock_text(&text)
+}
+
+/// Whether the pnpm store entry `entry_name` is an orphan (#1197): pnpm
+/// 7–11 keep a removed or upgraded-away package's entry until
+/// `modules-cache-max-age` (7 days) expires and pnpm 12 until `pnpm prune`,
+/// with nothing linking to it. It is one when the package it holds — named
+/// by the entry (a registry `name@version` entry, or a `name@file+…`
+/// tarball entry) and confirmed by its package.json — is not in the
+/// current lockfile. An entry that cannot be named or read stays.
+fn orphaned_pnpm_store_entry_sync(
+    store_path: &Path,
+    entry_name: &str,
+    installed: &crate::formats::pnpm::InstalledPackages,
+) -> bool {
+    let (name, version) = match decode_pnpm_store_entry_name(entry_name) {
+        Some((name, version)) => (name, Some(version)),
+        None => match entry_name.get(1..).and_then(|rest| rest.find("@file+")) {
+            Some(at) => (entry_name[..at + 1].replace('+', "/"), None),
+            None => return false,
+        },
+    };
+    let manifest = store_path
+        .join(entry_name)
+        .join("node_modules")
+        .join(&name)
+        .join("package.json");
+    let Some((found_name, found_version)) = read_package_json_sync(&manifest) else {
+        return false;
+    };
+    found_name == name
+        && version.is_none_or(|version| version == found_version)
+        && !installed.contains(&name, &found_version)
+}
+
 /// What [`live_bun_store_entries_sync`] found, by index into the
 /// candidates it was given: the scan walks thousands of entries, so they
 /// are tracked by position instead of hashed and cloned by name (#578).
@@ -3168,7 +3210,12 @@ impl NpmCrawler {
             events.extend(Self::gather_store_entries(entries));
         }
         if let Some(store_path) = relocated_pnpm_store {
-            let entries = Self::list_pnpm_store_entries_sync(&store_path, true);
+            let entries = Self::list_pnpm_shaped_store_entries_sync(
+                &store_path,
+                StoreLayout::Pnpm,
+                true,
+                true,
+            );
             events.extend(Self::gather_store_entries(entries));
         }
         if !global_store_entries.is_empty() {
@@ -3404,7 +3451,9 @@ impl NpmCrawler {
     /// (see [`PNPM_SHAPED_STORES`]), entry names decoded under `layout`.
     ///
     /// With `live_only` (the scan) a Bun store's orphaned entries are
-    /// skipped (see [`live_bun_store_entries_sync`]); the resolver and the
+    /// skipped (see [`live_bun_store_entries_sync`]), and so are the pnpm
+    /// store entries its current lockfile no longer installs (see
+    /// [`orphaned_pnpm_store_entry_sync`]); the resolver and the
     /// peer-variant finder keep them, since rollback must still restore a
     /// patched orphan a later install can re-link.
     fn list_pnpm_shaped_store_entries_sync(
@@ -3415,8 +3464,17 @@ impl NpmCrawler {
     ) -> Vec<StoreEntryDir> {
         let decode = |name: &str| layout.decode_pnpm_shaped(name);
         let candidates = pnpm_shaped_store_candidates_sync(store_path, layout);
-        // pnpm prunes its store on install; Bun never does (#599), so the
-        // scan, a judgement of the live install, skips its orphans.
+        // Bun never prunes its store (#599), and pnpm 7–12 keep a removed
+        // or upgraded-away entry for a while (#1197), so the scan, a
+        // judgement of the live install, skips their orphans.
+        let mut candidates = candidates;
+        if layout == StoreLayout::Pnpm && live_only {
+            if let Some(installed) = pnpm_current_lockfile_sync(store_path) {
+                candidates.retain(|entry| {
+                    !orphaned_pnpm_store_entry_sync(store_path, &entry.name_str, &installed)
+                });
+            }
+        }
         let live = (layout == StoreLayout::Bun && live_only)
             .then(|| live_bun_store_entries_sync(store_path, &candidates))
             .flatten();
@@ -6760,6 +6818,100 @@ mod tests {
         let candidates = pnpm_shaped_store_candidates_sync(&store, StoreLayout::Bun);
         assert_eq!(candidates.len(), 2);
         assert!(live_bun_store_entries_sync(&store, &candidates).is_none());
+    }
+
+    /// #1197: pnpm 7–11 keep a removed (or upgraded-away) package's
+    /// `.pnpm/<name>@<version>` entry for days, and pnpm 12 keeps an
+    /// upgraded-away one until `pnpm prune`. The current lockfile pnpm
+    /// writes beside the entries (`.pnpm/lock.yaml`) no longer lists it, so
+    /// the scan skips it; a vendored entry it lists by its `version:` stays,
+    /// as does every entry when there is no current lockfile. Restoring
+    /// operations still reach the orphan.
+    #[tokio::test]
+    async fn test_pnpm_store_entries_the_current_lockfile_drops_are_not_scanned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".pnpm");
+        std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let number = store.join("is-number@7.0.0/node_modules/is-number");
+        write_pkg(&number, "is-number", "7.0.0");
+        link_dir(&number, &nm.join("is-number"));
+        let vendored =
+            store.join("@s+lp@file+.socket+vendor+npm+u+s-lp-1.0.0.tgz/node_modules/@s/lp");
+        write_pkg(&vendored, "@s/lp", "1.0.0");
+        std::fs::create_dir_all(nm.join("@s")).unwrap();
+        link_dir(&vendored, &nm.join("@s/lp"));
+        // Orphans: a removed package, an upgraded-away version and a
+        // vendored entry of the old version.
+        let removed = store.join("left-pad@1.3.0/node_modules/left-pad");
+        write_pkg(&removed, "left-pad", "1.3.0");
+        let old = store.join("@s+lp@0.9.0/node_modules/@s/lp");
+        write_pkg(&old, "@s/lp", "0.9.0");
+        let old_vendored = store.join("ms@file+.socket+vendor+npm+v+ms-2.1.3.tgz/node_modules/ms");
+        write_pkg(&old_vendored, "ms", "2.1.3");
+        let ms = store.join("ms@2.1.2/node_modules/ms");
+        write_pkg(&ms, "ms", "2.1.2");
+        link_dir(&ms, &nm.join("ms"));
+
+        let unfiltered = scan_paths(&root).await;
+        for orphan in [&removed, &old, &old_vendored] {
+            assert!(
+                unfiltered.iter().any(|(_, path)| path == orphan),
+                "no current lockfile, nothing dropped: {unfiltered:?}"
+            );
+        }
+
+        std::fs::write(
+            store.join("lock.yaml"),
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      \
+             is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n\n  \
+             '@s/lp@file:.socket/vendor/npm/u/s-lp-1.0.0.tgz':\n    resolution: {integrity: \
+             sha512-x, tarball: file:.socket/vendor/npm/u/s-lp-1.0.0.tgz}\n    version: 1.0.0\n\n  \
+             is-number@7.0.0:\n    resolution: {integrity: sha512-y}\n\n  \
+             ms@2.1.2:\n    resolution: {integrity: sha512-z}\n\nsnapshots:\n\n  \
+             '@s/lp@file:.socket/vendor/npm/u/s-lp-1.0.0.tgz': {}\n\n  is-number@7.0.0: {}\n\n  \
+             ms@2.1.2: {}\n",
+        )
+        .unwrap();
+        let scanned = scan_paths(&root).await;
+        assert_eq!(
+            scanned,
+            vec![
+                ("pkg:npm/@s/lp@1.0.0".to_string(), nm.join("@s/lp")),
+                ("pkg:npm/is-number@7.0.0".to_string(), nm.join("is-number")),
+                ("pkg:npm/ms@2.1.2".to_string(), nm.join("ms")),
+            ]
+        );
+
+        // The pnpm 7 (v5.4) and pnpm 8 (v6.0) key grammars read the same.
+        for packages in [
+            "packages:\n\n  /is-number/7.0.0:\n    resolution: {integrity: sha512-y}\n\n  \
+             /ms/2.1.2:\n    resolution: {integrity: sha512-z}\n\n  \
+             file:.socket/vendor/npm/u/s-lp-1.0.0.tgz:\n    resolution: {integrity: sha512-x}\n    \
+             name: '@s/lp'\n    version: 1.0.0\n",
+            "packages:\n\n  /is-number@7.0.0:\n    resolution: {integrity: sha512-y}\n\n  \
+             /ms@2.1.2:\n    resolution: {integrity: sha512-z}\n\n  \
+             file:.socket/vendor/npm/u/s-lp-1.0.0.tgz:\n    resolution: {integrity: sha512-x}\n    \
+             name: '@s/lp'\n    version: 1.0.0\n",
+        ] {
+            std::fs::write(
+                store.join("lock.yaml"),
+                format!("lockfileVersion: '6.0'\n\n{packages}"),
+            )
+            .unwrap();
+            assert_eq!(scan_paths(&root).await, scanned, "{packages}");
+        }
+
+        // Restoring operations still reach the orphan.
+        let purls = vec!["pkg:npm/left-pad@1.3.0".to_string()];
+        let found = NpmCrawler::new().find_by_purls(&nm, &purls).await.unwrap();
+        assert_eq!(
+            found
+                .get("pkg:npm/left-pad@1.3.0")
+                .map(|copies| copies.iter().map(|p| p.path.clone()).collect::<Vec<_>>()),
+            Some(vec![removed.clone()])
+        );
     }
 
     /// #599: Bun never prunes `.bun`. After an in-place `bun install` that
