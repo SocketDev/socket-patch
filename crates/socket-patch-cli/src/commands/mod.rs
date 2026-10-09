@@ -71,8 +71,10 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
 /// An unreadable or malformed vendor ledger counts as vendored, so the
 /// vendored flow reports the corruption instead of a hosted takeover
 /// running over it; with no readable ledger no manifest record counts as
-/// covered. An unreadable manifest is not agent evidence (hosted and
-/// vendored mode never read it). Only called in project scope.
+/// covered. Likewise an unreadable or malformed manifest counts as agent
+/// state, so the agent flow reports it rather than a bare run converting
+/// the project to hosted mode (#1088). A missing manifest is no evidence.
+/// Only called in project scope.
 ///
 /// [`GlobalArgs::project_root`]: crate::args::GlobalArgs::project_root
 pub(crate) async fn mode_from_project_state(
@@ -89,9 +91,14 @@ pub(crate) async fn mode_from_project_state(
         Err(_) => Default::default(),
     };
     let vendored = !matches!(&vendor, Ok(state) if state.entries.is_empty());
-    let agent = matches!(&manifest, Ok(Some(m)) if m.patches.keys().any(|purl| {
-        !socket_patch_core::vendor::state::purl_keys_cover(&vendored_keys, purl)
-    }));
+    let agent = match &manifest {
+        Ok(Some(m)) => m
+            .patches
+            .keys()
+            .any(|purl| !socket_patch_core::vendor::state::purl_keys_cover(&vendored_keys, purl)),
+        Ok(None) => false,
+        Err(_) => true,
+    };
     match (vendored, agent) {
         (true, true) => Err(format!(
             "{} holds both agent-mode patches ({}) and vendored patches \
@@ -369,6 +376,24 @@ mod tests {
         let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
         let err = mode.expect_err("agent and vendored state together");
         assert!(err.contains("--mode"), "{err}");
+    }
+
+    /// A malformed manifest is agent state: a bare run must not take the
+    /// project over in hosted mode, so the agent flow reports the error.
+    #[tokio::test]
+    async fn a_malformed_manifest_is_not_a_hosted_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".socket")).unwrap();
+        std::fs::write(tmp.path().join(".socket/manifest.json"), b"{ not json").unwrap();
+        let common = args(tmp.path(), ".socket/manifest.json");
+        assert_eq!(
+            mode_from_project_state(&common).await,
+            Ok(scan::ScanMode::Agent)
+        );
+
+        // Beside a vendor ledger it is ambiguous, not silently vendored.
+        write_ledger(tmp.path()).await;
+        assert!(mode_from_project_state(&common).await.is_err());
     }
 
     /// With `--manifest-path` into another project, the ledger is read
