@@ -115,7 +115,7 @@ jobs:
     if: github.event.pull_request.draft != true
     # Builds the sbt image once (base image first: Dockerfile.sbt is
     # `FROM socket-patch-test-base:latest`) and hands it to every leg.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -168,7 +168,7 @@ jobs:
     # rust container. Absolute paths are kept (`tar -P`):
     # the test binaries carry their compile-time paths, and every leg checks
     # out to the same workspace path.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 40
     steps:
       - name: Checkout
@@ -194,7 +194,7 @@ jobs:
   docker:
     name: sbt ${{ matrix.sbt }} / jdk ${{ matrix.jdk }} / ${{ matrix.group }}
     needs: [image, linux-bins]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -257,7 +257,7 @@ jobs:
     # vendored (the versions the image installs).
     name: ${{ matrix.group }} ${{ matrix.version }}
     needs: [image, linux-bins]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -308,7 +308,7 @@ jobs:
     # The warm-seed step boots sbt once so the tests share its caches.
     name: sbt 1.13.0 ${{ matrix.suite }} / ${{ matrix.os }}
     if: github.event.pull_request.draft != true
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
