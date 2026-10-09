@@ -32,6 +32,7 @@ pub mod socket_dir;
 pub mod target;
 pub(crate) mod toml_edit_ext;
 pub mod uri;
+pub(crate) mod uv_workspace;
 pub(crate) mod workspace_globs;
 
 pub mod hatch;
