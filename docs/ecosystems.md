@@ -19,7 +19,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
 | RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
-| Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ single-POM repository, suffixed Maven reactor repository, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
+| Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ suffixed Maven repository (`<version>-socket.<hex8>` pin + `.mvn/maven.config` + fallback file repository) for every pom root, single-module or reactor, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
 | NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
 | Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
@@ -99,11 +99,35 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   matching package instance is rewritten; an unsupported instance prevents
   confirming that dependency across the lockfile set. Rollback preserves the
   original resolution fragments.
-  For root 9.0 locks, the CLI configures `trustLockfile: true` in
-  `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
+  A workspace with `sharedWorkspaceLockfile: false` (`shared-workspace-lockfile=false`
+  in `.npmrc` on pnpm 10 and older) installs each member from its own lock:
+  run from the workspace root, every `packages:` member's `pnpm-lock.yaml` is
+  pinned beside the root's (pnpm 7 writes no root lock at all), and `list`,
+  `vex` and `rollback` read the member locks too. Member locks beside a root
+  lock that lists member importers are stale and ignored. A member list the
+  CLI cannot read (including a `pnpm-workspace.yaml` with no `packages:` key)
+  is refused with `redirect_pnpm_member_locks_unresolved`.
+  With `gitBranchLockfile` on (`git-branch-lockfile=true` in `.npmrc` on
+  pnpm 10 and older), pnpm installs a branch from its own
+  `pnpm-lock.<branch>.yaml` (in each member's directory too, when members
+  keep their own locks), which neither mode can pin: while such a lock
+  exists, hosted mode refuses the pnpm pins with
+  `redirect_pnpm_git_branch_lockfile` and vendored mode with
+  `vendor_pnpm_git_branch_lockfile`. Turn the setting off and run
+  `pnpm install --merge-git-branch-lockfiles`, then re-run. With no branch
+  lock, `pnpm-lock.yaml` is the lock pnpm installs from and is pinned as usual.
+  For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
+  the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
   explicitly disabled by the project. pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
-  remains enforced. pnpm <=10 does not need the setting.
+  remains enforced. pnpm <=10 does not need the setting. A project with no
+  `pnpm-workspace.yaml` that pins pnpm 9.0–10.4 (`packageManager`,
+  `devEngines`, `engines.pnpm`, or the pnpm that last installed
+  `node_modules`) gets no file: there a root-only workspace makes
+  `pnpm add <pkg>` fail with `ERR_PNPM_ADDING_TO_ROOT`. Re-run the scan after
+  upgrading to pnpm >=11. When no pin says which pnpm runs, the file is
+  created, and pnpm 9.0–10.4 then need `pnpm add -w <pkg>`. Vendored mode
+  follows the same rule for its `overrides:` mirror.
   **Reinstall after redirecting:** a successful warm-cache install can retain
   upstream bytes. Use a clean install tree and an empty store; `--force` is not
   a reliable substitute. Run `socket-patch vex` after installation to verify
@@ -312,17 +336,36 @@ live at `common/config/rush/pnpm-lock.yaml` (plus one per subspace under
 `common/config/subspaces/<name>/`).
 
 - **Hosted** ✅ — `scan --mode hosted` discovers and repoints those locks in place
-  (subspaces included).
+  (subspaces included). On pnpm >=11 the install needs extra Rush settings (below).
 - **Agent** ✅ — works through the generated project symlink farm.
 - **Vendored** ❌ — refused (`vendor_rush_unsupported`): `rush install` copies the lock
   into `common/temp` and runs pnpm there, so vendor's relative `file:` specs can't
   survive the copy — the refusal routes you to hosted mode.
 
 Editing a Rush lock outside `rush update` desyncs the `pnpmShrinkwrapHash` in
-`common/config/rush/repo-state.json`, so when `preventManualShrinkwrapChanges` is enabled
+`common/config/rush/repo-state.json` (with subspaces enabled, in the
+`common/config/subspaces/<name>/repo-state.json` beside each subspace lock), so when `preventManualShrinkwrapChanges` is enabled
 `rush install` fails until `rush update` refreshes it (a `redirect_rush_repo_state_stale`
 warning flags this; the redirect survives the refresh — pnpm keeps locked resolutions for
 unchanged specifiers).
+
+On pnpm >=11 a repointed lock does not install under Rush's default flow: `rush install`
+either fails (`ERR_PNPM_TARBALL_URL_MISMATCH` /
+`ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION`) or, on pnpm 11, exits 0 after silently
+re-resolving the patched entries to the upstream registry. Rush runs pnpm in `common/temp`
+with a `pnpm-workspace.yaml` it generates, so the `trustLockfile` auto-config is not written
+in a Rush repo; the `redirect_pnpm_trust_lockfile` warning gives the Rush remedy instead
+(verified with Rush 5.180.0):
+
+- pnpm 12: install with `pnpm_config_trust_lockfile=true rush install` (set it in CI too).
+- pnpm 11: also set `"usePnpmFrozenLockfileForRushInstall": true` in
+  `common/config/rush/experiments.json`, so `rush install` stops passing
+  `--no-prefer-frozen-lockfile`.
+- pnpm <=10: nothing extra.
+
+Run `rush purge` before `rush install` so a warm store or old `node_modules` can't serve the
+upstream files, then verify with `socket-patch vex`. Don't rebuild the lock
+(`rush update --full`): that discards the hosted patches.
 
 ## npm: vlt notes
 
@@ -528,15 +571,20 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   confirmed directory, a POM at a canonical path whose contents disagree with its
   directory (hand-placed, or a legacy upstream POM with mismatched coordinates) reports
   the directory's coordinates.
-* **Warm `~/.m2` shadowing (legacy single-POM vendoring).** Maven consults the *local repository*
-  before any configured `<repository>`, so with vendored mode a warm `~/.m2` copy of the
-  same GAV silently wins over the committed `file://` repository — the build succeeds
-  with **unpatched** bytes. Purge it with:
-  `mvn dependency:purge-local-repository -DmanualInclude=<groupId>:<artifactId>`
-  (the always-on `vendor_maven_local_cache_shadow` warning carries the same one-liner).
-  Reactor vendoring and hosted mode use a suffixed version, so a cached original
-  version cannot shadow it. Audit conflicting copies of that suffix with
-  `vendor --check --local-repo <path>`.
+* **Warm `~/.m2` copies.** Vendored and hosted Maven both pin a suffixed
+  `<version>-socket.<hex8>`, so a cached copy of the original version in `~/.m2` cannot
+  shadow the patch. Audit conflicting copies of that suffix with
+  `vendor --check --local-repo <path>`. A project vendored before v5 (the same-GAV
+  `<repository>` wiring, which a warm `~/.m2` could shadow) is refused with
+  `legacy_maven_root` until you run `socket-patch vendor --revert` and vendor again.
+* **No Maven Wrapper (vendored).** Without `.mvn/wrapper/maven-wrapper.properties` the
+  CLI can't tell which Maven builds the project, so `vendor` warns `vendor_jvm_degraded`
+  twice: `maven_f_outside_root` (Maven 3.9.2–3.9.8 can't read the vendored tree with
+  `-f` from outside the project) and `maven_mirror_of_all` (Maven before 3.9.2 reads the
+  fallback file repository, which a `mirrorOf *` mirror captures). The patch is still
+  applied. To clear them, add a Maven Wrapper pinned to Maven 3.9.9 or later, or make
+  sure your `settings.xml` mirrors exclude `socket-patch-vendor` (for example
+  `<mirrorOf>external:*</mirrorOf>` or `<mirrorOf>*,!socket-patch-vendor</mirrorOf>`).
 * **`mirrorOf` mirrors (hosted Maven).** A `settings.xml` `<mirror>` with
   `<mirrorOf>*</mirrorOf>` (common in corporate environments) reroutes *all* repositories
   — including the injected `socket-patch-<uuid>` repository — through the mirror. Because

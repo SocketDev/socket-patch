@@ -13,7 +13,7 @@ use socket_patch_core::formats::pnpm::PnpmLock;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::records::{build_patch_record, files_for_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
+use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched, TelemetryAuth};
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
 };
@@ -82,12 +82,11 @@ async fn report_fetch_failure(
     identifier: &str,
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    telemetry: &TelemetryAuth,
     json: bool,
 ) -> i32 {
     let msg = error.to_string();
-    track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, api_token, org_slug).await;
+    track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, telemetry).await;
     report_error(json, "patch_fetch_failed", msg);
     1
 }
@@ -1130,8 +1129,17 @@ pub async fn run(args: GetArgs) -> i32 {
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
         get_api_client_with_overrides(overrides.clone()).await;
-    let telemetry_token = api_client.api_token().cloned();
-    let telemetry_org = api_client.org_slug().cloned();
+    let telemetry = TelemetryAuth::for_client(&api_client);
+    // A token whose org could not be resolved put the whole run on the
+    // public proxy (the client already warned on stderr): `--json`
+    // consumers get it in `warnings[]` too.
+    let org_warnings: Vec<(String, String)> = match api_client.org_unresolved() {
+        Some(reason) if args.common.json => vec![(
+            crate::commands::vex_sources::NOTE_API_AUTH_FALLBACK.to_string(),
+            reason.to_string(),
+        )],
+        _ => Vec::new(),
+    };
     let download_mode = args.common.download_mode.clone();
     // Set to `true` after the first 401/403 from the authenticated
     // endpoint triggered a rebuild against the public proxy. Plumbed
@@ -1182,8 +1190,8 @@ pub async fn run(args: GetArgs) -> i32 {
                         Some(&patch.purl),
                         &patch.uuid,
                         fallback_to_proxy,
-                        telemetry_token.as_deref(),
-                        telemetry_org.as_deref(),
+                        &telemetry,
+                        &org_warnings,
                     )
                     .await;
                 }
@@ -1211,8 +1219,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     &ecosystem_from_purl(&patch.purl),
                     &download_mode,
                     fallback_to_proxy,
-                    telemetry_token.as_deref(),
-                    telemetry_org.as_deref(),
+                    &telemetry,
                 )
                 .await;
                 // Mode dispatch. All three reuse THIS fetched patch and
@@ -1223,11 +1230,11 @@ pub async fn run(args: GetArgs) -> i32 {
                 return match mode {
                     // Save to manifest and apply in place.
                     super::scan::ScanMode::Agent => {
-                        save_and_apply_patch(&args, &api_client, &patch).await
+                        save_and_apply_patch(&args, &api_client, &patch, &org_warnings).await
                     }
                     super::scan::ScanMode::Hosted => {
                         let selected = vec![search_result_from_response(&patch)];
-                        run_get_hosted(&args, &api_client, &selected, &[], &[]).await
+                        run_get_hosted(&args, &api_client, &selected, &[], &org_warnings).await
                     }
                     super::scan::ScanMode::Vendored => {
                         let selected = vec![search_result_from_response(&patch)];
@@ -1238,9 +1245,8 @@ pub async fn run(args: GetArgs) -> i32 {
                             &selected,
                             Some(&patch),
                             &[],
-                            &[],
-                            telemetry_token.as_deref(),
-                            telemetry_org.as_deref(),
+                            &org_warnings,
+                            &telemetry,
                         )
                         .await
                     }
@@ -1255,8 +1261,8 @@ pub async fn run(args: GetArgs) -> i32 {
                     None,
                     &args.identifier,
                     fallback_to_proxy,
-                    telemetry_token.as_deref(),
-                    telemetry_org.as_deref(),
+                    &telemetry,
+                    &org_warnings,
                 )
                 .await;
             }
@@ -1265,12 +1271,13 @@ pub async fn run(args: GetArgs) -> i32 {
                     &args.identifier,
                     "not_found",
                     fallback_to_proxy,
-                    telemetry_token.as_deref(),
-                    telemetry_org.as_deref(),
+                    &telemetry,
                 )
                 .await;
                 if args.common.json {
-                    print_json(&empty_result_json("not_found"));
+                    let mut result = empty_result_json("not_found");
+                    fold_narrowing_into_result(&mut result, &[], &org_warnings);
+                    print_json(&result);
                 } else if !args.common.silent {
                     println!("No patch found with UUID: {}", args.identifier);
                 }
@@ -1281,8 +1288,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     &args.identifier,
                     e,
                     fallback_to_proxy,
-                    telemetry_token.as_deref(),
-                    telemetry_org.as_deref(),
+                    &telemetry,
                     args.common.json,
                 )
                 .await;
@@ -1315,8 +1321,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         &args.identifier,
                         e,
                         fallback_to_proxy,
-                        telemetry_token.as_deref(),
-                        telemetry_org.as_deref(),
+                        &telemetry,
                         args.common.json,
                     )
                     .await;
@@ -1372,8 +1377,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         &args.identifier,
                         e,
                         fallback_to_proxy,
-                        telemetry_token.as_deref(),
-                        telemetry_org.as_deref(),
+                        &telemetry,
                         args.common.json,
                     )
                     .await;
@@ -1386,7 +1390,9 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if search_response.patches.is_empty() {
         if args.common.json {
-            print_json(&empty_result_json("not_found"));
+            let mut result = empty_result_json("not_found");
+            fold_narrowing_into_result(&mut result, &[], &org_warnings);
+            print_json(&result);
         } else if !args.common.silent {
             println!("No patches found for {}: {}", id_type, args.identifier);
         }
@@ -1405,7 +1411,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if accessible.is_empty() {
         if args.common.json {
-            print_json(&serde_json::json!({
+            let mut result = serde_json::json!({
                 "status": "paid_required",
                 "found": search_response.patches.len(),
                 "downloaded": 0,
@@ -1415,7 +1421,9 @@ pub async fn run(args: GetArgs) -> i32 {
                     "uuid": p.uuid,
                     "tier": p.tier,
                 })).collect::<Vec<_>>(),
-            }));
+            });
+            fold_narrowing_into_result(&mut result, &[], &org_warnings);
+            print_json(&result);
         } else if !args.common.silent {
             let all: Vec<&PatchSearchResult> = search_response.patches.iter().collect();
             if id_type == IdentifierType::Package && !quiet {
@@ -1484,6 +1492,8 @@ pub async fn run(args: GetArgs) -> i32 {
             eprintln!("Warning: {detail}");
         }
     }
+    // Already on stderr from the client: JSON only, after the print above.
+    narrow_warnings.extend(org_warnings);
     if accessible.is_empty() {
         // Every accessible patch was narrowed out. Additive status (never
         // `no_match`, which is pinned to the fuzzy package-name path):
@@ -1651,8 +1661,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 None,
                 &narrow_skips,
                 &narrow_warnings,
-                telemetry_token.as_deref(),
-                telemetry_org.as_deref(),
+                &telemetry,
             )
             .await;
         }
@@ -1693,29 +1702,24 @@ async fn report_paid_required_uuid(
     purl: Option<&str>,
     patch_id: &str,
     fallback_to_proxy: bool,
-    telemetry_token: Option<&str>,
-    telemetry_org: Option<&str>,
+    telemetry: &TelemetryAuth,
+    org_warnings: &[(String, String)],
 ) -> i32 {
-    track_patch_fetch_failed(
-        patch_id,
-        "paid_required",
-        fallback_to_proxy,
-        telemetry_token,
-        telemetry_org,
-    )
-    .await;
+    track_patch_fetch_failed(patch_id, "paid_required", fallback_to_proxy, telemetry).await;
     if args.common.json {
         let mut record = serde_json::json!({ "uuid": patch_id, "tier": "paid" });
         if let Some(purl) = purl {
             record["purl"] = serde_json::json!(purl);
         }
-        print_json(&serde_json::json!({
+        let mut result = serde_json::json!({
             "status": "paid_required",
             "found": 1,
             "downloaded": 0,
             "applied": 0,
             "patches": [record],
-        }));
+        });
+        fold_narrowing_into_result(&mut result, &[], org_warnings);
+        print_json(&result);
     } else if !args.common.silent {
         let name = purl.map(|p| normalize_purl(p).into_owned());
         println!(
@@ -1923,7 +1927,12 @@ async fn save_patch_record(
 /// `--save-only`, apply it — under ONE apply lock, on the `client` the
 /// fetch used (a fresh client could re-hit the 401/403 its proxy fallback
 /// just recovered from).
-async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchResponse) -> i32 {
+async fn save_and_apply_patch(
+    args: &GetArgs,
+    client: &ApiClient,
+    patch: &PatchResponse,
+    org_warnings: &[(String, String)],
+) -> i32 {
     // Same "errors only" gate as `run` — informational prints respect
     // `--silent`; errors and the JSON envelope do not.
     let quiet = args.common.json || args.common.silent;
@@ -1933,7 +1942,13 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
     // A dry run previews against the manifest and writes nothing — not
     // even the lock (which would create `.socket/`).
     if args.common.dry_run {
-        return agent_dry_run(args, &[search_result_from_response(patch)], &[], &[]).await;
+        return agent_dry_run(
+            args,
+            &[search_result_from_response(patch)],
+            &[],
+            org_warnings,
+        )
+        .await;
     }
     // See `download_and_apply_patches_with`: the RMW runs under the lock,
     // which also creates `.socket/` and prunes it again when nothing lands;
@@ -2067,6 +2082,7 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
         if !warnings.is_empty() {
             result_json["warnings"] = serde_json::json!(warnings);
         }
+        fold_narrowing_into_result(&mut result_json, &[], org_warnings);
         print_json(&result_json);
     }
 
@@ -2181,8 +2197,7 @@ async fn run_get_vendored(
     prefetched: Option<&PatchResponse>,
     narrow_skips: &[serde_json::Value],
     narrow_warnings: &[(String, String)],
-    telemetry_token: Option<&str>,
-    telemetry_org: Option<&str>,
+    telemetry: &TelemetryAuth,
 ) -> i32 {
     // Dry run: ledger-classification preview only (scan's posture) — no
     // download, no vendor step, no writes.
@@ -2192,7 +2207,13 @@ async fn run_get_vendored(
             selected.iter().map(|p| p.purl.as_str()),
         )
         .await;
-        let preview = super::scan::preview_vendor_json(&args.common.cwd, selected, &takeover).await;
+        let preview = super::scan::preview_vendor_json(
+            &args.common.cwd,
+            selected,
+            &super::hosted_unwind::patch_server_origins(&args.common),
+            &takeover,
+        )
+        .await;
         if args.common.json {
             let mut result = serde_json::json!({
                 "status": "success",
@@ -2254,8 +2275,7 @@ async fn run_get_vendored(
             socket_patch_core::telemetry::track_patch_vendor_failed(
                 &detail,
                 args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
+                telemetry,
             )
             .await;
             if args.common.json {
@@ -2334,8 +2354,7 @@ async fn run_get_vendored(
         report_empty: true,
         prior: None,
         download_errors: dl_code != 0,
-        telemetry_token,
-        telemetry_org,
+        telemetry_auth: telemetry,
     })
     .await
     {
@@ -5530,8 +5549,7 @@ mod tests {
         let client = ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
             api_url: "http://127.0.0.1:1".into(),
             api_token: None,
-            use_public_proxy: false,
-            org_slug: None,
+            route: socket_patch_core::api::client::ApiRoute::Proxy,
         });
         let run = DownloadRun {
             api_client: &client,

@@ -696,3 +696,140 @@ async fn paths_echo_always_present() {
     );
     assert_eq!(v["paths"], serde_json::json!([]));
 }
+
+// ---------------------------------------------------------------------------
+// 7. Scope sees EVERY installed copy of a purl, not just the crawler's
+//    one-per-name@version representative (#778).
+// ---------------------------------------------------------------------------
+
+/// One `scan --mode agent --dry-run <pattern>` against a fresh mock: the
+/// batch-POST bodies it sent (empty when the scope selected nothing) and
+/// its envelope.
+async fn scoped_agent_scan(root: &Path, pattern: &str) -> (Vec<String>, serde_json::Value) {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let (code, stdout, stderr) = run_scan(
+        root,
+        &server.uri(),
+        &[pattern, "--mode", "agent", "--dry-run"],
+    );
+    assert_eq!(
+        code, 0,
+        "scoped scan of {pattern} must exit 0; stdout={stdout}; stderr={stderr}"
+    );
+    let reqs = recorded(&server).await;
+    let bodies = batch_posts(&reqs).into_iter().map(req_body).collect();
+    (bodies, parse_envelope(&stdout))
+}
+
+/// pnpm's isolated linker: each member's `node_modules/<dep>` is a symlink
+/// into the root `node_modules/.pnpm` store, which the crawl reaches
+/// first. Scoping to the member must still select its dependencies, the
+/// same copies `rollback packages/a` selects.
+#[cfg(unix)]
+#[tokio::test]
+async fn paths_scope_selects_pnpm_member_linked_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0", "private": true }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages: ['packages/*']\n",
+    )
+    .unwrap();
+    for (member, name, version) in [("a", "left-pad", "1.3.0"), ("b", "is-number", "7.0.0")] {
+        write_npm_package_at(
+            root,
+            &format!("node_modules/.pnpm/{name}@{version}"),
+            name,
+            version,
+        );
+        let member_dir = root.join("packages").join(member);
+        std::fs::create_dir_all(member_dir.join("node_modules")).unwrap();
+        std::fs::write(
+            member_dir.join("package.json"),
+            format!(
+                r#"{{ "name": "{member}", "version": "1.0.0", "dependencies": {{ "{name}": "{version}" }} }}"#
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            format!("../../../node_modules/.pnpm/{name}@{version}/node_modules/{name}"),
+            member_dir.join("node_modules").join(name),
+        )
+        .unwrap();
+    }
+
+    for pattern in [
+        "packages/a",
+        "packages/a/**",
+        "packages/a/node_modules/left-pad",
+    ] {
+        let (bodies, v) = scoped_agent_scan(root, pattern).await;
+        assert_eq!(
+            bodies.len(),
+            1,
+            "scan {pattern} must query the batch API once; envelope {v}"
+        );
+        assert!(
+            bodies[0].contains("pkg:npm/left-pad@1.3.0"),
+            "scan {pattern} must select member a's left-pad; body: {}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[0].contains("is-number"),
+            "scan {pattern} must not select member b's is-number; body: {}",
+            bodies[0]
+        );
+        assert_eq!(v["scannedPackages"], 1, "scan {pattern}: {v}");
+    }
+}
+
+/// yarn classic / npm workspaces with a version conflict: two real member
+/// copies of left-pad@1.3.0 (no symlinks), the root at 1.2.0. Whichever
+/// member copy the walk meets first, BOTH members must scope to it.
+#[tokio::test]
+async fn paths_scope_selects_every_nested_member_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0", "private": true, "workspaces": ["packages/*"], "dependencies": { "left-pad": "1.2.0" } }"#,
+    )
+    .unwrap();
+    write_npm_package_at(root, "", "left-pad", "1.2.0");
+    for member in ["a", "b"] {
+        let prefix = format!("packages/{member}");
+        std::fs::create_dir_all(root.join(&prefix)).unwrap();
+        std::fs::write(
+            root.join(&prefix).join("package.json"),
+            format!(r#"{{ "name": "{member}", "version": "1.0.0", "dependencies": {{ "left-pad": "1.3.0" }} }}"#),
+        )
+        .unwrap();
+        write_npm_package_at(root, &prefix, "left-pad", "1.3.0");
+    }
+
+    for pattern in ["packages/a", "packages/b"] {
+        let (bodies, v) = scoped_agent_scan(root, pattern).await;
+        assert_eq!(
+            bodies.len(),
+            1,
+            "scan {pattern} must query the batch API once; envelope {v}"
+        );
+        assert!(
+            bodies[0].contains("pkg:npm/left-pad@1.3.0"),
+            "scan {pattern} must select its member copy of left-pad@1.3.0; body: {}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[0].contains("left-pad@1.2.0"),
+            "scan {pattern} must not select the root left-pad@1.2.0; body: {}",
+            bodies[0]
+        );
+        assert_eq!(v["scannedPackages"], 1, "scan {pattern}: {v}");
+    }
+}

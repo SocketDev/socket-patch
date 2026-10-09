@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
+use crate::api::client::ApiRoute;
 use crate::constants::USER_AGENT;
 use crate::utils::env_compat::{is_offline_env, proxy_url_from_env};
 use crate::utils::fs::home_dir;
@@ -220,36 +221,76 @@ fn chrono_now_iso() -> String {
 // Send event
 // ---------------------------------------------------------------------------
 
-/// Decide which endpoint a telemetry event goes to, and whether to attach
-/// the bearer token.
+/// Where a run's telemetry events go, and the bearer they carry: the org
+/// API's `/v0/orgs/<slug>/telemetry` with the token, or the public proxy's
+/// `/patch/telemetry` anonymously.
 ///
-/// The authenticated `/v0/orgs/<slug>/telemetry` endpoint is used only when
-/// BOTH a non-empty token and a non-empty org slug are present. An empty
-/// string is treated as absent: a `Some("")` slug would otherwise build a
-/// malformed `/v0/orgs//telemetry` URL and a `Some("")` token an empty
-/// `Bearer ` header. This mirrors the empty-slug guard in
-/// `get_api_client_from_env`, keeping the contract robust even if a caller
-/// hands us blank values directly.
-fn resolve_telemetry_endpoint(api_token: Option<&str>, org_slug: Option<&str>) -> (String, bool) {
-    let token = api_token.filter(|t| !t.is_empty());
-    let slug = org_slug.filter(|s| !s.is_empty());
+/// A command that built an [`ApiClient`](crate::api::client::ApiClient)
+/// takes this from it ([`Self::for_client`]), so its telemetry follows the
+/// run's one [`ApiRoute`] — the same host and org as every API call. Only a
+/// command that never builds a client (`list`) uses
+/// [`Self::from_credentials`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryAuth {
+    url: String,
+    /// The bearer token to attach (org endpoint only).
+    bearer: Option<String>,
+}
 
-    match (token, slug) {
-        (Some(_token), Some(slug)) => {
-            // Same env → socket-cli config → default chain as API-client
-            // construction, so telemetry can't target a different host than
-            // the client that produced the event.
-            let api_url = crate::utils::socket_cli_config::resolve_api_base_url();
-            // Trim trailing slashes like `ApiClient::new` does, so a base URL
-            // of `https://host/` doesn't produce a malformed `//v0/...` path.
-            let api_url = api_url.trim_end_matches('/');
-            (format!("{api_url}/v0/orgs/{slug}/telemetry"), true)
+impl TelemetryAuth {
+    /// The client's route: its org endpoint with its token, or the proxy
+    /// endpoint on its (proxy) base URL.
+    pub fn for_client(client: &crate::api::client::ApiClient) -> Self {
+        let base = client.api_url().trim_end_matches('/');
+        match client.route() {
+            ApiRoute::Org { slug } => Self {
+                url: format!("{base}/v0/orgs/{slug}/telemetry"),
+                bearer: client.api_token().cloned(),
+            },
+            ApiRoute::Proxy => Self::proxy_at(base),
         }
-        _ => {
-            let proxy_url = proxy_url_from_env();
-            let proxy_url = proxy_url.trim_end_matches('/');
-            (format!("{proxy_url}/patch/telemetry"), false)
+    }
+
+    /// The route for a command without a client, with no network: the org
+    /// endpoint only when BOTH a non-empty token and a non-empty org slug
+    /// are given (the API base from env → socket-cli config → default, as
+    /// client construction resolves it), else the proxy from the
+    /// environment. An empty string is treated as absent: a `Some("")` slug
+    /// would otherwise build a malformed `/v0/orgs//telemetry` URL and a
+    /// `Some("")` token an empty `Bearer ` header.
+    pub fn from_credentials(api_token: Option<&str>, org_slug: Option<&str>) -> Self {
+        let token = api_token.filter(|t| !t.is_empty());
+        let slug = org_slug.filter(|s| !s.is_empty());
+        match (token, slug) {
+            (Some(token), Some(slug)) => {
+                let api_url = crate::utils::socket_cli_config::resolve_api_base_url();
+                // Trim trailing slashes like `ApiClient::new` does, so a base
+                // URL of `https://host/` doesn't produce a `//v0/...` path.
+                let api_url = api_url.trim_end_matches('/');
+                Self {
+                    url: format!("{api_url}/v0/orgs/{slug}/telemetry"),
+                    bearer: Some(token.to_string()),
+                }
+            }
+            _ => Self::proxy_at(&proxy_url_from_env()),
         }
+    }
+
+    fn proxy_at(base: &str) -> Self {
+        Self {
+            url: format!("{}/patch/telemetry", base.trim_end_matches('/')),
+            bearer: None,
+        }
+    }
+
+    /// The endpoint events are POSTed to.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Whether events carry the bearer (org endpoint).
+    pub fn is_authenticated(&self) -> bool {
+        self.bearer.is_some()
     }
 }
 
@@ -264,22 +305,14 @@ struct PreparedSend {
     bearer: Option<String>,
 }
 
-/// Resolve `event`'s endpoint (see [`resolve_telemetry_endpoint`]).
-fn prepare_send(
-    event: PatchTelemetryEvent,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) -> PreparedSend {
-    let (url, use_auth) = resolve_telemetry_endpoint(api_token, org_slug);
-
-    debug_log(&format!("Sending telemetry to {url}"));
-
-    let bearer = if use_auth {
-        api_token.map(str::to_string)
-    } else {
-        None
-    };
-    PreparedSend { event, url, bearer }
+/// Address `event` per `auth`.
+fn prepare_send(event: PatchTelemetryEvent, auth: &TelemetryAuth) -> PreparedSend {
+    debug_log(&format!("Sending telemetry to {}", auth.url));
+    PreparedSend {
+        event,
+        url: auth.url.clone(),
+        bearer: auth.bearer.clone(),
+    }
 }
 
 /// Send a telemetry event to the API.
@@ -382,8 +415,7 @@ impl PendingTelemetry {
 // ---------------------------------------------------------------------------
 // Per-event tracker wrappers (the public API)
 //
-// These accept `Option<&str>` for api_token/org_slug to make call sites
-// convenient (callers typically have `Option<String>` and call `.as_deref()`).
+// Each takes the run's `TelemetryAuth` (see `TelemetryAuth::for_client`).
 // ---------------------------------------------------------------------------
 
 /// Build the event the tracker wrappers below send, or `None` when
@@ -395,8 +427,7 @@ fn prepare(
     command: &'static str,
     metadata: serde_json::Value,
     error: Option<impl std::fmt::Display>,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) -> Option<PreparedSend> {
     if is_telemetry_disabled() {
         debug_log("Telemetry is disabled, skipping event");
@@ -409,7 +440,7 @@ fn prepare(
     };
     let error = error.map(|e| ("Error".to_string(), e.to_string()));
     let event = build_telemetry_event(event_type, command, metadata, error);
-    Some(prepare_send(event, api_token, org_slug))
+    Some(prepare_send(event, auth))
 }
 
 /// Shared fire-and-forget helper for the per-event tracker wrappers below.
@@ -422,13 +453,9 @@ async fn fire(
     command: &'static str,
     metadata: serde_json::Value,
     error: Option<impl std::fmt::Display>,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
-    fire_prepared(prepare(
-        event_type, command, metadata, error, api_token, org_slug,
-    ))
-    .await;
+    fire_prepared(prepare(event_type, command, metadata, error, auth)).await;
 }
 
 /// Send a prepared event inline, or return at once when telemetry is
@@ -440,19 +467,13 @@ async fn fire_prepared(prepared: Option<PreparedSend>) {
 }
 
 /// Track a successful patch application.
-pub async fn track_patch_applied(
-    patches_count: usize,
-    dry_run: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_patch_applied(patches_count: usize, dry_run: bool, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::PatchApplied,
         "apply",
         serde_json::json!({ "patches_count": patches_count, "dry_run": dry_run }),
         None::<&str>,
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
@@ -464,34 +485,26 @@ pub async fn track_patch_applied(
 pub async fn track_patch_apply_failed(
     error: impl std::fmt::Display,
     dry_run: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchApplyFailed,
         "apply",
         serde_json::json!({ "dry_run": dry_run }),
         Some(error),
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
 
 /// Track a successful vendor run (count = packages vendored).
-pub async fn track_patch_vendored(
-    vendored_count: u32,
-    dry_run: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_patch_vendored(vendored_count: u32, dry_run: bool, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::PatchVendored,
         "vendor",
         serde_json::json!({ "patches_count": vendored_count, "dry_run": dry_run }),
         None::<&str>,
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
@@ -500,84 +513,62 @@ pub async fn track_patch_vendored(
 pub async fn track_patch_vendor_failed(
     error: impl std::fmt::Display,
     dry_run: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchVendorFailed,
         "vendor",
         serde_json::json!({ "dry_run": dry_run }),
         Some(error),
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
 
 /// Track a successful patch removal.
-pub async fn track_patch_removed(
-    removed_count: usize,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_patch_removed(removed_count: usize, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::PatchRemoved,
         "remove",
         serde_json::json!({ "removed_count": removed_count }),
         None::<&str>,
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
 
 /// Track a failed patch removal. Accepts any `Display` type for the error.
-pub async fn track_patch_remove_failed(
-    error: impl std::fmt::Display,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_patch_remove_failed(error: impl std::fmt::Display, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::PatchRemoveFailed,
         "remove",
         serde_json::Value::Null,
         Some(error),
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
 
 /// Track a successful patch rollback.
-pub async fn track_patch_rolled_back(
-    rolled_back_count: usize,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_patch_rolled_back(rolled_back_count: usize, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::PatchRolledBack,
         "rollback",
         serde_json::json!({ "rolled_back_count": rolled_back_count }),
         None::<&str>,
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
 
 /// Track a failed patch rollback. Accepts any `Display` type for the error.
-pub async fn track_patch_rollback_failed(
-    error: impl std::fmt::Display,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_patch_rollback_failed(error: impl std::fmt::Display, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::PatchRollbackFailed,
         "rollback",
         serde_json::Value::Null,
         Some(error),
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
@@ -598,8 +589,7 @@ fn prepare_patch_scanned(
     can_access_paid: bool,
     ecosystems: &[String],
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) -> Option<PreparedSend> {
     prepare(
         PatchTelemetryEventType::PatchScanned,
@@ -613,8 +603,7 @@ fn prepare_patch_scanned(
             "fallback_to_proxy": fallback_to_proxy,
         }),
         None::<&str>,
-        api_token,
-        org_slug,
+        auth,
     )
 }
 
@@ -639,8 +628,7 @@ pub async fn track_patch_scanned(
     can_access_paid: bool,
     ecosystems: &[String],
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
     fire_prepared(prepare_patch_scanned(
         packages_scanned,
@@ -649,8 +637,7 @@ pub async fn track_patch_scanned(
         can_access_paid,
         ecosystems,
         fallback_to_proxy,
-        api_token,
-        org_slug,
+        auth,
     ))
     .await;
 }
@@ -667,8 +654,7 @@ pub fn spawn_patch_scanned(
     can_access_paid: bool,
     ecosystems: &[String],
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
     pending.spawn_prepared(prepare_patch_scanned(
         packages_scanned,
@@ -677,8 +663,7 @@ pub fn spawn_patch_scanned(
         can_access_paid,
         ecosystems,
         fallback_to_proxy,
-        api_token,
-        org_slug,
+        auth,
     ));
 }
 
@@ -686,16 +671,14 @@ pub fn spawn_patch_scanned(
 fn prepare_patch_scan_failed(
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) -> Option<PreparedSend> {
     prepare(
         PatchTelemetryEventType::PatchScanFailed,
         "scan",
         serde_json::json!({ "fallback_to_proxy": fallback_to_proxy }),
         Some(error),
-        api_token,
-        org_slug,
+        auth,
     )
 }
 
@@ -705,16 +688,9 @@ fn prepare_patch_scan_failed(
 pub async fn track_patch_scan_failed(
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
-    fire_prepared(prepare_patch_scan_failed(
-        error,
-        fallback_to_proxy,
-        api_token,
-        org_slug,
-    ))
-    .await;
+    fire_prepared(prepare_patch_scan_failed(error, fallback_to_proxy, auth)).await;
 }
 
 /// [`track_patch_scan_failed`], sent in the background (see
@@ -723,15 +699,9 @@ pub fn spawn_patch_scan_failed(
     pending: &mut PendingTelemetry,
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
-    pending.spawn_prepared(prepare_patch_scan_failed(
-        error,
-        fallback_to_proxy,
-        api_token,
-        org_slug,
-    ));
+    pending.spawn_prepared(prepare_patch_scan_failed(error, fallback_to_proxy, auth));
 }
 
 /// Track a successful `get`. Reports patch identity + delivery mode and
@@ -743,8 +713,7 @@ pub async fn track_patch_fetched(
     ecosystem: &str,
     download_mode: &str,
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchFetched,
@@ -757,8 +726,7 @@ pub async fn track_patch_fetched(
             "fallback_to_proxy": fallback_to_proxy,
         }),
         None::<&str>,
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
@@ -782,8 +750,7 @@ pub async fn track_patch_fetch_failed(
     uuid: &str,
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchFetchFailed,
@@ -793,8 +760,7 @@ pub async fn track_patch_fetch_failed(
             "fallback_to_proxy": fallback_to_proxy
         }),
         Some(error),
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
@@ -804,18 +770,13 @@ pub async fn track_patch_fetch_failed(
 // ---------------------------------------------------------------------------
 
 /// Track a successful `list`. Reports the number of patches surfaced.
-pub async fn track_patch_listed(
-    patches_count: usize,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_patch_listed(patches_count: usize, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::PatchListed,
         "list",
         serde_json::json!({ "patches_count": patches_count }),
         None::<&str>,
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
@@ -825,8 +786,7 @@ pub async fn track_patch_repaired(
     blobs_added: usize,
     blobs_removed: usize,
     bytes_freed: u64,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchRepaired,
@@ -837,25 +797,19 @@ pub async fn track_patch_repaired(
             "bytes_freed": bytes_freed,
         }),
         None::<&str>,
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
 
 /// Track a failed `repair`.
-pub async fn track_patch_repair_failed(
-    error: impl std::fmt::Display,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_patch_repair_failed(error: impl std::fmt::Display, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::PatchRepairFailed,
         "repair",
         serde_json::Value::Null,
         Some(error),
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
@@ -870,8 +824,7 @@ pub async fn track_vex_generated(
     advisories_count: usize,
     format: &str,
     output_kind: &str,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::VexGenerated,
@@ -882,25 +835,19 @@ pub async fn track_vex_generated(
             "output_kind": output_kind,
         }),
         None::<&str>,
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
 
 /// Track a failed `vex` generation.
-pub async fn track_vex_failed(
-    error: impl std::fmt::Display,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_vex_failed(error: impl std::fmt::Display, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::VexFailed,
         "vex",
         serde_json::Value::Null,
         Some(error),
-        api_token,
-        org_slug,
+        auth,
     )
     .await;
 }
@@ -1064,12 +1011,13 @@ mod tests {
 
         // No token / org: both events go to the proxy endpoint above.
         let ecosystems = vec!["npm".to_string(), "pypi".to_string()];
+        let auth = TelemetryAuth::from_credentials(None, None);
         let mut pending = PendingTelemetry::new();
-        track_patch_scanned(5, 3, 2, true, &ecosystems, true, None, None).await;
-        spawn_patch_scanned(&mut pending, 5, 3, 2, true, &ecosystems, true, None, None);
+        track_patch_scanned(5, 3, 2, true, &ecosystems, true, &auth).await;
+        spawn_patch_scanned(&mut pending, 5, 3, 2, true, &ecosystems, true, &auth);
         pending.flush().await;
-        track_patch_scan_failed("all batches failed", true, None, None).await;
-        spawn_patch_scan_failed(&mut pending, "all batches failed", true, None, None);
+        track_patch_scan_failed("all batches failed", true, &auth).await;
+        spawn_patch_scan_failed(&mut pending, "all batches failed", true, &auth);
         pending.flush().await;
 
         for (key, value) in saved {
@@ -1402,6 +1350,41 @@ mod tests {
         assert!(s < 60, "second {s} out of range");
         assert_eq!(millis.len(), 3);
         assert!(millis.parse::<u64>().unwrap() < 1000);
+    }
+
+    /// [`TelemetryAuth::from_credentials`] as `(url, authenticated)`.
+    fn resolve_telemetry_endpoint(token: Option<&str>, slug: Option<&str>) -> (String, bool) {
+        let auth = TelemetryAuth::from_credentials(token, slug);
+        (auth.url().to_string(), auth.is_authenticated())
+    }
+
+    /// A client's telemetry follows its route: the org endpoint on the
+    /// client's own base with its bearer, or the proxy endpoint on the
+    /// proxy client's base (an explicit `--proxy-url`) without one. No env
+    /// lookup is involved.
+    #[test]
+    fn for_client_follows_the_clients_route() {
+        use crate::api::client::{ApiClient, ApiClientOptions};
+        let org = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.example.test/".into(),
+            api_token: Some("tok".into()),
+            route: ApiRoute::org("acme"),
+        });
+        let auth = TelemetryAuth::for_client(&org);
+        assert_eq!(
+            auth.url(),
+            "https://api.example.test/v0/orgs/acme/telemetry"
+        );
+        assert!(auth.is_authenticated());
+
+        let proxy = ApiClient::new(ApiClientOptions {
+            api_url: "https://proxy.example.test".into(),
+            api_token: Some("tok".into()),
+            route: ApiRoute::Proxy,
+        });
+        let auth = TelemetryAuth::for_client(&proxy);
+        assert_eq!(auth.url(), "https://proxy.example.test/patch/telemetry");
+        assert!(!auth.is_authenticated(), "the proxy never gets the bearer");
     }
 
     /// Endpoint selection must use the authenticated org route only when both

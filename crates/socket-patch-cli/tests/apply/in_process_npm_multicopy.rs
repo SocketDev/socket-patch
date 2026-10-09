@@ -12,6 +12,7 @@
 //! assert EVERY physical copy is patched (and later restored) AND that the
 //! JSON summary counts every copy.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -130,6 +131,11 @@ fn build_two_copy_tree(tmp: &Path) -> (PathBuf, PathBuf, PathBuf, String, String
 }
 
 fn run_apply(root: &Path) -> (i32, serde_json::Value) {
+    run_apply_with(root, &[])
+}
+
+/// `run_apply` plus `extra` arguments (flags or path targets).
+fn run_apply_with(root: &Path, extra: &[&OsStr]) -> (i32, serde_json::Value) {
     let out = Command::new(binary())
         .args([
             "apply",
@@ -138,8 +144,9 @@ fn run_apply(root: &Path) -> (i32, serde_json::Value) {
             "--ecosystems",
             "npm",
             "--cwd",
-            root.to_str().unwrap(),
         ])
+        .arg(root)
+        .args(extra)
         .output()
         .expect("run apply");
     let code = out.status.code().unwrap_or(-1);
@@ -324,6 +331,11 @@ fn build_vlt_peer_variant_tree(tmp: &Path, link_importer: bool) -> (PathBuf, Pat
 }
 
 fn run_rollback(root: &Path) -> (i32, serde_json::Value) {
+    run_rollback_with(root, &[])
+}
+
+/// `run_rollback` plus `extra` arguments (flags or path targets).
+fn run_rollback_with(root: &Path, extra: &[&OsStr]) -> (i32, serde_json::Value) {
     let out = Command::new(binary())
         .args([
             "rollback",
@@ -333,8 +345,9 @@ fn run_rollback(root: &Path) -> (i32, serde_json::Value) {
             "--ecosystems",
             "npm",
             "--cwd",
-            root.to_str().unwrap(),
         ])
+        .arg(root)
+        .args(extra)
         .output()
         .expect("run rollback");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -683,5 +696,222 @@ fn apply_and_rollback_refuse_a_node_modules_link_to_first_party_source() {
         std::fs::read(&fork_index).unwrap(),
         patched,
         "rollback wrote through the link"
+    );
+}
+
+/// #633: in a pnpm workspace on the isolated linker, a member's
+/// `packages/a/node_modules/dupvuln` is a link to the root store entry
+/// `node_modules/.pnpm/dupvuln@1.0.0/node_modules/dupvuln`. The root and
+/// the member are separate `node_modules` roots, so the resolver sees the
+/// one physical copy under two spellings; apply and rollback must still
+/// visit it once (they used to report a phantom `already_patched` /
+/// already-original second event on every run). Path targets keep seeing
+/// the member's spelling, so `rollback packages/a` still selects it.
+#[cfg(unix)]
+#[test]
+fn apply_and_rollback_visit_a_pnpm_workspace_member_link_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let name = "dupvuln";
+    let purl = "pkg:npm/dupvuln@1.0.0";
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0", "private": true }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\n",
+    )
+    .unwrap();
+    let store_copy = write_copy(
+        &root
+            .join("node_modules/.pnpm/dupvuln@1.0.0/node_modules")
+            .join(name),
+        name,
+        "1.0.0",
+        original,
+    );
+    let member = root.join("packages").join("a");
+    std::fs::create_dir_all(member.join("node_modules")).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{ "name": "a", "version": "1.0.0", "dependencies": { "dupvuln": "1.0.0" } }"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../../../node_modules/.pnpm/dupvuln@1.0.0/node_modules/dupvuln",
+        member.join("node_modules").join(name),
+    )
+    .unwrap();
+    stage_manifest_and_blob(
+        root,
+        purl,
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    );
+    std::fs::write(
+        root.join(".socket")
+            .join("blobs")
+            .join(git_sha256(original)),
+        original,
+    )
+    .unwrap();
+
+    let (code, v) = run_apply(root);
+    assert_eq!(code, 0, "first apply; envelope={v}");
+    assert_eq!(std::fs::read(&store_copy).unwrap(), patched);
+    assert_eq!(v["summary"]["applied"], 1, "first apply; envelope={v}");
+    assert_eq!(v["summary"]["skipped"], 0, "first apply; envelope={v}");
+    assert_eq!(
+        dupvuln_events(&v),
+        vec![("applied".to_string(), String::new())],
+        "first apply; envelope={v}"
+    );
+
+    let (code, v) = run_apply(root);
+    assert_eq!(code, 0, "second apply; envelope={v}");
+    assert_eq!(v["summary"]["applied"], 0, "second apply; envelope={v}");
+    assert_eq!(v["summary"]["skipped"], 1, "second apply; envelope={v}");
+    assert_eq!(
+        dupvuln_events(&v),
+        vec![("skipped".to_string(), "already_patched".to_string())],
+        "second apply; envelope={v}"
+    );
+
+    // `--preserve-state` keeps the manifest entry for the scoped run below.
+    let (code, v) = run_rollback_with(root, &["--preserve-state".as_ref()]);
+    assert_eq!(code, 0, "rollback; envelope={v}");
+    assert_eq!(std::fs::read(&store_copy).unwrap(), original);
+    assert_eq!(v["rolledBack"], 1, "rollback; envelope={v}");
+    assert_eq!(v["alreadyOriginal"], 0, "rollback; envelope={v}");
+
+    // A path target still selects the copy through the member's link.
+    let (code, v) = run_apply(root);
+    assert_eq!(code, 0, "re-apply; envelope={v}");
+    assert_eq!(std::fs::read(&store_copy).unwrap(), patched);
+    let (code, v) = run_rollback_with(root, &["packages/a".as_ref()]);
+    assert_eq!(code, 0, "scoped rollback; envelope={v}");
+    assert_eq!(std::fs::read(&store_copy).unwrap(), original);
+    assert_eq!(v["rolledBack"], 1, "scoped rollback; envelope={v}");
+    assert_eq!(v["alreadyOriginal"], 0, "scoped rollback; envelope={v}");
+}
+
+/// One pnpm 11+ isolated global install, `<v11>/<hash>/node_modules`, with
+/// its own `.pnpm` holding a real `dupvuln@1.0.0`, linked at the top level
+/// (`direct`) or reached only through `wrapper` (transitive-only).
+/// Returns the store copy's `index.js`.
+#[cfg(unix)]
+fn write_pnpm_global_install(v11: &Path, hash: &str, direct: bool, original: &[u8]) -> PathBuf {
+    let nm = v11.join(hash).join("node_modules");
+    std::fs::create_dir_all(&nm).unwrap();
+    std::fs::write(v11.join(hash).join("package.json"), "{}").unwrap();
+    std::fs::write(nm.join(".modules.yaml"), "layoutVersion: 5\n").unwrap();
+    let store = nm.join(".pnpm");
+    let pkg = store.join("dupvuln@1.0.0/node_modules/dupvuln");
+    let index = write_copy(&pkg, "dupvuln", "1.0.0", original);
+    if direct {
+        std::os::unix::fs::symlink(&pkg, nm.join("dupvuln")).unwrap();
+    } else {
+        let wrapper = store.join("wrapper@1.0.0/node_modules/wrapper");
+        write_copy(&wrapper, "wrapper", "1.0.0", b"require('dupvuln');\n");
+        std::os::unix::fs::symlink(&pkg, store.join("wrapper@1.0.0/node_modules/dupvuln")).unwrap();
+        std::os::unix::fs::symlink(&wrapper, nm.join("wrapper")).unwrap();
+    }
+    index
+}
+
+/// #435: pnpm 11+ gives every `pnpm add -g` its own install dir
+/// (`$PNPM_HOME/global/v11/<hash>/node_modules`, each with its own
+/// `.pnpm`), and `pnpm root -g` prints their parent. With one install
+/// linking the package directly and another holding it only
+/// transitively, apply patched one copy and reported success while the
+/// other stayed vulnerable. Both orientations are built so the guard
+/// fails whatever the directory listing order.
+#[cfg(unix)]
+#[test]
+fn apply_global_prefix_patches_every_pnpm_isolated_global_install() {
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    for direct_first in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        stage_manifest_and_blob(
+            &root,
+            "pkg:npm/dupvuln@1.0.0",
+            &git_sha256(original),
+            &git_sha256(&patched),
+            &patched,
+        );
+        let v11 = tmp.path().join("pnpm-home/global/v11");
+        let a = write_pnpm_global_install(&v11, "aaa", direct_first, original);
+        let b = write_pnpm_global_install(&v11, "bbb", !direct_first, original);
+
+        let (code, v) = run_apply_with(&root, &["--global-prefix".as_ref(), v11.as_os_str()]);
+        assert_eq!(code, 0, "direct_first={direct_first}; envelope={v}");
+        for index in [&a, &b] {
+            assert_eq!(
+                std::fs::read(index).unwrap(),
+                patched,
+                "{index:?} left unpatched; direct_first={direct_first}; envelope={v}"
+            );
+        }
+        assert_eq!(
+            dupvuln_events(&v),
+            vec![
+                ("applied".to_string(), String::new()),
+                ("applied".to_string(), String::new())
+            ],
+            "direct_first={direct_first}; envelope={v}"
+        );
+    }
+}
+
+/// Splitting `global/v11` into one root per install must not turn one
+/// physical copy that two installs both link (pnpm 11's global virtual
+/// store is the real-world case, refused there as a shared store) into
+/// two events.
+#[cfg(unix)]
+#[test]
+fn apply_global_prefix_visits_a_copy_shared_by_two_pnpm_global_installs_once() {
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    stage_manifest_and_blob(
+        &root,
+        "pkg:npm/dupvuln@1.0.0",
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    );
+    // An installed copy (under a `node_modules`), not linked first-party
+    // source, which apply refuses.
+    let shared = tmp.path().join("shared/node_modules/dupvuln");
+    let index = write_copy(&shared, "dupvuln", "1.0.0", original);
+    let v11 = tmp.path().join("pnpm-home/global/v11");
+    for hash in ["aaa", "bbb"] {
+        let nm = v11.join(hash).join("node_modules");
+        std::fs::create_dir_all(nm.join(".pnpm")).unwrap();
+        std::fs::write(v11.join(hash).join("package.json"), "{}").unwrap();
+        std::fs::write(nm.join(".modules.yaml"), "layoutVersion: 5\n").unwrap();
+        std::os::unix::fs::symlink(&shared, nm.join("dupvuln")).unwrap();
+    }
+
+    let (code, v) = run_apply_with(&root, &["--global-prefix".as_ref(), v11.as_os_str()]);
+    assert_eq!(code, 0, "envelope={v}");
+    assert_eq!(std::fs::read(&index).unwrap(), patched, "envelope={v}");
+    assert_eq!(
+        dupvuln_events(&v),
+        vec![("applied".to_string(), String::new())],
+        "envelope={v}"
     );
 }

@@ -1229,36 +1229,142 @@ fn gradle_vendor_428_repair_from_subproject_refuses() {
     assert_eq!(snapshot(root), before);
 }
 
-/// A single-pom root vendored before a Gradle build sat beside it keeps
-/// its single-pom entry: the re-run warns that the Gradle build stays
-/// unpatched and writes no Gradle wiring, `--check` passes, and the
-/// revert restores every byte.
+/// Plant the wiring the retired pre-v5 single-pom backend left in `proj`:
+/// a `<repository>` before `</project>`, its `.socket/vendor/maven/<uuid>`
+/// tree and a `maven_pom_repository` ledger entry for `foo`.
+fn plant_legacy_single_pom(root: &Path, pom: &str) {
+    let repo_id = format!("socket-patch-vendor-{FOO_UUID}");
+    let tree = format!(".socket/vendor/maven/{FOO_UUID}");
+    let at = pom.rfind("</project>").unwrap();
+    let wired = format!(
+        "{}  <repositories>\n    <repository>\n      <id>{repo_id}</id>\n      \
+         <url>file://${{project.basedir}}/{tree}</url>\n      <releases>\n        \
+         <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      \
+         </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      \
+         </snapshots>\n    </repository>\n  </repositories>\n{}",
+        &pom[..at],
+        &pom[at..]
+    );
+    write(root, "proj/pom.xml", wired.as_bytes());
+    let jar_rel = format!("{tree}/org/example/foo/1.0/foo-1.0.jar");
+    let jar_bytes = jar(b"NOTICE foo\nPATCHED\n");
+    write(root, &format!("proj/{jar_rel}"), &jar_bytes);
+    let state = serde_json::json!({
+        "version": 1,
+        "entries": { purl("foo"): {
+            "ecosystem": "maven",
+            "basePurl": purl("foo"),
+            "uuid": FOO_UUID,
+            "artifact": {
+                "path": jar_rel,
+                "sha256": hex::encode(Sha256::digest(&jar_bytes)),
+                "size": jar_bytes.len(),
+            },
+            "wiring": [{
+                "file": "pom.xml",
+                "kind": "maven_pom_repository",
+                "action": "added",
+                "key": repo_id,
+                "original": pom,
+                "new": wired,
+            }],
+        } },
+    });
+    write(
+        root,
+        "proj/.socket/vendor/state.json",
+        serde_json::to_string_pretty(&state).unwrap().as_bytes(),
+    );
+}
+
+/// #973: a root whose ledger still holds a pre-v5 single-pom entry is
+/// refused whole (`legacy_maven_root`), alone or beside a Gradle build,
+/// with nothing written. `vendor --revert` restores every byte, and the
+/// next vendor plans the root through the suffixed planner.
 #[test]
-fn gradle_vendor_395_legacy_single_pom_entry_is_not_migrated() {
+fn legacy_single_pom_entry_is_refused_until_reverted() {
+    let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.x</groupId>\n  <artifactId>app</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency><groupId>org.example</groupId><artifactId>foo</artifactId><version>1.0</version></dependency>\n  </dependencies>\n</project>\n";
+    for mixed in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+        if !mixed {
+            std::fs::remove_file(root.join("proj/settings.gradle")).unwrap();
+            std::fs::remove_dir_all(root.join("proj/app")).unwrap();
+        }
+        write(root, "proj/pom.xml", pom.as_bytes());
+        let pristine = snapshot(root);
+        plant_legacy_single_pom(root, pom);
+        assert_refused(root, "legacy_maven_root", "socket-patch vendor --revert");
+        ok(root, &["vendor", "--revert"]);
+        assert_eq!(snapshot(root), pristine, "mixed={mixed}");
+        let env = ok(root, &["vendor"]);
+        assert_eq!(env["summary"]["applied"], 1, "mixed={mixed}: {env}");
+        assert!(root
+            .join(FOO_MAVEN_TREE)
+            .join("foo-1.0-socket.1d3c1fd2.jar")
+            .is_file());
+        let state = std::fs::read_to_string(root.join("proj/.socket/vendor/state.json")).unwrap();
+        assert!(!state.contains("maven_pom_repository"), "{state}");
+        ok(root, &["vendor", "--revert"]);
+        assert_eq!(snapshot(root), pristine, "mixed={mixed}");
+    }
+}
+
+/// #973: a lone single-module pom with no Maven Wrapper vendors through
+/// the planner: suffixed tree and pin, `.mvn/maven.config`, both
+/// wrapper-less warnings, `--check` and VEX pass, and the revert restores
+/// every byte.
+#[test]
+fn single_module_pom_vendors_through_the_planner() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    std::fs::remove_file(root.join("proj/settings.gradle")).unwrap();
+    std::fs::remove_dir_all(root.join("proj/app")).unwrap();
     write(
         root,
         "proj/pom.xml",
         b"<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.x</groupId>\n  <artifactId>app</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency><groupId>org.example</groupId><artifactId>foo</artifactId><version>1.0</version></dependency>\n  </dependencies>\n</project>\n",
     );
     let pristine = snapshot(root);
-    let settings = root.join("proj/settings.gradle");
-    let parked = root.join("settings.gradle.parked");
-    std::fs::rename(&settings, &parked).unwrap();
-    ok(root, &["vendor"]);
-    let state = std::fs::read_to_string(root.join("proj/.socket/vendor/state.json")).unwrap();
-    assert!(state.contains("maven_pom_repository"), "{state}");
-    std::fs::rename(&parked, &settings).unwrap();
-    let legacy = snapshot(root);
     let env = ok(root, &["vendor"]);
-    assert!(
-        env.to_string().contains("reason: legacy_maven_root: "),
-        "{env}"
-    );
-    assert_eq!(snapshot(root), legacy, "no Gradle wiring is added");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let text = env.to_string();
+    for reason in ["maven_f_outside_root", "maven_mirror_of_all"] {
+        assert!(
+            text.contains(&format!("reason: {reason}: ")),
+            "{reason}: {env}"
+        );
+    }
+    assert!(!text.contains("vendor_maven_local_cache_shadow"), "{env}");
+    assert!(root
+        .join(FOO_MAVEN_TREE)
+        .join("foo-1.0-socket.1d3c1fd2.jar")
+        .is_file());
+    assert!(std::fs::read_to_string(root.join("proj/pom.xml"))
+        .unwrap()
+        .contains("1.0-socket.1d3c1fd2"));
+    assert!(root.join("proj/.mvn/maven.config").is_file());
+    assert!(!root.join("proj/.socket/vendor/maven").exists());
+    let again = snapshot(root);
+    ok(root, &["vendor"]);
+    assert_eq!(snapshot(root), again, "an in-sync re-run writes nothing");
     ok(root, &["vendor", "--check"]);
+    let vex = root.join("vex.json");
+    ok(
+        root,
+        &[
+            "vex",
+            "-O",
+            vex.to_str().unwrap(),
+            "--product",
+            "pkg:generic/x@1",
+        ],
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&vex).unwrap()).unwrap();
+    assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
+    std::fs::remove_file(vex).unwrap();
     ok(root, &["vendor", "--revert"]);
     assert_eq!(snapshot(root), pristine);
 }

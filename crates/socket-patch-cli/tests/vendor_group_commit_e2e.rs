@@ -244,9 +244,12 @@ fn a_crash_mid_loop_leaves_the_pre_run_commit_points() {
     }
 }
 
+/// Maven is not in the list: its JVM tree is written durably as it goes
+/// (`vendor::jvm::apply::write_plan`), so a Maven run leaves the artifact
+/// barrier nothing to sync and the failpoint first fires after the commit.
 #[test]
 fn a_crash_at_the_artifact_barrier_leaves_the_pre_run_commit_points() {
-    for eco in ["pnpm", "golang", "maven"] {
+    for eco in ["pnpm", "golang", "nuget"] {
         crash_then_rerun(eco, "durability_barrier", true);
     }
 }

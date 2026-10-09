@@ -38,7 +38,7 @@ else
 fi
 [ -n "$launcher" ] || { echo "sbt-warm-seed: no sbt launcher on PATH" >&2; exit 1; }
 
-mkdir -p "$SEED/coursier/v1" "$SEED/ivy2" "$SEED/boot" "$SEED/global"
+mkdir -p "$SEED"
 seed="$(cd "$SEED" && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -54,15 +54,42 @@ case "$VERSION" in 2.*) extra=(--server) ;; esac
 unset SBT_OPTS JAVA_OPTS JVM_OPTS JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS SBT_NATIVE_CLIENT
 while IFS= read -r var; do unset "$var"; done < <(env | sed -n 's/^\(COURSIER_[A-Za-z0-9_]*\)=.*/\1/p')
 
-(
-  cd "$work"
-  COURSIER_CACHE="$(native "$seed/coursier/v1")" "$launcher" -batch -no-colors \
-    -Dsbt.server.autostart=false \
-    "-Dsbt.global.base=$(native "$seed/global")" \
-    "-Dsbt.boot.directory=$(native "$seed/boot")" \
-    "-Dsbt.ivy.home=$(native "$seed/ivy2")" \
-    ${extra[@]+"${extra[@]}"} update >&2
-)
+boot() {
+  (
+    cd "$work"
+    COURSIER_CACHE="$(native "$seed/coursier/v1")" "$launcher" -batch -no-colors \
+      -Dsbt.server.autostart=false \
+      "-Dsbt.global.base=$(native "$seed/global")" \
+      "-Dsbt.boot.directory=$(native "$seed/boot")" \
+      "-Dsbt.ivy.home=$(native "$seed/ivy2")" \
+      ${extra[@]+"${extra[@]}"} update
+  )
+}
+
+# Maven Central blips on runners (a CDN 429, 404 or reset), and this boot
+# is the leg's first fetch: one failed download used to fail the whole
+# job. Retry only a boot that failed fetching (the same signatures
+# sbt_vendor_build_common::FETCH_ERRORS matches: Coursier, Ivy and the
+# launcher), each from an empty seed and project/target, since Coursier
+# and Ivy can remember a miss. Any other failure exits at once.
+fetch_errors='Error downloading|download error|Server access error|unresolved dependency|Error retrieving required libraries'
+log="$work/boot.log"
+attempt=1
+while :; do
+  rm -rf "$seed/coursier" "$seed/ivy2" "$seed/boot" "$seed/global" \
+    "$work/project/target" "$work/target"
+  mkdir -p "$seed/coursier/v1" "$seed/ivy2" "$seed/boot" "$seed/global"
+  status=0
+  boot > "$log" 2>&1 || status=$?
+  cat "$log" >&2
+  [ "$status" -eq 0 ] && break
+  if [ "$attempt" -ge 3 ] || ! grep -Eq "$fetch_errors" "$log"; then
+    exit "$status"
+  fi
+  echo "sbt-warm-seed: attempt $attempt failed fetching; retrying" >&2
+  sleep $((attempt * 10))
+  attempt=$((attempt + 1))
+done
 # global/ holds sbt's per-machine state (server sockets, compiled plugins);
 # the suites never read it from a seed.
 rm -rf "$seed/global"

@@ -2,15 +2,19 @@
 //! pnpm projects whose shape the pnpm vendored backend refuses although
 //! hosted mode accepts it (#853): a `catalog:` dependency
 //! (`vendor_lock_entry_unsupported`), a CRLF `pnpm-lock.yaml`
-//! (`vendor_lockfile_crlf_unsupported`) and a user exact-pin override in
-//! `pnpm-workspace.yaml` (`vendor_override_conflict`).
+//! (`vendor_lockfile_crlf_unsupported`) and a conflicting user override
+//! (a range) in `pnpm-workspace.yaml` (`vendor_override_conflict`).
 //!
 //! `scan`/`get --mode vendored` over such a hosted pin used to commit the
 //! upstream restore FIRST and only then reach the backend's refusal, so
 //! the run failed with the hosted pin already gone and the project went
 //! back to installing the unpatched registry release. A refused takeover
 //! must leave the hosted wiring byte-for-byte in place; a plain dependency
-//! still takes over.
+//! and a workspace exact pin equal to the vendored version (#854) still
+//! take over. The `--dry-run` preview of the same runs lists a refused
+//! pin `would_refuse` with the wet run's code, never `would_vendor`.
+//! pnpm 12's two-document lock (#466) takes over both ways, editing the
+//! project document only.
 //!
 //! The API and the npm registry are wiremock; no pnpm binary is needed.
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
@@ -50,11 +54,23 @@ enum Shape {
     Catalog,
     /// A plain dependency whose lock is converted to CRLF after hosting.
     Crlf,
-    /// A plain dependency plus a user `overrides: { left-pad: 1.3.0 }`.
+    /// A plain dependency plus a conflicting user
+    /// `overrides: { left-pad: ^1.3.0 }` in pnpm-workspace.yaml.
     Override,
+    /// A plain dependency plus a user exact pin
+    /// `overrides: { left-pad: 1.3.0 }` in pnpm-workspace.yaml, which
+    /// vendoring takes over (#854).
+    ExactPin,
     /// A plain dependency: the control both modes accept.
     Plain,
+    /// A plain dependency in pnpm 12's two-document lock (`packageManager`
+    /// set): pnpm's env document ahead of the project lock (#466).
+    TwoDocument,
 }
+
+/// The env document pnpm 12.8.1 writes ahead of the project lock when
+/// `packageManager` is set (the `@pnpm/exe.*` platform entries trimmed).
+const ENV_DOC: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies: {}\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.8.1\n        version: 12.8.1\n\npackages:\n\n  pnpm@12.8.1:\n    resolution: {integrity: sha512-9kupB1B/XOr+BsjTjmBS0BeURFgOwSed3Vv8EctIqoomRLZlmOB+dh2oSHKp/FfV+QK4f6SdAkGY1VhhKqu+RQ==}\n    engines: {node: '>=18.*'}\n    hasBin: true\n\nsnapshots:\n\n  pnpm@12.8.1: {}\n";
 
 /// package.json, pnpm-workspace.yaml, the installed (unpatched) copy and
 /// the pristine lockfileVersion 9.0 lock pnpm writes for `shape`.
@@ -72,8 +88,9 @@ fn write_pnpm_project(root: &Path, shape: Shape) {
     .unwrap();
     let workspace = match shape {
         Shape::Catalog => format!("packages:\n  - .\ncatalog:\n  {NAME}: {VERSION}\n"),
-        Shape::Override => format!("overrides:\n  {NAME}: {VERSION}\n"),
-        Shape::Crlf | Shape::Plain => String::new(),
+        Shape::Override => format!("overrides:\n  {NAME}: ^{VERSION}\n"),
+        Shape::ExactPin => format!("overrides:\n  {NAME}: {VERSION}\n"),
+        Shape::Crlf | Shape::Plain | Shape::TwoDocument => String::new(),
     };
     if !workspace.is_empty() {
         std::fs::write(root.join("pnpm-workspace.yaml"), workspace).unwrap();
@@ -87,15 +104,20 @@ fn write_pnpm_project(root: &Path, shape: Shape) {
     .unwrap();
     std::fs::write(pkg.join("index.js"), ORIG_INDEX).unwrap();
 
-    let mut lock = String::from(
+    let mut lock = match shape {
+        Shape::TwoDocument => format!("---\n{ENV_DOC}\n---\n"),
+        _ => String::new(),
+    };
+    lock.push_str(
         "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\n",
     );
     match shape {
         Shape::Catalog => lock.push_str(&format!(
             "catalogs:\n  default:\n    {NAME}:\n      specifier: {VERSION}\n      version: {VERSION}\n\n"
         )),
-        Shape::Override => lock.push_str(&format!("overrides:\n  {NAME}: {VERSION}\n\n")),
-        Shape::Crlf | Shape::Plain => {}
+        Shape::Override => lock.push_str(&format!("overrides:\n  {NAME}: ^{VERSION}\n\n")),
+        Shape::ExactPin => lock.push_str(&format!("overrides:\n  {NAME}: {VERSION}\n\n")),
+        Shape::Crlf | Shape::Plain | Shape::TwoDocument => {}
     }
     let specifier = match shape {
         Shape::Catalog => "'catalog:'".to_string(),
@@ -335,6 +357,15 @@ fn assert_refused(env: &Value, exit: i32, code: &str) {
     );
 }
 
+/// The `scan` / `get --mode vendored --dry-run` preview row for `PURL`.
+fn preview_row(envelope: &Value) -> Value {
+    envelope["vendor"]["patches"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["purl"] == PURL))
+        .cloned()
+        .unwrap_or_else(|| panic!("the dry run must preview {PURL}: {envelope:#}"))
+}
+
 async fn refused_takeover_keeps_hosted_pin(shape: Shape, command: &str, code: &str) {
     let server = MockServer::start().await;
     mock_api(&server).await;
@@ -342,9 +373,21 @@ async fn refused_takeover_keeps_hosted_pin(shape: Shape, command: &str, code: &s
     let root = tmp.path();
     let hosted = host_project(root, &server.uri(), shape);
 
-    // The dry run writes nothing.
-    let (_, env) = run_mode(root, &server.uri(), command, "vendored", &["--dry-run"]);
+    // The dry run writes nothing, and previews the wet run's refusal
+    // (status and exit code unchanged) instead of promising the takeover.
+    let (exit, env) = run_mode(root, &server.uri(), command, "vendored", &["--dry-run"]);
     assert_still_hosted(root, &hosted, &env);
+    assert_eq!(
+        exit, 0,
+        "a would_refuse preview does not fail the run: {env:#}"
+    );
+    let row = preview_row(&env);
+    assert_eq!(row["action"], "would_refuse", "{env:#}");
+    assert_eq!(row["errorCode"], code, "{env:#}");
+    assert!(
+        row["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the preview carries the backend's detail: {env:#}"
+    );
 
     let (exit, env) = run_mode(root, &server.uri(), command, "vendored", &[]);
     assert_refused(&env, exit, code);
@@ -373,10 +416,87 @@ async fn scan_vendored_over_hosted_pnpm_crlf_lock_keeps_the_hosted_pin() {
         .await;
 }
 
-/// #853: a user exact-pin override in `pnpm-workspace.yaml`.
+/// #853: `get --mode vendored` over a CRLF lock (a project-level refusal).
+#[tokio::test(flavor = "multi_thread")]
+async fn get_vendored_over_hosted_pnpm_crlf_lock_keeps_the_hosted_pin() {
+    refused_takeover_keeps_hosted_pin(Shape::Crlf, "get", "vendor_lockfile_crlf_unsupported").await;
+}
+
+/// #853: a conflicting user override (a range) in `pnpm-workspace.yaml`.
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_vendored_over_hosted_pnpm_workspace_override_keeps_the_hosted_pin() {
     refused_takeover_keeps_hosted_pin(Shape::Override, "scan", "vendor_override_conflict").await;
+}
+
+/// #556: a hosted pin in `pnpm-lock.yaml` after the project turned
+/// `gitBranchLockfile` on and pnpm wrote a branch lock. The vendored
+/// backend refuses that project (it wires `pnpm-lock.yaml` only), so the
+/// takeover must refuse before the restore rather than strip the pin.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_vendored_over_hosted_pnpm_git_branch_lockfile_keeps_the_hosted_pin() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    host_project(root, &server.uri(), Shape::Plain);
+    let ws = root.join("pnpm-workspace.yaml");
+    let mut workspace = std::fs::read_to_string(&ws).unwrap_or_default();
+    workspace.push_str("gitBranchLockfile: true\n");
+    std::fs::write(&ws, workspace).unwrap();
+    let lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
+    std::fs::write(root.join("pnpm-lock.feature.yaml"), lock).unwrap();
+    let hosted = snapshot(root);
+
+    let (_, env) = run_mode(root, &server.uri(), "scan", "vendored", &["--dry-run"]);
+    assert_still_hosted(root, &hosted, &env);
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_refused(&env, exit, "vendor_pnpm_git_branch_lockfile");
+    assert_still_hosted(root, &hosted, &env);
+}
+
+/// #556, the other direction: `scan --mode hosted` over a vendored pnpm
+/// entry once `gitBranchLockfile` is on with a branch lock. Hosted mode
+/// pins no pnpm lock there, so reverting the vendored wiring first would
+/// leave the package in neither mode: the takeover is refused and the
+/// vendored wiring and ledger stay byte-for-byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_hosted_over_vendored_pnpm_git_branch_lockfile_keeps_the_vendored_wiring() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_pnpm_project(root, Shape::Plain);
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_eq!(exit, 0, "the plain project vendors: {env:#}");
+    let ws = root.join("pnpm-workspace.yaml");
+    let mut workspace = std::fs::read_to_string(&ws).unwrap_or_default();
+    workspace.push_str("gitBranchLockfile: true\n");
+    std::fs::write(&ws, workspace).unwrap();
+    let lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
+    std::fs::write(root.join("pnpm-lock.feature.yaml"), lock).unwrap();
+    let vendored = snapshot(root);
+    let state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+
+    for extra in [&["--dry-run"][..], &[]] {
+        let (exit, env) = run_mode(root, &server.uri(), "scan", "hosted", extra);
+        assert_eq!(exit, 0, "{env:#}");
+        assert!(
+            has_event_code(&env, "redirect_pnpm_git_branch_lockfile"),
+            "{env:#}"
+        );
+        assert!(
+            !has_event_code(&env, "redirect_takeover_unpatched"),
+            "{env:#}"
+        );
+        for ((file, before), (_, now)) in vendored.iter().zip(snapshot(root)) {
+            assert_eq!(before, &now, "{file} keeps the vendored wiring: {env:#}");
+        }
+        assert_eq!(
+            std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+            state,
+            "{env:#}"
+        );
+    }
 }
 
 /// Control: a plain dependency is supported by both modes, so the takeover
@@ -389,8 +509,11 @@ async fn scan_vendored_over_hosted_pnpm_plain_dep_still_takes_over() {
     let root = tmp.path();
     host_project(root, &server.uri(), Shape::Plain);
 
+    // The hosted project (pin + hosted-created workspace scaffold) is not
+    // over-refused by the preview's takeover gates.
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &["--dry-run"]);
     assert_eq!(exit, 0, "{env:#}");
+    assert_eq!(preview_row(&env)["action"], "would_vendor", "{env:#}");
 
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
     assert_eq!(exit, 0, "the plain takeover must succeed: {env:#}");
@@ -404,6 +527,95 @@ async fn scan_vendored_over_hosted_pnpm_plain_dep_still_takes_over() {
         lock.contains(&format!(".socket/vendor/npm/{UUID}/")),
         "the lock must point at the vendored artifact:\n{lock}"
     );
+}
+
+/// #854: a user exact pin equal to the vendored version in
+/// `pnpm-workspace.yaml` (the pnpm 10.5+/11/12 override map) is taken over
+/// like the same pin in package.json: the workspace value becomes the
+/// vendored `file:` spec under the user's own key, and package.json is
+/// left alone. It used to be refused as `vendor_override_conflict`.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_vendored_over_hosted_pnpm_workspace_exact_pin_takes_over() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let hosted = host_project(root, &server.uri(), Shape::ExactPin);
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &["--dry-run"]);
+    assert_eq!(exit, 0, "{env:#}");
+    assert_still_hosted(root, &hosted, &env);
+    assert_eq!(preview_row(&env)["action"], "would_vendor", "{env:#}");
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_eq!(exit, 0, "the exact-pin takeover must succeed: {env:#}");
+    let spec = format!("file:.socket/vendor/npm/{UUID}/{NAME}-{VERSION}.tgz");
+    let ws = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap();
+    // Hosted mode's `trustLockfile: true` line may follow; the override
+    // entry itself is rewritten in place under the user's key.
+    assert!(
+        ws.starts_with(&format!("overrides:\n  {NAME}: {spec}\n")),
+        "{ws}\n{env:#}"
+    );
+    let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+    assert!(!lock.contains(HOSTED_URL), "{lock}");
+    assert!(
+        lock.contains(&format!("overrides:\n  {NAME}: {spec}\n")),
+        "the lock override map must equal the workspace file's:\n{lock}"
+    );
+    let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
+    assert!(!pkg.contains("overrides"), "{pkg}");
+}
+
+/// #466: pnpm 12's two-document lock (`packageManager` set). Hosted →
+/// vendored takes over in the project document, and the default hosted
+/// `scan` takes the vendored project back: the vendored revert used to
+/// read pnpm's env document, find every lock record "drifted", and unwind
+/// the override surfaces around a lock left wired to the artifact — so the
+/// takeover reported `redirected: 0`, dropped the vendor ledger, and left a
+/// lock frozen installs reject. The env document is never edited.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_document_lock_takes_over_both_ways() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    host_project(root, &server.uri(), Shape::TwoDocument);
+    let lock_path = root.join("pnpm-lock.yaml");
+    let env_doc = |lock: &str| -> String {
+        let (env, _) = lock
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .unwrap_or_else(|| panic!("two documents expected:\n{lock}"));
+        env.to_string()
+    };
+    let read_lock = || std::fs::read_to_string(&lock_path).unwrap();
+    assert_eq!(env_doc(&read_lock()), ENV_DOC);
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_eq!(exit, 0, "the two-document takeover must succeed: {env:#}");
+    let lock = read_lock();
+    assert_eq!(env_doc(&lock), ENV_DOC, "{lock}");
+    assert!(!lock.contains(HOSTED_URL), "{lock}");
+    assert!(
+        lock.contains(&format!("{NAME}@file:.socket/vendor/npm/{UUID}/")),
+        "the project document is wired:\n{lock}\n{env:#}"
+    );
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "hosted", &[]);
+    assert_eq!(exit, 0, "{env:#}");
+    assert!(
+        has_event_code(&env, "redirect_takeover_reverted_vendored"),
+        "{env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let lock = read_lock();
+    assert_eq!(env_doc(&lock), ENV_DOC, "{lock}");
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    assert!(!lock.contains(".socket/vendor"), "{lock}");
+    let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
+    assert!(!pkg.contains(".socket/vendor"), "{pkg}");
+    assert!(!root.join(".socket/vendor/npm").exists(), "{env:#}");
 }
 
 /// `vendor --dry-run` over the hosted pin previews the backend's refusal of
