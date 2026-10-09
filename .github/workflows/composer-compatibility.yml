@@ -130,7 +130,7 @@ jobs:
           - {os: windows-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
           - {os: windows-latest, composer: '2.9.8', php: '8.4', sha256: 59b2c50e10cafa0d8efc19ede9a326d782f096c674a26baf98cf042ce23de890}
           - {os: windows-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     steps: &native-steps
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -216,7 +216,7 @@ jobs:
           # all (#1210); 2.40.0 resolves the tap's formula aliases first.
           # Ubuntu and Windows keep the 2.10.3 / 8.5 cell.
           - {os: macos-latest, composer: '2.10.3', php: '8.4', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     steps: *native-steps
 
@@ -226,7 +226,7 @@ jobs:
     # Composer 1, so 1.10.28 is covered by the native legs only.
     name: docker composer ${{ matrix.composer }}
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 35
     strategy:
       fail-fast: false
