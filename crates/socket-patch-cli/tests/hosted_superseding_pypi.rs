@@ -187,10 +187,7 @@ async fn assert_superseded(root: &Path, files: &[&str]) {
     let url_a = offer(&server, UUID_A, GRANT_A, 1).await;
     let (code, env) = hosted_scan(root, &server);
     assert_eq!(code, 0, "first hosted scan: {env:#}");
-    assert_eq!(
-        env["redirect"]["redirected"], 1,
-        "first hosted scan: {env:#}"
-    );
+    assert_eq!(env["summary"]["applied"], 1, "first hosted scan: {env:#}");
     for f in files {
         let text = std::fs::read_to_string(root.join(f)).unwrap();
         assert!(text.contains(&url_a), "{f} wired to uuid A:\n{text}");
@@ -217,7 +214,7 @@ async fn assert_superseded(root: &Path, files: &[&str]) {
             "{code} refused the upgrade: {env:#}"
         );
     }
-    assert_eq!(env["redirect"]["redirected"], 1, "re-pinned: {env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "re-pinned: {env:#}");
     for f in files {
         let text = std::fs::read_to_string(root.join(f)).unwrap();
         assert!(text.contains(&url_b), "{f} re-pinned to uuid B:\n{text}");

@@ -20,8 +20,8 @@
 //!
 //! Every refusal test pins the whole observable contract: exit code; the
 //! exact envelope shape (uuid path: `status:"error"` with `error{code,
-//! message}` and a `failed` record carrying `errorCode` AND `error`; scan
-//! and purl paths: `partial_failure` with the same record); ZERO
+//! message}` and a `failed` event carrying `errorCode` AND `error`; scan
+//! and purl paths: `partialFailure` with the same event); ZERO
 //! `/patches/view/` fetches for the refused patch (request-log oracle); a
 //! byte-identical `bun.lock`; no `.socket/vendor/`; and — where a legacy
 //! manifest existed — that manifest surviving byte-for-byte (vendored mode
@@ -435,12 +435,30 @@ fn manifest_value(root: &Path) -> Option<serde_json::Value> {
     Some(serde_json::from_str(&body).unwrap_or_else(|e| panic!("manifest not JSON: {e}\n{body}")))
 }
 
-/// The refused `failed` record every entry point must emit for [`PURL`].
+/// The envelope's events with `action` (any leg).
+fn events_with<'a>(v: &'a serde_json::Value, action: &str) -> Vec<&'a serde_json::Value> {
+    v["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events array: {v}"))
+        .iter()
+        .filter(|e| e["action"] == action)
+        .collect()
+}
+
+/// The ONE `failed` event of a refused run (the download-phase refusal).
+fn refused_event(v: &serde_json::Value) -> &serde_json::Value {
+    let failed = events_with(v, "failed");
+    assert_eq!(failed.len(), 1, "exactly one failed event: {v}");
+    failed[0]
+}
+
+/// The refused `failed` event every entry point must emit for [`PURL`].
 fn assert_refused_record(record: &serde_json::Value, code: &str, ctx: &serde_json::Value) {
     assert_eq!(record["purl"], PURL, "{ctx}");
     assert_eq!(record["uuid"], UUID, "{ctx}");
     assert_eq!(record["action"], "failed", "{ctx}");
     assert_eq!(record["errorCode"], code, "{ctx}");
+    assert_eq!(record["details"]["mode"], "vendored", "{ctx}");
     assert!(
         record["error"].as_str().is_some_and(|d| !d.is_empty()),
         "a refused record must carry the engine's detail text: {ctx}"
@@ -474,7 +492,7 @@ fn assert_refusal_left_tree_alone(root: &Path, lock_before: &[u8]) {
 // ---------------------------------------------------------------------------
 
 /// Drive `scan --mode vendored --json` on `shape` and pin the refusal
-/// contract for `code`: exit 1, `partial_failure`, the download-phase
+/// contract for `code`: exit 1, `partialFailure`, the download-phase
 /// record, zero downloads, zero view fetches, engine untouched.
 async fn assert_scan_refuses(shape: LockShape, code: &str) {
     let mock = MockServer::start().await;
@@ -490,17 +508,12 @@ async fn assert_scan_refuses(shape: LockShape, code: &str) {
     let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(exit, 1, "{shape:?}: stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_eq!(v["status"], "partial_failure", "{shape:?}: {v}");
-    let dl = &v["download"];
-    assert_eq!(dl["found"], 1, "{v}");
-    assert_eq!(dl["downloaded"], 0, "{v}");
-    assert_eq!(dl["skipped"], 0, "{v}");
-    assert_eq!(dl["failed"], 1, "{v}");
-    assert_refused_record(&dl["patches"][0], code, &v);
-    assert_eq!(
-        v["vendor"]["summary"]["applied"], 0,
-        "nothing may be vendored: {v}"
-    );
+    assert_eq!(v["status"], "partialFailure", "{shape:?}: {v}");
+    assert_eq!(v["summary"]["downloaded"], 0, "{v}");
+    assert_eq!(v["summary"]["skipped"], 0, "{v}");
+    assert_eq!(v["summary"]["failed"], 1, "{v}");
+    assert_refused_record(refused_event(&v), code, &v);
+    assert_eq!(v["summary"]["applied"], 0, "nothing may be vendored: {v}");
     assert_eq!(
         view_requests_for(&mock, UUID).await,
         0,
@@ -551,7 +564,7 @@ async fn scan_vendored_refusal_preserves_seeded_manifest_record() {
     let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_refused_record(&v["download"]["patches"][0], WS_CODE, &v);
+    assert_refused_record(refused_event(&v), WS_CODE, &v);
     assert_eq!(view_requests_for(&mock, UUID).await, 0);
     assert_eq!(
         view_requests_for(&mock, OTHER_UUID).await,
@@ -584,15 +597,13 @@ async fn scan_vendored_refuses_v1_workspace_before_fetch() {
     let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_eq!(v["status"], "partial_failure", "{v}");
-    let dl = &v["download"];
-    assert_eq!(dl["detached"], true, "{v}");
+    assert_eq!(v["status"], "partialFailure", "{v}");
     assert_eq!(
-        dl["downloaded"], 0,
+        v["summary"]["downloaded"], 0,
         "detached must refuse BEFORE fetching: {v}"
     );
-    assert_eq!(dl["failed"], 1, "{v}");
-    assert_refused_record(&dl["patches"][0], WS_CODE, &v);
+    assert_eq!(v["summary"]["failed"], 1, "{v}");
+    assert_refused_record(refused_event(&v), WS_CODE, &v);
     assert_eq!(view_requests_for(&mock, UUID).await, 0);
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
@@ -613,12 +624,12 @@ async fn scan_vendored_refuses_bun_lockb_before_fetch() {
     let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_eq!(v["download"]["downloaded"], 0, "{v}");
-    assert_refused_record(&v["download"]["patches"][0], LOCKB_CODE, &v);
+    assert_eq!(v["summary"]["downloaded"], 0, "{v}");
+    assert_refused_record(refused_event(&v), LOCKB_CODE, &v);
     assert!(
-        !v["vendor"]["events"]
+        !v["events"]
             .as_array()
-            .unwrap_or(&vec![])
+            .unwrap()
             .iter()
             .any(|e| e["errorCode"] == "package_not_installed"),
         "the refusal must not degrade to package_not_installed: {v}"
@@ -634,7 +645,7 @@ async fn scan_vendored_refuses_bun_lockb_before_fetch() {
 
 /// `get <uuid> --mode vendored --json` on a refused Bun project exits 1
 /// with EXACTLY this envelope (contract: uuid-path pre-record refusal):
-/// `status:"error"`, `error{code,message}`, counts, and a `failed` record
+/// `status:"error"`, `error{code,message}`, and one `failed` event
 /// carrying both `errorCode` and `error`. The uuid lookup itself is the
 /// only network traffic (one view fetch — that IS the identifier
 /// resolution), and NOTHING is written: no `.socket/` at all.
@@ -655,19 +666,23 @@ async fn get_uuid_vendored_refusal_envelope_is_exact_and_writes_nothing() {
         .to_string();
     assert!(!detail.is_empty(), "{v}");
     let expected = serde_json::json!({
+        "command": "get",
         "status": "error",
-        "found": 1,
-        "downloaded": 0,
-        "skipped": 0,
-        "failed": 1,
-        "error": { "code": WS_CODE, "message": detail },
-        "patches": [{
+        "dryRun": false,
+        "events": [{
+            "action": "failed",
             "purl": PURL,
             "uuid": UUID,
-            "action": "failed",
             "errorCode": WS_CODE,
             "error": detail,
+            "details": { "mode": "vendored" },
         }],
+        "summary": {
+            "discovered": 0, "downloaded": 0, "applied": 0, "updated": 0,
+            "skipped": 0, "failed": 1, "removed": 0, "verified": 0,
+            "rebuilt": 0, "rolledBack": 0, "bytesFreed": 0,
+        },
+        "error": { "code": WS_CODE, "message": detail },
     });
     assert_eq!(
         v,
@@ -714,10 +729,9 @@ async fn get_uuid_vendored_refusal_human_names_code_on_stderr() {
 // get <purl> --mode vendored: the search-path refusal
 // ---------------------------------------------------------------------------
 
-/// The search path shares `scan`'s download phase: `partial_failure`, the
-/// same `failed` record (with `errorCode` + `error`), zero fetches, an
-/// empty vendor envelope, `applied` dropped — and, vendored mode being
-/// manifest-free, no manifest.
+/// The search path shares `scan`'s download phase: `partialFailure`, the
+/// same `failed` event (with `errorCode` + `error`), zero fetches, nothing
+/// applied — and, vendored mode being manifest-free, no manifest.
 #[tokio::test]
 async fn get_purl_vendored_refuses_v1_workspace_before_fetch() {
     let mock = MockServer::start().await;
@@ -729,17 +743,13 @@ async fn get_purl_vendored_refuses_v1_workspace_before_fetch() {
     let (exit, stdout, stderr) = get_vendored(tmp.path(), &mock.uri(), PURL, &["--json"]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_eq!(v["status"], "partial_failure", "{v}");
-    assert_eq!(v["found"], 1, "{v}");
-    assert_eq!(v["downloaded"], 0, "{v}");
-    assert_eq!(v["skipped"], 0, "{v}");
-    assert_eq!(v["failed"], 1, "{v}");
-    assert!(
-        v.get("applied").is_none(),
-        "vendored mode drops `applied`: {v}"
-    );
-    assert_refused_record(&v["patches"][0], WS_CODE, &v);
-    assert_eq!(v["vendor"]["summary"]["applied"], 0, "{v}");
+    assert_eq!(v["command"], "get", "{v}");
+    assert_eq!(v["status"], "partialFailure", "{v}");
+    assert_eq!(v["summary"]["downloaded"], 0, "{v}");
+    assert_eq!(v["summary"]["skipped"], 0, "{v}");
+    assert_eq!(v["summary"]["failed"], 1, "{v}");
+    assert_refused_record(refused_event(&v), WS_CODE, &v);
+    assert_eq!(v["summary"]["applied"], 0, "{v}");
     assert_eq!(view_requests_for(&mock, UUID).await, 0);
     assert_refusal_left_tree_alone(tmp.path(), &lock_before);
     assert_eq!(
@@ -797,14 +807,14 @@ async fn silent_refusals_stay_visible_on_stderr_with_empty_stdout() {
 }
 
 // ---------------------------------------------------------------------------
-// --dry-run: the preview names the refusal (additive `would_refuse`)
+// --dry-run: the preview names the refusal (a `skipped` event + code)
 // ---------------------------------------------------------------------------
 
 /// The vendored dry-run preview is a ledger classification by contract
 /// (exit 0, `status:"success"`, nothing written); on a Bun project the
-/// wet run is known to refuse, its npm records become the additive
-/// `would_refuse` (+`errorCode`/`error`) instead of advertising
-/// `would_vendor`. All three entry points; nothing touched on disk.
+/// wet run is known to refuse, its npm patch is a `skipped` event with the
+/// refusal code (+ the detail as `reason`) instead of a `verified`
+/// would-vendor. All three entry points; nothing touched on disk.
 #[tokio::test]
 async fn dry_run_previews_report_would_refuse_on_refused_bun_project() {
     let mock = MockServer::start().await;
@@ -834,17 +844,22 @@ async fn dry_run_previews_report_would_refuse_on_refused_bun_project() {
         );
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "success", "{label}: {v}");
-        let preview = &v["vendor"];
-        assert_eq!(preview["dryRun"], true, "{label}: {v}");
-        let rec = &preview["patches"][0];
-        assert_eq!(rec["purl"], PURL, "{label}: {v}");
+        assert_eq!(v["dryRun"], true, "{label}: {v}");
+        let rec = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["purl"] == PURL)
+            .unwrap_or_else(|| panic!("{label}: no preview event: {v}"));
         assert_eq!(rec["uuid"], UUID, "{label}: {v}");
-        assert_eq!(rec["action"], "would_refuse", "{label}: {v}");
+        assert_eq!(rec["action"], "skipped", "{label}: {v}");
         assert_eq!(rec["errorCode"], WS_CODE, "{label}: {v}");
+        assert_eq!(rec["details"]["mode"], "vendored", "{label}: {v}");
         assert!(
-            rec["error"].as_str().is_some_and(|d| !d.is_empty()),
+            rec["reason"].as_str().is_some_and(|d| !d.is_empty()),
             "{label}: {v}"
         );
+        assert_eq!(v["summary"]["verified"], 0, "{label}: {v}");
         assert!(
             !tmp.path().join(".socket").exists(),
             "{label}: a dry run writes nothing"
@@ -902,8 +917,9 @@ async fn get_save_only_agent_bypasses_bun_preflight() {
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "{v}");
-    assert_eq!(v["patches"][0]["action"], "added", "{v}");
-    assert!(v["patches"][0].get("errorCode").is_none(), "{v}");
+    let dl = events_with(&v, "downloaded");
+    assert_eq!(dl.len(), 1, "{v}");
+    assert!(dl[0].get("errorCode").is_none(), "{v}");
     assert_eq!(view_requests_for(&mock, UUID).await, 1);
     let manifest = manifest_value(tmp.path()).expect("manifest written");
     assert_eq!(manifest["patches"][PURL]["uuid"], UUID, "{manifest}");
@@ -937,10 +953,10 @@ async fn scan_vendored_v2_workspace_lock_vendors() {
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "{v}");
-    assert_eq!(v["download"]["downloaded"], 1, "{v}");
-    assert_eq!(v["download"]["detached"], true, "{v}");
-    assert_eq!(v["download"]["patches"][0]["action"], "downloaded", "{v}");
-    assert_eq!(v["vendor"]["summary"]["applied"], 1, "{v}");
+    assert_eq!(v["summary"]["downloaded"], 1, "{v}");
+    let dl = events_with(&v, "downloaded");
+    assert_eq!(dl[0]["details"]["mode"], "vendored", "{v}");
+    assert_eq!(v["summary"]["applied"], 1, "{v}");
     assert_eq!(
         manifest_value(tmp.path()),
         None,
@@ -990,8 +1006,8 @@ async fn get_uuid_vendored_v0_direct_lock_vendors_and_rollback_restores_bytes() 
     assert_eq!(v["status"], "success", "{v}");
     // Vendored mode is manifest-free for `get` too: the record is fetched
     // in memory (`downloaded`), never recorded in a manifest.
-    assert_eq!(v["patches"][0]["action"], "downloaded", "{v}");
-    assert_eq!(v["vendor"]["summary"]["applied"], 1, "{v}");
+    assert_eq!(events_with(&v, "downloaded").len(), 1, "{v}");
+    assert_eq!(v["summary"]["applied"], 1, "{v}");
     assert_eq!(manifest_value(tmp.path()), None, "{v}");
     let tgz_rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
     let lock = String::from_utf8(lock_bytes(tmp.path())).unwrap();
@@ -1074,21 +1090,16 @@ async fn preserved_ledger_does_not_bypass_bun_refusal_after_rollback() {
     let (exit, stdout, stderr) = scan_vendored(root, &mock.uri(), &["--json", "--dry-run"]);
     assert_eq!(exit, 0, "{stdout}\n{stderr}");
     let preview = parse_single_json_doc(&stdout);
-    assert_eq!(
-        preview["vendor"]["patches"][0]["action"], "would_refuse",
-        "{preview}"
-    );
-    assert_eq!(
-        preview["vendor"]["patches"][0]["errorCode"], WS_CODE,
-        "{preview}"
-    );
+    let rec = &preview["events"][0];
+    assert_eq!(rec["action"], "skipped", "{preview}");
+    assert_eq!(rec["errorCode"], WS_CODE, "{preview}");
 
     let views_before = view_requests_for(&mock, UUID).await;
     let (exit, stdout, stderr) = get_vendored(root, &mock.uri(), UUID, &["--json"]);
     assert_eq!(exit, 1, "{stdout}\n{stderr}");
     let env = parse_single_json_doc(&stdout);
     assert_eq!(env["status"], "error", "{env}");
-    assert_eq!(env["downloaded"], 0, "{env}");
+    assert_eq!(env["summary"]["downloaded"], 0, "{env}");
     assert_eq!(env["error"]["code"], WS_CODE, "{env}");
     assert_eq!(
         view_requests_for(&mock, UUID).await,
@@ -1105,21 +1116,21 @@ async fn preserved_ledger_does_not_bypass_bun_refusal_after_rollback() {
 
     // The WET scan/search path: the preserved ledger still names this exact
     // uuid (detached, record embedded — the idempotency skip's shape), but
-    // the refusal must win over the skip: `download.patches[0]` is `failed`
+    // the refusal must win over the skip: the one event is `failed`
     // with the workspace code, nothing is fetched, nothing changes on disk.
     // (Contract: "UUID equality in the ledger alone never exempts a purl".)
     let views_before = view_requests_for(&mock, UUID).await;
     let (exit, stdout, stderr) = scan_vendored(root, &mock.uri(), &["--json"]);
     assert_eq!(exit, 1, "{stdout}\n{stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_eq!(v["status"], "partial_failure", "{v}");
-    assert_eq!(v["download"]["downloaded"], 0, "{v}");
+    assert_eq!(v["status"], "partialFailure", "{v}");
+    assert_eq!(v["summary"]["downloaded"], 0, "{v}");
     assert_eq!(
-        v["download"]["skipped"], 0,
+        v["summary"]["skipped"], 0,
         "a preserved uuid is not a skip: {v}"
     );
-    assert_eq!(v["download"]["failed"], 1, "{v}");
-    assert_refused_record(&v["download"]["patches"][0], WS_CODE, &v);
+    assert_eq!(v["summary"]["failed"], 1, "{v}");
+    assert_refused_record(refused_event(&v), WS_CODE, &v);
     assert_eq!(
         view_requests_for(&mock, UUID).await,
         views_before,
@@ -1143,9 +1154,9 @@ async fn preserved_ledger_does_not_bypass_bun_refusal_after_rollback() {
 }
 
 /// The download phase must NOT refuse a purl the ledger already wires at
-/// the selected uuid: the re-run classifies it `skipped` (the ledger's
-/// embedded record is reused) exactly as on a non-Bun project, instead of
-/// `failed`. Pinned independently of the vendor step (see the next test) so
+/// the selected uuid: the re-run reuses the ledger's embedded record (no
+/// download event, no fetch) exactly as on a non-Bun project, instead of
+/// a `failed` event. Pinned independently of the vendor step (see the next test) so
 /// a regression in the CLI half fails on its own.
 #[tokio::test]
 async fn already_vendored_v1_workspace_rerun_download_phase_is_skipped_not_refused() {
@@ -1156,13 +1167,11 @@ async fn already_vendored_v1_workspace_rerun_download_phase_is_skipped_not_refus
 
     let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     let v = parse_single_json_doc(&stdout);
-    let rec = &v["download"]["patches"][0];
-    assert_eq!(
-        rec["action"], "skipped",
+    assert!(
+        events_with(&v, "failed").is_empty() && events_with(&v, "downloaded").is_empty(),
         "an in-sync vendored purl must not be refused by the preflight (exit {exit}): {v}\n{stderr}"
     );
-    assert!(rec.get("errorCode").is_none(), "{v}");
-    assert_eq!(v["download"]["failed"], 0, "{v}");
+    assert_eq!(v["summary"]["failed"], 0, "{v}");
     assert_eq!(
         lock_bytes(tmp.path()),
         lock_before,
@@ -1186,8 +1195,11 @@ async fn already_vendored_v1_workspace_rerun_is_already_vendored_exit_zero() {
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "{v}");
-    assert_eq!(v["download"]["patches"][0]["action"], "skipped", "{v}");
-    let events = v["vendor"]["events"].as_array().unwrap();
+    assert!(
+        events_with(&v, "downloaded").is_empty(),
+        "reused, not fetched: {v}"
+    );
+    let events = v["events"].as_array().unwrap();
     assert!(
         events.iter().any(|e| e["purl"] == PURL
             && e["action"] == "skipped"
@@ -1221,18 +1233,19 @@ async fn superseding_uuid_on_already_vendored_v1_workspace_is_revendored_not_ref
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "{v}");
-    assert_eq!(v["patches"][0]["action"], "downloaded", "{v}");
+    let dl = events_with(&v, "downloaded");
+    assert_eq!(dl.len(), 1, "{v}");
     assert_eq!(
-        v["patches"][0]["oldUuid"], UUID,
-        "the superseded ledger uuid must ride the downloaded record: {v}"
+        dl[0]["details"]["oldUuid"], UUID,
+        "the superseded ledger uuid must ride the downloaded event: {v}"
     );
-    assert!(v["patches"][0].get("errorCode").is_none(), "{v}");
+    assert!(dl[0].get("errorCode").is_none(), "{v}");
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "vendored mode never writes a manifest"
     );
-    assert_eq!(v["vendor"]["summary"]["applied"], 1, "{v}");
-    assert_eq!(v["vendor"]["summary"]["failed"], 0, "{v}");
+    assert_eq!(v["summary"]["applied"], 1, "{v}");
+    assert_eq!(v["summary"]["failed"], 0, "{v}");
     assert!(
         !stdout.contains(WS_CODE),
         "no arm may raise the workspace refusal for an already-vendored purl: {v}"
@@ -1289,13 +1302,19 @@ async fn wiped_ledger_on_already_vendored_v1_workspace_is_not_refused_at_preflig
 
     let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     let v = parse_single_json_doc(&stdout);
-    let rec = &v["download"]["patches"][0];
+    let dl = events_with(&v, "downloaded");
     assert_eq!(
-        rec["action"], "downloaded",
+        dl.len(),
+        1,
         "an in-sync purl must not be refused for a lost ledger (exit {exit}): {v}\n{stderr}"
     );
-    assert!(rec.get("errorCode").is_none(), "{v}");
-    assert_eq!(v["download"]["failed"], 0, "{v}");
+    assert!(dl[0].get("errorCode").is_none(), "{v}");
+    assert!(
+        !events_with(&v, "failed")
+            .iter()
+            .any(|e| e["errorCode"] == WS_CODE),
+        "{v}"
+    );
     assert!(
         !stdout.contains(WS_CODE),
         "no arm may raise the workspace refusal: {v}"
@@ -1342,7 +1361,7 @@ async fn corrupt_vendor_ledger_on_refused_bun_lock_reports_vendor_state_unreadab
             .is_some_and(|m| m.contains("state.json")),
         "the detail names the ledger file: {v}"
     );
-    assert_eq!(v["patches"][0]["errorCode"], LEDGER_CODE, "{v}");
+    assert_eq!(refused_event(&v)["errorCode"], LEDGER_CODE, "{v}");
     assert!(
         !stdout.contains(WS_CODE),
         "the Bun lock remedy must not shadow the ledger corruption: {v}"
@@ -1357,23 +1376,22 @@ async fn corrupt_vendor_ledger_on_refused_bun_lock_reports_vendor_state_unreadab
         "stderr must carry the ledger code:\n{stderr}"
     );
 
-    // Dry-run preview: `would_refuse` with the ledger code.
+    // Dry-run preview: a `skipped` event with the ledger code.
     let (exit, stdout, stderr) =
         get_vendored(tmp.path(), &mock.uri(), UUID, &["--dry-run", "--json"]);
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    let rec = &v["vendor"]["patches"][0];
-    assert_eq!(rec["action"], "would_refuse", "{v}");
+    let rec = &v["events"][0];
+    assert_eq!(rec["action"], "skipped", "{v}");
     assert_eq!(rec["errorCode"], LEDGER_CODE, "{v}");
 
     // Detached download phase: the same code before any fetch.
     let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    let rec = &v["download"]["patches"][0];
-    assert_eq!(rec["action"], "failed", "{v}");
+    let rec = refused_event(&v);
     assert_eq!(rec["errorCode"], LEDGER_CODE, "{v}");
-    assert_eq!(v["download"]["downloaded"], 0, "{v}");
+    assert_eq!(v["summary"]["downloaded"], 0, "{v}");
 
     assert_eq!(
         lock_bytes(tmp.path()),
@@ -1453,16 +1471,14 @@ async fn digestless_vendored_tuple_rerun_is_already_vendored_and_heals_the_diges
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "{v}");
-    assert_eq!(
-        v["download"]["patches"][0]["action"], "skipped",
-        "the ledger still wires the purl: {v}"
+    assert!(
+        events_with(&v, "downloaded").is_empty(),
+        "the ledger still wires the purl (reused, not fetched): {v}"
     );
-    assert_eq!(v["download"]["failed"], 0, "{v}");
-    let vendor = &v["vendor"];
-    assert_eq!(vendor["summary"]["applied"], 0, "{v}");
-    assert_eq!(vendor["summary"]["skipped"], 1, "{v}");
-    assert_eq!(vendor["summary"]["failed"], 0, "{v}");
-    let events = vendor["events"].as_array().unwrap();
+    assert_eq!(v["summary"]["applied"], 0, "{v}");
+    assert_eq!(v["summary"]["skipped"], 1, "{v}");
+    assert_eq!(v["summary"]["failed"], 0, "{v}");
+    let events = v["events"].as_array().unwrap();
     assert!(
         events.iter().any(|e| e["purl"] == PURL
             && e["action"] == "skipped"
@@ -1569,10 +1585,10 @@ async fn scan_vendored_from_workspace_member_cwd_fetches_then_engine_refuses_loc
         scan_vendored(tmp.path(), &mock.uri(), &["--json", "--cwd", &member_str]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_eq!(v["status"], "partial_failure", "{v}");
-    assert_eq!(v["download"]["downloaded"], 1, "{v}");
-    assert_eq!(v["download"]["patches"][0]["action"], "downloaded", "{v}");
-    let events = v["vendor"]["events"].as_array().unwrap();
+    assert_eq!(v["status"], "partialFailure", "{v}");
+    assert_eq!(v["summary"]["downloaded"], 1, "{v}");
+    assert_eq!(events_with(&v, "downloaded").len(), 1, "{v}");
+    let events = v["events"].as_array().unwrap();
     assert!(
         events
             .iter()
@@ -1683,7 +1699,7 @@ async fn fifo_bun_lock_is_refused_without_blocking() {
     let (exit, stdout, stderr) = run_with_deadline(tmp.path(), &argv, Duration::from_secs(20));
     assert_eq!(exit, 1, "scan: stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_refused_record(&v["download"]["patches"][0], MISSING_CODE, &v);
+    assert_refused_record(refused_event(&v), MISSING_CODE, &v);
     assert_eq!(view_requests_for(&mock, UUID).await, 0);
 
     // get <uuid>: the FIFO is the only Bun artefact the preflight reads.

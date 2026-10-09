@@ -1315,7 +1315,7 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
             );
             let env = envelope(&out, &report.what("scan --mode hosted"));
             assert!(
-                env["redirect"]["redirected"].as_u64().unwrap_or(0) >= 1,
+                env["summary"]["applied"].as_u64().unwrap_or(0) >= 1,
                 "{}: nothing redirected: {env:#}",
                 report.what("scan --mode hosted")
             );

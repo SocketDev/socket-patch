@@ -277,14 +277,10 @@ fn run_mode(cwd: &Path, api: &str, command: &str, mode: &str, extra: &[&str]) ->
     run_json(cwd, api, &args)
 }
 
-/// The vendor events: top-level for `vendor`, under `vendor` for the
-/// `scan`/`get` envelopes that embed the vendor step.
+/// The vendor events: `vendor`'s, and (v5.0) the `scan`/`get` envelopes'
+/// own, which the vendor step's events join.
 fn events(envelope: &Value) -> Vec<Value> {
-    envelope["events"]
-        .as_array()
-        .or_else(|| envelope["vendor"]["events"].as_array())
-        .cloned()
-        .unwrap_or_default()
+    envelope["events"].as_array().cloned().unwrap_or_default()
 }
 
 fn has_event_code(envelope: &Value, code: &str) -> bool {
@@ -357,12 +353,12 @@ fn assert_refused(env: &Value, exit: i32, code: &str) {
     );
 }
 
-/// The `scan` / `get --mode vendored --dry-run` preview row for `PURL`.
+/// The `scan` / `get --mode vendored --dry-run` preview event for `PURL`
+/// (v5.0: `verified` to vendor, `skipped` + the refusal code to refuse).
 fn preview_row(envelope: &Value) -> Value {
-    envelope["vendor"]["patches"]
-        .as_array()
-        .and_then(|rows| rows.iter().find(|r| r["purl"] == PURL))
-        .cloned()
+    events(envelope)
+        .into_iter()
+        .find(|r| r["purl"] == PURL && r["details"]["mode"] == "vendored")
         .unwrap_or_else(|| panic!("the dry run must preview {PURL}: {envelope:#}"))
 }
 
@@ -377,15 +373,12 @@ async fn refused_takeover_keeps_hosted_pin(shape: Shape, command: &str, code: &s
     // (status and exit code unchanged) instead of promising the takeover.
     let (exit, env) = run_mode(root, &server.uri(), command, "vendored", &["--dry-run"]);
     assert_still_hosted(root, &hosted, &env);
-    assert_eq!(
-        exit, 0,
-        "a would_refuse preview does not fail the run: {env:#}"
-    );
+    assert_eq!(exit, 0, "a refusal preview does not fail the run: {env:#}");
     let row = preview_row(&env);
-    assert_eq!(row["action"], "would_refuse", "{env:#}");
+    assert_eq!(row["action"], "skipped", "{env:#}");
     assert_eq!(row["errorCode"], code, "{env:#}");
     assert!(
-        row["error"].as_str().is_some_and(|e| !e.is_empty()),
+        row["reason"].as_str().is_some_and(|e| !e.is_empty()),
         "the preview carries the backend's detail: {env:#}"
     );
 
@@ -513,7 +506,7 @@ async fn scan_vendored_over_hosted_pnpm_plain_dep_still_takes_over() {
     // over-refused by the preview's takeover gates.
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &["--dry-run"]);
     assert_eq!(exit, 0, "{env:#}");
-    assert_eq!(preview_row(&env)["action"], "would_vendor", "{env:#}");
+    assert_eq!(preview_row(&env)["action"], "verified", "{env:#}");
 
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
     assert_eq!(exit, 0, "the plain takeover must succeed: {env:#}");
@@ -545,7 +538,7 @@ async fn scan_vendored_over_hosted_pnpm_workspace_exact_pin_takes_over() {
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &["--dry-run"]);
     assert_eq!(exit, 0, "{env:#}");
     assert_still_hosted(root, &hosted, &env);
-    assert_eq!(preview_row(&env)["action"], "would_vendor", "{env:#}");
+    assert_eq!(preview_row(&env)["action"], "verified", "{env:#}");
 
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
     assert_eq!(exit, 0, "the exact-pin takeover must succeed: {env:#}");
@@ -608,7 +601,7 @@ async fn two_document_lock_takes_over_both_ways() {
         has_event_code(&env, "redirect_takeover_reverted_vendored"),
         "{env:#}"
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pin_count(&env), 1, "{env:#}");
     let lock = read_lock();
     assert_eq!(env_doc(&lock), ENV_DOC, "{lock}");
     assert!(lock.contains(HOSTED_URL), "{lock}");
@@ -660,4 +653,19 @@ async fn vendor_dry_run_over_hosted_pnpm_catalog_dep_previews_the_refusal() {
     let (exit, env) = vendor(&[]);
     assert_refused(&env, exit, "vendor_lock_entry_unsupported");
     assert_still_hosted(root, &hosted, &env);
+}
+
+/// How many hosted pins the run wrote (`applied`) or, on a dry run, would
+/// write (`verified`): the `details.mode: "hosted"` events (v5.0's
+/// `redirect.redirected`).
+fn hosted_pin_count(envelope: &serde_json::Value) -> usize {
+    envelope["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count()
 }

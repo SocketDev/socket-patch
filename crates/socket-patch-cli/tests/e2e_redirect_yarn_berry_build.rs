@@ -533,10 +533,7 @@ async fn berry_hosted_project_with(
         panic!("{driver:?} --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
     });
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(
-        env["redirect"]["redirected"], 1,
-        "one dep redirected: {env}"
-    );
+    assert_eq!(env["summary"]["applied"], 1, "one dep redirected: {env}");
     if driver == HostedDriver::Scan {
         // In-run VEX (step 3 of the module doc): the envelope's vex block plus
         // the document's unverified `(redirected)` attestation. Without these,
@@ -546,8 +543,10 @@ async fn berry_hosted_project_with(
         assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
         assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
         assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
-        assert_eq!(
-            env["vex"]["verified"], false,
+        assert!(
+            env["vex"]["warnings"]
+                .as_array()
+                .is_some_and(|w| w.iter().any(|w| w["code"] == "vex_hosted_unverified")),
             "in-run redirect VEX is attested from this run's fetched record, not hash-verified: {env}"
         );
         let vex_doc: serde_json::Value =

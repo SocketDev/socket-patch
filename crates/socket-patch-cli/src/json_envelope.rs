@@ -665,71 +665,18 @@ pub(crate) fn manifest_load_error_code(err: &std::io::Error) -> &'static str {
     }
 }
 
-/// The `{code, message}` object every `--json` failure carries as its
-/// top-level `error` — the serialized form of an [`EnvelopeError`].
-pub(crate) fn error_object(err: &EnvelopeError) -> serde_json::Value {
-    serde_json::json!({ "code": err.code, "message": err.message })
-}
-
-/// Mark a legacy (`scan` / `get` / `rollback`) JSON result as a top-level
-/// failure: `status: "error"` plus `error: {code, message}`. Any older
-/// top-level `errorCode` sibling is removed — the code lives in
-/// `error.code` (v5.0). Per-record `errorCode`s inside arrays are untouched.
-pub(crate) fn set_error(value: &mut serde_json::Value, err: EnvelopeError) {
-    // `status` first, so a fresh object reads `{status, error}`.
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("status".into(), serde_json::json!("error"));
-    }
-    set_error_keep_status(value, err);
-}
-
-/// [`set_error`] without touching `status`, for results whose status is
-/// itself the routing signal (get's `selection_required`).
-pub(crate) fn set_error_keep_status(value: &mut serde_json::Value, err: EnvelopeError) {
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("errorCode");
-        obj.insert("error".into(), error_object(&err));
-    }
-}
-
-/// The minimal legacy failure shape: `{status: "error", error: {code,
-/// message}}`.
-pub(crate) fn legacy_error(code: &str, message: &str) -> serde_json::Value {
-    let mut v = serde_json::json!({});
-    set_error(&mut v, EnvelopeError::new(code, message));
-    v
-}
-
-/// Print [`legacy_error`] on stdout.
-pub(crate) fn print_legacy_error(code: &str, message: &str) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&legacy_error(code, message)).expect("json serialize")
-    );
-}
-
-/// Whether `command` still prints its legacy (non-[`Envelope`]) JSON shape.
-fn is_legacy_shape(command: Command) -> bool {
-    matches!(command, Command::Scan | Command::Get)
-}
-
 /// The JSON a self-enforced usage error prints under `--json`: a full
-/// [`Envelope`] for commands already on it, the legacy error shape for
-/// `scan` / `get` / `rollback`.
+/// [`Envelope`] with `status: "error"`.
 pub(crate) fn usage_error_json(
     command: Command,
     dry_run: bool,
     code: &str,
     message: &str,
 ) -> serde_json::Value {
-    if is_legacy_shape(command) {
-        legacy_error(code, message)
-    } else {
-        let mut env = Envelope::new(command);
-        env.dry_run = dry_run;
-        env.mark_error(EnvelopeError::new(code, message));
-        serde_json::to_value(&env).expect("envelope serialize")
-    }
+    let mut env = Envelope::new(command);
+    env.dry_run = dry_run;
+    env.mark_error(EnvelopeError::new(code, message));
+    env.to_value()
 }
 
 /// Report a usage error a command enforces itself (clap's own parse errors
@@ -784,53 +731,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn set_error_writes_object_and_drops_error_code() {
-        let mut v = serde_json::json!({
-            "status": "success",
-            "errorCode": "lock_held",
-            "error": "old",
-            "patches": [{ "errorCode": "apply_failed", "error": "per-record" }],
-        });
-        set_error(&mut v, EnvelopeError::new("lock_held", "held"));
-        assert_eq!(v["status"], "error");
-        assert_eq!(
-            v["error"],
-            serde_json::json!({"code": "lock_held", "message": "held"})
-        );
-        assert!(v.get("errorCode").is_none(), "{v}");
-        // Per-record keys are out of scope and untouched.
-        assert_eq!(v["patches"][0]["errorCode"], "apply_failed");
-        assert_eq!(v["patches"][0]["error"], "per-record");
-    }
-
-    #[test]
-    fn set_error_keep_status_leaves_status() {
-        let mut v = serde_json::json!({ "status": "selection_required" });
-        set_error_keep_status(&mut v, EnvelopeError::new("selection_required", "pick"));
-        assert_eq!(v["status"], "selection_required");
-        assert_eq!(v["error"]["code"], "selection_required");
-        assert_eq!(v["error"]["message"], "pick");
-    }
-
-    #[test]
-    fn legacy_error_has_minimal_shape() {
-        let v = legacy_error("manifest_unreadable", "bad json");
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "status": "error",
-                "error": { "code": "manifest_unreadable", "message": "bad json" },
-            })
-        );
-    }
-
-    #[test]
-    fn usage_error_json_legacy_vs_envelope() {
-        for cmd in [Command::Scan, Command::Get] {
-            let v = usage_error_json(cmd, true, "invalid_args", "bad");
-            assert_eq!(v, legacy_error("invalid_args", "bad"), "{cmd:?}");
-        }
+    fn usage_error_json_is_a_full_envelope_for_every_command() {
         for cmd in [
+            Command::Scan,
+            Command::Get,
             Command::Apply,
             Command::Rollback,
             Command::List,

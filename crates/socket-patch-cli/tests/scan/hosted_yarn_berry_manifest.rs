@@ -21,6 +21,24 @@ const PURL: &str = "pkg:npm/uuid@9.0.1";
 const UUID: &str = "71717171-7171-4171-8171-717171717171";
 const TOKEN: &str = "33333333-3333-4333-8333-333333333333";
 
+/// The hosted `skipped` events of a scan envelope as v4's
+/// `redirect.skipped[]` rows: `{purl, uuid, reason: <errorCode>, detail:
+/// <reason>}` (v5.0 records them as `details.mode: "hosted"` events).
+fn hosted_skipped(doc: &serde_json::Value) -> Vec<serde_json::Value> {
+    doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "skipped")
+        .map(|e| {
+            serde_json::json!({
+                "purl": e["purl"], "uuid": e["uuid"],
+                "reason": e["errorCode"], "detail": e["reason"],
+            })
+        })
+        .collect()
+}
+
 fn tgz(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
         Vec::new(),
@@ -204,7 +222,11 @@ async fn issue_718_hosted_pin_takes_bin_from_the_served_tarball() {
 
     let (code, doc, stderr) = scan(&root, &server.uri());
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(
+        crate::common::envelope::hosted_pins(&doc).len(),
+        1,
+        "{doc:#}"
+    );
     let lock = std::fs::read_to_string(root.join("yarn.lock")).unwrap();
     assert!(
         lock.contains(&format!(
@@ -226,9 +248,8 @@ async fn unfetchable_served_manifest_skips_the_patch() {
     let lock_before = std::fs::read(root.join("yarn.lock")).unwrap();
 
     let (_, doc, stderr) = scan(&root, &server.uri());
-    let skipped: Vec<&Value> = doc["redirect"]["skipped"]
-        .as_array()
-        .unwrap_or_else(|| panic!("redirect.skipped: {doc:#}\n{stderr}"))
+    let all_skipped = hosted_skipped(&doc);
+    let skipped: Vec<&Value> = all_skipped
         .iter()
         .filter(|s| s["reason"] == "npm_manifest_unavailable")
         .collect();
@@ -239,7 +260,11 @@ async fn unfetchable_served_manifest_skips_the_patch() {
         !detail.contains(&server.uri()),
         "the hosted URL is redacted: {detail}"
     );
-    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    assert_eq!(
+        crate::common::envelope::hosted_pins(&doc).len(),
+        0,
+        "{doc:#}"
+    );
     assert_eq!(
         std::fs::read(root.join("yarn.lock")).unwrap(),
         lock_before,

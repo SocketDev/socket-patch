@@ -458,12 +458,6 @@ impl ScanPolicy {
             .collect()
     }
 
-    /// Whether selection can filter anything (a floor, or patching
-    /// disabled): report-only runs select only for the report then.
-    pub(crate) fn reports_selection(&self) -> bool {
-        !self.policy.enabled() || self.policy.min_severity().0.is_some()
-    }
-
     /// Whether the policy filtered this whole project root.
     pub(crate) fn root_excluded(&self) -> bool {
         self.root_verdict.is_err()
@@ -670,25 +664,16 @@ impl ScanPolicy {
     }
 
     /// Put the `policy` block and the policy warnings on a scan `--json`
-    /// result (idempotent: the block is rebuilt, warnings added once).
-    pub(crate) fn fold_into_json(&self, result: &mut serde_json::Value) {
-        result["policy"] = self.json();
-        let warnings = result
-            .as_object_mut()
-            .expect("scan JSON result is an object")
-            .entry("warnings")
-            .or_insert_with(|| serde_json::json!([]));
-        if let Some(arr) = warnings.as_array_mut() {
-            for w in self.warnings.iter().chain(&self.shared_copy_warnings()) {
-                let present = arr
-                    .iter()
-                    .any(|e| e["code"] == w.code && e["detail"] == w.detail.as_str());
-                if !present {
-                    arr.push(serde_json::json!({ "code": w.code, "detail": w.detail }));
-                }
-            }
-            if arr.is_empty() {
-                result.as_object_mut().map(|o| o.remove("warnings"));
+    /// envelope (idempotent: the block is rebuilt, warnings added once).
+    pub(crate) fn fold_into_envelope(&self, env: &mut crate::json_envelope::Envelope) {
+        env.set_extra("policy", self.json());
+        for w in self.warnings.iter().chain(&self.shared_copy_warnings()) {
+            let present = env
+                .warnings
+                .iter()
+                .any(|e| e.code == w.code && e.detail == w.detail);
+            if !present {
+                env.warn(w.code, w.detail.clone());
             }
         }
     }
@@ -809,25 +794,6 @@ fn shared_copy_detail(purl: &str, projects: &BTreeSet<String>) -> String {
         if projects.len() == 1 { "" } else { "s" },
         projects.join(", ")
     )
-}
-
-/// The JSON error object for a policy file that cannot be honored: scan's
-/// error shape, `error: {code, message}`.
-pub(crate) fn policy_error_json(err: &PolicyError, paths: &[String]) -> serde_json::Value {
-    serde_json::json!({
-        "status": "error",
-        "error": { "code": err.code(), "message": err.to_string() },
-        "scannedPackages": 0,
-        "lockfileOnlyPackages": 0,
-        "packagesWithPatches": 0,
-        "totalPatches": 0,
-        "freePatches": 0,
-        "paidPatches": 0,
-        "canAccessPaidPatches": false,
-        "packages": [],
-        "updates": [],
-        "paths": paths,
-    })
 }
 
 /// `get`'s `policy_bypassed` warnings: `get` is explicit intent, so it

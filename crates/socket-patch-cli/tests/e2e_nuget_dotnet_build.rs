@@ -803,7 +803,7 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
         Some(0),
         "SDK {sdk} scan --mode hosted: {env:#}\n{stderr}"
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
     let doc: Value = serde_json::from_slice(&std::fs::read(&embedded).unwrap()).unwrap();
     assert_attested(&doc, PURL, HOSTED_UUID, Marker::Redirected, &vulns());
     let config = std::fs::read_to_string(fixture.join("nuget.config")).unwrap();

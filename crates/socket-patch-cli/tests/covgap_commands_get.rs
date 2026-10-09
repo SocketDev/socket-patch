@@ -50,7 +50,8 @@ async fn download_and_apply_patches(
         lock_timeout: None,
         verbose: false,
     };
-    download_and_apply_patches_with(selected, params, &run).await
+    let (code, env) = download_and_apply_patches_with(selected, params, &run).await;
+    (code, env.to_value())
 }
 
 #[path = "common/mod.rs"]
@@ -557,11 +558,16 @@ async fn get_uuid_traversal_after_hash_fails_blob_write_both_modes() {
         assert_eq!(code, 1, "blob failure must exit 1; stdout={stdout}");
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "error", "stdout={stdout}");
+        assert_eq!(v["error"]["code"], "blob_write_failed", "stdout={stdout}");
         assert_eq!(
             v["error"]["message"], "Blob decode or write failed",
             "stdout={stdout}"
         );
-        assert_eq!(v["patches"][0]["action"], "failed", "stdout={stdout}");
+        assert_eq!(v["events"][0]["action"], "failed", "stdout={stdout}");
+        assert_eq!(
+            v["events"][0]["errorCode"], "blob_write_failed",
+            "stdout={stdout}"
+        );
         assert_no_manifest(tmp.path());
         assert!(
             !tmp.path().join("covgap-escape").exists()
@@ -783,8 +789,8 @@ async fn package_search_without_a_match_is_no_match_in_both_modes() {
         );
         assert_eq!(code, 0, "no_match is a clean exit; stdout={stdout}");
         let v = parse_single_json_doc(&stdout);
-        assert_eq!(v["status"], "no_match", "stdout={stdout}");
-        assert_eq!(v["patches"].as_array().unwrap().len(), 0);
+        assert_eq!(v["status"], "noMatch", "stdout={stdout}");
+        assert_eq!(v["events"].as_array().unwrap().len(), 0);
         assert!(
             received_paths(&server).await.is_empty(),
             "no_match must be decided before any API call"
@@ -885,12 +891,16 @@ async fn engine_no_applicable_files_is_failed_and_unrecorded() {
         download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
-    assert_eq!(json["status"], "partial_failure", "json={json}");
-    assert_eq!(json["failed"], 1, "json={json}");
-    assert_eq!(json["downloaded"], 0, "json={json}");
-    assert_eq!(json["patches"][0]["action"], "failed", "json={json}");
+    assert_eq!(json["status"], "partialFailure", "json={json}");
+    assert_eq!(json["summary"]["failed"], 1, "json={json}");
+    assert_eq!(json["summary"]["downloaded"], 0, "json={json}");
+    assert_eq!(json["events"][0]["action"], "failed", "json={json}");
     assert_eq!(
-        json["patches"][0]["error"], "patch has no applicable files",
+        json["events"][0]["errorCode"], "patch_no_applicable_files",
+        "json={json}"
+    );
+    assert_eq!(
+        json["events"][0]["error"], "patch has no applicable files",
         "json={json}"
     );
     assert_no_manifest(tmp.path());
@@ -927,9 +937,13 @@ async fn engine_invalid_blob_hash_is_failed_and_unrecorded() {
         download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
-    assert_eq!(json["failed"], 1, "json={json}");
+    assert_eq!(json["summary"]["failed"], 1, "json={json}");
     assert_eq!(
-        json["patches"][0]["error"], "Blob decode or write failed",
+        json["events"][0]["errorCode"], "blob_write_failed",
+        "json={json}"
+    );
+    assert_eq!(
+        json["events"][0]["error"], "Blob decode or write failed",
         "json={json}"
     );
     assert_no_manifest(tmp.path());
@@ -952,9 +966,13 @@ async fn engine_view_404_is_could_not_fetch_details() {
         download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
-    assert_eq!(json["failed"], 1, "json={json}");
+    assert_eq!(json["summary"]["failed"], 1, "json={json}");
     assert_eq!(
-        json["patches"][0]["error"], "could not fetch details",
+        json["events"][0]["errorCode"], "download_failed",
+        "json={json}"
+    );
+    assert_eq!(
+        json["events"][0]["error"], "could not fetch details",
         "json={json}"
     );
     assert_no_manifest(tmp.path());
@@ -1168,16 +1186,21 @@ async fn engine_uninstalled_variant_base_keeps_all_with_warning() {
     let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
-    assert_eq!(json["found"], 2, "both variants must be kept; json={json}");
-    assert_eq!(json["failed"], 2, "json={json}");
+    assert_eq!(
+        json["events"].as_array().unwrap().len(),
+        2,
+        "both variants must be kept; json={json}"
+    );
+    assert_eq!(json["summary"]["failed"], 2, "json={json}");
     let warnings = json["warnings"]
         .as_array()
         .unwrap_or_else(|| panic!("keep-all fallback must surface warnings; json={json}"));
     assert!(
-        warnings.iter().any(|w| w
-            .as_str()
-            .unwrap_or_default()
-            .contains("not installed locally")),
+        warnings.iter().any(|w| w["code"] == "release_narrowing"
+            && w["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not installed locally")),
         "json={json}"
     );
 }
@@ -1202,13 +1225,13 @@ async fn engine_human_mode_skip_and_failed_summary() {
     let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
-    assert_eq!(json["status"], "partial_failure", "json={json}");
+    assert_eq!(json["status"], "partialFailure", "json={json}");
     assert_eq!(
-        json["skipped"], 1,
+        json["summary"]["skipped"], 1,
         "same-uuid entry is skipped; json={json}"
     );
-    assert_eq!(json["failed"], 1, "json={json}");
-    assert_eq!(json["downloaded"], 0, "json={json}");
+    assert_eq!(json["summary"]["failed"], 1, "json={json}");
+    assert_eq!(json["summary"]["downloaded"], 0, "json={json}");
     // The skipped purl's record is untouched.
     assert_eq!(manifest_json(tmp.path())["patches"][PURL]["uuid"], UUID);
     assert!(manifest_json(tmp.path())["patches"][PURL_V2].is_null());
@@ -1291,16 +1314,16 @@ async fn engine_variant_no_hash_match_keeps_all_variants_with_note() {
         code, 0,
         "keep-all downloads must still succeed; json={json}"
     );
-    assert_eq!(json["found"], 2, "json={json}");
-    assert_eq!(json["downloaded"], 2, "json={json}");
+    assert_eq!(json["summary"]["downloaded"], 2, "json={json}");
     let warnings = json["warnings"]
         .as_array()
         .unwrap_or_else(|| panic!("no-match fallback must warn; json={json}"));
     assert!(
-        warnings.iter().any(|w| w
-            .as_str()
-            .unwrap_or_default()
-            .contains("No release variant")),
+        warnings.iter().any(|w| w["code"] == "release_narrowing"
+            && w["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("No release variant")),
         "json={json}"
     );
     // Keep-all is observable in the manifest: BOTH qualified purls recorded.
@@ -1360,17 +1383,18 @@ async fn engine_variant_view_fetch_error_keeps_errored_variant() {
         "the kept variant's failure must surface; json={json}"
     );
     assert_eq!(
-        json["found"], 1,
+        json["events"].as_array().unwrap().len(),
+        1,
         "only the fetch-error variant may be kept (vacuous match); json={json}"
     );
-    assert_eq!(json["failed"], 1, "json={json}");
+    assert_eq!(json["summary"]["failed"], 1, "json={json}");
     assert_eq!(
-        json["patches"][0]["purl"], purl_erroring,
+        json["events"][0]["purl"], purl_erroring,
         "the KEPT variant must be the one whose view errored; json={json}"
     );
     // The mismatching sibling was narrowed out entirely.
     assert!(
-        !json["patches"]
+        !json["events"]
             .as_array()
             .unwrap()
             .iter()
@@ -1503,12 +1527,22 @@ async fn get_uuid_vendored_superseding_action_carries_old_uuid() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["downloaded"], 1, "stdout={stdout}");
-    assert_eq!(v["skipped"], 0, "stdout={stdout}");
-    assert_eq!(v["detached"], true, "stdout={stdout}");
-    assert_eq!(v["patches"][0]["action"], "downloaded", "stdout={stdout}");
-    assert_eq!(v["patches"][0]["oldUuid"], UUID_B, "stdout={stdout}");
-    assert!(v["vendor"].is_object(), "stdout={stdout}");
+    assert_eq!(v["summary"]["downloaded"], 1, "stdout={stdout}");
+    assert_eq!(v["events"][0]["action"], "downloaded", "stdout={stdout}");
+    assert_eq!(
+        v["events"][0]["details"]["mode"], "vendored",
+        "stdout={stdout}"
+    );
+    assert_eq!(
+        v["events"][0]["details"]["oldUuid"], UUID_B,
+        "stdout={stdout}"
+    );
+    // The vendor engine's events follow (no nested `vendor` envelope).
+    assert!(v.get("vendor").is_none(), "stdout={stdout}");
+    assert!(
+        v["summary"]["applied"].as_u64().unwrap() >= 1,
+        "stdout={stdout}"
+    );
     assert_vendored_detached(tmp.path(), PURL, UUID);
 }
 
@@ -1625,25 +1659,25 @@ fn assert_legacy_state_untouched(root: &Path, manifest_before: &str, state_befor
 }
 
 fn assert_vendor_error_envelope(v: &serde_json::Value) {
-    assert_eq!(v["status"], "partial_failure", "envelope={v}");
-    assert_eq!(
-        v["vendor"]["events"][0]["errorCode"], "vendor_lockfile_missing",
+    assert_eq!(v["status"], "partialFailure", "envelope={v}");
+    let events = v["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the envelope must have events[]; envelope={v}"));
+    // The download half reports the record it fetched first; the vendor
+    // engine's events follow in the same envelope.
+    assert_eq!(events[0]["action"], "downloaded", "envelope={v}");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_lockfile_missing"
+                && e["details"]["mode"] == "vendored"),
         "{v}"
     );
-    assert_eq!(
-        v["vendor"]["status"], "partialFailure",
-        "the carried envelope's status must be demoted; envelope={v}"
-    );
-    let events = v["vendor"]["events"]
-        .as_array()
-        .unwrap_or_else(|| panic!("the carried envelope must have events[]; envelope={v}"));
     assert!(
         !events.iter().any(|e| e["purl"] == UNSELECTED_PURL),
         "the detached vendor step must not reconcile (revert) unselected ledger entries; envelope={v}"
     );
-    // The download half reports the record it fetched before the abort.
-    assert_eq!(v["patches"][0]["action"], "downloaded", "envelope={v}");
-    assert_eq!(v["detached"], true, "envelope={v}");
+    assert!(v.get("vendor").is_none(), "no nested vendor envelope: {v}");
 }
 
 /// `get <uuid> --mode vendored --json` whose vendor step dies at staging:
@@ -2054,8 +2088,8 @@ async fn engine_human_silent_no_applicable_files_still_fails() {
     let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
-    assert_eq!(json["status"], "partial_failure", "json={json}");
-    assert_eq!(json["failed"], 1, "json={json}");
+    assert_eq!(json["status"], "partialFailure", "json={json}");
+    assert_eq!(json["summary"]["failed"], 1, "json={json}");
     assert_no_manifest(tmp.path());
 }
 
@@ -2236,8 +2270,8 @@ async fn vendored_search_ignores_corrupt_manifest_and_vendors() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["patches"][0]["action"], "downloaded", "stdout={stdout}");
-    assert_eq!(v["vendor"]["summary"]["applied"], 1, "stdout={stdout}");
+    assert_eq!(v["events"][0]["action"], "downloaded", "stdout={stdout}");
+    assert_eq!(v["summary"]["applied"], 1, "stdout={stdout}");
     assert_eq!(
         std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap(),
         b"{ corrupt",
@@ -2277,12 +2311,17 @@ async fn vendored_search_json_download_failure_with_clean_vendor_is_partial_fail
     );
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_eq!(v["status"], "partial_failure", "stdout={stdout}");
-    assert_eq!(v["failed"], 1, "stdout={stdout}");
-    assert_eq!(
-        v["vendor"]["status"], "success",
-        "the vendor step itself was clean; stdout={stdout}"
-    );
+    assert_eq!(v["status"], "partialFailure", "stdout={stdout}");
+    assert_eq!(v["summary"]["failed"], 1, "stdout={stdout}");
+    // The only failure is the download's: the vendor step itself was clean.
+    let failed: Vec<&serde_json::Value> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "stdout={stdout}");
+    assert_eq!(failed[0]["errorCode"], "download_failed", "stdout={stdout}");
     // The successfully-downloaded patch was still vendored.
     let artifact = tmp
         .path()
@@ -2323,7 +2362,7 @@ async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
             "no pre-failure vendor envelope exists to carry; stdout={stdout}"
         );
         assert_eq!(
-            v["patches"][0]["action"], "downloaded",
+            v["events"][0]["action"], "downloaded",
             "the download phase preceded the refusal; stdout={stdout}"
         );
         assert_no_manifest(tmp.path());
@@ -2471,9 +2510,9 @@ async fn hosted_lock_held_get_errors_with_top_level_error_code() {
         v.get("errorCode").is_none(),
         "no top-level `errorCode` (v5.0); stdout={stdout}"
     );
-    assert_eq!(
-        v["redirect"]["mode"], "hosted",
-        "the hosted error envelope keeps its redirect block; stdout={stdout}"
+    assert!(
+        v.get("redirect").is_none(),
+        "nothing was rewritten, so no redirect payload (v5.0); stdout={stdout}"
     );
 
     // Wet human: the shared lock error line and the wait hint.
@@ -2502,8 +2541,11 @@ async fn hosted_lock_held_get_errors_with_top_level_error_code() {
     );
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["redirect"]["dryRun"], true, "stdout={stdout}");
-    assert_eq!(v["redirect"]["redirected"], 1, "stdout={stdout}");
+    assert_eq!(v["dryRun"], true, "stdout={stdout}");
+    assert_eq!(
+        v["summary"]["verified"], 1,
+        "the pin is previewed; stdout={stdout}"
+    );
 
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
@@ -2630,8 +2672,7 @@ async fn vendored_uuid_json_leaves_unselected_ledger_entries_alone() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["vendor"]["status"], "success", "stdout={stdout}");
-    let events = v["vendor"]["events"]
+    let events = v["events"]
         .as_array()
         .unwrap_or_else(|| panic!("vendor events must be carried; stdout={stdout}"));
     assert!(
@@ -2726,9 +2767,9 @@ async fn agent_uuid_dry_run_json_classifies_against_the_manifest() {
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "{v}");
     assert_eq!(v["dryRun"], true, "{v}");
-    assert_eq!(v["applied"], 0, "{v}");
-    assert_eq!(v["patches"][0]["action"], "would_update", "{v}");
-    assert_eq!(v["patches"][0]["oldUuid"], UUID_B, "{v}");
+    assert_eq!(v["summary"]["applied"], 0, "{v}");
+    assert_eq!(v["events"][0]["action"], "verified", "{v}");
+    assert_eq!(v["events"][0]["oldUuid"], UUID_B, "{v}");
     assert_eq!(
         before,
         std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap()
@@ -2883,9 +2924,15 @@ async fn proxy_403_on_uuid_is_paid_required() {
     let (code, stdout, stderr) = run(&["--json"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_eq!(v["status"], "paid_required", "{v}");
-    assert_eq!(v["patches"][0]["uuid"], UUID, "{v}");
-    assert_eq!(v["patches"][0]["tier"], "paid", "{v}");
+    assert_eq!(v["status"], "paidRequired", "{v}");
+    assert_eq!(v["events"][0]["action"], "skipped", "{v}");
+    assert_eq!(v["events"][0]["errorCode"], "paid_required", "{v}");
+    assert_eq!(v["events"][0]["uuid"], UUID, "{v}");
+    assert!(
+        v["events"][0].get("purl").is_none(),
+        "the proxy never named it: {v}"
+    );
+    assert_eq!(v["events"][0]["details"]["tier"], "paid", "{v}");
 
     let (code, stdout, stderr) = run(&[]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
@@ -3031,11 +3078,11 @@ async fn agent_dry_run_previews_only_the_installed_release_variant() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["dryRun"], true, "{v}");
-    let adds: Vec<&serde_json::Value> = v["patches"]
+    let adds: Vec<&serde_json::Value> = v["events"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|p| p["action"] == "would_add")
+        .filter(|p| p["action"] == "verified")
         .collect();
     assert_eq!(adds.len(), 1, "only the installed variant; {v}");
     assert_eq!(adds[0]["purl"], purl_wheel.as_str(), "{v}");
@@ -3173,14 +3220,18 @@ async fn engine_nested_apply_failure_reaches_the_json_envelope() {
     let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
-    assert_eq!(json["status"], "partial_failure", "json={json}");
-    assert_eq!(json["downloaded"], 1, "the download itself worked: {json}");
+    assert_eq!(json["status"], "partialFailure", "json={json}");
     assert_eq!(
-        json["failed"], 1,
+        json["summary"]["downloaded"], 1,
+        "the download itself worked: {json}"
+    );
+    assert_eq!(json["events"][0]["action"], "downloaded", "json={json}");
+    assert_eq!(
+        json["summary"]["failed"], 1,
         "the apply failure must be counted: {json}"
     );
-    assert_eq!(json["applied"], 0, "json={json}");
-    let rec = &json["patches"][0];
+    assert_eq!(json["summary"]["applied"], 0, "json={json}");
+    let rec = &json["events"][1];
     assert_eq!(rec["purl"], PURL, "json={json}");
     assert_eq!(rec["uuid"], UUID, "json={json}");
     assert_eq!(rec["action"], "failed", "json={json}");
@@ -3214,11 +3265,12 @@ async fn engine_nested_apply_not_installed_reaches_the_json_envelope() {
     let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
-    assert_eq!(json["status"], "partial_failure", "json={json}");
-    assert_eq!(json["failed"], 1, "json={json}");
-    assert_eq!(json["applied"], 0, "json={json}");
-    let rec = &json["patches"][0];
+    assert_eq!(json["status"], "partialFailure", "json={json}");
+    assert_eq!(json["summary"]["failed"], 1, "json={json}");
+    assert_eq!(json["summary"]["applied"], 0, "json={json}");
+    let rec = &json["events"][1];
     assert_eq!(rec["action"], "failed", "json={json}");
+    assert_eq!(rec["purl"], PURL, "json={json}");
     assert_eq!(rec["errorCode"], "package_not_installed", "json={json}");
     assert!(
         rec["error"].as_str().is_some_and(|e| !e.is_empty()),
@@ -3243,10 +3295,11 @@ async fn engine_nested_apply_success_keeps_added_and_counts_applied() {
 
     assert_eq!(code, 0, "json={json}");
     assert_eq!(json["status"], "success", "json={json}");
-    assert_eq!(json["failed"], 0, "json={json}");
-    assert_eq!(json["applied"], 1, "json={json}");
-    assert_eq!(json["patches"][0]["action"], "added", "json={json}");
-    assert!(json["patches"][0].get("errorCode").is_none(), "json={json}");
+    assert_eq!(json["summary"]["failed"], 0, "json={json}");
+    assert_eq!(json["summary"]["applied"], 1, "json={json}");
+    assert_eq!(json["events"][0]["action"], "downloaded", "json={json}");
+    assert_eq!(json["events"][1]["action"], "applied", "json={json}");
+    assert!(json["events"][0].get("errorCode").is_none(), "json={json}");
     assert_eq!(
         std::fs::read(tmp.path().join("node_modules").join(NAME).join("index.js")).unwrap(),
         AFTER_BYTES,
@@ -3267,10 +3320,10 @@ async fn get_uuid_json_nested_apply_failure_names_the_patch() {
     let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--json"]);
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     let json = parse_single_json_doc(&stdout);
-    assert_eq!(json["status"], "partial_failure", "json={json}");
-    assert_eq!(json["failed"], 1, "json={json}");
-    assert_eq!(json["applied"], 0, "json={json}");
-    let rec = &json["patches"][0];
+    assert_eq!(json["status"], "partialFailure", "json={json}");
+    assert_eq!(json["summary"]["failed"], 1, "json={json}");
+    assert_eq!(json["summary"]["applied"], 0, "json={json}");
+    let rec = &json["events"][1];
     assert_eq!(rec["action"], "failed", "json={json}");
     assert_eq!(rec["errorCode"], "apply_failed", "json={json}");
     assert!(
@@ -3290,10 +3343,11 @@ const LOCAL_EDIT_BYTES: &[u8] = b"vulnerable\n// local edit\n";
 /// entry naming `purl` and the overwritten file.
 fn has_mismatch_warning(json: &serde_json::Value, purl: &str) -> bool {
     json["warnings"].as_array().is_some_and(|ws| {
-        ws.iter().filter_map(|w| w.as_str()).any(|w| {
-            w.starts_with("(content_mismatch_overwritten) ")
-                && w.contains(purl)
-                && w.contains("package/index.js")
+        ws.iter().any(|w| {
+            let detail = w["detail"].as_str().unwrap_or_default();
+            w["code"] == "content_mismatch_overwritten"
+                && detail.contains(purl)
+                && detail.contains("package/index.js")
         })
     })
 }
@@ -3320,8 +3374,8 @@ async fn engine_nested_apply_mismatch_overwrite_reaches_the_json_envelope() {
 
     assert_eq!(code, 0, "json={json}");
     assert_eq!(json["status"], "success", "json={json}");
-    assert_eq!(json["applied"], 1, "json={json}");
-    assert_eq!(json["patches"][0]["action"], "added", "json={json}");
+    assert_eq!(json["summary"]["applied"], 1, "json={json}");
+    assert_eq!(json["events"][0]["action"], "downloaded", "json={json}");
     assert!(
         has_mismatch_warning(&json, PURL),
         "the overwrite must be reported: {json}"
@@ -3362,7 +3416,7 @@ async fn get_uuid_json_mismatch_overwrite_is_reported() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let json = parse_single_json_doc(&stdout);
     assert_eq!(json["status"], "success", "json={json}");
-    assert_eq!(json["applied"], 1, "json={json}");
+    assert_eq!(json["summary"]["applied"], 1, "json={json}");
     assert!(
         has_mismatch_warning(&json, PURL),
         "the overwrite must be reported: {json}"

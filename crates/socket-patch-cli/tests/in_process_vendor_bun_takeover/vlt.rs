@@ -452,10 +452,13 @@ async fn vlt_vendored_preflight_refuses_before_the_hosted_revert() {
     assert_intact("scan --mode vendored");
     let (code, env, _) = scan(root, &server, "vendored", &["--dry-run"]);
     assert_eq!(code, 0, "[scan --dry-run] {env:#}");
-    let preview = env.to_string();
     assert!(
-        preview.contains("would_refuse") && preview.contains("vendor_lock_entry_unsupported"),
-        "[scan --dry-run] {env:#}"
+        env["events"].as_array().is_some_and(|evs| {
+            evs.iter().any(|e| {
+                e["action"] == "skipped" && e["errorCode"] == "vendor_lock_entry_unsupported"
+            })
+        }),
+        "[scan --dry-run] the preview names the refusal: {env:#}"
     );
     assert_intact("scan --mode vendored --dry-run");
 }

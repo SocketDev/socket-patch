@@ -396,13 +396,10 @@ fn scan_vendored(cwd: &Path, extra: &[&str]) -> serde_json::Value {
 /// to the production catalog's future patches. The `applied` event's purl may
 /// carry qualifiers (`?artifact_id=…`), so a substring match is used.
 fn assert_vendor_applied(env: &serde_json::Value, purl_needle: &str, leg: &str) {
-    let vendor = &env["vendor"];
-    assert!(
-        !vendor.is_null(),
-        "{leg}: scan --mode vendored emitted no `vendor` sub-object — the CLI omits it \
-         when discovery found nothing, so this means the crawler did not see the \
-         installed dependency.\nenvelope:\n{env:#}"
-    );
+    // v5.0: the vendor engine's events and counts are merged into scan's
+    // own envelope (`details.mode: "vendored"`), no nested `vendor` object.
+    let vendor = env;
+    assert_eq!(vendor["command"], "scan", "{leg}: envelope:\n{env:#}");
     let applied = vendor["summary"]["applied"].as_u64().unwrap_or(0);
     assert!(
         applied >= 1,
@@ -434,7 +431,7 @@ fn vendor_events_for<'a>(
     purl_needle: &str,
     action: &str,
 ) -> Vec<&'a serde_json::Value> {
-    env["vendor"]["events"]
+    env["events"]
         .as_array()
         .map(|events| {
             events
@@ -458,12 +455,6 @@ fn vendor_events_for<'a>(
 /// deliberately not asserted.
 fn assert_vendor_applied_for(env: &serde_json::Value, purl_needle: &str, leg: &str) {
     assert!(
-        !env["vendor"].is_null(),
-        "{leg}: scan --mode vendored emitted no `vendor` sub-object — the CLI omits it \
-         when discovery found nothing, so this means the crawler did not see the \
-         installed dependency.\nenvelope:\n{env:#}"
-    );
-    assert!(
         !vendor_events_for(env, purl_needle, "applied").is_empty(),
         "{leg}: no `applied` event for a purl containing `{purl_needle}`.\nenvelope:\n{env:#}"
     );
@@ -475,12 +466,12 @@ fn assert_vendor_applied_for(env: &serde_json::Value, purl_needle: &str, leg: &s
 
 /// Assert the download phase resolved one of the expected patch UUIDs.
 fn assert_download_uuid(env: &serde_json::Value, uuids: &[&str], leg: &str) {
-    let patches = env["download"]["patches"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    // The download phase's events (`downloaded` / `failed`, tagged
+    // `details.mode: "vendored"`).
+    let patches = env["events"].as_array().cloned().unwrap_or_default();
     let found: Vec<String> = patches
         .iter()
+        .filter(|p| p["action"] == "downloaded")
         .filter_map(|p| p["uuid"].as_str().map(str::to_string))
         .collect();
     assert!(
@@ -895,7 +886,7 @@ fn npm_package_lock_vendored_install_proof() {
     // Idempotency: a re-run is an `already_vendored` no-op with a stable lock.
     let env2 = scan_vendored(&proj, &[]);
     assert_eq!(
-        env2["vendor"]["summary"]["applied"].as_u64().unwrap_or(99),
+        env2["summary"]["applied"].as_u64().unwrap_or(99),
         0,
         "{LEG}: re-run must vendor nothing new:\n{env2:#}"
     );
@@ -1031,7 +1022,7 @@ fn pnpm_vendored_install_proof() {
 
     let env2 = scan_vendored(&proj, &[]);
     assert_eq!(
-        env2["vendor"]["summary"]["applied"].as_u64().unwrap_or(99),
+        env2["summary"]["applied"].as_u64().unwrap_or(99),
         0,
         "{LEG}: re-run must vendor nothing new:\n{env2:#}"
     );
@@ -1271,7 +1262,7 @@ fn yarn_classic_vendored_install_proof() {
 
     let env2 = scan_vendored(&proj, &[]);
     assert_eq!(
-        env2["vendor"]["summary"]["applied"].as_u64().unwrap_or(99),
+        env2["summary"]["applied"].as_u64().unwrap_or(99),
         0,
         "{LEG}: re-run must vendor nothing new:\n{env2:#}"
     );
@@ -1383,7 +1374,7 @@ fn yarn_berry_vendored_install_proof() {
 
     let env2 = scan_vendored(&proj, &[]);
     assert_eq!(
-        env2["vendor"]["summary"]["applied"].as_u64().unwrap_or(99),
+        env2["summary"]["applied"].as_u64().unwrap_or(99),
         0,
         "{LEG}: re-run must vendor nothing new:\n{env2:#}"
     );
@@ -1639,7 +1630,7 @@ fn bun_vendored_install_proof() {
 
     let env2 = scan_vendored(&proj, &[]);
     assert_eq!(
-        env2["vendor"]["summary"]["applied"].as_u64().unwrap_or(99),
+        env2["summary"]["applied"].as_u64().unwrap_or(99),
         0,
         "{LEG}: re-run must vendor nothing new:\n{env2:#}"
     );
@@ -1949,7 +1940,7 @@ fn pypi_requirements_txt_vendored_install_proof() {
     let reqs_wired = std::fs::read(proj.join("requirements.txt")).unwrap();
     let env2 = scan_vendored(&proj, &["--ecosystems", "pypi"]);
     assert_eq!(
-        env2["vendor"]["summary"]["applied"].as_u64().unwrap_or(99),
+        env2["summary"]["applied"].as_u64().unwrap_or(99),
         0,
         "{LEG}: re-run must vendor nothing new:\n{env2:#}"
     );
@@ -2098,7 +2089,7 @@ fn pypi_uv_lock_vendored_install_proof() {
 
     let env2 = scan_vendored(&proj, &["--ecosystems", "pypi"]);
     assert_eq!(
-        env2["vendor"]["summary"]["applied"].as_u64().unwrap_or(99),
+        env2["summary"]["applied"].as_u64().unwrap_or(99),
         0,
         "{LEG}: re-run must vendor nothing new:\n{env2:#}"
     );
@@ -2216,11 +2207,12 @@ fn gem_bundler_vendored_install_proof() {
     assert_download_uuid(&env_json, &gem_uuids, LEG);
     // Which pinned patch did the resolver wire? The marker probes below are
     // per-patch — each advisory's diff marks a different file.
-    let wired_uuid = env_json["download"]["patches"]
+    let wired_uuid = env_json["events"]
         .as_array()
         .cloned()
         .unwrap_or_default()
         .iter()
+        .filter(|p| p["action"] == "downloaded")
         .filter_map(|p| p["uuid"].as_str())
         .find(|u| gem_uuids.contains(u))
         .expect("assert_download_uuid guarantees a pinned uuid is downloaded")
@@ -2231,9 +2223,14 @@ fn gem_bundler_vendored_install_proof() {
         .map(|(_, f)| *f)
         .unwrap();
     let pristine = pristine_by_file[patched_file_rel].clone();
-    assert_eq!(
-        env_json["download"]["failed"].as_u64().unwrap_or(99),
-        0,
+    assert!(
+        !env_json["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| {
+                e["action"] == "failed" && e["purl"].as_str().is_some_and(|p| p.contains(GEM_NAME))
+            }),
         "{LEG}: the gem patch download failed.\nenvelope:\n{env_json:#}"
     );
     // Purl-scoped (NOT run-wide counts): a future free patch on one of the
@@ -2247,7 +2244,7 @@ fn gem_bundler_vendored_install_proof() {
     // fallback expectation the moment the depscan stub fix deploys and the
     // rebuilt artifacts serve valid stubs (and catches both-or-neither as a
     // defect either way).
-    let route_markers = env_json["vendor"]["events"]
+    let route_markers = env_json["events"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -2533,18 +2530,16 @@ fn golang_vendored_finds_no_free_patches() {
     .expect("write go.mod");
 
     let env_json = scan_vendored(&proj, &["--ecosystems", "golang"]);
-    let applied = env_json["vendor"]["summary"]["applied"]
-        .as_u64()
-        .unwrap_or(0);
+    let applied = env_json["summary"]["applied"].as_u64().unwrap_or(0);
     assert_eq!(
         applied, 0,
         "{LEG}: golang vendored something, but production publishes no free golang patches. \
          Either production changed (extend this suite with a real golang delivery proof) or \
          this is a bug.\nenvelope:\n{env_json:#}"
     );
-    let patches = env_json["download"]["patches"]
+    let patches = env_json["events"]
         .as_array()
-        .map(|a| a.len())
+        .map(|a| a.iter().filter(|e| e["action"] == "downloaded").count())
         .unwrap_or(0);
     if patches > 0 {
         println!(
@@ -2575,9 +2570,7 @@ fn deno_vendored_is_unsupported() {
     .expect("write deno.json");
 
     let env_json = scan_vendored(&proj, &["--ecosystems", "deno"]);
-    let applied = env_json["vendor"]["summary"]["applied"]
-        .as_u64()
-        .unwrap_or(0);
+    let applied = env_json["summary"]["applied"].as_u64().unwrap_or(0);
     assert_eq!(
         applied, 0,
         "{LEG}: deno vendored something, but vendored mode is not supported for deno:\n{env_json:#}"

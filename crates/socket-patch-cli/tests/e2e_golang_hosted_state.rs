@@ -206,9 +206,9 @@ async fn refused_go_rewrite_is_not_confirmed_by_another_lockfile() {
     mount_hosted_grant(&server).await;
 
     let env = get_hosted(&consumer, &server, &tmp.path().join("modcache"));
-    assert_eq!(env["redirect"]["redirected"], 0, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 0, "envelope: {env}");
     assert!(
-        env["redirect"]["warnings"]
+        env["warnings"]
             .as_array()
             .unwrap()
             .iter()
@@ -245,9 +245,9 @@ async fn leftover_go_sum_lines_do_not_confirm_a_refused_rewrite() {
     mount_hosted_grant(&server).await;
 
     let env = get_hosted(&consumer, &server, &tmp.path().join("modcache"));
-    assert_eq!(env["redirect"]["redirected"], 0, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 0, "envelope: {env}");
     assert!(
-        env["redirect"]["warnings"]
+        env["warnings"]
             .as_array()
             .unwrap()
             .iter()
@@ -346,7 +346,7 @@ async fn hosted_takeover_of_vendored_module_removes_vendored_state() {
     );
 
     let env = get_hosted(&consumer, &server, &modcache);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
 
     let go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
     assert_eq!(
@@ -392,7 +392,7 @@ async fn hosted_rollback_restores_go_sum_byte_for_byte() {
     let server = MockServer::start().await;
     mount_hosted_grant(&server).await;
     let env = get_hosted(&consumer, &server, &modcache);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     assert!(
         !consumer.join(".socket/vendor/redirect-state.json").exists(),
         "hosted mode keeps no ledger: go.mod/go.sum are the record"
@@ -480,7 +480,7 @@ async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
     let server = MockServer::start().await;
     mount_hosted_grant(&server).await;
     let env = get_hosted(&consumer, &server, &modcache);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     let ledger_path = consumer.join(".socket/vendor/redirect-state.json");
     assert!(
         std::fs::read_to_string(consumer.join("go.mod"))
@@ -567,4 +567,18 @@ fn run_with_prebuilt(
         env.push(("SOCKET_VENDOR_URL", &fixture.uri));
     }
     common::run_with_env(cwd, &args, &env)
+}
+
+/// How many hosted pins the run wrote (v5.0: the `applied` / `verified`
+/// events with `details.mode: "hosted"`, formerly `redirect.redirected`).
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

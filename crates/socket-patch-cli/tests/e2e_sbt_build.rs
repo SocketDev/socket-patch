@@ -253,7 +253,7 @@ fn wired(extra: &str) -> Option<(Sbt, Workspace, Server)> {
         ws.project.join(HOSTED_FILE).is_file(),
         "socket-patch.sbt not written: {json}"
     );
-    assert_eq!(json["redirect"]["redirected"], 1, "{json}");
+    assert_eq!(json["summary"]["applied"], 1, "{json}");
     Some((sbt, ws, server))
 }
 
@@ -536,7 +536,7 @@ fn sbt_hosted_dep_edit_rechecks_after_update() {
         !all_codes(&json).contains(&"redirect_sbt_pin_unverifiable".to_string()),
         "{json}"
     );
-    assert_eq!(json["redirect"]["redirected"], 1, "{json}");
+    assert_eq!(json["summary"]["applied"], 1, "{json}");
     let after = std::fs::read(ws.project.join(HOSTED_FILE)).unwrap();
     assert_ne!(after, before, "the row's digest is refreshed");
     // ...and the next run is quiet.
@@ -574,7 +574,7 @@ fn sbt_hosted_declared_bump_fails_closed() {
         all_codes(&json).contains(&"redirect_sbt_pin_declared_newer".to_string()),
         "{json}"
     );
-    assert_eq!(json["redirect"]["redirected"], 0, "{json}");
+    assert_eq!(json["summary"]["applied"], 0, "{json}");
     // Declaring the base again is fine.
     ws.write("build.sbt", &build);
     assert_patched(&sbt, &ws);

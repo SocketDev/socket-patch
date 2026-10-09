@@ -88,7 +88,8 @@ impl Scan {
             .map(str::to_string)
     }
 
-    /// The `level` of the run-level warning `code`.
+    /// The `level` of the run-level warning `code` (v5.0: warnings are
+    /// exactly `{code, detail}`, so always `None`).
     fn warning_level(&self, code: &str) -> Option<String> {
         self.env["warnings"]
             .as_array()?
@@ -392,8 +393,9 @@ fn gradle_only_build_ignores_m2_and_says_so() {
     assert!(detail.contains(M2_ONLY), "{detail}");
     assert!(!detail.contains(COMMONS_TEXT), "{detail}");
     assert_eq!(
-        scan.warning_level("gradle_build_ignores_m2").as_deref(),
-        Some("warn")
+        scan.warning_level("gradle_build_ignores_m2"),
+        None,
+        "v5.0 warnings carry no level"
     );
 
     fx.write(
@@ -427,9 +429,9 @@ fn undetermined_maven_local_keeps_m2_with_a_note() {
         .unwrap_or_else(|| panic!("no gradle_maven_local_undetermined: {}", scan.env));
     assert!(detail.contains("mavenLocal()"), "{detail}");
     assert_eq!(
-        scan.warning_level("gradle_maven_local_undetermined")
-            .as_deref(),
-        Some("info")
+        scan.warning_level("gradle_maven_local_undetermined"),
+        None,
+        "v5.0 warnings carry no level"
     );
 }
 

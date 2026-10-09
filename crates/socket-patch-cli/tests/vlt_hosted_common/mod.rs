@@ -494,8 +494,10 @@ pub fn scan_hosted(
     (code, doc)
 }
 
+/// The scan envelope's top-level `warnings[]` codes (v5.0: the hosted
+/// engine's warnings are no longer nested under `redirect`).
 pub fn warning_codes(doc: &Value) -> Vec<String> {
-    doc["redirect"]["warnings"]
+    doc["warnings"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -506,7 +508,7 @@ pub fn warning_codes(doc: &Value) -> Vec<String> {
 }
 
 pub fn warning_detail(doc: &Value, code: &str) -> String {
-    doc["redirect"]["warnings"]
+    doc["warnings"]
         .as_array()
         .into_iter()
         .flatten()
@@ -516,10 +518,18 @@ pub fn warning_detail(doc: &Value, code: &str) -> String {
         .to_string()
 }
 
+/// How many hosted pins the run wrote (would write, on a dry run): its
+/// `applied` / `verified` events tagged `details.mode: "hosted"`.
 pub fn redirected(doc: &Value) -> u64 {
-    doc["redirect"]["redirected"]
-        .as_u64()
+    doc["events"]
+        .as_array()
         .unwrap_or_else(|| panic!("{doc:#}"))
+        .iter()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }
 
 /// Whether the VEX document at `path` attests [`PURL`].

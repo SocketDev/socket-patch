@@ -571,7 +571,7 @@ async fn redirect_scanned_project(
         "redirect sub-object is mode-tagged: {env}"
     );
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        env["summary"]["applied"], 1,
         "exactly one dep redirected: {env}"
     );
     match cli {
@@ -579,25 +579,33 @@ async fn redirect_scanned_project(
             assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
-            assert_eq!(
-                env["vex"]["verified"], false,
+            assert!(
+                env["vex"]["warnings"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|w| w["code"] == "vex_hosted_unverified")),
                 "in-run redirect VEX is attested from this run's fetched record, not hash-verified: {env}"
             );
         }
         RedirectCli::GetUuidHosted => {
             assert_eq!(
-                env["found"], 1,
-                "uuid get resolves exactly one patch: {env}"
-            );
-            assert_eq!(
-                env["patches"],
-                serde_json::json!([]),
-                "the UUID path is exempt from narrowing — no skip records: {env}"
+                env["events"].as_array().map(Vec::len),
+                Some(1),
+                "uuid get resolves exactly one patch, and the UUID path is exempt \
+                 from narrowing — no skip events: {env}"
             );
         }
         RedirectCli::GetGhsaHosted => {
-            assert_eq!(env["found"], 2, "both fan-out versions were found: {env}");
-            let skips = env["patches"].as_array().expect("patches array");
+            assert_eq!(
+                env["events"].as_array().map(Vec::len),
+                Some(2),
+                "both fan-out versions were found: {env}"
+            );
+            let skips: Vec<&serde_json::Value> = env["events"]
+                .as_array()
+                .expect("events array")
+                .iter()
+                .filter(|e| e["action"] == "skipped")
+                .collect();
             assert_eq!(
                 skips.len(),
                 1,
@@ -645,7 +653,7 @@ async fn redirect_scanned_project(
         );
     }
     // A lockfileVersion 1 lock (npm <= 6) gets the npm 6 install caveat.
-    let legacy_warned = env["redirect"]["warnings"]
+    let legacy_warned = env["warnings"]
         .as_array()
         .is_some_and(|w| w.iter().any(|w| w["code"] == "redirect_npm_legacy_client"));
     assert_eq!(
@@ -656,7 +664,7 @@ async fn redirect_scanned_project(
     // Every npm major gets the npm >= 12 install caveat (the run cannot know
     // which npm the project's CI uses).
     assert!(
-        env["redirect"]["warnings"]
+        env["warnings"]
             .as_array()
             .is_some_and(|w| w.iter().any(|w| w["code"] == "redirect_npm_allow_remote")),
         "the npm >= 12 allow-remote caveat must be emitted: {env}"
@@ -665,7 +673,7 @@ async fn redirect_scanned_project(
     // ...and the run AUTO-CONFIGURED it: a new project `.npmrc` holding
     // exactly `allow-remote=all`, said so in the warning (`rollback` removes
     // the file while it is still byte-identical to what the run created).
-    let allow_remote = env["redirect"]["warnings"]
+    let allow_remote = env["warnings"]
         .as_array()
         .and_then(|w| w.iter().find(|w| w["code"] == "redirect_npm_allow_remote"))
         .and_then(|w| w["detail"].as_str())

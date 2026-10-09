@@ -28,15 +28,14 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 // `commands::get` paths (the in-process tests and embedders call them);
 // the engine itself lives in the shared `agent_download` helper.
 use crate::commands::agent_download::{
-    apply_warning_lines, decide_patch_action, download_patch_records_preflighted,
-    download_patch_records_reusing, filter_to_installed_releases, fold_apply_failures,
-    max_vuln_severity, merge_metadata, nested_apply_args, patch_event_metadata, report_error,
-    report_lock_failure, run_nested_apply, run_outcome, unwind_new_blobs,
-    warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload, PatchAction,
-    VendorRefusals,
+    decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
+    filter_to_installed_releases, max_vuln_severity, nested_apply_args, patch_event_metadata,
+    record_apply_outcome, report_lock_failure, run_nested_apply, run_outcome, tag_mode,
+    unwind_new_blobs, warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload,
+    PatchAction, VendorRefusals, ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING,
 };
 pub use crate::commands::agent_download::{
-    download_and_apply_patches_with, DownloadParams, DownloadRun,
+    download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
 };
 use crate::commands::apply::ApplyRunReport;
 use crate::commands::bun_preflight::{bun_vendor_preflight, BunVendorRefusal};
@@ -44,7 +43,10 @@ use crate::commands::vlt_preflight::{
     vlt_refusal_for, vlt_vendor_preflight_selected, VltVendorRefusal,
 };
 use crate::ecosystem_dispatch::{crawl_ecosystems, find_packages_for_rollback, partition_purls};
-use crate::json_envelope::{usage_error, Command as JsonCommand};
+use crate::json_envelope::{
+    usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction as EventAction,
+    PatchEvent, RunWarning, Status,
+};
 use crate::ui::{print_json, select_one, SelectError};
 
 /// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
@@ -58,17 +60,59 @@ fn ecosystem_from_purl(purl: &str) -> String {
         .to_string()
 }
 
-/// Build a no-results JSON envelope with the given status code. Used in
-/// the `no_packages`, `no_match`, and `not_found` branches of `get`,
-/// which all share the same `{status, counts, patches: []}` shape.
-fn empty_result_json(status: &str) -> serde_json::Value {
-    serde_json::json!({
-        "status": status,
-        "found": 0,
-        "downloaded": 0,
-        "applied": 0,
-        "patches": [],
-    })
+/// A fresh `get` envelope for this run (`dryRun` from the flags).
+fn new_envelope(common: &GlobalArgs) -> Envelope {
+    let mut env = Envelope::new(JsonCommand::Get);
+    env.dry_run = common.dry_run;
+    env
+}
+
+/// The one `--json` emitter of `get`: every document it prints is a
+/// serialized [`Envelope`], printed here, exactly once per run.
+fn emit(env: &Envelope) {
+    print_json(&env.to_value());
+}
+
+/// A result with no per-patch outcome (`noPackages`, `noMatch`,
+/// `notFound`): an empty envelope with that status, plus the run's
+/// warnings. Exit 0.
+fn emit_empty(common: &GlobalArgs, status: Status, warnings: &[(String, String)]) {
+    let mut env = new_envelope(common);
+    env.status = status;
+    fold_narrowing_into_result(&mut env, &[], warnings);
+    emit(&env);
+}
+
+/// Report a top-level failure and return its exit code, 1: under `--json`
+/// a full envelope (`status: "error"`, empty `events`, `error: {code,
+/// message}`), otherwise `Error: <message>` on stderr.
+fn report_error(common: &GlobalArgs, code: &str, message: impl std::fmt::Display) -> i32 {
+    let message = message.to_string();
+    if common.json {
+        let mut env = new_envelope(common);
+        env.mark_error(EnvelopeError::new(code, message));
+        emit(&env);
+    } else {
+        eprintln!("Error: {message}");
+    }
+    1
+}
+
+/// Report a manifest that exists but cannot be loaded: the shared
+/// `manifest_invalid` / `manifest_unreadable` error under `--json`, the
+/// `Failed to read manifest` line otherwise. Exit 1.
+fn report_manifest_error(common: &GlobalArgs, manifest_path: &Path, err: &std::io::Error) -> i32 {
+    if common.json {
+        let mut env = new_envelope(common);
+        env.mark_error(crate::json_envelope::manifest_load_error(
+            manifest_path,
+            err,
+        ));
+        emit(&env);
+    } else {
+        eprintln!("Error: Failed to read manifest: {err}");
+    }
+    1
 }
 
 /// Fire a `patch_fetch_failed` telemetry event and surface the error to
@@ -79,12 +123,25 @@ async fn report_fetch_failure(
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
     telemetry: &TelemetryAuth,
-    json: bool,
+    common: &GlobalArgs,
 ) -> i32 {
     let msg = error.to_string();
     track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, telemetry).await;
-    report_error(json, "patch_fetch_failed", msg);
-    1
+    report_error(common, "patch_fetch_failed", msg)
+}
+
+/// The `skipped` event for a patch the caller's plan cannot download
+/// (`paid_required`), carrying the patch's `tier` in `details`. `purl` is
+/// `None` when the public proxy refused with 403 before naming it.
+fn paid_required_event(purl: Option<&str>, uuid: &str, tier: &str) -> PatchEvent {
+    let event = match purl {
+        Some(purl) => PatchEvent::new(EventAction::Skipped, purl),
+        None => PatchEvent::artifact(EventAction::Skipped),
+    };
+    event
+        .with_uuid(uuid)
+        .with_reason("paid_required", "this patch requires a paid Socket plan")
+        .with_details(serde_json::json!({ "tier": tier }))
 }
 
 #[derive(Args)]
@@ -402,11 +459,11 @@ fn format_did_you_mean(
 /// The `--verbose` per-version detail behind [`format_skip_summary`]: one
 /// `[skip]` line per purl (a free and a paid patch for the same version
 /// would otherwise repeat it), in natural version order.
-fn format_verbose_skips(skips: &[serde_json::Value]) -> Vec<String> {
+fn format_verbose_skips(skips: &[PatchEvent]) -> Vec<String> {
     let mut by_purl: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
     for rec in skips {
-        let purl = rec["purl"].as_str().unwrap_or_default();
-        let reason = match rec["errorCode"].as_str() {
+        let purl = rec.purl.as_deref().unwrap_or_default();
+        let reason = match rec.error_code.as_deref() {
             Some("package_not_installed") | None => "version not installed",
             Some(code) => code,
         };
@@ -470,10 +527,10 @@ fn format_selected_patches(selected: &[PatchSearchResult], color: bool) -> Strin
 }
 
 /// Number of distinct purls among skip records.
-fn distinct_skip_purls(skips: &[serde_json::Value]) -> usize {
+fn distinct_skip_purls(skips: &[PatchEvent]) -> usize {
     let purls: std::collections::BTreeSet<&str> = skips
         .iter()
-        .map(|r| r["purl"].as_str().unwrap_or_default())
+        .map(|r| r.purl.as_deref().unwrap_or_default())
         .collect();
     purls.len()
 }
@@ -481,11 +538,11 @@ fn distinct_skip_purls(skips: &[serde_json::Value]) -> usize {
 /// Summary lines for the patches the installed-version narrowing dropped,
 /// one line per reason (instead of one `[skip]` line per version), in a
 /// fixed order: not installed first, then each layout code alphabetically.
-fn format_skip_summary(skips: &[serde_json::Value]) -> Vec<String> {
-    let mut by_code: std::collections::BTreeMap<&str, Vec<serde_json::Value>> =
+fn format_skip_summary(skips: &[PatchEvent]) -> Vec<String> {
+    let mut by_code: std::collections::BTreeMap<&str, Vec<PatchEvent>> =
         std::collections::BTreeMap::new();
     for rec in skips {
-        let code = rec["errorCode"].as_str().unwrap_or("package_not_installed");
+        let code = rec.error_code.as_deref().unwrap_or("package_not_installed");
         by_code.entry(code).or_default().push(rec.clone());
     }
     let mut lines = Vec::new();
@@ -515,14 +572,14 @@ fn format_skip_summary(skips: &[serde_json::Value]) -> Vec<String> {
 
 /// The result line when the installed-version narrowing dropped EVERY
 /// accessible patch.
-fn format_all_narrowed(skips: &[serde_json::Value]) -> String {
+fn format_all_narrowed(skips: &[PatchEvent]) -> String {
     // When every skip is a PnP layout refusal, "not installed" and the
     // --all-releases advice would both be wrong: the packages were never
     // judged (structurally invisible), and the escape hatch cannot make a
     // PnP layout patchable — point at the layout warning instead.
     let pnp_only = skips.iter().all(|rec| {
         matches!(
-            rec["errorCode"].as_str(),
+            rec.error_code.as_deref(),
             Some("yarn_pnp_unsupported" | "pnpm_pnp_unsupported")
         )
     });
@@ -723,21 +780,26 @@ pub(crate) fn select_patches(
                             serde_json::json!({
                                 "uuid": p.uuid,
                                 "tier": p.tier,
-                                "published_at": p.published_at,
+                                "publishedAt": p.published_at,
                                 "description": p.description,
                                 "vulnerabilities": vulns,
                             })
                         })
                         .collect();
-                    print_json(&serde_json::json!({
-                        "status": "selection_required",
-                        "error": {
-                            "code": "selection_required",
-                            "message": format!("Multiple patches available for {purl}. Re-run with the chosen UUID as the identifier (`socket-patch get <uuid>`) to select one."),
-                        },
-                        "purl": purl,
-                        "options": options_json,
-                    }));
+                    // `status` stays `selectionRequired` (the routing
+                    // signal; exit 1) beside the coded `error`.
+                    let mut env = new_envelope(common);
+                    env.status = Status::SelectionRequired;
+                    env.error = Some(EnvelopeError::new(
+                        "selection_required",
+                        format!(
+                            "Multiple patches available for {purl}. Re-run with the chosen \
+                             UUID as the identifier (`socket-patch get <uuid>`) to select one."
+                        ),
+                    ));
+                    env.set_extra("purl", serde_json::json!(purl));
+                    env.set_extra("options", serde_json::Value::Array(options_json));
+                    emit(&env);
                     return Err(1);
                 }
                 Err(SelectError::Cancelled) => {
@@ -758,9 +820,9 @@ pub(crate) fn select_patches(
 struct InstalledNarrowing {
     /// Results whose package version is present (kept for selection).
     kept: Vec<PatchSearchResult>,
-    /// Contract-shaped skip records for the filtered-out results
-    /// (`action: "skipped"` + `errorCode`), purl-sorted.
-    skip_records: Vec<serde_json::Value>,
+    /// `skipped` events (+ `errorCode`) for the filtered-out results,
+    /// purl-sorted.
+    skip_records: Vec<PatchEvent>,
     /// Run-level `(code, detail)` warnings (PnP layout refusals), for both
     /// stderr and the JSON `warnings[]`.
     warnings: Vec<(String, String)>,
@@ -922,58 +984,47 @@ async fn filter_to_installed_purls(
         } else {
             "package_not_installed"
         };
-        out.skip_records.push(serde_json::json!({
-            "purl": result.purl, "uuid": result.uuid,
-            "action": "skipped", "errorCode": error_code,
-        }));
+        out.skip_records.push(
+            PatchEvent::new(EventAction::Skipped, result.purl.as_str())
+                .with_uuid(result.uuid.as_str())
+                .with_reason(error_code, narrowing_reason(error_code)),
+        );
     }
-    out.skip_records
-        .sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
+    out.skip_records.sort_by(|a, b| a.purl.cmp(&b.purl));
     out
 }
 
-/// Fold the coarse-narrowing skip records + PnP warnings into a get JSON
-/// envelope: they were "found" by the search and skipped before download,
-/// mirroring scan's vendored/not-installed fold. Warnings land as strings
-/// (get's `warnings[]` is a string array — unlike scan's `{code, detail}`
-/// objects) with the stable code prefixed for greppability.
+/// The human `reason` of a narrowing skip, by its `errorCode`.
+fn narrowing_reason(code: &str) -> &'static str {
+    match code {
+        "yarn_pnp_unsupported" => {
+            "this project's yarn Plug'n'Play layout makes its npm packages unpatchable here"
+        }
+        "pnpm_pnp_unsupported" => {
+            "this project's pnpm Plug'n'Play layout makes its npm packages unpatchable here"
+        }
+        _ => "this package version is not installed here (--all-releases includes it)",
+    }
+}
+
+/// Fold the coarse-narrowing skip events and the run's `(code, detail)`
+/// warnings (PnP layout refusals, `policy_bypassed`, the auth fallback,
+/// release narrowing) into a get envelope: the skips were found by the
+/// search and skipped before download, mirroring scan's
+/// vendored/not-installed skips.
 fn fold_narrowing_into_result(
-    result: &mut serde_json::Value,
-    skip_records: &[serde_json::Value],
+    env: &mut Envelope,
+    skip_records: &[PatchEvent],
     warnings: &[(String, String)],
 ) {
-    let Some(obj) = result.as_object_mut() else {
-        return;
-    };
-    // Only success-shaped envelopes carry a patches[] array to fold into —
-    // error envelopes ({status, error}) keep their minimal shape.
-    if !skip_records.is_empty() && obj.get("patches").and_then(|p| p.as_array()).is_some() {
-        let n = skip_records.len() as u64;
-        for key in ["found", "skipped"] {
-            let bumped = obj.get(key).and_then(|v| v.as_u64()).unwrap_or(0) + n;
-            obj.insert(key.to_string(), serde_json::json!(bumped));
-        }
-        if let Some(patches) = obj.get_mut("patches").and_then(|p| p.as_array_mut()) {
-            patches.extend(skip_records.iter().cloned());
-        }
+    for event in skip_records {
+        env.record(event.clone());
     }
-    if !warnings.is_empty() {
-        let mut merged: Vec<String> = obj
-            .get("warnings")
-            .and_then(|w| w.as_array())
-            .map(|w| {
-                w.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        merged.extend(
-            warnings
-                .iter()
-                .map(|(code, detail)| format!("({code}) {detail}")),
-        );
-        obj.insert("warnings".to_string(), serde_json::json!(merged));
-    }
+    env.warnings.extend(
+        warnings
+            .iter()
+            .map(|(code, detail)| RunWarning::new(code.as_str(), detail.as_str())),
+    );
 }
 
 /// Download patches WITHOUT touching the manifest and return the fetched
@@ -1058,13 +1109,12 @@ pub async fn run(args: GetArgs) -> i32 {
     // client is built (org auto-resolve is itself a network call). No
     // telemetry fires here: offline gates `is_telemetry_disabled` too.
     if args.common.offline {
-        report_error(
-            args.common.json,
+        return report_error(
+            &args.common,
             "offline_unsupported",
             "Fetching patches needs network access, so `get` cannot run with \
              --offline/SOCKET_OFFLINE (strict airgap)",
         );
-        return 1;
     }
 
     // Classify the identifier with the shared target grammar (the same
@@ -1167,7 +1217,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 // event, since it is not this run's patch.
                 if !args.common.purl_ecosystem_selected(&patch.purl) {
                     if args.common.json {
-                        print_json(&empty_result_json("not_found"));
+                        emit_empty(&args.common, Status::NotFound, &[]);
                     } else if !args.common.silent {
                         println!(
                             "No patch found with UUID: {} in the selected ecosystems \
@@ -1280,9 +1330,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 )
                 .await;
                 if args.common.json {
-                    let mut result = empty_result_json("not_found");
-                    fold_narrowing_into_result(&mut result, &[], &org_warnings);
-                    print_json(&result);
+                    emit_empty(&args.common, Status::NotFound, &org_warnings);
                 } else if !args.common.silent {
                     println!("No patch found with UUID: {}", args.identifier);
                 }
@@ -1294,7 +1342,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     e,
                     fallback_to_proxy,
                     &telemetry,
-                    args.common.json,
+                    &args.common,
                 )
                 .await;
             }
@@ -1325,7 +1373,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         e,
                         fallback_to_proxy,
                         &telemetry,
-                        args.common.json,
+                        &args.common,
                     )
                     .await;
                 }
@@ -1341,7 +1389,7 @@ pub async fn run(args: GetArgs) -> i32 {
             if all_packages.is_empty() {
                 status.finish();
                 if args.common.json {
-                    print_json(&empty_result_json("no_packages"));
+                    emit_empty(&args.common, Status::NoPackages, &[]);
                 } else if !args.common.silent {
                     println!("{}", no_packages_message(args.common.global));
                 }
@@ -1359,7 +1407,7 @@ pub async fn run(args: GetArgs) -> i32 {
             let matched = installed_target_matches(&target, &all_packages);
             if matched.is_empty() {
                 if args.common.json {
-                    print_json(&empty_result_json("no_match"));
+                    emit_empty(&args.common, Status::NoMatch, &[]);
                 } else if !args.common.silent {
                     println!("No packages matching \"{}\" found.", args.identifier);
                     // Near names are only ever suggested, never acted on.
@@ -1376,10 +1424,7 @@ pub async fn run(args: GetArgs) -> i32 {
             // on (`lodash` beside `@types/lodash` is `lodash` alone).
             let target = match target.settle(matched.iter().map(String::as_str)) {
                 Ok(settled) => settled,
-                Err(msg) => {
-                    report_error(args.common.json, "ambiguous_target", &msg);
-                    return 1;
-                }
+                Err(msg) => return report_error(&args.common, "ambiguous_target", &msg),
             };
             let matched: Vec<String> = matched
                 .into_iter()
@@ -1424,7 +1469,7 @@ pub async fn run(args: GetArgs) -> i32 {
                             e,
                             fallback_to_proxy,
                             &telemetry,
-                            args.common.json,
+                            &args.common,
                         )
                         .await;
                     }
@@ -1447,9 +1492,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if search_response.patches.is_empty() {
         if args.common.json {
-            let mut result = empty_result_json("not_found");
-            fold_narrowing_into_result(&mut result, &[], &org_warnings);
-            print_json(&result);
+            emit_empty(&args.common, Status::NotFound, &org_warnings);
         } else if !args.common.silent {
             println!("No patches found for {}: {}", id_type, args.identifier);
         }
@@ -1468,19 +1511,17 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if accessible.is_empty() {
         if args.common.json {
-            let mut result = serde_json::json!({
-                "status": "paid_required",
-                "found": search_response.patches.len(),
-                "downloaded": 0,
-                "applied": 0,
-                "patches": search_response.patches.iter().map(|p| serde_json::json!({
-                    "purl": p.purl,
-                    "uuid": p.uuid,
-                    "tier": p.tier,
-                })).collect::<Vec<_>>(),
-            });
-            fold_narrowing_into_result(&mut result, &[], &org_warnings);
-            print_json(&result);
+            // `paidRequired` (exit 0): one `skipped` / `paid_required`
+            // event per patch found.
+            let mut env = new_envelope(&args.common);
+            env.status = Status::PaidRequired;
+            let skips: Vec<PatchEvent> = search_response
+                .patches
+                .iter()
+                .map(|p| paid_required_event(Some(&p.purl), &p.uuid, &p.tier))
+                .collect();
+            fold_narrowing_into_result(&mut env, &skips, &org_warnings);
+            emit(&env);
         } else if !args.common.silent {
             let all: Vec<&PatchSearchResult> = search_response.patches.iter().collect();
             if id_type == TargetKind::Name && !quiet {
@@ -1529,10 +1570,10 @@ pub async fn run(args: GetArgs) -> i32 {
             .filter(|p| accessible_uuids.contains(p.uuid.as_str()))
             .cloned()
             .collect();
-        let skips: Vec<serde_json::Value> = narrowing
+        let skips: Vec<PatchEvent> = narrowing
             .skip_records
             .into_iter()
-            .filter(|r| accessible_uuids.contains(r["uuid"].as_str().unwrap_or_default()))
+            .filter(|r| accessible_uuids.contains(r.uuid.as_deref().unwrap_or_default()))
             .collect();
         (kept_accessible, narrowing.kept, skips, narrowing.warnings)
     };
@@ -1556,15 +1597,10 @@ pub async fn run(args: GetArgs) -> i32 {
         // `no_match`, which is pinned to the package-name path):
         // exit 0, the skips carry the detail via their errorCode.
         if args.common.json {
-            let mut result = serde_json::json!({
-                "status": "not_installed",
-                "found": narrow_skips.len(),
-                "downloaded": 0,
-                "applied": 0,
-                "patches": narrow_skips,
-            });
-            fold_narrowing_into_result(&mut result, &[], &narrow_warnings);
-            print_json(&result);
+            let mut env = new_envelope(&args.common);
+            env.status = Status::NotInstalled;
+            fold_narrowing_into_result(&mut env, &narrow_skips, &narrow_warnings);
+            emit(&env);
         } else if !args.common.silent {
             println!("{}", format_all_narrowed(&narrow_skips));
             if !quiet && args.common.verbose {
@@ -1656,7 +1692,7 @@ pub async fn run(args: GetArgs) -> i32 {
         narrow_warnings.extend(
             variant_warnings
                 .into_iter()
-                .map(|w| ("release_narrowing".to_string(), w)),
+                .map(|w| (RELEASE_NARROWING.to_string(), w)),
         );
         return agent_dry_run(&args, &selected, &narrow_skips, &narrow_warnings).await;
     }
@@ -1698,7 +1734,7 @@ pub async fn run(args: GetArgs) -> i32 {
             narrow_warnings.extend(
                 variant_warnings
                     .into_iter()
-                    .map(|w| ("release_narrowing".to_string(), w)),
+                    .map(|w| (RELEASE_NARROWING.to_string(), w)),
             );
             return run_get_hosted(
                 &args,
@@ -1732,22 +1768,16 @@ pub async fn run(args: GetArgs) -> i32 {
         lock_timeout: args.common.lock_timeout,
         verbose: args.common.verbose,
     };
-    let (code, mut result_json) = download_and_apply_patches_with(&selected, &params, &run).await;
-    // A download-phase HARD error (lock refused, unreadable manifest,
-    // failed manifest write) is an `error`-status envelope the engine has
-    // ALREADY printed — printing below would put a second JSON document on
-    // stdout (get's `--json` contract is exactly one per run). Per-patch
-    // failures are NOT this case: they ride a success-shaped
-    // (`partial_failure`) envelope the engine leaves for us to print.
-    if result_json["status"] == "error" {
-        return code;
-    }
-    fold_narrowing_into_result(&mut result_json, &narrow_skips, &narrow_warnings);
-
+    let mut env = new_envelope(&args.common);
+    // The narrowing skips came first (before any download).
+    fold_narrowing_into_result(&mut env, &narrow_skips, &narrow_warnings);
+    // The engine records into `env` and never prints it: exactly one JSON
+    // document per run, a hard error (lock refused, unloadable manifest,
+    // failed manifest write) included.
+    let code = download_and_apply_patches_into(&selected, &params, &run, &mut env).await;
     if args.common.json {
-        print_json(&result_json);
+        emit(&env);
     }
-
     code
 }
 
@@ -1764,19 +1794,11 @@ async fn report_paid_required_uuid(
 ) -> i32 {
     track_patch_fetch_failed(patch_id, "paid_required", fallback_to_proxy, telemetry).await;
     if args.common.json {
-        let mut record = serde_json::json!({ "uuid": patch_id, "tier": "paid" });
-        if let Some(purl) = purl {
-            record["purl"] = serde_json::json!(purl);
-        }
-        let mut result = serde_json::json!({
-            "status": "paid_required",
-            "found": 1,
-            "downloaded": 0,
-            "applied": 0,
-            "patches": [record],
-        });
-        fold_narrowing_into_result(&mut result, &[], org_warnings);
-        print_json(&result);
+        let mut env = new_envelope(&args.common);
+        env.status = Status::PaidRequired;
+        let skip = paid_required_event(purl, patch_id, "paid");
+        fold_narrowing_into_result(&mut env, &[skip], org_warnings);
+        emit(&env);
     } else if !args.common.silent {
         let name = purl.map(|p| normalize_purl(p).into_owned());
         println!(
@@ -1790,40 +1812,34 @@ async fn report_paid_required_uuid(
 /// Agent-mode `--dry-run`: classify each selected patch against the
 /// manifest (read-only) and report what a wet run would do — no download,
 /// no manifest or blob write, no apply, no prompt. JSON carries
-/// `dryRun: true` and per-patch `would_add` / `would_update` (+`oldUuid`)
-/// / `skipped` records, plus the narrowing skips.
+/// `dryRun: true`, one `verified` event per patch a wet run would record
+/// (`oldUuid` on a would-be update), `skipped` / `already_in_manifest` for
+/// the rest, plus the narrowing skips.
 async fn agent_dry_run(
     args: &GetArgs,
     selected: &[PatchSearchResult],
-    narrow_skips: &[serde_json::Value],
+    narrow_skips: &[PatchEvent],
     narrow_warnings: &[(String, String)],
 ) -> i32 {
     // Fail closed like the wet run: a preview over an unreadable manifest
     // would promise an outcome the wet run refuses.
-    let manifest = match read_manifest(&args.common.resolved_manifest_path()).await {
+    let manifest_path = args.common.resolved_manifest_path();
+    let manifest = match read_manifest(&manifest_path).await {
         Ok(m) => m.unwrap_or_else(PatchManifest::new),
-        Err(e) => {
-            report_error(
-                args.common.json,
-                "manifest_unreadable",
-                format!("Failed to read manifest: {e}"),
-            );
-            return 1;
-        }
+        Err(e) => return report_manifest_error(&args.common, &manifest_path, &e),
     };
-    let mut records = Vec::new();
+    let mut events = Vec::new();
     let mut lines = Vec::new();
     let mut changing = 0usize;
-    let mut skipped = 0usize;
     for p in selected {
         let shown = normalize_purl(&p.purl);
+        let event =
+            PatchEvent::new(EventAction::Verified, p.purl.as_str()).with_uuid(p.uuid.as_str());
         match decide_patch_action(&manifest, &p.purl, &p.uuid) {
             PatchAction::Added => {
                 changing += 1;
                 lines.push(format!("  [would-add] {shown}"));
-                records.push(serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "would_add",
-                }));
+                events.push(event);
             }
             PatchAction::Updated { old_uuid } => {
                 changing += 1;
@@ -1831,32 +1847,26 @@ async fn agent_dry_run(
                     "  [would-update] {shown} (replacing {})",
                     crate::ui::short_uuid(&old_uuid)
                 ));
-                records.push(serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "would_update",
-                    "oldUuid": old_uuid,
-                }));
+                events.push(event.with_old_uuid(old_uuid));
             }
             PatchAction::Skipped => {
-                skipped += 1;
                 lines.push(format!("  [skip] {shown} (already in manifest)"));
-                records.push(serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "skipped",
-                }));
+                events.push(
+                    PatchEvent::new(EventAction::Skipped, p.purl.as_str())
+                        .with_uuid(p.uuid.as_str())
+                        .with_reason(ALREADY_IN_MANIFEST, "already in manifest"),
+                );
             }
         }
     }
     if args.common.json {
-        let mut result = serde_json::json!({
-            "status": "success",
-            "dryRun": true,
-            "found": selected.len(),
-            "downloaded": 0,
-            "skipped": skipped,
-            "applied": 0,
-            "patches": records,
-        });
-        fold_narrowing_into_result(&mut result, narrow_skips, narrow_warnings);
-        print_json(&result);
+        let mut env = new_envelope(&args.common);
+        env.dry_run = true;
+        fold_narrowing_into_result(&mut env, narrow_skips, narrow_warnings);
+        for event in events {
+            env.record(event);
+        }
+        emit(&env);
     } else if !args.common.silent {
         for line in &lines {
             println!("{line}");
@@ -1896,14 +1906,7 @@ async fn save_patch_record(
         // Fail closed like the download flow: an unreadable manifest
         // treated as empty would be rewritten below with only this one
         // patch, destroying every tracked record.
-        Err(e) => {
-            report_error(
-                args.common.json,
-                "manifest_unreadable",
-                format!("Failed to read manifest: {e}"),
-            );
-            return Err(1);
-        }
+        Err(e) => return Err(report_manifest_error(&args.common, manifest_path, &e)),
     };
 
     // Build the manifest `files` map, retaining patch-added new files
@@ -1916,15 +1919,14 @@ async fn save_patch_record(
     // as applied would claim protection while writing nothing. Fail
     // loudly instead of counting a defective patch as `applied:1`.
     if files.is_empty() {
-        report_error(
-            args.common.json,
+        return Err(report_error(
+            &args.common,
             "patch_no_applicable_files",
             format!(
                 "Patch {} has no applicable files; nothing to apply",
                 patch.purl
             ),
-        );
-        return Err(1);
+        ));
     }
 
     // Classify against the manifest state BEFORE the insert, with the same
@@ -1939,22 +1941,17 @@ async fn save_patch_record(
     let blobs_dir = socket_dir.join("blobs");
     let Ok(new_blobs) = write_all_patch_blobs(&blobs_dir, patch, args.common.json).await else {
         if args.common.json {
-            print_json(&serde_json::json!({
-                "status": "error",
-                "found": 1,
-                "downloaded": 0,
-                "applied": 0,
-                "error": {
-                    "code": "blob_write_failed",
-                    "message": "Blob decode or write failed",
-                },
-                "patches": [{
-                    "purl": patch.purl,
-                    "uuid": patch.uuid,
-                    "action": "failed",
-                    "error": "Blob decode or write failed",
-                }],
-            }));
+            let mut env = new_envelope(&args.common);
+            env.record(
+                PatchEvent::new(EventAction::Failed, patch.purl.as_str())
+                    .with_uuid(patch.uuid.as_str())
+                    .with_error(BLOB_WRITE_FAILED, "Blob decode or write failed"),
+            );
+            env.mark_error(EnvelopeError::new(
+                BLOB_WRITE_FAILED,
+                "Blob decode or write failed",
+            ));
+            emit(&env);
         } else {
             eprintln!(
                 "Error: Blob decode or write failed for patch {}",
@@ -1970,12 +1967,11 @@ async fn save_patch_record(
     if let Err(e) = write_manifest(manifest_path, &manifest).await {
         // No record points at the blobs just written: unwind exactly those.
         unwind_new_blobs(&blobs_dir, &new_blobs).await;
-        report_error(
-            args.common.json,
+        return Err(report_error(
+            &args.common,
             "manifest_write_failed",
             format!("Failed to write manifest: {e}"),
-        );
-        return Err(1);
+        ));
     }
     Ok(action)
 }
@@ -2016,7 +2012,12 @@ async fn save_and_apply_patch(
     let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout) {
         Ok(guard) => guard,
         Err(e) => {
-            report_lock_failure(args.common.json, &socket_dir, &e, lock_timeout);
+            let err = report_lock_failure(args.common.json, &socket_dir, &e, lock_timeout);
+            if args.common.json {
+                let mut env = new_envelope(&args.common);
+                env.mark_error(err);
+                emit(&env);
+            }
             return 1;
         }
     };
@@ -2037,29 +2038,14 @@ async fn save_and_apply_patch(
         drop(guard);
         None
     };
-    let action_label = match &action {
-        PatchAction::Added => "added",
-        PatchAction::Updated { .. } => "updated",
-        PatchAction::Skipped => "skipped",
-    };
-
     // Vendored-uuid drift (mirrors `download_and_apply_patches_with`): the user
     // explicitly fetched this uuid; if the vendor ledger still wires a
     // different one, VEX verification fails closed (`vendor_uuid_mismatch`)
     // until a `vendor` run refreshes the committed artifact.
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings: Vec<RunWarning> = Vec::new();
+    let recorded = [(patch.purl.clone(), patch.uuid.clone())];
     if changed {
-        warn_on_vendored_uuid_drift(
-            &args.common.cwd,
-            quiet,
-            &[serde_json::json!({
-                "purl": patch.purl,
-                "uuid": patch.uuid,
-                "action": action_label,
-            })],
-            &mut warnings,
-        )
-        .await;
+        warn_on_vendored_uuid_drift(&args.common.cwd, quiet, &recorded, &mut warnings).await;
     }
 
     // Progress narration goes to stderr, like the search path's.
@@ -2095,55 +2081,44 @@ async fn save_and_apply_patch(
     }
     let apply_succeeded = apply_report.as_ref().is_some_and(|r| r.code == 0);
 
-    // The apply step ran (not --save-only) but failed →
-    // partial failure. The `status` field must agree with the exit code
-    // returned below; a hardcoded `success` alongside a non-zero exit
-    // misleads JSON consumers.
+    // The apply step ran (not --save-only) but failed → partial failure:
+    // `record_apply_outcome` records a `failed` event for it, so the
+    // envelope's status agrees with the exit code returned below. No
+    // "download failed" concept here — a blob failure early-returns with
+    // status `error` above — so only the apply step can degrade us.
     let apply_failed = !apply_succeeded && !args.save_only;
-    // No "download failed" concept here — a blob failure early-returns
-    // with status `error` above — so only the apply step can degrade us.
-    let (status, exit_code) = run_outcome(false, apply_failed);
+    let exit_code = run_outcome(false, apply_failed);
 
     if args.common.json {
-        let mut patch_record = serde_json::json!({
-            "purl": patch.purl,
-            "uuid": patch.uuid,
-            "action": action_label,
+        let mut env = new_envelope(&args.common);
+        fold_narrowing_into_result(&mut env, &[], run_warnings);
+        // The metadata rides only a changed record — an `already_in_manifest`
+        // skip means the consumer already saw it last time.
+        let event = match &action {
+            PatchAction::Added => PatchEvent::new(EventAction::Downloaded, patch.purl.as_str())
+                .with_details(patch_event_metadata(patch)),
+            PatchAction::Updated { old_uuid } => {
+                PatchEvent::new(EventAction::Updated, patch.purl.as_str())
+                    .with_old_uuid(old_uuid.as_str())
+                    .with_details(patch_event_metadata(patch))
+            }
+            PatchAction::Skipped => PatchEvent::new(EventAction::Skipped, patch.purl.as_str())
+                .with_reason(ALREADY_IN_MANIFEST, "already in manifest"),
+        };
+        env.record(event.with_uuid(patch.uuid.as_str()));
+        env.warnings.extend(warnings);
+        // A failed apply names what failed (#424); the manifest names the
+        // uuid of any other failing record.
+        let manifest = if apply_report.as_ref().is_some_and(|r| r.code != 0) {
+            Box::pin(read_manifest(&manifest_path)).await.ok().flatten()
+        } else {
+            None
+        };
+        record_apply_outcome(&mut env, &recorded, apply_report.as_ref(), |purl| {
+            let record = manifest.as_ref()?.patches.get(purl)?;
+            Some(record.uuid.clone())
         });
-        if let PatchAction::Updated { old_uuid } = &action {
-            patch_record["oldUuid"] = serde_json::json!(old_uuid);
-        }
-        if changed {
-            // Only enrich added/updated records — a `skipped` record means
-            // the consumer already saw the metadata last time.
-            merge_metadata(&mut patch_record, patch_event_metadata(patch));
-        }
-        let mut result_json = serde_json::json!({
-            "status": status,
-            "found": 1,
-            "downloaded": if changed { 1 } else { 0 },
-            "applied": if apply_succeeded { 1 } else { 0 },
-            "patches": [patch_record],
-        });
-        // A failed apply names what failed (#424); `failed` appears only
-        // then, so a clean run's envelope is unchanged.
-        if let Some(report) = apply_report.as_ref().filter(|r| r.code != 0) {
-            // The manifest names the uuid of any other failing record.
-            let recorded = Box::pin(read_manifest(&manifest_path)).await.ok().flatten();
-            result_json["failed"] = serde_json::json!(0);
-            let applied = fold_apply_failures(&mut result_json, report, |purl| {
-                let record = recorded.as_ref()?.patches.get(purl)?;
-                Some(record.uuid.clone())
-            });
-            result_json["applied"] = serde_json::json!(applied);
-        }
-        // Same contract as `download_and_apply_patches_with`: omitted when clean.
-        warnings.extend(apply_warning_lines(apply_report.as_ref()));
-        if !warnings.is_empty() {
-            result_json["warnings"] = serde_json::json!(warnings);
-        }
-        fold_narrowing_into_result(&mut result_json, &[], run_warnings);
-        print_json(&result_json);
+        emit(&env);
     }
 
     exit_code
@@ -2189,13 +2164,14 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
 /// hosted engine ([`super::scan::boxed_run_redirect_selected`]) — lockfile
 /// rewrite only, no manifest, no blobs, no ledger — so the on-disk result
 /// matches `scan --mode hosted` selecting the same patches. The engine owns
-/// all output (and honors `--dry-run` internally); in JSON mode it nests its
-/// `redirect` block into the get base envelope passed as `scan_result`.
+/// all output (and honors `--dry-run` internally); in JSON mode it records
+/// its events (`details.mode: "hosted"`) into the get envelope passed as
+/// `scan_result` and prints it.
 async fn run_get_hosted(
     args: &GetArgs,
     api_client: &ApiClient,
     selected: &[PatchSearchResult],
-    narrow_skips: &[serde_json::Value],
+    narrow_skips: &[PatchEvent],
     narrow_warnings: &[(String, String)],
 ) -> i32 {
     let pairs: Vec<(String, String)> = selected
@@ -2203,16 +2179,11 @@ async fn run_get_hosted(
         .map(|s| (s.purl.clone(), s.uuid.clone()))
         .collect();
     // `scan_result` iff --json: the engine's human/JSON split keys on
-    // common.json, and a --json caller passing None would get a minimal
-    // envelope that drops get's keys (see run_redirect_selected's doc).
+    // common.json (see run_redirect_selected's doc).
     let scan_result = args.common.json.then(|| {
-        let mut result = serde_json::json!({
-            "status": "success",
-            "found": pairs.len() + narrow_skips.len(),
-            "patches": narrow_skips,
-        });
-        fold_narrowing_into_result(&mut result, &[], narrow_warnings);
-        result
+        let mut env = new_envelope(&args.common);
+        fold_narrowing_into_result(&mut env, narrow_skips, narrow_warnings);
+        env
     });
     // Embedded VEX stays a scan/vendor feature (get has no --vex): a
     // default-off VexEmbedArgs — deliberately NOT env-bound here, so an
@@ -2255,10 +2226,12 @@ async fn run_get_vendored(
     use_public_proxy: bool,
     selected: &[PatchSearchResult],
     prefetched: Option<&PatchResponse>,
-    narrow_skips: &[serde_json::Value],
+    narrow_skips: &[PatchEvent],
     narrow_warnings: &[(String, String)],
     telemetry: &TelemetryAuth,
 ) -> i32 {
+    let mut env = new_envelope(&args.common);
+    fold_narrowing_into_result(&mut env, narrow_skips, narrow_warnings);
     // Dry run: ledger-classification preview only (scan's posture) — no
     // download, no vendor step, no writes.
     if args.common.dry_run {
@@ -2267,7 +2240,7 @@ async fn run_get_vendored(
             selected.iter().map(|p| p.purl.as_str()),
         )
         .await;
-        let preview = super::scan::preview_vendor_json(
+        let preview = super::scan::preview_vendor(
             &args.common.cwd,
             selected,
             &super::hosted_unwind::patch_server_origins(&args.common),
@@ -2275,17 +2248,11 @@ async fn run_get_vendored(
         )
         .await;
         if args.common.json {
-            let mut result = serde_json::json!({
-                "status": "success",
-                "found": selected.len() + narrow_skips.len(),
-                "patches": narrow_skips,
-            });
-            fold_narrowing_into_result(&mut result, &[], narrow_warnings);
-            result["vendor"] = preview;
-            print_json(&result);
+            preview.record_into(&mut env);
+            emit(&env);
         } else if !args.common.silent {
             println!("{}", format_dry_run("download and vendor", selected.len()));
-            super::scan::print_dry_run_refusals(&preview);
+            preview.print_refusals();
         }
         return 0;
     }
@@ -2301,18 +2268,9 @@ async fn run_get_vendored(
         // `.socket/` is created on a fresh project). The already-fetched
         // patch is the only network traffic of a refused run.
         //
-        // JSON shape (contract: `get <uuid> --mode vendored` pre-record
-        // refusal; the record carries BOTH `errorCode` and `error` like the
-        // search path's failed records, and the envelope carries `skipped`
-        // like this path's success shape):
-        //
-        // {
-        //   "status": "error",
-        //   "found": 1, "downloaded": 0, "skipped": 0, "failed": 1,
-        //   "error": { "code": "<vendor code>", "message": "<detail>" },
-        //   "patches": [{ "purl": "…", "uuid": "…", "action": "failed",
-        //                 "errorCode": "<vendor code>", "error": "<detail>" }]
-        // }
+        // JSON: `status: "error"` with `error: {code: <vendor code>,
+        // message: <detail>}` and the patch's `failed` event (same
+        // `errorCode` / `error`, `details.mode: "vendored"`).
         //
         // Human: `Error (<code>): <detail>` on stderr — an error, so it is
         // exempt from `--silent` like every other `Error (…)` line here.
@@ -2339,21 +2297,14 @@ async fn run_get_vendored(
             )
             .await;
             if args.common.json {
-                print_json(&serde_json::json!({
-                    "status": "error",
-                    "found": 1,
-                    "downloaded": 0,
-                    "skipped": 0,
-                    "failed": 1,
-                    "error": { "code": code, "message": detail },
-                    "patches": [{
-                        "purl": patch.purl,
-                        "uuid": patch.uuid,
-                        "action": "failed",
-                        "errorCode": code,
-                        "error": detail,
-                    }],
-                }));
+                env.record(tag_mode(
+                    PatchEvent::new(EventAction::Failed, patch.purl.as_str())
+                        .with_uuid(patch.uuid.as_str())
+                        .with_error(*code, detail.as_str()),
+                    Some("vendored"),
+                ));
+                env.mark_error(EnvelopeError::new(*code, detail.as_str()));
+                emit(&env);
             } else {
                 eprintln!(
                     "{}",
@@ -2374,7 +2325,7 @@ async fn run_get_vendored(
     let prefetched_views: HashMap<String, PatchResponse> = prefetched
         .map(|p| HashMap::from([(p.uuid.clone(), p.clone())]))
         .unwrap_or_default();
-    let (dl_code, mut result, records) = if prefetched.is_some() {
+    let download: DetachedDownload = if prefetched.is_some() {
         // The preflight above already read the lock: hand its outcome down.
         let vendor_state = load_state(&args.common.cwd).await;
         Box::pin(download_patch_records_preflighted(
@@ -2399,7 +2350,7 @@ async fn run_get_vendored(
         ))
         .await
     };
-    fold_narrowing_into_result(&mut result, narrow_skips, narrow_warnings);
+    let (dl_code, _, records) = download.into_envelope(&mut env);
 
     // The vendor step (scan's, verbatim): apply lock, in-memory staging
     // seeded with the blobs fetched above, the engine over exactly the
@@ -2420,14 +2371,11 @@ async fn run_get_vendored(
     {
         Ok((has_errors, venv)) => {
             if args.common.json {
-                result["status"] = serde_json::json!(if has_errors {
-                    "partial_failure"
-                } else {
-                    "success"
-                });
-                result["vendor"] =
-                    serde_json::to_value(&venv).unwrap_or_else(|_| serde_json::json!({}));
-                print_json(&result);
+                super::scan::vendor_flow::merge_vendor_envelope(&mut env, venv);
+                if has_errors {
+                    env.mark_partial_failure();
+                }
+                emit(&env);
             }
             i32::from(has_errors)
         }
@@ -2437,14 +2385,10 @@ async fn run_get_vendored(
                 // included) must reach the JSON consumer even though the
                 // run aborts here.
                 if let Some(venv) = venv {
-                    result["vendor"] =
-                        serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
+                    super::scan::vendor_flow::merge_vendor_envelope(&mut env, *venv);
                 }
-                crate::json_envelope::set_error(
-                    &mut result,
-                    crate::json_envelope::EnvelopeError::new(code, message),
-                );
-                print_json(&result);
+                env.mark_error(EnvelopeError::new(code, message));
+                emit(&env);
             } else {
                 eprintln!(
                     "{}",
@@ -3194,49 +3138,20 @@ mod tests {
     }
 
     // --- run_outcome -----------------------------------------------------
-    // The `status` field and the process exit code are derived from the
-    // same predicate: a failed *apply* step (no download failures) must
-    // still report `partial_failure` AND exit 1.
+    // Exit 1 for a download or an apply failure; the envelope's status
+    // follows from the `failed` events those runs record.
 
     #[test]
-    fn run_outcome_clean_is_success_exit_zero() {
-        assert_eq!(run_outcome(false, false), ("success", 0));
-    }
-
-    #[test]
-    fn run_outcome_download_failure_is_partial_exit_one() {
-        assert_eq!(run_outcome(true, false), ("partial_failure", 1));
-    }
-
-    #[test]
-    fn run_outcome_apply_failure_alone_is_partial_exit_one() {
+    fn run_outcome_exits_one_on_any_failure() {
+        assert_eq!(run_outcome(false, false), 0);
+        assert_eq!(run_outcome(true, false), 1);
         // The load-bearing case: nothing failed to download, but the apply
-        // step failed. status MUST agree with the non-zero exit code.
-        assert_eq!(run_outcome(false, true), ("partial_failure", 1));
+        // step failed.
+        assert_eq!(run_outcome(false, true), 1);
+        assert_eq!(run_outcome(true, true), 1);
     }
 
-    #[test]
-    fn run_outcome_both_failures_is_partial_exit_one() {
-        assert_eq!(run_outcome(true, true), ("partial_failure", 1));
-    }
-
-    #[test]
-    fn run_outcome_status_and_exit_never_disagree() {
-        // Exhaustive: a `success` status iff exit 0, `partial_failure` iff
-        // exit 1, for every input combination.
-        for pf in [false, true] {
-            for af in [false, true] {
-                let (status, code) = run_outcome(pf, af);
-                assert_eq!(
-                    status == "success",
-                    code == 0,
-                    "status/exit disagree for patches_failed={pf}, apply_failed={af}"
-                );
-            }
-        }
-    }
-
-    // --- fold_apply_failures (#424) ---------------------------------------
+    // --- record_apply_outcome (#424) --------------------------------------
 
     fn failure(purl: &str, code: &str, error: &str) -> crate::commands::apply::ApplyFailure {
         crate::commands::apply::ApplyFailure {
@@ -3259,45 +3174,81 @@ mod tests {
         }
     }
 
+    fn recorded(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(p, u)| (p.to_string(), u.to_string()))
+            .collect()
+    }
+
+    /// `(action, purl, uuid, errorCode)` of every event, for compact asserts.
+    fn outcomes(env: &Envelope) -> Vec<(String, String, String, String)> {
+        env.events
+            .iter()
+            .map(|e| {
+                (
+                    serde_json::to_value(e.action)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    e.purl.clone().unwrap_or_default(),
+                    e.uuid.clone().unwrap_or_default(),
+                    e.error_code.clone().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    fn o(action: &str, purl: &str, uuid: &str, code: &str) -> (String, String, String, String) {
+        (action.into(), purl.into(), uuid.into(), code.into())
+    }
+
     #[test]
-    fn fold_apply_failures_marks_the_failed_record_and_drops_metadata() {
-        let mut env = serde_json::json!({
-            "failed": 0,
-            "patches": [
-                {"purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "added", "license": "MIT"},
-                {"purl": "pkg:npm/b@1.0.0", "uuid": "ub", "action": "updated", "oldUuid": "o"},
-            ],
-        });
+    fn record_apply_outcome_clean_apply_records_every_patch_applied() {
+        let mut env = Envelope::new(JsonCommand::Get);
+        let report = ApplyRunReport::default();
+        let recs = recorded(&[("pkg:npm/a@1.0.0", "ua"), ("pkg:npm/b@1.0.0", "ub")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
+        assert_eq!(
+            outcomes(&env),
+            vec![
+                o("applied", "pkg:npm/a@1.0.0", "ua", ""),
+                o("applied", "pkg:npm/b@1.0.0", "ub", ""),
+            ]
+        );
+        assert_eq!(env.status, Status::Success);
+        assert_eq!(env.summary.applied, 2);
+        // No apply ran: nothing recorded.
+        let mut env = Envelope::new(JsonCommand::Get);
+        record_apply_outcome(&mut env, &recs, None, |_| None);
+        assert!(env.events.is_empty());
+    }
+
+    #[test]
+    fn record_apply_outcome_marks_the_failed_patch_and_counts_the_applied_one() {
+        let mut env = Envelope::new(JsonCommand::Get);
         let report = report_with(
             vec![failure("pkg:npm/a@1.0.0", "apply_failed", "denied")],
             &["pkg:npm/b@1.0.0"],
         );
+        let recs = recorded(&[("pkg:npm/a@1.0.0", "ua"), ("pkg:npm/b@1.0.0", "ub")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
         assert_eq!(
-            fold_apply_failures(&mut env, &report, |_| None),
-            1,
-            "b applied"
+            outcomes(&env),
+            vec![
+                o("failed", "pkg:npm/a@1.0.0", "ua", "apply_failed"),
+                o("applied", "pkg:npm/b@1.0.0", "ub", ""),
+            ]
         );
-        assert_eq!(
-            env["patches"][0],
-            serde_json::json!({
-                "purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "failed",
-                "errorCode": "apply_failed", "error": "denied",
-            })
-        );
-        assert_eq!(env["patches"][1]["action"], "updated", "{env}");
-        assert_eq!(env["failed"], 1, "{env}");
-        assert!(env.get("errorCode").is_none(), "{env}");
+        assert_eq!(env.events[0].error.as_deref(), Some("denied"));
+        assert_eq!(env.status, Status::PartialFailure);
+        assert!(env.error.is_none());
     }
 
     #[test]
-    fn fold_apply_failures_matches_percent_encoded_and_base_purl_keys() {
-        let mut env = serde_json::json!({
-            "failed": 0,
-            "patches": [
-                {"purl": "pkg:npm/%40scope/a@1.0.0", "uuid": "u1", "action": "added"},
-                {"purl": "pkg:pypi/six@1.16.0?artifact_id=w", "uuid": "u2", "action": "added"},
-            ],
-        });
+    fn record_apply_outcome_matches_percent_encoded_and_base_purl_keys() {
+        let mut env = Envelope::new(JsonCommand::Get);
         // An unqualified (base) key covers its qualified release variants.
         let report = report_with(
             vec![
@@ -3306,25 +3257,32 @@ mod tests {
             ],
             &[],
         );
-        assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 0);
-        assert_eq!(env["patches"][0]["action"], "failed", "{env}");
-        assert_eq!(env["patches"][1]["action"], "failed", "{env}");
-        assert_eq!(env["patches"][1]["errorCode"], "package_not_installed");
-        assert_eq!(env["patches"].as_array().unwrap().len(), 2, "{env}");
-        assert_eq!(env["failed"], 2, "{env}");
+        let recs = recorded(&[
+            ("pkg:npm/%40scope/a@1.0.0", "u1"),
+            ("pkg:pypi/six@1.16.0?artifact_id=w", "u2"),
+        ]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
+        assert_eq!(
+            outcomes(&env),
+            vec![
+                o("failed", "pkg:npm/%40scope/a@1.0.0", "u1", "apply_failed"),
+                o(
+                    "failed",
+                    "pkg:pypi/six@1.16.0?artifact_id=w",
+                    "u2",
+                    "package_not_installed"
+                ),
+            ]
+        );
+        assert_eq!(env.summary.failed, 2);
     }
 
     #[test]
-    fn fold_apply_failures_never_blames_a_sibling_variant() {
-        // A qualified failure that matches no selected record must not be
+    fn record_apply_outcome_never_blames_a_sibling_variant() {
+        // A qualified failure that matches no selected patch must not be
         // pinned on a selected sibling variant that applied: it gets its
-        // own record, and the sibling stays applied.
-        let mut env = serde_json::json!({
-            "failed": 0,
-            "patches": [
-                {"purl": "pkg:pypi/six@1.16.0?artifact_id=w", "uuid": "u1", "action": "added"},
-            ],
-        });
+        // own event, and the sibling stays applied.
+        let mut env = Envelope::new(JsonCommand::Get);
         let report = report_with(
             vec![failure(
                 "pkg:pypi/six@1.16.0?artifact_id=s",
@@ -3334,94 +3292,100 @@ mod tests {
             &["pkg:pypi/six@1.16.0?artifact_id=w"],
         );
         let uuid_of = |p: &str| p.ends_with("=s").then(|| "u0".to_string());
-        assert_eq!(fold_apply_failures(&mut env, &report, uuid_of), 1);
-        assert_eq!(env["patches"][0]["action"], "added", "{env}");
+        let recs = recorded(&[("pkg:pypi/six@1.16.0?artifact_id=w", "u1")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), uuid_of);
         assert_eq!(
-            env["patches"][1]["purl"],
-            "pkg:pypi/six@1.16.0?artifact_id=s"
+            outcomes(&env),
+            vec![
+                o("applied", "pkg:pypi/six@1.16.0?artifact_id=w", "u1", ""),
+                o(
+                    "failed",
+                    "pkg:pypi/six@1.16.0?artifact_id=s",
+                    "u0",
+                    "apply_failed"
+                ),
+            ]
         );
-        assert_eq!(env["patches"][1]["uuid"], "u0", "{env}");
-        assert_eq!(env["patches"][1]["action"], "failed", "{env}");
-        assert_eq!(env["failed"], 1, "{env}");
     }
 
     #[test]
-    fn fold_apply_failures_counts_only_patches_apply_reported_applied() {
-        // `c` is selected and recorded but apply never patched it (not
-        // installed: only a warning beside `a`'s real failure), so it must
-        // not count as applied.
-        let mut env = serde_json::json!({
-            "failed": 0,
-            "patches": [
-                {"purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "added"},
-                {"purl": "pkg:npm/b@1.0.0", "uuid": "ub", "action": "skipped"},
-                {"purl": "pkg:npm/c@1.0.0", "uuid": "uc", "action": "added"},
-                {"purl": "pkg:npm/d@1.0.0", "uuid": "ud", "action": "skipped",
-                 "errorCode": "package_not_installed"},
-            ],
-        });
+    fn record_apply_outcome_counts_only_patches_apply_reported_applied() {
+        // `c` is recorded but apply never patched it (not installed: only a
+        // warning beside `a`'s real failure), so it gets no `applied` event.
+        let mut env = Envelope::new(JsonCommand::Get);
         let report = report_with(
             vec![failure("pkg:npm/a@1.0.0", "apply_failed", "x")],
-            &["pkg:npm/b@1.0.0", "pkg:npm/d@1.0.0"],
+            &["pkg:npm/b@1.0.0"],
         );
+        let recs = recorded(&[
+            ("pkg:npm/a@1.0.0", "ua"),
+            ("pkg:npm/b@1.0.0", "ub"),
+            ("pkg:npm/c@1.0.0", "uc"),
+        ]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
         assert_eq!(
-            fold_apply_failures(&mut env, &report, |_| None),
-            1,
-            "only the already-recorded b applied: {env}"
+            outcomes(&env),
+            vec![
+                o("failed", "pkg:npm/a@1.0.0", "ua", "apply_failed"),
+                o("applied", "pkg:npm/b@1.0.0", "ub", ""),
+            ]
         );
-        assert_eq!(env["patches"][2]["action"], "added", "{env}");
-        assert_eq!(env["failed"], 1, "{env}");
     }
 
     #[test]
-    fn fold_apply_failures_appends_an_unselected_manifest_failure() {
+    fn record_apply_outcome_appends_an_unselected_manifest_failure_once() {
         // The nested apply covers the whole (ecosystem-scoped) manifest: a
-        // failing record this run did not select still gets named, without
-        // costing this run's own patch its `applied` count.
-        let mut env = serde_json::json!({
-            "failed": 1,
-            "patches": [
-                {"purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "added"},
-            ],
-        });
+        // failing record this run did not select still gets named, once,
+        // without costing this run's own patch its `applied` event.
+        let mut env = Envelope::new(JsonCommand::Get);
         let report = report_with(
-            vec![failure("pkg:npm/old@2.0.0", "apply_failed", "z")],
+            vec![
+                failure("pkg:npm/old@2.0.0", "apply_failed", "z"),
+                failure("pkg:npm/old@2.0.0", "apply_failed", "z again"),
+            ],
             &["pkg:npm/a@1.0.0"],
         );
         let uuid_of = |p: &str| (p == "pkg:npm/old@2.0.0").then(|| "uo".to_string());
-        assert_eq!(fold_apply_failures(&mut env, &report, uuid_of), 1);
-        assert_eq!(env["patches"][0]["action"], "added", "{env}");
+        let recs = recorded(&[("pkg:npm/a@1.0.0", "ua")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), uuid_of);
         assert_eq!(
-            env["patches"][1],
-            serde_json::json!({
-                "purl": "pkg:npm/old@2.0.0", "uuid": "uo", "action": "failed",
-                "errorCode": "apply_failed", "error": "z",
-            })
+            outcomes(&env),
+            vec![
+                o("applied", "pkg:npm/a@1.0.0", "ua", ""),
+                o("failed", "pkg:npm/old@2.0.0", "uo", "apply_failed"),
+            ]
         );
-        assert_eq!(env["failed"], 2, "download failures stay counted: {env}");
     }
 
     #[test]
-    fn fold_apply_failures_carries_a_run_level_error() {
-        let mut env = serde_json::json!({
-            "failed": 0,
-            "patches": [{"purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "added"}],
-        });
+    fn record_apply_outcome_records_a_run_level_failure() {
+        // A failure no single patch explains is a purl-less `failed` event:
+        // the status agrees with exit 1, and no top-level `error` is set
+        // (the downloads still landed).
+        let mut env = Envelope::new(JsonCommand::Get);
         let report = ApplyRunReport {
             code: 1,
             failures: Vec::new(),
             run_error: Some(("yarn_pnp_unsupported".to_string(), "pnp".to_string())),
             applied: Vec::new(),
-            warnings: Vec::new(),
+            warnings: vec![RunWarning::new("content_mismatch_overwritten", "w")],
         };
-        assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 0);
-        assert!(env.get("errorCode").is_none(), "{env}");
+        let recs = recorded(&[("pkg:npm/a@1.0.0", "ua")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
         assert_eq!(
-            env["error"],
-            serde_json::json!({"code": "yarn_pnp_unsupported", "message": "pnp"}),
-            "{env}"
+            outcomes(&env),
+            vec![o("failed", "", "", "yarn_pnp_unsupported")]
         );
-        assert_eq!(env["failed"], 0, "{env}");
+        assert_eq!(env.events[0].error.as_deref(), Some("pnp"));
+        assert_eq!(env.status, Status::PartialFailure);
+        assert!(env.error.is_none());
+        assert_eq!(env.warnings[0].code, "content_mismatch_overwritten");
+        // A failed apply with nothing to blame still records one failure.
+        let mut env = Envelope::new(JsonCommand::Get);
+        record_apply_outcome(&mut env, &recs, Some(&report_with(Vec::new(), &[])), |_| {
+            None
+        });
+        assert_eq!(outcomes(&env), vec![o("failed", "", "", "apply_failed")]);
     }
 
     // --- write_blob_entry ------------------------------------------------
@@ -3826,42 +3790,34 @@ mod tests {
     }
 
     // --- fold_narrowing_into_result ----------------------------------------
-    // Hosted runs stack release-variant warnings (already in the envelope as
-    // strings) with coarse-narrowing PnP warnings folded in later; the merge
-    // must PRESERVE the existing strings and append the new `(code) detail`
-    // ones, while skip records bump found/skipped and extend patches[].
+    // The narrowing skips are recorded (so `summary` counts them) and the
+    // `(code, detail)` warnings join the envelope's `{code, detail}`
+    // warnings after any already there.
 
     #[test]
-    fn fold_narrowing_merges_into_existing_warnings_and_counts() {
-        let mut result = serde_json::json!({
-            "status": "success",
-            "found": 1,
-            "skipped": 0,
-            "patches": [{"purl": "pkg:npm/kept@1.0.0", "action": "added"}],
-            "warnings": ["existing variant warning"],
-        });
-        let skips = vec![serde_json::json!({
-            "purl": "pkg:npm/skipped@1.0.0", "uuid": "u",
-            "action": "skipped", "errorCode": "package_not_installed",
-        })];
+    fn fold_narrowing_records_skips_and_appends_warnings() {
+        let mut env = Envelope::new(JsonCommand::Get);
+        env.warn(RELEASE_NARROWING, "existing variant warning");
+        let skips = vec![skip("pkg:npm/skipped@1.0.0", "package_not_installed")];
         let warnings = vec![(
             "yarn_pnp_unsupported".to_string(),
             "PnP layout detail".to_string(),
         )];
-        fold_narrowing_into_result(&mut result, &skips, &warnings);
+        fold_narrowing_into_result(&mut env, &skips, &warnings);
 
-        assert_eq!(result["found"], 2, "skip records count as found");
-        assert_eq!(result["skipped"], 1);
-        let patches = result["patches"].as_array().unwrap();
-        assert_eq!(patches.len(), 2, "skip record folded into patches[]");
-        assert_eq!(patches[1]["errorCode"], "package_not_installed");
+        assert_eq!(env.summary.skipped, 1);
+        assert_eq!(env.events.len(), 1);
         assert_eq!(
-            result["warnings"],
+            env.events[0].error_code.as_deref(),
+            Some("package_not_installed")
+        );
+        let v = env.to_value();
+        assert_eq!(
+            v["warnings"],
             serde_json::json!([
-                "existing variant warning",
-                "(yarn_pnp_unsupported) PnP layout detail"
+                {"code": "release_narrowing", "detail": "existing variant warning"},
+                {"code": "yarn_pnp_unsupported", "detail": "PnP layout detail"},
             ]),
-            "existing warning strings must survive the merge, new ones appended"
         );
     }
 
@@ -4142,8 +4098,10 @@ mod tests {
         assert_eq!(format_selected_patches(&[], false), "Selected:\n\n");
     }
 
-    fn skip(purl: &str, code: &str) -> serde_json::Value {
-        serde_json::json!({"purl": purl, "uuid": "u", "action": "skipped", "errorCode": code})
+    fn skip(purl: &str, code: &str) -> PatchEvent {
+        PatchEvent::new(EventAction::Skipped, purl)
+            .with_uuid("u")
+            .with_reason(code, narrowing_reason(code))
     }
 
     #[test]
@@ -4321,11 +4279,11 @@ mod tests {
     #[test]
     fn verbose_skips_dedupe_and_sort_naturally() {
         let rec = |purl: &str, code: Option<&str>| {
-            let mut r = serde_json::json!({"purl": purl, "action": "skipped"});
-            if let Some(c) = code {
-                r["errorCode"] = serde_json::json!(c);
+            let r = PatchEvent::new(EventAction::Skipped, purl);
+            match code {
+                Some(c) => r.with_reason(c, narrowing_reason(c)),
+                None => r,
             }
-            r
         };
         let skips = vec![
             rec("pkg:npm/a@4.10.0", Some("package_not_installed")),
@@ -4595,6 +4553,16 @@ mod tests {
         .0
     }
 
+    /// A detached download phase folded into a fresh envelope, serialized:
+    /// `(exit code, envelope JSON, records)`.
+    fn detached_json(
+        dl: DetachedDownload,
+    ) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
+        let mut env = Envelope::new(JsonCommand::Get);
+        let (code, _, records) = dl.into_envelope(&mut env);
+        (code, env.to_value(), records)
+    }
+
     /// The 3-arg shape the vendored-download unit tests below drive: builds
     /// the run's client against `server_url`, and drops the blob seed (the
     /// stager's concern, pinned by fetch_stage's tests).
@@ -4604,9 +4572,9 @@ mod tests {
         server_url: &str,
     ) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
         let api_client = test_client(server_url).await;
-        let (code, json, records) =
-            download_patch_records_with(selected, params, &api_client, HashMap::new()).await;
-        (code, json, records)
+        detached_json(
+            download_patch_records_with(selected, params, &api_client, HashMap::new()).await,
+        )
     }
 
     #[tokio::test]
@@ -4641,15 +4609,15 @@ mod tests {
             download_patch_records(&selected, &detached_params(tmp.path()), &server.uri()).await;
 
         assert_eq!(code, 1, "guardrail failure must exit 1; json={json}");
-        assert_eq!(json["failed"], 1, "json={json}");
-        assert_eq!(json["downloaded"], 0, "json={json}");
+        assert_eq!(json["summary"]["failed"], 1, "json={json}");
+        assert_eq!(json["summary"]["downloaded"], 0, "json={json}");
         assert!(
             records.is_empty(),
             "no record may be handed to the vendor step"
         );
-        assert_eq!(json["patches"][0]["action"], "failed", "json={json}");
+        assert_eq!(json["events"][0]["action"], "failed", "json={json}");
         assert_eq!(
-            json["patches"][0]["error"], "patch has no applicable files",
+            json["events"][0]["error"], "patch has no applicable files",
             "json={json}"
         );
     }
@@ -4672,11 +4640,11 @@ mod tests {
             download_patch_records(&selected, &detached_params(tmp.path()), &server.uri()).await;
 
         assert_eq!(code, 1, "a fetch miss must exit 1; json={json}");
-        assert_eq!(json["failed"], 1, "json={json}");
+        assert_eq!(json["summary"]["failed"], 1, "json={json}");
         assert!(records.is_empty());
-        assert_eq!(json["patches"][0]["action"], "failed", "json={json}");
+        assert_eq!(json["events"][0]["action"], "failed", "json={json}");
         assert_eq!(
-            json["patches"][0]["error"], "could not fetch details",
+            json["events"][0]["error"], "could not fetch details",
             "json={json}"
         );
     }
@@ -4713,38 +4681,48 @@ mod tests {
             download_patch_records(&selected, &detached_params(tmp.path()), &server.uri()).await;
 
         assert_eq!(code, 1, "json={json}");
-        assert_eq!(json["found"], 2, "both variants must be kept; json={json}");
-        assert_eq!(json["failed"], 2, "json={json}");
+        assert_eq!(
+            json["events"].as_array().unwrap().len(),
+            2,
+            "both variants must be kept; json={json}"
+        );
+        assert_eq!(json["summary"]["failed"], 2, "json={json}");
         assert!(records.is_empty());
         let warnings = json["warnings"]
             .as_array()
             .unwrap_or_else(|| panic!("keep-all fallback must surface warnings; json={json}"));
         assert!(
-            warnings.iter().any(|w| w
-                .as_str()
-                .unwrap_or_default()
-                .contains("not installed locally")),
+            warnings.iter().any(|w| w["code"] == "release_narrowing"
+                && w["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("not installed locally")),
             "warning must explain the keep-all fallback; json={json}"
         );
     }
 
     // --- misc edge cases -----------------------------------------------------
 
-    /// `merge_metadata` is a best-effort splice: a non-object record (or a
-    /// non-object metadata value) must be left untouched, never panic —
-    /// callers hand it freshly-built json! values, but the contract is
-    /// defensive on both sides.
+    /// `tag_mode` merges the leg tag into an event's `details`, keeping
+    /// any metadata already there and replacing a non-object `details`.
     #[test]
-    fn merge_metadata_leaves_non_object_inputs_untouched() {
-        // Non-object record: nothing to insert into.
-        let mut record = serde_json::Value::Null;
-        merge_metadata(&mut record, serde_json::json!({"severity": "high"}));
-        assert!(record.is_null(), "a non-object record must stay untouched");
-
-        // Non-object metadata: nothing to splice from.
-        let mut record = serde_json::json!({"purl": "pkg:npm/x@1.0.0"});
-        merge_metadata(&mut record, serde_json::Value::String("nope".into()));
-        assert_eq!(record, serde_json::json!({"purl": "pkg:npm/x@1.0.0"}));
+    fn tag_mode_merges_into_details() {
+        let event = PatchEvent::new(EventAction::Downloaded, "pkg:npm/x@1.0.0")
+            .with_details(serde_json::json!({"tier": "free"}));
+        let tagged = tag_mode(event, Some("vendored"));
+        assert_eq!(
+            tagged.details,
+            Some(serde_json::json!({"tier": "free", "mode": "vendored"}))
+        );
+        let event = PatchEvent::new(EventAction::Skipped, "pkg:npm/x@1.0.0")
+            .with_details(serde_json::json!("nope"));
+        let tagged = tag_mode(event, Some("hosted"));
+        assert_eq!(tagged.details, Some(serde_json::json!({"mode": "hosted"})));
+        let event = PatchEvent::new(EventAction::Skipped, "pkg:npm/x@1.0.0");
+        assert!(
+            tag_mode(event, None).details.is_none(),
+            "agent events carry no mode"
+        );
     }
 
     /// The `TargetKind` Display labels are user-facing vocabulary (the
@@ -4793,19 +4771,6 @@ mod tests {
         );
     }
 
-    /// `fold_narrowing_into_result` on a non-object envelope (the error
-    /// shapes are the callers' concern) must be a calm no-op.
-    #[test]
-    fn fold_narrowing_ignores_non_object_result() {
-        let mut result = serde_json::json!(["not", "an", "object"]);
-        fold_narrowing_into_result(
-            &mut result,
-            &[serde_json::json!({"purl": "p", "action": "skipped"})],
-            &[("code".to_string(), "detail".to_string())],
-        );
-        assert_eq!(result, serde_json::json!(["not", "an", "object"]));
-    }
-
     /// A corrupt vendor ledger must degrade the coarse narrowing to "no
     /// ledger extension" (the download path's fail-closed read still guards
     /// writes): a purl claimed by nothing else is skipped as not installed,
@@ -4838,7 +4803,10 @@ mod tests {
             "nothing may be kept via a corrupt ledger"
         );
         assert_eq!(out.skip_records.len(), 1);
-        assert_eq!(out.skip_records[0]["errorCode"], "package_not_installed");
+        assert_eq!(
+            out.skip_records[0].error_code.as_deref(),
+            Some("package_not_installed")
+        );
     }
 
     /// The lockfile/vendor-ledger supplements are gated OFF for
@@ -4889,7 +4857,10 @@ mod tests {
             "a prefix-scoped run must not treat lockfile resolution as presence"
         );
         assert_eq!(out.skip_records.len(), 1);
-        assert_eq!(out.skip_records[0]["errorCode"], "package_not_installed");
+        assert_eq!(
+            out.skip_records[0].error_code.as_deref(),
+            Some("package_not_installed")
+        );
     }
 
     /// B74: a FIFO planted at `pnpm-lock.yaml` of a pnpm-PnP project must
@@ -5021,9 +4992,11 @@ mod tests {
         let code_for = |purl: &str| {
             out.skip_records
                 .iter()
-                .find(|r| r["purl"] == purl)
-                .unwrap_or_else(|| panic!("missing skip record for {purl}"))["errorCode"]
+                .find(|r| r.purl.as_deref() == Some(purl))
+                .unwrap_or_else(|| panic!("missing skip record for {purl}"))
+                .error_code
                 .clone()
+                .unwrap_or_default()
         };
         assert_eq!(
             code_for("pkg:npm/covgap-noversion"),
@@ -5074,9 +5047,9 @@ mod tests {
         let (code, json, records) = download_patch_records(&selected, &params, &server.uri()).await;
 
         assert_eq!(code, 1, "json={json}");
-        assert_eq!(json["failed"], 1, "json={json}");
+        assert_eq!(json["summary"]["failed"], 1, "json={json}");
         assert_eq!(
-            json["patches"][0]["error"], "Blob decode or write failed",
+            json["events"][0]["error"], "Blob decode or write failed",
             "json={json}"
         );
         assert!(
@@ -5127,9 +5100,9 @@ mod tests {
         let (code, json, records) = download_patch_records(&selected, &params, &server.uri()).await;
 
         assert_eq!(code, 1, "json={json}");
-        assert_eq!(json["failed"], 1, "json={json}");
+        assert_eq!(json["summary"]["failed"], 1, "json={json}");
         assert_eq!(
-            json["patches"][0]["error"], "Blob decode or write failed",
+            json["events"][0]["error"], "Blob decode or write failed",
             "json={json}"
         );
         assert!(
@@ -5208,11 +5181,11 @@ mod tests {
         let (code, json, records) = download_patch_records(&selected, &params, &server.uri()).await;
 
         assert_eq!(code, 1, "json={json}");
-        assert_eq!(json["downloaded"], 1, "json={json}");
-        assert_eq!(json["failed"], 2, "json={json}");
+        assert_eq!(json["summary"]["downloaded"], 1, "json={json}");
+        assert_eq!(json["summary"]["failed"], 2, "json={json}");
         assert_eq!(records.len(), 1, "only the good patch yields a record");
         assert!(records.contains_key(good_purl), "json={json}");
-        let errors: Vec<&str> = json["patches"]
+        let errors: Vec<&str> = json["events"]
             .as_array()
             .unwrap()
             .iter()
@@ -5281,8 +5254,9 @@ mod tests {
         let (code, json, records) = download_patch_records(&selected, &params, &server.uri()).await;
 
         assert_eq!(code, 0, "json={json}");
-        assert_eq!(json["skipped"], 1, "json={json}");
-        assert_eq!(json["patches"][0]["action"], "skipped", "json={json}");
+        // Reused from the ledger with no fetch: no download event (the
+        // vendor engine reports the package).
+        assert_eq!(json["events"], serde_json::json!([]), "json={json}");
         assert_eq!(
             records.get(purl).map(|r| r.uuid.as_str()),
             Some(uuid),
@@ -5366,16 +5340,16 @@ mod tests {
             download_patch_records(&selected, &detached_params(tmp.path()), &server.uri()).await;
 
         assert_eq!(code, 1, "json={json}");
-        assert_eq!(json["found"], 1, "json={json}");
-        assert_eq!(json["downloaded"], 0, "json={json}");
-        assert_eq!(json["failed"], 1, "json={json}");
-        assert_eq!(json["patches"][0]["action"], "failed", "json={json}");
+        assert_eq!(json["events"].as_array().unwrap().len(), 1, "json={json}");
+        assert_eq!(json["summary"]["downloaded"], 0, "json={json}");
+        assert_eq!(json["summary"]["failed"], 1, "json={json}");
+        assert_eq!(json["events"][0]["action"], "failed", "json={json}");
         assert_eq!(
-            json["patches"][0]["errorCode"], "vendor_bun_lockb_invalid",
+            json["events"][0]["errorCode"], "vendor_bun_lockb_invalid",
             "json={json}"
         );
         assert!(
-            json["patches"][0]["error"]
+            json["events"][0]["error"]
                 .as_str()
                 .is_some_and(|d| !d.is_empty()),
             "the record must carry the engine's detail; json={json}"
@@ -5408,9 +5382,9 @@ mod tests {
             download_patch_records(&selected, &detached_params(tmp.path()), &server.uri()).await;
 
         assert_eq!(code, 1, "json={json}");
-        assert_eq!(json["failed"], 1, "json={json}");
+        assert_eq!(json["summary"]["failed"], 1, "json={json}");
         assert_eq!(
-            json["patches"][0]["errorCode"], "vendor_bun_workspace_unsupported",
+            json["events"][0]["errorCode"], "vendor_bun_workspace_unsupported",
             "json={json}"
         );
         assert!(records.is_empty());
@@ -5450,10 +5424,13 @@ mod tests {
 
         assert_eq!(code, 1, "json={json}");
         assert_eq!(
-            json["patches"][0]["error"], "could not fetch details",
+            json["events"][0]["error"], "could not fetch details",
             "a pypi purl must reach the fetch, not the Bun refusal; json={json}"
         );
-        assert!(json["patches"][0].get("errorCode").is_none(), "json={json}");
+        assert_eq!(
+            json["events"][0]["errorCode"], "download_failed",
+            "json={json}"
+        );
         assert_eq!(
             server.received_requests().await.unwrap_or_default().len(),
             1,
@@ -5520,7 +5497,7 @@ mod tests {
 
         assert_eq!(code, 1, "json={json}");
         let by_purl = |purl: &str| {
-            json["patches"]
+            json["events"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -5562,21 +5539,20 @@ mod tests {
         warn_on_vendored_uuid_drift(
             tmp.path(),
             true,
-            &[serde_json::json!({
-                "purl": "pkg:npm/x@1.0.0",
-                "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                "action": "added",
-            })],
+            &[(
+                "pkg:npm/x@1.0.0".to_string(),
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            )],
             &mut warnings,
         )
         .await;
         assert!(warnings.is_empty(), "unreadable state must warn nothing");
     }
 
-    /// Malformed per-patch records (missing purl/uuid) are skipped without
-    /// panicking, while a well-formed drifting record still warns.
+    /// A recorded patch whose purl the ledger wires at another uuid warns
+    /// (`vendored_uuid_drift`); one the ledger does not hold does not.
     #[tokio::test]
-    async fn warn_on_vendored_uuid_drift_skips_malformed_records_and_flags_drift() {
+    async fn warn_on_vendored_uuid_drift_flags_drift() {
         let tmp = tempfile::tempdir().unwrap();
         let purl = "pkg:npm/covgap-drift@1.0.0";
         let vendored_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -5606,17 +5582,19 @@ mod tests {
             tmp.path(),
             true,
             &[
-                // Malformed: no purl/uuid — must be skipped, not panic.
-                serde_json::json!({"action": "added"}),
+                // Not vendored at all: no warning.
+                ("pkg:npm/other@1.0.0".to_string(), new_uuid.to_string()),
                 // Genuine drift: manifest moved to a different uuid.
-                serde_json::json!({"purl": purl, "uuid": new_uuid, "action": "added"}),
+                (purl.to_string(), new_uuid.to_string()),
             ],
             &mut warnings,
         )
         .await;
         assert_eq!(warnings.len(), 1, "warnings={warnings:?}");
+        assert_eq!(warnings[0].code, "vendored_uuid_drift");
         assert!(
-            warnings[0].contains(purl) && warnings[0].contains("is vendored at patch"),
+            warnings[0].detail.contains(purl)
+                && warnings[0].detail.contains("is vendored at patch"),
             "warnings={warnings:?}"
         );
     }
@@ -5711,16 +5689,20 @@ mod tests {
         let client = test_client(&server.uri()).await;
         let prefetched = HashMap::from([(patch.uuid.clone(), patch.clone())]);
 
-        let (code, json, records) =
-            download_patch_records_with(&selected, &params, &client, prefetched).await;
+        let (code, json, records) = detached_json(
+            download_patch_records_with(&selected, &params, &client, prefetched).await,
+        );
 
         assert_eq!(code, 0, "json={json}");
-        assert_eq!(json["downloaded"], 1, "json={json}");
+        assert_eq!(json["summary"]["downloaded"], 1, "json={json}");
         assert!(!tmp.path().join(".socket/blobs").exists());
-        assert_eq!(json["detached"], true, "json={json}");
-        assert_eq!(json["patches"][0]["action"], "downloaded", "json={json}");
+        assert_eq!(json["events"][0]["action"], "downloaded", "json={json}");
+        assert_eq!(
+            json["events"][0]["details"]["mode"], "vendored",
+            "json={json}"
+        );
         assert!(
-            json["patches"][0].get("oldUuid").is_none(),
+            json["events"][0]["details"].get("oldUuid").is_none(),
             "no ledger entry, no oldUuid; json={json}"
         );
         assert_eq!(
@@ -5798,10 +5780,13 @@ mod tests {
             download_patch_records(&selected, &detached_params(tmp.path()), &server.uri()).await;
 
         assert_eq!(code, 0, "json={json}");
-        assert_eq!(json["downloaded"], 1, "json={json}");
-        assert_eq!(json["skipped"], 0, "json={json}");
-        assert_eq!(json["patches"][0]["action"], "downloaded", "json={json}");
-        assert_eq!(json["patches"][0]["oldUuid"], old_uuid, "json={json}");
+        assert_eq!(json["summary"]["downloaded"], 1, "json={json}");
+        assert_eq!(json["summary"]["skipped"], 0, "json={json}");
+        assert_eq!(json["events"][0]["action"], "downloaded", "json={json}");
+        assert_eq!(
+            json["events"][0]["details"]["oldUuid"], old_uuid,
+            "json={json}"
+        );
         assert_eq!(
             records.get(purl).map(|r| r.uuid.as_str()),
             Some(new_uuid),
@@ -5936,15 +5921,17 @@ mod tests {
         .map(|(u, n)| mk_patch(u, &purl(n), "free", "2024-01-01"))
         .collect();
         let client = test_client(&server.uri()).await;
-        let (_code, json, records) = download_patch_records_with(
-            &selected,
-            &detached_params(tmp.path()),
-            &client,
-            HashMap::from([(d.clone(), held)]),
-        )
-        .await;
+        let (_code, json, records) = detached_json(
+            download_patch_records_with(
+                &selected,
+                &detached_params(tmp.path()),
+                &client,
+                HashMap::from([(d.clone(), held)]),
+            )
+            .await,
+        );
 
-        let rows: Vec<(String, String, String)> = json["patches"]
+        let rows: Vec<(String, String, String)> = json["events"]
             .as_array()
             .unwrap()
             .iter()
@@ -5965,14 +5952,15 @@ mod tests {
                 row("b", "failed", "could not fetch details"),
                 row("c", "failed", "API request failed with status 500: boom"),
                 row("d", "downloaded", ""),
-                row("e", "skipped", ""),
+                // e: the ledger already holds it at this uuid — reused, no
+                // fetch and no event (the vendor engine reports it).
                 row("f", "downloaded", ""),
             ],
             "json={json}"
         );
-        assert_eq!(json["downloaded"], 3, "json={json}");
-        assert_eq!(json["failed"], 2, "json={json}");
-        assert_eq!(json["skipped"], 1, "json={json}");
+        assert_eq!(json["summary"]["downloaded"], 3, "json={json}");
+        assert_eq!(json["summary"]["failed"], 2, "json={json}");
+        assert_eq!(json["summary"]["skipped"], 0, "json={json}");
         let mut got: Vec<&String> = records.keys().collect();
         got.sort();
         assert_eq!(got, vec![&purl("a"), &purl("d"), &purl("e"), &purl("f")]);
@@ -6252,7 +6240,7 @@ mod tests {
         let (_code, json, _records) =
             download_patch_records(&selected, &detached_params(tmp.path()), &server.uri()).await;
 
-        let got: Vec<&str> = json["patches"]
+        let got: Vec<&str> = json["events"]
             .as_array()
             .expect("patches[]")
             .iter()
@@ -6261,7 +6249,7 @@ mod tests {
         let want: Vec<&str> = selected.iter().map(|p| p.purl.as_str()).collect();
         assert_eq!(
             got, want,
-            "download.patches must be emitted in the selection's purl order; json={json}"
+            "download events must be emitted in the selection's purl order; json={json}"
         );
     }
 }

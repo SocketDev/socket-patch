@@ -252,9 +252,16 @@ async fn gc_scan_crawls_the_unselected_ecosystems() {
         &["-e", "npm", "--sync", "--dry-run"][..],
     ] {
         let (v, _) = scan(tmp.path(), extra).await;
+        let pruned: Vec<&serde_json::Value> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["details"]["manifest"] == true)
+            .map(|e| &e["purl"])
+            .collect();
         assert_eq!(
-            v["gc"]["prunedManifestEntries"],
-            serde_json::json!(["pkg:npm/orphan-npm@9.9.9"]),
+            pruned,
+            [&serde_json::json!("pkg:npm/orphan-npm@9.9.9")],
             "{extra:?}: the installed crate must not read as uninstalled: {v}"
         );
     }

@@ -744,10 +744,7 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
     );
     let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(
-        env["vendor"]["summary"]["applied"], 1,
-        "one package vendored: {env}"
-    );
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
     assert!(
         !proj.join(".socket/manifest.json").exists(),
         "vendored mode must never write the manifest"

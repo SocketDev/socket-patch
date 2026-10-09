@@ -658,7 +658,7 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
         "envelope: {envelope}"
     );
     assert_eq!(
-        envelope["redirect"]["redirected"], 1,
+        envelope["summary"]["applied"], 1,
         "exactly one dep redirected: {envelope}"
     );
     assert_eq!(
@@ -666,9 +666,8 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
         serde_json::json!(["go.mod", "go.sum"]),
         "exactly the two committed files change: {envelope}"
     );
-    assert_eq!(
-        envelope["redirect"]["warnings"],
-        serde_json::json!([]),
+    assert!(
+        envelope["warnings"].as_array().is_none_or(|w| w.is_empty()),
         "no rewriter warnings: {envelope}"
     );
 

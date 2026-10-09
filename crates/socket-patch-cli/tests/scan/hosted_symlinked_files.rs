@@ -468,7 +468,11 @@ async fn hosted_rewrites_the_same_lock_once_it_is_a_regular_file() {
 
     let (code, doc, stderr) = scan_hosted_json(&root, &server.uri());
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(
+        crate::common::envelope::hosted_pins(&doc).len(),
+        1,
+        "{doc:#}"
+    );
     assert!(std::fs::read_to_string(root.join("package-lock.json"))
         .unwrap()
         .contains(NPM_HOSTED_URL));
@@ -604,7 +608,11 @@ async fn hosted_scan_returns_with_fifo_vlt_lock() {
     };
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     let doc: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    assert_eq!(
+        crate::common::envelope::hosted_pins(&doc).len(),
+        0,
+        "{doc:#}"
+    );
     assert_eq!(vlt::artifact_requests(&server).await, 0);
     let meta = std::fs::symlink_metadata(&fifo).unwrap();
     assert!(std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()));

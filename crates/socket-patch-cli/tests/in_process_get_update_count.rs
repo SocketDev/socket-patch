@@ -40,7 +40,8 @@ async fn download_and_apply_patches(
         lock_timeout: None,
         verbose: false,
     };
-    download_and_apply_patches_with(selected, params, &run).await
+    let (code, env) = download_and_apply_patches_with(selected, params, &run).await;
+    (code, env.to_value())
 }
 
 const ORG: &str = "test-org";
@@ -122,16 +123,16 @@ async fn failed_update_fetch_is_not_counted_as_updated() {
     let (code, json) = download_and_apply_patches(&selected, &params(tmp.path()), &server).await;
 
     assert_eq!(code, 1, "a failed detail fetch must exit 1; json={json}");
-    assert_eq!(json["status"], "partial_failure", "json={json}");
+    assert_eq!(json["status"], "partialFailure", "json={json}");
     assert_eq!(
-        json["failed"], 1,
+        json["summary"]["failed"], 1,
         "the fetch failure must be counted; json={json}"
     );
     assert_eq!(
-        json["updated"], 0,
+        json["summary"]["updated"], 0,
         "a patch that never downloaded must not be counted as updated; json={json}"
     );
-    assert_eq!(json["downloaded"], 0, "json={json}");
+    assert_eq!(json["summary"]["downloaded"], 0, "json={json}");
 
     // The manifest entry must be left at the OLD uuid — nothing was replaced.
     let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
@@ -178,14 +179,15 @@ async fn successful_update_is_counted_once() {
     assert_eq!(code, 0, "save-only update should succeed; json={json}");
     assert_eq!(json["status"], "success", "json={json}");
     assert_eq!(
-        json["updated"], 1,
+        json["summary"]["updated"], 1,
         "the replacement must be counted once; json={json}"
     );
-    assert_eq!(json["downloaded"], 1, "json={json}");
-    assert_eq!(json["failed"], 0, "json={json}");
+    // v5.0: an update is `updated`, not also `downloaded`.
+    assert_eq!(json["summary"]["downloaded"], 0, "json={json}");
+    assert_eq!(json["summary"]["failed"], 0, "json={json}");
 
-    // The per-patch record is an `updated` action carrying the prior uuid.
-    let patches = json["patches"].as_array().unwrap();
+    // The per-patch event is `updated` carrying the prior uuid.
+    let patches = json["events"].as_array().unwrap();
     assert_eq!(patches.len(), 1);
     assert_eq!(patches[0]["action"], "updated", "json={json}");
     assert_eq!(patches[0]["oldUuid"], OLD_UUID, "json={json}");

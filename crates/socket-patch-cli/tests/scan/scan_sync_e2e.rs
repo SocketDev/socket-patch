@@ -146,44 +146,20 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
         "scan --sync against a clean project must fully succeed; envelope={v}"
     );
 
-    // The apply sub-object MUST be present and report exactly one patch
-    // discovered, downloaded, and applied with no failures. Guarding this
-    // behind `if let Some(..)` (as before) let a missing apply object pass.
-    let apply = v["apply"]
-        .as_object()
-        .unwrap_or_else(|| panic!("scan --sync must emit an apply sub-object; envelope={v}"));
-    assert_eq!(apply["found"], 1, "apply.found; apply={apply:?}");
-    assert_eq!(apply["applied"], 1, "apply.applied; apply={apply:?}");
-    assert_eq!(apply["failed"], 0, "apply.failed; apply={apply:?}");
-    // A fresh add against an empty manifest MUST download the blob exactly once
-    // and classify it as new (not skipped/updated). Without these a regression
-    // that double-counts, re-uses a stale cache, or mislabels the action stays
-    // green on `applied == 1` alone.
+    // Exactly one patch downloaded (a new record: not skipped / updated)
+    // and applied, with no failures — the events and `summary` agree.
+    crate::common::envelope::assert_envelope_invariants(&v, "scan");
     assert_eq!(
-        apply["downloaded"], 1,
-        "the new patch must be downloaded; apply={apply:?}"
+        crate::common::envelope::event_triples(&v),
+        vec![
+            (purl.to_string(), "downloaded".to_string(), String::new()),
+            (purl.to_string(), "applied".to_string(), String::new()),
+        ],
+        "envelope={v}"
     );
-    assert_eq!(
-        apply["skipped"], 0,
-        "nothing to skip on a fresh add; apply={apply:?}"
-    );
-    assert_eq!(
-        apply["updated"], 0,
-        "no manifest entry existed to update; apply={apply:?}"
-    );
-    let patches = apply["patches"].as_array().expect("apply.patches array");
-    assert_eq!(
-        patches.len(),
-        1,
-        "exactly one patch record; apply={apply:?}"
-    );
-    assert_eq!(patches[0]["purl"], purl);
-    assert_eq!(patches[0]["uuid"], UUID);
-    assert_eq!(
-        patches[0]["action"], "added",
-        "patch must be newly added; record={:?}",
-        patches[0]
-    );
+    assert_eq!(v["events"][0]["uuid"], UUID);
+    assert_eq!(v["summary"]["failed"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["updated"], 0, "envelope={v}");
 
     // The manifest must exist AND record this exact patch/uuid.
     let manifest_path = tmp.path().join(".socket/manifest.json");
@@ -379,19 +355,14 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     // installed copy is still pristine, so the nested apply must reconcile it
     // from the cached blob (#454: a recorded-but-unapplied patch used to be
     // left unpatched with exit 0).
-    let apply = v["apply"]
-        .as_object()
-        .unwrap_or_else(|| panic!("scan --mode agent must emit an apply sub-object; envelope={v}"));
-    assert_eq!(apply["found"], 1, "apply.found; apply={apply:?}");
-    assert_eq!(
-        apply["skipped"], 1,
-        "patch must be skipped; apply={apply:?}"
-    );
+    crate::common::envelope::assert_envelope_invariants(&v, "scan");
+    let apply = &v["summary"];
+    assert_eq!(apply["skipped"], 1, "patch must be skipped; envelope={v}");
     assert_eq!(
         apply["applied"], 1,
-        "the recorded patch is applied to the pristine install; apply={apply:?}"
+        "the recorded patch is applied to the pristine install; envelope={v}"
     );
-    assert_eq!(apply["failed"], 0, "apply.failed; apply={apply:?}");
+    assert_eq!(apply["failed"], 0, "envelope={v}");
     // The defining claim of this test ("skip the blob download / use the cached
     // one"): a known UUID with a cached blob must NOT trigger a blob download
     // and must NOT update the manifest. The original test asserted neither, so
@@ -405,14 +376,16 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
         apply["updated"], 0,
         "a skipped patch must not update the manifest; apply={apply:?}"
     );
-    let patches = apply["patches"].as_array().expect("apply.patches array");
-    assert_eq!(patches.len(), 1, "apply={apply:?}");
+    let patches = v["events"].as_array().expect("events array");
+    assert_eq!(patches.len(), 2, "skipped, then applied: {v}");
     assert_eq!(patches[0]["uuid"], UUID);
     assert_eq!(
         patches[0]["action"], "skipped",
         "cached/known UUID must yield action=skipped; record={:?}",
         patches[0]
     );
+    assert_eq!(patches[0]["errorCode"], "already_in_manifest");
+    assert_eq!(patches[1]["action"], "applied");
 
     // The skipped record is still applied: index.js now holds the cached
     // blob's ("after") content, with no blob download (asserted above).
@@ -493,18 +466,12 @@ async fn scan_apply_with_no_patches_emits_empty_apply_object() {
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["status"], "success", "envelope={v}");
-    let apply = v["apply"].as_object().unwrap();
-    assert_eq!(apply["found"], 0, "apply={apply:?}");
-    assert_eq!(apply["applied"], 0, "apply={apply:?}");
-    assert_eq!(apply["skipped"], 0, "apply={apply:?}");
-    assert_eq!(apply["failed"], 0, "apply={apply:?}");
-    assert_eq!(apply["downloaded"], 0, "apply={apply:?}");
-    // No patches discovered => the patches list must be empty, not just absent.
-    assert_eq!(
-        apply["patches"].as_array().expect("patches array").len(),
-        0,
-        "apply.patches must be empty; apply={apply:?}"
-    );
+    crate::common::envelope::assert_envelope_invariants(&v, "scan");
+    // No patches discovered => no events at all, and a zero summary.
+    assert_eq!(v["events"], serde_json::json!([]), "envelope={v}");
+    for key in ["applied", "skipped", "failed", "downloaded"] {
+        assert_eq!(v["summary"][key], 0, "{key}: envelope={v}");
+    }
 
     // Discovery (batch) must have actually been queried.
     let reqs = mock.received_requests().await.expect("recorded requests");
@@ -639,17 +606,16 @@ async fn scan_apply_skips_vendored_purl_without_downloading() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "envelope={v}");
 
-    let apply = v["apply"].as_object().expect("apply sub-object");
-    assert_eq!(apply["found"], 1, "apply={apply:?}");
-    assert_eq!(apply["skipped"], 1, "apply={apply:?}");
+    let apply = &v["summary"];
+    assert_eq!(apply["skipped"], 1, "envelope={v}");
     assert_eq!(
         apply["downloaded"], 0,
-        "vendored purl must not download; apply={apply:?}"
+        "vendored purl must not download; envelope={v}"
     );
-    assert_eq!(apply["applied"], 0, "apply={apply:?}");
-    assert_eq!(apply["failed"], 0, "apply={apply:?}");
-    let patches = apply["patches"].as_array().expect("patches array");
-    assert_eq!(patches.len(), 1, "apply={apply:?}");
+    assert_eq!(apply["applied"], 0, "envelope={v}");
+    assert_eq!(apply["failed"], 0, "envelope={v}");
+    let patches = v["events"].as_array().expect("events array");
+    assert_eq!(patches.len(), 1, "envelope={v}");
     assert_eq!(patches[0]["purl"], purl);
     assert_eq!(patches[0]["action"], "skipped", "record={:?}", patches[0]);
     assert_eq!(

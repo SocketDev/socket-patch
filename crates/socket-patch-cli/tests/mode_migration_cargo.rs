@@ -716,7 +716,7 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
     let (code, stdout, stderr) = run_socket(&proj, &hosted_args, &cargo_home);
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
-    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_eq!(hosted_pinned(&envelope), 1, "{stdout}");
     // The takeover is surfaced, and it really reverted the vendored state.
     assert!(
         stdout.contains("redirect_takeover_reverted_vendored"),
@@ -890,7 +890,7 @@ async fn lockless_vendor_then_first_build_then_hosted_takeover() {
         !stdout.contains("redirect_cargo_lock_pkg_not_found"),
         "the reverted lock names the crate by its version: {stdout}"
     );
-    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_eq!(hosted_pinned(&envelope), 1, "{stdout}");
     assert_lock_version(&proj, &version, "lockless vendor -> hosted");
     let lock_block = package_block(&read(&proj, "Cargo.lock"), DEP).unwrap_or_default();
     assert!(
@@ -1319,4 +1319,19 @@ async fn vendor_over_unrestorable_hosted_pin_is_refused() {
     assert_eq!(read(&proj, "Cargo.toml"), table_toml);
     assert_eq!(read(&proj, "Cargo.lock"), pristine_lock);
     assert!(!vendor_ledger_claims(&proj, &purl));
+}
+
+/// How many hosted pins a `scan --mode hosted --json` run wrote (or would
+/// write, on a dry run): its `applied` / `verified` events with
+/// `details.mode: "hosted"`.
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

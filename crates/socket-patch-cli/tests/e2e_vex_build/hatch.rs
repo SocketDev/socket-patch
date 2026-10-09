@@ -247,7 +247,7 @@ fn flow(flavor: Flavor, mode: Mode) {
 
     if mode == Mode::Vendored && flavor == Flavor::HatchTomlEnv && vtuple(&version) < (1, 2) {
         assert_ne!(code, Some(0), "{what}: must refuse: {env}");
-        let codes: Vec<&str> = env["vendor"]["events"]
+        let codes: Vec<&str> = env["events"]
             .as_array()
             .into_iter()
             .flatten()
@@ -630,11 +630,8 @@ fn existing_env_flow(mode: Mode) {
     let (code, env, stderr) = socket_scan(&project, &api, &scan_mode_args(mode), &case_envs);
     assert_eq!(code, Some(0), "{what}: scan failed: {env}\n{stderr}");
     let (warnings, code_name) = match mode {
-        Mode::Hosted => (
-            env["redirect"]["warnings"].clone(),
-            "redirect_pypi_stale_install",
-        ),
-        Mode::Vendored => (env["vendor"]["events"].clone(), "pypi_hatch_stale_install"),
+        Mode::Hosted => (env["warnings"].clone(), "redirect_pypi_stale_install"),
+        Mode::Vendored => (env["events"].clone(), "pypi_hatch_stale_install"),
     };
     let details: Vec<String> = warnings
         .as_array()
