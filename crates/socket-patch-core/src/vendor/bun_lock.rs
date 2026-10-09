@@ -928,10 +928,22 @@ pub(crate) async fn revert_bun_opts(
         }
     }
 
+    // An empty registry field means "the default registry", which a
+    // committed bunfig.toml or .npmrc can rebind; with either naming a
+    // registry, an empty field proves nothing about where an upgrade
+    // installs from (#1155).
+    let default_registry_pinned = !project_configures_a_registry(project_root).await;
     let mut dirty = false;
     if let Some(lines) = lines.as_mut() {
         for rec in entry.wiring.iter().rev().filter(|r| r.file == BUN_LOCK) {
-            revert_one_record(lines, rec, &entry.uuid, &mut dirty, &mut outcome.warnings);
+            revert_one_record(
+                lines,
+                rec,
+                &entry.uuid,
+                default_registry_pinned,
+                &mut dirty,
+                &mut outcome.warnings,
+            );
         }
         if dirty {
             if let Err(e) = atomic_write_bytes_preserving_mode(
@@ -986,6 +998,7 @@ fn revert_one_record(
     lines: &mut [String],
     rec: &WiringRecord,
     entry_uuid: &str,
+    default_registry_pinned: bool,
     dirty: &mut bool,
     warnings: &mut Vec<VendorWarning>,
 ) {
@@ -1043,7 +1056,7 @@ fn revert_one_record(
             // exactly as after `bun remove`. Nothing to restore; the caller
             // keeps the artifact only while the lock still resolves through
             // it. A same-version re-resolution stays drift.
-            if let Some(live_version) = version_moved_off(rec, &parsed) {
+            if let Some(live_version) = version_moved_off(rec, &parsed, default_registry_pinned) {
                 warnings.push(VendorWarning::new(
                     super::LOCK_ENTRY_REMOVED_CODE,
                     format!(
@@ -1104,14 +1117,34 @@ fn registry_name_version(entry: &BunEntry) -> Option<(String, String)> {
 /// keeps the caller's drift verdict: an `original: None` record, a URL or
 /// `file:` spec, another package or another registry is not a plain upgrade
 /// and must keep the artifact and leave `vendor --check` red.
-fn version_moved_off(rec: &WiringRecord, live: &BunEntry) -> Option<String> {
+fn version_moved_off(
+    rec: &WiringRecord,
+    live: &BunEntry,
+    default_registry_pinned: bool,
+) -> Option<String> {
     let (live_name, live_version) = registry_name_version(live)?;
     let original = parse_entry_line(rec.original.as_ref().and_then(Value::as_str)?).ok()?;
     let (original_name, original_version) = registry_name_version(&original)?;
-    let same_registry = matches!((live.elems.get(1), original.elems.get(1)),
-        (Some(l), Some(o)) if decode_json_string(l).is_some() && decode_json_string(l) == decode_json_string(o));
+    let live_registry = decode_json_string(live.elems.get(1)?)?;
+    let same_registry = Some(&live_registry) == decode_json_string(original.elems.get(1)?).as_ref()
+        && (!live_registry.is_empty() || default_registry_pinned);
     (same_registry && live_name == original_name && live_version != original_version)
         .then_some(live_version)
+}
+
+/// True when the project's own `bunfig.toml` or `.npmrc` mentions a
+/// registry at all (or can't be read), so Bun's default registry may not
+/// be npmjs. Deliberately coarse: any doubt keeps the drift verdict.
+async fn project_configures_a_registry(project_root: &Path) -> bool {
+    for name in ["bunfig.toml", ".npmrc"] {
+        match read_regular_to_string(&project_root.join(name)).await {
+            Ok(text) if text.to_ascii_lowercase().contains("registry") => return true,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 // ───────────────────────── vendor-specific classification ─────────────────
@@ -3253,6 +3286,45 @@ mod tests {
             assert!(outcome.drift_skipped(), "{moved_line}: {:?}", outcome.warnings);
             assert!(outcome.kept_artifact, "{moved_line}: {:?}", outcome.warnings);
             assert_eq!(fx.read_lock().await, moved_lock, "left alone");
+        }
+    }
+
+    /// #1155 provenance guard: an empty registry field means "the default
+    /// registry", and a committed bunfig.toml or .npmrc can rebind that.
+    /// With either naming a registry, a version change from `""` is not
+    /// proven to come from the pre-vendor registry, so it stays drift.
+    #[tokio::test]
+    async fn revert_keeps_default_registry_upgrade_as_drift_when_the_registry_is_configured() {
+        for (file, text) in [
+            (
+                "bunfig.toml",
+                "[install]\nregistry = \"https://evil.example.com/\"\n",
+            ),
+            (".npmrc", "registry=https://evil.example.com/\n"),
+        ] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let upgraded_line =
+                "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
+            let live = fx.read_lock().await;
+            let new_line = entry.wiring[0]
+                .new
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap();
+            tokio::fs::write(
+                fx.root().join(BUN_LOCK),
+                live.replace(new_line, upgraded_line),
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(fx.root().join(file), text).await.unwrap();
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{file}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{file}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{file}: {:?}", outcome.warnings);
         }
     }
 

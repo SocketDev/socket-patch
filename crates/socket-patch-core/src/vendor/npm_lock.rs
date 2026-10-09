@@ -777,7 +777,26 @@ pub async fn revert_npm_opts(
             }
         };
 
-        let non_registry = npm_non_registry_entries(&lock, &overrides);
+        let mut non_registry = npm_non_registry_entries(&lock, &overrides);
+        // An override can also swap a registry edge for a git / URL /
+        // `file:` spec, which that set does not report. Any override that
+        // names the vendored package keeps every record off the upgrade
+        // path; the revert then drift-keeps as before #1155.
+        let overridden = super::npm_common::parse_npm_purl(&entry.base_purl)
+            .is_none_or(|(name, _)| overrides.mentions(&name));
+        if overridden {
+            for rec in entry.wiring.iter().filter(|r| r.file == lock_name) {
+                if let Some(key) = rec.key.as_deref() {
+                    let key = match rec.kind.as_str() {
+                        KIND_LOCK_LEGACY_ENTRY => legacy_pointer_packages_key(key),
+                        _ => Some(key.to_string()),
+                    };
+                    if let Some(key) = key {
+                        non_registry.insert(key, "an override names the package".to_string());
+                    }
+                }
+            }
+        }
         let mut changed = false;
         // Reverse application order, like every backend's revert.
         for rec in entry.wiring.iter().rev().filter(|r| r.file == lock_name) {
@@ -3617,6 +3636,51 @@ mod tests {
             assert!(outcome.success, "{spec}: {:?}", outcome.error);
             assert!(outcome.drift_skipped(), "{spec}: {:?}", outcome.warnings);
             assert!(outcome.kept_artifact, "{spec}: {:?}", outcome.warnings);
+        }
+    }
+
+    /// #1155 provenance guard: an override can swap a registry edge for a
+    /// git / URL / `file:` spec that npm ci installs instead of the lock's
+    /// `resolved`. While any override names the vendored package, a version
+    /// change is not trusted as a registry upgrade and stays drift.
+    #[tokio::test]
+    async fn revert_keeps_version_change_as_drift_while_an_override_names_the_package() {
+        for overrides in [
+            json!({ "left-pad": "file:../left-pad" }),
+            json!({ "foo": { "left-pad": "github:evil/left-pad" } }),
+            json!({ "left-pad@1.3.0": "https://example.com/left-pad.tgz" }),
+        ] {
+            let fx = fixture().await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let manifest = json!({ "name": "fixture", "version": "1.0.0", "overrides": overrides });
+            tokio::fs::write(
+                fx.root().join("package.json"),
+                serialize_json(&manifest, "  ").unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let upgraded = json!({
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"]["node_modules/left-pad"] = upgraded.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{overrides}: {:?}", outcome.error);
+            assert!(
+                outcome.drift_skipped(),
+                "{overrides}: {:?}",
+                outcome.warnings
+            );
+            assert!(outcome.kept_artifact, "{overrides}: {:?}", outcome.warnings);
         }
     }
 

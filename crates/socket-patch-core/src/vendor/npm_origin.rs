@@ -89,6 +89,23 @@ impl NpmOverrides {
         }
     }
 
+    /// True when any override rule, at any nesting depth, names the package
+    /// `name` (bare or with a selector). Coarser than [`Self::replacement`]
+    /// on purpose: a caller that must not trust an edge's registry
+    /// resolution while an override might swap it uses this.
+    pub(crate) fn mentions(&self, name: &str) -> bool {
+        fn walk(rules: &Map<String, Value>, name: &str) -> bool {
+            rules.iter().any(|(key, value)| {
+                let at = key
+                    .char_indices()
+                    .find_map(|(i, c)| (c == '@' && i > 0).then_some(i))
+                    .unwrap_or(key.len());
+                &key[..at] == name || value.as_object().is_some_and(|nested| walk(nested, name))
+            })
+        }
+        walk(&self.rules, name)
+    }
+
     /// The spec an override makes npm install for the edge `dep_name@spec`
     /// whose dependent sits at the lock key `from`, or `None` when no
     /// override clearly applies.
