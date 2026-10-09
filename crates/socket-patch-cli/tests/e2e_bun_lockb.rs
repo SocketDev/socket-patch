@@ -1051,7 +1051,9 @@ async fn native_binary_shared_bundled_record_hosted_pin_is_managed() {
     }
     assert_ne!(fixture.lock(), fixture.original_lock);
 
-    let (code, listed) = cli_code(project, &["list"]);
+    // `--patch-server-url`: the mock serves the hosted artifact, so name
+    // it the hosted origin (as the vendor run below does).
+    let (code, listed) = cli_code(project, &["list", "--patch-server-url", &uri]);
     assert_eq!(
         code, 0,
         "list must accept the hosted pin it wrote: {listed}"
@@ -1061,8 +1063,8 @@ async fn native_binary_shared_bundled_record_hosted_pin_is_managed() {
         "{listed}"
     );
     assert!(
-        listed.to_string().contains(UUID),
-        "list names the pin: {listed}"
+        listed.to_string().contains(PURL),
+        "list names the hosted pin: {listed}"
     );
 
     // The npm registry's version document for minimist@1.2.2, served
@@ -1115,6 +1117,16 @@ async fn native_binary_shared_bundled_record_hosted_pin_is_managed() {
         fixture.original_lock,
         "the revert restores the pre-hosted bytes exactly: {reverted}"
     );
+
+    // `rollback` of the same pin refuses it as any binary hosted pin is
+    // refused (the checkout remedy), not as contested wiring.
+    let hosted = scan(project, &server, "hosted", &[]);
+    assert_eq!(
+        hosted["redirect"]["redirected"], 1,
+        "hosted again: {hosted}"
+    );
+    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
+    assert_eq!(fixture.lock(), fixture.original_lock);
 }
 
 #[tokio::test(flavor = "multi_thread")]
