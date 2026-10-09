@@ -167,6 +167,11 @@ CLI_TRANSPORT_FAILURE = re.compile(r'error sending request for url \(|API reques
 BUN_TRANSPORT_FAILURE = re.compile(
     r'^error: (?:Connection\w+|FailedToOpenSocket|Timeout|TLSHandshakeTimeout) downloading '
     r'|^error: GET \S+ - 5\d\d\b', re.M)
+# The harness's own urllib fetch of a hosted service (e.g. the patched
+# tarball `hosted_lockb_digest` reads from patch.socket.dev) failing with a
+# 5xx / 429 (`HTTP Error 503: Service Unavailable`) or no response at all
+# (`<urlopen error [Errno 104] Connection reset by peer>`).
+HARNESS_TRANSPORT_FAILURE = re.compile(r'\bHTTP Error (?:5\d\d|429)\b|<urlopen error ')
 
 
 def bun_transport_failures(output):
@@ -176,13 +181,15 @@ def bun_transport_failures(output):
 
 def has_transport_failure(value):
     """Only explicit request transport errors (a request error or a patch API
-    5xx, from the CLI or from bun's fetch) qualify for a fresh-cell retry."""
+    5xx, from the CLI, from bun's fetch or from the harness's own fetch)
+    qualify for a fresh-cell retry."""
     if isinstance(value, dict):
         return any(has_transport_failure(item) for item in value.values())
     if isinstance(value, list):
         return any(has_transport_failure(item) for item in value)
     return isinstance(value, str) and bool(CLI_TRANSPORT_FAILURE.search(value)
-                                           or BUN_TRANSPORT_FAILURE.search(value))
+                                           or BUN_TRANSPORT_FAILURE.search(value)
+                                           or HARNESS_TRANSPORT_FAILURE.search(value))
 
 
 def retry_network_cell(run_case, job, root, attempts=3):
@@ -1080,10 +1087,12 @@ def main():
                         ('warmOrdinary', [], 'cache-ordinary')]:
                     if shape == 'production':
                         flags = [*flags, '--production']
-                    code, _ = install(bun, label, flags, cache=cache)
+                    code, output = install(bun, label, flags, cache=cache)
                     correct, hashes = oracle(project, record, 'after')
                     checks[label + 'PatchedBytes'] = code == 0 and correct
                     row[label + 'Files'] = hashes
+                    # Kept so a fetch failure here qualifies the cell for a retry.
+                    row[label + 'InstallTransport'] = bun_transport_failures(output)
                     installed_lock = lock.read_bytes()
                     if (lockb_origin and label == 'ordinary' and installed_lock != patched_lock
                             and ver(version) >= (1, 2, 23)):
