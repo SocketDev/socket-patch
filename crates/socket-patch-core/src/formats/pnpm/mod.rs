@@ -517,37 +517,83 @@ impl InstalledPackages {
         if !grammar::is_pnpm_lock_text(text) {
             return None;
         }
+        // One line walk (the scan reads this on every run, for every
+        // package of the install): two-space `packages:` keys and their
+        // four-space `name:` / `version:` fields, nothing else.
         let mut out = Self::default();
-        for package in pnpm_packages(grammar::main_document(strip_bom(text))) {
-            let field_name = grammar::entry_field(&package.entry, "name");
-            let field_version = grammar::entry_field(&package.entry, "version");
-            let (name, version) = match classify_pnpm_key(package.key) {
-                PnpmKey::Registry { name, version } => (Some(name), Some(version)),
-                PnpmKey::V9File { name, .. } => (Some(name), field_version),
-                PnpmKey::LegacyFile { .. } => (field_name, field_version),
-                // A v9 url / git key still leads with `name@`; a legacy
-                // one names its package only in the `name:` field.
-                PnpmKey::Other => {
-                    let base = strip_pnpm_peer_suffix(package.key);
-                    let v9_name = (!base.starts_with('/'))
-                        .then(|| base.get(1..).and_then(|rest| rest.find('@')))
-                        .flatten()
-                        .map(|at| &base[..at + 1]);
-                    (field_name.or(v9_name), field_version)
-                }
+        let mut entries = 0usize;
+        let mut in_packages = false;
+        let mut current: Option<(&str, Option<&str>, Option<&str>)> = None;
+        let mut finish = |entry: Option<(&str, Option<&str>, Option<&str>)>, out: &mut Self| {
+            let Some((key, field_name, field_version)) = entry else {
+                return Some(());
             };
-            let name = grammar::unquote(name?);
-            match version {
-                Some(version) => {
-                    out.versions
-                        .insert((name.to_string(), grammar::unquote(version).to_string()));
-                }
-                None => {
-                    out.any_version.insert(name.to_string());
+            entries += 1;
+            out.insert_entry(key, field_name, field_version)
+        };
+        for raw in grammar::main_document(strip_bom(text)).split('\n') {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            if !line.is_empty() && !line.starts_with([' ', '#']) {
+                finish(current.take(), &mut out)?;
+                in_packages = line == "packages:";
+                continue;
+            }
+            if !in_packages {
+                continue;
+            }
+            if let Some((key, _, _)) = lines::parse_key_line(line, 2) {
+                finish(current.take(), &mut out)?;
+                current = Some((key, None, None));
+            } else if let (Some(entry), Some((field, _, value))) =
+                (current.as_mut(), lines::parse_key_line(line, 4))
+            {
+                let value = Some(grammar::unquote(value.trim())).filter(|v| !v.is_empty());
+                match field {
+                    "name" => entry.1 = value,
+                    "version" => entry.2 = value,
+                    _ => {}
                 }
             }
         }
-        Some(out)
+        finish(current.take(), &mut out)?;
+        // A lock listing no package at all says nothing about the store.
+        (entries > 0).then_some(out)
+    }
+
+    /// Record one `packages:` entry; `None` when its package cannot be
+    /// named.
+    fn insert_entry(
+        &mut self,
+        key: &str,
+        field_name: Option<&str>,
+        field_version: Option<&str>,
+    ) -> Option<()> {
+        let (name, version) = match classify_pnpm_key(key) {
+            PnpmKey::Registry { name, version } => (Some(name), Some(version)),
+            PnpmKey::V9File { name, .. } => (Some(name), field_version),
+            PnpmKey::LegacyFile { .. } => (field_name, field_version),
+            // A v9 url / git key still leads with `name@`; a legacy one
+            // names its package only in the `name:` field.
+            PnpmKey::Other => {
+                let base = strip_pnpm_peer_suffix(key);
+                let v9_name = (!base.starts_with('/'))
+                    .then(|| base.get(1..).and_then(|rest| rest.find('@')))
+                    .flatten()
+                    .map(|at| &base[..at + 1]);
+                (field_name.or(v9_name), field_version)
+            }
+        };
+        let name = name?;
+        match version {
+            Some(version) => {
+                self.versions
+                    .insert((name.to_string(), version.to_string()));
+            }
+            None => {
+                self.any_version.insert(name.to_string());
+            }
+        }
+        Some(())
     }
 
     /// Whether the lock installs `name@version`.
@@ -627,6 +673,8 @@ mod tests {
                        registry.example.com/x/1.0.0:\n    resolution: {integrity: sha512-a}\n";
         assert!(InstalledPackages::from_lock_text(unnamed).is_none());
         assert!(InstalledPackages::from_lock_text("not: a lock\n").is_none());
+        // A lock listing no package says nothing about the store.
+        assert!(InstalledPackages::from_lock_text("lockfileVersion: 9\n").is_none());
     }
 
     const UUID: &str = "11111111-1111-4111-8111-111111111111";

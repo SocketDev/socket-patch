@@ -701,6 +701,13 @@ fn orphaned_pnpm_store_entry_sync(
             None => return false,
         },
     };
+    // The common case, a live registry entry, costs no read.
+    if version
+        .as_deref()
+        .is_some_and(|version| installed.contains(&name, version))
+    {
+        return false;
+    }
     let manifest = store_path
         .join(entry_name)
         .join("node_modules")
