@@ -587,11 +587,19 @@ async fn memory_recorded(project: &MemoryProject, root: &str, roots: &[String]) 
         &crate::vex::DiscoverOptions::default(),
     )
     .await;
-    let pins: Vec<(String, String)> = crate::patch::redirect::upstream::HostedPin::all(&discovery)
-        .into_iter()
-        .filter(|pin| pin.files.iter().any(own))
-        .map(|pin| (pin.purl, pin.uuid))
-        .collect();
+    let mut pins: Vec<(String, String)> =
+        crate::patch::redirect::upstream::HostedPin::all(&discovery)
+            .into_iter()
+            .filter(|pin| pin.files.iter().any(own))
+            .map(|pin| (pin.purl, pin.uuid))
+            .collect();
+    // A Gemfile-only gem pin (no lock ref until the next unfrozen `bundle
+    // install`) counts as recorded too (#1224).
+    for pin in crate::vex::discover::gem_manifest_source_pins(&ProjectView::Memory(project)).await {
+        if !pins.contains(&pin) {
+            pins.push(pin);
+        }
+    }
     let unlocked = discovery
         .unlocked_pins
         .into_iter()
