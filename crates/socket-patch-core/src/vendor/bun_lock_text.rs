@@ -121,7 +121,7 @@ pub(crate) fn default_trust_detail(name: &str, version: &str, target: &str) -> S
 /// `text` with the JSONC Bun accepts in a `package.json` removed: `//` and
 /// `/* */` comments and a comma before a closing `}` or `]`, all outside
 /// strings. Everything else, strings included, is kept byte for byte.
-fn strip_jsonc(text: &str) -> String {
+pub(crate) fn strip_jsonc(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     let mut in_string = false;

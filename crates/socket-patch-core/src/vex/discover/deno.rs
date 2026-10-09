@@ -31,6 +31,8 @@ use serde_json::Value;
 
 use std::path::PathBuf;
 
+use crate::crawlers::deno_crawler::lock_section;
+
 use super::{
     canonical_base_purl, npm_purl, parse_json, CopyTarget, DiscoverCtx, Discovery, UnattestedKind,
     UnwiredCopy,
@@ -59,15 +61,11 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
 }
 
-/// The keys of `deno.lock`'s npm package map, in any lockfile version.
+/// The keys of `deno.lock`'s npm package map, in any lockfile version
+/// ([`lock_section`]).
 fn deno_npm_keys(lock: &Value) -> Vec<&str> {
-    let npm = lock.get("npm");
-    let map = npm
-        .and_then(|n| n.get("packages"))
-        .or(npm)
-        .or_else(|| lock.get("packages").and_then(|p| p.get("npm")))
-        .and_then(Value::as_object);
-    map.map(|m| m.keys().map(String::as_str).collect())
+    lock_section(lock, "npm")
+        .map(|m| m.keys().map(String::as_str).collect())
         .unwrap_or_default()
 }
 

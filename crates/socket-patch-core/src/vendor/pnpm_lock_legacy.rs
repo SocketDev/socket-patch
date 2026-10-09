@@ -64,8 +64,9 @@ use crate::utils::fs::read_regular_to_string;
 use super::common::refused;
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
-    dep_field_lines, drifted, lines_value, removed, revert_overrides_line, value_lines,
-    vendor_value_is_for, EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
+    dep_field_lines, drifted, lines_value, merge_live_dep_refs, ref_record_blocks, removed,
+    revert_overrides_line, same_modulo_dep_refs, value_lines, vendor_value_is_for, DepRef, EditCtx,
+    PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
 };
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -1098,7 +1099,8 @@ fn revert_root_dep_pair(
 /// verify ownership, then reinsert the ORIGINAL block at its byte-sorted
 /// position (the rekey moved it across the `/` vs `file:` sort boundary, so
 /// an in-place splice would restore it out of order and break byte-identity
-/// with the pre-vendor lock).
+/// with the pre-vendor lock) — merged with any dependency ref ANOTHER entry
+/// rewrote inside the block since (#830, [`merge_live_dep_refs`]).
 fn revert_package_block(
     lines: &mut Vec<String>,
     rec: &WiringRecord,
@@ -1153,7 +1155,8 @@ fn revert_package_block(
             )));
             return;
         };
-        if swap_block_sorted(lines, "packages", new_key, orig_key, &original).is_err() {
+        let restored = merge_live_dep_refs(&original, &new_lines, &live);
+        if swap_block_sorted(lines, "packages", new_key, orig_key, &restored).is_err() {
             warnings.push(drifted(format!(
                 "packages entry `{new_key}` vanished mid-restore; left alone"
             )));
@@ -1165,12 +1168,13 @@ fn revert_package_block(
     // ALREADY CONVERGED: an earlier partial revert restored this record —
     // the restore rekeys the block back to its pre-vendor key, so the
     // recorded `file:` key no longer matches while the original block is
-    // live verbatim. Not drift: stay silent so the drift-skip keep gate can
-    // converge instead of keeping the artifacts forever.
+    // live (up to the dependency refs the merge kept). Not drift: stay
+    // silent so the drift-skip keep gate can converge instead of keeping
+    // the artifacts forever.
     if let Some(orig) = rec.original.as_ref().and_then(value_lines) {
         let mut j = start + 1;
         while let Some(block) = next_block(lines, j, end) {
-            if lines[block.header..block.end] == orig[..] {
+            if same_modulo_dep_refs(&lines[block.header..block.end], &orig) {
                 return;
             }
             j = block.end;
@@ -1181,6 +1185,11 @@ fn revert_package_block(
     )));
 }
 
+/// Restore one dependent packages block's dep ref to this entry. Keyed by
+/// the dependent's packages key at vendor time, which a later vendor or
+/// revert of the dependent itself rekeys (`/debug/4.3.4` ⇄ `file:…`): when
+/// that key is gone the ref is found under the same package's other key
+/// (#830, [`ref_record_blocks`]).
 fn revert_pkg_dep_ref(
     lines: &mut [String],
     rec: &WiringRecord,
@@ -1201,53 +1210,18 @@ fn revert_pkg_dep_ref(
         ));
         return;
     };
-    let mut i = start + 1;
-    while let Some(block) = next_block(lines, i, end) {
-        if block.key != pkg_key {
-            i = block.end;
-            continue;
-        }
-        let mut in_dep_map = false;
-        for line in lines[block.header + 1..block.end].iter_mut() {
-            if let Some((field, _repr, rest)) = parse_key_line(line, 4) {
-                in_dep_map =
-                    rest.is_empty() && matches!(field, "dependencies" | "optionalDependencies");
-                continue;
-            }
-            if !in_dep_map {
-                continue;
-            }
-            let Some((d, _repr, rest)) = parse_key_line(line, 6) else {
-                continue;
-            };
-            if d != dep {
-                continue;
-            }
-            // ALREADY CONVERGED: the live ref already equals the recorded
-            // pre-vendor original — an earlier partial revert (or the
-            // user, by hand) already restored it. Not drift.
-            if rec.original.as_ref().and_then(Value::as_str) == Some(rest) {
-                return;
-            }
-            let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
-                || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
-            if !ours {
-                warnings.push(drifted(format!(
-                    "dep ref `{key}` was re-resolved since vendoring ({rest}); left alone"
-                )));
-                return;
-            }
-            let Some(original) = rec.original.as_ref().and_then(Value::as_str) else {
-                warnings.push(drifted(format!(
-                    "dep ref `{key}` has no recorded pre-vendor original; left as-is"
-                )));
-                return;
-            };
-            *line = format!("      {}: {original}", yaml_key(dep));
-            *dirty = true;
+    let target = DepRef {
+        rec,
+        key,
+        dep,
+        entry_uuid,
+        label: "dep ref",
+        dep_maps_only: true,
+    };
+    for (header, block_end) in ref_record_blocks(lines, start, end, pkg_key) {
+        if target.restore_in(lines, header, block_end, dirty, warnings) {
             return;
         }
-        break;
     }
     warnings.push(removed(format!(
         "dep ref `{key}` no longer exists; nothing to restore"
@@ -4946,6 +4920,252 @@ importers:
                 planned, looped,
                 "{label}: the plan must refuse as the loop does"
             );
+        }
+    }
+
+    // ── a vendored parent and its vendored dependency (#830) ─────────────
+
+    const PC_PKG: &str = r#"{
+  "name": "fx",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "debug": "4.3.4"
+  }
+}
+"#;
+
+    const PC7_LOCK: &str = "lockfileVersion: 5.4
+
+specifiers:
+  debug: 4.3.4
+
+dependencies:
+  debug: 4.3.4
+
+packages:
+
+  /debug/4.3.4:
+    resolution: {integrity: sha512-3NN8vD3qzN8YtsF8Mxz4wHinpTcRP71BdOdGhzQk7dVDwXhUjS7O9BXaHGhn7m7Y1hB+L4szF+XwoAhBc2upBw==}
+    engines: {node: '>=6.0'}
+    peerDependencies:
+      supports-color: '*'
+    peerDependenciesMeta:
+      supports-color:
+        optional: true
+    dependencies:
+      ms: 2.1.2
+    dev: false
+
+  /ms/2.1.2:
+    resolution: {integrity: sha512-sGkPx+VjMtmA6MX27oA4FBFELFCZZ4S4XqeGOXCv68tT+jb3vk/RyaKWP0PTKyWtmLSM0b+adUTEvbs1PEaH2w==}
+    dev: false
+
+  /unrelated/1.0.0:
+    resolution: {integrity: sha512-unrelated==}
+    dependencies:
+      ms: 2.1.2
+    dev: false
+";
+
+    const PC8_LOCK: &str = "lockfileVersion: '6.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+dependencies:
+  debug:
+    specifier: 4.3.4
+    version: 4.3.4
+
+packages:
+
+  /debug@4.3.4:
+    resolution: {integrity: sha512-3NN8vD3qzN8YtsF8Mxz4wHinpTcRP71BdOdGhzQk7dVDwXhUjS7O9BXaHGhn7m7Y1hB+L4szF+XwoAhBc2upBw==}
+    engines: {node: '>=6.0'}
+    peerDependencies:
+      supports-color: '*'
+    peerDependenciesMeta:
+      supports-color:
+        optional: true
+    dependencies:
+      ms: 2.1.2
+    dev: false
+
+  /ms@2.1.2:
+    resolution: {integrity: sha512-sGkPx+VjMtmA6MX27oA4FBFELFCZZ4S4XqeGOXCv68tT+jb3vk/RyaKWP0PTKyWtmLSM0b+adUTEvbs1PEaH2w==}
+    dev: false
+
+  /unrelated@1.0.0:
+    resolution: {integrity: sha512-unrelated==}
+    dependencies:
+      ms: 2.1.2
+    dev: false
+";
+
+    const PC_DEBUG: &str = "pkg:npm/debug@4.3.4";
+    const PC_MS: &str = "pkg:npm/ms@2.1.2";
+    const PC_DEBUG_UUID: &str = "55555555-5555-4555-8555-555555555555";
+    const PC_MS_UUID: &str = "66666666-6666-4666-8666-666666666666";
+
+    fn pc_parts(purl: &str) -> (&'static str, &'static str, &'static str) {
+        match purl {
+            PC_DEBUG => ("debug", "4.3.4", PC_DEBUG_UUID),
+            PC_MS => ("ms", "2.1.2", PC_MS_UUID),
+            other => panic!("unknown purl {other}"),
+        }
+    }
+
+    async fn pc_vendor(fx: &Fixture, purl: &str) {
+        let (name, version, uuid) = pc_parts(purl);
+        let installed = fx.root().join("node_modules").join(name);
+        tokio::fs::create_dir_all(&installed).await.unwrap();
+        tokio::fs::write(
+            installed.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(installed.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
+        let mut record = fx.record.clone();
+        record.uuid = uuid.to_string();
+        let blobs = fx.root().join(".socket/blobs");
+        let outcome = crate::vendor::test_support::vendor_pnpm_legacy(
+            purl,
+            &installed,
+            fx.root(),
+            &record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-08-18T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let (result, entry, _) = expect_done(outcome);
+        assert!(result.success, "{purl}: {:?}", result.error);
+        let mut state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+        state.entries.insert(purl.to_string(), entry.unwrap());
+        crate::vendor::state::save_state(fx.root(), &state)
+            .await
+            .unwrap();
+    }
+
+    /// Every packages dep ref names an existing packages key (the dep path
+    /// a frozen install resolves: `/name/ver`, `/name@ver` or the bare
+    /// `file:` key).
+    fn assert_pkg_refs_resolve(lock: &str, v54: bool) {
+        let lines = split_lines(lock);
+        let (start, end) = section_bounds(&lines, "packages").unwrap();
+        let mut keys = std::collections::HashSet::new();
+        let mut refs = Vec::new();
+        let mut i = start + 1;
+        while let Some(block) = next_block(&lines, i, end) {
+            keys.insert(block.key.clone());
+            let mut in_dep_map = false;
+            for line in &lines[block.header + 1..block.end] {
+                if let Some((field, _, rest)) = parse_key_line(line, 4) {
+                    in_dep_map = rest.is_empty() && field == "dependencies";
+                    continue;
+                }
+                if let Some((dep, _, rest)) = parse_key_line(line, 6).filter(|_| in_dep_map) {
+                    refs.push(if rest.starts_with("file:") {
+                        rest.to_string()
+                    } else if v54 {
+                        format!("/{dep}/{rest}")
+                    } else {
+                        format!("/{dep}@{rest}")
+                    });
+                }
+            }
+            i = block.end;
+        }
+        for r in refs {
+            assert!(keys.contains(&r), "dangling dep ref `{r}`:\n{lock}");
+        }
+    }
+
+    /// The v9 `pc_round_trip` for the legacy grammars (#830).
+    async fn pc_round_trip(lock: &str, vendor_order: [&str; 2], revert_order: [&str; 2]) {
+        let v54 = lock.starts_with("lockfileVersion: 5.4");
+        let fx = fixture_with(PC_PKG, lock).await;
+        for purl in vendor_order {
+            pc_vendor(&fx, purl).await;
+        }
+        for (step, purl) in revert_order.into_iter().enumerate() {
+            let mut state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+            let entry = state.entries.get(purl).cloned().unwrap();
+            let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+            let label = format!("v54={v54} vendor {vendor_order:?}, revert {purl}");
+            assert!(outcome.success, "{label}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{label}: {:?}",
+                outcome.warnings
+            );
+            assert!(!outcome.kept_artifact, "{label}: artifact kept");
+            state.entries.remove(purl);
+            crate::vendor::state::save_state(fx.root(), &state)
+                .await
+                .unwrap();
+            let live = fx.read(PNPM_LOCK).await;
+            assert_pkg_refs_resolve(&live, v54);
+            if step == 0 {
+                let (name, version, uuid) = pc_parts(revert_order[1]);
+                let spec = format!("file:.socket/vendor/npm/{uuid}/{name}-{version}.tgz");
+                assert!(live.contains(&format!("  {spec}:")), "{label}:\n{live}");
+                let again = revert_pnpm_legacy(&entry, fx.root(), false).await;
+                assert!(again.success, "{label} re-run: {:?}", again.error);
+                assert!(
+                    again.warnings.is_empty(),
+                    "{label} re-run: {:?}",
+                    again.warnings
+                );
+                assert_eq!(fx.read(PNPM_LOCK).await, live, "{label}: re-run is a no-op");
+            }
+        }
+        assert_eq!(fx.read(PNPM_LOCK).await, lock, "lock byte-restored");
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            PC_PKG,
+            "package.json byte-restored"
+        );
+        for uuid in [PC_DEBUG_UUID, PC_MS_UUID] {
+            assert!(!fx
+                .root()
+                .join(format!(".socket/vendor/npm/{uuid}"))
+                .exists());
+        }
+    }
+
+    /// #830: unwinding the vendored parent alone keeps its vendored child's
+    /// dep ref; the child's ref record (keyed by the parent's now-gone
+    /// `file:` key) still restores it afterwards. Lockfile 5.4 and 6.0.
+    #[tokio::test]
+    async fn parent_first_revert_keeps_the_vendored_child_ref() {
+        for lock in [PC7_LOCK, PC8_LOCK] {
+            pc_round_trip(lock, [PC_DEBUG, PC_MS], [PC_DEBUG, PC_MS]).await;
+        }
+    }
+
+    /// #830, reverse twin: child vendored first, then the parent; unwinding
+    /// the child alone restores the ref inside the parent's `file:` block.
+    #[tokio::test]
+    async fn child_first_vendored_child_revert_restores_the_ref_in_the_rekeyed_parent() {
+        for lock in [PC7_LOCK, PC8_LOCK] {
+            pc_round_trip(lock, [PC_MS, PC_DEBUG], [PC_MS, PC_DEBUG]).await;
+        }
+    }
+
+    /// Guards: the two orders that already round-tripped stay clean.
+    #[tokio::test]
+    async fn parent_child_guard_orders_round_trip() {
+        for lock in [PC7_LOCK, PC8_LOCK] {
+            pc_round_trip(lock, [PC_DEBUG, PC_MS], [PC_MS, PC_DEBUG]).await;
+            pc_round_trip(lock, [PC_MS, PC_DEBUG], [PC_DEBUG, PC_MS]).await;
         }
     }
 }

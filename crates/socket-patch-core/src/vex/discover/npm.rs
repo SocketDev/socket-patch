@@ -684,6 +684,17 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         for rel in rush_lock_rels(ctx.view).await {
             extract_pnpm_lock(ctx, &rel, out).await;
         }
+    } else if let crate::utils::pnpm_workspace::MemberLocks::PerMember(rels) =
+        crate::utils::pnpm_workspace::member_locks(&ctx.view).await
+    {
+        // `sharedWorkspaceLockfile: false`: each workspace member installs
+        // from its own lock, which hosted mode pins beside the root's
+        // (#492). A member lock beside a shared root lock (one listing
+        // member importers) is a stale leftover pnpm never reads, and is
+        // not among `rels`.
+        for rel in rels {
+            extract_pnpm_lock(ctx, &rel, out).await;
+        }
     }
 }
 
@@ -2897,6 +2908,37 @@ mod tests {
         assert!(files.contains(&"common/config/rush/pnpm-lock.yaml".into()));
         assert!(files.contains(&"common/config/subspaces/frontend/pnpm-lock.yaml".into()));
         assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    }
+
+    /// #492: under `sharedWorkspaceLockfile: false` each member's own lock
+    /// is read (pnpm 7 writes no root lock at all); beside a shared root
+    /// lock (one listing member importers) or without the setting, a
+    /// member lock is a stale leftover and never attests.
+    #[tokio::test]
+    async fn pnpm_member_locks_under_an_unshared_workspace() {
+        let lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      ms:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  ms@1.3.0:\n    resolution: {integrity: sha512-UP==}\n";
+        let wired = hosted_rewrite("pnpm-lock.yaml", lock, &[pnpm_override("ms", UUID_B, None)]);
+        let p = Project::new();
+        p.write("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+        p.write("packages/a/package.json", "{}");
+        p.write("packages/a/pnpm-lock.yaml", &wired);
+        assert!(run(&p).await.refs.is_empty(), "shared default: not read");
+        p.write(".npmrc", "shared-workspace-lockfile=false\n");
+        let out = run(&p).await;
+        assert_refs(&out, &[("pkg:npm/ms@1.3.0", UUID_B, WiringMode::Hosted)]);
+        assert_eq!(
+            out.refs[0].source_file,
+            std::path::PathBuf::from("packages/a/pnpm-lock.yaml")
+        );
+        assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+        p.write(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  packages/a: {}\n",
+        );
+        assert!(
+            run(&p).await.refs.is_empty(),
+            "shared root lock: stale member"
+        );
     }
 
     /// `shrinkwrap.yaml` (pnpm <= 2) is read only when there is no

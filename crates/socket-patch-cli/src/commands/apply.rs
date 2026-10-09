@@ -15,7 +15,7 @@ use socket_patch_core::patch::redirect::golang_local::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
 };
 use socket_patch_core::patch::sidecars::{maven as maven_sidecars, SidecarAdvisoryCode};
-use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
+use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed, TelemetryAuth};
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
@@ -30,7 +30,10 @@ use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
 };
-use crate::ecosystem_dispatch::{find_all_packages_for_purls, partition_purls, JvmScope};
+use crate::ecosystem_dispatch::{
+    distinct_install_dirs, distinct_npm_copies, find_all_packages_for_purls, partition_purls,
+    JvmScope,
+};
 use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
     RunWarning, Status, VexSummary,
@@ -913,25 +916,6 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
     }
 }
 
-/// `paths` in order with every path that resolves to an already-listed
-/// directory dropped: two discovered site-packages paths can name ONE
-/// directory (a `lib64 -> lib` symlink, a symlinked venv), and patching it
-/// twice would report the second pass `already_patched`. A path that can't
-/// be canonicalized is kept as-is.
-async fn distinct_install_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut out = Vec::with_capacity(paths.len());
-    for path in paths {
-        let key = tokio::fs::canonicalize(path)
-            .await
-            .unwrap_or_else(|_| path.clone());
-        if seen.insert(key) {
-            out.push(path.clone());
-        }
-    }
-    out
-}
-
 /// The file whose verify status decides whether a release variant
 /// describes the installed distribution (fed to
 /// [`variant_matches_installed`]).
@@ -1120,7 +1104,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
             println!("No patch manifest found; nothing to apply.");
         }
         let vex_result = if !args.common.dry_run && !args.check && args.vex.vex.is_some() {
-            let params = args.vex.to_build_params();
+            let params = args.vex.to_build_params(None);
             Some(generate_vex_without_manifest(&args.common, &params, &manifest_path).await)
         } else {
             None
@@ -1312,8 +1296,7 @@ pub(crate) async fn run_locked(
     client: &ApiClient,
     lock: LockGuard,
 ) -> ApplyRunReport {
-    let api_token = client.api_token().cloned();
-    let org_slug = client.org_slug().cloned();
+    let telemetry = TelemetryAuth::for_client(client);
 
     // ONE parse of the manifest for the whole run — the PnP gate and the
     // apply loop (embedded VEX re-reads it by design, after the writes).
@@ -1324,13 +1307,13 @@ pub(crate) async fn run_locked(
         Ok(Some(m)) => m,
         Ok(None) => {
             lock.release();
-            let code = report_apply_failure(&args, "Invalid manifest", &api_token, &org_slug).await;
+            let code = report_apply_failure(&args, "Invalid manifest", &telemetry).await;
             return ApplyRunReport::run_failure(code, "apply_failed", "Invalid manifest");
         }
         Err(e) => {
             lock.release();
             let error = e.to_string();
-            let code = report_apply_failure(&args, &error, &api_token, &org_slug).await;
+            let code = report_apply_failure(&args, &error, &telemetry).await;
             return ApplyRunReport::run_failure(code, "apply_failed", error);
         }
     };
@@ -1502,7 +1485,7 @@ pub(crate) async fn run_locked(
             // `no_applicable_patches`, and would write an attestation
             // file during --dry-run. Skip instead.
             let vex_result = if success && !args.common.dry_run && args.vex.vex.is_some() {
-                let params = args.vex.to_build_params();
+                let params = args.vex.to_build_params(Some(client));
                 Some(generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await)
             } else {
                 None
@@ -1579,6 +1562,13 @@ pub(crate) async fn run_locked(
                 // `warnings[]` is their machine channel — stderr is
                 // suppressed under --json.
                 env.warnings.extend(run_warnings.iter().cloned());
+                // A token whose org could not be resolved put the run on the
+                // proxy (stderr already said so); the embedded `--vex` reuses
+                // this client and leaves reporting it to the host.
+                env.warnings
+                    .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                        client,
+                    ));
                 if !success {
                     env.mark_partial_failure();
                 }
@@ -1648,19 +1638,12 @@ pub(crate) async fn run_locked(
 
             // Track telemetry
             if success {
-                track_patch_applied(
-                    patched_count,
-                    args.common.dry_run,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_applied(patched_count, args.common.dry_run, &telemetry).await;
             } else {
                 track_patch_apply_failed(
                     "One or more patches failed to apply",
                     args.common.dry_run,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
+                    &telemetry,
                 )
                 .await;
             }
@@ -1717,7 +1700,7 @@ pub(crate) async fn run_locked(
         }
         Err(e) => {
             lock.release();
-            let code = report_apply_failure(&args, &e, &api_token, &org_slug).await;
+            let code = report_apply_failure(&args, &e, &telemetry).await;
             ApplyRunReport::run_failure(code, "apply_failed", e)
         }
     }
@@ -1728,19 +1711,8 @@ pub(crate) async fn run_locked(
 /// `--silent` ("errors only", never "nothing" — exit 1 with no message
 /// would be undiagnosable), exit 1. Shared by the manifest read in `run`
 /// and `apply_patches_inner`'s `Err` arm.
-async fn report_apply_failure(
-    args: &ApplyArgs,
-    error: &str,
-    api_token: &Option<String>,
-    org_slug: &Option<String>,
-) -> i32 {
-    track_patch_apply_failed(
-        error,
-        args.common.dry_run,
-        api_token.as_deref(),
-        org_slug.as_deref(),
-    )
-    .await;
+async fn report_apply_failure(args: &ApplyArgs, error: &str, telemetry: &TelemetryAuth) -> i32 {
+    track_patch_apply_failed(error, args.common.dry_run, telemetry).await;
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;
@@ -2262,12 +2234,15 @@ async fn apply_patches_inner(
     // physical copy per PURL. Patching only one would leave a live,
     // vulnerable copy while reporting success (the multi-copy silent
     // partial). The apply loop below iterates every copy.
-    let all_packages = find_all_packages_for_purls(
+    let mut all_packages = find_all_packages_for_purls(
         &partitioned,
         &crawler_options,
         args.common.silent || args.common.json,
     )
     .await;
+    // One visit per physical copy: a pnpm workspace member's link into
+    // the root store is the same copy the root walk found (#633).
+    distinct_npm_copies(&mut all_packages).await;
 
     if all_packages.is_empty() {
         // Vendored purls are already accounted for (synthesized Skipped/

@@ -50,6 +50,8 @@ mod lock_index_equivalence_tests;
 pub mod npmrc;
 mod pdm;
 mod pipenv;
+#[cfg(test)]
+mod pipenv_pylock_tests;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
 use crate::formats::cargo::hosted::CargoLockPlan;
@@ -5379,6 +5381,24 @@ fn record_python_metadata_edit(
     result.files.insert(edit.path, edit.rewritten);
 }
 
+/// #912: the refusal for a pylock Pipenv installs from
+/// ([`pipenv_reads_pylock`]): Pipenv drops the `archive` entry a pin
+/// writes, so `pipenv sync` would install the upstream release.
+///
+/// [`pipenv_reads_pylock`]: crate::utils::python_lock::pipenv_reads_pylock
+fn pipenv_pylock_refusal(path: &str, dep: &DepOverride) -> RewriteWarning {
+    RewriteWarning {
+        code: "redirect_pipenv_pylock_unsupported".into(),
+        detail: format!(
+            "{path} is installed by Pipenv (a Pipfile sits beside it and there is no \
+             Pipfile.lock), and Pipenv keeps only the version and hashes of a pylock \
+             entry, so a pin of {}=={} would be dropped and the upstream release \
+             installed; run `pipenv lock` to write a Pipfile.lock and re-run the scan",
+            dep.name, dep.version
+        ),
+    }
+}
+
 /// Each lock is parsed once ([`PythonLockSession`]) and every dep is
 /// planned, refused or applied against that one document. The lock is still
 /// rendered after every rewritten dep: each dep's FileEdit fragments are
@@ -5391,7 +5411,9 @@ fn rewrite_uv_lock(
     python_metadata: &BTreeMap<String, String>,
     result: &mut RewriteResult,
 ) {
-    use crate::utils::python_lock::{is_python_lock_name, ArtifactSource, PythonLockSession};
+    use crate::utils::python_lock::{
+        is_python_lock_name, pipenv_reads_pylock, ArtifactSource, PythonLockSession,
+    };
 
     let locks: Vec<(&String, &String)> = files
         .iter()
@@ -5417,9 +5439,17 @@ fn rewrite_uv_lock(
     for (path, original) in locks {
         let mut content = original.clone();
         let mut session = PythonLockSession::new(original);
+        let pipenv_reads = pipenv_reads_pylock(path, |rel| files.contains_key(rel));
         for &(dep, sha256) in &usable {
             let artifact = ArtifactSource::Url(&dep.artifact_url);
             let plan = match session.plan(&content, &dep.name, &dep.version, artifact) {
+                Ok(Some(_)) if pipenv_reads => {
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
+                    result.warnings.push(pipenv_pylock_refusal(path, dep));
+                    continue;
+                }
                 Ok(Some(plan)) => plan,
                 Ok(None) => {
                     result.warnings.push(RewriteWarning {

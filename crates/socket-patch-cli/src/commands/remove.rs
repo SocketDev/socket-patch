@@ -5,7 +5,7 @@ use socket_patch_core::manifest::cleanup_blobs::{format_bytes, ArtifactReference
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
-use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed};
+use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed, TelemetryAuth};
 use socket_patch_core::utils::purl::patch_matches;
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{
@@ -69,15 +69,9 @@ fn remove_matching(
 /// matched nothing in any store, tracking the failure. `dry_run` rides the
 /// envelope so a preview's failures still report `dryRun: true` (matching
 /// apply's error envelopes and remove's own success envelope).
-async fn emit_not_found(
-    json: bool,
-    dry_run: bool,
-    identifier: &str,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+async fn emit_not_found(json: bool, dry_run: bool, identifier: &str, telemetry: &TelemetryAuth) {
     let msg = format!("No patch found matching identifier: {identifier}");
-    track_patch_remove_failed(&msg, api_token, org_slug).await;
+    track_patch_remove_failed(&msg, telemetry).await;
     if json {
         let mut env = Envelope::new(Command::Remove);
         env.dry_run = dry_run;
@@ -340,8 +334,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     let (telemetry_client, _) =
         get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let api_token = telemetry_client.api_token().cloned();
-    let org_slug = telemetry_client.org_slug().cloned();
+    let telemetry = TelemetryAuth::for_client(&telemetry_client);
     let loud = !args.common.json && !args.common.silent;
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -477,14 +470,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         if let Ok(state) = vendor_state_result {
             let ledger_matches = vendor_entries_matching(&state, None, &args.identifier);
             if !ledger_matches.is_empty() {
-                return remove_ledger_only(
-                    &args,
-                    ledger_matches,
-                    state,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                return remove_ledger_only(&args, ledger_matches, state, &telemetry).await;
             }
         }
 
@@ -493,21 +479,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // per-purl exit path (restoring the upstream entry IS the removal).
         let hosted_matches = hosted_pins_matching(&hosted_pins, &args.identifier, &[]);
         if !hosted_matches.is_empty() {
-            return remove_hosted_only(
-                &args,
-                hosted_matches,
-                api_token.as_deref(),
-                org_slug.as_deref(),
-            )
-            .await;
+            return remove_hosted_only(&args, hosted_matches, &telemetry).await;
         }
 
         emit_not_found(
             args.common.json,
             args.common.dry_run,
             &args.identifier,
-            api_token.as_deref(),
-            org_slug.as_deref(),
+            &telemetry,
         )
         .await;
         return 1;
@@ -625,12 +604,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 rollback_not_installed = outcome.not_installed;
                 rollback_warnings = outcome.warnings;
                 if !outcome.success {
-                    track_patch_remove_failed(
-                        "Rollback failed during patch removal",
-                        api_token.as_deref(),
-                        org_slug.as_deref(),
-                    )
-                    .await;
+                    track_patch_remove_failed("Rollback failed during patch removal", &telemetry)
+                        .await;
                     // The nested rollback reports per-package failures
                     // inline only under --silent; say why here otherwise.
                     if loud {
@@ -691,7 +666,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 }
             }
             Err(e) => {
-                track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_remove_failed(&e, &telemetry).await;
                 let remedy = "Use --skip-rollback to remove from manifest without restoring files.";
                 if args.common.json {
                     // The pinned envelope message keeps its historical prefix.
@@ -757,19 +732,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
         } else {
             let keys: Vec<String> = vendored_matches.iter().map(|(k, _)| k.clone()).collect();
-            vendor_leg = match revert_vendored_matches(
-                &args,
-                &keys,
-                &mut vendor_state,
-                api_token.as_deref(),
-                org_slug.as_deref(),
-                true,
-            )
-            .await
-            {
-                Ok(leg) => leg,
-                Err(code) => return code,
-            };
+            vendor_leg =
+                match revert_vendored_matches(&args, &keys, &mut vendor_state, &telemetry, true)
+                    .await
+                {
+                    Ok(leg) => leg,
+                    Err(code) => return code,
+                };
             printed_progress |= loud && vendor_leg.printed;
         }
     }
@@ -860,7 +829,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
              removed (re-run `scan --mode vendored` to normalize, then remove)",
             args.identifier
         );
-        track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+        track_patch_remove_failed(&msg, &telemetry).await;
         if args.common.json {
             let mut env = Envelope::new(Command::Remove);
             env.dry_run = args.common.dry_run;
@@ -878,7 +847,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     if !args.common.dry_run && !removed.is_empty() {
         if let Err(e) = write_manifest(&manifest_path, &updated_manifest).await {
             let msg = e.to_string();
-            track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_remove_failed(&msg, &telemetry).await;
             emit_error_envelope(args.common.json, args.common.dry_run, "remove_failed", msg);
             return 1;
         }
@@ -1108,7 +1077,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     }
 
     if !args.common.dry_run {
-        track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref()).await;
+        track_patch_removed(removed.len(), &telemetry).await;
     }
     if vendor_leg.kept.is_empty() {
         0
@@ -1165,8 +1134,7 @@ async fn revert_vendored_matches(
     args: &RemoveArgs,
     keys: &[String],
     state: &mut VendorState,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    telemetry: &TelemetryAuth,
     manifest_backed: bool,
 ) -> Result<RemoveVendorLeg, i32> {
     let loud = !args.common.json && !args.common.silent;
@@ -1199,12 +1167,8 @@ async fn revert_vendored_matches(
         match step {
             VendorRevertStep::Missing => {}
             VendorRevertStep::Failed(why) => {
-                track_patch_remove_failed(
-                    "vendor revert failed during patch removal",
-                    api_token,
-                    org_slug,
-                )
-                .await;
+                track_patch_remove_failed("vendor revert failed during patch removal", telemetry)
+                    .await;
                 emit_error_envelope(
                     args.common.json,
                     args.common.dry_run,
@@ -1373,8 +1337,7 @@ fn emit_hosted_unwind_error(common: &GlobalArgs, err: HostedUnwindError, manifes
 async fn remove_hosted_only(
     args: &RemoveArgs,
     hosted_matches: Vec<HostedPin>,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    telemetry: &TelemetryAuth,
 ) -> i32 {
     let loud = !args.common.json && !args.common.silent;
     if args.skip_rollback {
@@ -1430,7 +1393,7 @@ async fn remove_hosted_only(
     let leg = match unwind_hosted(&args.common, &hosted_matches).await {
         Ok(leg) => leg,
         Err(err) => {
-            track_patch_remove_failed("hosted redirect revert failed", api_token, org_slug).await;
+            track_patch_remove_failed("hosted redirect revert failed", telemetry).await;
             emit_hosted_unwind_error(&args.common, err, false);
             return 1;
         }
@@ -1463,7 +1426,7 @@ async fn remove_hosted_only(
         println!("{}", env.to_pretty_json());
     }
     if !args.common.dry_run {
-        track_patch_removed(leg.reverted.len(), api_token, org_slug).await;
+        track_patch_removed(leg.reverted.len(), telemetry).await;
     }
     0
 }
@@ -1483,8 +1446,7 @@ async fn remove_ledger_only(
     args: &RemoveArgs,
     matches: Vec<(String, VendorEntry)>,
     mut state: VendorState,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    telemetry: &TelemetryAuth,
 ) -> i32 {
     let loud = !args.common.json && !args.common.silent;
     if args.skip_rollback {
@@ -1548,11 +1510,10 @@ async fn remove_ledger_only(
     }
 
     let keys: Vec<String> = matches.iter().map(|(k, _)| k.clone()).collect();
-    let leg =
-        match revert_vendored_matches(args, &keys, &mut state, api_token, org_slug, false).await {
-            Ok(leg) => leg,
-            Err(code) => return code,
-        };
+    let leg = match revert_vendored_matches(args, &keys, &mut state, telemetry, false).await {
+        Ok(leg) => leg,
+        Err(code) => return code,
+    };
 
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
@@ -1576,7 +1537,7 @@ async fn remove_ledger_only(
                  removed (re-run `scan --mode vendored` to normalize, then remove)",
                 args.identifier
             );
-            track_patch_remove_failed(&msg, api_token, org_slug).await;
+            track_patch_remove_failed(&msg, telemetry).await;
             env.error = Some(EnvelopeError::new("vendor_revert_kept", msg));
         }
     }
@@ -1584,7 +1545,7 @@ async fn remove_ledger_only(
         println!("{}", env.to_pretty_json());
     }
     if !args.common.dry_run {
-        track_patch_removed(leg.reverted_count, api_token, org_slug).await;
+        track_patch_removed(leg.reverted_count, telemetry).await;
     }
     if leg.kept.is_empty() {
         0

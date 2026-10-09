@@ -109,8 +109,8 @@ fn setup(
         )
         .unwrap();
     }
-    let home = SbtHome::new(&root);
-    let out = sbt.run(&proj, &home, &[], &["sbtVersion", "update"]);
+    let mut home = SbtHome::new(&root);
+    let out = sbt_vendor_build_common::warm_up(&sbt, &proj, &mut home);
     if !ok(&out) {
         let why = format!("warm-up `sbt update` failed:\n{}", dump(&out));
         sbt_vendor_build_common::skip(suite, &why);
