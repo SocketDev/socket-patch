@@ -5,7 +5,8 @@
 //! Verifies:
 //!   - `apply` (default, online) fetches missing blobs from the API
 //!     and writes them to an OS tempdir (NOT `.socket/`).
-//!   - `--download-mode file` falls back to the per-file blob endpoint.
+//!   - a cold-cache apply fetches only per-file blobs, never a diff
+//!     archive (v5 removed the diff download path).
 //!   - `apply` against installed packages writes patched content to
 //!     node_modules and leaves `.socket/` byte-identical.
 
@@ -130,18 +131,6 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
         .respond_with(ResponseTemplate::new(200).set_body_bytes(after.to_vec()))
         .mount(&mock)
         .await;
-    // The diff/package endpoints might be queried first (default mode is
-    // `diff`). 404 them so the fetcher falls back to the blob endpoint.
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/diff/{uuid}")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/package/{uuid}")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock)
-        .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
@@ -155,7 +144,7 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
     let socket = tmp.path().join(".socket");
     write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
 
-    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--download-mode", "file"]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
     assert_eq!(
         code, 0,
         "apply must succeed; stdout={stdout}; stderr={stderr}"
@@ -180,6 +169,22 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
             .iter()
             .map(|r| r.url.path().to_string())
             .collect::<Vec<_>>()
+    );
+    // Per-file blobs are the only download: a cold cache must never
+    // request a diff (or legacy package) archive.
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.url.path().contains("/diff") && !r.url.path().contains("/package/")),
+        "apply must request only blobs; got requests={:?}",
+        requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !socket.join("diffs").exists(),
+        "apply must not create .socket/diffs/"
     );
     // The fetch path must have actually applied the patch (not silently
     // no-op'd to a green exit). Assert the JSON summary, not just exit code.
@@ -473,8 +478,7 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
     };
 
     // DEFAULT: the mismatch is overwritten with the full verified patched
-    // content (the diff strategy would self-skip; the blob is hash-gated to
-    // afterHash) and surfaced as a warning event — exit 0.
+    // content (the blob is hash-gated to afterHash) and surfaced as a warning event — exit 0.
     let tmp = fixture();
     let out = Command::new(binary())
         .args(["apply", "--json", "--offline"])
@@ -701,13 +705,12 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
 }
 
 // ---------------------------------------------------------------------------
-// Mismatch + diff-mode sources: the full blob is redownloaded on demand.
+// Mismatch: the full blob is downloaded and applied.
 // ---------------------------------------------------------------------------
 
-/// A mismatched file cannot be patched from a partial source (the diff
-/// strategy needs the exact before-bytes), so the default mismatch policy
-/// redownloads the FULL afterHash blob and applies that — even when a
-/// local source archive made the stage step skip downloading.
+/// The default mismatch policy applies the FULL afterHash blob to a
+/// mismatched file. A leftover legacy package archive is not a source, so
+/// the stage step still downloads the blob.
 #[tokio::test]
 async fn apply_mismatch_redownloads_full_blob_and_applies() {
     let after = b"after\n";
@@ -741,9 +744,8 @@ async fn apply_mismatch_redownloads_full_blob_and_applies() {
         &expected_before_hash,
         &after_hash,
     );
-    // A LOCAL package archive exists (so the stage step downloads nothing)
-    // but carries no entry for index.js — only the blob can produce the
-    // patched bytes, and no blob is staged.
+    // A leftover LOCAL package archive exists, but nothing reads it: only
+    // the blob can produce the patched bytes, and no blob is cached.
     let packages = socket.join("packages");
     std::fs::create_dir_all(&packages).unwrap();
     {
@@ -964,14 +966,11 @@ async fn apply_online_ignores_legacy_package_archive_when_downloads_fail() {
 
 /// Two physical copies of one PURL (a root copy plus a nested duplicate):
 /// the root copy already carries the afterHash bytes, the nested one was
-/// locally modified (matches NEITHER hash). A cached diff archive makes the
-/// stage step download nothing, so the on-demand mismatch top-up is the
-/// ONLY chance to fetch the full afterHash blob the nested copy needs under
-/// the default warn-and-overwrite policy — and copies drift independently,
-/// so the top-up must probe EVERY copy, not just the first (clean, root)
-/// one.
+/// locally modified (matches NEITHER hash). The stage step fetches the full
+/// afterHash blob, and the default warn-and-overwrite policy must apply it
+/// to EVERY copy, not just the first (clean, root) one.
 #[tokio::test]
-async fn mismatch_blob_topup_probes_every_copy_of_a_duplicated_package() {
+async fn mismatch_overwrites_every_copy_of_a_duplicated_package() {
     let before = b"before\n";
     let after = b"after\n";
     let before_hash = git_sha256(before);
@@ -1006,36 +1005,6 @@ async fn mismatch_blob_topup_probes_every_copy_of_a_duplicated_package() {
 
     let socket = tmp.path().join(".socket");
     write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
-    // A cached diff archive: the stage step concludes nothing needs
-    // downloading (default `--download-mode diff`), so sources are read
-    // in place and no whole-manifest blob fallback runs. The archive's
-    // content is never consulted for these copies (already-patched needs
-    // nothing; a mismatched file can only take the full blob).
-    let diffs = socket.join("diffs");
-    std::fs::create_dir_all(&diffs).unwrap();
-    {
-        use std::io::Write as _;
-        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-            std::fs::File::create(diffs.join(format!("{uuid}.tar.gz"))).unwrap(),
-            flate2::Compression::default(),
-        ));
-        let mut header = tar::Header::new_gnu();
-        let bytes = b"unrelated";
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "other.js", &bytes[..])
-            .unwrap();
-        builder
-            .into_inner()
-            .unwrap()
-            .finish()
-            .unwrap()
-            .flush()
-            .unwrap();
-    }
-
     let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
@@ -1048,12 +1017,12 @@ async fn mismatch_blob_topup_probes_every_copy_of_a_duplicated_package() {
     );
     assert_eq!(v["summary"]["failed"], 0, "no copy may fail.\nstdout={v:#}");
 
-    // The nested copy's blob was fetched on demand…
+    // The blob was fetched…
     let requests = mock.received_requests().await.unwrap();
     let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
     assert!(
         requests.iter().any(|r| r.url.path() == blob_path),
-        "the top-up must fetch the blob the nested copy needs; got {:?}",
+        "the stage step must fetch the blob the nested copy needs; got {:?}",
         requests
             .iter()
             .map(|r| r.url.path().to_string())
@@ -1075,7 +1044,7 @@ async fn mismatch_blob_topup_probes_every_copy_of_a_duplicated_package() {
         "the nested copy must be overwritten with the verified patched bytes"
     );
 
-    // Apply stays read-only against the persistent cache: the on-demand
+    // Apply stays read-only against the persistent cache: the fetched
     // blob lands in a transient overlay, never `.socket/blobs/`.
     let blobs_dir = socket.join("blobs");
     if blobs_dir.exists() {

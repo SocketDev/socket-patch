@@ -2712,13 +2712,7 @@ async fn try_pypi_service_wheel(
     } else {
         (false, String::new())
     };
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored the wheel for {base} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
+    warnings.push(archive.downloaded_warning(format_args!("the wheel for {base}")));
     PypiServiceWheel::Used(Box::new(AcquiredWheel {
         rel_wheel,
         result: if dry_run {

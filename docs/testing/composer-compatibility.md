@@ -17,7 +17,7 @@ contract.
 | Mode | Lock entry after the rewrite |
 | --- | --- |
 | Vendored (`vendor`, `scan`/`get --mode vendored`) | `dist` → `{"type": "path", "url": ".socket/vendor/composer/<uuid>/<vendor>/<name>@<version>", "reference": "<patch-uuid>"}` in the original slot, `"transport-options": {"symlink": false}` after it, `source` removed. The patched copy is committed under `.socket/vendor/composer/`. |
-| Hosted (`scan --mode hosted`) | `dist.type` → `zip`, `dist.url` → the hosted archive, `dist.shasum` → its sha1 (inserted when the lock had none). The entry's top-level `source` is removed wherever it sits in the entry, and `dist.mirrors` is removed (`redirect_composer_dist_mirrors_removed`). A `source` that is not an object is left and warned about (`redirect_composer_source_kept`). |
+| Hosted (`scan --mode hosted`) | `dist.type` → `zip`, `dist.url` → the hosted archive, `dist.shasum` → its sha1 (inserted when the lock had none). The entry's top-level `source` is removed wherever it sits in the entry, `dist.mirrors` is removed (`redirect_composer_dist_mirrors_removed`), and the entry's `transport-options` are removed (`redirect_composer_transport_options_removed`): Composer copies a repository's `options` (auth headers, client certificates, proxy) into each entry it resolves and applies them to the dist download, so kept on a redirected entry they would go to the hosted host (#399). The ledger's fragment revert restores all three. A `source` that is not an object is left and warned about (`redirect_composer_source_kept`). |
 
 The lock's `version` spelling is never rewritten (`v6.4.1` stays `v6.4.1`).
 Patch coordinates are matched by Composer release identity, so a lock
