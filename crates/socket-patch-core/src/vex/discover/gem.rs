@@ -750,7 +750,7 @@ mod tests {
     async fn manifest_source_pins_fail_closed() {
         let block =
             |uuid: &str, decl: &str| format!("source \"{}\" do\n  {decl}\nend\n", index(uuid));
-        for gemfile in [
+        for (case, gemfile) in [
             // A range, no version, a source-selecting option.
             block(UUID_A, "gem \"rails\", \"~> 7.0\""),
             block(UUID_A, "gem \"rails\""),
@@ -769,9 +769,13 @@ mod tests {
                 "{}source \"https://gems.example.com/\" do\n  gem \"rails\", \"7.0.0\"\nend\n",
                 block(UUID_A, "gem \"rails\", \"7.0.0\"")
             ),
-        ] {
-            let pins = manifest_pins(&[("Gemfile", &gemfile), ("Gemfile.lock", MIXED_LOCK)]).await;
-            assert!(pins.is_empty(), "{gemfile}\n=> {pins:?}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            let pins =
+                manifest_pins(&[("Gemfile", gemfile.as_str()), ("Gemfile.lock", MIXED_LOCK)]).await;
+            assert!(pins.is_empty(), "case {case} must yield no pin");
         }
         // bundler loads gems.rb + gems.locked: a leftover Gemfile is not read.
         let gemfile = block(UUID_A, "gem \"rails\", \"7.0.0\"");
@@ -784,7 +788,10 @@ mod tests {
             ("gems.locked", MIXED_LOCK),
         ])
         .await;
-        assert!(pins.is_empty(), "{pins:?}");
+        assert!(
+            pins.is_empty(),
+            "a Gemfile bundler does not load must yield no pin"
+        );
         let pins = manifest_pins(&[("gems.rb", &gemfile), ("gems.locked", MIXED_LOCK)]).await;
         assert_eq!(
             pins,

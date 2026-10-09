@@ -3244,10 +3244,10 @@ async fn gem_hosted_capped_rescan_counts_a_gemfile_only_pin_as_already() {
         "run 2 must count the gem run 1 wired as ALREADY and add the other: {env}"
     );
     let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
-    for uuid in [UUID, TINY_GEN2] {
+    for (gem, patch) in [(DEP, UUID), (TRANSITIVE, TINY_GEN2)] {
         assert!(
-            gemfile.contains(&registry(uuid)),
-            "run 2 must leave both gems wired ({uuid} missing):\n{gemfile}"
+            gemfile.contains(&registry(patch)),
+            "run 2 must leave both gems wired ({gem} missing)"
         );
     }
     let env = run_capped_hosted_scan(&fx.proj, &api, "1");
