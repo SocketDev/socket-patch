@@ -304,10 +304,17 @@ fn workspace_in_effect(cwd: &Path) -> bool {
     match std::env::var_os("GOWORK") {
         Some(v) if v == "off" => false,
         Some(v) if !v.is_empty() => true,
-        _ => cwd
-            .ancestors()
-            .any(|dir| std::fs::symlink_metadata(dir.join("go.work")).is_ok()),
+        _ => go_work_at_or_above(cwd, &std::env::current_dir().unwrap_or_default()),
     }
+}
+
+/// Whether a `go.work` exists in `cwd` or an ancestor, a relative `cwd`
+/// taken against `base` first: the CLI's default `cwd` is `.`, whose
+/// lexical ancestors stop at itself, so a parent `go.work` would be missed.
+fn go_work_at_or_above(cwd: &Path, base: &Path) -> bool {
+    base.join(cwd)
+        .ancestors()
+        .any(|dir| std::fs::symlink_metadata(dir.join("go.work")).is_ok())
 }
 
 /// Look up each `recorded` module in cache root `cache_path` instead of
@@ -1404,6 +1411,24 @@ mod tests {
             // GOWORK naming a file elsewhere.
             let _gowork = EnvGuard::set("GOWORK", "/elsewhere/go.work");
             assert_eq!(f.crawl().await, walked);
+        }
+
+        /// A relative `cwd` (the CLI passes `.`) still finds a parent
+        /// go.work, resolved against the process's directory.
+        #[test]
+        fn a_relative_cwd_still_sees_a_parent_workspace() {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("ws").join("project");
+            mkdir(&project);
+            assert!(!go_work_at_or_above(Path::new("."), &project));
+            write(&tmp.path().join("ws").join("go.work"), "go 1.22\n");
+            assert!(go_work_at_or_above(Path::new("."), &project));
+            assert!(go_work_at_or_above(
+                Path::new("project"),
+                &tmp.path().join("ws")
+            ));
+            // An absolute cwd ignores the base.
+            assert!(go_work_at_or_above(&project, Path::new("/elsewhere")));
         }
 
         /// go.sum is project content joined onto the cache root: traversal
