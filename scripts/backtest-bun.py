@@ -117,7 +117,7 @@ SHAPES = ['direct', 'dev', 'optional', 'alias', 'transitive', 'two-versions',
 # former `vendored-detached` leg collapsed into `vendored`: same footprint.
 MODES = ['hosted', 'vendored']
 PURL = 'pkg:npm/minimist@1.2.2'
-UUID = '80630680-4da6-45f9-bba8-b888e0ffd58c'
+UUID = '642d7f02-ebc1-4ab0-99e2-07f5dd8463cb'
 # The registry slot bun writes for a non-default registry: the full tarball URL.
 REGISTRY_SLOT = 'https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz'
 LOCAL_TUPLE_SPEC = f'minimist@.socket/vendor/npm/{UUID}/minimist-1.2.2.tgz'
