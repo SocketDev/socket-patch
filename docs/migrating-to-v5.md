@@ -140,7 +140,7 @@ Remove only the Socket-managed portions of old hooks, preserving other commands:
 | npm / pnpm / yarn / bun | Remove the Socket Patch `apply --silent --ecosystems npm` command from `package.json`'s `postinstall` and `dependencies` scripts; remove empty script keys |
 | Composer | Remove `socket-patch apply --offline --silent --ecosystems composer` from `post-install-cmd` and `post-update-cmd` |
 | Python | Remove `socket-patch[hook]` from requirements or project dependencies, and uninstall `socket-patch-hook` in affected environments |
-| Bundler | Remove the managed `plugin "socket-patch", path: ...` Gemfile block; run `bundle plugin uninstall socket-patch`; remove `.socket/bundler-plugin/`, `.socket/gem-plugin-stamp`, and its `.socket/.gitignore` entry |
+| Bundler | Remove the managed `plugin "socket-patch", path: ...` Gemfile block; remove `.socket/bundler-plugin/`, `.socket/gem-plugin-stamp`, and its `.socket/.gitignore` entry. Then, in **every** checkout that ran `bundle install` under v4 (each developer machine and persistent CI runner, not only yours), run `bundle plugin uninstall socket-patch` or delete `.bundle/plugin/`: the registration lives in the uncommitted `.bundle/`, and once the plugin directory is gone Bundler 2.3–2.5 fail every `bundle install` with a `LoadError` (2.6+ warn on each run). `scan` and `apply` report a leftover registration as `gem_bundler_plugin_stale` |
 
 Use `socket-patch list` to inspect the remaining patch set. For agent projects,
 run `socket-patch apply` once after migration to confirm the manifest still applies.

@@ -1,6 +1,8 @@
 use clap::Args;
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
-use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
+use socket_patch_core::crawlers::ruby_crawler::{
+    config_path_ignored_warning, stale_plugin_registration_warning,
+};
 use socket_patch_core::crawlers::{
     bun_uses_global_store, detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler,
 };
@@ -1977,6 +1979,16 @@ async fn apply_patches_inner(
             code: code.to_string(),
             detail,
         });
+    }
+    // A Bundler plugin registration v4's `setup` left in this checkout,
+    // pointing at a plugin dir the v5 migration deleted (#1295).
+    if gem_discovery.is_some() {
+        if let Some((code, detail)) = stale_plugin_registration_warning(&args.common.cwd).await {
+            run_warnings.push(RunWarning {
+                code: code.to_string(),
+                detail,
+            });
+        }
     }
     let mut fallback_skips: Vec<FallbackHomeSkip> = Vec::new();
 

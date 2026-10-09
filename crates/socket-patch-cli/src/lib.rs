@@ -347,7 +347,10 @@ const RETIRED_SUBCOMMANDS: &[(&str, &str)] = &[
         "was removed in v5.0, together with the install hooks it wired. In CI, run \
          `socket-patch apply` after each install (agent mode), or switch to \
          `socket-patch scan --mode hosted` or `--mode vendored`, whose lockfile edits \
-         need no hook",
+         need no hook. To remove the old Bundler plugin, delete the Gemfile \
+         `plugin \"socket-patch\"` block and `.socket/bundler-plugin/`, then run \
+         `bundle plugin uninstall socket-patch` in every checkout that ran \
+         `bundle install` with it",
     ),
     (
         "unlock",
