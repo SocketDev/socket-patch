@@ -10467,8 +10467,6 @@ mod tests {
         r.warnings.iter().filter(|w| w.code == BERRY_RISK).count()
     }
 
-    /// #907: a hosted pin in a classic lock is dropped by a yarn 2+ install
-    /// exactly like vendored wiring, so the hosted rewrite must warn the
     /// #1271: a classic block keyed by an empty range (`left-pad@:` from
     /// `"left-pad": ""`), alone or merged ahead of another member's range,
     /// is the registry copy: hosted pins it, keeping the key line, and
@@ -10510,6 +10508,8 @@ mod tests {
         }
     }
 
+    /// #907: a hosted pin in a classic lock is dropped by a yarn 2+ install
+    /// exactly like vendored wiring, so the hosted rewrite must warn the
     /// way the vendored probe does — with no `packageManager` pin, with a
     /// non-1 yarn declared (`yarn@10` must not prefix-match `yarn@1`), and
     /// when the manifest is unparseable (fail toward warning).

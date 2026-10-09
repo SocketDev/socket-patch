@@ -2610,13 +2610,6 @@ packages:
     );
 }
 
-/// Real classic-lock degenerations: a `resolved` URL without the legacy
-/// `#sha1` fragment (registries that strip fragments) and a block with
-/// no `resolved` at all (offline-pruned locks). Both stay listed for
-/// discovery with no verifier — never dropped, never guessed.
-#[tokio::test]
-async fn yarn_classic_fragmentless_and_resolvedless_blocks_stay_discovery_only() {
-    let tmp = tempfile::tempdir().unwrap();
 /// #1271: a block keyed by an empty range (`left-pad@:` from
 /// `"left-pad": ""`), alone or merged ahead of another range, is a
 /// registry package lock-only discovery sees.
@@ -2649,6 +2642,13 @@ async fn yarn_classic_empty_range_key_is_inventoried() {
     }
 }
 
+/// Real classic-lock degenerations: a `resolved` URL without the legacy
+/// `#sha1` fragment (registries that strip fragments) and a block with
+/// no `resolved` at all (offline-pruned locks). Both stay listed for
+/// discovery with no verifier — never dropped, never guessed.
+#[tokio::test]
+async fn yarn_classic_fragmentless_and_resolvedless_blocks_stay_discovery_only() {
+    let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
         "yarn.lock",

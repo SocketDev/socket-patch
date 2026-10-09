@@ -1707,6 +1707,10 @@ left-pad@^1.3.0:
 
         let fx = fixture_with_lock(Y2_BEFORE).await;
         tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
+        assert!(detail.contains("yarn install"), "{detail}");
+    }
+
     /// #1271: yarn 1 locks `"left-pad": ""` (an empty range, the same as
     /// `*`) under `left-pad@:`, merged with another member's range as
     /// `left-pad@, left-pad@^1.3.0:`. Both blocks are the installed
@@ -1733,10 +1737,6 @@ left-pad@^1.3.0:
             assert!(outcome.warnings.is_empty(), "{key}: {:?}", outcome.warnings);
             assert_eq!(fx.lock_text().await, lock, "{key}: lock restored");
         }
-    }
-
-        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
-        assert!(detail.contains("yarn install"), "{detail}");
     }
 
     #[tokio::test]

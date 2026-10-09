@@ -990,8 +990,6 @@ mod tests {
         }
     }
 
-    /// Multi-pattern keys, scoped names, and `npm:` alias keys: the purl is
-    /// the REAL package every pattern stands for.
     /// #1271: a hosted pin on a block keyed by an empty range
     /// (`left-pad@:` from `"left-pad": ""`), alone or merged ahead of
     /// another range, is attributed like any registry key.
@@ -1018,6 +1016,8 @@ mod tests {
         }
     }
 
+    /// Multi-pattern keys, scoped names, and `npm:` alias keys: the purl is
+    /// the REAL package every pattern stands for.
     #[tokio::test]
     async fn classic_hosted_scoped_multi_pattern_and_alias_keys() {
         let lp = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
