@@ -40,7 +40,10 @@
 //! A pin counts only where Maven resolves it: a direct `<dependency>`
 //! literal version wins over `<dependencyManagement>`, so a managed Socket
 //! pin shadowed by a direct plain version (or a GA declared with several
-//! different effective versions) is diagnosed, not a ref. A `${property}`
+//! different effective versions) is diagnosed, not a ref.
+//! A hosted pin in a reactor root (`<modules>` / `<subprojects>`) is
+//! diagnosed too: a module's own literal `<version>` overrides it, and only
+//! the root pom is read here (the rewriter refuses such roots, #261). A `${property}`
 //! version is resolved one level from the root `<properties>`.
 //!
 //! Integrity: when the pom sha256 was known the rewriter also writes Maven
@@ -146,7 +149,8 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
 
     let gas = group_by_ga(&pom.deps);
-    extract_hosted(ctx, &pom, &gas, &hosted, out).await;
+    let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw);
+    extract_hosted(ctx, &pom, &gas, &hosted, reactor, out).await;
     if !vendored.is_empty() {
         extract_vendored(ctx, &gas, &vendored, out).await;
     }
@@ -159,6 +163,7 @@ async fn extract_hosted(
     pom: &Pom,
     gas: &BTreeMap<(String, String), GaVersions>,
     hosted: &BTreeMap<String, String>,
+    reactor: bool,
     out: &mut Discovery,
 ) {
     // uuid -> the (purl, g, a, suffixed version) pins that tie to it.
@@ -260,6 +265,17 @@ async fn extract_hosted(
                 ))
                 .await;
         match candidates.as_slice() {
+            // A reactor root's pin may be shadowed by a module's own literal
+            // <version>, which this root-only read cannot see (#261).
+            [_] if reactor => out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                POM,
+                format!(
+                    "{POM}: {ga} <version>{pinned}</version> is a hosted pin in a reactor root \
+                     (<modules>/<subprojects>); a module's own <version> overrides it, so it \
+                     is not attested"
+                ),
+            ),
             [uuid] => {
                 ties.entry(*uuid).or_default().insert((
                     purl,
@@ -765,6 +781,40 @@ mod tests {
         p.write("pom.xml", text);
         let out = run(&p).await;
         assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+    }
+
+    /// A hosted pin in a reactor root is not attested (#261): a module that
+    /// declares the GA with its own literal `<version>` overrides the root's
+    /// managed pin, and discovery reads only the root pom. The pin and its
+    /// repository are diagnosed instead, so `vex` never says not_affected
+    /// for a module that still resolves the upstream jar.
+    #[tokio::test]
+    async fn hosted_pin_in_a_reactor_root_is_not_attested() {
+        for reactor in [
+            "<modules>\n<module>child</module>\n</modules>\n",
+            "<subprojects>\n<subproject>child</subproject>\n</subprojects>\n",
+        ] {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<packaging>pom</packaging>\n{reactor}<dependencyManagement>\n<dependencies>\n{}</dependencies>\n</dependencyManagement>\n<repositories>\n{}</repositories>\n",
+                    dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                    hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A)),
+                )),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("org.slf4j:slf4j-api")
+                        && d.detail.contains("module")),
+                "{reactor}: {:?}",
+                out.diagnostics
+            );
+        }
     }
 
     #[tokio::test]

@@ -557,6 +557,13 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   repository whose grant URL changed (a rotated token) is refreshed in place. A suffixed
   literal no hosted repository in the pom minted (a vendored `socket-patch-vendor-<uuid>`
   pin, say) is still a mismatch and is skipped.
+* **Multi-module reactors are vendored-only (hosted Maven).** Hosted mode reads only
+  the root `pom.xml`, and a module's own literal `<version>` always beats a root
+  `<dependencyManagement>` pin, so a root pin would leave that module on the unpatched
+  upstream jar. A root that declares `<modules>` or `<subprojects>` (directly or in a
+  profile) is therefore refused with `redirect_maven_multimodule_unsupported` and left
+  untouched; use `scan --mode vendored`, whose reactor planner rewrites each module's
+  declaration. `vex` likewise does not attest a hosted pin found in a reactor root.
 * **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —
