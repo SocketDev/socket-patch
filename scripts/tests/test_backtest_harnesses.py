@@ -814,6 +814,39 @@ class VltOracleTests(unittest.TestCase):
         self.assertLessEqual(set(vlt.SHAPES), capture_names)
 
 
+class VltInstalledBytesTests(unittest.TestCase):
+    def test_holds_checks_root_and_nested_files_with_optional_package_prefix(self):
+        contents = {
+            'index.js': {'before': b'original entrypoint', 'after': b'patched entrypoint'},
+            'test/proto.js': {'before': b'original test', 'after': b'patched test'},
+        }
+        for prefix in ('', 'package/'):
+            for side in ('before', 'after'):
+                with self.subTest(prefix=prefix, side=side), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    package = root / 'node_modules' / 'minimist'
+                    record = {'files': {
+                        prefix + name: {s + 'Hash': vlt.git_hash(data) for s, data in sides.items()}
+                        for name, sides in contents.items()
+                    }}
+                    cell = vlt.Cell({'out': root, 'record': record}, '1.2.0', 'vendored', 'direct')
+                    expected = {}
+                    for name, sides in contents.items():
+                        path = package / name
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(sides[side])
+                        expected[str(path.relative_to(root))] = vlt.git_hash(sides[side])
+                    self.assertEqual(cell.holds(root, '{}', side), (True, expected))
+                    other_side = 'after' if side == 'before' else 'before'
+                    self.assertFalse(cell.holds(root, '{}', other_side)[0])
+
+                    nested = package / 'test' / 'proto.js'
+                    nested.write_bytes(b'corrupted')
+                    self.assertFalse(cell.holds(root, '{}', side)[0])
+                    nested.unlink()
+                    self.assertFalse(cell.holds(root, '{}', side)[0])
+
+
 class VltConfigTests(unittest.TestCase):
     """write_vlt_json follows the DESIGN §8.3 per-era registry table."""
 

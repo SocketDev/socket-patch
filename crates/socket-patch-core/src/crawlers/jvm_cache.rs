@@ -138,9 +138,7 @@ pub fn push_classified(roots: &mut Vec<JvmCacheRoot>, root: JvmCacheRoot) -> boo
 
 /// A `SOCKET_DEBUG` line from the JVM cache discovery.
 pub(crate) fn debug_log(message: &str) {
-    if crate::utils::env_compat::is_debug_enabled() {
-        eprintln!("[socket-patch debug] {message}");
-    }
+    crate::utils::env_compat::debug_log("debug", message);
 }
 
 /// One installed-artifact cache to crawl.

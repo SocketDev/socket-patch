@@ -1409,7 +1409,15 @@ async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
     fetch_registry_bytes(url, MAX_POM_BYTES as u64).await
 }
 
+/// Bounded HTTP GET from a Maven registry. Errors quote the URL redacted
+/// (a mirror's userinfo, reqwest's own error text included).
 pub(crate) async fn fetch_registry_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
+    fetch_registry_bytes_unredacted(url, cap)
+        .await
+        .map_err(|e| crate::utils::redact::redact_urls_in(&e).into_owned())
+}
+
+async fn fetch_registry_bytes_unredacted(url: &str, cap: u64) -> Result<Vec<u8>, String> {
     let client = super::registry_fetch::registry_client_builder(MAVEN_USER_AGENT)
         .build()
         .map_err(|e| format!("build http client: {e}"))?;

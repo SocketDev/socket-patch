@@ -1029,10 +1029,23 @@ async fn revert_bun_wiring(
         }
     }
 
+    // An empty registry field means "the default registry", which a
+    // committed bunfig.toml or .npmrc can rebind (`registry`, a scope
+    // table); with either configuring one, an empty field proves nothing
+    // about where an upgrade installs from (#1155).
+    let default_registry_pinned =
+        !super::npm_common::project_may_redirect_registry(project_root).await;
     let mut dirty = false;
     if let Some(lines) = lines.as_mut() {
         for rec in entry.wiring.iter().rev().filter(|r| r.file == BUN_LOCK) {
-            revert_one_record(lines, rec, &entry.uuid, &mut dirty, &mut outcome.warnings);
+            revert_one_record(
+                lines,
+                rec,
+                &entry.uuid,
+                default_registry_pinned,
+                &mut dirty,
+                &mut outcome.warnings,
+            );
         }
         if dirty && !dry_run {
             if let Err(e) = atomic_write_bytes_preserving_mode(
@@ -1090,6 +1103,7 @@ pub(super) fn revert_one_record(
     lines: &mut [String],
     rec: &WiringRecord,
     entry_uuid: &str,
+    default_registry_pinned: bool,
     dirty: &mut bool,
     warnings: &mut Vec<VendorWarning>,
 ) {
@@ -1141,6 +1155,22 @@ pub(super) fn revert_one_record(
                 .and_then(|path| parse_vendor_path(&path))
                 .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !exact && !ours_uuid {
+            // MOVED OFF THE VENDORED VERSION, not drifted (#1155): `bun
+            // update` / `bun add pkg@other` re-locked the entry at another
+            // registry version, so the vendored version left the lock graph
+            // exactly as after `bun remove`. Nothing to restore; the caller
+            // keeps the artifact only while the lock still resolves through
+            // it. A same-version re-resolution stays drift.
+            if let Some(live_version) = version_moved_off(rec, &parsed, default_registry_pinned) {
+                warnings.push(VendorWarning::new(
+                    super::LOCK_ENTRY_REMOVED_CODE,
+                    format!(
+                        "lock entry `{key}` now locks version {live_version}; the vendored \
+                         version is no longer installed, so there is nothing to restore"
+                    ),
+                ));
+                return;
+            }
             warnings.push(drifted(format!(
                 "lock entry `{key}` was re-resolved since vendoring; left alone"
             )));
@@ -1170,6 +1200,41 @@ pub(super) fn revert_one_record(
         super::LOCK_ENTRY_REMOVED_CODE,
         format!("lock entry `{key}` no longer exists; nothing to restore"),
     ));
+}
+
+/// The package name and registry version an entry tuple locks
+/// (`"left-pad@1.3.1"` → `("left-pad", "1.3.1")`), or `None` for any other
+/// spec (a vendored path, a URL, `file:`/`github:`).
+fn registry_name_version(entry: &BunEntry) -> Option<(String, String)> {
+    let spec = decode_json_string(entry.elems.first()?)?;
+    let (name, version) = split_name_spec(&spec)?;
+    let plain = !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    plain.then(|| (name.to_string(), version.to_string()))
+}
+
+/// The live entry's registry version when the user moved the package to
+/// another version from the same registry since vendoring: same package
+/// name, same registry field (the tuple's second element) as the pre-vendor
+/// tuple in `rec.original`, different version. `None` otherwise, which
+/// keeps the caller's drift verdict: an `original: None` record, a URL or
+/// `file:` spec, another package or another registry is not a plain upgrade
+/// and must keep the artifact and leave `vendor --check` red.
+fn version_moved_off(
+    rec: &WiringRecord,
+    live: &BunEntry,
+    default_registry_pinned: bool,
+) -> Option<String> {
+    let (live_name, live_version) = registry_name_version(live)?;
+    let original = parse_entry_line(rec.original.as_ref().and_then(Value::as_str)?).ok()?;
+    let (original_name, original_version) = registry_name_version(&original)?;
+    let live_registry = decode_json_string(live.elems.get(1)?)?;
+    let same_registry = Some(&live_registry) == decode_json_string(original.elems.get(1)?).as_ref()
+        && (!live_registry.is_empty() || default_registry_pinned);
+    (same_registry && live_name == original_name && live_version != original_version)
+        .then_some(live_version)
 }
 
 // ───────────────────────── vendor-specific classification ─────────────────
@@ -3650,14 +3715,143 @@ mod tests {
         );
     }
 
+    /// #1155: `bun update` / `bun add left-pad@1.3.1` moved the vendored
+    /// package off its patched version. The vendored version left the lock
+    /// graph exactly as after `bun remove`, so the revert has nothing to
+    /// restore and the artifact goes once nothing resolves through it,
+    /// instead of a drift-keep that `vendor --check` can never clear.
+    #[tokio::test]
+    async fn revert_after_version_change_drops_the_unreferenced_artifact() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let upgraded_line = "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
+        let live = fx.read_lock().await;
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap();
+        let upgraded_lock = live.replace(new_line, upgraded_line);
+        assert_ne!(upgraded_lock, live, "test setup must move the entry");
+        tokio::fs::write(fx.root().join(BUN_LOCK), &upgraded_lock)
+            .await
+            .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_removed"
+                    && w.detail.contains("left-pad")
+                    && w.detail.contains("1.3.1")),
+            "the version change is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            fx.read_lock().await,
+            upgraded_lock,
+            "the user's upgraded lock is left byte-identical"
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "nothing resolves through the artifact, so it is removed"
+        );
+    }
+
+    /// #1155 provenance guard: a version change counts as an upgrade only
+    /// for the same package from the same registry field as the pre-vendor
+    /// tuple. Another registry or another package name stays drift.
+    #[tokio::test]
+    async fn revert_keeps_version_change_from_another_registry_as_drift() {
+        for moved_line in [
+            "    \"left-pad\": [\"left-pad@1.3.1\", \"https://evil.example.com/\", {}, \"sha512-other==\"],",
+            "    \"left-pad\": [\"not-left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],",
+        ] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let live = fx.read_lock().await;
+            let new_line = entry.wiring[0]
+                .new
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap();
+            let moved_lock = live.replace(new_line, moved_line);
+            assert_ne!(moved_lock, live, "test setup must move the entry");
+            tokio::fs::write(fx.root().join(BUN_LOCK), &moved_lock)
+                .await
+                .unwrap();
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{moved_line}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{moved_line}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{moved_line}: {:?}", outcome.warnings);
+            assert_eq!(fx.read_lock().await, moved_lock, "left alone");
+        }
+    }
+
+    /// #1155 provenance guard: an empty registry field means "the default
+    /// registry", and a committed bunfig.toml or .npmrc can rebind that.
+    /// With either naming a registry, a version change from `""` is not
+    /// proven to come from the pre-vendor registry, so it stays drift.
+    #[tokio::test]
+    async fn revert_keeps_default_registry_upgrade_as_drift_when_the_registry_is_configured() {
+        for (file, text) in [
+            (
+                "bunfig.toml",
+                "[install]\nregistry = \"https://evil.example.com/\"\n",
+            ),
+            (".npmrc", "registry=https://evil.example.com/\n"),
+            (
+                "bunfig.toml",
+                "[install.scopes]\n\"@s\" = \"https://evil.example.com/\"\n",
+            ),
+        ] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let upgraded_line =
+                "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
+            let live = fx.read_lock().await;
+            let new_line = entry.wiring[0]
+                .new
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap();
+            tokio::fs::write(
+                fx.root().join(BUN_LOCK),
+                live.replace(new_line, upgraded_line),
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(fx.root().join(file), text).await.unwrap();
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{file}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{file}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{file}: {:?}", outcome.warnings);
+        }
+    }
+
     #[tokio::test]
     async fn revert_leaves_drifted_entries_alone_with_warning() {
         let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
 
-        // The user re-resolved the entry behind our back (`bun update`).
-        let drifted_line = "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
+        // The user re-resolved the entry behind our back at the SAME
+        // version (a fork tarball). A version change is not drift (#1155);
+        // see `revert_after_version_change_drops_the_unreferenced_artifact`.
+        let drifted_line =
+            "    \"left-pad\": [\"left-pad@https://example.com/left-pad-1.3.0.tgz\", {}],";
         let live = fx.read_lock().await;
         let new_line = entry.wiring[0]
             .new

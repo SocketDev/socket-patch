@@ -101,7 +101,6 @@ fn default_apply(cwd: &Path) -> ApplyArgs {
             ecosystems: None,
             json: true,
             verbose: false,
-            download_mode: "diff".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         force: false,

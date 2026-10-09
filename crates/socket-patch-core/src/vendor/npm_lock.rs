@@ -31,7 +31,9 @@ use super::npm_common::{
     guard_revert_uuid_dir, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend, NpmStagedPack,
     NpmVendorRequest, WireCx,
 };
-use super::npm_origin::{npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides};
+use super::npm_origin::{
+    legacy_packages_key, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+};
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
@@ -745,6 +747,11 @@ pub async fn revert_npm_opts(
         }
     }
 
+    // An entry npm installs from a non-registry spec (git, URL, `file:`) is
+    // never a registry upgrade, whatever its `resolved` says (#326).
+    let overrides = NpmOverrides::read(project_root).await;
+    let upgrades_trusted = overrides.is_empty()
+        && !super::npm_common::project_may_redirect_registry(project_root).await;
     for lock_name in lock_files {
         let lock_path = project_root.join(lock_name);
         let lock_bytes = match read_regular_to_bytes(&lock_path).await {
@@ -771,12 +778,32 @@ pub async fn revert_npm_opts(
             }
         };
 
+        let mut non_registry = npm_non_registry_entries(&lock, &overrides);
+        // Any `overrides` rule (it can swap a registry edge, alias edges
+        // included, for a git / URL / `file:` spec npm ci installs instead
+        // of the lock's `resolved`) or a project `.npmrc` that can rebind
+        // the registry host keeps every record off the upgrade path; the
+        // revert then drift-keeps as before #1155.
+        if !upgrades_trusted {
+            for rec in entry.wiring.iter().filter(|r| r.file == lock_name) {
+                if let Some(key) = rec.key.as_deref() {
+                    let key = match rec.kind.as_str() {
+                        KIND_LOCK_LEGACY_ENTRY => legacy_pointer_packages_key(key),
+                        _ => Some(key.to_string()),
+                    };
+                    if let Some(key) = key {
+                        non_registry.insert(key, "project config can redirect it".to_string());
+                    }
+                }
+            }
+        }
         let mut changed = false;
         // Reverse application order, like every backend's revert.
         for rec in entry.wiring.iter().rev().filter(|r| r.file == lock_name) {
             revert_one_record(
                 &mut lock,
                 rec,
+                &non_registry,
                 &entry.uuid,
                 &mut changed,
                 &mut outcome.warnings,
@@ -1152,12 +1179,109 @@ fn drifted_resolved_note(resolved: Option<&str>) -> String {
     }
 }
 
+/// The live entry's `version` when the user moved the package to another
+/// version from the same registry since vendoring: the version differs
+/// from both the one we wired (`rec.new`) and the pre-vendor one
+/// (`rec.original`), and `resolved` is the same package's tarball on the
+/// registry the pre-vendor entry used (same `<registry>/<name>/-/` prefix).
+/// `None` otherwise, which keeps the caller's drift verdict: a missing
+/// version or pre-vendor `resolved`, or a resolution anywhere else (another
+/// host, another package, a URL or `file:` spec) is not a plain upgrade
+/// and must keep the artifact and leave `vendor --check` red.
+fn version_moved_off<'a>(rec: &WiringRecord, live: &'a Value) -> Option<&'a str> {
+    let live_version = live.get("version").and_then(Value::as_str)?;
+    let recorded: Vec<&str> = [rec.new.as_ref(), rec.original.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("version").and_then(Value::as_str))
+        .collect();
+    if recorded.is_empty() || recorded.contains(&live_version) {
+        return None;
+    }
+    let original_resolved = rec.original.as_ref()?.get("resolved")?.as_str()?;
+    let (original_scheme, prefix) = registry_tarball_prefix(original_resolved)?;
+    let live_resolved = live.get("resolved").and_then(Value::as_str)?;
+    let (live_scheme, live_rest) = split_http_scheme(live_resolved)?;
+    // npm rewrites an old lock's `http://` registry URLs to `https://` on
+    // the next install, so that upgrade is the same registry; a move from
+    // `https://` down to `http://` is not.
+    if live_scheme != original_scheme && (original_scheme, live_scheme) != ("http", "https") {
+        return None;
+    }
+    // The tarball file must be exactly `<basename>-<version>.tgz`, with the
+    // basename taken from the pre-vendor tarball and a plain version, so
+    // no separator, `..`, `\`, query or fragment can steer npm's fetch to
+    // another package after it normalizes the URL.
+    let original_leaf = split_http_scheme(original_resolved)?
+        .1
+        .strip_prefix(prefix)?;
+    let original_version = tarball_version(
+        rec.original
+            .as_ref()?
+            .get("version")
+            .and_then(Value::as_str)?,
+    );
+    let basename = original_leaf.strip_suffix(&format!("-{original_version}.tgz"))?;
+    let tarball = tarball_version(live_version);
+    let plain_version = !tarball.is_empty()
+        && tarball
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    let leaf = live_rest.strip_prefix(prefix)?;
+    (plain_version && leaf == format!("{basename}-{tarball}.tgz")).then_some(live_version)
+}
+
+/// The `packages` key a legacy `dependencies` wiring pointer mirrors
+/// (`/dependencies/a/dependencies/b` → `node_modules/a/node_modules/b`), or
+/// `None` for a pointer of any other shape.
+fn legacy_pointer_packages_key(pointer: &str) -> Option<String> {
+    let mut tokens = pointer.strip_prefix('/')?.split('/');
+    let mut key = String::new();
+    while let Some(field) = tokens.next() {
+        if field != "dependencies" {
+            return None;
+        }
+        let name = tokens.next()?.replace("~1", "/").replace("~0", "~");
+        key = legacy_packages_key(&key, &name);
+    }
+    (!key.is_empty()).then_some(key)
+}
+
+/// The version a lock `version` field names in its tarball file: itself,
+/// or for a legacy (lockfile v1) alias row's `npm:left-pad@1.3.0` /
+/// `npm:@scope/pkg@1.0.0` spelling, the part after the last `@`.
+fn tarball_version(version: &str) -> &str {
+    match version.strip_prefix("npm:") {
+        Some(spec) => spec.rsplit_once('@').map_or(spec, |(_, v)| v),
+        None => version,
+    }
+}
+
+/// `https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz` →
+/// `("https", "registry.npmjs.org/left-pad/-/")`: the scheme and the
+/// registry tarball directory of one package, which every version of it
+/// shares.
+fn registry_tarball_prefix(resolved: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = split_http_scheme(resolved)?;
+    let at = rest.rfind("/-/")?;
+    Some((scheme, &rest[..at + 3]))
+}
+
+/// `https://host/path` → `("https", "host/path")`; `None` for anything but
+/// an `http`/`https` URL.
+fn split_http_scheme(url: &str) -> Option<(&str, &str)> {
+    ["https", "http"]
+        .into_iter()
+        .find_map(|scheme| Some((scheme, url.strip_prefix(scheme)?.strip_prefix("://")?)))
+}
+
 /// Apply one wiring record in reverse: restore `original` iff the live
 /// fragment is still ours (drift = third party re-resolved it; leave theirs
 /// alone, with a warning).
 fn revert_one_record(
     lock: &mut Value,
     rec: &WiringRecord,
+    non_registry: &BTreeMap<String, String>,
     entry_uuid: &str,
     changed: &mut bool,
     warnings: &mut Vec<VendorWarning>,
@@ -1216,6 +1340,28 @@ fn revert_one_record(
         None => false,
     };
     if !ours {
+        // MOVED OFF THE VENDORED VERSION, not drifted (#1155): `npm install
+        // pkg@other` (or Dependabot) re-locked the entry at another
+        // version, so the vendored version left the lock graph exactly as
+        // after `npm uninstall`. Nothing to restore; the caller keeps the
+        // artifact only while a lock still resolves through it. A
+        // same-version re-resolution stays drift: re-vendoring can undo it.
+        let packages_key = match rec.kind.as_str() {
+            KIND_LOCK_LEGACY_ENTRY => legacy_pointer_packages_key(key),
+            _ => Some(key.to_string()),
+        };
+        let registry_install = packages_key.is_some_and(|k| !non_registry.contains_key(&k));
+        if let Some(live_version) = version_moved_off(rec, live).filter(|_| registry_install) {
+            warnings.push(VendorWarning::new(
+                super::LOCK_ENTRY_REMOVED_CODE,
+                format!(
+                    "lock entry `{key}` now locks version {live_version} ({}); the vendored \
+                     version is no longer installed, so there is nothing to restore",
+                    drifted_resolved_note(live_resolved)
+                ),
+            ));
+            return;
+        }
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
             format!(
@@ -3873,6 +4019,434 @@ mod tests {
             uninstalled,
             "the user's post-uninstall lock is left byte-identical"
         );
+    }
+
+    /// #1155: the user moved the vendored package off its patched version
+    /// (`npm install left-pad@1.3.1`, or Dependabot doing the same), so
+    /// every recorded entry still exists but now resolves another version
+    /// from the registry. The vendored version left the lock graph just as
+    /// it does after `npm uninstall`: nothing to restore, and the artifact
+    /// goes once nothing resolves through it. Keeping it as drift would
+    /// leave `vendor --check` red with remedies that can never converge.
+    #[tokio::test]
+    async fn revert_after_version_change_drops_the_unreferenced_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let upgraded = json!({
+            "version": "1.3.1",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+            "integrity": "sha512-upgraded=="
+        });
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"] = upgraded.clone();
+        live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+        let after_upgrade = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_removed"
+                    && w.detail.contains("node_modules/left-pad")
+                    && w.detail.contains("1.3.1")),
+            "the version change is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "nothing resolves through the artifact, so it is removed"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            after_upgrade,
+            "the user's upgraded lock is left byte-identical"
+        );
+    }
+
+    /// #1155, downgrade of one instance: the direct copy moved to 1.2.0
+    /// while the nested copy is still wired. The nested copy is restored,
+    /// the direct one is left as the user locked it, and the artifact goes
+    /// because the restore leaves nothing resolving through it.
+    #[tokio::test]
+    async fn revert_after_partial_downgrade_restores_the_rest_and_drops_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let downgraded = json!({
+            "version": "1.2.0",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.2.0.tgz",
+            "integrity": "sha512-older=="
+        });
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"] = downgraded.clone();
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        let after = fx.read_lock().await;
+        assert_eq!(after["packages"]["node_modules/left-pad"], downgraded);
+        assert_eq!(
+            after["packages"]["node_modules/foo/node_modules/left-pad"],
+            default_lock()["packages"]["node_modules/foo/node_modules/left-pad"],
+            "the still-wired instance is restored"
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    /// #1155 provenance guard: an edge npm installs from a git, URL or
+    /// `file:` spec is not a registry upgrade even when its `packages` entry
+    /// is written in the registry tarball shape: npm ci installs it from the
+    /// spec. It stays drift and the artifact is kept.
+    #[tokio::test]
+    async fn revert_keeps_version_change_behind_a_non_registry_spec_as_drift() {
+        for spec in [
+            "github:stevemao/left-pad#v1.3.1",
+            "https://example.com/left-pad-1.3.1.tgz",
+            "file:../left-pad",
+        ] {
+            let fx = fixture().await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+
+            let forged = json!({
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"][""]["dependencies"]["left-pad"] = json!(spec);
+            live["packages"]["node_modules/left-pad"] = forged.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = forged;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{spec}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{spec}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{spec}: {:?}", outcome.warnings);
+        }
+    }
+
+    /// #1155 provenance guard: an override can swap a registry edge (alias
+    /// edges included) for a git / URL / `file:` spec that npm ci installs
+    /// instead of the lock's `resolved`. While the project declares any
+    /// override, a version change is not trusted as a registry upgrade and
+    /// stays drift.
+    #[tokio::test]
+    async fn revert_keeps_version_change_as_drift_while_any_override_is_declared() {
+        for overrides in [
+            json!({ "left-pad": "file:../left-pad" }),
+            json!({ "foo": { "left-pad": "github:evil/left-pad" } }),
+            json!({ "left-pad@1.3.0": "https://example.com/left-pad.tgz" }),
+            json!({ "foo": { "aliased": "git+file:///evil" } }),
+        ] {
+            let fx = fixture().await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let manifest = json!({ "name": "fixture", "version": "1.0.0", "overrides": overrides });
+            tokio::fs::write(
+                fx.root().join("package.json"),
+                serialize_json(&manifest, "  ").unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let upgraded = json!({
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"]["node_modules/left-pad"] = upgraded.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{overrides}: {:?}", outcome.error);
+            assert!(
+                outcome.drift_skipped(),
+                "{overrides}: {:?}",
+                outcome.warnings
+            );
+            assert!(outcome.kept_artifact, "{overrides}: {:?}", outcome.warnings);
+        }
+    }
+
+    /// #1155 provenance guard: npm rewrites a `registry.npmjs.org` dist URL
+    /// to the project `.npmrc` registry at fetch time
+    /// (`replace-registry-host`), so with a registry configured there a
+    /// version move's recorded host proves nothing. It stays drift.
+    #[tokio::test]
+    async fn revert_keeps_version_change_as_drift_while_a_project_npmrc_sets_anything() {
+        for npmrc in [
+            "registry=https://evil.example.com/\n",
+            "@s:registry=https://evil.example.com/\n",
+            "replace-registry-host=always\n",
+            "https-proxy=http://evil.example.com:8080\nstrict-ssl=false\n",
+            "cafile=./evil-ca.pem\n",
+        ] {
+            let fx = fixture().await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            tokio::fs::write(fx.root().join(".npmrc"), npmrc)
+                .await
+                .unwrap();
+            let upgraded = json!({
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"]["node_modules/left-pad"] = upgraded.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{npmrc}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{npmrc}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{npmrc}: {:?}", outcome.warnings);
+        }
+    }
+
+    /// A project `.npmrc` that holds only comments or blank lines changes
+    /// nothing about where npm fetches, so the upgrade is still trusted.
+    #[tokio::test]
+    async fn revert_after_version_change_ignores_a_comment_only_npmrc() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::write(fx.root().join(".npmrc"), "# nothing here\n\n; nor here\n")
+            .await
+            .unwrap();
+        let upgraded = json!({
+            "version": "1.3.1",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+            "integrity": "sha512-upgraded=="
+        });
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"] = upgraded.clone();
+        live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+    }
+
+    #[test]
+    fn legacy_pointer_maps_to_its_packages_key() {
+        assert_eq!(
+            legacy_pointer_packages_key("/dependencies/foo/dependencies/@s~1pad").as_deref(),
+            Some("node_modules/foo/node_modules/@s/pad")
+        );
+        assert_eq!(legacy_pointer_packages_key("/packages/x"), None);
+        assert_eq!(legacy_pointer_packages_key("/dependencies"), None);
+    }
+
+    /// #1155, old lock: npm 6 recorded `http://registry.npmjs.org/...`
+    /// tarball URLs, and the next `npm install` writes `https://`. That
+    /// upgrade is from the same registry, so it reverts like any other.
+    /// The reverse (an `https` entry moved to `http`) stays drift.
+    #[tokio::test]
+    async fn revert_after_version_change_accepts_http_to_https_upgrade_only() {
+        for (original, moved, reverts) in [
+            (
+                "http://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                true,
+            ),
+            (
+                "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "http://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                false,
+            ),
+        ] {
+            let mut lock = default_lock();
+            lock["packages"]["node_modules/left-pad"]["resolved"] = json!(original);
+            lock["packages"]["node_modules/foo/node_modules/left-pad"]["resolved"] =
+                json!(original);
+            let fx = fixture_with("left-pad", "1.3.0", lock).await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+
+            let upgraded = json!({
+                "version": "1.3.1",
+                "resolved": moved,
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"]["node_modules/left-pad"] = upgraded.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{moved}: {:?}", outcome.error);
+            assert_eq!(
+                outcome.drift_skipped(),
+                !reverts,
+                "{moved}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                fx.root()
+                    .join(format!(".socket/vendor/npm/{UUID}"))
+                    .exists(),
+                !reverts,
+                "{moved}"
+            );
+        }
+    }
+
+    /// #1155, legacy alias: a lockfile v1 alias row spells its version
+    /// `npm:left-pad@1.3.0`. Upgrading the alias (`npm install
+    /// pad@npm:left-pad@1.3.1`) writes `npm:left-pad@1.3.1` with the 1.3.1
+    /// registry tarball, which is the same plain upgrade. An alias pointed
+    /// at another package's tarball stays drift.
+    #[test]
+    fn version_moved_off_reads_legacy_alias_versions() {
+        let rec = WiringRecord {
+            file: PACKAGE_LOCK.to_string(),
+            kind: KIND_LOCK_LEGACY_ENTRY.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("/dependencies/pad".to_string()),
+            original: Some(json!({
+                "version": "npm:left-pad@1.3.0",
+                "resolved": REG_RESOLVED,
+                "integrity": "sha512-orig=="
+            })),
+            new: Some(json!({
+                "version": "npm:left-pad@1.3.0",
+                "resolved": format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+            })),
+        };
+        let upgraded = json!({
+            "version": "npm:left-pad@1.3.1",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+        });
+        assert_eq!(
+            version_moved_off(&rec, &upgraded),
+            Some("npm:left-pad@1.3.1")
+        );
+        let elsewhere = json!({
+            "version": "npm:left-pad@1.3.1",
+            "resolved": "https://registry.npmjs.org/left-pad/-/other-1.3.1.tgz",
+        });
+        assert_eq!(version_moved_off(&rec, &elsewhere), None);
+        assert_eq!(tarball_version("npm:@scope/pkg@1.0.0"), "1.0.0");
+        assert_eq!(tarball_version("1.0.0"), "1.0.0");
+    }
+
+    /// #1155 provenance guard: a version change is only an upgrade when the
+    /// new tarball is the same package on the registry the pre-vendor entry
+    /// used. A version change that resolves anywhere else (another host,
+    /// another package's tarball, a bare URL) is not something `npm
+    /// install pkg@x` writes, so it stays drift: the artifact is kept and
+    /// `vendor --check` stays red.
+    #[tokio::test]
+    async fn revert_keeps_version_change_resolved_off_the_recorded_registry_as_drift() {
+        for resolved in [
+            "https://evil.example.com/left-pad/-/left-pad-1.3.1.tgz",
+            "https://registry.npmjs.org/not-left-pad/-/not-left-pad-1.3.1.tgz",
+            "https://example.com/left-pad-1.3.1.tgz",
+            "file:../left-pad-1.3.1.tgz",
+            "https://registry.npmjs.org/left-pad/-/..\\..\\not-left-pad\\-\\not-left-pad-1.3.1.tgz",
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz?x=/../../evil",
+            "https://registry.npmjs.org/left-pad/-/other-1.3.1.tgz",
+        ] {
+            let fx = fixture().await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+
+            let moved = json!({
+                "version": "1.3.1",
+                "resolved": resolved,
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"]["node_modules/left-pad"] = moved.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = moved;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{resolved}: {:?}", outcome.error);
+            assert!(
+                outcome.drift_skipped(),
+                "{resolved}: {:?}",
+                outcome.warnings
+            );
+            assert!(outcome.kept_artifact, "{resolved}: {:?}", outcome.warnings);
+            assert!(fx
+                .root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists());
+        }
+    }
+
+    /// #1155 guard: the recorded entry moved to another version, but the
+    /// lock still resolves through the artifact under a key the wiring
+    /// never recorded. The artifact may be the only copy that install
+    /// needs, so it is kept.
+    #[tokio::test]
+    async fn revert_keeps_artifact_when_version_changed_but_uuid_still_referenced() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        let wired = packages["node_modules/left-pad"].clone();
+        packages.insert("node_modules/bar/node_modules/left-pad".into(), wired);
+        packages.insert(
+            "node_modules/left-pad".into(),
+            json!({
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded=="
+            }),
+        );
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     /// #665 guard: a recorded entry vanished but the lock still resolves

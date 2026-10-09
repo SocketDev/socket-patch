@@ -1009,7 +1009,6 @@ async fn vendor_vlt_new_uuid_downloads_independent_server_artifact() {
     let blobs = root.join(".socket/blobs");
     let sources = socket_patch_core::patch::apply::PatchSources {
         blobs_path: &blobs,
-        diffs_path: None,
         mem_blobs: None,
     };
     crate::prebuilt_common::mount_record(
