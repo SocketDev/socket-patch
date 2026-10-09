@@ -167,7 +167,7 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 
 ### 5.5 Security: zip inflate on committed artifacts (fixed, #587)
 
-`zip_bytes_match_after_hashes` now streams each member through the Git SHA-256 reader with an 8 KiB buffer and checks the declared length against the bytes read; it no longer inflates members into a `Vec` sized by the archive's own header (#587). The maintainer ruled that this data is trusted not to be too big, so the fix streams instead of capping. {{C01}} Agent-mode jar verification still buffers each member. {{C51}}
+`zip_bytes_match_after_hashes` now streams each member through the Git SHA-256 reader with an 8 KiB buffer and checks the declared length against the bytes read; it no longer inflates members into a `Vec` sized by the archive's own header (#587). The maintainer ruled that this data is trusted not to be too big, so the fix streams instead of capping. {{C01}} Agent-mode jar verification streams through the same hasher since #1253 (`hash::git_sha256::zip_member_git_sha256`); this function still runs its own lookup-and-hash loop. {{C51}}
 
 It runs on:
 - committed, tamperable artifacts (the NuGet hot path, `nuget_feed.rs:266`; the committed Maven jar, `maven_repo.rs:736` and `:1464`);
