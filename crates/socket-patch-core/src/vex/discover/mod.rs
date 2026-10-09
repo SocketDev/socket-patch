@@ -1147,13 +1147,14 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
 /// ledger claim it alone mentions is dead, and one diagnostic says why.
 /// Disk runs only: an in-memory project has no ancestors.
 async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discovery) {
-    if matches!(
-        ctx.view,
-        crate::vendor::lock_inventory::ProjectView::Memory(_)
-    ) {
+    // Declares the project files the check reads; the rest are above the
+    // project, which no overlay of the project's files changes.
+    let Some(root) =
+        ctx.disk_root_reading(crate::hosted::governing_root::member_stray_lock_own_files())
+    else {
         return;
-    }
-    let Some(stray) = crate::hosted::governing_root::member_stray_lock(ctx.root).await else {
+    };
+    let Some(stray) = crate::hosted::governing_root::member_stray_lock(root).await else {
         return;
     };
     for rel in &stray.ignored {

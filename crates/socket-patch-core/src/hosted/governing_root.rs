@@ -310,6 +310,15 @@ const STRAY_LOCK_FAMILIES: [(NpmLockFamily, &str); 3] = [
     (NpmLockFamily::Npm, "npm"),
 ];
 
+/// The project-directory files [`member_stray_lock`] reads; everything
+/// else it reads is above the project. VEX discovery declares these to a
+/// read recording so the check does not make it unusable.
+pub(crate) fn member_stray_lock_own_files() -> impl Iterator<Item = &'static str> {
+    npm_lock_files()
+        .chain(EXTRA_OWN_LOCKS)
+        .chain(["rush.json", VLT_JSON])
+}
+
 /// The project directory is a workspace member whose own locks are all
 /// ones its package manager never reads (a stray lock, typically left
 /// behind when a standalone package moved into the monorepo), so a run
