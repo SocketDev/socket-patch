@@ -4130,8 +4130,7 @@ wheels = [
                 ApiClient::new(ApiClientOptions {
                     api_url: server_uri.to_string(),
                     api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-                    use_public_proxy: false,
-                    org_slug: Some("acme".into()),
+                    route: crate::api::client::ApiRoute::org("acme"),
                 })
                 .with_vendor_retry(crate::api::client::VendorRetryPolicy::none()),
             ),

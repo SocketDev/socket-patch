@@ -13,7 +13,9 @@ use socket_patch_core::patch::rollback::{
     cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
     VerifyRollbackResult, VerifyRollbackStatus,
 };
-use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
+use socket_patch_core::telemetry::{
+    track_patch_rollback_failed, track_patch_rolled_back, TelemetryAuth,
+};
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
@@ -878,8 +880,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     let (telemetry_client, _) =
         get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let api_token = telemetry_client.api_token().cloned();
-    let org_slug = telemetry_client.org_slug().cloned();
+    let telemetry = TelemetryAuth::for_client(&telemetry_client);
 
     let manifest_path = args.common.resolved_manifest_path();
     let cwd = args.common.cwd.clone();
@@ -1052,18 +1053,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
         match read_manifest(&manifest_path).await {
             Ok(Some(m)) => m,
             Ok(None) => {
-                track_patch_rollback_failed(
-                    "Invalid manifest",
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_rollback_failed("Invalid manifest", &telemetry).await;
                 emit_rollback_error(args.common.json, "manifest_invalid", "Invalid manifest");
                 return 1;
             }
             Err(e) => {
                 let msg = e.to_string();
-                track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_rollback_failed(&msg, &telemetry).await;
                 emit_rollback_error(args.common.json, "manifest_unreadable", &msg);
                 return 1;
             }
@@ -1121,7 +1117,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 format!(" (to target a directory instead, use ./{id} or {id}/**)")
             };
             let msg = format!("No patch found matching identifier: {id}{hint}");
-            track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_rollback_failed(&msg, &telemetry).await;
             if args.common.json {
                 println!(
                     "{}",
@@ -1200,7 +1196,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                  identifier or an unscoped rollback)",
                 unmatched.1
             );
-            track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_rollback_failed(&msg, &telemetry).await;
             emit_rollback_error(args.common.json, "path_glob_no_match", &msg);
             return 1;
         }
@@ -1816,19 +1812,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             if success {
-                track_patch_rolled_back(
-                    rolled_back_count,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_rolled_back(rolled_back_count, &telemetry).await;
             } else {
-                track_patch_rollback_failed(
-                    "One or more rollbacks failed",
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_rollback_failed("One or more rollbacks failed", &telemetry).await;
             }
 
             if success {
@@ -1838,7 +1824,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_rollback_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_rollback_failed(&e, &telemetry).await;
             if args.common.json {
                 println!(
                     "{}",
