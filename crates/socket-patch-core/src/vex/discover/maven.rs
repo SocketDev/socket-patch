@@ -592,7 +592,13 @@ struct GaVersions {
 
 fn group_by_ga(deps: &[PomDep]) -> BTreeMap<(String, String), GaVersions> {
     let mut map: BTreeMap<(String, String), GaVersions> = BTreeMap::new();
-    for dep in deps.iter().filter(|d| !d.in_profile) {
+    // A classifier variant (`sources`, `tests`, a native build) is its own
+    // artifact, managed apart from the main jar: its version neither pins
+    // nor shadows the main jar's.
+    for dep in deps
+        .iter()
+        .filter(|d| !d.in_profile && d.classifier.is_none())
+    {
         let Some(version) = &dep.version else {
             continue;
         };
@@ -681,6 +687,21 @@ mod tests {
             "transitive-depmgmt",
             "existing-depmgmt",
             "existing-repositories",
+            // The scope-aware rewrites (#259, #262, #342): what the rewriter
+            // reports redirected, VEX attests — a commented-out, profile or
+            // plugin declaration and a classifier sibling left at the base
+            // version neither pin nor shadow the main jar.
+            "comment-dependency",
+            "profile-repositories",
+            "plugin-dependency",
+            "profile-depmgmt",
+            "commented-repositories",
+            "classifier-sources-sibling",
+            "classifier-only-transitive-main",
+            "self-closed-repositories",
+            "depmgmt-comment",
+            "self-closed-depmgmt",
+            "profile-literal",
         ] {
             let out = run(&fixture(case)).await;
             assert_refs(&out, &[(FX_PURL, FX_UUID, WiringMode::Hosted)]);

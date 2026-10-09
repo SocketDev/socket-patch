@@ -557,6 +557,18 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   repository whose grant URL changed (a rotated token) is refreshed in place. A suffixed
   literal no hosted repository in the pom minted (a vendored `socket-patch-vendor-<uuid>`
   pin, say) is still a mismatch and is skipped.
+  The rewriter reads the pom the way Maven builds the project: markup inside comments,
+  CDATA, `<build>` / `<reporting>` (plugin classpaths), `<pluginRepositories>`,
+  `<distributionManagement>` and `<profiles>` is never matched or edited, and the
+  repository and `<dependencyManagement>` pin always land in the project's own top-level
+  sections (an existing self-closed `<repositories/>` or `<dependencyManagement/>` is
+  expanded in place, so Maven never sees a duplicated tag). A GA declared only in such
+  markup counts as transitive and gets the top-level pin; a base literal inside
+  `<profiles>` is left as-is and reported (`redirect_maven_profile_dependency_unpatched`),
+  because an active profile's literal beats the pin. The grant serves the main jar only:
+  a `<classifier>` variant (sources, tests, a native build) keeps its version
+  (`redirect_maven_classifier_unsupported`), and the literal-or-pin decision is made from
+  the classifier-less declarations.
 * **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —
