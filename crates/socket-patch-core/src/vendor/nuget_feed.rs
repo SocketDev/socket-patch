@@ -20,7 +20,7 @@ use super::common::{
 use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
 use super::revert::{self, KeepPolicy};
-use super::service_fetch::{service_archive_copy, ServiceCopy};
+use super::service_fetch::service_archive_copy;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -649,11 +649,11 @@ fn nuget_entry(
     nupkg_bytes: &[u8],
     wiring: Vec<WiringRecord>,
 ) -> VendorEntry {
-    VendorEntry {
-        ecosystem: "nuget".to_string(),
+    VendorEntry::new(
+        "nuget".to_string(),
         base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
+        record.uuid.clone(),
+        VendorArtifact {
             yarn_berry10c0: None,
             // A `.nupkg` is a single verifiable file; record its plain sha256
             // for tooling (harvest re-derives per-entry git hashes from the
@@ -665,17 +665,7 @@ fn nuget_entry(
             file_inventory: None,
         },
         wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    }
+    )
 }
 
 /// Revert a NuGet vendor entry: undo the lock pin, restore/delete the
@@ -800,7 +790,7 @@ async fn materialise_patched_nupkg(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
     match service_archive_copy(service, record, name, ".nupkg", warnings).await {
-        ServiceCopy::Used(bytes) => {
+        Ok(bytes) => {
             if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
                 if !config_wired {
                     let _ = remove_tree(uuid_dir).await;
@@ -813,7 +803,7 @@ async fn materialise_patched_nupkg(
                 already_patched_result(purl, nupkg_path, &record.files),
             ))
         }
-        ServiceCopy::HardFail(outcome) => Err(outcome),
+        Err(outcome) => Err(outcome),
     }
 }
 
@@ -2774,11 +2764,11 @@ mod tests {
         let root = dir.path().join("proj");
         tokio::fs::create_dir_all(&root).await.unwrap();
 
-        let entry = VendorEntry {
-            ecosystem: "nuget".to_string(),
-            base_purl: PURL.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
+        let entry = VendorEntry::new(
+            "nuget".to_string(),
+            PURL.to_string(),
+            UUID.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: copy_rel(),
                 sha256: String::new(),
@@ -2786,7 +2776,7 @@ mod tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![WiringRecord {
+            vec![WiringRecord {
                 file: "../outside.txt".to_string(),
                 kind: CONFIG_SOURCE_WIRING_KIND.to_string(),
                 action: WiringAction::Rewritten,
@@ -2794,17 +2784,7 @@ mod tests {
                 original: Some(Value::String("EVIL".to_string())),
                 new: Some(Value::String("precious".to_string())),
             }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        };
+        );
         let outcome = revert_nuget(&entry, &root, false).await;
         assert!(
             !outcome.success,
@@ -3588,11 +3568,11 @@ mod tests {
     // ── revert entry validation edges ──────────────────────────────────────
 
     fn entry_with_wiring(uuid: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
-        VendorEntry {
-            ecosystem: "nuget".to_string(),
-            base_purl: PURL.to_string(),
-            uuid: uuid.to_string(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "nuget".to_string(),
+            PURL.to_string(),
+            uuid.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: copy_rel(),
                 sha256: String::new(),
@@ -3601,17 +3581,7 @@ mod tests {
                 file_inventory: None,
             },
             wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+        )
     }
 
     /// A tampered state.json uuid must refuse the revert fail-closed before

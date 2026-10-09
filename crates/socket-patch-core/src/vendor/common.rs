@@ -105,19 +105,11 @@ pub(crate) fn done(
     }
 }
 
-/// Shared helper the vendor backends delegate to: the fail-closed refusals
-/// for a `--vendor-source=service` run that cannot reach the service —
-/// combined with `--offline`, or with no API client configured — checked
-/// before any service consultation. Every backend's service helper treats
-/// `!service_enabled()` as "build locally", so this is the one gate that
-/// keeps `service` mode from silently building.
+/// Refuse network acquisition when offline or without an API client.
 pub(crate) fn service_offline_conflict(
     service: Option<&VendorServiceConfig>,
 ) -> Option<VendorOutcome> {
     let cfg = service?;
-    if !cfg.source.requires_service() {
-        return None;
-    }
     if cfg.offline {
         return Some(refused(
             "vendor_service_offline_conflict",

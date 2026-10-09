@@ -407,28 +407,21 @@ mod tests {
 
     fn entry_for(uuid: &str, rel: &str, bytes: &[u8]) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: "pkg:npm/left-pad@1.3.0".into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: rel.into(),
-                sha256: hex::encode(Sha256::digest(bytes)),
-                size: Some(bytes.len() as u64),
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             flavor: Some("package-lock".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-            detached: false,
-            record: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                "pkg:npm/left-pad@1.3.0".into(),
+                uuid.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel.into(),
+                    sha256: hex::encode(Sha256::digest(bytes)),
+                    size: Some(bytes.len() as u64),
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 

@@ -5,8 +5,7 @@
 //! then integrity-verifies the bytes BEFORE they are ever written/extracted.
 //! Verification is fail-closed — a byte/hash mismatch is always a hard error
 //! (`IntegrityMismatch`), never a silent fallback to a wrong artifact. The
-//! per-ecosystem backends own the placement (Tier A: write the archive; Tier B:
-//! extract it into the vendor directory) and the build-vs-service policy.
+//! backends own the placement: write the archive or extract it into a directory.
 
 use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
 use crate::manifest::schema::PatchRecord;
@@ -36,17 +35,12 @@ pub(crate) async fn preview_service(
     let cfg = service
         .filter(|cfg| cfg.service_enabled())
         .ok_or_else(|| Box::new(required()))?;
-    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
-    let archive = match policy.settle::<()>(
+    let policy = ServicePolicy::Refused;
+    let archive = policy.settle(
         fetch_verified_archive(cfg, &record.uuid).await,
         "archive",
         &record.uuid,
-        &mut Vec::new(),
-    ) {
-        Ok(archive) => archive,
-        Err(ServiceAttempt::HardFail(outcome)) => return Err(outcome),
-        _ => return Err(Box::new(required())),
-    };
+    )?;
     let stage = tempfile::tempdir()
         .map_err(|e| Box::new(refused("vendor_prebuilt_extract_failed", e.to_string())))?;
     super::registry_fetch::extract_on_blocking_pool(archive.bytes, stage.path(), extract)
@@ -185,86 +179,49 @@ pub(crate) async fn claim_prestaged(
     }
 }
 
-/// Outcome of a backend's verified service download.
-pub(crate) enum ServiceAttempt<T> {
-    /// The verified service artifact was used; `T` is what the backend made
-    /// of it.
-    Used(T),
-    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
-    HardFail(Box<VendorOutcome>),
-}
-
-/// The single-file outcome for the Tier-A backends (maven `.jar`, nuget
-/// `.nupkg`): the prebuilt patched bytes, written verbatim.
-pub(crate) type ServiceCopy = ServiceAttempt<Vec<u8>>;
-
 /// How a backend reports a terminal service failure.
 #[derive(Clone, Copy)]
-pub(crate) enum ServiceTerminal<'a> {
-    /// A [`VendorOutcome::Refused`] carrying the refusal code.
+pub(crate) enum ServicePolicy<'a> {
     Refused,
-    /// The npm backends' failed `Done` for `purl` (the code is not reported).
+    /// npm reports a failed `Done` for this purl.
     Failure(&'a str),
 }
 
-/// Every service miss is terminal; backends never construct an archive locally.
-pub(crate) struct ServicePolicy<'a> {
-    terminal: ServiceTerminal<'a>,
-}
-
-impl<'a> ServicePolicy<'a> {
-    pub(crate) fn new(_cfg: &VendorServiceConfig, terminal: ServiceTerminal<'a>) -> Self {
-        Self { terminal }
+impl ServicePolicy<'_> {
+    pub(crate) fn hard(&self, code: &'static str, detail: String) -> Box<VendorOutcome> {
+        Box::new(match self {
+            Self::Refused => refused(code, detail),
+            Self::Failure(purl) => super::npm_common::done_failure(purl, detail),
+        })
     }
 
-    pub(crate) fn hard<T>(&self, code: &'static str, detail: String) -> ServiceAttempt<T> {
-        ServiceAttempt::HardFail(Box::new(match self.terminal {
-            ServiceTerminal::Refused => refused(code, detail),
-            ServiceTerminal::Failure(purl) => super::npm_common::done_failure(purl, detail),
-        }))
-    }
-
-    /// Refuse a patch the service has no artifact for (`code` is
-    /// [`super::VENDOR_PREBUILT_PENDING`] or [`super::VENDOR_PREBUILT_UNAVAILABLE`]):
-    /// the same hard failure as [`Self::hard`], except that the npm backends'
-    /// failed `Done` also carries `code` as a warning, so the vendor loop can
-    /// tell "not served (yet)" from a real failure and keep an older vendored
-    /// patch of the same package instead of failing the run (#954).
-    fn unserved<T>(&self, code: &'static str, detail: String) -> ServiceAttempt<T> {
-        match self.terminal {
-            ServiceTerminal::Refused => self.hard("vendor_prebuilt_required", detail),
-            ServiceTerminal::Failure(purl) => {
+    /// npm must distinguish unserved patches from failures so the vendor loop
+    /// can keep an older vendored patch of the same package (#954).
+    fn unserved(&self, code: &'static str, detail: String) -> Box<VendorOutcome> {
+        match self {
+            Self::Refused => self.miss(detail),
+            Self::Failure(purl) => {
                 let warning = VendorWarning::new(code, detail.clone());
-                ServiceAttempt::HardFail(Box::new(super::common::done(
+                Box::new(super::common::done(
                     super::common::failed_result(purl, std::path::Path::new(""), detail),
                     None,
                     vec![warning],
-                )))
+                ))
             }
         }
     }
 
-    /// Refuse an unavailable server artifact.
-    pub(crate) fn miss<T>(
-        &self,
-        warnings: &mut Vec<VendorWarning>,
-        code: &'static str,
-        reason: String,
-    ) -> ServiceAttempt<T> {
-        let _ = (warnings, code);
+    pub(crate) fn miss(&self, reason: String) -> Box<VendorOutcome> {
         self.hard("vendor_prebuilt_required", reason)
     }
 
-    /// The verified archive of a `Ready` outcome, or every other outcome
-    /// mapped onto the policy. `noun` names the artifact kind in messages
-    /// ("crate"); `subject` names this artifact ("crate for serde").
-    pub(crate) fn settle<T>(
+    /// `noun` names the artifact kind; `subject` identifies it in error messages.
+    pub(crate) fn settle(
         &self,
         artifact: ServiceArtifact,
         noun: &str,
         subject: &str,
-        warnings: &mut Vec<VendorWarning>,
-    ) -> Result<VerifiedArchive, ServiceAttempt<T>> {
+    ) -> Result<VerifiedArchive, Box<VendorOutcome>> {
         match artifact {
             ServiceArtifact::Ready(archive) => Ok(archive),
             ServiceArtifact::IntegrityMismatch(reason) => Err(self.hard(
@@ -278,16 +235,13 @@ impl<'a> ServicePolicy<'a> {
                 super::VENDOR_PREBUILT_PENDING,
                 format!("prebuilt {noun} is still building"),
             )),
-            // No artifact is available for these coordinates or entitlements.
             ServiceArtifact::Unavailable(reason) => Err(self.unserved(
                 super::VENDOR_PREBUILT_UNAVAILABLE,
                 format!("prebuilt {noun} unavailable: {reason}"),
             )),
-            ServiceArtifact::Failed(reason) => Err(self.miss(
-                warnings,
-                "vendor_prebuilt_unavailable",
-                format!("patch service request failed ({reason})"),
-            )),
+            ServiceArtifact::Failed(reason) => {
+                Err(self.miss(format!("patch service request failed ({reason})")))
+            }
         }
     }
 }
@@ -300,25 +254,19 @@ pub(crate) async fn service_archive_copy(
     name: &str,
     noun: &str,
     warnings: &mut Vec<VendorWarning>,
-) -> ServiceCopy {
+) -> Result<Vec<u8>, Box<VendorOutcome>> {
     // The maven/nuget flows have no earlier guard, so the fail-closed
     // `--vendor-source=service` refusals (`--offline`, no API client) live
     // here (the other backends check the same helper at their entry points).
     if let Some(refusal) = service_offline_conflict(service) {
-        return ServiceCopy::HardFail(Box::new(refusal));
+        return Err(Box::new(refusal));
     }
-    let Some(cfg) = service else {
-        return ServiceCopy::HardFail(Box::new(super::service_fetch::required()));
-    };
-    if !cfg.service_enabled() {
-        return ServiceCopy::HardFail(Box::new(super::service_fetch::required()));
-    }
-    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+    let cfg = service
+        .filter(|cfg| cfg.service_enabled())
+        .ok_or_else(|| Box::new(super::service_fetch::required()))?;
+    let policy = ServicePolicy::Refused;
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
-    let archive = match policy.settle(fetched, noun, noun, warnings) {
-        Ok(archive) => archive,
-        Err(attempt) => return attempt,
-    };
+    let archive = policy.settle(fetched, noun, noun)?;
     // The SRI proves the download is intact, not that it carries the
     // patch: the bytes are written verbatim and reported AlreadyPatched,
     // so every patched member must hash to its afterHash first (the
@@ -328,14 +276,10 @@ pub(crate) async fn service_archive_copy(
         .zip_verdict(&record.files)
         .unwrap_or_else(|| zip_bytes_match_after_hashes(&archive.bytes, &record.files))
     {
-        return policy.miss(
-            warnings,
-            "vendor_prebuilt_layout_mismatch",
-            format!(
-                "prebuilt {noun} for {name} does not carry the patched files at their \
+        return Err(policy.miss(format!(
+            "prebuilt {noun} for {name} does not carry the patched files at their \
                  recorded paths"
-            ),
-        );
+        )));
     }
     warnings.push(VendorWarning::new(
         "vendor_prebuilt_downloaded",
@@ -344,7 +288,7 @@ pub(crate) async fn service_archive_copy(
             archive.source_url
         ),
     ));
-    ServiceCopy::Used(archive.bytes)
+    Ok(archive.bytes)
 }
 
 /// Outcome of fetching + verifying a named secondary artifact.
@@ -364,9 +308,8 @@ pub(crate) enum SecondaryArtifactResult {
 /// `gem-stub-gemspec`) referenced by a [`VerifiedArchive`].
 ///
 /// The bytes are verified against the artifact's own sha512 SRI, fail-closed
-/// like the primary archive. Returns `Absent` when the archive referenced no
-/// artifact of this kind — the caller treats that as a miss (fall back under
-/// `auto`, refuse under `service`).
+/// like the primary archive. Returns `Absent` when no artifact of this kind
+/// was referenced.
 pub(crate) async fn fetch_verified_secondary(
     cfg: &VendorServiceConfig,
     archive: &VerifiedArchive,
@@ -535,26 +478,23 @@ mod tests {
         ));
     }
 
-    /// IntegrityMismatch is a hard error in EVERY mode — under the
-    /// default `auto` the Tier-A copy must refuse, never fall back to a local
-    /// rebuild on tampered bytes (the enum's own contract: "never fall back").
+    /// Tampered bytes must be refused before extraction.
     #[tokio::test]
-    async fn service_copy_integrity_mismatch_auto_hard_fails() {
+    async fn service_copy_integrity_mismatch_hard_fails() {
         let server = MockServer::start().await;
         let body = b"the real bytes";
         let wrong = PackedTarball::from_bytes(b"completely different bytes").integrity;
         mount_granted(&server, &wrong, body).await;
-        let mut cfg = cfg_for(&server);
-        cfg.source = VendorSource::Service;
+        let cfg = cfg_for(&server);
         let mut warnings = Vec::new();
         match service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await {
-            ServiceCopy::HardFail(outcome) => match *outcome {
+            Err(outcome) => match *outcome {
                 VendorOutcome::Refused { code, .. } => {
                     assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
                 }
                 other => panic!("expected Refused, got {other:?}"),
             },
-            ServiceCopy::Used(_) => panic!("tampered bytes must never be used"),
+            Ok(_) => panic!("tampered bytes must never be used"),
         }
     }
 
@@ -565,27 +505,14 @@ mod tests {
         cfg.offline = true;
         let mut warnings = Vec::new();
         match service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await {
-            ServiceCopy::HardFail(outcome) => match *outcome {
+            Err(outcome) => match *outcome {
                 VendorOutcome::Refused { code, .. } => {
                     assert_eq!(code, "vendor_service_offline_conflict");
                 }
                 other => panic!("expected Refused, got {other:?}"),
             },
-            ServiceCopy::Used(_) => panic!("offline run must not download"),
+            Ok(_) => panic!("offline run must not download"),
         }
-    }
-
-    #[tokio::test]
-    async fn service_copy_offline_refuses_without_advisory() {
-        let server = MockServer::start().await;
-        let mut cfg = cfg_for(&server);
-        cfg.source = VendorSource::Service;
-        cfg.offline = true;
-        let mut warnings = Vec::new();
-        assert!(matches!(
-            service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await,
-            ServiceCopy::HardFail(_)
-        ));
         assert!(warnings.is_empty(), "the refusal needs no advisory");
     }
 
@@ -644,7 +571,7 @@ mod tests {
     }
 
     /// Tier-A happy path: a granted, integrity-verified archive comes back as
-    /// `Used(bytes)` plus exactly one `vendor_prebuilt_downloaded` advisory
+    /// bytes plus exactly one `vendor_prebuilt_downloaded` advisory
     /// naming the package and the serve URL.
     #[tokio::test]
     async fn service_copy_ready_returns_used_bytes_with_downloaded_note() {
@@ -662,8 +589,8 @@ mod tests {
         )
         .await
         {
-            ServiceCopy::Used(bytes) => assert_eq!(bytes, body),
-            ServiceCopy::HardFail(outcome) => panic!("expected Used, got HardFail({outcome:?})"),
+            Ok(bytes) => assert_eq!(bytes, body),
+            Err(outcome) => panic!("expected archive bytes, got {outcome:?}"),
         }
         assert_eq!(warnings.len(), 1, "exactly one downloaded advisory");
         assert_eq!(warnings[0].code, "vendor_prebuilt_downloaded");
@@ -682,23 +609,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_copy_pending_refuses_without_fallback() {
-        let server = MockServer::start().await;
-        mount_status(&server, "pending_build").await;
-        let mut cfg = cfg_for(&server);
-        cfg.source = VendorSource::Service;
-        let mut warnings = Vec::new();
-        assert!(matches!(
-            service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await,
-            ServiceCopy::HardFail(_)
-        ));
-        assert!(
-            warnings.is_empty(),
-            "a hard failure is not a fallback advisory"
-        );
-    }
-
-    #[tokio::test]
     async fn service_copy_pending_service_hard_fails() {
         let server = MockServer::start().await;
         mount_status(&server, "pending_build").await;
@@ -712,14 +622,14 @@ mod tests {
         )
         .await
         {
-            ServiceCopy::HardFail(outcome) => match *outcome {
+            Err(outcome) => match *outcome {
                 VendorOutcome::Refused { code, detail } => {
                     assert_eq!(code, "vendor_prebuilt_required");
                     assert!(detail.contains("is still building"), "{detail}");
                 }
                 other => panic!("expected Refused, got {other:?}"),
             },
-            ServiceCopy::Used(_) => panic!("pending build must not yield bytes"),
+            Ok(_) => panic!("pending build must not yield bytes"),
         }
         assert!(warnings.is_empty(), "the hard-fail path must not warn");
     }
@@ -740,58 +650,16 @@ mod tests {
         )
         .await
         {
-            ServiceCopy::HardFail(outcome) => match *outcome {
+            Err(outcome) => match *outcome {
                 VendorOutcome::Refused { code, detail } => {
                     assert_eq!(code, "vendor_prebuilt_required");
                     assert_eq!(detail, "prebuilt .jar unavailable: not_found");
                 }
                 other => panic!("expected Refused, got {other:?}"),
             },
-            ServiceCopy::Used(_) => panic!("unavailable archive must not yield bytes"),
+            Ok(_) => panic!("unavailable archive must not yield bytes"),
         }
         assert!(warnings.is_empty(), "the hard-fail path must not warn");
-    }
-
-    /// An unavailable artifact is a refusal, with no fallback advisory.
-    #[tokio::test]
-    async fn service_copy_unavailable_refuses_without_fallback() {
-        let server = MockServer::start().await;
-        mount_status(&server, "not_found").await;
-        let mut cfg = cfg_for(&server);
-        cfg.source = VendorSource::Service;
-        let mut warnings = Vec::new();
-        assert!(matches!(
-            service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await,
-            ServiceCopy::HardFail(_)
-        ));
-        assert!(
-            warnings.is_empty(),
-            "Unavailable under auto must fall back quietly, without a warning"
-        );
-    }
-
-    /// Transport failure under `auto`: warn and fall back. The Failed arm
-    /// deliberately reuses the `vendor_prebuilt_unavailable` warning code
-    /// (matching the golang mapping) rather than a dedicated one.
-    #[tokio::test]
-    async fn service_copy_failed_refuses_without_fallback() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let mut cfg = cfg_for(&server);
-        cfg.source = VendorSource::Service;
-        let mut warnings = Vec::new();
-        assert!(matches!(
-            service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await,
-            ServiceCopy::HardFail(_)
-        ));
-        assert!(
-            warnings.is_empty(),
-            "a hard failure is not a fallback advisory"
-        );
     }
 
     #[tokio::test]
@@ -812,7 +680,7 @@ mod tests {
         )
         .await
         {
-            ServiceCopy::HardFail(outcome) => match *outcome {
+            Err(outcome) => match *outcome {
                 VendorOutcome::Refused { code, detail } => {
                     assert_eq!(code, "vendor_prebuilt_required");
                     assert!(
@@ -822,7 +690,7 @@ mod tests {
                 }
                 other => panic!("expected Refused, got {other:?}"),
             },
-            ServiceCopy::Used(_) => panic!("a failed request must not yield bytes"),
+            Ok(_) => panic!("a failed request must not yield bytes"),
         }
         assert!(warnings.is_empty(), "the hard-fail path must not warn");
     }
@@ -895,7 +763,7 @@ mod tests {
             let mut warnings = Vec::new();
             let copy = service_archive_copy(Some(&cfg), &rec, "x", ".jar", &mut warnings).await;
             match (source, copy) {
-                (VendorSource::Service, ServiceCopy::HardFail(outcome)) => match *outcome {
+                (VendorSource::Service, Err(outcome)) => match *outcome {
                     VendorOutcome::Refused { code, detail } => {
                         assert_eq!(code, "vendor_prebuilt_required");
                         assert!(
@@ -905,7 +773,7 @@ mod tests {
                     }
                     other => panic!("expected Refused, got {other:?}"),
                 },
-                (source, ServiceCopy::Used(_)) => {
+                (source, Ok(_)) => {
                     panic!("{source:?}: unpatched service bytes were accepted")
                 }
             }

@@ -66,26 +66,23 @@ const KIND_LOCK_BLOCK: &str = "yarn_lock_block";
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_yarn_classic<'a>(
     purl: &str,
-    installed_dir: impl Into<PackageSource<'a>>,
+    _installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     vendor_npm_family(
         &YarnClassicBackend,
         NpmVendorRequest {
             purl,
-            installed_dir: installed_dir.into(),
             project_root,
             record,
-            sources,
             vendored_at,
             dry_run,
-            force,
             service,
         },
     )

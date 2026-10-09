@@ -320,24 +320,21 @@ pub async fn binary_vendor_paths(project_root: &Path) -> Result<Vec<String>, Str
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor_bun<'a>(
     purl: &str,
-    installed_dir: impl Into<PackageSource<'a>>,
+    _installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     let req = NpmVendorRequest {
         purl,
-        installed_dir: installed_dir.into(),
         project_root,
         record,
-        sources,
         vendored_at,
         dry_run,
-        force,
         service,
     };
     if binary_lock_drives(project_root) {

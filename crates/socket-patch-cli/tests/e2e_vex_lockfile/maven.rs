@@ -384,35 +384,29 @@ fn write_vendor_ledger(
     state.entries.insert(
         purl.to_string(),
         VendorEntry {
-            ecosystem: eco.to_string(),
-            base_purl: purl.to_string(),
-            uuid: uuid.to_string(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: artifact_rel.to_string(),
-                sha256,
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: vec![WiringRecord {
-                file: wiring.0.to_string(),
-                kind: wiring.1.to_string(),
-                action: WiringAction::Rewritten,
-                key: None,
-                original: None,
-                new: None,
-            }],
-            lock: None,
-            took_over_go_patches: false,
             detached: true,
             record: Some(rec),
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                eco.to_string(),
+                purl.to_string(),
+                uuid.to_string(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: artifact_rel.to_string(),
+                    sha256,
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                vec![WiringRecord {
+                    file: wiring.0.to_string(),
+                    kind: wiring.1.to_string(),
+                    action: WiringAction::Rewritten,
+                    key: None,
+                    original: None,
+                    new: None,
+                }],
+            )
         },
     );
     fx.put(

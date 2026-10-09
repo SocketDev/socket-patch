@@ -312,6 +312,33 @@ pub struct VendorEntry {
 }
 
 impl VendorEntry {
+    /// Create an entry with no ecosystem-specific metadata or embedded record.
+    pub fn new(
+        ecosystem: String,
+        base_purl: String,
+        uuid: String,
+        artifact: VendorArtifact,
+        wiring: Vec<WiringRecord>,
+    ) -> Self {
+        Self {
+            ecosystem,
+            base_purl,
+            uuid,
+            artifact,
+            wiring,
+            lock: None,
+            took_over_go_patches: false,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+            detached: false,
+            record: None,
+        }
+    }
+
     /// The ledger entry every npm-family vendor backend records: ecosystem
     /// `npm`, the wiring flavor (`None` is package-lock's pre-flavor
     /// spelling) and no other ecosystem's extras. A flavor sets its one
@@ -324,21 +351,8 @@ impl VendorEntry {
         flavor: Option<&str>,
     ) -> Self {
         Self {
-            ecosystem: "npm".to_string(),
-            base_purl,
-            uuid,
-            artifact,
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
             flavor: flavor.map(str::to_string),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-            detached: false,
-            record: None,
+            ..Self::new("npm".to_string(), base_purl, uuid, artifact, wiring)
         }
     }
 
@@ -974,11 +988,11 @@ mod tests {
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
     fn sample_entry() -> VendorEntry {
-        VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: "pkg:npm/lodash@4.17.21".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "npm".into(),
+            "pkg:npm/lodash@4.17.21".into(),
+            UUID.into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: format!(".socket/vendor/npm/{UUID}/lodash-4.17.21.tgz"),
                 sha256: "ab".repeat(32),
@@ -986,7 +1000,7 @@ mod tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![WiringRecord {
+            vec![WiringRecord {
                 file: "package-lock.json".into(),
                 kind: "npm_lock_entry".into(),
                 action: WiringAction::Rewritten,
@@ -1002,17 +1016,7 @@ mod tests {
                     "integrity": "sha512-ours"
                 })),
             }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+        )
     }
 
     /// A cargo entry migrated from the pre-v5 `.cargo/config.toml` wiring to
@@ -1031,28 +1035,21 @@ mod tests {
         };
         let uuid = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
         let base = |wiring: Vec<WiringRecord>, lock: Option<CargoLockOriginal>| VendorEntry {
-            ecosystem: "cargo".into(),
-            base_purl: "pkg:cargo/cfg-if@1.0.4".into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring,
             lock,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "cargo".into(),
+                "pkg:cargo/cfg-if@1.0.4".into(),
+                uuid.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
         };
         let orig = CargoLockOriginal {
             source: "registry+https://github.com/rust-lang/crates.io-index".into(),

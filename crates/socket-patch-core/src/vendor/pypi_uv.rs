@@ -2451,28 +2451,22 @@ wheels = [
 
     fn entry_for(wiring: Vec<WiringRecord>, meta: UvMeta) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: REL_WHEEL.into(),
-                sha256: WHEEL_SHA.into(),
-                size: Some(11053),
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("uv".into()),
             uv: Some(meta),
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "pypi".into(),
+                "pkg:pypi/six@1.16.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: REL_WHEEL.into(),
+                    sha256: WHEEL_SHA.into(),
+                    size: Some(11053),
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
         }
     }
 

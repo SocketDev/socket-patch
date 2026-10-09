@@ -45,9 +45,7 @@ use super::common::{
 use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::{extract_on_blocking_pool, extract_tgz};
-use super::service_fetch::{
-    claim_prestaged, fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal,
-};
+use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServicePolicy};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker,
@@ -264,10 +262,6 @@ async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str)
     None
 }
 
-/// Outcome of attempting to materialise the cargo copy from the patch service
-/// (`Used`: the prebuilt crate was extracted into `copy_dir`).
-type CargoServiceCopy = ServiceAttempt<()>;
-
 /// Download the prebuilt `.crate`, integrity-verify it, and extract it into
 /// `copy_dir` (a path-dep copy must carry no `.cargo-checksum.json`). The extracted
 /// crate is the patched package built by the server.
@@ -279,20 +273,14 @@ pub(super) async fn cargo_service_copy(
     copy_dir: &Path,
     uuid_dir: &Path,
     warnings: &mut Vec<VendorWarning>,
-) -> CargoServiceCopy {
-    let Some(cfg) = service else {
-        return CargoServiceCopy::HardFail(Box::new(super::service_fetch::required()));
-    };
-    if !cfg.service_enabled() {
-        return CargoServiceCopy::HardFail(Box::new(super::service_fetch::required()));
-    }
-    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+) -> Result<(), Box<VendorOutcome>> {
+    let cfg = service
+        .filter(|cfg| cfg.service_enabled())
+        .ok_or_else(|| Box::new(super::service_fetch::required()))?;
+    let policy = ServicePolicy::Refused;
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
     let subject = format!("crate for {name}");
-    let mut archive = match policy.settle(fetched, "crate", &subject, warnings) {
-        Ok(archive) => archive,
-        Err(attempt) => return attempt,
-    };
+    let mut archive = policy.settle(fetched, "crate", &subject)?;
     // Extract the `.crate` (tar.gz; strip its single `{name}-{version}/`
     // top-level dir) into a STAGE sibling and swap it into the copy dir only
     // once fully verified — a failure then leaves any pre-existing copy
@@ -305,48 +293,42 @@ pub(super) async fn cargo_service_copy(
         let _ = remove_tree(&stage).await;
         if let Err(e) = tokio::fs::create_dir_all(&stage).await {
             cleanup_failed_stage(&stage, uuid_dir, false).await;
-            return policy.hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_write_failed",
                 format!("cannot create {}: {e}", stage.display()),
-            );
+            ));
         }
         let crate_bytes = std::mem::take(&mut archive.bytes);
         if let Err(e) = extract_on_blocking_pool(crate_bytes, &stage, extract_tgz).await {
             cleanup_failed_stage(&stage, uuid_dir, false).await;
-            return policy.hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_extract_failed",
                 format!("cannot extract the prebuilt crate: {e}"),
-            );
+            ));
         }
     }
     let _ = tokio::fs::remove_file(stage.join(".cargo-checksum.json")).await;
     if !copy_matches_after_hashes(&stage, &record.files).await {
         cleanup_failed_stage(&stage, uuid_dir, false).await;
-        return policy.miss(
-            warnings,
-            "vendor_prebuilt_layout_mismatch",
-            format!(
-                "prebuilt crate for {name} extracted to an unexpected \
+        return Err(policy.miss(format!(
+            "prebuilt crate for {name} extracted to an unexpected \
                  layout (patched files absent at their recorded paths)"
-            ),
-        );
+        )));
     }
     // The copy's version carries the patch uuid tag, written in the stage so
     // a swapped-in copy is never untagged.
     if let Err(e) = cargo_tag::tag_copy_manifest(&stage, version, &record.uuid).await {
         cleanup_failed_stage(&stage, uuid_dir, false).await;
-        return policy.miss(
-            warnings,
-            "vendor_prebuilt_layout_mismatch",
-            format!("prebuilt crate for {name}: cannot tag its version ({e})"),
-        );
+        return Err(policy.miss(format!(
+            "prebuilt crate for {name}: cannot tag its version ({e})"
+        )));
     }
     if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
         cleanup_failed_stage(&stage, uuid_dir, false).await;
-        return policy.hard(
+        return Err(policy.hard(
             "vendor_prebuilt_write_failed",
             format!("cannot move the extracted crate into place: {e}"),
-        );
+        ));
     }
     warnings.push(VendorWarning::new(
         "vendor_prebuilt_downloaded",
@@ -355,7 +337,7 @@ pub(super) async fn cargo_service_copy(
             archive.source_url
         ),
     ));
-    CargoServiceCopy::Used(())
+    Ok(())
 }
 
 /// Everything [`vendor_cargo_crate`] decides before its dry-run branch: the
@@ -854,10 +836,8 @@ pub async fn vendor_cargo_crate<'a>(
             )
             .await
             {
-                CargoServiceCopy::Used(()) => {
-                    already_patched_result(purl, &copy_dir, &record.files)
-                }
-                CargoServiceCopy::HardFail(outcome) => return *outcome,
+                Ok(()) => already_patched_result(purl, &copy_dir, &record.files),
+                Err(outcome) => return *outcome,
             };
             warnings.push(VendorWarning::new(
                 "vendor_artifact_rebuilt",
@@ -982,12 +962,12 @@ pub async fn vendor_cargo_crate<'a>(
     )
     .await
     {
-        CargoServiceCopy::Used(()) => {
+        Ok(()) => {
             // The service crate is the patched package; trust its verified
             // integrity (every file reads as AlreadyPatched).
             already_patched_result(purl, &copy_dir, &record.files)
         }
-        CargoServiceCopy::HardFail(outcome) => return *outcome,
+        Err(outcome) => return *outcome,
     };
 
     let file_inventory =
@@ -1172,28 +1152,21 @@ fn cargo_entry(
         });
     }
     VendorEntry {
-        ecosystem: "cargo".to_string(),
-        base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: copy_rel.to_string(),
-            sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
-            size: None,
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring,
         lock: lock_original,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
+        ..VendorEntry::new(
+            "cargo".to_string(),
+            base_purl,
+            record.uuid.clone(),
+            VendorArtifact {
+                yarn_berry10c0: None,
+                path: copy_rel.to_string(),
+                sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring,
+        )
     }
 }
 
@@ -3951,11 +3924,11 @@ mod tests {
     }
 
     fn ledger_entry_for(uuid: &str) -> VendorEntry {
-        VendorEntry {
-            ecosystem: "cargo".into(),
-            base_purl: PURL.into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "cargo".into(),
+            PURL.into(),
+            uuid.into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
                 sha256: String::new(),
@@ -3963,18 +3936,8 @@ mod tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+            Vec::new(),
+        )
     }
 
     /// The lockfile-in-use probe for cargo (GC/prune reclaim): detached lock

@@ -31,7 +31,7 @@ use super::common::{
 };
 use super::path::vendor_uuid_dir_rel;
 use super::revert::{self, KeepPolicy};
-use super::service_fetch::{service_archive_copy, ServiceCopy};
+use super::service_fetch::service_archive_copy;
 use super::state::{VendorArtifact, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -163,11 +163,11 @@ fn maven_entry(
     jar_bytes: &[u8],
     wiring: Vec<WiringRecord>,
 ) -> VendorEntry {
-    VendorEntry {
-        ecosystem: "maven".to_string(),
+    VendorEntry::new(
+        "maven".to_string(),
         base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
+        record.uuid.clone(),
+        VendorArtifact {
             yarn_berry10c0: None,
             // A `.jar` is a single verifiable file; record its plain sha256 for
             // tooling (harvest re-derives per-entry git hashes from the zip, so
@@ -179,17 +179,7 @@ fn maven_entry(
             file_inventory: None,
         },
         wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    }
+    )
 }
 
 /// Revert a Maven vendor entry. A JVM entry goes to the planner's revert;
@@ -793,11 +783,11 @@ async fn vendor_maven_jvm(
                 match service_archive_copy(service, record, &artifact_id, ".jar", &mut warnings)
                     .await
                 {
-                    ServiceCopy::Used(bytes) => (
+                    Ok(bytes) => (
                         bytes,
                         already_patched_result(purl, &display_path, &record.files),
                     ),
-                    ServiceCopy::HardFail(outcome) => return *outcome,
+                    Err(outcome) => return *outcome,
                 };
             if !result.success {
                 return done(result, None, warnings);
