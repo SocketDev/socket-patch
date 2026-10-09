@@ -147,6 +147,72 @@ pub(crate) fn governed_locks_on_disk(
     ))
 }
 
+/// [`governed_locks_on_disk`] through a [`ProjectView`]: every listing, read
+/// and probe goes through the view, so a recording [`DiskSnapshot`] read
+/// cache fingerprints them like its own reads (asking it for its raw root
+/// would end its recording, and with it the re-scan's reuse of the
+/// discovery it guards). Same walk rules as [`project_files`].
+///
+/// [`ProjectView`]: crate::vendor::lock_inventory::ProjectView
+/// [`DiskSnapshot`]: crate::vendor::lock_inventory::DiskSnapshot
+pub(crate) async fn governed_locks_in(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+) -> Result<crate::formats::nuget::lock::GovernedLocks, String> {
+    use crate::formats::nuget::lock::{governed_locks, is_project_file};
+    let mut projects: Vec<(String, String)> = Vec::new();
+    let mut pending = vec![String::new()];
+    let mut listed = 0usize;
+    while let Some(rel) = pending.pop() {
+        listed += 1;
+        if listed > WALK_DIR_BUDGET {
+            return Err(format!(
+                "more than {WALK_DIR_BUDGET} directories under the project root"
+            ));
+        }
+        let entries = view.list_dir(&rel).await.map_err(|e| {
+            format!(
+                "unreadable {}: {e}",
+                if rel.is_empty() { "." } else { &rel }
+            )
+        })?;
+        for entry in entries {
+            let child = if rel.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{rel}/{}", entry.name)
+            };
+            if entry.is_dir {
+                if !entry.name.starts_with('.') && !SKIPPED_DIRS.contains(&entry.name.as_str()) {
+                    pending.push(child);
+                }
+            } else if is_project_file(&entry.name) {
+                let text = view
+                    .read_text(&child)
+                    .await
+                    .map_err(|e| format!("unreadable {child}: {e}"))?;
+                if text.len() as u64 > MAX_PROJECT_BYTES {
+                    return Err(format!("{child} is too large to read"));
+                }
+                projects.push((child, text));
+            }
+        }
+    }
+    projects.sort();
+    // Which lock paths the discovery asks about, then their answers.
+    let asked = std::cell::RefCell::new(Vec::<String>::new());
+    governed_locks(&projects, |rel| {
+        asked.borrow_mut().push(rel.to_string());
+        false
+    });
+    let mut present = std::collections::BTreeSet::new();
+    for rel in asked.into_inner() {
+        if !present.contains(&rel) && view.exists_no_follow(&rel).await {
+            present.insert(rel);
+        }
+    }
+    Ok(governed_locks(&projects, |rel| present.contains(rel)))
+}
+
 /// Whether something other than a directory sits at `root/rel` (`lstat`):
 /// a FIFO or link under a lock name is then read, and refused, by the
 /// FIFO-safe reader rather than taken for an absent lock.
