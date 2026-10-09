@@ -1741,7 +1741,12 @@ pub(crate) async fn run_redirect_selected(
             let mut next_steps = if common.dry_run {
                 Vec::new()
             } else {
-                format_next_steps(&human_files, &rewrite.edits, !takeover_migrated.is_empty())
+                format_next_steps(
+                    &common.cwd,
+                    &human_files,
+                    &rewrite.edits,
+                    !takeover_migrated.is_empty(),
+                )
             };
             next_steps.extend(deferred_steps);
             for line in next_steps {
@@ -2153,8 +2158,10 @@ fn join_names(names: &[String], max: usize) -> String {
 /// rewritten files, reinstall so the installed tree picks up the patched
 /// artifacts, then verify with `vex`. After a vendored→hosted takeover
 /// (`vendored_removed`) the commit also has to carry the deleted vendored
-/// ledger entries and artifacts.
+/// ledger entries and artifacts. `cwd` locates the project's Composer
+/// vendor directory for the composer reinstall hint.
 fn format_next_steps(
+    cwd: &std::path::Path,
     files: &[String],
     edits: &[socket_patch_core::patch::redirect::FileEdit],
     vendored_removed: bool,
@@ -2177,7 +2184,9 @@ fn format_next_steps(
     } else if let Some(sbt) = socket_patch_core::patch::redirect::sbt::next_step_hint(files) {
         sbt.to_string()
     } else {
-        crate::commands::composer_hints::hosted_reinstall_hint(files, edits).unwrap_or_default()
+        let vendor_dir = crate::commands::composer_hints::vendor_dir_label(cwd);
+        crate::commands::composer_hints::hosted_reinstall_hint(files, edits, &vendor_dir)
+            .unwrap_or_default()
     };
     let mut extra = Vec::new();
     if files
@@ -4326,9 +4335,14 @@ mod tests {
 
     #[test]
     fn next_steps_name_the_rewritten_files_and_reinstall() {
-        assert!(format_next_steps(&[], &[], false).is_empty());
+        assert!(format_next_steps(std::path::Path::new("."), &[], &[], false).is_empty());
         assert_eq!(
-            format_next_steps(&["package-lock.json".to_string()], &[], false),
+            format_next_steps(
+                std::path::Path::new("."),
+                &["package-lock.json".to_string()],
+                &[],
+                false
+            ),
             vec![
                 "Next steps:".to_string(),
                 "  1. Commit package-lock.json to keep the hosted patches.".to_string(),
@@ -4339,6 +4353,7 @@ mod tests {
             ]
         );
         let steps = format_next_steps(
+            std::path::Path::new("."),
             &[
                 "pnpm-lock.yaml".to_string(),
                 "pnpm-workspace.yaml".to_string(),
@@ -4355,22 +4370,35 @@ mod tests {
 
     #[test]
     fn next_steps_add_the_vlt_ci_line_only_for_a_rewritten_vlt_lock() {
-        let steps = format_next_steps(&["vlt-lock.json".to_string()], &[], false);
+        let steps = format_next_steps(
+            std::path::Path::new("."),
+            &["vlt-lock.json".to_string()],
+            &[],
+            false,
+        );
         assert_eq!(
             steps.last().map(String::as_str),
             Some("  3. vlt: commit vlt-lock.json; CI should run `vlt ci`.")
         );
-        assert!(
-            !format_next_steps(&["package-lock.json".to_string()], &[], false)
-                .iter()
-                .any(|s| s.contains("vlt:"))
-        );
+        assert!(!format_next_steps(
+            std::path::Path::new("."),
+            &["package-lock.json".to_string()],
+            &[],
+            false
+        )
+        .iter()
+        .any(|s| s.contains("vlt:")));
     }
 
     #[test]
     fn next_steps_after_a_takeover_name_the_removed_vendored_state() {
         assert_eq!(
-            format_next_steps(&["pnpm-lock.yaml".to_string()], &[], true)[1],
+            format_next_steps(
+                std::path::Path::new("."),
+                &["pnpm-lock.yaml".to_string()],
+                &[],
+                true
+            )[1],
             "  1. Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
              pnpm-lock.yaml to keep the hosted patches."
         );
