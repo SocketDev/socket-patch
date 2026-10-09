@@ -155,6 +155,7 @@ fn rewrite_sources(
     direct: bool,
     layout: SourcesLayout,
 ) -> Result<(), String> {
+    let hosted = matches!(artifact, ArtifactSource::Url(_));
     let (key, location) = match artifact {
         ArtifactSource::Url(location) => ("url", location),
         ArtifactSource::Path(location) => ("path", location),
@@ -220,11 +221,51 @@ fn rewrite_sources(
                     "Python project already overrides {name}; revert it before applying a patch"
                 ));
             }
+        } else if hosted {
+            push_hosted_override(overrides, specifier);
         } else {
             overrides.push(specifier);
         }
     }
     Ok(())
+}
+
+/// The comment the hosted rewrite puts on the line above each
+/// `override-dependencies` entry it adds. v5 hosted mode keeps no ledger,
+/// so this comment is the only evidence the upstream restore has that the
+/// entry is socket-patch's to remove: an entry without it, even one spelled
+/// exactly `<name>==<version>`, is the user's own pin and is kept (#411).
+pub(crate) const HOSTED_OVERRIDE_MARK: &str =
+    "# socket-patch hosted: pins a patched transitive dependency; rollback removes it";
+
+/// Whether an `override-dependencies` element carries
+/// [`HOSTED_OVERRIDE_MARK`] (the hosted rewrite added it).
+pub(crate) fn is_hosted_override(value: &Value) -> bool {
+    value
+        .decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .is_some_and(|prefix| prefix.contains(HOSTED_OVERRIDE_MARK))
+}
+
+/// Append `specifier` to `overrides` on its own line, under
+/// [`HOSTED_OVERRIDE_MARK`]. An array the rewrite just created (empty) is
+/// laid out multi-line with a trailing comma; an existing array keeps its
+/// other elements as they were. Removing the element again (its decor goes
+/// with it) restores the array's original bytes.
+fn push_hosted_override(overrides: &mut Array, specifier: String) {
+    const INDENT: &str = "    ";
+    let created = overrides.is_empty();
+    let mut value = Value::from(specifier);
+    value
+        .decor_mut()
+        .set_prefix(format!("\n{INDENT}{HOSTED_OVERRIDE_MARK}\n{INDENT}"));
+    value.decor_mut().set_suffix("");
+    overrides.push_formatted(value);
+    if created {
+        overrides.set_trailing_comma(true);
+        overrides.set_trailing("\n");
+    }
 }
 
 fn contains_dependency(item: Option<&Item>, name: &str) -> bool {
@@ -574,7 +615,7 @@ mod rendering_tests {
         .unwrap();
         assert_eq!(
             transitive,
-            format!("[project]\nname = \"p\"\ndependencies = [\"requests\"]\n\n[tool.uv]\noverride-dependencies = [\"alpha==1.0.0\"]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n")
+            format!("[project]\nname = \"p\"\ndependencies = [\"requests\"]\n\n[tool.uv]\noverride-dependencies = [\n    {HOSTED_OVERRIDE_MARK}\n    \"alpha==1.0.0\",\n]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n")
         );
         assert_settled(&transitive);
         // An existing `[tool.uv]` header gains the sources as its own
@@ -760,7 +801,7 @@ mod rendering_tests {
         .unwrap();
         assert_eq!(
             transitive,
-            format!("[tool.ruff]\nline-length = 100\n\n[tool.uv]\noverride-dependencies = [\"alpha==1.0.0\"]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n\n[project]\nname = \"p\"\ndependencies = [\"requests\"]\n")
+            format!("[tool.ruff]\nline-length = 100\n\n[tool.uv]\noverride-dependencies = [\n    {HOSTED_OVERRIDE_MARK}\n    \"alpha==1.0.0\",\n]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n\n[project]\nname = \"p\"\ndependencies = [\"requests\"]\n")
         );
         assert_settled(&transitive);
 
@@ -820,7 +861,7 @@ mod rendering_tests {
         .unwrap();
         assert_eq!(
             transitive,
-            format!("tool.uv.sources.other = {{ git = \"https://example.test/other\" }}\ntool.uv.sources.alpha = {{ url = \"{URL}\" }}\ntool.uv.override-dependencies = [\"alpha==1.0.0\"]\n\n[project]\nname = \"p\"\ndependencies = [\"other\"]\n")
+            format!("tool.uv.sources.other = {{ git = \"https://example.test/other\" }}\ntool.uv.sources.alpha = {{ url = \"{URL}\" }}\ntool.uv.override-dependencies = [\n    {HOSTED_OVERRIDE_MARK}\n    \"alpha==1.0.0\",\n]\n\n[project]\nname = \"p\"\ndependencies = [\"other\"]\n")
         );
         assert_settled(&transitive);
     }
@@ -848,7 +889,7 @@ mod rendering_tests {
             ),
             (
                 "# /// script\n# dependencies = [\"requests\", \"beta\"]\n#\n# [tool.uv.sources]\n# beta = { git = \"https://example.test/beta\" }\n# ///\nprint('x')\n",
-                format!("# /// script\n# dependencies = [\"requests\", \"beta\"]\n#\n# [tool.uv]\n# override-dependencies = [\"alpha==1.0.0\"]\n#\n# [tool.uv.sources]\n# beta = {{ git = \"https://example.test/beta\" }}\n# alpha = {{ url = \"{URL}\" }}\n# ///\nprint('x')\n"),
+                format!("# /// script\n# dependencies = [\"requests\", \"beta\"]\n#\n# [tool.uv]\n# override-dependencies = [\n#     {HOSTED_OVERRIDE_MARK}\n#     \"alpha==1.0.0\",\n# ]\n#\n# [tool.uv.sources]\n# beta = {{ git = \"https://example.test/beta\" }}\n# alpha = {{ url = \"{URL}\" }}\n# ///\nprint('x')\n"),
             ),
         ];
         for (script, expected) in cases {

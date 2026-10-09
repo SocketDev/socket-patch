@@ -43,7 +43,9 @@
 //!   `extra == '<x>'` terms name the extra, the rest is the declaration's
 //!   own marker). An `overrides` entry the rewrite added for
 //!   a transitive dependency is removed with its `override-dependencies`
-//!   line;
+//!   line — the one under the rewrite's ownership comment
+//!   (`python_script::HOSTED_OVERRIDE_MARK`); a user's own pin of the same
+//!   release has none and is kept (#411);
 //! * the metadata's `[tool.uv.sources].<name> = { url }` is removed.
 //!
 //! uv 0.2 `[[distribution]]` locks are refused (their artifact grammar
@@ -1476,7 +1478,9 @@ fn restore_requirements(
     ctx: &Ctx<'_>,
 ) -> Result<(), String> {
     // A transitive dependency's `overrides` entry is the rewrite's own when
-    // the metadata's `override-dependencies` holds exactly the pin it adds.
+    // the metadata's `override-dependencies` holds the pin it adds, under
+    // its ownership comment; a user's own pin is restored like any other
+    // declaration.
     let transitive_override = meta.is_some_and(|m| pushed_override(m, hit).is_some());
     for package in doc
         .get_mut("package")
@@ -1565,19 +1569,30 @@ fn declares_directly(meta: &Metadata, hit: &Hit) -> bool {
             .any(names)
 }
 
-/// The index of the `override-dependencies` entry the rewrite adds for a
-/// transitive `hit` (`<name>==<version>`), when present.
+/// The index of the `override-dependencies` entry the rewrite added for a
+/// transitive `hit` (`<name>==<version>` under
+/// [`HOSTED_OVERRIDE_MARK`](crate::utils::python_script::HOSTED_OVERRIDE_MARK)),
+/// when present. Hosted mode keeps no ledger, so that comment is the only
+/// evidence of ownership: an unmarked entry of the same spelling is the
+/// user's own pin (the rewrite reuses it rather than adding one) and stays,
+/// along with the lock's `[manifest] overrides` record of it (#411).
 fn pushed_override(meta: &Metadata, hit: &Hit) -> Option<usize> {
     if declares_directly(meta, hit) {
         return None;
     }
     let want = format!("{}=={}", hit.name, hit.version);
-    strings(tool_uv(&meta.doc).and_then(|u| u.get("override-dependencies")))
+    tool_uv(&meta.doc)
+        .and_then(|u| u.get("override-dependencies"))
+        .and_then(Item::as_array)?
         .iter()
-        .position(|spec| {
+        .position(|value| {
+            let Some(spec) = value.as_str() else {
+                return false;
+            };
             let compact: String = spec.chars().filter(|c| !c.is_whitespace()).collect();
             canonicalize_pypi_name(pep508_name(&compact)) == hit.name
                 && compact[pep508_name(&compact).len()..] == want[hit.name.len()..]
+                && crate::utils::python_script::is_hosted_override(value)
         })
 }
 
@@ -1713,21 +1728,34 @@ mod tests {
     /// Hosted rewrite of `six` into `original`, then `restore_metadata`:
     /// the pyproject must come back byte-identically (#524).
     fn assert_metadata_round_trips(original: &str) {
+        metadata_round_trip(original, false);
+    }
+
+    /// [`assert_metadata_round_trips`] for a project or (`script`) a PEP 723
+    /// script; whether the restore reported removing an override.
+    fn metadata_round_trip(original: &str, script: bool) -> bool {
         use crate::utils::python_lock::ArtifactSource;
-        let rewritten = crate::utils::python_script::rewrite_project_metadata(
-            original,
-            "six",
-            "1.16.0",
-            ArtifactSource::Url(HOSTED_SIX),
-        )
-        .unwrap()
-        .expect("the rewrite adds a source");
+        let rewrite = if script {
+            crate::utils::python_script::rewrite_script_metadata
+        } else {
+            crate::utils::python_script::rewrite_project_metadata
+        };
+        let rewritten = rewrite(original, "six", "1.16.0", ArtifactSource::Url(HOSTED_SIX))
+            .unwrap()
+            .expect("the rewrite adds a source");
         assert!(rewritten.contains(HOSTED_SIX), "{rewritten}");
+        let body = if script {
+            crate::utils::python_script::script_metadata(&rewritten)
+                .unwrap()
+                .1
+        } else {
+            rewritten.clone()
+        };
         let mut meta = Metadata {
             rel: "pyproject.toml".into(),
             text: rewritten.clone(),
-            script: false,
-            doc: rewritten.parse().unwrap(),
+            script,
+            doc: body.parse().unwrap(),
         };
         let hit = Hit {
             index: 0,
@@ -1741,12 +1769,53 @@ mod tests {
             origins: &[],
             bun_lockb: false,
         };
-        restore_metadata(&mut meta, &hit, &ctx);
+        let removed = restore_metadata(&mut meta, &hit, &ctx);
         assert_eq!(
             meta.render().unwrap(),
             original,
             "rewritten was:\n{rewritten}"
         );
+        removed
+    }
+
+    const DATEUTIL_HEAD: &str = "[project]\nname = \"uvp\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"python-dateutil==2.8.2\"]\n";
+
+    /// #411: the user's own `override-dependencies` pin of the exact release
+    /// being patched is reused by the hosted rewrite, so the restore must
+    /// leave it (and report no removal) instead of guessing it was added.
+    #[test]
+    fn restore_keeps_a_user_authored_override_of_the_patched_release() {
+        for overrides in [
+            "override-dependencies = [\"six==1.16.0\"]\n",
+            "override-dependencies = [\"idna==3.7\", \"six==1.16.0\"]\n",
+            "override-dependencies = [\n    \"six==1.16.0\",\n]\n",
+        ] {
+            let original = format!("{DATEUTIL_HEAD}\n[tool.uv]\n{overrides}");
+            assert!(
+                !metadata_round_trip(&original, false),
+                "a user-authored override is not the rewrite's to remove:\n{original}"
+            );
+        }
+        let script = "# /// script\n# dependencies = [\"python-dateutil==2.8.2\"]\n#\n# [tool.uv]\n# override-dependencies = [\"six==1.16.0\"]\n# ///\nimport six\n";
+        assert!(!metadata_round_trip(script, true));
+    }
+
+    /// The override the hosted rewrite adds for a transitive dependency
+    /// carries its ownership comment and is removed again, into an existing
+    /// user array as well as a new one.
+    #[test]
+    fn restore_removes_the_override_the_rewrite_added() {
+        for tool_uv in [
+            "",
+            "\n[tool.uv]\noverride-dependencies = [\"idna==3.7\"]\n",
+            "\n[tool.uv]\noverride-dependencies = [\n    \"idna==3.7\",\n]\n",
+        ] {
+            let original = format!("{DATEUTIL_HEAD}{tool_uv}");
+            assert!(metadata_round_trip(&original, false), "{original}");
+        }
+        let script =
+            "# /// script\n# dependencies = [\"python-dateutil==2.8.2\"]\n# ///\nimport six\n";
+        assert!(metadata_round_trip(script, true));
     }
 
     const SUB_TABLE_SOURCES: &str = "[tool.uv.sources.idna]\nurl = \"https://files.pythonhosted.org/packages/e5/3e/idna-3.7-py3-none-any.whl\"\n";
@@ -1868,6 +1937,38 @@ mod declaration_tests {
 
     const HEAD: &str =
         "[project]\nname = \"uvp\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\n";
+
+    /// #411: the lock's `[manifest] overrides` record of a user's own
+    /// `override-dependencies` pin gets its specifier back instead of being
+    /// dropped as the rewrite's; the one the rewrite added (its pin under
+    /// the ownership comment) is still dropped.
+    #[test]
+    fn manifest_override_of_a_user_pin_is_restored_not_dropped() {
+        let lock_text = format!(
+            "{}\n[manifest]\noverrides = [{}]\n",
+            lock(
+                &[spec("==2.8.2", None).replace("six", "python-dateutil")],
+                &[]
+            ),
+            six(None)
+        );
+        let user = format!(
+            "{HEAD}dependencies = [\"python-dateutil==2.8.2\"]\n\n[tool.uv]\n\
+             override-dependencies = [\"six==1.16.0\"]\n"
+        );
+        let out = unwind(&user, &lock_text).unwrap();
+        assert!(
+            out.contains(&format!("overrides = [{}]", spec("==1.16.0", None))),
+            "{out}"
+        );
+        let added = format!(
+            "{HEAD}dependencies = [\"python-dateutil==2.8.2\"]\n\n[tool.uv]\n\
+             override-dependencies = [\n    {}\n    \"six==1.16.0\",\n]\n",
+            crate::utils::python_script::HOSTED_OVERRIDE_MARK
+        );
+        let out = unwind(&added, &lock_text).unwrap();
+        assert!(!out.contains("[manifest]"), "{out}");
+    }
 
     /// #606 (a): a pin in `dependencies` and a floor in an extra.
     #[test]
