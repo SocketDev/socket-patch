@@ -124,7 +124,7 @@ impl NpmLockBackend for YarnClassicBackend {
             other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version).await;
         let (candidate_keys, skipped) =
             rewritable_candidates(&blocks, &coords.name, &coords.version).map_err(|o| {
-                only_other_name_copies(o, &coords.name, &coords.version, &other_name)
+                only_other_name_copies(o, &blocks, &coords.name, &coords.version, &other_name)
             })?;
         warnings.extend(skipped);
         warnings.extend(other_name);
@@ -408,14 +408,18 @@ async fn other_name_copy_warnings(
 /// are locked under ANOTHER dependency name ([`other_name_copy_warnings`])
 /// becomes `vendor_lock_entry_not_rewritable` naming them: the package IS
 /// installed, and `yarn install` can't re-lock those copies to it (#1236).
-/// Any other refusal passes through.
+/// A block of the package under its OWN name (one with no `resolved`,
+/// which `yarn install` does re-lock) keeps the "not found" remedy. Any
+/// other refusal passes through.
 fn only_other_name_copies(
     refusal: Box<VendorOutcome>,
+    blocks: &[LockBlock],
     name: &str,
     version: &str,
     other_name: &[VendorWarning],
 ) -> Box<VendorOutcome> {
     if other_name.is_empty()
+        || has_own_name_block(blocks, name, version)
         || super::npm_common::refusal_code(&refusal) != "vendor_lock_entry_not_found"
     {
         return refusal;
@@ -430,6 +434,14 @@ fn only_other_name_copies(
             details.join("; ")
         ),
     ))
+}
+
+/// Whether any block locks `name@version` under the package's own name.
+fn has_own_name_block(blocks: &[LockBlock], name: &str, version: &str) -> bool {
+    blocks.iter().any(|b| {
+        classic_key_real_name(&split_key_patterns(&b.key)) == Some(name)
+            && classic_field(&b.lines, "version") == Some(version)
+    })
 }
 
 /// The lock as [`vendor_yarn_classic`]'s step 2 leaves it: read, re-sniffed
@@ -480,9 +492,10 @@ pub(crate) async fn preflight_packages(
             let Ok(coords) = super::npm_common::guard_coordinates(purl, record) else {
                 continue;
             };
-            if !other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version)
-                .await
-                .is_empty()
+            if !has_own_name_block(&blocks, &coords.name, &coords.version)
+                && !other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version)
+                    .await
+                    .is_empty()
             {
                 *gate = Err("vendor_lock_entry_not_rewritable");
             }
@@ -1737,9 +1750,17 @@ left-pad@^1.3.0:
     #[tokio::test]
     async fn issue_1236_only_other_name_copies_are_refused_as_not_rewritable() {
         let lock = "# yarn lockfile v1\n\n\n\"lp2@file:./lpdir\":\n  version \"1.3.0\"\n";
-        for (fork, code) in [
-            ("left-pad", "vendor_lock_entry_not_rewritable"),
-            ("other-pkg", "vendor_lock_entry_not_found"),
+        // Review: beside a same-name block with no `resolved`, which
+        // `yarn install` does re-lock, "not found" and its remedy stand.
+        let with_unresolved = format!("{lock}\nleft-pad@^1.3.0:\n  version \"1.3.0\"\n");
+        for (lock, fork, code) in [
+            (lock, "left-pad", "vendor_lock_entry_not_rewritable"),
+            (lock, "other-pkg", "vendor_lock_entry_not_found"),
+            (
+                with_unresolved.as_str(),
+                "left-pad",
+                "vendor_lock_entry_not_found",
+            ),
         ] {
             let fx = fixture_with_lock(lock).await;
             tokio::fs::create_dir_all(fx.root().join("lpdir"))
@@ -1752,7 +1773,7 @@ left-pad@^1.3.0:
             .await
             .unwrap();
             let detail = expect_refused(fx.vendor(false).await, code);
-            if fork == "left-pad" {
+            if code == "vendor_lock_entry_not_rewritable" {
                 assert!(detail.contains("lp2@file:./lpdir"), "{detail}");
                 assert!(detail.contains("yarn install` will not help"), "{detail}");
             }
