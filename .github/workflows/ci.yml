@@ -427,17 +427,20 @@ jobs:
           python3 scripts/ci-test-shard.py "$TEST_SHARD" 2
 
   test-release:
-    # Not in the merge queue: each PR's head already ran this, and so did
-    # every PR ahead of it, so a merge group would re-spend ~30 min (23 of it
-    # compiling) on the same release-mode suite while the queue waits. It
-    # still runs on every PR and on main after each merge; `ci-ok` counts a
-    # skipped job as passing.
+    # Each PR and main push runs the complete release-mode suite. The merge
+    # queue already skips this job because each constituent PR ran it.
     if: github.event.pull_request.draft != true && github.event_name != 'merge_group'
     needs: clippy
     runs-on: ubuntu-latest
-    # Every tests/ target is its own optimized link (~240 test binaries).
-    # The manifest-less VEX suites share two multi-module binaries
-    # (tests/e2e_vex_lockfile/, tests/e2e_vex_build/) to keep the count down.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    # Warm-cache runs still spend 20-23 minutes compiling ~240 optimized
+    # test binaries, followed by 5-6 minutes executing them. Split both
+    # compilation and execution with the same partitioner as `test`:
+    # shard 1 owns the unit tests/doctests and fewer integration targets.
+    # `ci-ok` waits for every shard and fails if any shard fails.
     timeout-minutes: 40
     steps:
       - name: Checkout
@@ -465,7 +468,10 @@ jobs:
         # semantics this job exists to validate; ~23m of LTO relinking gone.
         # Default features for the same reason as the `test` job; the
         # feature-gated suites' compile rot is e2e-build's.
-        run: cargo test --workspace --profile ci-release
+        env:
+          TEST_SHARD: ${{ matrix.shard }}
+          TEST_SHARD_COUNT: ${{ strategy.job-total }}
+        run: python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" --locked --profile ci-release
 
   coverage:
     if: github.event.pull_request.draft != true
@@ -979,32 +985,26 @@ jobs:
           # hosted redirect must drop); 2.10 does not. The exact-release
           # matrix, 2.9.8 and macOS/Windows included, is
           # composer-compatibility.yml.
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '2.2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '1'}
-          - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '2'}
-          - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '2.2'}
-          - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '1'}
+          # Both capstones share one leg per composer line: the setup is
+          # identical and the run step loops over `suite`.
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2'}
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2.2'}
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1'}
           # Real-bundler gem capstones, one leg per bundler era. Boundaries:
           # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
           # pre-CHECKSUMS, 2.6 CHECKSUMS, 4.0.15/4.0.21 before/after the
           # strict frozen check (rubygems#9750). bundler <= 2.2 needs
           # Ruby <= 3.3 and 1.17-2.1 need Ruby <= 3.1 (`untaint`). 2.7.2
           # (no boundary of its own) is in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '1.17.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '2.1.4'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '2.2.33'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.5.23'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.6.9'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.4', bundler: '4.0.15'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.4', bundler: '4.0.21'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.6.9'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
+          # Hosted and vendored share each era's leg (one Ruby + bundler
+          # setup; the run step loops over `suite`).
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.6.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
           # e2e_scan) are intentionally NOT in the PR matrix — their
           # `#[ignore]`-gated tests hit the real public proxy at
@@ -1083,52 +1083,39 @@ jobs:
           # latest release alone cannot prove the rewrite + fresh install
           # round-trip on the locks real projects commit. 1.1.45 = last v0
           # writer, 1.2.23 = v1, 1.3.14 = last pre-v2 default, 1.4.2 = v2.
+          #
+          # One leg per bun release runs all three suites (the run step
+          # loops over `suite`); e2e_bun_lockb keeps its own legs because
+          # the SOCKET_PATCH_BUN_LOCKB_* gates key on the row's suite.
           - os: ubuntu-latest
-            suite: e2e_redirect_bun_build
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.4.2'
             test_filter: --include-ignored
           - os: ubuntu-latest
-            suite: e2e_redirect_bun_build
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.1.45'
             test_filter: --include-ignored
           - os: ubuntu-latest
-            suite: e2e_redirect_bun_build
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.2.23'
             test_filter: --include-ignored
           - os: ubuntu-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.1.45'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.2.23'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: mode_migration_bun
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: mode_migration_bun
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.3.14'
             test_filter: --include-ignored
-          # Manifest-less VEX era legs: the last pre-v2 text-lock writer for
-          # the hosted/vendored capstones, the v0/v1 writers for the takeover
-          # suite, and the binary bun.lockb era (1.0 / 1.1 lines) through
-          # e2e_bun_lockb, which reads the SOCKET_PATCH_BUN_LOCKB_* gates
-          # exported for it below.
-          - {os: ubuntu-latest, suite: e2e_redirect_bun_build, bun: '1.3.14', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_bun_build, bun: '1.3.14', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: mode_migration_bun, bun: '1.1.45', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: mode_migration_bun, bun: '1.2.23', test_filter: --include-ignored}
+          # The binary bun.lockb era (1.0 / 1.1 lines) through e2e_bun_lockb,
+          # which reads the SOCKET_PATCH_BUN_LOCKB_* gates exported for it
+          # below.
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.0.36', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
           # Bun >= 1.4 migrating a hosted workspace bun.lockb to bun.lock
-          # (#803): the only binary-lock test whose reader must be 1.4+.
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.4.2', test_filter: --include-ignored workspace_text_migration_heals_on_rerun}
+          # (#803; its reader must be 1.4+) and a vendored one, then
+          # reverting it (#784; skipped by the < 1.2 readers above). Both
+          # 1.4.2 and 1.3.14 also run the isolated-linker vendored re-run
+          # after a late dependent (#861); 1.3 re-hoists a frozen binary lock
+          # and refuses one whose trees changed.
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.4.2', test_filter: --include-ignored text_migration workspace_late_dependent}
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.3.14', test_filter: --include-ignored workspace_late_dependent}
           # Real-vlt capstones (DESIGN §8.4): wiremock patch service and a local
           # npm registry fed from npmjs, driven by the pinned vlt release
           # (`node vlt.js`, installed below from a sha512-checked `npm pack`).
@@ -1227,16 +1214,14 @@ jobs:
           # 3.9 (trusted checksums), 4.0 rc. Hosted also runs both sides of
           # the trusted-checksums floor: 3.9.3 (last release that ignores
           # the .mvn/checksums pin) and 3.9.4 (first that enforces it).
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.6.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.8.9'}
+          # Lines that run both capstones run them in one leg (one Maven
+          # install; the run step loops over `suite`).
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.6.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.8.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.3'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.4'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.6.3'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.8.9'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.6.3', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.8.9', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
@@ -1534,10 +1519,10 @@ jobs:
         # The exact release a leg names rather than the runner's Maven. The
         # tarball comes from Maven Central's CDN (well under a second);
         # archive.apache.org throttles bulk downloads to 1.5-5.5 minutes per
-        # leg. Its sha512 still comes from the Apache archive (Central has
-        # none for 3.6.3/3.8.9), so the bytes are checked against a digest
-        # from a second origin. --ssl-revoke-best-effort: see the `test`
-        # job's vexctl step.
+        # leg. If the CDN fails, use the slower archive tarball. Both
+        # sources must match the committed SHA512 in scripts/maven-sha512.json;
+        # an origin cannot replace both the archive and its expected digest.
+        # --ssl-revoke-best-effort: see the `test` job's vexctl step.
         shell: bash
         env:
           MAVEN_VERSION: ${{ matrix.maven || '3.9.16' }}
@@ -1545,10 +1530,20 @@ jobs:
           major="${MAVEN_VERSION%%.*}"
           file="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
           url="https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/${file}"
-          sha_url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/${file}.sha512"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$sha_url" -o "$RUNNER_TEMP/maven.sha512"
-          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
+          archive_url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/${file}"
+          if ! curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"; then
+            echo "::warning::Maven Central download failed; falling back to the Apache archive."
+            curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$archive_url" -o "$RUNNER_TEMP/maven.tgz"
+          fi
+          python - "$MAVEN_VERSION" "$RUNNER_TEMP/maven.tgz" <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+          # Pins come from Apache's release checksums, cross-checked against
+          # the Maven Central tarballs. Add a pin when adding a matrix version.
+          expected = json.loads(Path("scripts/maven-sha512.json").read_text())[sys.argv[1]]
+          if hashlib.sha512(Path(sys.argv[2]).read_bytes()).hexdigest() != expected:
+              raise SystemExit("Maven archive SHA512 mismatch")
+          PY
           # Python accepts native Windows paths for both archive and destination.
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
@@ -1771,15 +1766,7 @@ jobs:
           - os: windows-latest
             suite: e2e_redirect_rush_sim
           - os: windows-latest
-            suite: e2e_redirect_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: windows-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: windows-latest
-            suite: mode_migration_bun
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.4.2'
             test_filter: --include-ignored
           - {os: windows-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
@@ -1866,8 +1853,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.7.2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.2.37'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.3.5'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.4.30'}

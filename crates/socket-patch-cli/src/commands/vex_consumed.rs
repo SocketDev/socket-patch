@@ -115,6 +115,15 @@ pub(crate) async fn hosted_consumed_copies(
                 },
             );
         }
+        // An orphaned Bun store entry is no consumed copy (#599); the
+        // installed lookup dropped its own, this drops the ones the alias
+        // and identity fallbacks' variant expansion added.
+        socket_patch_core::crawlers::npm_crawler::retain_live_store_copies(
+            out.iter_mut()
+                .filter(|(purl, _)| npm.contains(purl))
+                .map(|(_, copies)| &mut copies.paths),
+        )
+        .await;
     }
 
     // Distinct-store ecosystems: only the hosted artifact's own store entry.

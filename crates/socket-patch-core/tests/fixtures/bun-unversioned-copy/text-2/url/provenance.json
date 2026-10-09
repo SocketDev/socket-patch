@@ -1,0 +1,8 @@
+{
+  "bun": "1.4.2",
+  "os": "darwin",
+  "arch": "aarch64",
+  "command": "bun install",
+  "note": "the root depends on minimist by a codeload.github.com tarball URL of tag v1.2.2; the folder dependency dep (file:./dep) depends on minimist@1.2.2, a nested registry copy. Bun records no version for the root copy",
+  "sha256": "00826b8f468df16110cf007cd95b9cdb122f859a0702a4dd201dc0638aeeef64"
+}

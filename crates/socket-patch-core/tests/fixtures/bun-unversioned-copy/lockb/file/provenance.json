@@ -1,0 +1,8 @@
+{
+  "bun": "1.1.45",
+  "os": "darwin",
+  "arch": "aarch64",
+  "command": "bun install (default binary lockfile)",
+  "note": "the root depends on minimist by a file: tarball named pkg.tgz (the minimist-1.2.2 registry tarball, renamed); the folder dependency dep (file:./dep) depends on minimist@1.2.2, a nested registry copy. Bun records no version for the root copy",
+  "sha256": "27c7816d285c04441e4c21fa5f05cd5a2be755a439463ef7ec61ddccf03292f4"
+}
