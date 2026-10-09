@@ -36,7 +36,43 @@ Rows are in `--help` order (v5.0): the hosted/vendored workflow (`scan` → `vex
 
 **Bare-UUID fallback.** `socket-patch <UUID>` is rewritten to `socket-patch get <UUID>`, also when root-position flags come first (`socket-patch --json <UUID>`); a UUID after a subcommand name is that subcommand's operand. The UUID shape checked is the standard 8-4-4-4-12 hex pattern (case-insensitive), the target grammar's.
 
-**Target grammar (v5.0).** `get`, `remove`, `rollback` and the bare-UUID fallback classify their package/patch token with one parser (core `utils::target`): a UUID; `CVE-…` / `GHSA-…` (case-insensitive); a `pkg:` purl (with a version: that release, a base purl covering every release variant and a `?qualified` one exactly one; without a version: every version); otherwise an **exact** package name — full name or last segment, case-insensitive, PEP 503 for PyPI — the same matcher as `scan --package` and `socket.yml`. A name never matches by prefix or substring, and a Go major-version suffix (`v2`) is never a name. **Ambiguous names**: `get`, `remove` and `rollback` act on one package per name, so a name whose last-segment rule reaches several packages (`core` → `@angular/core` and `@babel/core`; the same name in two ecosystems) is refused with exit 1 before anything is searched or changed — `"core" is ambiguous: it names pkg:npm/@angular/core, pkg:npm/@babel/core; use the full name or a purl` (`remove --json`: `errorCode: "ambiguous_target"`; `get` / `rollback --json`: `{status: "error", error}`). Several versions of one package are not ambiguous. `scan --package` and `socket.yml` keep selecting every package the name reaches. `get <name>` searches every installed version of the matched name (within `--ecosystems`) and prints `Matched: …` on stderr; with no exact match it is `no_match` (exit 0, no API call) and, in human mode, suggests up to five near names (`Did you mean: …?`) without acting on them. `remove` / `rollback` accept the same names and versionless purls against manifest records, vendor-ledger entries and hosted pins; CVE/GHSA ids match no record there. A name containing `/` (composer `vendor/pkg`, a go module path) is path-shaped, so `rollback` first tries it as a name: when it selects a recorded or hosted patch it is a target, otherwise a path glob.
+**Target grammar (v5.0).** `get`, `remove`, `rollback` and the bare-UUID
+fallback classify their package/patch token with one parser (core `utils::target`):
+a UUID; `CVE-…` / `GHSA-…` (case-insensitive); a `pkg:` purl (with a version:
+that release, a base purl covering every release variant and a `?qualified` one
+exactly one; without a version: every version); otherwise an **exact** package
+name — full name or last segment, case-insensitive, PEP 503 for PyPI — the same
+matcher as `scan --package` and `socket.yml`. A name never matches by prefix or
+substring, and a Go major-version suffix (`v2`) alone never selects a module.
+
+A full-name match takes precedence over last-segment matches: `lodash` selects
+only `lodash` when `@types/lodash` is also present. **Ambiguous names**: `get`,
+`remove` and `rollback` act on one package per name, so a name that still reaches
+several packages (`core` → `@angular/core` and `@babel/core`; the same name in two
+ecosystems) is refused with exit 1 before any patch search or mutation. The
+message lists versionless purls and a remedy: `"core" is ambiguous: it names
+pkg:npm/@angular/core, pkg:npm/@babel/core; use the full name or a purl`. All three
+commands report `status: "error"` and `error.code: "ambiguous_target"` under
+`--json`. Several versions of one package are not ambiguous. `scan --package` and
+`socket.yml` keep selecting every package the name reaches.
+
+`get <name>` searches every installed version of the matched name (within
+`--ecosystems`) and prints `Matched: …` on stderr. With no exact match in a
+nonempty inventory it is `no_match` (exit 0, no patch-search API call) and, in
+human mode, suggests up to five near names (`Did you mean: …?`) without acting on
+them. An empty inventory is `no_packages` (exit 0). `--ecosystems` also filters
+advisory/purl search results and UUID selection before any patch is written; a
+UUID outside the selected ecosystems is `not_found` (exit 0).
+
+`remove` / `rollback` accept the same names and versionless purls against manifest
+records, vendor-ledger entries and hosted pins; CVE/GHSA ids match no record
+there. An npm scoped name (`@babel/core`) is always a package target. A relative
+name containing `/` (composer `vendor/pkg`, a Go module path), without glob
+metacharacters or `.` / `..` path segments, is path-shaped, so `rollback` first
+tries it as a name: when it selects a recorded or hosted patch it is a target,
+otherwise a path glob. Use `./vendor/pkg` or `'vendor/pkg/**'` to explicitly select
+installed copies by path. See the [migration guide](../../docs/migrating-to-v5.md#package-targeting)
+for examples and script migration guidance.
 
 **Root `--update` flag.** `socket-patch --update [VERSION]` updates the binary itself from GitHub Releases. It is a root flag, not a subcommand: argv is rewritten (the same mechanism as the bare-UUID fallback) onto an internal hidden subcommand whose name carries no stability guarantee — script the flag, never the internal name. Combining the flag with a subcommand (`socket-patch --update scan`) is a usage error (exit 2). Full contract: [Self-update contract](#self-update-contract-socket-patch---update).
 
