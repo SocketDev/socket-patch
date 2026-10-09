@@ -1078,3 +1078,94 @@ fn repair_silent_suppresses_human_stdout() {
         "silent repair must still perform cleanup (orphan should be gone)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Retention: one policy for every patch still in the manifest (#893)
+// ---------------------------------------------------------------------------
+
+/// `repair` (alias `gc`) must keep the beforeHash blob of a patch that is
+/// still in the manifest: it is the only local restore data, and `repair`
+/// cannot download it again (its fetch covers afterHash blobs only). Before
+/// #893 the sweep kept afterHash blobs only, so an offline rollback of a
+/// still-active patch failed after any `repair` and told the user to run
+/// `repair`. A beforeHash blob that only a manifest-absent patch referenced
+/// is still collected.
+#[test]
+fn repair_keeps_active_patch_before_blob_so_offline_rollback_still_works() {
+    const ORIGINAL: &[u8] = b"module.exports = 'original';\n";
+    const PATCHED: &[u8] = b"module.exports = 'patched';\n";
+    let before = git_sha256(ORIGINAL);
+    let after = git_sha256(PATCHED);
+    let purl = "pkg:npm/repair-retention@1.0.0";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "repair-retention-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let pkg = root.join("node_modules/repair-retention");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{ "name": "repair-retention", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), PATCHED).unwrap();
+
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    let manifest = serde_json::json!({
+        "patches": {
+            purl: {
+                "uuid": "22222222-2222-4222-8222-222222222222",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": { "beforeHash": before, "afterHash": after }
+                },
+                "vulnerabilities": {},
+                "description": "retention test patch",
+                "license": "MIT",
+                "tier": "free"
+            }
+        }
+    });
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    // The layout `get` leaves: both blobs of the active patch.
+    write_blob(&socket, &before, ORIGINAL);
+    write_blob(&socket, &after, PATCHED);
+    // An original only a removed patch referenced is still garbage.
+    let stale_original = git_sha256(b"original of a removed patch\n");
+    write_blob(&socket, &stale_original, b"original of a removed patch\n");
+
+    let (code, stdout) = run_repair(root, &[]);
+    assert_eq!(code, 0, "repair must succeed; stdout=\n{stdout}");
+    assert!(
+        socket.join("blobs").join(&before).exists(),
+        "repair must keep the active patch's beforeHash blob; stdout=\n{stdout}"
+    );
+    assert!(socket.join("blobs").join(&after).exists());
+    assert!(
+        !socket.join("blobs").join(&stale_original).exists(),
+        "an original no manifest patch references is still swept"
+    );
+
+    let out = socket_cmd(root)
+        .args(["rollback", "--offline", "--json"])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "offline rollback after repair must succeed; stdout=\n{stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
+    assert_eq!(v["status"], "success", "stdout=\n{stdout}");
+    assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), ORIGINAL);
+}
