@@ -149,6 +149,14 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   vendored `uv.lock` / `pyproject.toml` writer (including the appended
   `[manifest]` and `[package.metadata]` fragments and their revert) keep the
   file's convention.
+- uv workspaces are refused from the root (`pypi_uv_workspace_unsupported` /
+  `redirect_uv_project_unsupported`) and from a member directory: a member
+  listed by the nearest ancestor `[tool.uv.workspace] members` (no
+  standalone `[project]` in between) installs from the root's `uv.lock`,
+  whatever locks sit in the member, so both modes refuse it before writing
+  (`redirect_workspace_lockfile_elsewhere` hosted,
+  `pypi_uv_workspace_unsupported` vendored) instead of rewriting a
+  Hatch-configured member as a lockless Hatch project (#1138).
 - A script lock requires its paired script and a valid PEP 723 metadata block.
   Missing metadata or an incompatible existing source is reported before either
   file is rewritten.

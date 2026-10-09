@@ -2070,3 +2070,116 @@ async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
         "the takeover names requirements.txt as an unpatched install source: {env:#}"
     );
 }
+
+// ── #1138: a uv workspace member ─────────────────────────────────────────
+
+/// A uv workspace (root `pyproject.toml` with `[tool.uv.workspace]` and its
+/// `uv.lock`) whose member `packages/a` carries `member`'s Hatch
+/// configuration; `six` 1.16.0 is installed in the run's venv. Returns the
+/// member directory.
+fn stage_uv_workspace_member(ws: &Path, member: &[(&str, &str)]) -> std::path::PathBuf {
+    std::fs::write(
+        ws.join("pyproject.toml"),
+        "[project]\nname = \"root\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"a\"]\n\n[tool.uv.workspace]\nmembers = [\"packages/*\"]\n\n[tool.uv.sources]\na = { workspace = true }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ws.join("uv.lock"),
+        "version = 1\nrequires-python = \">=3.9\"\n\n[manifest]\nmembers = [\"a\", \"root\"]\n",
+    )
+    .unwrap();
+    let dir = ws.join("packages/a");
+    for (rel, text) in member {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    // The venv `run_raw` points at (beside the member) holds six 1.16.0.
+    let site = dir.join("../empty-venv").join(if cfg!(windows) {
+        "Lib/site-packages"
+    } else {
+        "lib/python3.11/site-packages"
+    });
+    let dist_info = site.join("six-1.16.0.dist-info");
+    std::fs::create_dir_all(&dist_info).unwrap();
+    std::fs::write(
+        dist_info.join("METADATA"),
+        "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+    )
+    .unwrap();
+    std::fs::write(site.join("six.py"), ORIG).unwrap();
+    dir
+}
+
+/// Every file under `root` outside `.socket/` and the test venv (relative
+/// path → bytes).
+fn tree(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if path
+                .components()
+                .any(|c| c.as_os_str() == ".socket" || c.as_os_str() == "empty-venv")
+            {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.insert(rel, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// #1138: a scan from a uv workspace member whose own files are Hatch-shaped
+/// (the hatchling backend `uv init --package` scaffolds before uv 0.8, or a
+/// `hatch.toml`) used to rewrite the member as a lockless Hatch project in
+/// both modes, exit 0 `success`, while the root `uv.lock` went stale and
+/// `uv sync --frozen` installed the unpatched release. Both modes must fail
+/// closed, name the workspace root and write nothing.
+#[tokio::test]
+async fn uv_workspace_hatch_member_is_refused_in_both_modes() {
+    const HATCHLING: &str = "[project]\nname = \"a\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n";
+    const PLAIN: &str = "[project]\nname = \"a\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n";
+    for member in [
+        &[("pyproject.toml", HATCHLING)][..],
+        &[
+            ("pyproject.toml", PLAIN),
+            ("hatch.toml", "[envs.default]\n"),
+        ][..],
+    ] {
+        let (_tmp, ws) = project();
+        let dir = stage_uv_workspace_member(&ws, member);
+        let before = tree(&ws);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&dir, &server);
+        assert_eq!(code, 1, "hosted: {env:#}");
+        assert_eq!(
+            env["error"]["code"], "redirect_workspace_lockfile_elsewhere",
+            "hosted: {env:#}"
+        );
+        let message = env["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("uv workspace"), "{message}");
+        assert_eq!(tree(&ws), before, "hosted wrote nothing");
+
+        stage_manifest(&dir);
+        let (code, env) = run_cli(&dir, &["vendor"], &[]);
+        assert_ne!(code, 0, "vendored: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_uv_workspace_unsupported"),
+            "vendored: {env:#}"
+        );
+        assert_eq!(tree(&ws), before, "vendored wrote nothing");
+    }
+}
