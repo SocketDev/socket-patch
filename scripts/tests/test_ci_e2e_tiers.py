@@ -329,7 +329,12 @@ class VltProofDedupe(unittest.TestCase):
 
     def test_lv0_mode_migration_without_ci_upgrade_stays(self):
         self.assertIn("mode_migration_vlt", proof.remaining(self.suites, "windows-latest", "1.0.0-rc.14", text=TEXT))
-        self.assertNotIn("mode_migration_vlt", proof.remaining(self.suites, "ubuntu-latest", "1.0.0-rc.14", text=TEXT))
+        # Lean scope: the rc.14 Linux row is in e2e-extended, which pull
+        # requests skip, so the proof keeps it. Only rows of the lean `e2e`
+        # job (here: redirect on vlt 1.2.0) are left out.
+        self.assertIn("mode_migration_vlt", proof.remaining(self.suites, "ubuntu-latest", "1.0.0-rc.14", text=TEXT))
+        self.assertNotIn("e2e_redirect_vlt_build",
+                         proof.remaining(self.suites, "ubuntu-latest", "1.2.0", text=TEXT))
 
 
 if __name__ == "__main__":
