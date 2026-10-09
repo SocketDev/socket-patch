@@ -570,6 +570,19 @@ pub struct Discovery {
     /// so the management commands (rollback, remove, list, the vendored
     /// takeover) still see and unwind it (#828). Validated like `refs`.
     pub shadowed: Vec<PatchedRef>,
+    /// Refs withheld from `refs` because another copy of the same
+    /// `name@version` that a re-run CAN rewire still resolves elsewhere:
+    /// another entry of the same lock (an `npm:` alias added after the
+    /// pin), the npm twin lock, another manager's lock
+    /// ([`Discovery::contest_across_locks`]), npm 6's legacy mirror, a Bun
+    /// registry entry. Each is diagnosed [`DIAG_REF_UNATTRIBUTABLE`] and is
+    /// neither attested nor unwound by the management commands, but it is
+    /// still a pin a live lock records: the rollout's recorded view counts
+    /// it ([`HostedPin::recorded`]), so the re-scan that rewires the other
+    /// copy is not capped as NEW (#1195). Validated and sorted like `refs`.
+    ///
+    /// [`HostedPin::recorded`]: crate::patch::redirect::upstream::HostedPin::recorded
+    pub rewirable: Vec<PatchedRef>,
     /// The bundled copies (purl → root-relative directory) the vlt
     /// extractor found in the installed store for the lock's nodes, exactly
     /// as [`crate::vendor::vlt_bundled::bundled_copies`] reports them: the
@@ -639,6 +652,18 @@ impl Discovery {
         if let Some(r) = self.validated(r) {
             if !self.shadowed.contains(&r) {
                 self.shadowed.push(r);
+            }
+        }
+    }
+
+    /// Withhold the wired `r` from attestation because another copy of its
+    /// `name@version` that a re-run can rewire resolves elsewhere
+    /// ([`Discovery::rewirable`]). The caller diagnoses why. Validated
+    /// exactly like [`Discovery::push`].
+    pub(crate) fn withhold_rewirable(&mut self, r: PatchedRef) {
+        if let Some(r) = self.validated(r) {
+            if !self.rewirable.contains(&r) {
+                self.rewirable.push(r);
             }
         }
     }
@@ -901,6 +926,7 @@ impl Discovery {
                     other.display()
                 ),
             );
+            self.withhold_rewirable(r);
         }
     }
 
@@ -1056,7 +1082,7 @@ impl Discovery {
         self.unattested.dedup();
         self.contested.sort();
         self.contested.dedup();
-        for refs in [&mut self.refs, &mut self.shadowed] {
+        for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
             refs.sort_by(|a, b| {
                 (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
                     &b.source_file,

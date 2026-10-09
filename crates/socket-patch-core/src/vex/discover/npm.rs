@@ -193,6 +193,7 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, twin_present: bool, out: &mut Disco
                         lock.file, r.purl, r.uuid,
                     ),
                 );
+                out.withhold_rewirable(r.clone());
                 continue;
             }
             let contested_by = locks.iter().enumerate().find(|(j, other)| {
@@ -211,6 +212,7 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, twin_present: bool, out: &mut Disco
                         lock.file, r.purl, r.uuid, other.file, NPM_LOCKS[0], NPM_LOCKS[1],
                     ),
                 );
+                out.withhold_rewirable(r.clone());
             } else if let Some(other) = locks
                 .iter()
                 .enumerate()
@@ -230,6 +232,7 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, twin_present: bool, out: &mut Disco
                         lock.file, r.purl, r.uuid, other.file, NPM_LOCKS[0], NPM_LOCKS[1],
                     ),
                 );
+                out.withhold_rewirable(r.clone());
             } else {
                 if locks.len() == 1 && lock.file == NPM_LOCKS[0] {
                     // A shrinkwrap with no package-lock.json twin (#899):
@@ -393,6 +396,7 @@ fn drop_mirror_unwired(
                 r.purl, r.uuid
             ),
         );
+        out.withhold_rewirable(r.clone());
         false
     });
 }
@@ -2165,6 +2169,93 @@ mod tests {
             "{:#?}",
             out.diagnostics
         );
+    }
+
+    /// REGRESSION (#1195): a ref withheld because another copy of its
+    /// `name@version` that a re-run can rewire resolves elsewhere (another
+    /// entry of the same lock, the twin lock resolving it from the registry
+    /// or missing it) is kept in `rewirable`, so the rollout's recorded view
+    /// (`HostedPin::recorded`) still reads the patch as the project's while
+    /// the management commands' pins (`HostedPin::all`) and attestation do
+    /// not. A wired lock with no other copy withholds nothing.
+    #[tokio::test]
+    async fn issue_1195_rewirable_refs_stay_recorded_pins() {
+        use crate::patch::redirect::upstream::HostedPin;
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let wired = serde_json::json!({ "version": "1.3.0", "resolved": hosted, "integrity": SRI });
+        let upstream = serde_json::json!({
+            "version": "1.3.0", "resolved": registry, "integrity": "sha512-ORIG"
+        });
+        let pinned_lock = lock_with_packages(serde_json::json!({ "node_modules/left-pad": wired }));
+        let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+            (
+                "npm: alias of the same version in the same lock",
+                vec![(
+                    "package-lock.json",
+                    lock_with_packages(serde_json::json!({
+                        "node_modules/left-pad": wired,
+                        "node_modules/lp": {
+                            "name": "left-pad", "version": "1.3.0",
+                            "resolved": registry, "integrity": "sha512-ORIG"
+                        },
+                    })),
+                )],
+            ),
+            (
+                "twin lock resolving it from the registry",
+                vec![
+                    ("package-lock.json", pinned_lock.clone()),
+                    (
+                        "npm-shrinkwrap.json",
+                        lock_with_packages(
+                            serde_json::json!({ "node_modules/left-pad": upstream }),
+                        ),
+                    ),
+                ],
+            ),
+            (
+                "twin lock without the package",
+                vec![
+                    ("package-lock.json", pinned_lock.clone()),
+                    (
+                        "npm-shrinkwrap.json",
+                        lock_with_packages(serde_json::json!({})),
+                    ),
+                ],
+            ),
+        ];
+        let pair = (String::from("pkg:npm/left-pad@1.3.0"), String::from(UUID_A));
+        let pairs = |pins: Vec<HostedPin>| -> Vec<(String, String)> {
+            pins.into_iter().map(|p| (p.purl, p.uuid)).collect()
+        };
+        for (case, files) in cases {
+            let p = Project::new();
+            for (file, text) in &files {
+                p.write(file, text);
+            }
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            assert!(out.shadowed.is_empty(), "{case}: {:#?}", out.shadowed);
+            assert!(HostedPin::all(&out).is_empty(), "{case}");
+            assert_eq!(
+                pairs(HostedPin::recorded(&out)),
+                [pair.clone()],
+                "{case}: {:#?}",
+                out.diagnostics
+            );
+        }
+
+        // Control: the pin alone is attributable and withholds nothing.
+        let p = Project::new();
+        p.write("package-lock.json", pinned_lock);
+        let out = run(&p).await;
+        assert!(out.rewirable.is_empty(), "{:#?}", out.rewirable);
+        assert_eq!(
+            pairs(HostedPin::all(&out)),
+            pairs(HostedPin::recorded(&out))
+        );
+        assert_eq!(pairs(HostedPin::all(&out)), [pair]);
     }
 
     /// #490: a git edge the project's `overrides` send to the registry is

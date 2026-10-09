@@ -124,6 +124,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unattested,
         contested,
         shadowed,
+        rewirable,
         // Bookkeeping of what the vlt extractor read from the store, not a
         // finding: every copy it found already shows as a contest and a
         // diagnostic above.
@@ -261,6 +262,9 @@ fn render(out: &Discovery, root: &Path) -> Value {
     }
     if !shadowed.is_empty() {
         rendered["shadowed"] = shadowed.iter().map(render_ref).collect::<Vec<_>>().into();
+    }
+    if !rewirable.is_empty() {
+        rendered["rewirable"] = rewirable.iter().map(render_ref).collect::<Vec<_>>().into();
     }
     if !unpatched_copies.is_empty() {
         rendered["unpatched_copies"] = unpatched_copies
