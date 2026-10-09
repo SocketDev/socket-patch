@@ -937,6 +937,17 @@ async fn vendor_maven_jvm(
         Shape::Sbt => {
             super::jvm::sbt::plan_with_digest(&read, &patch, gate_pass.deps_digest.as_deref())
         }
+        Shape::MavenReactor | Shape::Mixed => {
+            let external = external_maven_poms(&read, &patch, &local, service).await;
+            super::jvm::plan_with_external(
+                shape,
+                &read,
+                &list,
+                &patch,
+                config_enabled,
+                Some(&external),
+            )
+        }
         _ => super::jvm::plan_with_config(shape, &read, &list, &patch, config_enabled),
     };
     if let Some(rel) = reader.escaped() {
@@ -1308,6 +1319,31 @@ async fn collect_gradle_metadata(
         collect_metadata_artifacts(local, &g, &a, &v, bom, service, out).await?;
     }
     Ok(model.properties)
+}
+
+/// The poms outside the checkout (external parents, imported BOMs) the
+/// reactor planner weighs a pin against (#488), from the local caches or
+/// the registry like any upstream metadata; one that neither has is
+/// recorded unavailable, and the planner then leaves that root unpinned.
+async fn external_maven_poms(
+    read: super::jvm::ReadFn<'_>,
+    patch: &super::jvm::JvmPatch<'_>,
+    local: &LocalSources,
+    service: Option<&VendorServiceConfig>,
+) -> super::jvm::maven_reactor::ExternalPoms {
+    let mut known = super::jvm::maven_reactor::ExternalPoms::new();
+    loop {
+        let need = super::jvm::maven_reactor::external_poms_needed(read, patch, &known);
+        if need.is_empty() {
+            return known;
+        }
+        for (g, a, v) in need {
+            let bytes = acquire_upstream_metadata(local, &g, &a, &v, "pom", service)
+                .await
+                .ok();
+            known.insert((g, a, v), bytes);
+        }
+    }
 }
 
 /// A parent's or BOM's metadata file: the local caches only (never the
