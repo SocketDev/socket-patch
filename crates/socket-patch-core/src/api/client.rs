@@ -21,8 +21,9 @@ use crate::api::vendor_prefetch::VendorPrefetch;
 pub use crate::api::vendor_prefetch::VendorPrefetchGuard;
 use crate::constants::USER_AGENT as USER_AGENT_VALUE;
 use crate::utils::digest::is_hex;
-use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
+use crate::utils::env_compat::{is_offline_env, proxy_url_from_env};
 use crate::utils::notice::{notice_once, Notice};
+use crate::utils::redact::{redact_url, redact_urls_in};
 use crate::utils::socket_cli_config;
 use crate::utils::target::is_uuid_shaped;
 
@@ -38,10 +39,12 @@ static MULTI_ORG_SHOWN: AtomicBool = AtomicBool::new(false);
 /// act on ("Connection refused", a DNS or TLS failure). Causes already
 /// spelled out by an outer message are skipped.
 fn network_error_detail(e: &reqwest::Error) -> String {
-    let mut msg = e.to_string();
+    // reqwest's text names the request URL: a grant URL, or one with
+    // userinfo from `--api-url` / a proxy, is quoted redacted.
+    let mut msg = redact_urls_in(&e.to_string()).into_owned();
     let mut source = std::error::Error::source(e);
     while let Some(cause) = source {
-        let part = cause.to_string();
+        let part = redact_urls_in(&cause.to_string()).into_owned();
         if !part.is_empty() && !msg.contains(&part) {
             msg.push_str(": ");
             msg.push_str(&part);
@@ -95,9 +98,14 @@ fn status_error(head: &str, status: StatusCode, text: &str) -> String {
     }
 }
 
-/// Log debug messages when debug mode is enabled.
+/// Log debug messages when debug mode is enabled. Every URL in `message`
+/// is redacted first: debug lines quote grant URLs and `--api-url`s, and
+/// debug output is routinely pasted into CI logs and bug reports.
 fn debug_log(message: &str) {
-    if is_debug_enabled() && !defer_debug_line(message) {
+    let Some(message) = crate::utils::env_compat::debug_message(message) else {
+        return;
+    };
+    if !defer_debug_line(&message) {
         eprintln!("[socket-patch debug] {}", message);
     }
 }
@@ -1694,7 +1702,8 @@ impl ApiClient {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return (
                 ServeDownload::Failed(ApiError::Other(format!(
-                    "refusing non-http(s) artifact URL `{url}`"
+                    "refusing non-http(s) artifact URL `{}`",
+                    redact_url(url)
                 ))),
                 None,
             );
@@ -1843,8 +1852,14 @@ pub(crate) struct DeferredAttempt {
 fn artifact_download_result(outcome: ServeDownload, url: &str) -> Result<Vec<u8>, ApiError> {
     match outcome {
         ServeDownload::Ok(bytes) => Ok(bytes),
-        ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
-        ServeDownload::Pending => Err(ApiError::Other(format!("artifact still building: {url}"))),
+        ServeDownload::NotFound => Err(ApiError::Other(format!(
+            "artifact not found: {}",
+            redact_url(url)
+        ))),
+        ServeDownload::Pending => Err(ApiError::Other(format!(
+            "artifact still building: {}",
+            redact_url(url)
+        ))),
         ServeDownload::Failed(e) => Err(e),
     }
 }
@@ -2831,7 +2846,8 @@ impl ApiClient {
     ) -> Result<Vec<u8>, ApiError> {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return Err(ApiError::Other(format!(
-                "refusing non-http(s) artifact URL `{url}`"
+                "refusing non-http(s) artifact URL `{}`",
+                redact_url(url)
             )));
         }
         let attempts = self.vendor_retry.attempts.max(1);
@@ -2883,13 +2899,19 @@ impl ApiClient {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND | StatusCode::GONE => {
                 return (
-                    Err(ApiError::Other(format!("artifact not found: {url}"))),
+                    Err(ApiError::Other(format!(
+                        "artifact not found: {}",
+                        redact_url(url)
+                    ))),
                     None,
                 )
             }
             StatusCode::REQUEST_TIMEOUT => {
                 return (
-                    Err(ApiError::Other(format!("artifact still building: {url}"))),
+                    Err(ApiError::Other(format!(
+                        "artifact still building: {}",
+                        redact_url(url)
+                    ))),
                     None,
                 )
             }
@@ -5118,6 +5140,36 @@ mod vendor_package_tests {
                 );
             }
             other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// The artifact errors quote the grant URL redacted: neither the grant
+    /// token nor userinfo reaches the error a caller shows.
+    #[tokio::test]
+    async fn download_artifact_errors_never_carry_a_credential() {
+        const GRANT: &str = "grant-level";
+        const UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        let grant_path = format!("/patch/pypi/a/1.0.0/{GRANT}/{UUID}/a.whl");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(grant_path.as_str()))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = auth_client(server.uri());
+        for url in [
+            format!("ftp://u:pw@h.example{grant_path}"),
+            format!(
+                "{}{grant_path}",
+                server.uri().replace("http://", "http://u:pw@")
+            ),
+        ] {
+            let msg = match client.download_artifact(&url).await {
+                Err(ApiError::Other(msg)) => msg,
+                other => panic!("expected Other, got {other:?}"),
+            };
+            assert!(!msg.contains(GRANT) && !msg.contains("u:pw"), "{msg}");
+            assert!(msg.contains(&format!("/<redacted>/{UUID}/")), "{msg}");
         }
     }
 

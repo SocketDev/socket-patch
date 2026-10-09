@@ -567,13 +567,7 @@ async fn go_service_redirect(
             format!("failed to update go.mod: {e}"),
         );
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {module} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
+    warnings.push(archive.downloaded_warning(module));
     GoServiceRedirect::Used(file_inventory)
 }
 

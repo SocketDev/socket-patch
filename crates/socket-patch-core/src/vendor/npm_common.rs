@@ -470,14 +470,10 @@ async fn try_service_pack(
     .await
     {
         Ok(mut staged) => {
+            warnings.push(
+                archive.downloaded_warning(format_args!("{}@{}", coords.name, coords.version)),
+            );
             staged.packed.yarn_berry10c0 = archive.yarn_berry10c0;
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored {}@{} from the patch service ({})",
-                    coords.name, coords.version, archive.source_url
-                ),
-            ));
             // No local apply to verify — every patched file reads as
             // `AlreadyPatched` (the tarball's members were checked against
             // their afterHashes above).

@@ -22,6 +22,24 @@ use crate::utils::digest::sha1_hex;
 use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry, SourceKind};
 use crate::vendor::path::{parse_vendor_path, VendorPathParts};
 
+/// The lock-entry members that belong to the package's ORIGINAL repository
+/// and must not survive a rewrite that points the entry somewhere else
+/// (the hosted patch URL, a vendored path dist):
+///
+/// * `source`: the upstream VCS checkout Composer falls back to (see
+///   [`source`]);
+/// * `transport-options`: Composer copies the repository's `options`
+///   (`http.header` auth tokens, `ssl` client certificates, `http.proxy`)
+///   into every entry it resolves from it, and applies them to that entry's
+///   dist download. Kept on a redirected entry, they send a private
+///   registry's credentials to the new host (#399).
+///
+/// Both backends drop exactly these: the hosted splice
+/// ([`source::apply_dist_edit`]) and the vendored rebuild
+/// ([`crate::vendor::composer_lock`]'s `rewrite_lock_entry`, which then
+/// writes its own `transport-options`).
+pub(crate) const ORIGIN_BOUND_ENTRY_KEYS: [&str; 2] = ["source", "transport-options"];
+
 // ── entry model ──
 
 /// One entry of a parsed `composer.lock` (see [`composer_lock_packages`]).
