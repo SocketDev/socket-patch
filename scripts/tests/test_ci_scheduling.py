@@ -112,6 +112,8 @@ class Scheduling(unittest.TestCase):
         self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", addon)
         self.assertIn("github.event_name == 'pull_request' && 'macos-latest' || ''", addon)
         self.assertIn("shared-key: addon-${{ matrix.os }}", addon)
+        # The shared setup script must run under Bash on the Windows leg.
+        self.assertIn("shell: bash", reader.step(JOBS["node-addon"], "Install Rust"))
         build = reader.step(JOBS["node-addon"], "Build addon")
         self.assertIn("SOCKET_PATCH_NODE_CARGO_PROFILE: dev", build)
         self.assertIn("node crates/socket-patch-node/npm/scripts/build-addon.mjs", build)
