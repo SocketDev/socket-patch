@@ -6403,6 +6403,26 @@ fn rewrite_gem(
             }
             continue;
         }
+        // A manifest with no lock (a fresh library clone before `bundle
+        // install`): nothing records which version the project resolves,
+        // and the crawl may hand in another project's copy from the shared
+        // gem home. Pinning it would overwrite the user's constraint or
+        // append a gem the project never declared, and a Gemfile-only pin
+        // is no reference `vex` / `rollback` / `remove` can see (#1125).
+        // Hosted mode re-points the version a lock resolves, so ask for one.
+        if locked.is_none() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_gem_no_lockfile".into(),
+                detail: format!(
+                    "{gemfile_name} has no {lock_name}, so nothing says which version of {} \
+                     this project resolves ({} {} may be another project's copy in the \
+                     shared gem home); redirect skipped — run `bundle lock` (or `bundle \
+                     install`), commit {lock_name}, and re-run the hosted scan",
+                    dep.name, dep.name, dep.version
+                ),
+            });
+            continue;
+        }
 
         // Platform-suffixed CHECKSUMS siblings (`name (version-arm64-darwin)
         // sha256=`) mean bundler resolves platform-specific gems the patch
@@ -14771,6 +14791,73 @@ mod tests {
         assert!(out.contains("  gem \"colorize\", \"1.1.0\"\nend"), "{out}");
     }
 
+    /// #1125: with no `Gemfile.lock` / `gems.locked` (a fresh library
+    /// clone before `bundle install`) nothing says which version the
+    /// project resolves, and the crawl may hand in another project's copy
+    /// from the shared gem home. Pinning it would downgrade the user's
+    /// range or append a gem the project never used. The rewriter skips
+    /// every gem with a lock-first remedy, writing nothing.
+    #[test]
+    fn gem_without_a_lock_is_never_pinned() {
+        for (manifest, gemfile) in [
+            (
+                "Gemfile",
+                "source \"https://rubygems.org\"\n\ngem \"colorize\", \"~> 2.0\"\n",
+            ),
+            (
+                "Gemfile",
+                "source \"https://rubygems.org\"\n\ngem \"tiny-dep\"\n",
+            ),
+            (
+                "Gemfile",
+                "source \"https://rubygems.org\"\n\ngem \"colorize\", \"0.8.1\"\n",
+            ),
+            (
+                "gems.rb",
+                "source \"https://rubygems.org\"\n\ngem \"tiny-dep\"\n",
+            ),
+        ] {
+            let files = BTreeMap::from([(manifest.to_string(), gemfile.to_string())]);
+            let r = rewrite_registry_redirect(&files, &[gem_override("colorize", "0.8.1")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{gemfile}: a lockless gem must not be pinned\nfiles={:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_no_lockfile"],
+                "{gemfile}: {:?}",
+                r.warnings
+            );
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains("bundle lock") && detail.contains("colorize 0.8.1"),
+                "{detail}"
+            );
+        }
+    }
+
+    /// A bundler 2.2–2.5 lock (no CHECKSUMS) resolving `specs` from
+    /// rubygems.org, each `(name, version, deps)`, with `direct` in
+    /// DEPENDENCIES. Hosted mode only pins a version a lock resolves
+    /// (#1055, #1125); without CHECKSUMS it leaves the lock untouched.
+    fn gem_lock_resolving(specs: &[(&str, &str, &[&str])], direct: &[&str]) -> String {
+        let mut out = String::from("GEM\n  remote: https://rubygems.org/\n  specs:\n");
+        for (name, version, deps) in specs {
+            out.push_str(&format!("    {name} ({version})\n"));
+            for dep in *deps {
+                out.push_str(&format!("      {dep}\n"));
+            }
+        }
+        out.push_str("\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n");
+        for dep in direct {
+            out.push_str(&format!("  {dep}\n"));
+        }
+        out.push_str("\nBUNDLED WITH\n   2.5.23\n");
+        out
+    }
+
     fn gem_override(name: &str, version: &str) -> DepOverride {
         DepOverride {
             ecosystem: "gem".into(),
@@ -14851,6 +14938,13 @@ mod tests {
             "Gemfile".to_string(),
             "source \"https://rubygems.org\"\n\ngem \"rack-mini-profiler\", \"3.1.0\", require: false\n"
                 .to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock_resolving(
+                &[("rack-mini-profiler", "3.1.0", &[])],
+                &["rack-mini-profiler (= 3.1.0)"],
+            ),
         );
         let r = rewrite_registry_redirect(&files, &[gem_override("rack-mini-profiler", "3.1.0")]);
         let out = r.files.get("Gemfile").expect("Gemfile rewritten");
@@ -14965,6 +15059,10 @@ mod tests {
              gem \"rails\", \"7.0.0\"\n"
                 .to_string(),
         );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
+        );
         let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
         let out = r.files.get("Gemfile").expect("Gemfile rewritten");
         assert!(
@@ -14997,6 +15095,10 @@ mod tests {
         files.insert(
             "Gemfile".to_string(),
             "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
         );
         let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
         let redirected = first.files.get("Gemfile").expect("first run rewrites");
@@ -15069,6 +15171,10 @@ mod tests {
             "Gemfile".to_string(),
             "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
         );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
+        );
         let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
         files.insert(
             "Gemfile".to_string(),
@@ -15140,6 +15246,10 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert("gems.rb".to_string(), gemfile.clone());
         files.insert("Gemfile".to_string(), gemfile);
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
+        );
         let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
         for (name, content) in first.files {
             files.insert(name, content);
@@ -15186,6 +15296,10 @@ mod tests {
              gem \"rails\", \"7.0.0\"\r\nend\r\n";
         let mut files = BTreeMap::new();
         files.insert("Gemfile".to_string(), crlf_gemfile.to_string());
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
+        );
 
         // Same grant: recognized in place, a true no-op.
         let same = rewrite_registry_redirect(&files, &[ov("tok-one")]);
@@ -15391,6 +15505,10 @@ mod tests {
     fn gemfile_source_option_refusal_prescribes_vendor_revert_for_own_wiring() {
         let mut files = BTreeMap::new();
         files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
+        );
+        files.insert(
             "Gemfile".to_string(),
             "source \"https://rubygems.org\"\n\n\
              gem \"rails\", \"7.0.0\", path: \".socket/vendor/gem/11111111-1111-4111-8111-111111111111/rails-7.0.0\"\n"
@@ -15540,6 +15658,13 @@ mod tests {
              gem\t\"puma\", \"6.0.0\"\n"
                 .to_string(),
         );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock_resolving(
+                &[("puma", "6.0.0", &[]), ("rails", "7.0.0", &[])],
+                &["puma (= 6.0.0)", "rails (= 7.0.0)"],
+            ),
+        );
         let r = rewrite_registry_redirect(
             &files,
             &[
@@ -15576,6 +15701,10 @@ mod tests {
         files.insert(
             "Gemfile".to_string(),
             "source \"https://rubygems.org\"\n\ngem\"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
         );
         let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
         assert!(
@@ -16668,6 +16797,10 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert("gems.rb".to_string(), gemfile.clone());
         files.insert("Gemfile".to_string(), gemfile);
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
+        );
         let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
         assert!(
             r.files.contains_key("gems.rb") && !r.files.contains_key("Gemfile"),
@@ -16717,6 +16850,10 @@ mod tests {
     #[test]
     fn gems_rb_divergence_only_in_redirected_dep_line_proceeds() {
         let mut files = BTreeMap::new();
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
+        );
         files.insert(
             "gems.rb".to_string(),
             "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
@@ -16803,6 +16940,10 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert("gems.rb".to_string(), gemfile.clone());
         files.insert("Gemfile".to_string(), gemfile);
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
+        );
         let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
         for (name, content) in first.files {
             files.insert(name, content);
@@ -16847,6 +16988,16 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert("gems.rb".to_string(), gemfile.clone());
         files.insert("Gemfile".to_string(), gemfile);
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock_resolving(
+                &[
+                    ("rack", "3.0.0", &["rails (>= 7)"]),
+                    ("rails", "7.0.0", &[]),
+                ],
+                &["rack (= 3.0.0)"],
+            ),
+        );
         let ovr = gem_override("rails", "7.0.0");
         let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(
@@ -16897,6 +17048,10 @@ mod tests {
         // gems.rb exactly as run 1 wrote it, after a CRLF checkout; the
         // Gemfile twin got the same CRLF treatment but never had the block.
         let mut files = BTreeMap::new();
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
+        );
         files.insert(
             "gems.rb".to_string(),
             "source \"https://rubygems.org\"\r\n\r\n\
@@ -22706,6 +22861,10 @@ packages:
         files.insert(
             "Gemfile".to_string(),
             "source \"https://rubygems.org\"\n\ngem(\"rails\",\n  \"7.0.0\")\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails (= 7.0.0)"]),
         );
         let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
         assert!(
