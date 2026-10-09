@@ -1,6 +1,8 @@
 [agent] Progress ledger for the scheduled Cargo bug-hunt routine (label pm:cargo).
 
-Last updated: 2026-10-08 (run 16), main `9472be4` (47 new commits; cargo-relevant: #1035 generation sweep, which closed #864; #1050 vendored in-use verdict for `--prune`; #1029 `apply --check` now covers cargo; #1038 shared home resolver), CLI 4.0.0, latest release v4.0.0. Re-triage: #864 verified fixed; #863 still reproduces (`remove` and `rollback`).
+Last updated: 2026-10-09 (run 17), main `4aec9d7` (76 new commits; cargo-relevant: b17a114 / #1205, which scopes the local cargo crawl to the registry crates `Cargo.lock` resolves). CLI 4.0.0, latest release v4.0.0. Re-triage: #339 and #1135 still reproduce (#1135 also with `-g`, commented). Filed #1278, a regression from #1205.
+
+Run 17 added these cells (Linux, cargo 1.93.1; not yet in the table): agent `rollback` after the crate is dropped from the lock: pass. Agent `scan --sync` after a patched crate is bumped or dropped: fail #1278 (prunes the entry and orphans the patched shared-cache copy; `6f43b99` passes). Local scan of cache crates outside the lock (backlog 7): pass since #1205. `scan -g -e cargo` with `HOME` unset: fail #1135 (0 crates, exit 0).
 
 Run 16 added these cells (Linux, cargo 1.93.1; not yet in the table): hosted re-pin A→B (single, workspace member, two crates with one superseded, A's block in a legacy / CRLF / CRLF-legacy config): pass, nothing names A, and `remove` is byte-identical. Vendored `scan --prune` on lock v1–v4 × {plain, transitive} × {unchanged, a second `cfg-if` version relocked, `cargo update`}: 24/24 pass (kept); with the dependency dropped, it reverts (pass). Agent `apply --check`: drift detected (pass), but a second index dir holding an unpatched copy passes (#339, commented). Agent scan with `HOME` unset: fail #1135.
 
@@ -41,7 +43,8 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 4. Re-triage #387 and #339 live once cargo code changes on main.
 5. #616: a target-gated crate (`cfg(windows)` dependency on Linux) should stay a calm skip once the fix lands. Verify that.
 6. `-g` default `~/.cargo` on macOS and Windows (Linux passed in run 11).
-7. Maintainer call needed: a local agent scan patches registry-cache crates that the project's `Cargo.lock` doesn't contain, and `vex --product <project>` lists them (see Known non-bugs; #506 is the narrower, filed case).
+7. (resolved by #1205, run 17: a local scan now crawls only locked crates) Left over: `vex` still attests a stale manifest entry for a crate the lock no longer holds. Cosmetic.
+8. #1278 follow-ups: prune orphaning from a workspace-member cwd (walk fallback) and with `-g`; #1205 edges: a `+build` version, an uppercase name, a `replace-with` mirror index dir, and a symlinked `Cargo.lock` through `locate_crates`.
 
 ## Known non-bugs
 
@@ -58,7 +61,7 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 - `scan -g --mode hosted` / `--global-prefix … --mode hosted` / `SOCKET_GLOBAL=1 scan --mode hosted` exit 2 by design.
 - Hosted `remove` / `rollback` with the crates.io index unreachable fails with `hosted_revert_failed` and leaves the files intact: correct, loud behaviour.
 - `-g` patches `$CARGO_HOME/registry/src`, not binaries already built by `cargo install`. That's inherent to cargo.
-- A local agent scan crawls the whole shared registry cache (the crawler's documented fallback), so it can patch and attest crates outside the project's `Cargo.lock`. It isn't filed: it's documented as "wherever the crawler finds it" and is pending a maintainer call (backlog 7).
+- (superseded in run 17) A local agent scan crawled the whole shared registry cache. Since #1205 it crawls only the lock's registry crates; a project with no lock, a bad lock or `vendor/` still walks.
 - (v5) `vendor --offline` with no committed artifact refuses `vendor_service_offline_conflict`: artifacts come from the service (`--vendor-source service` is the default, and local building was removed). Use the `tests/prebuilt_common` fixture server for vendored cells.
 - `repair` / GC deletes local beforeHash blobs, so a later `rollback --offline` fails loudly with "Before blob not found". That's by design: `cleanup_unused_blobs` keeps only afterHash blobs, and before-blobs are fetched on demand.
 - Hosted `cfg-if = { path = …, version = "1.0.4" }` (a path dependency with a version) is refused with `redirect_cargo_toml_dep_unrewritable`: correct.
@@ -82,3 +85,5 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 - `cargo --manifest-path <dir>/Cargo.toml` run from another cwd ignores `<dir>/.cargo/config*`, because cargo reads config from the cwd. Always `cd` into the fresh checkout for hosted oracle builds (run 16).
 - `scan --offline` refuses outright ("strict airgap"), so `scan --prune` cells need a patch-API stand-in (run 16).
 - After `--prune` reverts a dropped vendored dependency, a `[[patch.unused]]` for the tagged version is left in `Cargo.lock`. `--locked` builds, and cargo drops it on the next relock. Cosmetic (run 16).
+- `scan --sync` / `--prune` whose crawl finds 0 packages skips the manifest GC by design (`PRUNE_SKIPPED_EMPTY`), so a project whose only dependency was removed keeps its entry (run 17).
+- The public-proxy stand-in must answer `GET /patch/by-package/<purl>` too, or `apply.found` is 0 (run 17).
