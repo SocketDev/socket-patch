@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-08 ~21:58Z, main `830749f`. Filed #1184 (a #997 residual-reference keep after a `pipenv requirements` export is reported by remove / rollback / the hosted takeover as drift, and the printed remedy loops). Commented the Pipenv lane on #1167 (subdirectory export, wheel deleted). #1142 and #981 still fail. CRLF prune and `--dev` uninstall prune pass. Previous run: 2026-10-08 ~15:39Z.
+Last run: 2026-10-09 ~03:35Z, main `f3c6313`. Filed #1219 (the `apply --check` drift remedy drops `-g` / `--global-prefix` / `--cwd`, and following it exits 0 with nothing patched). #1142 verified fixed (#1147). The #1167 Pipenv lane passes (#1168). #842 still fails with a new symptom (agent `[skip] not installed`, commented). #1184 still fails (commented with the subdir / UTF-16 lanes). Core hosted + vendored sweep on 2022 / 2023 / 2026: pass. Previous run: 2026-10-08 ~21:58Z.
 
 ## Coverage matrix
 
@@ -92,12 +92,15 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `21:58Z` run (2026-10-08), `830749f`, rebuilt mock: a #997 residual keep from a root `pipenv requirements` export on 2022.12.19 / 2023.12.1 / 2026.8.0 keeps the wheel correctly, but remove / rollback / the takeover call it drift and the remedy loops (fail #1184). A subdirectory export (`requirements/prod.txt`) is unprobed, and the revert deletes the wheel (#1167, commented). #1050 prune on CRLF locks (2022 / 2026) and `pipenv uninstall --dev` prune (2022 / 2026): pass. VEX in the half-reverted state is honest.
 
+`03:35Z` run (2026-10-09), `f3c6313` (main force-updated): core hosted + vendored sweep (scan, sync, fresh `install --deploy`, vex, byte-exact rollback) on 2022.12.19 / 2023.12.1 / 2026.8.0 pass. #1058 `--max-new-patches 0` on hosted `default` / `develop` / `[docs]` gives `already` (pass). #1142 fixed (2022). #1167 subdir exports keep the wheel (pass; wording is #1184). UTF-16LE + CRLF exports: vendored keep / #612 warning / check / VEX pass, hosted refuses `candidate_file_unreadable` (pass). Editable `path = "."` project entry, hosted + vendored: pass. `apply --check -g --global-prefix` verdicts pass; its remedy drops the scope flags (fail #1219, also `--cwd`). #842 agent shape now skips as "not installed" (exit 0, no system-Python write).
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
-00000000000. #1184: re-verify once fixed (remove / rollback / takeover wording and the loop). #1167: re-verify once #1168 merges, with Pipenv `requirements/prod.txt` and `docker/requirements.txt` exports.
-0000000000. #1142: re-verify once fixed (also `[dev-packages]` uninstall and a named category with packages left in it). #1050 GC on the #1122 pylock-wired shape and on BOM / CRLF locks: untested.
+000000000000. #1219: re-verify once fixed (`apply --check` remedy with `-g`, `--global-prefix`, `--cwd`, `--manifest-path`).
+00000000000. #1184: re-verify once fixed (remove / rollback / takeover / `vendor --revert` summary wording and the loop; also subdir and UTF-16 exports). (#1167 Pipenv lane verified fixed on `f3c6313`, 2026-10-09.)
+0000000000. (#1142 verified fixed on `f3c6313`, 2026-10-09; the named-category-with-packages-left variant is still untested.) #1050 GC on the #1122 pylock-wired shape and on BOM / CRLF locks: untested.
 000000000. #1122: re-verify once fixed; variants `pylock_name` with both files, standalone `vendor` from an agent manifest, revert / rollback on the pylock-wired project. #612: the takeover policy is still open (warning and red check verified 2026-10-08 09:37Z). `apply --check` × #842 shape and `apply --check -g` (Docker `--system`).
 00000000. (#1048 verified fixed on `b762f41`, 2026-10-08; the withholding runs before every rewriter, so category / Pipenv 11 variants share it.) Service-vendoring mock: rebuild it (http.server: batch filtered by purl, by-package, by-cve, view with inline base64 blobs, blob route, grant with sha256 + sha512) and reuse it for the #612 / #567 vendored variants.
 0000000. #981: re-verify once fixed. (Bisect: first bad 2023.7.9; `--dev` / `--categories` exports also have no hash. Done 2026-10-07 09:46Z.) Re-verify #477 for Pipenv once fixed (the rollback / remove / `vendor --revert` remedy should name `pipenv run pip uninstall -y <pkg> && pipenv sync` with the lock's category args).
@@ -116,7 +119,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 6. #725 re-verified fixed (2026-10-05 21:44Z). Re-verify #744 once fixed. (`install <other>` on 2022 / 2023 and the vendor / apply dry-run VEX: done 2026-10-04 21:42Z, pass.) (Mirror-named `pypi` source and hosted path-prefix on 11 / 2018 / 2022 done 2026-10-03 21:36Z, pass.)
 6b. Re-verify #409 for Pipenv once fixed: `--site-packages` fresh + warm venv, hosted + vendored, 2018–2026 (stale warning or vex refusal expected). (Mixed-sources hosted rollback: done 2026-10-05, pass.)
 6c. Pipenv 2020 / 2021: include them in the #645 re-verification. (The #790 `[dev-packages]` remedy on 2020.11.15: done 2026-10-05 19:15Z, pass.) (Relative `WORKON_HOME` with `--cwd`: done 2026-10-05 09:32Z, see Known non-bugs.)
-6d. Re-verify #842 once fixed: agent (2018 / 2023 / 2025 / 2026.1 fail; 2026.2+ use `./.venv`) and the hosted stale-install warning (2018 / 2023 / 2026.1 missing, commented 2026-10-05). (Pipfile key × env precedence on 2026.8: done, pass.) (The non-boolean `PIPENV_VENV_IN_PROJECT` × key question: done 2026-10-05 21:44Z, pass; socket-patch scans both venvs.)
+6d. Re-verify #842 once fixed (since #950 the agent shape is `[skip] not installed`, exit 0, no system write): agent (2018 / 2023 / 2025 / 2026.1 fail; 2026.2+ use `./.venv`) and the hosted stale-install warning (2018 / 2023 / 2026.1 missing, commented 2026-10-05). (Pipfile key × env precedence on 2026.8: done, pass.) (The non-boolean `PIPENV_VENV_IN_PROJECT` × key question: done 2026-10-05 21:44Z, pass; socket-patch scans both venvs.)
 6e. (#838 Pipenv multi-venv rollback: done 2026-10-06 09:49Z, pass.)
 7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked: branch deletion fails through the git proxy, and as of 2026-10-05 21:44Z it is also refused by the session's permission policy.
 
@@ -198,3 +201,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - `remove` / `rollback` with a purl carrying an unknown qualifier (`?foo=bar`) → "No patch found". That's cross-PM identifier behaviour (`PurlKey::qualified`).
 - Harness note (2026-10-08 21:58Z): the mock is rebuilt each run; it isn't on the ledger branch. Public-proxy routes plus `SOCKET_PROXY_URL` / `SOCKET_PATCH_SERVER_URL` / `SOCKET_PYPI_JSON_API` pointed at it are enough for hosted, vendored and vex (no token needed). The shape is in the 20261008T215835Z entry.
 - Vendored → hosted takeover with a root requirements.txt export of the vendored lock: refused with `redirect_vendored_revert_failed`, still patched. That refusal is documented; only its wording and remedy are #1184.
+- A UTF-8 BOM Pipfile: Pipenv 2022 / 2026 can't parse it (tomllib error), so it isn't a real shape.
+- Hosted scan with a UTF-16 sibling requirements.txt (a PowerShell 5.1 export) refuses with `candidate_file_unreadable` and writes nothing. That's fail-closed by design (#1152).
+- Harness note: export `WORKON_HOME` and create venvs with `pipenv --python /usr/bin/python3.11`; otherwise Pipenv 2022 may pick py3.13 and crash in `pkg_resources` (`ImpImporter`).
+- `apply -g` with no `--global-prefix` patches the default system interpreter (the distro's dist-packages in the sandbox). That's documented `-g` behaviour; restore with `rollback -g`.
