@@ -31,7 +31,7 @@ _Last updated 2026-10-09T05:45Z · main @ f3c6313_
 Re-ranked 2026-10-09T05:00Z at `f3c6313` against 19 `arch-refactor/*` / `agent/fix-*` / `arch-fix/*` PRs changing 346 files; #914 skipped (`jvm_jar.rs` in #1041), #1144 (`vex.rs` in #1041). Free but lower: E16 remainder (`detect_eol` caller in `yarn_classic_lock.rs`, #1211), #1202 (`nuget_feed.rs` in #1041), #1014 (`.mill-version` needs a decision), #265 Maven crawl (no lockfile to scope by: risk H), E37 (`composer_crawler::normalize_version` ≡ `strip_leading_v`, D 1).
 
 **Notes:**
-- `bench.yml` `scan performance` gates +10% per scenario: a reader called once per patched dep (hosted converge) must stay cheap; time it in release (`cargo test --release`, background, ~12 min) against `main` before pushing.
+- `bench.yml` `scan performance` gates +10% per scenario: a reader called once per patched dep (hosted converge) must stay cheap; time it in release (background `cargo test --release`, ~12 min) against `main` before pushing.
 - Gem lock edits locate through `formats::gem::parse` since #1221: `Section::lines()` / `end`, `remote_line_nos`, `GemfileLock::dependencies` (entries with one name rule). Whitespace-only lines are blank separators. The vendored slice should read the same fields, not add a fourth walker.
 - Real bundler 4.0.18 is in the sandbox: `e2e_redirect_gem_build -- --ignored`, `e2e_vendor_gem_build -- --include-ignored` run in ~30 s.
 - `golang_rewrite.golden`'s go.sum generator injects a stray CRLF line, so its inputs are mixed even with the `line_endings` mixer off; any terminator-rule change re-blesses it.
@@ -42,7 +42,6 @@ Re-ranked 2026-10-09T05:00Z at `f3c6313` against 19 `arch-refactor/*` / `agent/f
 - NuGet crawl scope (#1183): only a `cwd` with a project file is scoped; a solution root keeps the walk (restores at any depth). Extend through `PackageRoots::scope`, not a second assets reader.
 - Poetry 2.x `files` is written one file per line by the shared engine since #1185; a test or golden that greps `files = [{ file` only sees 1.0/1.1 package-level `files` now.
 - A hash read from a manifest is lowercase after #1163; `api::blob_fetcher::blob_hash_matches` and vendored `eq_ignore_ascii_case` sites become plain `==` once their files are free (#707 remainder).
-- A closed issue whose row is only `partly fixed` gets a new follow-up issue for the remainder; don't reopen it.
 - `formats::xml` (#1145) is the shared XML element scanner (comment + CDATA blanking, `elements`, `children`, `attr`); route new XML readers (NuGet, pom writers) through it instead of a private masker.
 - The skip rule names `arch-refactor/*` and `agent/fix-*` PRs only; still check `arch-fix/*` and `ci*` hunks before touching the same lines.
 - E35's crawler oracles can't become `golden.rs` digests (their randomized trees differ by OS and uid); keep them.
