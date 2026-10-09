@@ -443,7 +443,7 @@ async fn get_with_explicit_ghsa_flag() {
 }
 
 /// Write a minimal installed npm package under `<cwd>/node_modules/<name>`
-/// so `crawl_all_ecosystems` discovers it as `pkg:npm/<name>@<version>`.
+/// so `crawl_ecosystems` discovers it as `pkg:npm/<name>@<version>`.
 fn install_npm_fixture(cwd: &Path, name: &str, version: &str) {
     let pkg_dir = cwd.join("node_modules").join(name);
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -457,7 +457,7 @@ fn install_npm_fixture(cwd: &Path, name: &str, version: &str) {
 #[tokio::test]
 #[serial]
 async fn get_with_explicit_package_no_install_short_circuits() {
-    // `--package` routes through `crawl_all_ecosystems` over the cwd. With
+    // `--package` routes through `crawl_ecosystems` over the cwd. With
     // NO installed packages the run short-circuits on `no_packages` and must
     // exit 0 WITHOUT ever contacting the API. We assert the full contract:
     // exit 0, no manifest, AND that the mounted mock saw zero requests — so a
@@ -602,6 +602,141 @@ async fn get_package_name_matches_pypi_spellings_pip_accepts() {
     if let Some(v) = saved_venv {
         std::env::set_var("VIRTUAL_ENV", v);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The shared target grammar (B11, B56, B57)
+// ---------------------------------------------------------------------------
+
+fn requested_paths(requests: &[wiremock::Request]) -> Vec<String> {
+    requests.iter().map(|r| r.url.path().to_string()).collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn get_package_name_searches_every_installed_version_exactly() {
+    // B11: `get <name>` used to fuzzy-pick ONE installed purl (the top-level
+    // copy), so a nested older (vulnerable) copy was never searched, and a
+    // prefix sibling could be picked instead. Now: every installed version
+    // of the EXACT name is searched; the sibling never is.
+    const UUID_OLD: &str = "22222222-2222-4222-8222-222222222222";
+    const PURL_OLD: &str = "pkg:npm/in-process-test@0.9.0";
+    let (server, url) = start_wiremock().await;
+    make_search_mock_one(
+        &server,
+        "by-package",
+        "pkg%3Anpm%2Fin-process-test%401.0.0",
+        UUID,
+        PURL,
+        "free",
+    )
+    .await;
+    make_search_mock_one(
+        &server,
+        "by-package",
+        "pkg%3Anpm%2Fin-process-test%400.9.0",
+        UUID_OLD,
+        PURL_OLD,
+        "free",
+    )
+    .await;
+    make_view_mock(&server, UUID, PURL, "free").await;
+    make_view_mock(&server, UUID_OLD, PURL_OLD, "free").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    install_npm_fixture(tmp.path(), "in-process-test", "1.0.0");
+    install_npm_fixture(tmp.path(), "in-process-test-extra", "1.0.0");
+    install_npm_fixture(
+        &tmp.path()
+            .join("node_modules")
+            .join("in-process-test-extra"),
+        "in-process-test",
+        "0.9.0",
+    );
+
+    let mut args = default_args("in-process-test", tmp.path());
+    args.common.api_url = Some(url);
+    assert_eq!(run(args).await, 0);
+    assert_patch_saved(tmp.path(), PURL, UUID);
+    assert_patch_saved(tmp.path(), PURL_OLD, UUID_OLD);
+    let paths = requested_paths(&server.received_requests().await.unwrap());
+    assert!(
+        !paths.iter().any(|p| p.contains("in-process-test-extra")),
+        "a prefix sibling must never be searched: {paths:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn get_package_name_never_falls_back_to_a_near_name() {
+    // B11: `get yaml` with only yaml-ast-parser installed used to search and
+    // patch yaml-ast-parser. A near name is only suggested: no_match, exit
+    // 0, no API call, nothing written.
+    let (server, url) = start_wiremock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    install_npm_fixture(tmp.path(), "in-process-test-extra", "1.0.0");
+    let mut args = default_args("in-process-test", tmp.path());
+    args.common.api_url = Some(url);
+    assert_eq!(run(args).await, 0);
+    assert_no_manifest(tmp.path());
+    let paths = requested_paths(&server.received_requests().await.unwrap());
+    assert!(paths.is_empty(), "no API call for a near name: {paths:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn get_cve_selects_only_the_requested_ecosystems() {
+    // B56: `--ecosystems` used to scope only the nested apply; an advisory
+    // spanning npm and PyPI recorded both.
+    const UUID_PY: &str = "33333333-3333-4333-8333-333333333333";
+    const PURL_PY: &str = "pkg:pypi/in-process-test@1.0.0";
+    let (server, url) = start_wiremock().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-cve/CVE-2024-0001")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [
+                {"uuid": UUID, "purl": PURL, "publishedAt": "2024-01-01T00:00:00Z",
+                 "description": "x", "license": "MIT", "tier": "free", "vulnerabilities": {}},
+                {"uuid": UUID_PY, "purl": PURL_PY, "publishedAt": "2024-01-01T00:00:00Z",
+                 "description": "x", "license": "MIT", "tier": "free", "vulnerabilities": {}},
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    make_view_mock(&server, UUID, PURL, "free").await;
+    make_view_mock(&server, UUID_PY, PURL_PY, "free").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut args = default_args("CVE-2024-0001", tmp.path());
+    args.common.api_url = Some(url);
+    args.common.ecosystems = Some(vec!["npm".to_string()]);
+    assert_eq!(run(args).await, 0);
+    assert_patch_saved(tmp.path(), PURL, UUID);
+    let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
+    assert!(
+        !body.contains(PURL_PY),
+        "a PyPI patch outside -e npm was recorded: {body}"
+    );
+    let paths = requested_paths(&server.received_requests().await.unwrap());
+    assert!(
+        !paths.iter().any(|p| p.ends_with(UUID_PY)),
+        "the excluded patch must not even be fetched: {paths:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn get_uuid_outside_the_requested_ecosystems_is_not_acted_on() {
+    // B57: the UUID path follows the search path's `--ecosystems` rule.
+    let (server, url) = start_wiremock().await;
+    make_view_mock(&server, UUID, PURL, "free").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut args = default_args(UUID, tmp.path());
+    args.common.api_url = Some(url);
+    args.common.ecosystems = Some(vec!["pypi".to_string()]);
+    assert_eq!(run(args).await, 0);
+    assert_no_manifest(tmp.path());
 }
 
 // ---------------------------------------------------------------------------

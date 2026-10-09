@@ -1294,6 +1294,43 @@ async fn get_bypasses_the_policy_with_a_warning() {
     assert!(!stdout.contains("policy_bypassed"), "{stdout}");
 }
 
+/// B29 (#453): `get <uuid>` dispatched before the policy check, so the
+/// most direct form of `get` overrode socket.yml silently. Every mode now
+/// warns like the purl/CVE forms.
+#[tokio::test]
+#[serial]
+async fn get_by_uuid_bypasses_the_policy_with_a_warning_in_every_mode() {
+    let server = MockServer::start().await;
+    mount_api(&server, catalog()).await;
+    let repo = Repo::new(Some("version: 2\npatches:\n  ignorePackages: [alpha]\n"));
+    let web = repo.dir("services/web");
+    for mode in ["hosted", "vendored", "agent"] {
+        let args = [
+            "get",
+            P_ALPHA.uuid,
+            "--mode",
+            mode,
+            "--json",
+            "--yes",
+            "--dry-run",
+            "--cwd",
+            web.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ];
+        let (code, stdout, stderr) = run_cli(&web, &args, &[]);
+        assert_eq!(code, 0, "{mode}: stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains("(policy_bypassed)") && stdout.contains("alpha"),
+            "{mode}: the envelope must carry the policy_bypassed warning: {stdout}"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn agent_mode_honors_path_filters_and_keeps_the_prune_universe() {
