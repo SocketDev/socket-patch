@@ -31,7 +31,9 @@ use super::npm_common::{
     guard_revert_uuid_dir, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend, NpmStagedPack,
     NpmVendorRequest, WireCx,
 };
-use super::npm_origin::{npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides};
+use super::npm_origin::{
+    legacy_packages_key, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+};
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
