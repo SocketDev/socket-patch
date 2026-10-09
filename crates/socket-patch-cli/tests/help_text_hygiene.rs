@@ -285,3 +285,21 @@ fn short_help_lists_about_eight_options_and_long_help_lists_all() {
         "{long}"
     );
 }
+
+/// #923: service-only vendoring never reads the installed files, so
+/// `vendor --force` only bypasses the installed-variant probe. Its help
+/// must not promise a missing-file tolerance or a mismatch warning that
+/// no vendored backend implements.
+#[test]
+fn vendor_force_help_describes_only_the_variant_probe_bypass() {
+    let help = long_help(&["vendor"]);
+    let force = help
+        .split("--force")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  -").next())
+        .expect("vendor --help documents --force");
+    assert!(force.contains("variant probe"), "{force}");
+    for stale in ["Tolerate missing", "vendor_content_mismatch_overwritten"] {
+        assert!(!force.contains(stale), "stale {stale:?} in: {force}");
+    }
+}

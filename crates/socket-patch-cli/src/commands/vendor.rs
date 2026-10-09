@@ -71,11 +71,11 @@ pub struct VendorArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Tolerate missing patch-target files in the staged copy (skip them
-    /// instead of failing) and bypass the variant probe for multi-release
-    /// ecosystems. Not needed for a beforeHash mismatch: vendoring always
-    /// overwrites mismatched content with the verified patched bytes and
-    /// warns (`vendor_content_mismatch_overwritten`).
+    /// Bypass the installed-variant probe for multi-release ecosystems
+    /// (vendor every recorded release variant, not just the one whose
+    /// bytes match the installed copy). Vendoring never reads the
+    /// installed files' content: it commits the patch server's verified
+    /// artifact, so a missing or locally edited file needs no flag.
     #[arg(
         short = 'f',
         long,
