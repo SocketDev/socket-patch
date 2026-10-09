@@ -28,6 +28,47 @@ pub fn is_hatch(files: &BTreeMap<String, String>) -> bool {
         })
 }
 
+/// Whether the project's Hatch configuration locks environments (Hatch
+/// 1.17+: `lock-envs = true`, or an environment with `locked = true` or a
+/// `lock-filename`), in pyproject's `[tool.hatch]` or hatch.toml.
+fn locks_environments(files: &BTreeMap<String, String>) -> bool {
+    HATCH_FILES.into_iter().any(|file| {
+        let Some(document) = parsed(files, file) else {
+            return false;
+        };
+        let hatch = if file == HATCH_FILES[1] {
+            Some(document.as_item())
+        } else {
+            document.get("tool").and_then(|tool| tool.get("hatch"))
+        };
+        let Some(hatch) = hatch else {
+            return false;
+        };
+        hatch.get("lock-envs").and_then(Item::as_bool) == Some(true)
+            || hatch
+                .get("envs")
+                .and_then(Item::as_table_like)
+                .is_some_and(|envs| {
+                    envs.iter().any(|(_, env)| {
+                        env.get("locked").and_then(Item::as_bool) == Some(true)
+                            || env.get("lock-filename").is_some()
+                    })
+                })
+    })
+}
+
+/// Whether `path` is a PEP 751 lock Hatch derives from pyproject (#479):
+/// a `pylock.toml` / `pylock.<name>.toml` in a Hatch project whose
+/// environments are locked. Hatch regenerates it from pyproject whenever
+/// the dependency hash changes, so it is not an independent install
+/// source: the Hatch wiring (pyproject) is what must be rewritten, and a
+/// rewrite of only the lock is thrown away by the next environment sync.
+pub fn is_hatch_lock(files: &BTreeMap<String, String>, path: &str) -> bool {
+    crate::utils::python_lock::is_pep751_lock_name(path)
+        && is_hatch(files)
+        && locks_environments(files)
+}
+
 /// One PEP 508 dependency string Hatch installs.
 pub(crate) struct HatchSpec<'d> {
     /// `pyproject.toml` or `hatch.toml` (a [`HATCH_FILES`] entry).
