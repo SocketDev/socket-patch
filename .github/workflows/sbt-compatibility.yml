@@ -39,6 +39,8 @@ on:
       - 'crates/*/src/**/*scala*'
       - 'crates/*/src/**/*scala*/**'
       - 'crates/socket-patch-core/src/vendor/jvm/**'
+      - 'crates/*/src/**/*coursier*'
+      - 'crates/*/src/**/*ivy*'
       - 'crates/socket-patch-cli/tests/docker_e2e_sbt.rs'
       - 'crates/socket-patch-cli/tests/e2e_sbt_build.rs'
       - 'crates/socket-patch-cli/tests/e2e_sbt_vendor_build.rs'
