@@ -388,6 +388,16 @@ impl Fixture {
             )
             .unwrap();
         }
+        if shape == "bundled" {
+            // REGRESSION (#1243): a local parent that bundles its own
+            // minimist@1.2.2 beside the root's registry minimist@1.2.2.
+            std::fs::write(
+                project.join("bparent-1.0.0.tgz"),
+                bundling_parent_tgz("minimist", "1.2.2"),
+            )
+            .unwrap();
+            package["dependencies"]["bparent"] = json!("file:./bparent-1.0.0.tgz");
+        }
         if shape == "extensions" {
             package["dependencies"]["consumer"] = json!("workspace:*");
             package["dependencies"]["git-number"] = json!("github:jonschlinkert/is-number#7.0.0");
@@ -666,6 +676,44 @@ impl Fixture {
             self.original_manifest
         );
     }
+}
+
+/// A `bparent@1.0.0` tarball that declares `bundleDependencies: [name]`
+/// and ships its own `name@version` under `node_modules/`.
+fn bundling_parent_tgz(name: &str, version: &str) -> Vec<u8> {
+    let manifest = json!({"name":"bparent", "version":"1.0.0",
+        "dependencies":{name: version}, "bundleDependencies":[name]});
+    let bundled = json!({"name":name, "version":version, "main":"index.js"});
+    let files = [
+        ("package/package.json".to_string(), manifest.to_string()),
+        (
+            "package/index.js".to_string(),
+            format!("module.exports = require({name:?});\n"),
+        ),
+        (
+            format!("package/node_modules/{name}/package.json"),
+            bundled.to_string(),
+        ),
+        (
+            format!("package/node_modules/{name}/index.js"),
+            "module.exports = 'bundled';\n".to_string(),
+        ),
+    ];
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    for (path, body) in &files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, body.as_bytes())
+            .unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
 }
 
 fn make_tgz_from_installed(pkg_dir: &Path, replaced_index: &[u8]) -> Vec<u8> {
@@ -1032,6 +1080,115 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
     fixture.pristine();
     fixture.frozen("rolled-back", &fixture.original, "minimist");
+}
+
+/// REGRESSION (#1243): Bun 1.2+ keeps ONE `bun.lockb` record for a
+/// version installed both from the registry and bundled inside a parent's
+/// tarball. The hosted scan wires that record for the regular install
+/// (warning that the bundled copy stays unpatched); the pin it wrote must
+/// then be listed and unwound like any other: `list` succeeds, the online
+/// hosted → vendored takeover restores the registry record and vendors over
+/// it, and `vendor --revert` gives back the pre-hosted bytes exactly.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn binary_shared_bundled_record_hosted_pin_is_managed() {
+    let Some(fixture) = Fixture::new("bundled") else {
+        return;
+    };
+    let server = MockServer::start().await;
+    mock_api(&server, &fixture, "minimist").await;
+    let project = &fixture.project;
+    let uri = server.uri();
+
+    let hosted = scan(project, &server, "hosted", &[]);
+    assert_eq!(hosted["redirect"]["redirected"], 1, "hosted scan: {hosted}");
+    let text = hosted.to_string();
+    let shared =
+        text.contains("redirect_bun_bundled_instance_skipped") && text.contains("also bundled");
+    if !shared {
+        // Bun < 1.2 records no bundled flag on the regular record; that
+        // shape is the ordinary hosted pin the other tests cover.
+        eprintln!("SKIP #1243 leg: this Bun keeps no shared bundled record: {hosted}");
+        return;
+    }
+    assert_ne!(fixture.lock(), fixture.original_lock);
+
+    // `--patch-server-url`: the mock serves the hosted artifact, so name
+    // it the hosted origin (as the vendor run below does).
+    let (code, listed) = cli_code(project, &["list", "--patch-server-url", &uri]);
+    assert_eq!(
+        code, 0,
+        "list must accept the hosted pin it wrote: {listed}"
+    );
+    assert!(
+        !listed.to_string().contains("hosted_wiring_contested"),
+        "{listed}"
+    );
+    assert!(
+        listed.to_string().contains(PURL),
+        "list names the hosted pin: {listed}"
+    );
+
+    // The npm registry's version document for minimist@1.2.2, served
+    // locally (see native_binary_hosted_vendored_takeover_roundtrip).
+    let integrity = "sha512-rIqbOrKb8GJmx/5bc2M0QchhUouMXSpd1RTclXsB41JdL+VtnojfaJR+h7F9k18/4kHUsBFgk80Uk+q569vjPA==";
+    Mock::given(method("GET"))
+        .and(path("/minimist/1.2.2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"dist": {
+            "tarball": "https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz",
+            "integrity": integrity}})))
+        .mount(&server)
+        .await;
+    fixture.stage();
+    let taken_over = cli_env(
+        project,
+        &[
+            "vendor",
+            "--patch-server-url",
+            &uri,
+            "--vendor-source",
+            "service",
+        ],
+        &[("SOCKET_NPM_REGISTRY", &uri)],
+    );
+    assert_eq!(
+        taken_over["summary"]["applied"], 1,
+        "online vendor over the shared hosted pin: {taken_over}"
+    );
+    assert!(
+        taken_over["events"].as_array().is_some_and(|events| events
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_takeover_reverted_redirect")),
+        "the takeover is reported: {taken_over}"
+    );
+    assert!(
+        !taken_over
+            .to_string()
+            .contains("vendor_lock_entry_not_found"),
+        "{taken_over}"
+    );
+    let vendor_lock = fixture.lock();
+    assert!(
+        !vendor_lock.windows(uri.len()).any(|w| w == uri.as_bytes()),
+        "no hosted URL is left in bun.lockb"
+    );
+
+    let reverted = cli(project, &["vendor", "--revert", "--offline"]);
+    assert_eq!(
+        fixture.lock(),
+        fixture.original_lock,
+        "the revert restores the pre-hosted bytes exactly: {reverted}"
+    );
+
+    // `rollback` of the same pin refuses it as any binary hosted pin is
+    // refused (the checkout remedy), not as contested wiring.
+    let hosted = scan(project, &server, "hosted", &[]);
+    assert_eq!(
+        hosted["redirect"]["redirected"], 1,
+        "hosted again: {hosted}"
+    );
+    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
+    assert_eq!(fixture.lock(), fixture.original_lock);
 }
 
 #[tokio::test(flavor = "multi_thread")]
