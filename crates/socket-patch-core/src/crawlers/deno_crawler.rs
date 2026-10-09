@@ -41,6 +41,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use serde_json::{Map, Value};
+
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{home_dir, is_dir};
@@ -108,38 +110,9 @@ impl DenoCrawler {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
         for purl in purls {
-            let Some(((scope, name), version)) = crate::utils::purl::parse_jsr_purl(purl) else {
-                continue;
-            };
-            // SECURITY: scope/name/version come straight from the (untrusted)
-            // manifest PURL and are joined onto the cache root below. A real
-            // JSR coordinate is a single path segment, so reject any that
-            // could traverse out of the cache (`..`/`.`, a separator, NUL).
-            // The parser percent-decodes components, so these guards see the
-            // decoded form — `%2e%2e` cannot smuggle a traversal past them.
-            // Unlike the cargo/npm crawlers there is no content check to catch
-            // a bogus path, and jsr patches in place — so fail closed here.
-            if !(is_safe_jsr_component(&scope)
-                && is_safe_jsr_component(&name)
-                && is_safe_jsr_component(&version))
-            {
-                continue;
+            if let Some(pkg) = locate(jsr_cache_path, purl).await {
+                result.insert(purl.clone(), pkg);
             }
-            // Cache layout: <root>/<scope>/<name>/<version>/
-            let pkg_dir = jsr_cache_path.join(&*scope).join(&*name).join(&*version);
-            if !is_dir(&pkg_dir).await {
-                continue;
-            }
-            result.insert(
-                purl.clone(),
-                CrawledPackage {
-                    name: name.to_string(),
-                    version: version.to_string(),
-                    namespace: Some(scope.to_string()),
-                    purl: purl.clone(),
-                    path: pkg_dir,
-                },
-            );
         }
 
         Ok(result)
@@ -150,6 +123,52 @@ impl Default for DenoCrawler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The cache directory of JSR `purl` under `jsr_cache_path`, reported
+/// under `purl`: the lookup behind [`DenoCrawler::find_by_purls`]. `None`
+/// for a non-`pkg:jsr/` purl, an unsafe coordinate, or a version directory
+/// that is not there.
+async fn locate(jsr_cache_path: &Path, purl: &str) -> Option<CrawledPackage> {
+    let ((scope, name), version) = crate::utils::purl::parse_jsr_purl(purl)?;
+    // SECURITY: scope/name/version come straight from the (untrusted)
+    // manifest PURL and are joined onto the cache
+    // root below. A real JSR coordinate is a single path segment, so reject
+    // any that could traverse out of the cache (`..`/`.`, a separator,
+    // NUL). The parser percent-decodes components, so these guards see the
+    // decoded form — `%2e%2e` cannot smuggle a traversal past them.
+    // Unlike the cargo/npm crawlers there is no content check to catch
+    // a bogus path, and jsr patches in place — so fail closed here.
+    if !(is_safe_jsr_component(&scope)
+        && is_safe_jsr_component(&name)
+        && is_safe_jsr_component(&version))
+    {
+        return None;
+    }
+    // Cache layout: <root>/<scope>/<name>/<version>/
+    let pkg_dir = jsr_cache_path.join(&*scope).join(&*name).join(&*version);
+    if !is_dir(&pkg_dir).await {
+        return None;
+    }
+    Some(CrawledPackage {
+        name: name.to_string(),
+        version: version.to_string(),
+        namespace: Some(scope.to_string()),
+        purl: purl.to_string(),
+        path: pkg_dir,
+    })
+}
+
+/// The `section` (`npm` or `jsr`) package map of a parsed `deno.lock`, in
+/// any lockfile version: top-level in versions 4 and 5, `packages.<section>`
+/// in version 3 and `<section>.packages` in version 2. The one reader of
+/// the lock's layout, shared with VEX discovery (`vex::discover::deno`).
+pub(crate) fn lock_section<'a>(lock: &'a Value, section: &str) -> Option<&'a Map<String, Value>> {
+    let top = lock.get(section);
+    top.and_then(|s| s.get("packages"))
+        .or(top)
+        .or_else(|| lock.get("packages").and_then(|p| p.get(section)))
+        .and_then(Value::as_object)
 }
 
 /// Walk `<root>/@<scope>/<name>/<version>/` and emit a
@@ -500,6 +519,32 @@ mod tests {
             global_prefix: None,
         };
         assert!(crawler.crawl_all(&opts).await.is_empty());
+    }
+
+    /// The shared section reader answers every lockfile version for both
+    /// callers: the crawl's `jsr` scope and VEX discovery's `npm` keys.
+    #[test]
+    fn lock_section_reads_every_lock_version() {
+        let keys = |text: &str, section: &str| -> Vec<String> {
+            let lock: Value = serde_json::from_str(text).unwrap();
+            lock_section(&lock, section)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        // v4 / v5: top-level sections.
+        let v4 = r#"{"version":"4","npm":{"left-pad@1.3.0":{}},"jsr":{"@std/path@1.0.0":{}}}"#;
+        assert_eq!(keys(v4, "npm"), ["left-pad@1.3.0"]);
+        assert_eq!(keys(v4, "jsr"), ["@std/path@1.0.0"]);
+        // v3: under `packages`.
+        let v3 = r#"{"version":"3","packages":{"npm":{"left-pad@1.3.0":{}},"jsr":{"@std/path@1.0.0":{}}}}"#;
+        assert_eq!(keys(v3, "npm"), ["left-pad@1.3.0"]);
+        assert_eq!(keys(v3, "jsr"), ["@std/path@1.0.0"]);
+        // v2: `npm.packages`; there is no jsr section.
+        let v2 = r#"{"version":"2","npm":{"specifiers":{},"packages":{"left-pad@1.3.0":{}}}}"#;
+        assert_eq!(keys(v2, "npm"), ["left-pad@1.3.0"]);
+        assert!(keys(v2, "jsr").is_empty());
+        // A non-object section is no section.
+        assert!(keys(r#"{"version":"4","jsr":[]}"#, "jsr").is_empty());
     }
 
     /// Unit contract for the coordinate gate: real scope/name/version
