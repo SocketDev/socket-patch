@@ -1069,7 +1069,7 @@ class Cell:
         ok = True
         for copy_dir in self.copies(root, lock_text):
             for key, hashes in self.record['files'].items():
-                path = copy_dir / key.split('/', 1)[1]
+                path = copy_dir / key.removeprefix('package/')
                 digest = git_hash(path.read_bytes()) if path.is_file() else None
                 details[str(path.relative_to(root))] = digest
                 ok = ok and digest == hashes.get(f'{side}Hash')
