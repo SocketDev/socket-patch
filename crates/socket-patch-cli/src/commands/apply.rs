@@ -28,7 +28,10 @@ use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
 };
-use crate::ecosystem_dispatch::{find_all_packages_for_purls, partition_purls, JvmScope};
+use crate::ecosystem_dispatch::{
+    distinct_install_dirs, distinct_npm_copies, find_all_packages_for_purls, partition_purls,
+    JvmScope,
+};
 use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
     RunWarning, Status, VexSummary,
@@ -909,25 +912,6 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
         None => true,
         Some(status) => *status == VerifyStatus::Ready || *status == VerifyStatus::AlreadyPatched,
     }
-}
-
-/// `paths` in order with every path that resolves to an already-listed
-/// directory dropped: two discovered site-packages paths can name ONE
-/// directory (a `lib64 -> lib` symlink, a symlinked venv), and patching it
-/// twice would report the second pass `already_patched`. A path that can't
-/// be canonicalized is kept as-is.
-async fn distinct_install_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut out = Vec::with_capacity(paths.len());
-    for path in paths {
-        let key = tokio::fs::canonicalize(path)
-            .await
-            .unwrap_or_else(|_| path.clone());
-        if seen.insert(key) {
-            out.push(path.clone());
-        }
-    }
-    out
 }
 
 /// The file whose verify status decides whether a release variant
@@ -2248,12 +2232,15 @@ async fn apply_patches_inner(
     // physical copy per PURL. Patching only one would leave a live,
     // vulnerable copy while reporting success (the multi-copy silent
     // partial). The apply loop below iterates every copy.
-    let all_packages = find_all_packages_for_purls(
+    let mut all_packages = find_all_packages_for_purls(
         &partitioned,
         &crawler_options,
         args.common.silent || args.common.json,
     )
     .await;
+    // One visit per physical copy: a pnpm workspace member's link into
+    // the root store is the same copy the root walk found (#633).
+    distinct_npm_copies(&mut all_packages).await;
 
     if all_packages.is_empty() {
         // Vendored purls are already accounted for (synthesized Skipped/

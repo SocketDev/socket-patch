@@ -30,7 +30,10 @@ use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
+use crate::ecosystem_dispatch::{
+    crawl_ecosystems, crawl_ecosystems_with_npm, find_all_packages_for_rollback_reusing,
+    partition_purls,
+};
 use crate::json_envelope::{usage_error, Command as JsonCommand};
 use crate::ui::{self, plural, print_json, StatusLine};
 
@@ -1809,7 +1812,11 @@ async fn run_scan(
     // Crawl packages. Vendored mode keeps the npm half for its engine to
     // reuse; hosted mode keeps it only for an embedded `--vex` (skipped
     // under `--dry-run`). No other run pays for copying the snapshot.
-    let keep_npm = vendor || (hosted && args.vex.vex.is_some() && !args.common.dry_run);
+    // A path-scoped (agent or mode-less) run keeps it to resolve every
+    // installed copy for the scope filter below.
+    let keep_npm = vendor
+        || (hosted && args.vex.vex.is_some() && !args.common.dry_run)
+        || !path_scope.is_empty();
     let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if keep_npm {
         crawl_ecosystems_with_npm(&crawler_options, crawl_scope).await
     } else {
@@ -1973,7 +1980,10 @@ async fn run_scan(
 
     // PATH scoping, strictly AFTER the `scanned_purls` capture. A purl is
     // in scope when ANY genuinely-crawled copy of it sits under a matching
-    // path.
+    // path. The crawl keeps one record per purl (for npm, the first copy
+    // the walk meets: a pnpm workspace's root `.pnpm` store entry, not the
+    // member's link to it), so a purl whose record misses is resolved to
+    // every installed copy the way `rollback`'s path targets are.
     let filtered_crawled: Vec<_> = if path_scope.is_empty() {
         filtered_crawled
     } else {
@@ -2000,12 +2010,35 @@ async fn run_scan(
             ));
         }
         let scope = path_scope.bind(&args.common.cwd);
-        let in_scope: HashSet<String> = filtered_crawled
+        let mut in_scope: HashSet<String> = filtered_crawled
             .iter()
             .filter(|pkg| !supplement_purls.contains(&pkg.purl))
             .filter(|pkg| scope.matches(&pkg.path))
             .map(|pkg| pkg.purl.clone())
             .collect();
+        let mut unresolved: Vec<String> = filtered_crawled
+            .iter()
+            .filter(|pkg| !supplement_purls.contains(&pkg.purl) && !in_scope.contains(&pkg.purl))
+            .map(|pkg| pkg.purl.clone())
+            .collect();
+        unresolved.sort();
+        unresolved.dedup();
+        if !unresolved.is_empty() {
+            let partitioned = partition_purls(&unresolved, args.common.ecosystems.as_deref());
+            let copies = find_all_packages_for_rollback_reusing(
+                &partitioned,
+                &crawler_options,
+                true,
+                npm_crawl.as_ref(),
+            )
+            .await;
+            in_scope.extend(
+                copies
+                    .into_iter()
+                    .filter(|(_, paths)| paths.iter().any(|p| scope.matches(p)))
+                    .map(|(purl, _)| purl),
+            );
+        }
         filtered_crawled
             .into_iter()
             .filter(|pkg| in_scope.contains(&pkg.purl))
@@ -3129,7 +3162,15 @@ async fn run_scan(
                     selected.iter().map(|p| p.purl.as_str()),
                 )
                 .await;
-                Some(preview_vendor_json(&args.common.cwd, &selected, &takeover).await)
+                Some(
+                    preview_vendor_json(
+                        &args.common.cwd,
+                        &selected,
+                        &crate::commands::hosted_unwind::patch_server_origins(&args.common),
+                        &takeover,
+                    )
+                    .await,
+                )
             } else {
                 None
             };

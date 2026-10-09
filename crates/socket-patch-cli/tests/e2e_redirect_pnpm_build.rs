@@ -77,8 +77,8 @@ mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
-    assert_absent, assert_attested, assert_not_attested, patch_view, run_vex, strip_ledgers,
-    strip_manifest, Marker, PatchApi, VexRun, VexVia,
+    assert_absent, assert_attested, assert_not_attested, installed_pnpm_pre_10_5, patch_view,
+    run_vex, strip_ledgers, strip_manifest, Marker, PatchApi, VexRun, VexVia,
 };
 
 const ORG: &str = "test-org";
@@ -642,7 +642,11 @@ async fn redirect_scanned_pnpm_project(
     // neither the lockfile policy nor the setting, so legacy runs rewrite
     // ONLY the lock and keep the manual flag guidance.
     let v9_lock = lock_before.starts_with("lockfileVersion: '9.0'");
-    let auto_trust = v9_lock && !no_trust_config;
+    // pnpm 9.0–10.4 (as the install recorded it) get no pnpm-workspace.yaml:
+    // a root-only workspace breaks `pnpm add` there and they never read
+    // `trustLockfile` (#734).
+    let pre_10_5 = installed_pnpm_pre_10_5(&proj);
+    let auto_trust = v9_lock && !no_trust_config && !pre_10_5;
     let expected_rewrites = if auto_trust {
         serde_json::json!(["pnpm-lock.yaml", "pnpm-workspace.yaml"])
     } else {
@@ -670,6 +674,12 @@ async fn redirect_scanned_pnpm_project(
         assert!(
             trust_detail.contains("trustLockfile: true"),
             "the v9 warning must name the auto-configured trustLockfile key; got: {trust_detail}"
+        );
+    } else if v9_lock && !no_trust_config {
+        assert!(
+            trust_detail.contains("ERR_PNPM_ADDING_TO_ROOT"),
+            "the pnpm 9.0–10.4 warning must say why no workspace file was created; \
+             got: {trust_detail}"
         );
     } else if v9_lock {
         // Opted out on a v9 lock: the manual two-recovery guidance stands.
@@ -709,8 +719,8 @@ async fn redirect_scanned_pnpm_project(
         assert_eq!(
             ws_path.exists(),
             ws_existed_before,
-            "a legacy-lock or --no-trust-lockfile-config run must not create \
-             pnpm-workspace.yaml ({tag})"
+            "a legacy-lock, pnpm 9.0–10.4 or --no-trust-lockfile-config run must not \
+             create pnpm-workspace.yaml ({tag})"
         );
         None
     };
@@ -1141,6 +1151,26 @@ async fn pnpm9_redirect_fresh_checkout_frozen_install_lands_patched_bytes() {
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_SECONDARY, "pnpm9", &[], false);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm9");
     assert_fixture_manifestless_vex(&fx, &fresh, "pnpm9");
+    // #734: the scan left the project a plain single package, so pnpm 9's
+    // everyday `pnpm add` still works (a root-only workspace fails it with
+    // ERR_PNPM_ADDING_TO_ROOT).
+    assert!(!fx.proj.join("pnpm-workspace.yaml").exists());
+    let store = fx.tmp.path().join("pnpm-store");
+    let add = corepack(
+        &fx.proj,
+        PNPM_SECONDARY,
+        &[
+            "add",
+            "is-number@7.0.0",
+            &format!("--store-dir={}", store.display()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&add.stderr);
+    let stdout = String::from_utf8_lossy(&add.stdout);
+    assert!(
+        !stdout.contains("ADDING_TO_ROOT") && !stderr.contains("ADDING_TO_ROOT"),
+        "pnpm 9 `pnpm add` must not hit ERR_PNPM_ADDING_TO_ROOT:\n{stdout}\n{stderr}"
+    );
 }
 
 /// pnpm@11 ZERO-TOUCH leg: pnpm 11's lockfile supply-chain policy verifies

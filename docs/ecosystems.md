@@ -99,11 +99,35 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   matching package instance is rewritten; an unsupported instance prevents
   confirming that dependency across the lockfile set. Rollback preserves the
   original resolution fragments.
-  For root 9.0 locks, the CLI configures `trustLockfile: true` in
-  `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
+  A workspace with `sharedWorkspaceLockfile: false` (`shared-workspace-lockfile=false`
+  in `.npmrc` on pnpm 10 and older) installs each member from its own lock:
+  run from the workspace root, every `packages:` member's `pnpm-lock.yaml` is
+  pinned beside the root's (pnpm 7 writes no root lock at all), and `list`,
+  `vex` and `rollback` read the member locks too. Member locks beside a root
+  lock that lists member importers are stale and ignored. A member list the
+  CLI cannot read (including a `pnpm-workspace.yaml` with no `packages:` key)
+  is refused with `redirect_pnpm_member_locks_unresolved`.
+  With `gitBranchLockfile` on (`git-branch-lockfile=true` in `.npmrc` on
+  pnpm 10 and older), pnpm installs a branch from its own
+  `pnpm-lock.<branch>.yaml` (in each member's directory too, when members
+  keep their own locks), which neither mode can pin: while such a lock
+  exists, hosted mode refuses the pnpm pins with
+  `redirect_pnpm_git_branch_lockfile` and vendored mode with
+  `vendor_pnpm_git_branch_lockfile`. Turn the setting off and run
+  `pnpm install --merge-git-branch-lockfiles`, then re-run. With no branch
+  lock, `pnpm-lock.yaml` is the lock pnpm installs from and is pinned as usual.
+  For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
+  the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
   explicitly disabled by the project. pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
-  remains enforced. pnpm <=10 does not need the setting.
+  remains enforced. pnpm <=10 does not need the setting. A project with no
+  `pnpm-workspace.yaml` that pins pnpm 9.0–10.4 (`packageManager`,
+  `devEngines`, `engines.pnpm`, or the pnpm that last installed
+  `node_modules`) gets no file: there a root-only workspace makes
+  `pnpm add <pkg>` fail with `ERR_PNPM_ADDING_TO_ROOT`. Re-run the scan after
+  upgrading to pnpm >=11. When no pin says which pnpm runs, the file is
+  created, and pnpm 9.0–10.4 then need `pnpm add -w <pkg>`. Vendored mode
+  follows the same rule for its `overrides:` mirror.
   **Reinstall after redirecting:** a successful warm-cache install can retain
   upstream bytes. Use a clean install tree and an empty store; `--force` is not
   a reliable substitute. Run `socket-patch vex` after installation to verify
@@ -312,17 +336,36 @@ live at `common/config/rush/pnpm-lock.yaml` (plus one per subspace under
 `common/config/subspaces/<name>/`).
 
 - **Hosted** ✅ — `scan --mode hosted` discovers and repoints those locks in place
-  (subspaces included).
+  (subspaces included). On pnpm >=11 the install needs extra Rush settings (below).
 - **Agent** ✅ — works through the generated project symlink farm.
 - **Vendored** ❌ — refused (`vendor_rush_unsupported`): `rush install` copies the lock
   into `common/temp` and runs pnpm there, so vendor's relative `file:` specs can't
   survive the copy — the refusal routes you to hosted mode.
 
 Editing a Rush lock outside `rush update` desyncs the `pnpmShrinkwrapHash` in
-`common/config/rush/repo-state.json`, so when `preventManualShrinkwrapChanges` is enabled
+`common/config/rush/repo-state.json` (with subspaces enabled, in the
+`common/config/subspaces/<name>/repo-state.json` beside each subspace lock), so when `preventManualShrinkwrapChanges` is enabled
 `rush install` fails until `rush update` refreshes it (a `redirect_rush_repo_state_stale`
 warning flags this; the redirect survives the refresh — pnpm keeps locked resolutions for
 unchanged specifiers).
+
+On pnpm >=11 a repointed lock does not install under Rush's default flow: `rush install`
+either fails (`ERR_PNPM_TARBALL_URL_MISMATCH` /
+`ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION`) or, on pnpm 11, exits 0 after silently
+re-resolving the patched entries to the upstream registry. Rush runs pnpm in `common/temp`
+with a `pnpm-workspace.yaml` it generates, so the `trustLockfile` auto-config is not written
+in a Rush repo; the `redirect_pnpm_trust_lockfile` warning gives the Rush remedy instead
+(verified with Rush 5.180.0):
+
+- pnpm 12: install with `pnpm_config_trust_lockfile=true rush install` (set it in CI too).
+- pnpm 11: also set `"usePnpmFrozenLockfileForRushInstall": true` in
+  `common/config/rush/experiments.json`, so `rush install` stops passing
+  `--no-prefer-frozen-lockfile`.
+- pnpm <=10: nothing extra.
+
+Run `rush purge` before `rush install` so a warm store or old `node_modules` can't serve the
+upstream files, then verify with `socket-patch vex`. Don't rebuild the lock
+(`rush update --full`): that discards the hosted patches.
 
 ## npm: vlt notes
 

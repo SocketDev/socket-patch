@@ -2192,7 +2192,13 @@ async fn run_get_vendored(
             selected.iter().map(|p| p.purl.as_str()),
         )
         .await;
-        let preview = super::scan::preview_vendor_json(&args.common.cwd, selected, &takeover).await;
+        let preview = super::scan::preview_vendor_json(
+            &args.common.cwd,
+            selected,
+            &super::hosted_unwind::patch_server_origins(&args.common),
+            &takeover,
+        )
+        .await;
         if args.common.json {
             let mut result = serde_json::json!({
                 "status": "success",
