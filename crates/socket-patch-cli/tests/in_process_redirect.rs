@@ -41,6 +41,8 @@ const PURL: &str = "pkg:npm/in-proc-redirect@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const HOSTED_URL: &str = "http://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
+/// The grant's sha1: yarn classic pins it as `resolved`'s `#` fragment (#558).
+const PATCHED_SHA1: &str = "5ba15ba15ba15ba15ba15ba15ba15ba15ba15ba1";
 const GHSA: &str = "GHSA-rdir-aaaa-bbbb";
 
 fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
@@ -114,7 +116,7 @@ async fn mock_reference(server: &MockServer) {
                     "artifacts": [{
                         "kind": "tarball",
                         "url": HOSTED_URL,
-                        "integrity": { "sha512": PATCHED_SHA512 }
+                        "integrity": { "sha512": PATCHED_SHA512, "sha1": PATCHED_SHA1 }
                     }],
                     "registryOverride": null
                 }
@@ -122,6 +124,61 @@ async fn mock_reference(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
+
+/// A granted reference whose tarball the mock serves (a yarn classic pin
+/// reads it, #558 / #591), the grant's hashes matching it: `(url, sha512
+/// SRI, sha1 hex)`.
+async fn mock_served_reference(server: &MockServer) -> (String, String, String) {
+    use base64::Engine as _;
+    use sha1::Digest as _;
+    let manifest = format!(r#"{{"name":"{NAME}","version":"{VERSION}"}}"#);
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "package/package.json", manifest.as_bytes())
+        .unwrap();
+    let tgz = builder.into_inner().unwrap().finish().unwrap();
+    let sha512 = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&tgz))
+    );
+    let sha1 = hex::encode(sha1::Sha1::digest(&tgz));
+    let artifact = format!(
+        "/patch/npm/{NAME}/{VERSION}/22222222-2222-4222-8222-222222222222/{UUID}/{NAME}-{VERSION}.tgz"
+    );
+    let url = format!("{}{artifact}", server.uri());
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": url,
+                    "purl": PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": url,
+                        "integrity": { "sha512": sha512, "sha1": sha1 }
+                    }],
+                    "registryOverride": null
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(artifact))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
+        .mount(server)
+        .await;
+    (url, sha512, sha1)
 }
 
 /// The `view/{uuid}` endpoint `run_redirect` calls to build the patch record
@@ -1244,7 +1301,7 @@ async fn scan_redirect_refuses_a_mixed_line_ending_yarn_berry_manifest() {
 async fn scan_redirect_rewrites_correct_entry_in_crlf_classic_lock() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    mock_reference(&server).await;
+    let (hosted_url, sha512, sha1) = mock_served_reference(&server).await;
 
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -1283,8 +1340,8 @@ async fn scan_redirect_rewrites_correct_entry_in_crlf_classic_lock() {
         "the decoy entry must stay byte-identical: {lock}"
     );
     assert!(
-        lock.contains(&format!("resolved \"{HOSTED_URL}\"\r\n"))
-            && lock.contains(&format!("integrity {PATCHED_SHA512}\r\n")),
+        lock.contains(&format!("resolved \"{hosted_url}#{sha1}\"\r\n"))
+            && lock.contains(&format!("integrity {sha512}\r\n")),
         "the target entry must pin the hosted patch: {lock}"
     );
     assert!(

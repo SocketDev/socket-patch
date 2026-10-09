@@ -316,9 +316,10 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub confirmed_yarn_berry_uuids: std::collections::BTreeSet<String>,
-    /// Patch uuids the yarn classic rewriter refused because the project
+    /// Patch uuids the yarn classic rewriter refused: the project
     /// configures a `yarn-offline-mirror` (see
-    /// [`preflight_yarn_classic_hosted`]). Never confirmed.
+    /// [`preflight_yarn_classic_hosted`]), or the served tarball depends on
+    /// a descriptor `yarn.lock` doesn't lock (#591). Never confirmed.
     #[cfg_attr(
         test,
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
@@ -732,7 +733,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| {
             rewrite_npm_lock(files, overrides, result);
             plan_hosted(files, overrides, result);
-            rewrite_yarn_classic_with(files, overrides, yarn_outer, result);
+            rewrite_yarn_classic_with(files, overrides, artifact_metadata, yarn_outer, result);
             rewrite_yarn_berry_with_manifests(files, overrides, artifact_metadata, result);
             rewrite_bun_lock(files, overrides, result);
         }),
@@ -3571,6 +3572,24 @@ pub fn yarn_classic_offline_mirror(
 /// mirror, so yarn installs the upstream bytes and fails the patched
 /// integrity (or, `--offline`, never fetches the patched tarball at all).
 /// `Ok` for a lock that is not classic (the berry rewriter owns those).
+/// Whether the project's yarn offline mirror refuses every hosted yarn
+/// classic pin of `files`' `yarn.lock` ([`preflight_yarn_classic_hosted`]),
+/// so the hosted flows need not read any served tarball for one.
+pub fn yarn_classic_hosted_refused(
+    files: &BTreeMap<String, String>,
+    outer: &yarnrc::OuterYarnMirror,
+) -> bool {
+    files.get("yarn.lock").is_some_and(|lock| {
+        preflight_yarn_classic_hosted(
+            lock,
+            files.get(YARNRC_REL).map(String::as_str),
+            files.get(npmrc::NPMRC_REL).map(String::as_str),
+            outer,
+        )
+        .is_err()
+    })
+}
+
 fn preflight_yarn_classic_hosted(
     lock: &str,
     yarnrc: Option<&str>,
@@ -3679,14 +3698,19 @@ fn rewrite_yarn_classic(
     rewrite_yarn_classic_with(
         files,
         overrides,
+        &BTreeMap::new(),
         &yarnrc::OuterYarnMirror::default(),
         result,
     )
 }
 
+/// `manifests` holds the served tarballs' own package.json texts, keyed by
+/// artifact URL (the hosted flows fetch the ones a classic pin reads; a
+/// dep with none keeps its lock block's dependency sub-maps as they are).
 fn rewrite_yarn_classic_with(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    manifests: &BTreeMap<String, String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
     result: &mut RewriteResult,
 ) {
@@ -3764,6 +3788,55 @@ fn rewrite_yarn_classic_with(
             });
             continue;
         };
+        // Yarn 1 files a tarball in its cache under the `resolved` URL's
+        // `#<sha1>` fragment; a fragmentless hosted URL shares the slot of
+        // any fragmentless upstream copy of this version, so a warm cache
+        // installs those bytes or fails the integrity check (#558). The
+        // hosted flows derive the sha1 from the served tarball when the
+        // grant carries none; a dep that still lacks one is never pinned.
+        let Some(sha1) = dep.integrity.sha1.clone() else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_classic_missing_sha1".into(),
+                detail: format!(
+                    "{fname}@{} has no sha1 for the yarn.lock `resolved` fragment, so it \
+                     is not pinned: yarn 1 would share the cache slot of an unpatched copy",
+                    dep.version
+                ),
+            });
+            continue;
+        };
+        // The served tarball's own package.json (#591): yarn 1 installs the
+        // dependencies a block's sub-maps name, each through a block of its
+        // own. A patch that adds a dependency or changes a range needs the
+        // sub-maps rewritten and every new descriptor locked; no hosted
+        // rewrite can resolve one, so such a dep is refused, never pinned
+        // with a graph yarn would install without it.
+        let served_manifest: Option<Value> = manifests
+            .get(&dep.artifact_url)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(Value::is_object);
+        if let Some(pkg) = &served_manifest {
+            let missing = crate::formats::yarn::classic_deps::unlocked_descriptors(&blocks, pkg);
+            if !missing.is_empty() {
+                result
+                    .refused_yarn_classic_uuids
+                    .insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_dep_manifest_unlocked".into(),
+                    detail: format!(
+                        "the patched {fname}@{} depends on {}, which yarn.lock does not lock; \
+                         yarn 1 installs only what the lock names, so it is not pinned and \
+                         stays unpatched. Lock them first (for example `yarn add {}`), then \
+                         re-run",
+                        dep.version,
+                        missing.join(", "),
+                        missing.join(" ")
+                    ),
+                });
+                continue;
+            }
+        }
+        let mut manifest_rewritten = false;
         let mut matched_any = false;
         let mut pinned_any = false;
         let mut alias_skipped = false;
@@ -3964,17 +4037,18 @@ fn rewrite_yarn_classic_with(
                 continue;
             }
             pinned_any = true;
-            let frag = dep
-                .integrity
-                .sha1
-                .as_ref()
-                .map(|s| format!("#{s}"))
-                .unwrap_or_default();
-            let pinned = repin_classic_block(
+            let mut pinned = repin_classic_block(
                 &block.lines,
-                &format!("{}{frag}", dep.artifact_url),
+                &format!("{}#{sha1}", dep.artifact_url),
                 &sha512,
             );
+            if let Some(pkg) = &served_manifest {
+                if !crate::formats::yarn::classic_deps::dep_maps_match(&pinned, pkg) {
+                    pinned =
+                        crate::formats::yarn::classic_deps::with_manifest_dep_maps(&pinned, pkg);
+                    manifest_rewritten = true;
+                }
+            }
             if pinned != block.lines {
                 // Edits record the block's on-disk bytes (CRLF lines for a
                 // CRLF block), so they match what the file really held.
@@ -3993,6 +4067,17 @@ fn rewrite_yarn_classic_with(
                 pinned_blocks[i] = true;
                 changed = true;
             }
+        }
+        if manifest_rewritten {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_classic_dep_manifest_rewritten".into(),
+                detail: format!(
+                    "the patched {fname}@{} declares different dependencies; its yarn.lock \
+                     dependency sub-maps were rewritten to match (every descriptor is already \
+                     locked)",
+                    dep.version
+                ),
+            });
         }
         if !matched_any && !alias_skipped && !copy_skipped {
             result.warnings.push(RewriteWarning {
@@ -8195,6 +8280,10 @@ fn rewrite_golang(
 mod tests {
     use super::*;
 
+    /// The sha1 an npm grant carries (or the hosted flow derives from the
+    /// served tarball, #558): yarn classic pins it as `resolved`'s fragment.
+    const NPM_SHA1: &str = "5ha1";
+
     fn npm_override(name: &str, version: &str, url: &str, sha512: &str) -> DepOverride {
         DepOverride {
             ecosystem: "npm".into(),
@@ -8207,6 +8296,7 @@ mod tests {
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(sha512.into()),
+                sha1: Some(NPM_SHA1.into()),
                 ..Default::default()
             },
         }
@@ -10729,7 +10819,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key}: the block must be pinned: {:?}", r.warnings));
             assert!(out.contains(&format!("\n{key}\n")), "{key}: {out}");
             assert!(
-                out.contains("resolved \"http://p.test/lp.tgz\"")
+                out.contains("resolved \"http://p.test/lp.tgz#5ha1\"")
                     && out.contains("integrity sha512-PATCHED=="),
                 "{key}: {out}"
             );
@@ -10996,7 +11086,7 @@ mod tests {
         assert!(
             out.contains(
                 "left-pad@^1.3.0:\r\n  version \"1.3.0\"\r\n  \
-                 resolved \"http://p.test/lp.tgz\"\r\n  integrity sha512-PATCHED==\r\n"
+                 resolved \"http://p.test/lp.tgz#5ha1\"\r\n  integrity sha512-PATCHED==\r\n"
             ),
             "the target entry must pin the hosted artifact: {out}"
         );
@@ -11049,7 +11139,7 @@ mod tests {
         let want = lock.replace(
             "resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
              integrity sha512-UPSTREAMupstream==",
-            "resolved \"http://p.test/lp.tgz\"\n  integrity sha512-PATCHED==",
+            "resolved \"http://p.test/lp.tgz#5ha1\"\n  integrity sha512-PATCHED==",
         );
         assert_eq!(r.files["yarn.lock"], want);
     }
@@ -11070,7 +11160,7 @@ mod tests {
         let mut r = RewriteResult::default();
         rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(
-            r.files["yarn.lock"].contains("  resolved \"http://p.test/$1/$name/lp.tgz\"\n"),
+            r.files["yarn.lock"].contains("  resolved \"http://p.test/$1/$name/lp.tgz#5ha1\"\n"),
             "{}",
             r.files["yarn.lock"]
         );
@@ -11277,7 +11367,13 @@ mod tests {
             let mut files = BTreeMap::new();
             files.insert("yarn.lock".to_string(), classic_lock_two_entries());
             let mut r = RewriteResult::default();
-            rewrite_yarn_classic_with(&files, std::slice::from_ref(&ovr), outer, &mut r);
+            rewrite_yarn_classic_with(
+                &files,
+                std::slice::from_ref(&ovr),
+                &BTreeMap::new(),
+                outer,
+                &mut r,
+            );
             assert!(
                 r.files.is_empty() && r.edits.is_empty(),
                 "{outer:?}: {:?}",
@@ -11308,7 +11404,13 @@ mod tests {
             "yarn-offline-mirror false\n".to_string(),
         );
         let mut r = RewriteResult::default();
-        rewrite_yarn_classic_with(&files, std::slice::from_ref(&ovr), &refusing[1], &mut r);
+        rewrite_yarn_classic_with(
+            &files,
+            std::slice::from_ref(&ovr),
+            &BTreeMap::new(),
+            &refusing[1],
+            &mut r,
+        );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.files["yarn.lock"].contains("left-pad-1.3.0.tgz"));
         // The full chain drives it too.
@@ -11465,7 +11567,10 @@ mod tests {
             rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
             assert_eq!(r.edits.len(), 1, "{copy}: {:?}", r.edits);
             let out = &r.files["yarn.lock"];
-            assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+            assert!(
+                out.contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+                "{out}"
+            );
             assert!(out.ends_with(copy), "{copy}: copy byte-identical:\n{out}");
             let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
             assert_eq!(
@@ -11531,7 +11636,10 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
         assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         let out = &r.files["yarn.lock"];
-        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(
+            out.contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+            "{out}"
+        );
         assert!(
             out.contains(file_block),
             "file: block byte-identical:\n{out}"
@@ -11594,7 +11702,7 @@ mod tests {
             let mut r = RewriteResult::default();
             rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
             assert!(
-                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz\""),
+                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz#5ha1\""),
                 "the registry block is still pinned: {:?}",
                 r.files
             );
@@ -11677,7 +11785,10 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
         assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         let out = &r.files["yarn.lock"];
-        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(
+            out.contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+            "{out}"
+        );
         assert!(out.contains(git_block), "git block byte-identical:\n{out}");
         assert!(r
             .warnings
@@ -11779,7 +11890,7 @@ mod tests {
         assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
         let out = r.files.get("yarn.lock").expect("must rewrite");
         assert!(
-            out.contains("resolved \"http://p.test/lp.tgz\"")
+            out.contains("resolved \"http://p.test/lp.tgz#5ha1\"")
                 && out.contains("left-pad@^1.3.0, \"safe-pad@npm:left-pad@^1.3.0\":"),
             "merged key preserved, resolution repointed: {out}"
         );
@@ -21088,6 +21199,140 @@ packages:
         );
     }
 
+    /// #591: the hosted classic rewriter reads the served tarball's own
+    /// package.json. A dependency it adds (or a range it changes to) that
+    /// no block locks would be dropped by yarn 1, which installs only what
+    /// the lock names: the dep is refused and nothing is written. When
+    /// every descriptor is locked, the block's sub-maps are rewritten to
+    /// the served manifest's.
+    #[test]
+    fn issue_591_hosted_classic_checks_the_served_manifest_against_the_lock() {
+        let url = "http://p.test/is-odd-3.0.1.tgz";
+        let ovr = npm_override("is-odd", "3.0.1", url, "sha512-P==");
+        let lock = "# yarn lockfile v1\n\n\n\
+                    is-number@^6.0.0:\n  version \"6.0.0\"\n  \
+                    resolved \"https://registry.yarnpkg.com/is-number/-/is-number-6.0.0.tgz#aaaa\"\n\n\
+                    is-odd@3.0.1:\n  version \"3.0.1\"\n  \
+                    resolved \"https://registry.yarnpkg.com/is-odd/-/is-odd-3.0.1.tgz#bbbb\"\n  \
+                    integrity sha512-UP==\n  dependencies:\n    is-number \"^6.0.0\"\n";
+        let run = |lock: &str, manifest: &str| {
+            let files = BTreeMap::from([("yarn.lock".to_string(), lock.to_string())]);
+            let manifests = BTreeMap::from([(url.to_string(), manifest.to_string())]);
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic_with(
+                &files,
+                std::slice::from_ref(&ovr),
+                &manifests,
+                &yarnrc::OuterYarnMirror::default(),
+                &mut r,
+            );
+            r
+        };
+
+        // Added dependency, and a changed range: refused, nothing written.
+        for (manifest, missing) in [
+            (
+                r#"{"name":"is-odd","dependencies":{"is-number":"^6.0.0","wow":"^1.0.0"}}"#,
+                "wow@^1.0.0",
+            ),
+            (
+                r#"{"name":"is-odd","dependencies":{"is-number":"^7.0.0"}}"#,
+                "is-number@^7.0.0",
+            ),
+        ] {
+            let r = run(lock, manifest);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{manifest}: {:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_yarn_classic_dep_manifest_unlocked"],
+                "{manifest}"
+            );
+            assert!(r.warnings[0].detail.contains(missing), "{:?}", r.warnings);
+            assert!(r.refused_yarn_classic_uuids.contains(&ovr.patch_uuid));
+        }
+
+        // The served manifest declares what the lock already says: a plain
+        // pin, sub-map untouched.
+        let r = run(
+            lock,
+            r#"{"name":"is-odd","dependencies":{"is-number":"^6.0.0"}}"#,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(
+            r.files["yarn.lock"].contains(&format!(
+                "  resolved \"{url}#{NPM_SHA1}\"\n  integrity sha512-P==\n  \
+                 dependencies:\n    is-number \"^6.0.0\"\n"
+            )),
+            "{:?}",
+            r.files
+        );
+
+        // The new range is locked: the sub-map follows the served manifest.
+        let locked = format!(
+            "{lock}\nis-number@^7.0.0:\n  version \"7.0.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/is-number/-/is-number-7.0.0.tgz#cccc\"\n"
+        );
+        let r = run(
+            &locked,
+            r#"{"name":"is-odd","dependencies":{"is-number":"^7.0.0"}}"#,
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_yarn_classic_dep_manifest_rewritten"]
+        );
+        assert!(
+            r.files["yarn.lock"].contains(&format!(
+                "  resolved \"{url}#{NPM_SHA1}\"\n  integrity sha512-P==\n  \
+                 dependencies:\n    is-number \"^7.0.0\"\n"
+            )),
+            "{:?}",
+            r.files
+        );
+        assert!(r.refused_yarn_classic_uuids.is_empty());
+    }
+
+    /// #558: a yarn classic pin without a sha1 would have no `#<sha1>`
+    /// fragment, so yarn 1 would file the hosted tarball in the cache slot
+    /// of a fragmentless upstream copy and install its bytes. The rewriter
+    /// refuses such a dep and leaves the lock untouched.
+    #[test]
+    fn issue_558_yarn_classic_refuses_a_dep_without_sha1() {
+        let mut ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", "sha512-P==");
+        ovr.integrity.sha1 = None;
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz\"\n  \
+             integrity sha512-UP==\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "no fragmentless pin: {:?}",
+            r.files
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_yarn_classic_missing_sha1"]
+        );
+
+        ovr.integrity.sha1 = Some("abc123".into());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files["yarn.lock"].contains("  resolved \"http://p.test/lp.tgz#abc123\"\n"),
+            "{:?}",
+            r.files
+        );
+    }
+
     /// The pypi twins of the missing-integrity legs: requirements.txt and
     /// uv.lock each warn for a granted dep with no sha256.
     #[test]
@@ -22186,7 +22431,7 @@ packages:
         assert!(
             out.contains(
                 "left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
-                 resolved \"http://p.test/lp.tgz\"\n  integrity sha512-PATCHED=="
+                 resolved \"http://p.test/lp.tgz#5ha1\"\n  integrity sha512-PATCHED=="
             ),
             "integrity inserted after the repointed resolved: {out}"
         );
@@ -23644,7 +23889,10 @@ packages:
             out.contains("not-a-key-line"),
             "keyless block preserved: {out}"
         );
-        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(
+            out.contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+            "{out}"
+        );
     }
 
     /// An EXPLICIT `.yarnrc.yml` `compressionLevel: 0` (the supported value,

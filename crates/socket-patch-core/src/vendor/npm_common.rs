@@ -707,12 +707,18 @@ pub(super) async fn done_failure_unstage(
     uuid_dir_rel: &str,
     uuid_dir_preexisted: bool,
 ) -> VendorOutcome {
+    unstage(project_root, uuid_dir_rel, uuid_dir_preexisted).await;
+    done_failure(purl, error)
+}
+
+/// Remove the uuid dir a run staged, unless it existed before the run (a
+/// same-uuid re-vendor's dir may still be referenced by live wiring).
+async fn unstage(project_root: &Path, uuid_dir_rel: &str, uuid_dir_preexisted: bool) {
     if !uuid_dir_preexisted {
         let uuid_dir = project_root.join(uuid_dir_rel);
         let _ = remove_tree(&uuid_dir).await;
         super::common::prune_empty_vendor_levels(&uuid_dir).await;
     }
-    done_failure(purl, error)
 }
 
 /// The vendor ledger tail every npm flavor shares once its wiring is on
@@ -807,6 +813,19 @@ pub(super) trait NpmLockBackend {
         warnings: &mut Vec<VendorWarning>,
     ) -> Result<Option<NpmCommit>, String>;
 
+    /// A refusal for a patch whose rewritten `package.json` (`staged_pkg`)
+    /// the flavor's lock can't follow, checked after staging and before any
+    /// wiring is written (the driver unstages the uuid dir). `None`: wire
+    /// as usual.
+    fn manifest_refusal(
+        &self,
+        _plan: &Self::Plan,
+        _staged_pkg: &Value,
+        _coords: &NpmCoords,
+    ) -> Option<VendorOutcome> {
+        None
+    }
+
     /// The advisory for a patch that rewrites the package's own
     /// `package.json`, whose mirrors the flavor's lock either recomputes or
     /// keeps.
@@ -862,6 +881,20 @@ pub(super) async fn vendor_npm_family<B: NpmLockBackend>(
         (staged.name.as_str(), staged.version.as_str()),
         (coords.name.as_str(), coords.version.as_str())
     );
+
+    if let Some(refusal) = staged
+        .staged_pkg_json
+        .as_ref()
+        .and_then(|pkg| backend.manifest_refusal(&plan, pkg, &coords))
+    {
+        unstage(
+            project_root,
+            &coords.uuid_dir_rel,
+            staged.uuid_dir_preexisted,
+        )
+        .await;
+        return refusal;
+    }
 
     let cx = WireCx {
         project_root,

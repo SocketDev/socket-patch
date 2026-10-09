@@ -1460,7 +1460,8 @@ async fn mount_berry_hosted_api_opts(server: &wiremock::MockServer, berry_zip: b
         .mount(server)
         .await;
     let mut artifacts = vec![json!({ "kind": "tarball", "url": hosted_url,
-                                    "integrity": { "sha512": "sha512-unused-by-berry==" } })];
+                                    "integrity": { "sha512": "sha512-unused-by-berry==",
+                                                   "sha1": "5ba15ba15ba15ba15ba15ba15ba15ba15ba15ba1" } })];
     if berry_zip {
         artifacts.push(json!({ "kind": "yarn-berry-zip", "url": hosted_url,
             "integrity": { "yarnBerry10c0": format!("10c0/{}", "7".repeat(128)) } }));

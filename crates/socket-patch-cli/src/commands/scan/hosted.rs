@@ -1045,6 +1045,43 @@ pub(crate) async fn run_redirect_selected(
             }
         }
     }
+    // A yarn classic pin reads the served tarball: its sha1 is the
+    // `resolved` fragment yarn 1 keys its cache slot on when the grant
+    // carries none (#558), and its package.json's dependencies must match
+    // the lock block's sub-maps, every new descriptor locked (#591). The
+    // tarball is checked against the grant's sha512; one that cannot be
+    // fetched, verified or read drops its patch.
+    let classic_targets: Vec<(String, String, DepOverride)> =
+        engine::yarn_classic_artifact_targets(
+            &candidates,
+            &read.files,
+            &resolve_outer_yarn_mirror_for_process(&common.cwd),
+        )
+        .into_iter()
+        .filter_map(|dep| {
+            let sha512 = dep.integrity.sha512.clone()?;
+            Some((dep.artifact_url.clone(), sha512, dep.clone()))
+        })
+        .collect();
+    for (url, sha512, dep) in classic_targets {
+        status.set(format!("Fetching hosted tarball for {}...", dep.name));
+        match socket_patch_core::hosted::npm_manifest::fetch_hosted_classic_artifact(
+            api_client, &url, &sha512,
+        )
+        .await
+        {
+            Ok(artifact) => engine::record_classic_artifact(
+                &mut candidates,
+                &mut python_metadata,
+                &url,
+                &artifact,
+            ),
+            Err(detail) => {
+                unavailable_python_artifacts.insert(url.clone());
+                skipped.push(engine::npm_tarball_unavailable(&dep, &detail));
+            }
+        }
+    }
     status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
     // The Pipfile.lock reference shape depends on the installing Pipenv
@@ -2041,6 +2078,9 @@ fn describe_skip_reason(reason: &str) -> String {
         "python_metadata_unavailable" => "the hosted wheel's metadata could not be fetched".into(),
         "npm_manifest_unavailable" => {
             "the hosted tarball's package.json could not be fetched".into()
+        }
+        "npm_tarball_unavailable" => {
+            "the hosted tarball could not be fetched, verified or read".into()
         }
         "redirect_bun_lock_unsupported" | "redirect_bun_lockb_invalid" => {
             "the Bun lockfile blocks the vendored-to-hosted migration (see the warning)".into()

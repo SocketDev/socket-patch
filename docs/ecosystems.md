@@ -195,7 +195,23 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   a reliable substitute. Run `socket-patch vex` after installation to verify
   the patched files. See the [compatibility matrix and workflow](testing/pnpm-compatibility.md).
 - **yarn classic** — the `yarn.lock` entry's `resolved` / `integrity` are
-  rewritten to the hosted tarball. A project that sets `yarn-offline-mirror`
+  rewritten to the hosted tarball. `resolved` always carries the tarball's
+  `#<sha1>` fragment: yarn 1 names its cache slot after it, so a fragmentless
+  URL would share the slot of an unpatched copy of the same version and a warm
+  cache would install those bytes (or fail the integrity check). For an entry it
+  hasn't pinned yet (or a grant with no sha1), the scan downloads the served
+  tarball and checks it against the grant's sha512. It pins the sha1 of those
+  bytes when the grant has none, and it compares the tarball's own
+  `package.json` with the lock: yarn 1 installs only the dependencies the lock
+  names, so when the patch adds a dependency (or changes a range) that no
+  `yarn.lock` block locks, the pin is refused with
+  `redirect_yarn_classic_dep_manifest_unlocked` (lock the new descriptor first,
+  for example with `yarn add`, then re-run). When every descriptor is already
+  locked, the entry's dependency sub-maps are rewritten to match
+  (`redirect_yarn_classic_dep_manifest_rewritten`). Vendored mode refuses the
+  same case with `vendor_dep_manifest_unlocked`. If the download, the check or
+  the `package.json` read fails, the patch is skipped as
+  `npm_tarball_unavailable`. A project that sets `yarn-offline-mirror`
   is refused with `redirect_yarn_classic_offline_mirror`. The mirror is
   resolved the way yarn 1 resolves it: the project's `.yarnrc` / `.npmrc`,
   the user's (`~/.yarnrc`, which `yarn config set` writes, and `~/.npmrc`),
