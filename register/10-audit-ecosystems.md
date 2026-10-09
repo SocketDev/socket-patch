@@ -59,7 +59,7 @@ _Last updated 2026-10-09T12:58Z · main @ a80b89e_
 | E59 | 2 | Vendored gem `edit_lock` searched only the first `GEM` section. | new finding | #779 | fixed (#805) |
 | E61 | 2 | Vendored-reference scan missed NuGet/Maven/hatch wiring. | new finding | #832, #958 | fixed (#1015) |
 | E63 | 2 | Hosted Maven splices the API `maven_suffixed_version` into `pom.xml` unchecked, while hosted Gradle refuses a malformed suffix; four suffix builders (executed twice). | new finding | #882 | filed #882 |
-| E64 | 2 | No shared BOM helper (4 `strip_bom` copies, ~50 inline strips); `formats::pnpm`'s `lockfileVersion` readers skipped it (executed twice). Symptoms #903, #904, #623. | new finding; 4.4 | #905 | partly fixed (#909, #1117, #1160, #1191); 11 files remain on `PENDING_INLINE_BOMS` |
+| E64 | 2 | No shared BOM helper (4 `strip_bom` copies, ~50 inline strips); `formats::pnpm`'s `lockfileVersion` readers skipped it (executed twice). Symptoms #903, #904, #623. | new finding; 4.4 | #905 | partly fixed (#909, #1117, #1160, #1191); slice 4 in PR #1277 (7 files); 4 files remain on `PENDING_INLINE_BOMS` |
 | E65 | 3 | Every vendored sink discards `force`/`sources`, yet `vendor --force` docs promise a tolerance and a warning nothing emits (executed twice). | new finding; 5.2 | #923 | filed #923 |
 | E66 | 2 | Vendored Poetry picks its forward splicer by line ending (`utils::poetry_lock` vs the `toml_surgery` scanner), with different `files` shapes and checks (executed twice). | new finding; 5.4 | #936 | fixed (#1185) |
 | E68 | 2 | Vendored gem forward treats any Gemfile containing the copy path as wired, revert needs the exact line: a trailing comment leaves the lock restored and the Gemfile on `path:` (executed 3×). | new finding; 5.3 | #988 | filed #988 |
