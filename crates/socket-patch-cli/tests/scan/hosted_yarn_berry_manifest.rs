@@ -247,7 +247,7 @@ async fn unfetchable_served_manifest_skips_the_patch() {
     write_berry_project(&root);
     let lock_before = std::fs::read(root.join("yarn.lock")).unwrap();
 
-    let (_, doc, stderr) = scan(&root, &server.uri());
+    let (_, doc, _stderr) = scan(&root, &server.uri());
     let all_skipped = hosted_skipped(&doc);
     let skipped: Vec<&Value> = all_skipped
         .iter()
