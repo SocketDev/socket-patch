@@ -22,8 +22,11 @@ name: sbt / Mill / scala-cli compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    # Everything the agent, hosted and vendored cells run through, shared
-    # engine code included (as composer-compatibility.yml does).
+    # Only this ecosystem's own files. A change to shared engine code
+    # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
+    # push to main, or on demand via workflow_dispatch on the PR branch;
+    # ci.yml's per-ecosystem blocking slice still runs on every PR and in
+    # the merge queue (#1198).
     paths:
       - '.github/workflows/sbt-compatibility.yml'
       - 'scripts/sbt-compat-matrix.sh'
@@ -31,19 +34,11 @@ on:
       - 'docs/testing/sbt-compatibility.md'
       - 'tests/docker/Dockerfile.sbt'
       - 'tests/docker/Dockerfile.base'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/*/Cargo.toml'
-      - 'crates/socket-patch-core/src/formats/**'
-      - 'crates/socket-patch-core/src/crawlers/**'
-      - 'crates/socket-patch-core/src/hosted/**'
-      - 'crates/socket-patch-core/src/patch/**'
-      - 'crates/socket-patch-core/src/manifest/**'
-      - 'crates/socket-patch-core/src/api/**'
-      - 'crates/socket-patch-core/src/utils/**'
-      - 'crates/socket-patch-core/src/vendor/**'
-      - 'crates/socket-patch-core/src/vex/**'
-      - 'crates/socket-patch-cli/src/**'
+      - 'crates/*/src/**/*sbt*'
+      - 'crates/*/src/**/*sbt*/**'
+      - 'crates/*/src/**/*scala*'
+      - 'crates/*/src/**/*scala*/**'
+      - 'crates/socket-patch-core/src/vendor/jvm/**'
       - 'crates/socket-patch-cli/tests/docker_e2e_sbt.rs'
       - 'crates/socket-patch-cli/tests/e2e_sbt_build.rs'
       - 'crates/socket-patch-cli/tests/e2e_sbt_vendor_build.rs'
