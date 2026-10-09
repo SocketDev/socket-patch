@@ -96,15 +96,15 @@
 |---|---|
 | Production code (non-blank, non-comment) | **134.5K lines** in `socket-patch-core` + `socket-patch-cli` on `9c43dfc` (2026-10-06; the same script gives 117.8K at the snapshot, which the review reported as 117.6K + 34.8K comment + 9K blank). The growth is mostly the Gradle landing (#646) |
 | Inline `#[cfg(test)]` code in `src/` | ~228K lines on `9c43dfc` (~197K at the snapshot) |
-| Integration tests (`crates/*/tests`) | ~298K lines in **235 separate test executables** in core + CLI (36 core, 199 CLI: top-level files plus 12 directory binaries; recounted at `b762f41`, 2026-10-08; ~296K at `05ecc6e`; 224 and ~283K at `9c43dfc`; ~255K at the snapshot) |
+| Integration tests (`crates/*/tests`) | ~298K lines in **240 separate test executables** in core + CLI (37 core, 203 CLI: top-level files plus 12 directory binaries; recounted at `f3c6313`, 2026-10-09; 235 at `b762f41`; ~296K at `05ecc6e`; 224 and ~283K at `9c43dfc`; ~255K at the snapshot) |
 | Test : production ratio | ~2.8 : 1 overall; ~7 : 1 for the CLI crate |
-| Largest file | `patch/redirect/mod.rs`: 22,272 lines at `b762f41` (2026-10-08; 21,936 at `db83f01`; 7.6K production, 14.3K inline tests; 17,517 at the snapshot, 6.2K production then) |
+| Largest file | `patch/redirect/mod.rs`: 23,913 lines at `f3c6313` (2026-10-09; 22,272 at `b762f41`; 21,936 at `db83f01`; 7.6K production, 14.3K inline tests; 17,517 at the snapshot, 6.2K production then) |
 | Functions > 200 / > 500 lines | 74 / 11 at `1c6c509` (61 / 9 at the snapshot: `run_scan` 1,540 on `045d7ec`, now 1,577; `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
 | CLI surface | 9 visible + 2 hidden subcommands; 57 visible long flags; 27 globals on every command; 43 env bindings (84 `SOCKET_*` names in source); 156 documented `errorCode`s; ~570 code-like strings in source |
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |
-| `CLI_CONTRACT.md` | 423 KB at `b762f41` (2026-10-08; 417 KB at `431b818`; 415 KB at `c5be5d1`, 332 KB at the snapshot); the longest *line* is 12,077 characters at `c5be5d1` |
-| Open issues | About 320 on 2026-10-08 at 03:40Z (~194 `bughunt`, ~109 `arch-audit`; 322 on 2026-10-07). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
+| `CLI_CONTRACT.md` | 460 KB (459,861 bytes) at `f3c6313` (2026-10-09; 423 KB at `b762f41`, 2026-10-08; 417 KB at `431b818`; 415 KB at `c5be5d1`, 332 KB at the snapshot); the longest *line* is 12,077 characters at `c5be5d1` |
+| Open issues | 287 on 2026-10-09 at 03:40Z (180 `bughunt`, 80 `arch-audit`; about 320 on 2026-10-08; 322 on 2026-10-07). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
 | PR size | Recent squash merges of +53K, +85K and +94K lines |
 
 ---

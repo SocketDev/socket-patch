@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-08T21:47Z · main @ 830749f_
+_Last updated 2026-10-09T03:52Z · main @ f3c6313_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -74,6 +74,7 @@ _Last updated 2026-10-08T21:47Z · main @ 830749f_
 | C75 | 2 | Every HTTP client trusts only reqwest's bundled webpki roots (no platform store, `SSL_CERT_FILE` or extra-CA knob), so behind a TLS-inspecting proxy the documented `HTTPS_PROXY` route fails with `UnknownIssuer` on every API, registry, telemetry and self-update call. | new finding | #1107 | filed #1107 |
 | C76 | 3 | `validate_paths` (#1029) refuses a directory manifest only when `--manifest-path` is spelled differently from the default: exit 2 with no `--json` output vs exit 1 `manifest_unreadable` for the same file. | new finding | #1123 | filed #1123 |
 | C77 | 3 | The VEX document (`vex --output`, embedded `--vex`) is written with `tokio::fs::write`, not the stage + rename writer: a failed write leaves a truncated OpenVEX file the stale-doc cleanup can't remove. | new finding | #1144 | filed #1144 |
+| C78 | 3 | The hosted upstream restore sends every public-registry lookup at once (`join_all` in 5 formats); `utils::concurrent::registry_concurrency()` (cap 4, fd-tight 1) has no caller: 40 pins → 40 in flight. | new finding | #1220 | filed #1220 |
 
 **Handed off** (to the CI janitor): coverage de-instrumentation, the LTO `docker-base` build, a reusable compat workflow, per-leg compiles and dead CI path filters (review 8.2, 8.5 B/C/E).
 
