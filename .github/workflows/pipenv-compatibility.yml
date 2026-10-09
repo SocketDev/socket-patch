@@ -10,24 +10,20 @@ name: Pipenv compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Only this ecosystem's own files. A change to shared engine code
+    # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
+    # push to main, or on demand via workflow_dispatch on the PR branch;
+    # ci.yml's per-ecosystem blocking slice still runs on every PR and in
+    # the merge queue (#1198).
     paths:
       - '.github/actions/upload-artifact/**'
-      - 'crates/socket-patch-core/src/patch/redirect/pipenv.rs'
-      - 'crates/socket-patch-core/src/vendor/pypi_pipenv.rs'
+      - '.github/workflows/pipenv-compatibility.yml'
+      - 'crates/*/src/**/*pipenv*'
+      - 'crates/*/src/**/*pipenv*/**'
       - 'crates/socket-patch-core/src/vendor/pypi.rs'
-      - 'crates/socket-patch-core/src/vendor/lock_inventory/**'
       - 'crates/socket-patch-core/src/crawlers/python_crawler.rs'
-      - 'crates/socket-patch-core/src/utils/pipenv.rs'
-      - 'crates/socket-patch-cli/src/commands/scan/hosted.rs'
-      - 'crates/socket-patch-cli/src/commands/vendor.rs'
-      - 'crates/socket-patch-cli/src/commands/rollback.rs'
-      - 'crates/socket-patch-cli/src/commands/vex.rs'
-      - 'crates/socket-patch-core/src/patch/redirect/replay.rs'
       - 'scripts/backtest-pipenv.py'
       - 'scripts/tests/test_backtest_harnesses.py'
-      - 'crates/socket-patch-core/src/vex/**'
-      - 'crates/socket-patch-cli/src/commands/vex_sources.rs'
-      - '.github/workflows/pipenv-compatibility.yml'
   push:
     branches: [main]
   workflow_dispatch:
