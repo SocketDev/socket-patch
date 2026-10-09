@@ -21,7 +21,7 @@ _Last updated 2026-10-09T17:45Z · main @ a8e9397_
 | 4 | #782 E41: delete dead `lock_inventory/wired.rs` (260 prod lines) | 0 | 0 | ≈2.3 | L | ≈4.6 | skipped: its tests live in `lock_inventory/tests.rs` (#1274) |
 | 5 | #1220 (C78): upstream restore through `utils::concurrency` | 1 | 0 | ≈5 | M | ≈11 | skipped: upstream files (#1279 maintainer draft, #1188, #1283, #1026) |
 
-Re-ranked 2026-10-09T16:56Z at `a8e9397` against 60 open PRs (about 40 new `agent/v5-*` fixer drafts, mostly the NuGet, PyPI, cargo, berry and gem backends). Still skipped by file overlap: #914 rest (`vendor/common.rs`, #1279), #1202 rest (`nuget_feed.rs`, #1279/#1288), #705 (`apply.rs`), #675/#647 (`scan`, `api/client.rs`), #823 (`spawn_env_hygiene.rs`, #1049), #782 leftovers (`commands/vendor.rs`, `vendor/state.rs`). Free but low: E37 composer `normalize_version`, C17 digests in `group_commit.rs` + `jvm/mod.rs`, #1270 (E95, fixer-sized).
+Re-ranked 2026-10-09T16:56Z at `a8e9397` against 60 open PRs (~40 new `agent/v5-*` fixer drafts). Still skipped by file overlap: #914 rest (`vendor/common.rs`, #1279), #1202 rest (`nuget_feed.rs`, #1279/#1288), #705 (`apply.rs`), #675/#647 (`scan`, `api/client.rs`), #823 (`spawn_env_hygiene.rs`, #1049), #782 leftovers (`commands/vendor.rs`, `vendor/state.rs`). Free but low: E37 composer `normalize_version`, C17 digests in `group_commit.rs` + `jvm/mod.rs`, #1270 (E95, fixer-sized).
 
 **Notes:**
 - pnpm layout (#1347): ask `crawlers::pnpm_layout` (`configured_modules_dirs`, `installed_store_in`) for where pnpm installs; never probe a literal `node_modules/.pnpm` again. A snapshot read through it goes through `root()` (recording not reused), only when `node_modules` holds no store.
