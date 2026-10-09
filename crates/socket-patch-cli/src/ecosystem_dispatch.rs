@@ -30,8 +30,8 @@ pub fn crawl_covers_purl(purl: &str) -> bool {
 }
 
 /// Of `purls` (manifest keys), the Cargo ones whose agent-mode in-place
-/// patch may still be on disk: a copy [`find_cargo_copies`] locates with at
-/// least one file at its record's afterHash, or one that cannot be read to
+/// patch may still be on disk: a copy [`find_cargo_copies`] locates
+/// (`shadowed_registry`: see there) with at least one file at its record's afterHash, or one that cannot be read to
 /// tell (an I/O error, an unsafe key: kept fail-closed). Sorted.
 ///
 /// Cargo is the one ecosystem whose patched copy outlives the project's
@@ -47,6 +47,7 @@ pub async fn cargo_copies_still_patched<'a>(
     purls: impl IntoIterator<Item = &'a String>,
     options: &CrawlerOptions,
     blobs_path: &std::path::Path,
+    shadowed_registry: bool,
 ) -> Vec<String> {
     use socket_patch_core::patch::rollback::{verify_file_rollback, VerifyRollbackStatus};
     let cargo: Vec<String> = purls
@@ -58,7 +59,7 @@ pub async fn cargo_copies_still_patched<'a>(
     if cargo.is_empty() {
         return Vec::new();
     }
-    let found = find_cargo_copies(cargo, options).await;
+    let found = find_cargo_copies(cargo, options, shadowed_registry).await;
     let mut patched = Vec::new();
     for (purl, paths) in &found {
         let Some(record) = manifest.patches.get(purl) else {
@@ -85,19 +86,24 @@ pub async fn cargo_copies_still_patched<'a>(
     patched
 }
 
-/// Every copy of the Cargo `purls` that agent mode may have patched: the
-/// copies [`find_all_packages_for_rollback`] locates, plus — for a local
-/// project with a `cargo vendor` dir, whose crawl searches only that dir —
-/// the shared `$CARGO_HOME/registry/src` copies an earlier apply (before
-/// `cargo vendor`) may have patched.
+/// The copies of the Cargo `purls` [`find_all_packages_for_rollback`]
+/// locates (the roots rollback restores), plus, with `shadowed_registry`,
+/// the shared `$CARGO_HOME/registry/src` copies of a local Cargo project
+/// with a `cargo vendor` dir, whose crawl searches only that dir — where
+/// an apply from before `cargo vendor` may have left the patch. Callers
+/// only READ the shadowed copies (the prune's keep decision): rollback
+/// never writes a registry copy its own crawl would not reach.
 pub async fn find_cargo_copies(
     purls: Vec<String>,
     options: &CrawlerOptions,
+    shadowed_registry: bool,
 ) -> HashMap<String, Vec<PathBuf>> {
     let partitioned = HashMap::from([(Ecosystem::Cargo, purls)]);
     let mut found = find_all_packages_for_rollback(&partitioned, options, true).await;
     let local = !options.global && options.global_prefix.is_none();
-    if local && options.cwd.join("vendor").is_dir() {
+    let cargo_project =
+        options.cwd.join("Cargo.toml").is_file() || options.cwd.join("Cargo.lock").is_file();
+    if shadowed_registry && local && cargo_project && options.cwd.join("vendor").is_dir() {
         let registry = CrawlerOptions {
             cwd: options.cwd.clone(),
             global: true,

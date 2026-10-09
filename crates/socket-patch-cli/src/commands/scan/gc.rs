@@ -283,6 +283,7 @@ async fn keep_patched_cargo_copies(
         prunable.iter(),
         &common.crawler_options(),
         &socket_dir.join("blobs"),
+        true,
     )
     .await;
     prunable.retain(|p| !kept.contains(p));
@@ -293,8 +294,9 @@ async fn keep_patched_cargo_copies(
                 format!(
                     "kept {purl}: the project no longer resolves it, but its copy in the \
                      shared Cargo registry cache is still patched (or could not be \
-                     read to tell); run `socket-patch rollback {purl}` to restore that \
-                     copy and drop the entry"
+                     read to tell); run `socket-patch rollback {purl}` (with `--global` \
+                     when a `cargo vendor` dir hides the registry cache) to restore \
+                     that copy and drop the entry"
                 ),
             )
         })

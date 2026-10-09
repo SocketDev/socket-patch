@@ -518,4 +518,27 @@ async fn sync_keeps_shared_cache_entry_behind_a_cargo_vendor_dir() {
         "itoa entry dropped: {m:#}"
     );
     assert_eq!(std::fs::read(itoa_old.join("src/lib.rs")).unwrap(), patched);
+
+    // The warning's remedy: `rollback --global` reaches the hidden copy.
+    std::fs::write(socket.join("blobs").join(git_sha256(orig)), orig).unwrap();
+    let out = run(
+        &[
+            "rollback",
+            itoa,
+            "--global",
+            "--json",
+            "--offline",
+            "--cwd",
+            cwd,
+        ],
+        root,
+        &proxy_url,
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "rollback --global must exit 0:\n{stdout}"
+    );
+    assert_eq!(std::fs::read(itoa_old.join("src/lib.rs")).unwrap(), orig);
 }

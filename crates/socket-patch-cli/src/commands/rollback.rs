@@ -2040,6 +2040,7 @@ pub(crate) async fn rollback_patches_inner(
         &vendored_purls,
         &common.crawler_options(),
         &blobs_path,
+        false,
     )
     .await;
     let (cache_targets, vendored_targets): (Vec<_>, Vec<_>) = vendored_targets
@@ -2119,19 +2120,6 @@ pub(crate) async fn rollback_patches_inner(
         common.silent || common.json,
     )
     .await;
-    // A vendored crate restored for its shared-cache copy (#336) is looked
-    // up the way that copy was found: a `cargo vendor` dir hides the
-    // registry cache from the crawl above.
-    let cache_in_scope: Vec<String> = cache_patched
-        .iter()
-        .filter(|p| in_scope.contains(*p))
-        .cloned()
-        .collect();
-    if !cache_in_scope.is_empty() {
-        all_packages_multi.extend(
-            crate::ecosystem_dispatch::find_cargo_copies(cache_in_scope, &crawler_options).await,
-        );
-    }
     // One restore per physical copy, as apply patches them (#633).
     distinct_npm_copies(&mut all_packages_multi).await;
 
