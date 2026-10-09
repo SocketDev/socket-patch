@@ -1541,3 +1541,263 @@ async fn gem_hosted_default_cwd_keeps_project_local_remedy() {
         );
     }
 }
+
+/// #1109: Bundler also stops using system gems without an explicit `path`.
+/// `deployment` (local config or env) installs into `vendor/bundle`, and
+/// `simulate_version 5` (Bundler 4.x) or `default_install_uses_path`
+/// (Bundler 2.x) into `.bundle`. On a fresh checkout none of those stores
+/// exist yet, but `bundle install` still fetches into them and never reuses
+/// the `gem env` copy, so it is not stale: no warning, and the same run's
+/// `--vex` attests the purl.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_implicit_project_path_ignores_system_home_copy() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let cases: &[(&str, Option<&str>, &[(&str, &str)])] = &[
+        ("local deployment", Some("BUNDLE_DEPLOYMENT: \"true\""), &[]),
+        ("env deployment", None, &[("BUNDLE_DEPLOYMENT", "true")]),
+        (
+            "local simulate_version 5",
+            Some("BUNDLE_SIMULATE_VERSION: \"5\""),
+            &[],
+        ),
+        (
+            "local default_install_uses_path",
+            Some("BUNDLE_DEFAULT_INSTALL_USES_PATH: \"true\""),
+            &[],
+        ),
+        (
+            "env default_install_uses_path",
+            None,
+            &[("BUNDLE_DEFAULT_INSTALL_USES_PATH", "true")],
+        ),
+    ];
+    for (case, local, extra) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        if let Some(line) = local {
+            std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+            std::fs::write(proj.join(".bundle").join("config"), format!("---\n{line}\n")).unwrap();
+        }
+        let bin_dir = tmp.path().join("fake-bin");
+        let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
+
+        let (code, env, stderr, vex_path) =
+            hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, extra);
+        assert!(
+            stale_warnings(&env).is_empty(),
+            "{case}: bundler never reuses {}: {env}",
+            system_copy.display()
+        );
+        assert_eq!(
+            code, 0,
+            "{case}: the run must attest, not fail.\nenvelope: {env}\nstderr:\n{stderr}"
+        );
+        let doc = std::fs::read_to_string(&vex_path).expect("VEX written");
+        assert!(doc.contains(PURL), "{case}: purl not attested:\n{doc}");
+    }
+}
+
+/// #1109 controls: a falsy `deployment`, a `simulate_version` below 5, and
+/// a higher tier that turns system gems back on (`path.system`, or a falsy
+/// `disable_shared_gems`) all leave Bundler on the system gems, so the
+/// stale `gem env` copy still warns and stays out of the VEX.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_system_gems_settings_still_flag_system_home_copy() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let cases: &[(&str, Option<&str>, &[(&str, &str)])] = &[
+        ("local deployment false", Some("BUNDLE_DEPLOYMENT: \"false\""), &[]),
+        (
+            "local simulate_version 4",
+            Some("BUNDLE_SIMULATE_VERSION: \"4\""),
+            &[],
+        ),
+        (
+            "local path.system over env deployment",
+            Some("BUNDLE_PATH__SYSTEM: \"true\""),
+            &[("BUNDLE_DEPLOYMENT", "true")],
+        ),
+        (
+            "local disable_shared_gems false over env default_install_uses_path",
+            Some("BUNDLE_DISABLE_SHARED_GEMS: \"false\""),
+            &[("BUNDLE_DEFAULT_INSTALL_USES_PATH", "true")],
+        ),
+    ];
+    for (case, local, extra) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        if let Some(line) = local {
+            std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+            std::fs::write(proj.join(".bundle").join("config"), format!("---\n{line}\n")).unwrap();
+        }
+        let bin_dir = tmp.path().join("fake-bin");
+        let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
+
+        let (code, env, stderr, vex_path) =
+            hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, extra);
+        let warnings = stale_warnings(&env);
+        assert_eq!(warnings.len(), 1, "{case}: {env}");
+        assert!(
+            warnings[0].contains(&system_copy.display().to_string()),
+            "{case}: {}",
+            warnings[0]
+        );
+        if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+            assert!(!doc.contains(PURL), "{case}: stale purl attested:\n{doc}");
+        }
+        assert_ne!(code, 0, "{case}: stderr:\n{stderr}");
+    }
+}
+
+/// The lock `bundle install` writes once the hosted pin is installed
+/// (bundler >= 2.2: a separate patch-registry `GEM` section).
+fn converged_lock(api: &str) -> String {
+    let index_url = format!("{api}/patch-registry/gem/{TOKEN}/{UUID}/");
+    format!(
+        "GEM\n  remote: {index_url}\n  specs:\n    {DEP} ({DEP_VERSION})\n\n\
+         GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  {DEP} (= {DEP_VERSION})!\n\n\
+         BUNDLED WITH\n   2.6.9\n"
+    )
+}
+
+/// #1098 (and #1109 for standalone `vex`): when Bundler doesn't use system
+/// gems for the project, standalone `vex` must not judge the unused,
+/// unpatched copy in the `gem env` home. Each case scans, converges the
+/// lock the way `bundle install` would, then runs a manifest-less `vex`
+/// with the same fake `gem` on `PATH`:
+///
+/// - a fresh checkout under an explicit `path` (env, local or global
+///   config) or `deployment`, nothing installed yet: attested from the
+///   lock;
+/// - an installed `BUNDLE_PATH: gems` holding the PATCHED copy: verified.
+///
+/// The control, where Bundler does use system gems, still refuses the
+/// unpatched system copy with `not_applied`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_standalone_vex_ignores_unused_system_home_copy() {
+    use vex_e2e_common::{
+        assert_attested, assert_not_attested, run_vex, strip_ledgers, strip_manifest, Marker,
+        VexRun,
+    };
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let bin = vex_e2e_common::binary();
+    let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2026-4444"])];
+
+    enum Config {
+        None,
+        Local(&'static str),
+        Env(&'static str, &'static str),
+        Global(&'static str),
+    }
+    let cases: &[(&str, Config, bool, bool)] = &[
+        // (case, config, install the patched copy under `gems/`, attests)
+        (
+            "fresh, local path",
+            Config::Local("BUNDLE_PATH: \"vendor/bundle\""),
+            false,
+            true,
+        ),
+        (
+            "fresh, env path",
+            Config::Env("BUNDLE_PATH", "vendor/bundle"),
+            false,
+            true,
+        ),
+        (
+            "fresh, global path",
+            Config::Global("BUNDLE_PATH: \"vendor/bundle\""),
+            false,
+            true,
+        ),
+        (
+            "fresh, local deployment",
+            Config::Local("BUNDLE_DEPLOYMENT: \"true\""),
+            false,
+            true,
+        ),
+        (
+            "installed, local path gems",
+            Config::Local("BUNDLE_PATH: \"gems\""),
+            true,
+            true,
+        ),
+        ("control, system gems", Config::None, false, false),
+    ];
+    for (case, config, install, attests) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let bin_dir = tmp.path().join("fake-bin");
+        stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
+        let global_config = tmp.path().join("user-bundle-config");
+        let mut envs: Vec<(String, std::ffi::OsString)> =
+            vec![("PATH".into(), bin_dir.clone().into_os_string())];
+        match config {
+            Config::None => {}
+            Config::Local(line) => {
+                std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+                std::fs::write(proj.join(".bundle").join("config"), format!("---\n{line}\n"))
+                    .unwrap();
+            }
+            Config::Env(k, v) => envs.push(((*k).into(), (*v).into())),
+            Config::Global(line) => {
+                std::fs::write(&global_config, format!("---\n{line}\n")).unwrap();
+                envs.push(("BUNDLE_USER_CONFIG".into(), global_config.clone().into()));
+            }
+        }
+        let scan_env: Vec<(&str, &str)> = envs
+            .iter()
+            .filter(|(k, _)| k != "PATH")
+            .map(|(k, v)| (k.as_str(), v.to_str().unwrap()))
+            .collect();
+        let (code, env, stderr, _) =
+            hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, &scan_env);
+        assert_eq!(
+            code == 0,
+            *attests,
+            "{case}: hosted scan --vex.\nenvelope: {env}\nstderr:\n{stderr}"
+        );
+        strip_manifest(&proj);
+        strip_ledgers(&proj);
+        std::fs::write(proj.join("Gemfile.lock"), converged_lock(&server.uri())).unwrap();
+        if *install {
+            let gem_dir = proj
+                .join("gems")
+                .join("ruby")
+                .join("3.3.0")
+                .join("gems")
+                .join(format!("{DEP}-{DEP_VERSION}"));
+            std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+            std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), PATCHED_LIB).unwrap();
+        }
+
+        let run = VexRun {
+            api_url: Some(server.uri()),
+            api_token: Some("fake".into()),
+            org: Some(ORG.into()),
+            patch_server_url: Some(server.uri()),
+            product: Some("pkg:gem/app@1.0.0".into()),
+            envs,
+            ..VexRun::default()
+        };
+        let out = run_vex(&bin, &proj, &run);
+        if *attests {
+            assert_eq!(out.code, Some(0), "{case}: {out}");
+            assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+        } else {
+            assert_eq!(out.code, Some(1), "{case}: {out}");
+            assert_not_attested(&out.envelope, PURL, "not_applied");
+        }
+    }
+}
