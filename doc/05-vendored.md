@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ a80b89e on 2026-10-09 by audit-ecosystems (the scala-cli and sbt evidence policies for E95; the E10 reactor bullet after #1036). Earlier: `f3c6313` on 2026-10-09 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
+_Last checked against main @ 9ab72d4 on 2026-10-09 by audit-ecosystems (the requirements.txt pin readers for E96; E68 re-checked after #1245). Earlier: `a80b89e` on 2026-10-09 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -254,6 +254,7 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E96}} October 9: requirements.txt exact pins are read by three grammars: `utils::requirements::exact_pin` (inventory, VEX), the hosted `requirement_version` regex, and the vendored `parse_requirement_line`/`scan_pins`. They have drifted: `six (==1.16.0)` is an exact pin to the inventory and to hosted mode, but vendored refuses it as `pypi_requirement_not_pinned`, and only hosted accepts `===` (executed twice). #604 is the same split on PEP 440 equality.
 - {{E95}} October 9: the two JVM evidence readers keep opposite policies for a record they can't read. sbt evidence fails closed (`formats::sbt::evidence::resolution` returns `None`), but `crawlers::scala_evidence::discover` skips an oversized or unparseable Bloop file. A truncated `-test` twin therefore hides a `//> using test.dep` conflict, and the vendored scala-cli gate passes.
 - {{E74}} October 7: "is this vendored entry still in use" had four answers; it is now one discovery verdict (`Discovery::vendor_entry_in_use`), so every ecosystem's dead entries are pruned and JVM orphans are reported (#1050).
 - {{E71}} October 7: a re-pin or remove left the older patch generation's wiring behind. `patch::redirect::generation` now owns the pin-name grammar and the hosted re-pin sweep (Cargo registry block, go.sum pair, Maven `-socket.<hex8>` repository, `remove`/`rollback` by generation; #1035), and vendored uv/Hatch re-vendor was fixed by #943. #1008 fixed #954 for the npm family: while the superseding patch is unbuilt, the run keeps the older vendored patch and reports a skip. Every other vendored backend still fails that run (E94 below), and the Go and Maven restores still leave older generations' residue.

@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against main @ a80b89e on 2026-10-09 by audit-ecosystems (the E78 bullet after #1007; the pnpm v9 dual lookup is unchanged). Earlier: `f3c6313` on 2026-10-09 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
+_Last checked against main @ 9ab72d4 on 2026-10-09 by audit-ecosystems (the E17 bun-lock presence bullet after #1009). Earlier: `a80b89e` on 2026-10-09 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -80,7 +80,7 @@ The question "which lockfile drives installs?" was answered in **at least eight 
 - **sha512 SRI formatting** is inlined at `npm_pack.rs:27`, `bun_lock.rs:388` and `vlt_preflight.rs:70`. `utils/digest.rs` has no SRI helper.
 - **npm tarball URLs:** the canonical `registry_fetch::npm_tarball_url` is re-implemented only at `bun_lockb.rs:235`, which writes format-1 lock semantics, not a fetch URL. vlt inventory uses the canonical helper, and the second `NPM_REGISTRY` constant is gone (#574). {{E02}}
 - **vlt `registry_base`:** one shared `vlt_lock_text::registry_base` serves lock inventory and hosted restore. It follows vlt 1.3.5 DepID hydration (scoped registries; `~~` as the `npm` alias); the two private copies were deleted (#574). {{E03}}
-- **"Is a bun lock present":** seven sites with three semantics. lstat (`lock_inventory/bun.rs::bun_text_lock_present`, which also feeds the GC in-use probe, and VEX `DiscoverCtx::exists`) treats a dangling `bun.lock` symlink as present; `Path::exists` (`hosted/engine.rs::bun_lock_present`, `bun_lock.rs::binary_lock_drives`, `bun_workspace.rs`, CLI `repair.rs`) and `is_file` (`pkg_managers.rs`) treat it as absent, like Bun itself. Proved on `045d7ec`: with a dangling `bun.lock` beside a `bun.lockb` that Bun installs from, the inventory returns nothing while vendored and hosted write `bun.lockb`. {{E17}}
+- **"Is a bun lock present":** one answer since #1009. `lock_inventory::bun_text_lock_drives` uses `stat` semantics, as Bun does: only `NotFound` means absent, so a dangling `bun.lock` symlink leaves `bun.lockb` live, while ELOOP, ENOTDIR or EACCES shadow both locks. `bun_binary_lock_drives` is derived from it, and the inventory, hosted engine, vendored `bun_lock`/`bun_workspace`, wired scan and GC all route through it. {{E17}}
 - **`name@spec` splitting** is written twice (`yarn_classic_lock::split_pattern`, `bun_lock_text::split_name_spec`). npm purl → (name, version) is parsed three more times outside `utils/purl.rs`.
 - **Wiring `KIND_*` constants** are private to each backend but re-spelled as string literals in `recover.rs` (7 production sites); the `state.rs` copy is test-only. {{E18}}
 - **Recursion depth:** the legacy npm `dependencies` recursion is bounded at 64 in two places and unbounded in two others.

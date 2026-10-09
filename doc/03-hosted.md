@@ -2,7 +2,7 @@
 
 ## Part 3: Hosted mode (redirect, hosted engine, upstream restore, Node addon)
 
-_Last checked against main @ 03b9418 on 2026-10-09 by audit-ecosystems (3.6 in-memory engine sizes and gaps re-measured for decision #1200; the pinned-check bullet rewritten for #1058). Earlier: `cf8b164` on 2026-10-08 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
+_Last checked against main @ 9ab72d4 on 2026-10-09 by audit-ecosystems (E63 re-checked: hosted Maven is now the only hosted JVM planner that splices `maven_suffixed_version` unchecked, since sbt validates its values; hosted requirements.txt pin grammar compared for E96). Earlier: `03b9418` on 2026-10-09 by audit-ecosystems; older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `patch/redirect/**`, `hosted/**`, `crates/socket-patch-node/**`, CLI `scan/hosted.rs`, `scan/hosted/*`, `hosted_bundle.rs`.
 
