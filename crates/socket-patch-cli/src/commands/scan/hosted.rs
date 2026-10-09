@@ -1583,16 +1583,14 @@ pub(crate) async fn run_redirect_selected(
             .iter()
             .any(|f| f == "go.mod" || f.ends_with("/go.mod"))
     {
-        for w in crate::commands::apply::go_consumer_sync_warnings(
+        for (code, detail) in socket_patch_core::vendor::go_consumer_sync::audit_warnings(
             &common.cwd,
             &std::collections::HashMap::new(),
         )
         .await
         {
-            engine_warnings.push(socket_patch_core::patch::redirect::RewriteWarning {
-                code: w.code,
-                detail: w.detail,
-            });
+            engine_warnings
+                .push(socket_patch_core::patch::redirect::RewriteWarning { code, detail });
         }
     }
     let mut warnings: Vec<serde_json::Value> =

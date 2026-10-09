@@ -3802,13 +3802,16 @@ pub(crate) async fn vendor_records_reusing(
     // A vendored Go module builds only if the committed vendor/modules.txt
     // and the go.mod requirements agree with its `replace` (#343, #618).
     if !common.dry_run && records.keys().any(|p| p.starts_with("pkg:golang/")) {
-        for w in
-            crate::commands::apply::go_consumer_sync_warnings(&common.cwd, &HashMap::new()).await
-        {
+        let warnings = socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+            &common.cwd,
+            &HashMap::new(),
+        )
+        .await;
+        for (code, detail) in warnings {
             if !common.json && !common.silent {
-                eprintln!("Warning: {}", w.detail);
+                eprintln!("Warning: {detail}");
             }
-            env.warnings.push(w);
+            env.warnings.push(RunWarning { code, detail });
         }
     }
 

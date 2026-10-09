@@ -393,17 +393,8 @@ fn publish(tmp: &Path, module: &str, version: &str, files: &[(&str, &str)]) {
 }
 
 /// The JSON `warnings[]` codes of a `--json` run's stdout.
-fn warning_codes(stdout: &str) -> Vec<String> {
-    let env: serde_json::Value = serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("not a JSON envelope ({e}):\n{stdout}"));
-    env["warnings"]
-        .as_array()
-        .map(|ws| {
-            ws.iter()
-                .filter_map(|w| w["code"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+fn warnings_of(stdout: &str) -> Vec<String> {
+    common::envelope::codes_in(&common::envelope::parse_json_envelope(stdout)["warnings"])
 }
 
 /// #343: in a project with a committed `vendor/` (`go mod vendor`), the
@@ -452,7 +443,7 @@ fn committed_vendor_dir_needs_go_mod_vendor_after_apply_and_rollback() {
     );
     assert_eq!(code, 0, "apply failed.\n{so}\n{se}");
     assert!(
-        warning_codes(&so).contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
+        warnings_of(&so).contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
         "apply must name the vendor/modules.txt regeneration:\n{so}"
     );
     let broken = go(&consumer, &["build", "./..."], &goenv);
@@ -510,7 +501,7 @@ fn committed_vendor_dir_needs_go_mod_vendor_after_apply_and_rollback() {
     );
     assert_eq!(code, 0, "rollback failed.\n{so}\n{se}");
     assert!(
-        warning_codes(&so).contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
+        warnings_of(&so).contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
         "rollback must name the vendor/modules.txt regeneration:\n{so}"
     );
     let (code, _so, se) = run_socket(
@@ -640,7 +631,7 @@ fn patched_go_mod_requirement_bump_needs_go_mod_tidy() {
     );
     assert_eq!(code, 0, "apply failed.\n{so}\n{se}");
     assert!(
-        warning_codes(&so).contains(&"go_requirements_out_of_sync".to_string()),
+        warnings_of(&so).contains(&"go_requirements_out_of_sync".to_string()),
         "apply must name the go.mod/go.sum refresh:\n{so}"
     );
     let broken = go(&consumer, &["build", "./..."], &goenv);

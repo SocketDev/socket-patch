@@ -155,6 +155,19 @@ pub async fn audit(
     issues
 }
 
+/// [`audit`] as `(code, detail)` warning pairs, for the commands' warning
+/// channels.
+pub async fn audit_warnings(
+    project_root: &Path,
+    pristine_go_mods: &HashMap<String, PathBuf>,
+) -> Vec<(String, String)> {
+    audit(project_root, pristine_go_mods)
+        .await
+        .into_iter()
+        .map(|issue| (issue.code().to_string(), issue.to_string()))
+        .collect()
+}
+
 /// Where go looks for the vendor directory's `modules.txt`, and the command
 /// that regenerates it: the workspace root's `vendor/` (`go work vendor`)
 /// when a `go.work` is in effect, else the module's own (`go mod vendor`).
