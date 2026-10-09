@@ -8,6 +8,9 @@
 //! This is the CLI counterpart of the depscan-side install-verify e2e; the
 //! rewriter bytes themselves are pinned by the shared golden fixtures.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -830,7 +833,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
         let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
         assert_eq!(code, Some(0), "{label}: rollback: {env:#}");
         assert_eq!(
-            env["hosted"]["reverted"],
+            rollback_json::hosted_reverted(&env),
             serde_json::json!([PURL]),
             "{label}: {env:#}"
         );
@@ -928,7 +931,7 @@ async fn yarn_berry_catalog_dependency_is_pinned_and_rolled_back() {
     let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
     assert_eq!(code, Some(0), "rollback: {env:#}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&env),
         serde_json::json!([PURL]),
         "{env:#}"
     );
@@ -990,7 +993,7 @@ async fn yarn_berry_legacy_archive_url_pin_is_rolled_back_and_repinned() {
     let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
     assert_eq!(code, Some(0), "rollback: {env:#}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&env),
         serde_json::json!([PURL]),
         "{env:#}"
     );
@@ -1723,7 +1726,7 @@ async fn bun_rollback_keeps_the_bunfig_registry_tarball_url() {
         let (code, env) = rollback_json(tmp.path(), &server);
         assert_eq!(code, Some(0), "{mirror}: rollback: {env:#}");
         assert_eq!(
-            env["hosted"]["reverted"],
+            rollback_json::hosted_reverted(&env),
             serde_json::json!([PURL]),
             "{mirror}: {env:#}"
         );
@@ -5041,7 +5044,7 @@ async fn yarn_berry_rollback_restores_the_registry_archive_url_binding() {
     let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
     assert_eq!(code, Some(0), "rollback: {env:#}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&env),
         serde_json::json!([PURL]),
         "{env:#}"
     );
@@ -5169,7 +5172,7 @@ async fn yarn_berry_rollback_reads_the_tarball_from_the_project_registry() {
     let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
     assert_eq!(code, Some(0), "rollback: {env:#}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&env),
         serde_json::json!([PURL]),
         "{env:#}"
     );
@@ -5214,7 +5217,7 @@ fn pnpm_pin_and_rollback_env(root: &Path, server: &MockServer) -> (String, serde
     let (code, env) = rollback_json(root, server);
     assert_eq!(code, Some(0), "rollback: {env:#}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&env),
         serde_json::json!([PURL]),
         "{env:#}"
     );
@@ -5447,7 +5450,7 @@ async fn pnpm_rollback_reads_the_scope_registry_for_a_scoped_name() {
         let (code, env) = rollback_json(tmp.path(), &server);
         assert_eq!(code, Some(0), "rollback: {env:#}");
         assert_eq!(
-            env["hosted"]["reverted"],
+            rollback_json::hosted_reverted(&env),
             serde_json::json!(["pkg:npm/@socktest/scoped-pkg@1.0.0"]),
             "{env:#}"
         );
@@ -5493,7 +5496,7 @@ async fn pnpm_rollback_falls_back_from_an_unreadable_mirror_and_warns() {
     let (code, env) = rollback_json(tmp.path(), &server);
     assert_eq!(code, Some(0), "rollback: {env:#}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&env),
         serde_json::json!([PURL]),
         "{env:#}"
     );

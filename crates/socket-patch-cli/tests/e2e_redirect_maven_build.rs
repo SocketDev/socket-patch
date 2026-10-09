@@ -52,6 +52,9 @@
 //! `SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}` gates in
 //! `maven_build_common`.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "hosted_maven_common/mod.rs"]
 mod hosted_maven_common;
 #[path = "maven_build_common/mod.rs"]
@@ -504,7 +507,7 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     );
     assert_eq!(code, Some(0), "rollback --offline: {env}\n{stderr}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&env),
         serde_json::json!([purl()]),
         "rollback restores the hosted pin: {env}"
     );

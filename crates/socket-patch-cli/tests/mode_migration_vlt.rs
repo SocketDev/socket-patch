@@ -7,6 +7,9 @@
 //! checkout's locked install. Each leg is `vlt_pinned_matrix_migration_<leg>`
 //! and prints one `VLT-LEG` line.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -424,7 +427,7 @@ async fn vlt_pinned_matrix_migration_scoped_unwind_one_of_two() {
     let out = rollback_all(&fx, &fx.proj, &[&a.purl()]);
     assert_eq!(out.code, 0, "{out}");
     assert_eq!(
-        out.json()["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&out.json()),
         serde_json::json!([a.purl()]),
         "only a is restored: {out}"
     );

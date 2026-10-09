@@ -7,6 +7,9 @@
 //! patch API. No go toolchain is needed: every assertion is on the files
 //! the CLI writes and on its JSON envelope.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -418,9 +421,9 @@ async fn hosted_rollback_restores_go_sum_byte_for_byte() {
         "offline must refuse\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(doc["hosted"]["failed"][0]["purl"], UPURL, "{doc}");
+    assert_eq!(rollback_json::hosted_failed(&doc)[0]["purl"], UPURL, "{doc}");
     assert!(
-        doc["hosted"]["failed"][0]["error"]
+        rollback_json::hosted_failed(&doc)[0]["error"]
             .as_str()
             .is_some_and(|e| e.contains("this run is offline") && e.contains("go.mod")),
         "{doc}"
@@ -443,7 +446,7 @@ async fn hosted_rollback_restores_go_sum_byte_for_byte() {
     );
     let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
-        doc["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&doc),
         serde_json::json!([UPURL]),
         "{doc}"
     );

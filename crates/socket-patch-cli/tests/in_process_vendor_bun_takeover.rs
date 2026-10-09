@@ -43,6 +43,9 @@
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
 //! telemetry hard-disabled; each test runs in its own tempdir.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -880,8 +883,8 @@ fn bun_scoped_rollback_and_remove_of_a_digestless_hosted_record_unwind_only_that
             "scoped {verb} over a digest-less hosted line must succeed: {env:#}"
         );
         if verb == "rollback" {
-            assert_eq!(env["hosted"]["reverted"], json!([PURL]), "{env:#}");
-            assert_eq!(env["hosted"]["failed"], json!([]), "{env:#}");
+            assert_eq!(rollback_json::hosted_reverted(&env), json!([PURL]), "{env:#}");
+            assert_eq!(rollback_json::hosted_failed(&env), json!([]), "{env:#}");
         } else {
             assert!(env["error"].is_null(), "{env:#}");
         }
@@ -1009,8 +1012,8 @@ fn bun_scoped_rollback_of_one_of_two_hosted_records_unwinds_only_that_purl() {
     );
     assert_eq!(code, 0, "scoped rollback must succeed: {env:#}");
     assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(env["hosted"]["reverted"], json!([PURL]), "{env:#}");
-    assert_eq!(env["hosted"]["failed"], json!([]), "{env:#}");
+    assert_eq!(rollback_json::hosted_reverted(&env), json!([PURL]), "{env:#}");
+    assert_eq!(rollback_json::hosted_failed(&env), json!([]), "{env:#}");
     assert_only_left_pad_unwound(root, &pristine);
 
     // The last pin out: pristine lock, no ledger anywhere.

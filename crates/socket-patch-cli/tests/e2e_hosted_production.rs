@@ -81,6 +81,9 @@
 //!   cargo test -p socket-patch-cli --test e2e_hosted_production -- --ignored
 //! ```
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "common/mod.rs"]
 mod common;
 use common::binary;
@@ -1062,7 +1065,7 @@ fn npm_package_lock_hosted_install_proof() {
     let rb: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("{LEG}: rollback --json is not JSON ({e}):\n{stdout}"));
     assert_eq!(
-        rb["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&rb),
         serde_json::json!([NPM_PURL]),
         "{LEG}: rollback restores the hosted pin: {rb:#}"
     );

@@ -371,8 +371,8 @@ fn apply_and_rollback_reach_both_vlt_peer_variant_copies_from_an_importer_link()
 
     let (code, v) = run_rollback(&root);
     assert_eq!(code, 0, "rollback must succeed; envelope={v}");
-    assert_eq!(v["rolledBack"], 1, "envelope={v}");
-    assert_eq!(v["alreadyOriginal"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["rolledBack"], 1, "envelope={v}");
+    assert_eq!(crate::rollback_json::already_original(&v), 0, "envelope={v}");
     assert_vlt_copies([&primary, &twin], false, "after rollback");
 }
 
@@ -394,8 +394,8 @@ fn apply_and_rollback_reach_both_transitive_only_vlt_store_copies() {
 
     let (code, v) = run_rollback(&root);
     assert_eq!(code, 0, "rollback must succeed; envelope={v}");
-    assert_eq!(v["rolledBack"], 1, "envelope={v}");
-    assert_eq!(v["alreadyOriginal"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["rolledBack"], 1, "envelope={v}");
+    assert_eq!(crate::rollback_json::already_original(&v), 1, "envelope={v}");
     assert_vlt_copies([&primary, &twin], false, "after rollback");
 }
 
@@ -509,8 +509,8 @@ fn apply_and_rollback_report_a_write_to_only_a_store_twin() {
         let (code, v) = run_rollback(&root);
         assert_eq!(code, 0, "{layout}: rollback; envelope={v}");
         assert_vlt_copies([&primary, &twin], false, "after rollback");
-        assert_eq!(v["rolledBack"], 1, "{layout}: envelope={v}");
-        assert_eq!(v["alreadyOriginal"], 0, "{layout}: envelope={v}");
+        assert_eq!(v["summary"]["rolledBack"], 1, "{layout}: envelope={v}");
+        assert_eq!(crate::rollback_json::already_original(&v), 0, "{layout}: envelope={v}");
     }
 }
 
@@ -775,8 +775,8 @@ fn apply_and_rollback_visit_a_pnpm_workspace_member_link_once() {
     let (code, v) = run_rollback_with(root, &["--preserve-state".as_ref()]);
     assert_eq!(code, 0, "rollback; envelope={v}");
     assert_eq!(std::fs::read(&store_copy).unwrap(), original);
-    assert_eq!(v["rolledBack"], 1, "rollback; envelope={v}");
-    assert_eq!(v["alreadyOriginal"], 0, "rollback; envelope={v}");
+    assert_eq!(v["summary"]["rolledBack"], 1, "rollback; envelope={v}");
+    assert_eq!(crate::rollback_json::already_original(&v), 0, "rollback; envelope={v}");
 
     // A path target still selects the copy through the member's link.
     let (code, v) = run_apply(root);
@@ -785,8 +785,8 @@ fn apply_and_rollback_visit_a_pnpm_workspace_member_link_once() {
     let (code, v) = run_rollback_with(root, &["packages/a".as_ref()]);
     assert_eq!(code, 0, "scoped rollback; envelope={v}");
     assert_eq!(std::fs::read(&store_copy).unwrap(), original);
-    assert_eq!(v["rolledBack"], 1, "scoped rollback; envelope={v}");
-    assert_eq!(v["alreadyOriginal"], 0, "scoped rollback; envelope={v}");
+    assert_eq!(v["summary"]["rolledBack"], 1, "scoped rollback; envelope={v}");
+    assert_eq!(crate::rollback_json::already_original(&v), 0, "scoped rollback; envelope={v}");
 }
 
 /// One pnpm 11+ isolated global install, `<v11>/<hash>/node_modules`, with

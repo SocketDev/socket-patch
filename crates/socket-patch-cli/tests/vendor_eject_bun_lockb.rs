@@ -21,6 +21,9 @@
 //! registry (`SOCKET_NPM_REGISTRY`) and the patch-server origin
 //! (`SOCKET_PATCH_SERVER_URL`) all point at a wiremock.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -416,7 +419,8 @@ async fn rollback_and_offline_vendor_refuse_with_the_checkout_remedy() {
 
     let (code, env) = p.run_json(&["rollback", "--yes"]);
     assert_eq!(code, 1, "{env:#}");
-    let failed = env["hosted"]["failed"]
+    let failed_view = rollback_json::hosted_failed(&env);
+    let failed = failed_view
         .as_array()
         .cloned()
         .unwrap_or_default();

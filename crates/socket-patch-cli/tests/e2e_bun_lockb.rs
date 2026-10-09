@@ -10,6 +10,9 @@
 //! SOCKET_PATCH_BUN_LOCKB_WRITER points at the writer when testing a newer
 //! reader against a binary lock from an older release.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -133,8 +136,9 @@ fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &
     // The refused pin is the run's only outcome: a total failure (#1066).
     assert_eq!(env["status"], "error", "{env}");
     assert_eq!(env["error"]["code"], "rollback_failed", "{env}");
-    assert_eq!(env["failed"], 1, "{env}");
-    let failed = env["hosted"]["failed"]
+    assert_eq!(env["summary"]["failed"], 1, "{env}");
+    let failed_view = rollback_json::hosted_failed(&env);
+    let failed = failed_view
         .as_array()
         .cloned()
         .unwrap_or_default();

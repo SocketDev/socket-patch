@@ -4,6 +4,8 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/rollback_json.rs"]
+mod rollback_json;
 #[path = "../common/pty_io.rs"]
 mod pty_io;
 #[path = "../vlt_hosted_common/mod.rs"]

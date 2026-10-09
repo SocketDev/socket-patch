@@ -29,7 +29,7 @@
 //! a file inside it whose on-disk bytes hash to `afterHash`, and asserts
 //! the rollback actually (a) discovered the package via that ecosystem's
 //! crawler, (b) restored the file's original bytes on disk, and (c)
-//! reported `rolledBack == 1` for that exact PURL. A broken/removed
+//! reported `summary.rolledBack == 1` for that exact PURL. A broken/removed
 //! rollback dispatch branch yields zero discovered packages → the
 //! assertions fail loudly.
 
@@ -466,24 +466,28 @@ fn assert_rollback_restored(cwd: &Path, ecosystem: &str, fixture: &RollbackFixtu
         "rollback --ecosystems={ecosystem}: expected success; env={env}"
     );
     assert_eq!(
-        env["rolledBack"].as_u64(),
+        env["summary"]["rolledBack"].as_u64(),
         Some(1),
         "rollback --ecosystems={ecosystem}: must roll back exactly the one installed package; env={env}"
     );
     assert_eq!(
-        env["failed"].as_u64(),
+        env["summary"]["failed"].as_u64(),
         Some(0),
         "rollback --ecosystems={ecosystem}: no failures expected; env={env}"
     );
     assert_eq!(
-        env["alreadyOriginal"].as_u64(),
+        env["summary"]["skipped"].as_u64(),
         Some(0),
         "rollback --ecosystems={ecosystem}: package was patched, not already-original; env={env}"
     );
 
-    let results = env["results"]
+    let results: Vec<&Value> = env["events"]
         .as_array()
-        .unwrap_or_else(|| panic!("rollback --ecosystems={ecosystem}: results missing; env={env}"));
+        .unwrap_or_else(|| panic!("rollback --ecosystems={ecosystem}: events missing; env={env}"))
+        .iter()
+        // The restore events, not the manifest-removal ones.
+        .filter(|e| e["details"]["manifest"] != true)
+        .collect();
     assert_eq!(
         results.len(),
         1,
@@ -495,11 +499,11 @@ fn assert_rollback_restored(cwd: &Path, ecosystem: &str, fixture: &RollbackFixtu
         "rollback --ecosystems={ecosystem}: rolled-back PURL mismatch; env={env}"
     );
     assert_eq!(
-        results[0]["success"], true,
+        results[0]["action"], "rolledBack",
         "rollback --ecosystems={ecosystem}: per-package rollback must succeed; env={env}"
     );
     assert!(
-        results[0]["filesRolledBack"]
+        results[0]["files"]
             .as_array()
             .is_some_and(|a| !a.is_empty()),
         "rollback --ecosystems={ecosystem}: must list at least one rolled-back file; env={env}"
@@ -532,18 +536,22 @@ fn assert_rollback_not_dispatched(cwd: &Path, ecosystem: &str, fixture: &Rollbac
         "rollback --ecosystems={ecosystem}: out-of-scope rollback should be a clean no-op (exit 0); env={env}"
     );
     assert_eq!(
-        env["rolledBack"].as_u64(),
+        env["summary"]["rolledBack"].as_u64(),
         Some(0),
         "rollback --ecosystems={ecosystem}: out-of-scope package must NOT be rolled back; env={env}"
     );
     assert_eq!(
-        env["alreadyOriginal"].as_u64(),
+        env["summary"]["skipped"].as_u64(),
         Some(0),
         "rollback --ecosystems={ecosystem}: out-of-scope package must not be discovered at all; env={env}"
     );
-    let results = env["results"]
+    let results: Vec<&Value> = env["events"]
         .as_array()
-        .unwrap_or_else(|| panic!("rollback --ecosystems={ecosystem}: results missing; env={env}"));
+        .unwrap_or_else(|| panic!("rollback --ecosystems={ecosystem}: events missing; env={env}"))
+        .iter()
+        // The restore events, not the manifest-removal ones.
+        .filter(|e| e["details"]["manifest"] != true)
+        .collect();
     assert!(
         results.is_empty(),
         "rollback --ecosystems={ecosystem}: expected no results for out-of-scope PURL, got {}; env={env}",

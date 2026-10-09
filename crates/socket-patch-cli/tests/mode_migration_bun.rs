@@ -86,6 +86,9 @@
 //! equal `bun --version`, so a CI leg cannot pass by running the wrong bun
 //! or no bun at all.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "common/mod.rs"]
 mod common;
 use common::binary;
@@ -1190,7 +1193,7 @@ fn assert_unscoped_rollback_restores_pristine(fx: &Fixture, proj: &Path, tag: &s
         "rollback envelope ({tag}): {env:#}"
     );
     assert_eq!(
-        env["hosted"]["failed"],
+        rollback_json::hosted_failed(&env),
         json!([]),
         "rollback ({tag}) must not fail any hosted purl: {env:#}"
     );
@@ -1817,9 +1820,8 @@ async fn bun_scoped_rollback_and_remove_unwind_one_of_two_hosted_records() {
     assert_eq!(code, 0, "scoped rollback must succeed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(env["hosted"]["reverted"], json!([DEP_A.purl]), "{env:#}");
-    assert_eq!(env["hosted"]["failed"], json!([]), "{env:#}");
-    assert_eq!(env["hosted"]["unsupported"], json!([]), "{env:#}");
+    assert_eq!(rollback_json::hosted_reverted(&env), json!([DEP_A.purl]), "{env:#}");
+    assert_eq!(rollback_json::hosted_failed(&env), json!([]), "{env:#}");
     assert_only_a_unwound(&fx, &by_rollback, b, "scoped-rollback");
     // Then the unscoped rollback restores the remaining pin ⇒ pristine.
     assert_unscoped_rollback_restores_pristine(&fx, &by_rollback, "after-scoped-rollback");
@@ -1905,11 +1907,11 @@ async fn bun_rollback_from_each_mixed_state_restores_pristine() {
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["status"], "success", "{env:#}");
     assert_eq!(
-        env["vendoredReverted"],
+        rollback_json::vendored_reverted(&env),
         json!([DEP_A.purl]),
         "rollback must unwire the vendored purl: {env:#}"
     );
-    assert_eq!(env["vendoredFailed"], json!([]), "{env:#}");
+    assert_eq!(rollback_json::vendored_failed(&env), json!([]), "{env:#}");
     assert_pristine_unwound(&fx, &two, "rollback (mixed-2)");
     let fresh = fresh_frozen_install(&fx, &two, "fresh-rolled-back-mixed-2");
     assert_installed(&fresh, &DEP_A, &fx.a.orig, "after rollback (mixed-2)");

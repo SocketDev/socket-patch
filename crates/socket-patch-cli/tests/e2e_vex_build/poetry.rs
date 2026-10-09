@@ -886,7 +886,7 @@ fn poetry_hosted_fresh_install_then_manifestless_vex() {
     );
     assert_eq!(code, Some(0), "rollback: {env}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        crate::rollback_json::hosted_reverted(&env),
         json!([PURL]),
         "rollback restores the hosted pin: {env}"
     );

@@ -414,7 +414,7 @@ async fn existing_npmrc_gets_one_line_and_rollback_keeps_user_edits() {
 
     let (code, doc) = rollback(tmp.path(), &server, &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(doc["hosted"]["reverted"], json!([PURL]), "{doc:#}");
+    assert_eq!(crate::rollback_json::hosted_reverted(&doc), json!([PURL]), "{doc:#}");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
         live,
