@@ -629,7 +629,7 @@ pub fn bun_uses_global_store(project_root: &Path) -> bool {
 fn live_bun_store_entries_sync(
     store_path: &Path,
     candidates: &[ListedEntry],
-) -> Option<(HashSet<OsString>, HashMap<OsString, Listing>)> {
+) -> Option<LiveBunStore> {
     if candidates.is_empty() {
         return None;
     }
@@ -640,27 +640,102 @@ fn live_bun_store_entries_sync(
         _ => Path::new("."),
     };
     let names = BunStoreNames::new(candidates);
-    let unreached = |live: &HashSet<OsString>| candidates.iter().any(|e| !live.contains(&e.name));
+    // The quick walk reads every entry's listing (the scan reads them
+    // anyway) in one parallel pass up front, instead of one pass per
+    // frontier: each pass costs a round of the walk pool waking and
+    // parking for little work (#578).
+    let mut quick_reads: Vec<Option<BunStoreRead>> =
+        par_map((0..candidates.len()).collect::<Vec<usize>>(), |index| {
+            let nm = dirs.entry_node_modules(&Reached::Entry(index));
+            Some(read_bun_store_node_modules_sync(&nm, &dirs, Some(&names)))
+        });
     // Read at most once, shared by both walks.
     let mut members: Option<Option<Vec<PathBuf>>> = None;
-    let mut walk = |unique: Option<&BunStoreNames>| {
-        let mut live: HashSet<OsString> = HashSet::new();
-        let mut listings = HashMap::new();
+    let mut walk = |unique: Option<&BunStoreNames>,
+                    mut read: Option<&mut [Option<BunStoreRead>]>| {
+        let mut live = LiveBunStore::new(candidates.len());
         let seeds = [store_path.join("node_modules"), importer.to_path_buf()];
-        reach_bun_store_entries_sync(&seeds, &dirs, unique, &mut live, &mut listings)?;
-        if unreached(&live) {
+        reach_bun_store_entries_sync(&seeds, &dirs, unique, &mut live, read.as_deref_mut())?;
+        if live.unreached() {
             let members = members
                 .get_or_insert_with(|| bun_workspace_member_node_modules_sync(root))
                 .as_deref()?;
-            reach_bun_store_entries_sync(members, &dirs, unique, &mut live, &mut listings)?;
+            reach_bun_store_entries_sync(members, &dirs, unique, &mut live, read)?;
         }
-        (!live.is_empty()).then_some((live, listings))
+        live.any().then_some(live)
     };
-    let quick = walk(Some(&names))?;
-    if !unreached(&quick.0) {
+    let quick = walk(Some(&names), Some(&mut quick_reads))?;
+    if !quick.unreached() {
         return Some(quick);
     }
-    walk(None)
+    walk(None, None)
+}
+
+/// What [`live_bun_store_entries_sync`] found, by index into the
+/// candidates it was given: the scan walks thousands of entries, so they
+/// are tracked by position instead of hashed and cloned by name (#578).
+struct LiveBunStore {
+    /// Whether each candidate is live.
+    live: Vec<bool>,
+    /// How many of `live` are set.
+    count: usize,
+    /// Reached names that are no candidate (walked all the same).
+    other: HashSet<OsString>,
+    /// The `node_modules` listing of each candidate the walk read.
+    listings: Vec<Option<Listing>>,
+}
+
+impl LiveBunStore {
+    fn new(candidates: usize) -> Self {
+        Self {
+            live: vec![false; candidates],
+            count: 0,
+            other: HashSet::new(),
+            listings: std::iter::repeat_with(|| None).take(candidates).collect(),
+        }
+    }
+
+    /// Mark `entry` live: whether it was not already.
+    fn insert(&mut self, entry: &Reached) -> bool {
+        match entry {
+            Reached::Entry(index) => {
+                let fresh = !std::mem::replace(&mut self.live[*index], true);
+                self.count += usize::from(fresh);
+                fresh
+            }
+            Reached::Other(name) => !self.other.contains(name) && self.other.insert(name.clone()),
+        }
+    }
+
+    /// Some candidate is not live.
+    fn unreached(&self) -> bool {
+        self.count < self.live.len()
+    }
+
+    /// Anything is live.
+    fn any(&self) -> bool {
+        self.count > 0 || !self.other.is_empty()
+    }
+
+    /// The names of every live entry.
+    fn into_names(self, candidates: &[ListedEntry]) -> HashSet<OsString> {
+        let mut names = self.other;
+        names.extend(
+            candidates
+                .iter()
+                .zip(self.live)
+                .filter(|(_, live)| *live)
+                .map(|(entry, _)| entry.name.clone()),
+        );
+        names
+    }
+}
+
+/// A `.bun` entry a link reaches: a candidate (by index) or some other
+/// name in the store.
+enum Reached {
+    Entry(usize),
+    Other(OsString),
 }
 
 /// The `node_modules` dirs of the workspace members a Bun install at
@@ -819,7 +894,7 @@ fn orphaned_bun_store_copies_sync(paths: &[PathBuf]) -> HashSet<PathBuf> {
         };
         let live = stores.entry(store).or_insert_with_key(|store| {
             let candidates = pnpm_shaped_store_candidates_sync(store, StoreLayout::Bun);
-            live_bun_store_entries_sync(store, &candidates).map(|(live, _)| live)
+            live_bun_store_entries_sync(store, &candidates).map(|live| live.into_names(&candidates))
         });
         if live.as_ref().is_some_and(|live| !live.contains(&entry)) {
             orphans.insert(path.clone());
@@ -872,33 +947,34 @@ pub async fn retain_live_store_copies<'a>(lists: impl IntoIterator<Item = &'a mu
 /// neither is read. Only a package with several entries (where an orphan
 /// hides) needs its links read.
 struct BunStoreNames {
-    unique: HashMap<String, OsString>,
-    scopes: HashMap<String, Vec<OsString>>,
+    /// Package name to the one candidate (by index) holding it.
+    unique: HashMap<String, usize>,
+    scopes: HashMap<String, Vec<usize>>,
 }
 
 impl BunStoreNames {
     fn new(candidates: &[ListedEntry]) -> Self {
-        let mut by_package: HashMap<String, Option<&OsString>> = HashMap::new();
-        for entry in candidates {
+        let mut by_package: HashMap<String, Option<usize>> = HashMap::new();
+        for (index, entry) in candidates.iter().enumerate() {
             if let Some(package) = bun_store_entry_package(&entry.name_str) {
                 by_package
                     .entry(package)
                     .and_modify(|only| *only = None)
-                    .or_insert(Some(&entry.name));
+                    .or_insert(Some(index));
             }
         }
         let mut unique = HashMap::new();
-        let mut scopes: HashMap<String, Option<Vec<OsString>>> = HashMap::new();
+        let mut scopes: HashMap<String, Option<Vec<usize>>> = HashMap::new();
         for (package, only) in by_package {
             let scope = package.split_once('/').map(|(scope, _)| scope.to_string());
             match only {
                 Some(entry) => {
                     if let Some(scope) = scope {
                         if let Some(entries) = scopes.entry(scope).or_insert(Some(Vec::new())) {
-                            entries.push(entry.clone());
+                            entries.push(entry);
                         }
                     }
-                    unique.insert(package, entry.clone());
+                    unique.insert(package, entry);
                 }
                 None => {
                     if let Some(scope) = scope {
@@ -928,45 +1004,76 @@ fn bun_store_entry_package(entry_name: &str) -> Option<String> {
     })
 }
 
-/// Add to `live` every `.bun` entry (by name) reachable through links from
-/// the `seeds` dirs, following each reached entry's own `node_modules`
-/// links, and record each entry's listing in `listings`. Read one
-/// frontier at a time, each frontier's dirs in parallel. With `names`,
-/// targets are guessed by name where they can be. `None` when a link
-/// reaches a global store entry this store does not link (see
-/// [`BunStoreDirs::entry_of`]): what lies past it cannot be told.
+/// A `node_modules` dir's listing and the `.bun` entries its links reach
+/// (see [`bun_store_link_targets_sync`]).
+type BunStoreRead = (Option<Listing>, Option<Vec<Reached>>);
+
+/// Read the `node_modules` dir `nm` for the orphan walk.
+fn read_bun_store_node_modules_sync(
+    nm: &Path,
+    dirs: &BunStoreDirs,
+    names: Option<&BunStoreNames>,
+) -> BunStoreRead {
+    let listing = read_dir_entries_sync(nm)
+        .map(|(entries, complete)| Listing::from_entries(entries, complete));
+    let targets = match &listing {
+        Some(listing) => bun_store_link_targets_sync(nm, listing, dirs, names),
+        None => Some(Vec::new()),
+    };
+    (listing, targets)
+}
+
+/// Add to `live` every `.bun` entry reachable through links from the
+/// `seeds` dirs, following each reached entry's own `node_modules` links,
+/// and record each candidate's listing. A candidate already read into
+/// `read` is taken from there; the rest are read one frontier at a time,
+/// each frontier's dirs in parallel. With `names`, targets are guessed by
+/// name where they can be. `None` when a link reaches a global store
+/// entry this store does not link (see [`BunStoreDirs::entry_of`]): what
+/// lies past it cannot be told.
 fn reach_bun_store_entries_sync(
     seeds: &[PathBuf],
     dirs: &BunStoreDirs,
     names: Option<&BunStoreNames>,
-    live: &mut HashSet<OsString>,
-    listings: &mut HashMap<OsString, Listing>,
+    live: &mut LiveBunStore,
+    mut read: Option<&mut [Option<BunStoreRead>]>,
 ) -> Option<()> {
-    let mut frontier: Vec<(Option<OsString>, PathBuf)> = seeds
+    let mut frontier: Vec<(Option<Reached>, Option<PathBuf>)> = seeds
         .iter()
-        .filter_map(|nm| Some((None, std::fs::canonicalize(nm).ok()?)))
+        .filter_map(|nm| Some((None, Some(std::fs::canonicalize(nm).ok()?))))
         .collect();
     while !frontier.is_empty() {
-        let visited = par_map(frontier, |(entry, nm)| {
-            let listing = read_dir_entries_sync(&nm)
-                .map(|(entries, complete)| Listing::from_entries(entries, complete));
-            let targets = match &listing {
-                Some(listing) => bun_store_link_targets_sync(&nm, listing, dirs, names),
-                None => Some(Vec::new()),
+        let mut visited = Vec::with_capacity(frontier.len());
+        let mut unread = Vec::new();
+        for (entry, nm) in frontier {
+            let cached = match (&entry, read.as_deref_mut()) {
+                (Some(Reached::Entry(index)), Some(read)) => read[*index].take(),
+                _ => None,
             };
+            match cached {
+                Some((listing, targets)) => visited.push((entry, listing, targets)),
+                None => {
+                    let nm = match (nm, &entry) {
+                        (Some(nm), _) => nm,
+                        (None, Some(entry)) => dirs.entry_node_modules(entry),
+                        (None, None) => continue,
+                    };
+                    unread.push((entry, nm));
+                }
+            }
+        }
+        visited.extend(par_map(unread, |(entry, nm)| {
+            let (listing, targets) = read_bun_store_node_modules_sync(&nm, dirs, names);
             (entry, listing, targets)
-        });
+        }));
         frontier = Vec::new();
         for (entry, listing, targets) in visited {
-            if let (Some(entry), Some(listing)) = (entry, listing) {
-                listings.insert(entry, listing);
+            if let (Some(Reached::Entry(index)), Some(listing)) = (entry, listing) {
+                live.listings[index] = Some(listing);
             }
             for target in targets? {
-                // Most targets are already live: check before cloning.
-                if !live.contains(&target) {
-                    live.insert(target.clone());
-                    let nm = dirs.entry_node_modules(&target);
-                    frontier.push((Some(target), nm));
+                if live.insert(&target) {
+                    frontier.push((Some(target), None));
                 }
             }
         }
@@ -978,56 +1085,87 @@ fn reach_bun_store_entries_sync(
 /// (canonical) store dir itself, or, for each entry that is a link into
 /// Bun's global store (#635), in its shared `<cache>/links/<entry>-<hash>`
 /// dir, whose dependency links point at sibling cache dirs.
-struct BunStoreDirs {
+struct BunStoreDirs<'a> {
     real_store: PathBuf,
+    /// The store's candidate entries, which [`Reached::Entry`] indexes.
+    candidates: &'a [ListedEntry],
+    /// Each candidate's index, by name.
+    index: HashMap<&'a OsStr, usize>,
     /// The real dir of each global store entry, and the entry linking it.
-    global: HashMap<PathBuf, OsString>,
+    global: HashMap<PathBuf, usize>,
     /// The same, by entry.
-    global_dirs: HashMap<OsString, PathBuf>,
+    global_dirs: HashMap<usize, PathBuf>,
     /// The `links` dirs those real dirs sit in.
     global_links: HashSet<PathBuf>,
 }
 
-impl BunStoreDirs {
+impl<'a> BunStoreDirs<'a> {
     /// `None` when the store or one of its global store links does not
     /// resolve.
-    fn new(store_path: &Path, candidates: &[ListedEntry]) -> Option<Self> {
+    fn new(store_path: &Path, candidates: &'a [ListedEntry]) -> Option<Self> {
         let real_store = std::fs::canonicalize(store_path).ok()?;
         let mut global = HashMap::new();
         let mut global_dirs = HashMap::new();
         let mut global_links = HashSet::new();
-        for entry in candidates {
+        for (index, entry) in candidates.iter().enumerate() {
             if entry.file_type.is_some_and(|ft| ft.is_symlink()) {
                 let real = std::fs::canonicalize(store_path.join(&entry.name)).ok()?;
                 global_links.insert(real.parent()?.to_path_buf());
-                global.insert(real.clone(), entry.name.clone());
-                global_dirs.insert(entry.name.clone(), real);
+                global.insert(real.clone(), index);
+                global_dirs.insert(index, real);
             }
         }
+        let index = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.name.as_os_str(), index))
+            .collect();
         Some(Self {
             real_store,
+            candidates,
+            index,
             global,
             global_dirs,
             global_links,
         })
     }
 
-    /// The real `node_modules` dir of the entry named `entry`.
-    fn entry_node_modules(&self, entry: &OsStr) -> PathBuf {
-        match self.global_dirs.get(entry) {
-            Some(dir) => dir.join("node_modules"),
-            None => self.real_store.join(entry).join("node_modules"),
+    /// The real `node_modules` dir of `entry`.
+    fn entry_node_modules(&self, entry: &Reached) -> PathBuf {
+        let name = match entry {
+            Reached::Entry(index) => {
+                if let Some(dir) = self.global_dirs.get(index) {
+                    return dir.join("node_modules");
+                }
+                self.candidates[*index].name.as_os_str()
+            }
+            Reached::Other(name) => name.as_os_str(),
+        };
+        let mut nm = PathBuf::with_capacity(
+            self.real_store.as_os_str().len() + name.len() + "/node_modules".len() + 1,
+        );
+        nm.push(&self.real_store);
+        nm.push(name);
+        nm.push("node_modules");
+        nm
+    }
+
+    /// The entry named `name` of this store.
+    fn reached(&self, name: &OsStr) -> Reached {
+        match self.index.get(name) {
+            Some(&index) => Reached::Entry(index),
+            None => Reached::Other(name.to_os_string()),
         }
     }
 
-    /// The entry a (lexical or real) path lies in: `Some(Some(name))` in
+    /// The entry a (lexical or real) path lies in: `Some(Some(entry))` in
     /// this store or one of its global store entries, `Some(None)` in some
     /// other entry of the same global store (not linked from this store,
     /// so its reach is unknown), `None` anywhere else.
-    fn entry_of(&self, path: &Path) -> Option<Option<OsString>> {
+    fn entry_of(&self, path: &Path) -> Option<Option<Reached>> {
         if let Ok(below) = path.strip_prefix(&self.real_store) {
             return match below.components().next() {
-                Some(std::path::Component::Normal(name)) => Some(Some(name.to_os_string())),
+                Some(std::path::Component::Normal(name)) => Some(Some(self.reached(name))),
                 _ => None,
             };
         }
@@ -1035,8 +1173,8 @@ impl BunStoreDirs {
             return None;
         }
         for dir in path.ancestors() {
-            if let Some(entry) = self.global.get(dir) {
-                return Some(Some(entry.clone()));
+            if let Some(&entry) = self.global.get(dir) {
+                return Some(Some(Reached::Entry(entry)));
             }
             if dir
                 .parent()
@@ -1063,7 +1201,7 @@ fn bun_store_link_targets_sync(
     listing: &Listing,
     dirs: &BunStoreDirs,
     names: Option<&BunStoreNames>,
-) -> Option<Vec<OsString>> {
+) -> Option<Vec<Reached>> {
     let mut targets = Vec::new();
     // A link whose package name guesses its entry is never read, and is
     // looked up before any path is built: a quick walk visits every link
@@ -1079,12 +1217,12 @@ fn bun_store_link_targets_sync(
         }
         if file_type.is_symlink() {
             match guess(&entry.name_str) {
-                Some(target) => targets.push(target.clone()),
+                Some(&target) => targets.push(Reached::Entry(target)),
                 None => links.push(nm.join(&entry.name)),
             }
         } else if file_type.is_dir() && entry.name_str.starts_with('@') {
             if let Some(entries) = names.and_then(|names| names.scopes.get(&entry.name_str)) {
-                targets.extend(entries.iter().cloned());
+                targets.extend(entries.iter().map(|&entry| Reached::Entry(entry)));
                 continue;
             }
             let scope = nm.join(&entry.name);
@@ -1092,7 +1230,7 @@ fn bun_store_link_targets_sync(
                 if scoped.file_type.is_some_and(|ft| ft.is_symlink()) {
                     let package = format!("{}/{}", entry.name_str, scoped.name_str);
                     match guess(&package) {
-                        Some(target) => targets.push(target.clone()),
+                        Some(&target) => targets.push(Reached::Entry(target)),
                         None => links.push(scope.join(&scoped.name)),
                     }
                 }
@@ -3213,25 +3351,24 @@ impl NpmCrawler {
         live_only: bool,
     ) -> Vec<StoreEntryDir> {
         let decode = |name: &str| layout.decode_pnpm_shaped(name);
-        let mut candidates = pnpm_shaped_store_candidates_sync(store_path, layout);
+        let candidates = pnpm_shaped_store_candidates_sync(store_path, layout);
         // pnpm prunes its store on install; Bun never does (#599), so the
         // scan, a judgement of the live install, skips its orphans.
-        let mut listings = HashMap::new();
-        if layout == StoreLayout::Bun && live_only {
-            if let Some((live, walked)) = live_bun_store_entries_sync(store_path, &candidates) {
-                candidates.retain(|e| live.contains(&e.name));
-                listings = walked;
-            }
-        }
-        let candidates: Vec<(ListedEntry, Option<Listing>)> = candidates
-            .into_iter()
-            .map(|entry| {
-                let listing = listings.remove(&entry.name).filter(|_| read_listings);
-                (entry, listing)
-            })
-            .collect();
+        let live = (layout == StoreLayout::Bun && live_only)
+            .then(|| live_bun_store_entries_sync(store_path, &candidates))
+            .flatten();
+        let candidates: Vec<(ListedEntry, Option<Listing>)> = match live {
+            Some(walked) => candidates
+                .into_iter()
+                .zip(walked.live)
+                .zip(walked.listings)
+                .filter(|((_, live), _)| *live)
+                .map(|((entry, _), listing)| (entry, listing.filter(|_| read_listings)))
+                .collect(),
+            None => candidates.into_iter().map(|entry| (entry, None)).collect(),
+        };
 
-        par_map(candidates, |(entry, listing)| {
+        let entry_dirs = |(entry, listing): (ListedEntry, Option<Listing>)| {
             let entry_path = store_path.join(&entry.name);
             let entry_nm = entry_path.join("node_modules");
             if read_listings {
@@ -3266,10 +3403,16 @@ impl NpmCrawler {
                     })
                     .collect()
             }
-        })
-        .into_iter()
-        .flatten()
-        .collect()
+        };
+        // With every listing already read (a live Bun walk) nothing is
+        // left to read, and a parallel pass would only wake the pool.
+        if read_listings && candidates.iter().all(|(_, listing)| listing.is_some()) {
+            return candidates.into_iter().flat_map(entry_dirs).collect();
+        }
+        par_map(candidates, entry_dirs)
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// Async `(name, node_modules)` view of
@@ -6441,8 +6584,12 @@ mod tests {
 
         let candidates = pnpm_shaped_store_candidates_sync(&store, StoreLayout::Bun);
         assert_eq!(candidates.len(), 5);
-        let (live, _) = live_bun_store_entries_sync(&store, &candidates).unwrap();
-        let mut live: Vec<String> = live.into_iter().map(|e| e.into_string().unwrap()).collect();
+        let live = live_bun_store_entries_sync(&store, &candidates).unwrap();
+        let mut live: Vec<String> = live
+            .into_names(&candidates)
+            .into_iter()
+            .map(|e| e.into_string().unwrap())
+            .collect();
         live.sort();
         assert_eq!(
             live,
