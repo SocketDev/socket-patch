@@ -120,7 +120,8 @@ socket-patch vendor                        # eject an existing hosted patch set
 socket-patch rollback                      # restore upstream dependencies
 ```
 
-`get` also accepts a GHSA, patch UUID, PURL, or package name. `scan` selects from
+`get` also accepts a GHSA, patch UUID, PURL, or exact package name (every installed
+version of that name is searched; near names are only suggested). `scan` selects from
 patches your account can download, preferring the highest severity, then the most
 advisories fixed, then the newest publication date. Existing patches are upgraded
 only by a better-ranked patch.

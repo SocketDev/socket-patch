@@ -12,6 +12,10 @@ use std::path::Path;
 
 use serde_json::Value;
 
+#[path = "common/envelope.rs"]
+mod envelope;
+use envelope::all_codes;
+
 #[path = "vlt_e2e_common/mod.rs"]
 mod vlt_e2e_common;
 
@@ -29,30 +33,8 @@ fn migration_leg(name: &'static str) -> Option<Leg> {
     Some(leg)
 }
 
-/// Every object in `doc` carrying an `errorCode`, at any depth.
-fn codes(doc: &Value) -> Vec<String> {
-    fn walk(v: &Value, out: &mut Vec<String>) {
-        match v {
-            Value::Object(m) => {
-                if let Some(c) = m.get("errorCode").and_then(Value::as_str) {
-                    out.push(c.to_string());
-                }
-                if let Some(c) = m.get("code").and_then(Value::as_str) {
-                    out.push(c.to_string());
-                }
-                m.values().for_each(|c| walk(c, out));
-            }
-            Value::Array(a) => a.iter().for_each(|c| walk(c, out)),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(doc, &mut out);
-    out
-}
-
 fn has_code(doc: &Value, code: &str) -> bool {
-    codes(doc).iter().any(|c| c == code)
+    all_codes(doc).iter().any(|c| c == code)
 }
 
 /// Every committable byte of `proj` (no installed trees).

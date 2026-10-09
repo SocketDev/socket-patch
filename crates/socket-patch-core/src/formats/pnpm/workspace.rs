@@ -57,10 +57,10 @@ pub(crate) fn top_level_key(line: &str) -> Option<(String, &str)> {
 }
 
 /// The value of the last top-level `key` in a YAML settings file
-/// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed.
+/// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed. [`top_level_key`]
+/// skips the first line's BOM.
 pub(crate) fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
-    strip_bom(text)
-        .lines()
+    text.lines()
         .filter_map(top_level_key)
         .rfind(|(k, _)| k == key)
         .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())

@@ -13,8 +13,11 @@
 //! hosted) all point at a wiremock; `SOCKET_VENDOR_SOURCE=build` keeps the
 //! vendoring service out of it.
 
+#[path = "common/envelope.rs"]
+mod envelope;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
+use envelope::find_event;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -199,17 +202,6 @@ async fn mock_view(p: &Project) {
         .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(&p.server)
         .await;
-}
-
-fn find_event<'a>(env: &'a Value, action: &str, code: Option<&str>) -> &'a Value {
-    env["events"]
-        .as_array()
-        .and_then(|events| {
-            events
-                .iter()
-                .find(|e| e["action"] == action && code.is_none_or(|c| e["errorCode"] == c))
-        })
-        .unwrap_or_else(|| panic!("no `{action}` event (errorCode={code:?}) in:\n{env:#}"))
 }
 
 /// (1) + (2): eject vendors the hosted pin into `.socket/vendor/`, rewires

@@ -557,7 +557,7 @@ pub(crate) fn finish_writes(read: ReadFn<'_>, writes: Vec<FileWrite>) -> Vec<Fil
         .filter(|w| match read(&w.rel) {
             None => true,
             Some(cur) if !w.tree && eol_blind(&w.rel) => {
-                !crate::gradle::eol::eol_eq(&cur, &w.bytes)
+                !crate::utils::line_endings::eol_eq(&cur, &w.bytes)
             }
             Some(cur) => cur != w.bytes,
         })
@@ -607,7 +607,7 @@ pub(crate) const TREE_GITATTRIBUTES: &str = "* -text\n";
 
 /// Whether `current` is still the owned text `ours` (line endings aside).
 pub(crate) fn is_ours(current: Option<&[u8]>, ours: &str) -> bool {
-    current.is_some_and(|c| crate::gradle::eol::eol_eq(c, ours.as_bytes()))
+    current.is_some_and(|c| crate::utils::line_endings::eol_eq(c, ours.as_bytes()))
 }
 
 /// A disk round-trip harness for the planners' tests: vendor and revert

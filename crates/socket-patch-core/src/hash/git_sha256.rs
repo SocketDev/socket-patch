@@ -111,6 +111,18 @@ pub(crate) fn compute_git_sha256_from_std_reader<R: std::io::Read>(
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Git SHA-256 of the zip member `name`, streamed through
+/// [`compute_git_sha256_from_std_reader`] so the member is never inflated
+/// into memory. `None` when the archive has no such member; `Some(Err)` when
+/// it can't be read whole (a corrupt stream or a size that disagrees with it).
+pub(crate) fn zip_member_git_sha256<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Option<io::Result<String>> {
+    let entry = archive.by_name(name).ok()?;
+    Some(compute_git_sha256_from_std_reader(entry.size(), entry))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +416,38 @@ mod tests {
         let result = compute_git_sha256_from_reader(content.len() as u64 - 1, cursor).await;
         let err = result.expect_err("one byte over declared size must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// `zip_member_git_sha256` hashes stored, deflated and empty members
+    /// exactly as the buffered hash of their bytes, and reports an absent
+    /// member as `None`.
+    #[test]
+    fn test_zip_member_matches_buffered_hash() {
+        use std::io::Write as _;
+        let members: [(&str, &[u8], zip::CompressionMethod); 3] = [
+            ("stored.txt", b"hello world", zip::CompressionMethod::Stored),
+            (
+                "deflated.txt",
+                &[b'a'; 100_000],
+                zip::CompressionMethod::Deflated,
+            ),
+            ("empty.txt", b"", zip::CompressionMethod::Deflated),
+        ];
+        let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes, method) in &members {
+            let opts = zip::write::SimpleFileOptions::default().compression_method(*method);
+            out.start_file(*name, opts).unwrap();
+            out.write_all(bytes).unwrap();
+        }
+        let jar = out.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar)).unwrap();
+        for (name, bytes, _) in &members {
+            assert_eq!(
+                zip_member_git_sha256(&mut archive, name).unwrap().unwrap(),
+                compute_git_sha256_from_bytes(bytes),
+                "{name}"
+            );
+        }
+        assert!(zip_member_git_sha256(&mut archive, "missing.txt").is_none());
     }
 }

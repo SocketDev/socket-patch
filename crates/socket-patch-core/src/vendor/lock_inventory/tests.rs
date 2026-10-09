@@ -999,7 +999,10 @@ async fn headerless_yarn_classic_lock_is_inventoried_as_classic_by_the_fallback(
         .filter(|l| !l.starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!headerless.contains("lockfile v1"), "fixture drops the header");
+    assert!(
+        !headerless.contains("lockfile v1"),
+        "fixture drops the header"
+    );
     write(tmp.path(), "yarn.lock", &headerless).await;
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
     assert_eq!(flavor, NpmLockFlavor::YarnClassic);
@@ -3588,6 +3591,36 @@ async fn requirements_in_root_includes_are_inventoried() {
         .await
         .unwrap();
     assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
+}
+
+/// #1249: pip's `join_lines` strips the backslash of a continued line
+/// that is the file's last and flushes it at EOF, so `six==1.16.0 \` with
+/// nothing after it installs six 1.16.0. Lock-only discovery reads it as
+/// that pin, in the root file and in a `-r` include, LF and CRLF.
+#[tokio::test]
+async fn requirements_dangling_eof_continuation_is_inventoried() {
+    for root in ["six==1.16.0 \\", "six==1.16.0 \\\n", "six==1.16.0 \\\r\n"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "requirements.txt", root).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![("six".to_string(), "1.16.0".to_string())],
+            "{root:?}"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "requirements.txt", "-r dev.txt\n").await;
+    write(tmp.path(), "dev.txt", "idna==3.4\nsix==1.16.0 \\\n").await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("idna".to_string(), "3.4".to_string()),
+            ("six".to_string(), "1.16.0".to_string()),
+        ]
+    );
 }
 
 /// #721: pip decodes a requirements file by its BOM, so a UTF-16 root

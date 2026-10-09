@@ -51,6 +51,8 @@
 
 //! manifest-less lockfile-wired project.
 
+use crate::common::binary;
+
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -82,10 +84,6 @@ const PRISTINE_RS: &[u8] = b"// serde pristine\npub fn f() {}\n";
 const PATCHED_RS: &[u8] = b"// serde patched\npub fn f() {}\n";
 
 // ── harness ───────────────────────────────────────────────────────────
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// A project under `<tmp>/app` plus a private (empty unless a test fills
 /// it) cargo home.

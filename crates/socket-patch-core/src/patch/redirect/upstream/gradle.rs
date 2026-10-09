@@ -21,7 +21,6 @@
 use std::collections::BTreeMap;
 
 use super::{Ctx, FormatResult, HostedPin, View};
-use crate::gradle::eol::eol_eq;
 use crate::gradle::locks;
 use crate::patch::redirect::gradle::{
     apply_line_created, apply_line_span, graph_of, has_component, index_digest, lockfile_paths,
@@ -29,6 +28,7 @@ use crate::patch::redirect::gradle::{
     without_component, GradleFiles, HostedRow, GITATTRIBUTES, GITATTRIBUTES_REL, HOSTED_INDEX_REL,
     HOSTED_SCRIPT, HOSTED_SCRIPT_REL, MAX_ROUNDS,
 };
+use crate::utils::line_endings::eol_eq;
 use crate::vendor::jvm::gradle as vendored;
 
 const VERIFICATION_REL: &str = vendored::VERIFICATION_REL;

@@ -489,6 +489,9 @@ mod tests {
         let other = format!("log = {{ version = \"0.4.20\", registry = \"socket-patch-{C}\" }}\n");
         let (outcome, after) = restore_b(&manifest(&other), &config).await;
         assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
-        assert_eq!(after.as_deref().map(str::trim_start), Some(block(C).as_str()));
+        assert_eq!(
+            after.as_deref().map(str::trim_start),
+            Some(block(C).as_str())
+        );
     }
 }

@@ -331,8 +331,9 @@ async fn find_site_packages_under(
 ///    conda `CONDA_PREFIX`)
 /// 2. For a Pipenv project, the venv(s) Pipenv resolves for it (see
 ///    [`pipenv_project_site_packages`]), and nothing else
-/// 3. Poetry's out-of-tree virtualenv(s), when Poetry itself would not use
-///    `./.venv` for the project (see [`find_poetry_virtualenv_site_packages`])
+/// 3. For a Poetry project, the env Poetry picks for it (see
+///    [`poetry_project_site_packages`]): an existing in-project `./.venv`,
+///    else its out-of-tree virtualenv(s), and nothing else
 /// 4. `.venv` directory in `cwd`
 /// 5. `venv` directory in `cwd` (a PDM project with neither: PEP 582)
 /// 6. Hatch's out-of-tree envs for the project (see
@@ -383,29 +384,24 @@ async fn managed_or_local_site_packages(
     if is_pipenv_project(cwd) {
         return pipenv_project_site_packages(cwd, var).await;
     }
-    let poetry = load_poetry_project(cwd, var).await;
-
-    // Poetry versions can use different placeholder roots. Apply its
-    // recorded-env / active-shell / in-project precedence within each
-    // compatible placement, then retain their ordered union.
-    if let Some(project) = &poetry {
-        let found = poetry_project_site_packages(cwd, project, var).await;
+    // Poetry picks one env for the project (`EnvManager.get`), and that
+    // answer is final: an empty one means nothing installed yet, or (with
+    // `virtualenvs.create = false`) the system env. Neither a stray
+    // `./venv` nor a `./.venv` Poetry rules out may stand in for it (#671).
+    if let Some(project) = load_poetry_project(cwd, var).await {
+        return poetry_project_site_packages(cwd, &project, var).await;
+    }
+    let pdm_ignores_active =
+        pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV") && pdm_drives_project(cwd).await;
+    let active_prefix = if !pdm_ignores_active {
+        var("VIRTUAL_ENV")
+    } else {
+        None
+    };
+    if let Some(prefix) = active_prefix {
+        let found = find_site_packages_under(Path::new(&prefix), "site-packages").await;
         if !found.is_empty() {
             return found;
-        }
-    } else {
-        let pdm_ignores_active =
-            pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV") && pdm_drives_project(cwd).await;
-        let active_prefix = if !pdm_ignores_active {
-            var("VIRTUAL_ENV")
-        } else {
-            None
-        };
-        if let Some(prefix) = active_prefix {
-            let found = find_site_packages_under(Path::new(&prefix), "site-packages").await;
-            if !found.is_empty() {
-                return found;
-            }
         }
     }
 
@@ -1827,12 +1823,15 @@ impl PoetryProject {
 }
 
 /// EnvManager.get takes VIRTUAL_ENV, then a non-base CONDA_PREFIX, only
-/// when this placement has no `poetry env use` record for the project.
+/// when the project has no `poetry env use` record. A record in any
+/// placement counts: with `{data-dir}` the placeholder generations give
+/// several roots, and the record lives only in the one the installed
+/// Poetry uses (#866).
 fn poetry_active_prefix(
-    placement: Option<&PoetryPlacement>,
+    project: &PoetryProject,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    if placement.is_some_and(|p| p.activated.is_some()) {
+    if project.placements.iter().any(|p| p.activated.is_some()) {
         return None;
     }
     let prefix = var("VIRTUAL_ENV").or_else(|| var("CONDA_PREFIX"))?;
@@ -1862,7 +1861,7 @@ async fn load_poetry_project(
         .await
         .ok()?;
     let poetry_project =
-        has("poetry.lock") || has("poetry.toml") || pyproject.contains("[tool.poetry");
+        has("poetry.lock") || has("poetry.toml") || declares_tool_poetry(&pyproject);
     if !poetry_project {
         return None;
     }
@@ -1899,6 +1898,17 @@ async fn load_poetry_project(
         });
     }
     Some(PoetryProject { config, placements })
+}
+
+/// Whether a pyproject.toml has a `[tool.poetry]` table (or a subtable of
+/// it). A plugin table such as `[tool.poetry-dynamic-versioning]` alone
+/// does not make a project Poetry's.
+fn declares_tool_poetry(pyproject: &str) -> bool {
+    pyproject
+        .parse::<toml_edit::DocumentMut>()
+        .ok()
+        .and_then(|doc| doc.get("tool")?.get("poetry").map(|_| ()))
+        .is_some()
 }
 
 /// Matching environment directories for the first project-name spelling
@@ -1955,47 +1965,43 @@ async fn poetry_virtualenv_site_packages(project: &PoetryProject) -> Vec<PathBuf
     results
 }
 
-/// Apply EnvManager.get's precedence separately for each compatible root.
-/// With no recorded environment anywhere, the ordinary active/in-project
-/// rules still apply once. Unioning only afterwards preserves both
-/// runtimes when one Poetry generation recorded an env and another uses
-/// the active shell; single-root activation still vetoes an unrelated shell.
+/// The env EnvManager.get picks for the project, as `site-packages`
+/// directories: the active shell env unless a `poetry env use` record
+/// exists, else an existing in-project `./.venv`, else (unless
+/// `virtualenvs.create = false`, which means the system env) the project's
+/// envs in every compatible placement. Empty means no env Poetry would
+/// use exists yet, or the system env; the caller decides which with
+/// [`poetry_owns_project_env`].
 async fn poetry_project_site_packages(
     cwd: &Path,
     project: &PoetryProject,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
-    let placements: Vec<Option<&PoetryPlacement>> = if project.placements.is_empty() {
-        vec![None]
-    } else {
-        project.placements.iter().map(Some).collect()
-    };
-    let mut results = Vec::new();
-    for placement in placements {
-        let mut found = Vec::new();
-        if let Some(active) = poetry_active_prefix(placement, var) {
-            found = find_site_packages_under(Path::new(&active), "site-packages").await;
-        }
-        if found.is_empty() {
-            if project.in_project_venv_exists(cwd) {
-                found = find_site_packages_under(&cwd.join(".venv"), "site-packages").await;
-                // Keep the existing local inventory when Poetry selects
-                // its in-project env. A healthy .venv must not hide stale
-                // bytes in a sibling venv from hosted verification/VEX.
-                found.extend(find_site_packages_under(&cwd.join("venv"), "site-packages").await);
-            } else if project.config.create != Some(false) {
-                if let Some(placement) = placement {
-                    found = poetry_placement_site_packages(placement).await;
-                }
-            }
-        }
-        for path in found {
-            if !results.contains(&path) {
-                results.push(path);
-            }
+    if let Some(active) = poetry_active_prefix(project, var) {
+        let found = find_site_packages_under(Path::new(&active), "site-packages").await;
+        if !found.is_empty() {
+            return found;
         }
     }
-    results
+    if project.in_project_venv_exists(cwd) {
+        let mut found = find_site_packages_under(&cwd.join(".venv"), "site-packages").await;
+        // Keep the existing local inventory when Poetry selects its
+        // in-project env. A healthy .venv must not hide stale bytes in a
+        // sibling venv from hosted verification/VEX.
+        found.extend(find_site_packages_under(&cwd.join("venv"), "site-packages").await);
+        return found;
+    }
+    poetry_virtualenv_site_packages(project).await
+}
+
+/// Whether only Poetry's own env can hold the project at `cwd`: a Poetry
+/// project whose `virtualenvs.create` is not `false`. With none created
+/// yet nothing is installed for it, and its lock-only packages come from
+/// `poetry.lock`; the OS Python is never its env (#1023).
+async fn poetry_owns_project_env(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> bool {
+    load_poetry_project(cwd, var)
+        .await
+        .is_some_and(|project| project.config.create != Some(false))
 }
 
 /// `site-packages` of the virtualenv Pipenv would use for the project at
@@ -3077,6 +3083,39 @@ pub async fn is_python_project(cwd: &Path) -> bool {
     crate::utils::python_lock::python_lock_paths(cwd).is_ok_and(|paths| !paths.is_empty())
 }
 
+/// Local-mode discovery for [`PythonCrawler::get_site_packages_paths`]
+/// over an explicit environment (tests pass a closure instead of mutating
+/// the process environment).
+async fn local_site_packages_with(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let venv_paths = find_local_venv_site_packages_with(cwd, var).await;
+    if !venv_paths.is_empty() {
+        return venv_paths;
+    }
+    // A Pipenv project's env is only ever the one Pipenv resolves for it
+    // (see `pipenv_project_site_packages`). With none yet, nothing is
+    // installed for the project, and its lock-only packages come from
+    // `Pipfile.lock`; the OS Python is never its env (#504, #947).
+    if is_pipenv_project(cwd) {
+        return Vec::new();
+    }
+    // A uv project or script lock installs only into uv's own env. With
+    // none synced yet nothing is installed for it, and its lock-only
+    // packages come from the lock; the OS Python is never its env (#964).
+    if uv_owns_project_env(cwd).await {
+        return Vec::new();
+    }
+    if poetry_owns_project_env(cwd, var).await {
+        return Vec::new();
+    }
+    if is_python_project(cwd).await {
+        return get_global_python_site_packages().await;
+    }
+    Vec::new()
+}
+
 // ---------------------------------------------------------------------------
 // PythonCrawler
 // ---------------------------------------------------------------------------
@@ -3098,8 +3137,9 @@ impl PythonCrawler {
     ///      out-of-tree virtualenvs.
     ///   2. If no venv was found AND the cwd looks like a Python
     ///      project (see `is_python_project`) whose env is not only ever
-    ///      Pipenv's own (`is_pipenv_project`) or uv's own (see
-    ///      `uv_owns_project_env`), fall through
+    ///      Pipenv's own (`is_pipenv_project`), uv's own (see
+    ///      `uv_owns_project_env`) or Poetry's own (see
+    ///      `poetry_owns_project_env`), fall through
     ///      to `get_global_python_site_packages`. This mirrors the
     ///      cargo / ruby / go pattern where a project marker
     ///      indicates "scan this ecosystem globally for this project".
@@ -3116,27 +3156,8 @@ impl PythonCrawler {
             }
             return Ok(get_global_python_site_packages().await);
         }
-        let venv_paths = find_local_venv_site_packages(&options.cwd).await;
-        if !venv_paths.is_empty() {
-            return Ok(venv_paths);
-        }
-        // A Pipenv project's env is only ever the one Pipenv resolves for it
-        // (see `pipenv_project_site_packages`). With none yet, nothing is
-        // installed for the project, and its lock-only packages come from
-        // `Pipfile.lock`; the OS Python is never its env (#504, #947).
-        if is_pipenv_project(&options.cwd) {
-            return Ok(Vec::new());
-        }
-        // A uv project or script lock installs only into uv's own env. With
-        // none synced yet nothing is installed for it, and its lock-only
-        // packages come from the lock; the OS Python is never its env (#964).
-        if uv_owns_project_env(&options.cwd).await {
-            return Ok(Vec::new());
-        }
-        if is_python_project(&options.cwd).await {
-            return Ok(get_global_python_site_packages().await);
-        }
-        Ok(Vec::new())
+        let var = |name: &str| std::env::var(name).ok();
+        Ok(local_site_packages_with(&options.cwd, &var).await)
     }
 
     /// Crawl all discovered `site-packages` and return every package found.
@@ -5810,7 +5831,9 @@ G=
             find_local_venv_site_packages(&project).await,
             vec![site(&venv311, "3.11"), site(&venv312, "3.12")]
         );
-        // ...but a `./venv` still serves when Poetry has no env at all.
+        // ...nor when Poetry has no env at all: nothing is installed for
+        // the project yet, and an activated `./venv` arrives through
+        // `VIRTUAL_ENV` instead (#671, #1023).
         let venv_only = tmp.path().join("venv-only");
         std::fs::create_dir_all(site(&venv_only.join("venv"), "3.12")).unwrap();
         std::fs::write(
@@ -5818,10 +5841,7 @@ G=
             "[tool.poetry]\nname = \"venv-only\"\n",
         )
         .unwrap();
-        assert_eq!(
-            find_local_venv_site_packages(&venv_only).await,
-            vec![site(&venv_only.join("venv"), "3.12")]
-        );
+        assert!(find_local_venv_site_packages(&venv_only).await.is_empty());
         std::fs::remove_dir_all(project.join("venv")).unwrap();
 
         // #327 case 1: a nameless `package-mode = false` project. Poetry
@@ -6062,6 +6082,169 @@ G=
         );
     }
 
+    /// #671: with `virtualenvs.create = false`, Poetry installs into an
+    /// existing in-project `./.venv` (unless `in-project = false`), else the
+    /// interpreter it runs under. It never uses `./venv`, so a stray tree
+    /// there (or a `.venv` that `in-project = false` rules out) must not
+    /// shadow the system env, which the global fallback then covers.
+    #[tokio::test]
+    async fn poetry_create_false_ignores_a_stray_venv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, _, _) = poetry_fixture(tmp.path(), "create = false\n", &[]);
+        let stray = poetry_site(&project.join("venv"), "3.11");
+        std::fs::create_dir_all(&stray).unwrap();
+        let var = poetry_env(tmp.path(), &[]);
+        assert!(
+            find_local_venv_site_packages_with(&project, &var)
+                .await
+                .is_empty(),
+            "create = false never uses ./venv"
+        );
+        assert!(
+            !poetry_owns_project_env(&project, &var).await,
+            "create = false installs into the system env"
+        );
+
+        // The same through POETRY_VIRTUALENVS_CREATE.
+        let (project2, _, _) = poetry_fixture(&tmp.path().join("env"), "", &[]);
+        std::fs::create_dir_all(poetry_site(&project2.join("venv"), "3.11")).unwrap();
+        let flag = [("POETRY_VIRTUALENVS_CREATE", "false".to_string())];
+        let flag_var = poetry_env(tmp.path(), &flag);
+        assert!(find_local_venv_site_packages_with(&project2, &flag_var)
+            .await
+            .is_empty());
+        assert!(!poetry_owns_project_env(&project2, &flag_var).await);
+
+        // `in-project = false` rules out an existing `./.venv` too.
+        let (project3, _, _) = poetry_fixture(
+            &tmp.path().join("off"),
+            "create = false\nin-project = false\n",
+            &[],
+        );
+        std::fs::create_dir_all(poetry_site(&project3.join(".venv"), "3.11")).unwrap();
+        assert!(find_local_venv_site_packages_with(&project3, &var)
+            .await
+            .is_empty());
+
+        // Control: with `in-project` unset, Poetry does use an existing
+        // `./.venv`.
+        let dot_venv = poetry_site(&project.join(".venv"), "3.12");
+        std::fs::create_dir_all(&dot_venv).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![dot_venv, stray]
+        );
+    }
+
+    /// #1023: a fresh Poetry checkout (`virtualenvs.create` true, no env
+    /// yet) has nothing installed. The empty result is final, as for
+    /// Pipenv (#950) and uv (#964): never a stray `./venv` and never the
+    /// OS Python, which Poetry never installs this project into.
+    #[tokio::test]
+    async fn poetry_fresh_checkout_has_no_env_and_no_global_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        // PEP 621 metadata, a poetry.lock and no `[tool.poetry]` table:
+        // what Poetry 2 writes.
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"demo-fresh\"\nversion = \"0.1.0\"\n\n[build-system]\nrequires = [\"poetry-core>=2.0\"]\nbuild-backend = \"poetry.core.masonry.api\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("poetry.lock"),
+            "[metadata]\nlock-version = \"2.1\"\n",
+        )
+        .unwrap();
+        let var = poetry_env(tmp.path(), &[]);
+        assert!(poetry_owns_project_env(&project, &var).await);
+        assert!(local_site_packages_with(&project, &var).await.is_empty());
+
+        // `[tool.poetry]`, an out-of-tree path with no env in it yet, and a
+        // stray `./venv` Poetry never uses.
+        let (legacy, _, _) = poetry_fixture(&tmp.path().join("legacy"), "", &[]);
+        std::fs::create_dir_all(poetry_site(&legacy.join("venv"), "3.11")).unwrap();
+        assert!(local_site_packages_with(&legacy, &var).await.is_empty());
+
+        // `in-project = true` with no `./.venv` yet.
+        let (in_project, _, _) =
+            poetry_fixture(&tmp.path().join("inproj"), "in-project = true\n", &[]);
+        assert!(local_site_packages_with(&in_project, &var).await.is_empty());
+
+        // Only `create = false` makes the interpreter Poetry runs under the
+        // project's env.
+        let (system, _, _) = poetry_fixture(&tmp.path().join("system"), "create = false\n", &[]);
+        assert!(!poetry_owns_project_env(&system, &var).await);
+
+        // A `[tool.poetry-…]` plugin table alone does not make a project
+        // Poetry's.
+        let plugin = tmp.path().join("plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("pyproject.toml"),
+            "[project]\nname = \"plugin\"\nversion = \"0.1.0\"\n\n[tool.poetry-dynamic-versioning]\nenable = true\n",
+        )
+        .unwrap();
+        assert!(!poetry_owns_project_env(&plugin, &var).await);
+    }
+
+    /// #866: with `{data-dir}` in `virtualenvs.path`, several placeholder
+    /// generations give several roots, but only one holds the project's
+    /// `poetry env use` record. That record makes Poetry ignore an active
+    /// `VIRTUAL_ENV` / non-base `CONDA_PREFIX`; the roots without a record
+    /// must not bring the unrelated shell env back.
+    #[tokio::test]
+    async fn poetry_env_use_record_in_any_root_vetoes_the_active_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, _, prefix) = poetry_fixture(tmp.path(), "", &[]);
+        std::fs::write(
+            project.join("poetry.toml"),
+            "[virtualenvs]\npath = '{data-dir}/venvs'\n",
+        )
+        .unwrap();
+        let data = tmp.path().join("data");
+        let current = data.join("venvs");
+        let env312 = poetry_site(&current.join(format!("{prefix}-py3.12")), "3.12");
+        std::fs::create_dir_all(&env312).unwrap();
+        std::fs::write(
+            current.join("envs.toml"),
+            format!("[{prefix}]\nminor = '3.12'\n"),
+        )
+        .unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(poetry_site(&other, "3.11")).unwrap();
+        let home = data.to_string_lossy().into_owned();
+        let other_prefix = other.to_string_lossy().into_owned();
+
+        let active = [
+            ("POETRY_HOME", home.clone()),
+            ("VIRTUAL_ENV", other_prefix.clone()),
+        ];
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &poetry_env(tmp.path(), &active)).await,
+            vec![env312.clone()],
+            "VIRTUAL_ENV"
+        );
+        let conda = [
+            ("POETRY_HOME", home.clone()),
+            ("CONDA_PREFIX", other_prefix.clone()),
+            ("CONDA_DEFAULT_ENV", "work".to_string()),
+        ];
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &poetry_env(tmp.path(), &conda)).await,
+            vec![env312.clone()],
+            "CONDA_PREFIX"
+        );
+
+        // Control: with no record anywhere, Poetry uses the active env.
+        std::fs::remove_file(current.join("envs.toml")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &poetry_env(tmp.path(), &active)).await,
+            vec![poetry_site(&other, "3.11")]
+        );
+    }
+
     /// B66: an empty or relative injected `HOME` is no home. It used to be
     /// joined as-is, so the pdm/poetry config, cache and installer probes
     /// read `./.config/pypoetry/…` (and the like) under the working
@@ -6217,12 +6400,14 @@ G=
             ("VIRTUAL_ENV", active.to_string_lossy().into_owned()),
         ];
         let var = poetry_env(tmp.path(), &env);
-        // A different generation can use the active shell even when its
-        // root has never been created. Only the legacy activation remains.
+        // Only the legacy activation remains. The `poetry env use` record
+        // is in the root the installed Poetry reads, and it makes Poetry
+        // ignore the active shell; a root with no record must not bring
+        // that shell env back (#866).
         std::fs::remove_dir_all(&current).unwrap();
         assert_eq!(
             find_local_venv_site_packages_with(&project, &var).await,
-            vec![active_site.clone(), legacy311.clone()]
+            vec![legacy311.clone()]
         );
         let no_active = [("POETRY_HOME", data.to_string_lossy().into_owned())];
         let no_active_var = poetry_env(tmp.path(), &no_active);

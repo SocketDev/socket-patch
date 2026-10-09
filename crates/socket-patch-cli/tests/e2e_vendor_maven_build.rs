@@ -297,10 +297,17 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
             .is_file(),
         "the local repository stays warm"
     );
+    // The mirror keeps the id `central` so the warm plugin closure (cached
+    // under that id) is reused instead of re-fetched from Central (CI run
+    // 37909555148).
     let mirrored = root.join("mirrored-settings.xml");
-    write_settings(
+    write_settings_with_ids(
         &mirrored,
-        &[("external:*", "https://repo.maven.apache.org/maven2")],
+        &[(
+            "central",
+            "external:*",
+            "https://repo.maven.apache.org/maven2",
+        )],
     );
     for (label, settings) in [("warm", &settings), ("mirrorOf external:*", &mirrored)] {
         let out = mvn.copy_dependencies(&fresh, &m2, settings, "target/dep");

@@ -662,6 +662,37 @@ pub fn build_nuget(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
         "project/Program.cs",
         "System.Console.WriteLine(\"bench\");\n",
     )?;
+    // A restored project has `obj/project.assets.json`; with it the crawl
+    // looks the restore's libraries up in the global folder instead of
+    // walking it. `packageFolders` is left out: the fixture's absolute
+    // path is not known here, and the crawl already reads `~/.nuget`.
+    let libraries: serde_json::Map<_, _> = pkgs
+        .iter()
+        .map(|p| {
+            (
+                format!("{}/{}", p.name, p.version),
+                json!({
+                    "sha512": gen::sri_sha512(&format!("nupkg:{}", p.name))[7..],
+                    "type": "package",
+                    "path": format!("{}/{}", p.name.to_ascii_lowercase(), p.version),
+                    "files": [format!("lib/net8.0/{}.dll", p.name)],
+                }),
+            )
+        })
+        .collect();
+    let assets = json!({
+        "version": 3,
+        "targets": { "net8.0": {} },
+        "libraries": libraries,
+        "project": {
+            "version": "1.0.0",
+            "restore": { "projectName": "Bench.App", "projectStyle": "PackageReference" },
+        },
+    });
+    t.write(
+        "project/obj/project.assets.json",
+        serde_json::to_string_pretty(&assets).unwrap(),
+    )?;
     for p in &pkgs {
         let id = p.name.to_ascii_lowercase();
         let dir = format!("home/.nuget/packages/{id}/{}", p.version);

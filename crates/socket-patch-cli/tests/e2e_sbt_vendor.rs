@@ -16,6 +16,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
+use common::envelope::event_triples;
 use common::git_sha256;
 
 #[path = "common/hermetic.rs"]
@@ -300,18 +301,6 @@ impl Fixture {
     }
 }
 
-fn events(env: &serde_json::Value) -> Vec<(String, String, String)> {
-    env["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| {
-            let s = |k: &str| e[k].as_str().unwrap_or_default().to_string();
-            (s("purl"), s("action"), s("errorCode"))
-        })
-        .collect()
-}
-
 /// The ledger entry, the generated file and the tree: every record a
 /// planner can produce for the coordinates, no user file edited, and a
 /// re-run (and `--check`) in sync.
@@ -417,7 +406,7 @@ fn vendor_ledger_shape_and_generated_file() {
     fx.sbt_update(&[(GSON, GSON_UUID)]);
     let env = fx.ok(&["vendor"]);
     assert_eq!(
-        events(&env),
+        event_triples(&env),
         [(
             GSON.purl(),
             "skipped".to_string(),
@@ -462,7 +451,7 @@ fn vendor_two_patches_roll_back_in_either_order() {
         assert_eq!(left.pins.values().next().unwrap().artifact, other.artifact);
         let env = fx.ok(&["vendor"]);
         assert_eq!(
-            events(&env),
+            event_triples(&env),
             [(
                 other.purl(),
                 "skipped".to_string(),
@@ -492,7 +481,7 @@ fn vendor_patch_update_replaces_the_pin_and_sweeps() {
     .unwrap();
     let env = fx.ok(&["vendor"]);
     assert!(
-        events(&env)
+        event_triples(&env)
             .iter()
             .any(|(_, _, code)| code == "vendor_stale_artifact_removed"),
         "{env}"
@@ -540,7 +529,7 @@ fn vendor_check_drift_rerun_and_repair() {
     std::fs::rename(&cache, &parked).unwrap();
     let env = fx.ok(&["vendor"]);
     assert_eq!(
-        events(&env),
+        event_triples(&env),
         [(
             GSON.purl(),
             "skipped".to_string(),
@@ -746,7 +735,7 @@ fn vendor_no_evidence_warns_and_exits_zero() {
     // counted applied.
     assert_eq!(env["summary"]["applied"], 0, "{env}");
     assert!(
-        events(&env).contains(&(
+        event_triples(&env).contains(&(
             GSON.purl(),
             "skipped".to_string(),
             "vendor_sbt_no_resolution_evidence".to_string()
@@ -809,7 +798,7 @@ fn vendor_takeover_the_gate_would_skip_keeps_the_hosted_pin() {
     let (exit, env) = fx.run(&["vendor"]);
     assert_eq!(exit, Some(1), "{env}");
     assert!(
-        events(&env).contains(&(
+        event_triples(&env).contains(&(
             GSON.purl(),
             "failed".to_string(),
             "vendor_sbt_no_resolution_evidence".to_string()
@@ -892,7 +881,7 @@ fn vendor_eject_the_gate_would_skip_is_refused() {
     assert_eq!(exit, Some(1), "{env}");
     assert_eq!(env["error"]["code"], "eject_refused", "{env}");
     assert!(
-        events(&env).contains(&(
+        event_triples(&env).contains(&(
             GSON.purl(),
             "failed".to_string(),
             "vendor_sbt_no_resolution_evidence".to_string()

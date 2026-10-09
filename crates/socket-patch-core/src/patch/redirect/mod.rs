@@ -81,9 +81,9 @@ use crate::formats::yarn::patterns::{
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
 #[cfg(test)]
-mod pnpm_equivalence_tests;
-#[cfg(test)]
 mod platform_wheel_tests;
+#[cfg(test)]
+mod pnpm_equivalence_tests;
 mod poetry;
 mod pypi_takeover;
 pub use pypi_takeover::preflight_pypi_takeover;
@@ -352,6 +352,20 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub bundled_skipped_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuid → the yarn.lock keys of the `npm:` alias entries of its
+    /// package the rewriter left untouched (`redirect_yarn_classic_alias_skipped`,
+    /// `redirect_yarn_berry_alias_skipped`): that copy keeps installing the
+    /// unpatched artifact even when a direct entry of the same uuid is
+    /// pinned. A confirmation of the uuid is then a PARTIAL pin, so the
+    /// in-run VEX never assumes it applied (#1081), and a vendored → hosted
+    /// takeover that would un-wire a vendored alias copy is retracted
+    /// (#1158). Serialized only when non-empty, like the set above.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")
+    )]
+    pub alias_skipped_entries:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     /// [`vlt::vlt_drives`] over the rewriter's input files and the
     /// caller's `bun_lockb_present`.
     pub vlt_drives: bool,
@@ -579,7 +593,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
-     &yarnrc::OuterYarnMirror::default(),
+        &yarnrc::OuterYarnMirror::default(),
     )
 }
 
@@ -818,6 +832,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_vlt_uuids,
         vlt_foreign_uuids,
         bundled_skipped_uuids,
+        alias_skipped_entries,
         vlt_drives: _,
         gradle_uuids,
         confirmed_gradle_uuids,
@@ -867,6 +882,13 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_gradle_uuids.extend(confirmed_gradle_uuids);
     result.refused_gradle_uuids.extend(refused_gradle_uuids);
     result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
+    for (uuid, keys) in alias_skipped_entries {
+        result
+            .alias_skipped_entries
+            .entry(uuid)
+            .or_default()
+            .extend(keys);
+    }
     result.confirmed_sbt_uuids.extend(confirmed_sbt_uuids);
     result.refused_sbt_uuids.extend(refused_sbt_uuids);
 }
@@ -3707,6 +3729,22 @@ fn rewrite_yarn_classic_with(
     // re-pin never changes a block's key line.
     let heads: Vec<(Vec<String>, Option<String>)> =
         blocks.iter().map(|b| classic_block_head(&b.key)).collect();
+    // The package each `file:` directory / url copy really installs, with
+    // its version, when its key names another (#1236): read once per block.
+    let renamed: Vec<Option<(String, String, CopySource)>> = blocks
+        .iter()
+        .zip(&heads)
+        .map(|(b, (patterns, _))| {
+            let version = classic_field(&b.lines, "version")?;
+            let (name, source) = crate::formats::yarn::source::classic_copy_real_name(
+                patterns,
+                classic_field(&b.lines, "resolved"),
+                version,
+                |rel| files.get(rel).cloned(),
+            )?;
+            Some((name, version.to_string(), source))
+        })
+        .collect();
     // A pinned block's new lines are kept in `blocks[i].lines` (so a later
     // dep reads the pinned fields) and spliced over the block's original
     // byte span once, at the end: re-scanning and re-copying the whole lock
@@ -3737,6 +3775,43 @@ fn rewrite_yarn_classic_with(
             // matching on the alias name alone would hijack the fork.
             let (patterns, real_name) = &heads[i];
             if real_name.as_deref() != Some(fname.as_str()) {
+                // yarn 1 keys a `file:` directory or url copy by the
+                // DEPENDENCY name (`"lp2@file:./lpdir"`), so a copy of this
+                // package under another name is read from the copy itself
+                // (#1236). No rewrite reaches it: named, and never assumed
+                // applied by the in-run VEX.
+                let Some((version, source)) = renamed[i]
+                    .as_ref()
+                    .filter(|(name, _, _)| *name == fname)
+                    .map(|(_, version, source)| (version, *source))
+                else {
+                    continue;
+                };
+                if *version != dep.version {
+                    continue;
+                }
+                copy_skipped = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                let (code, from) = match source {
+                    CopySource::Directory => (
+                        "redirect_yarn_classic_directory_skipped",
+                        "a file: directory, which yarn copies into node_modules rather than \
+                         fetching a tarball",
+                    ),
+                    _ => (
+                        "redirect_yarn_classic_non_registry_entry_skipped",
+                        "a URL tarball",
+                    ),
+                };
+                result.warnings.push(RewriteWarning {
+                    code: code.into(),
+                    detail: format!(
+                        "lock entry `{}` installs {fname}@{version} under another dependency \
+                         name, from {from}; the hosted redirect leaves it untouched, so this \
+                         copy stays unpatched",
+                        blocks[i].key
+                    ),
+                });
                 continue;
             }
             let block = &blocks[i];
@@ -3855,6 +3930,11 @@ fn rewrite_yarn_classic_with(
                 .any(|p| split_classic_pattern(p).is_some_and(|(n, _)| n == fname))
             {
                 alias_skipped = true;
+                result
+                    .alias_skipped_entries
+                    .entry(dep.patch_uuid.clone())
+                    .or_default()
+                    .insert(key.clone());
                 result.warnings.push(RewriteWarning {
                     code: "redirect_yarn_classic_alias_skipped".into(),
                     detail: format!(
@@ -4184,6 +4264,11 @@ fn rewrite_yarn_berry_with_manifests(
                 }) && locks_version(block)
                 {
                     alias_skipped = true;
+                    result
+                        .alias_skipped_entries
+                        .entry(dep.patch_uuid.clone())
+                        .or_default()
+                        .insert(raw_key.to_string());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_yarn_berry_alias_skipped".into(),
                         detail: format!(
@@ -6997,8 +7082,10 @@ fn rewrite_maven_pom(
     // One pass over the pom's repositories: `(id, url)` of each, which also
     // answers the per-dep URL-refresh check below while the pom is still
     // unchanged (a no-op rescan then never re-scans the pom per dep).
-    let original_repos: Vec<(String, Option<String>)> =
-        pom.as_deref().map(maven_repository_ids_and_urls).unwrap_or_default();
+    let original_repos: Vec<(String, Option<String>)> = pom
+        .as_deref()
+        .map(maven_repository_ids_and_urls)
+        .unwrap_or_default();
     let hosted_repo_generations: std::collections::BTreeSet<String> = original_repos
         .iter()
         .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
@@ -11111,7 +11198,10 @@ mod tests {
             &[(YARNRC_REL, "yarn-offline-mirror: false\n")],
             &[(YARNRC_REL, "yarn-offline-mirror:\n")],
             &[(YARNRC_REL, "yarn-offline-mirror \"\"\n")],
-            &[(YARNRC_REL, "yarn-offline-mirror-pruning true\n# yarn-offline-mirror ./m\n")],
+            &[(
+                YARNRC_REL,
+                "yarn-offline-mirror-pruning true\n# yarn-offline-mirror ./m\n",
+            )],
             &[(npmrc::NPMRC_REL, "[scope]\nyarn-offline-mirror=./m\n")],
             &[
                 (YARNRC_REL, "yarn-offline-mirror false\n"),
@@ -11127,7 +11217,10 @@ mod tests {
             let mut r = RewriteResult::default();
             rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
             assert!(r.warnings.is_empty(), "{rcs:?}: {:?}", r.warnings);
-            assert!(r.files["yarn.lock"].contains("http://p.test/lp.tgz"), "{rcs:?}");
+            assert!(
+                r.files["yarn.lock"].contains("http://p.test/lp.tgz"),
+                "{rcs:?}"
+            );
             assert!(r.refused_yarn_classic_uuids.is_empty(), "{rcs:?}");
         }
     }
@@ -11152,7 +11245,10 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&other), &mut r);
         assert!(r.refused_yarn_classic_uuids.is_empty());
         assert_eq!(
-            r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
             ["redirect_yarn_classic_entry_not_found"]
         );
     }
@@ -11313,6 +11409,79 @@ mod tests {
             let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
             assert_eq!(codes, ["redirect_yarn_classic_directory_skipped"], "{only}");
             assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+        }
+    }
+
+    /// #1236: yarn 1 locks a `file:` directory or url copy under the
+    /// DEPENDENCY name (`"lp2@file:./lpdir"`), so a copy of the patched
+    /// left-pad@1.3.0 declared as `lp2` is read from the copy itself (the
+    /// directory's `package.json`, the registry url's path). The registry
+    /// block is still pinned; the copy is named with the same codes as a
+    /// same-name copy and kept out of the in-run VEX. Controls: a copy of
+    /// another package, of another version, or whose manifest is not
+    /// readable is not named.
+    #[test]
+    fn issue_1236_yarn_classic_other_name_copy_is_named() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let registry_block = "left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        let dir_block = "\"lp2@file:./lpdir\":\n  version \"1.3.0\"\n";
+        let url_block = "\"lp2@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\":\n  \
+             version \"1.3.0\"\n  \
+             resolved \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n";
+        let run = |copy: &str, manifest: Option<&str>| {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "yarn.lock".to_string(),
+                format!("# yarn lockfile v1\n\n\n{registry_block}\n{copy}"),
+            );
+            if let Some(m) = manifest {
+                files.insert("lpdir/package.json".to_string(), m.to_string());
+            }
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(
+                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz\""),
+                "the registry block is still pinned: {:?}",
+                r.files
+            );
+            assert!(r.files["yarn.lock"].contains(copy), "copy byte-identical");
+            r
+        };
+        let left_pad = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        for (copy, code) in [
+            (dir_block, "redirect_yarn_classic_directory_skipped"),
+            (
+                url_block,
+                "redirect_yarn_classic_non_registry_entry_skipped",
+            ),
+        ] {
+            let r = run(copy, Some(left_pad));
+            let named: Vec<&RewriteWarning> =
+                r.warnings.iter().filter(|w| w.code == code).collect();
+            assert_eq!(named.len(), 1, "{copy}: {:?}", r.warnings);
+            assert!(named[0].detail.contains("lp2@"), "{:?}", named[0]);
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid), "{copy}");
+        }
+        let other_version = dir_block.replace("1.3.0", "1.2.0");
+        for (case, copy, manifest) in [
+            (
+                "another package",
+                dir_block,
+                Some(r#"{"name":"other-pkg","version":"1.3.0"}"#),
+            ),
+            ("another version", other_version.as_str(), Some(left_pad)),
+            ("no readable manifest", dir_block, None),
+        ] {
+            let r = run(copy, manifest);
+            assert!(r.warnings.is_empty(), "{case}: {:?}", r.warnings);
+            assert!(r.bundled_skipped_uuids.is_empty(), "{case}");
         }
     }
 
@@ -11517,6 +11686,13 @@ mod tests {
         rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty() && r.edits.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_yarn_berry_alias_skipped");
+        assert_eq!(
+            r.alias_skipped_entries.get(&ovr.patch_uuid),
+            Some(&std::collections::BTreeSet::from([
+                "\"safe-pad@npm:left-pad@^1.3.0\"".to_string()
+            ])),
+            "the skipped alias entry is recorded for its uuid (#1081)"
+        );
         assert!(
             !r.warnings
                 .iter()
@@ -11524,6 +11700,58 @@ mod tests {
             "the alias warning replaces the generic not-found: {:?}",
             r.warnings
         );
+    }
+
+    /// #1081 / #1158: yarn 1.22.22 locks a direct dep and an `npm:` alias
+    /// of it as two blocks. The direct block is pinned and the alias block
+    /// skipped, and the result records that skipped block's key for the
+    /// uuid, so a confirmation of it reads as a PARTIAL pin.
+    #[test]
+    fn yarn_classic_alias_beside_direct_records_the_skipped_block() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\n\n\
+             left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n\n\
+             \"lp@npm:left-pad@1.3.0\":\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n"
+                .to_string(),
+        );
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(
+            r.edits.len(),
+            1,
+            "the direct block is pinned: {:?}",
+            r.edits
+        );
+        assert_eq!(
+            r.alias_skipped_entries.get(&ovr.patch_uuid),
+            Some(&std::collections::BTreeSet::from([
+                "\"lp@npm:left-pad@1.3.0\"".to_string()
+            ])),
+        );
+        // A lock with no alias block records nothing.
+        let direct_only = files["yarn.lock"]
+            .split("\n\n\"lp@")
+            .next()
+            .unwrap()
+            .to_string()
+            + "\n";
+        let files = BTreeMap::from([("yarn.lock".to_string(), direct_only)]);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1);
+        assert!(r.alias_skipped_entries.is_empty());
     }
 
     fn bun_lock_file(entry: &str, version: u64) -> String {

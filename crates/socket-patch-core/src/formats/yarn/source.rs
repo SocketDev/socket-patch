@@ -74,6 +74,95 @@ pub(crate) fn classic_copy_source(patterns: &[String], resolved: Option<&str>) -
     }
 }
 
+/// The root-relative `file:` directory a classic block's key names, if
+/// any: yarn 1 COPIES it into node_modules under the DEPENDENCY name
+/// (`"lp2@file:./lpdir"`), so which package that copy is comes from the
+/// directory's own `package.json` (#1236). `None` for a `file:` tarball or
+/// a path that leaves the root.
+pub(crate) fn classic_file_directory(patterns: &[String]) -> Option<String> {
+    patterns.iter().find_map(|p| {
+        let path = split_classic_pattern(p)?.1.strip_prefix("file:")?;
+        let path = path.split('#').next().unwrap_or_default();
+        if is_tarball_path(path) {
+            return None;
+        }
+        crate::utils::cargo_workspace::normalize_rel("", path)
+    })
+}
+
+/// The package a classic `file:` directory or url copy really installs,
+/// whatever dependency name its key carries (#1236): the directory's
+/// `package.json` `name` (read through `read_text`, given the
+/// root-relative manifest path), or the registry package a url tarball's
+/// path names. `None` when neither says (a `file:` tarball, a
+/// non-registry url, an unreadable manifest).
+pub(crate) fn classic_copy_real_name(
+    patterns: &[String],
+    resolved: Option<&str>,
+    version: &str,
+    read_text: impl Fn(&str) -> Option<String>,
+) -> Option<(String, CopySource)> {
+    match classic_copy_source(patterns, resolved) {
+        CopySource::Directory => {
+            let dir = classic_file_directory(patterns)?;
+            let manifest = if dir.is_empty() {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            };
+            let name = manifest_name(read_text(&manifest)?.as_bytes())?;
+            Some((name, CopySource::Directory))
+        }
+        CopySource::RemoteTarball => {
+            let url = resolved?.split('#').next().unwrap_or_default();
+            if !url.starts_with("http") {
+                return None;
+            }
+            Some((
+                registry_tarball_name(url, version)?,
+                CopySource::RemoteTarball,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `name` of a `package.json`.
+pub(crate) fn manifest_name(bytes: &[u8]) -> Option<String> {
+    let bytes = crate::formats::text::strip_bom_bytes(bytes);
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()?
+        .get("name")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The package an npm registry tarball url serves, from its
+/// `/<name>/-/<leaf>-<version>.tgz` path (`<name>` may be `@scope/leaf`,
+/// its `@` / `/` possibly percent-encoded); `None` for any other shape.
+pub(crate) fn registry_tarball_name(url: &str, version: &str) -> Option<String> {
+    let path = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = path.split(['?']).next()?;
+    let (before, file) = path.rsplit_once("/-/")?;
+    let mut segs: Vec<String> = before
+        .split('/')
+        .skip(1) // the host
+        .map(|seg| crate::utils::purl::percent_decode_purl_component(seg).into_owned())
+        .collect();
+    let leaf_name = segs.pop()?;
+    let (scope, leaf_name) = match leaf_name.split_once('/') {
+        Some((scope, leaf)) => (Some(scope.to_string()), leaf.to_string()),
+        None => (segs.pop().filter(|s| s.starts_with('@')), leaf_name),
+    };
+    if file != format!("{leaf_name}-{version}.tgz") {
+        return None;
+    }
+    Some(match scope {
+        Some(scope) => format!("{scope}/{leaf_name}"),
+        None => leaf_name,
+    })
+}
+
 /// A GitHub codeload tarball: what yarn 1 locks a hosted-git shorthand to.
 fn is_codeload_tarball(resolved: &str) -> bool {
     resolved

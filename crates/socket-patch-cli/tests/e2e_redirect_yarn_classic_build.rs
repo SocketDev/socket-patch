@@ -1001,7 +1001,10 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
         return;
     };
     assert!(
-        fx.proj.join("mirror").join(format!("{DEP}-{DEP_VERSION}.tgz")).is_file(),
+        fx.proj
+            .join("mirror")
+            .join(format!("{DEP}-{DEP_VERSION}.tgz"))
+            .is_file(),
         "the fixture install must populate the offline mirror"
     );
     let fresh = fx.tmp.path().join("fresh");
@@ -1027,7 +1030,11 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
             String::from_utf8_lossy(&ci.stderr)
         );
         assert!(
-            !fresh.join("node_modules").join(DEP).join("index.js").exists(),
+            !fresh
+                .join("node_modules")
+                .join(DEP)
+                .join("index.js")
+                .exists(),
             "yarn < 1.7 is expected to install nothing from the mirror"
         );
         return;
@@ -1049,7 +1056,10 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
         );
         let installed =
             std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
-        assert_eq!(installed, fx.orig, "the untouched lock installs the upstream bytes");
+        assert_eq!(
+            installed, fx.orig,
+            "the untouched lock installs the upstream bytes"
+        );
         std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
     }
 }
@@ -1337,6 +1347,134 @@ async fn classic_file_directory_dependency_is_named_and_not_attested() {
     assert!(
         !vex.contains("not_affected"),
         "nothing may be attested for the file: copy:\n{vex}\n{env}"
+    );
+}
+
+/// #1236: the same `file:` directory declared under ANOTHER dependency
+/// name (`"lp2": "file:./lpdir"`, lpdir being left-pad@1.3.0) locks as
+/// `"lp2@file:./lpdir"`, beside the registry left-pad. yarn 1 copies it
+/// into `node_modules/lp2`, so it stays unpatched whatever the pin does.
+/// `scan --mode hosted` must still pin the registry block, name the copy
+/// (`redirect_yarn_classic_directory_skipped`), and neither its in-run VEX
+/// nor a lock-only `vex` may attest left-pad not_affected.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_file_directory_copy_under_another_name_is_named_and_not_attested() {
+    if !require_yarn_classic("e2e_redirect_yarn_classic_build (other-name file:)", |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let copy = proj.join("lpdir");
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(
+        copy.join("package.json"),
+        format!(r#"{{"name":"{DEP}","version":"{DEP_VERSION}","main":"index.js"}}"#),
+    )
+    .unwrap();
+    let orig: &[u8] = b"module.exports = function leftPad(s) { return s; };\n";
+    std::fs::write(copy.join("index.js"), orig).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"other-name-classic","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}","lp2":"file:./lpdir"}}}}"#
+        ),
+    )
+    .unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "(other-name file:): fixture `yarn install` failed:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    let lock_pristine = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock_pristine.contains("lp2@file:./lpdir"),
+        "fixture must lock the copy under its dependency name:\n{lock_pristine}"
+    );
+
+    let installed_dir = proj.join("node_modules").join(DEP);
+    let installed_orig = std::fs::read(installed_dir.join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), &installed_orig].concat();
+    let tgz_path = tmp.path().join("patched.tgz");
+    build_patched_tgz(&installed_dir, &patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let server = mock_hosted_grant(&tgz, &installed_orig, &patched, "other-name fixture").await;
+
+    let api_url = server.uri();
+    let api = [
+        "--api-url",
+        api_url.as_str(),
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    let mut args = vec![
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--vex",
+        "out.vex.json",
+        "--vex-product",
+        PRODUCT,
+    ];
+    args.extend(api);
+    let (code, stdout, stderr) = run_socket(&proj, &args);
+    println!("scan exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan --json output is not JSON: {e}\n{stdout}\n{stderr}"));
+    let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("{UUID}/{DEP}-{DEP_VERSION}.tgz")),
+        "the registry left-pad block must still be pinned:\n{lock}"
+    );
+    assert!(
+        env.to_string()
+            .contains("redirect_yarn_classic_directory_skipped"),
+        "the other-name copy must be named: {env}"
+    );
+    assert!(env.to_string().contains("lp2@file:./lpdir"), "{env}");
+    let vex = std::fs::read_to_string(proj.join("out.vex.json")).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "the in-run VEX must not attest left-pad:\n{vex}\n{env}"
+    );
+
+    // Lock-only: with node_modules gone, `vex` reads only the lock.
+    std::fs::remove_dir_all(proj.join("node_modules")).unwrap();
+    let mut args = vec![
+        "vex",
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--output",
+        "lock-only.vex.json",
+        "--product",
+        PRODUCT,
+        "--patch-server-url",
+        api_url.as_str(),
+    ];
+    args.extend(api);
+    let (code, stdout, stderr) = run_socket(&proj, &args);
+    println!("vex exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let vex = std::fs::read_to_string(proj.join("lock-only.vex.json")).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "lock-only vex must not attest left-pad:\n{vex}\n{stdout}\n{stderr}"
     );
 }
 
