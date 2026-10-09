@@ -5695,6 +5695,21 @@ wheels = [
             warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
             "{warnings:?}"
         );
+        // What `vendor --check` and `vex` read: both files wire the same
+        // vendored wheel, so neither contests the other.
+        let discovery = crate::vex::discover::discover_patched_refs(&fx.root).await;
+        assert!(discovery.contested.is_empty(), "{:?}", discovery.contested);
+        let wired_in: std::collections::BTreeSet<String> = discovery
+            .refs
+            .iter()
+            .filter(|r| r.uuid == UUID)
+            .map(|r| r.source_file.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(
+            wired_in.contains("Pipfile.lock") && wired_in.contains("requirements.txt"),
+            "{:?}",
+            discovery.refs
+        );
 
         let outcome = revert_pypi(
             entry.as_ref().expect("a wet vendor records its entry"),
