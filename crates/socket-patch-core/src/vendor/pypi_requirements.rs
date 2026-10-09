@@ -271,6 +271,49 @@ fn wired_pin_in(content: &str, canon_name: &str, record_uuid: &str) -> Option<(S
     })
 }
 
+/// Whether the root `requirements.txt` (and its `-r` includes) could be
+/// co-wired beside another flavor's lock for `canon_name==version` (#612).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CoWire {
+    /// Not yet wired, and a fresh wiring plans cleanly.
+    Wire,
+    /// Already routes the package to this patch's wheel.
+    Wired,
+    /// Refused (another uuid's vendor line, an unwirable pin, an unreadable
+    /// file): left alone, and named as a loser.
+    Blocked,
+}
+
+/// Probe [`CoWire`] without writing: the same preflight and plan a fresh
+/// requirements vendor runs, with a placeholder wheel (the plan's refusals
+/// depend on the pins, not on the wheel).
+pub(super) async fn co_wire_state(
+    root: &Path,
+    canon_name: &str,
+    version: &str,
+    record_uuid: &str,
+) -> CoWire {
+    match preflight_requirements(root, canon_name, version, record_uuid).await {
+        Ok(RequirementsTarget::InSync { .. }) => CoWire::Wired,
+        Ok(RequirementsTarget::Fresh) => {
+            let placeholder_sha = "0".repeat(64);
+            match plan_requirements(
+                root,
+                canon_name,
+                version,
+                &format!(".socket/vendor/pypi/{record_uuid}/{canon_name}-{version}.whl"),
+                &placeholder_sha,
+            )
+            .await
+            {
+                Ok(_) => CoWire::Wire,
+                Err(_) => CoWire::Blocked,
+            }
+        }
+        _ => CoWire::Blocked,
+    }
+}
+
 /// Rewrite every exact pin across the root `requirements.txt` and its `-r`
 /// includes (or append a managed transitive line at the root EOF when the
 /// package is absent). Returns the wiring records in application order.

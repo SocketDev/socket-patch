@@ -373,7 +373,11 @@ async fn detect_pypi_flavor(
     // (`pipenv requirements`, `uv export`) is an install source the
     // single-lock wiring leaves untouched — name it among the losers when it
     // pins this package.
-    if governing.is_some() && requirements_pins_target(project_root, target).await {
+    // Pipenv co-wires it instead (the Pipenv plan names it a loser only
+    // when it cannot).
+    if governing.is_some_and(|lock| lock != "Pipfile.lock")
+        && requirements_pins_target(project_root, target).await
+    {
         present.push(PYPI_REQUIREMENTS);
     }
     if !has_uv_lock && !additional_locks.is_empty() {
@@ -502,7 +506,9 @@ enum WiringPlan {
     Pdm(Box<PdmProject>),
     /// The ledger entry of an OLDER patch uuid whose Pipfile.lock wiring the
     /// guards admitted for an in-place re-wire (#769), if any.
-    Pipenv(Box<PipenvProject>, Option<Box<VendorEntry>>),
+    /// The Pipfile.lock wiring, the superseded entry it re-wires, and
+    /// whether the sibling `requirements.txt` is co-wired with it (#612).
+    Pipenv(Box<PipenvProject>, Option<Box<VendorEntry>>, bool),
     /// The uv, script-lock, Hatch, Poetry or PDM wiring routes this package
     /// through an OLDER patch uuid's vendored wheel that the ledger still
     /// records (#742, #650, #1136): replay that entry's revert, then wire
@@ -1075,14 +1081,45 @@ async fn pypi_prelude<'p>(
             {
                 warnings.push(stale);
             }
+            // #612: a `requirements.txt` exported beside Pipfile.lock
+            // (`pipenv requirements`) installs the package too. A fresh
+            // vendor wires it with the lock; one that cannot be wired (or a
+            // project vendored before it was) is a loud loser.
+            let co_wire =
+                if requirements_pins_target(project_root, Some((&canon_name, version))).await {
+                    super::pypi_requirements::co_wire_state(
+                        project_root,
+                        &canon_name,
+                        version,
+                        &record.uuid,
+                    )
+                    .await
+                } else {
+                    super::pypi_requirements::CoWire::Wired
+                };
+            let wires_requirements = co_wire == super::pypi_requirements::CoWire::Wire
+                && target == PipenvTarget::Fresh
+                && superseded.is_none();
+            if co_wire != super::pypi_requirements::CoWire::Wired && !wires_requirements {
+                warnings.push(VendorWarning::new(
+                    "pypi_multiple_lockfiles",
+                    format!(
+                        "multiple python lockfiles found; wiring `Pipfile.lock` — installs \
+                         driven by {} will still install the UNPATCHED registry bytes",
+                        crate::formats::governing_locks::PYPI_REQUIREMENTS
+                    ),
+                ));
+            }
             match target {
                 PipenvTarget::InSync => {
                     wired_pin = pipenv_wired_pin(&project.lock, &uuid_dir_rel);
                     WiringPlan::InSync
                 }
-                PipenvTarget::Fresh => {
-                    WiringPlan::Pipenv(Box::new(project), superseded.map(Box::new))
-                }
+                PipenvTarget::Fresh => WiringPlan::Pipenv(
+                    Box::new(project),
+                    superseded.map(Box::new),
+                    wires_requirements,
+                ),
             }
         }
     };
@@ -1546,19 +1583,54 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             .await
             .map(|(wiring, meta)| (wiring, MetaSlot::Pdm(meta)))
         }
-        WiringPlan::Pipenv(project, superseded) => super::pypi_pipenv::wire_pipenv_superseding(
-            &project,
-            project_root,
-            &canon_name,
-            version,
-            &rel_wheel,
-            &artifact.sha256_hex,
-            &record.uuid,
-            &hosted_origins,
-            superseded.as_deref(),
-        )
-        .await
-        .map(|(wiring, meta)| (wiring, MetaSlot::Pipenv(meta))),
+        WiringPlan::Pipenv(project, superseded, wires_requirements) => {
+            let wired = super::pypi_pipenv::wire_pipenv_superseding(
+                &project,
+                project_root,
+                &canon_name,
+                version,
+                &rel_wheel,
+                &artifact.sha256_hex,
+                &record.uuid,
+                &hosted_origins,
+                superseded.as_deref(),
+            )
+            .await;
+            match wired {
+                Ok((mut wiring, meta)) if wires_requirements => {
+                    // #612: the sibling requirements.txt, after the lock. A
+                    // failure puts the lock back so the vendor fails whole.
+                    match wire_requirements(
+                        project_root,
+                        &canon_name,
+                        version,
+                        &rel_wheel,
+                        &artifact.sha256_hex,
+                    )
+                    .await
+                    {
+                        Ok(records) => {
+                            wiring.extend(records);
+                            Ok((wiring, MetaSlot::Pipenv(meta)))
+                        }
+                        Err((code, mut detail)) => {
+                            if let Err(e) = crate::utils::fs::atomic_write_bytes_preserving_mode(
+                                &project_root.join("Pipfile.lock"),
+                                project.lock_text.as_bytes(),
+                            )
+                            .await
+                            {
+                                detail.push_str(&format!(
+                                    "; restoring Pipfile.lock also failed: {e}"
+                                ));
+                            }
+                            Err((code, detail))
+                        }
+                    }
+                }
+                other => other.map(|(wiring, meta)| (wiring, MetaSlot::Pipenv(meta))),
+            }
+        }
         // Returned right after the wheel build above.
         WiringPlan::InSync => unreachable!("in-sync rebuilds never reach wiring"),
         // Replaced by its fresh plan just above.
@@ -2279,6 +2351,43 @@ fn residual_reference_warning(uuid: &str, clause: &str) -> VendorWarning {
     )
 }
 
+/// Revert a Pipenv entry: its Pipfile.lock records, then the sibling
+/// `requirements.txt` lines a fresh vendor co-wired with them (#612), each
+/// through its own flavor's revert.
+async fn revert_pipenv_with_requirements(
+    entry: &VendorEntry,
+    project_root: &Path,
+    dry_run: bool,
+) -> RevertOutcome {
+    const REQUIREMENTS_LINE: &str = "requirements_line";
+    if entry.wiring.iter().all(|r| r.kind != REQUIREMENTS_LINE) {
+        return super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await;
+    }
+    let (requirements, lock): (Vec<_>, Vec<_>) = entry
+        .wiring
+        .iter()
+        .cloned()
+        .partition(|r| r.kind == REQUIREMENTS_LINE);
+    let lock_entry = VendorEntry {
+        wiring: lock,
+        ..entry.clone()
+    };
+    let requirements_entry = VendorEntry {
+        wiring: requirements,
+        ..entry.clone()
+    };
+    let mut outcome = super::pypi_pipenv::revert_pipenv(&lock_entry, project_root, dry_run).await;
+    if !outcome.success {
+        return outcome;
+    }
+    let second = revert_requirements(&requirements_entry, project_root, dry_run).await;
+    outcome.success = second.success;
+    outcome.error = second.error;
+    outcome.kept_artifact |= second.kept_artifact;
+    outcome.warnings.extend(second.warnings);
+    outcome
+}
+
 /// `VendorEntry::flavor` values the dispatch below knows how to revert —
 /// the set an UNWIRED entry must belong to (or be `None`) before it is
 /// treated as a reclaimable orphan.
@@ -2352,7 +2461,7 @@ pub async fn revert_pypi_opts(
             Some("requirements") => revert_requirements(entry, project_root, dry_run).await,
             Some("poetry") => super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await,
             Some("pdm") => super::pypi_pdm::revert_pdm(entry, project_root, dry_run).await,
-            Some("pipenv") => super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await,
+            Some("pipenv") => revert_pipenv_with_requirements(entry, project_root, dry_run).await,
             other => {
                 return RevertOutcome::failed(format!(
                     "unknown pypi vendor flavor {other:?}; cannot revert"
@@ -2759,11 +2868,24 @@ mod tests {
     /// lock (`pipenv requirements`, `uv export`) is an install source the
     /// single-lock wiring leaves UNPATCHED, so it must be named by the
     /// documented `pypi_multiple_lockfiles` warning — but only when it pins
-    /// the package being vendored.
+    /// the package being vendored. Pipfile.lock is the exception: its plan
+    /// co-wires the sibling (see
+    /// `pipenv_vendor_wires_the_exported_sibling_requirements`), so routing
+    /// stays quiet about it.
     #[tokio::test]
     async fn requirements_beside_the_governing_lock_is_a_loud_loser() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "Pipfile.lock", "{}").await;
+        touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
+        let (selected, warnings) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+            .await
+            .unwrap();
+        assert_eq!(selected, PypiFlavor::Pipenv);
+        assert!(
+            warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
+            "{warnings:?}"
+        );
         for (lock, content, flavor) in [
-            ("Pipfile.lock", "{}", PypiFlavor::Pipenv),
             ("uv.lock", "version = 1\n", PypiFlavor::UvProject),
             ("poetry.lock", "", PypiFlavor::Poetry),
             ("pdm.lock", "", PypiFlavor::Pdm),
@@ -5541,6 +5663,85 @@ wheels = [
             None,
         )
         .await
+    }
+
+    /// #612: `pipenv requirements > requirements.txt` beside Pipfile.lock is
+    /// a second install source (Docker / plain pip). Vendored mode must wire
+    /// both, as hosted mode does, and revert must restore both byte for byte.
+    #[tokio::test]
+    async fn pipenv_vendor_wires_the_exported_sibling_requirements() {
+        const EXPORTED: &str =
+            "-i https://pypi.org/simple\nsix==1.16.0 ; python_version >= '2.7'\n";
+        let fx = pipenv_e2e_fixture().await;
+        touch(&fx.root, "requirements.txt", EXPORTED).await;
+        let VendorOutcome::Done {
+            entry, warnings, ..
+        } = pipenv_vendor(&fx, &fx.record).await
+        else {
+            panic!("vendor did not complete");
+        };
+        let requirements = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        assert!(
+            requirements.contains(&format!(".socket/vendor/pypi/{UUID}/")),
+            "requirements.txt left unpatched:\n{requirements}"
+        );
+        let lock = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        assert!(lock.contains(UUID), "Pipfile.lock not wired:\n{lock}");
+        assert!(
+            warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
+            "{warnings:?}"
+        );
+
+        let outcome = revert_pypi(
+            entry.as_ref().expect("a wet vendor records its entry"),
+            &fx.root,
+            false,
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            EXPORTED
+        );
+        assert_eq!(
+            read_json(&fx.root, "Pipfile.lock").await,
+            serde_json::from_str::<serde_json::Value>(PIPENV_REGISTRY_LOCK).unwrap()
+        );
+    }
+
+    /// #612: a project whose Pipfile.lock was vendored before the sibling
+    /// requirements.txt was co-wired is in sync for the lock; the re-run
+    /// leaves requirements.txt alone and keeps naming it a loud loser.
+    #[tokio::test]
+    async fn pipenv_in_sync_rerun_names_an_unwired_sibling_requirements() {
+        let fx = pipenv_e2e_fixture().await;
+        assert!(matches!(
+            pipenv_vendor(&fx, &fx.record).await,
+            VendorOutcome::Done { .. }
+        ));
+        touch(&fx.root, "requirements.txt", "six==1.16.0\n").await;
+        let VendorOutcome::Done { warnings, .. } = pipenv_vendor(&fx, &fx.record).await else {
+            panic!("re-run did not complete");
+        };
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            "six==1.16.0\n"
+        );
+        assert!(
+            warnings.iter().any(|w| w.code == "pypi_multiple_lockfiles"
+                && w.detail.contains("requirements.txt")
+                && w.detail.contains("UNPATCHED")),
+            "{warnings:?}"
+        );
     }
 
     async fn read_json(root: &Path, name: &str) -> serde_json::Value {
