@@ -1029,7 +1029,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
 /// it, and `vendor --revert` gives back the pre-hosted bytes exactly.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
-async fn native_binary_shared_bundled_record_hosted_pin_is_managed() {
+async fn binary_shared_bundled_record_hosted_pin_is_managed() {
     let Some(fixture) = Fixture::new("bundled") else {
         return;
     };
