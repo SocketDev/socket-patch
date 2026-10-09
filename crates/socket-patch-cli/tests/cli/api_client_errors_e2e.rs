@@ -510,13 +510,7 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
     .unwrap();
 
     let out = crate::common::hermetic_command(&binary())
-        .args([
-            "repair",
-            "--json",
-            "--download-mode",
-            "file",
-            "--download-only",
-        ])
+        .args(["repair", "--json", "--download-only"])
         .current_dir(tmp.path())
         .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token")

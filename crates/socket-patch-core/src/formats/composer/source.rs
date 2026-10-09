@@ -39,10 +39,11 @@ pub(crate) struct Member {
     pub value_end: usize,
 }
 
-/// What to do with the entry's top-level `source` member.
+/// What to do with one origin-bound member of the entry
+/// ([`super::ORIGIN_BOUND_ENTRY_KEYS`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SourcePlan {
-    /// The entry has no top-level `source`.
+    /// The entry has no such top-level member.
     None,
     /// Delete this inclusive byte range (the member plus one adjoining comma).
     Remove(RangeInclusive<usize>),
@@ -236,20 +237,33 @@ pub(super) fn member_removal_range(
     Some(start..=member.value_end)
 }
 
-/// Plan the drop of the top-level `source` member of the entry object
-/// spanning `object_open` to `entry_end`.
-pub(super) fn plan_source_drop(content: &str, object_open: usize, entry_end: usize) -> SourcePlan {
+/// Plan the drop of the top-level `key` member (one of
+/// [`super::ORIGIN_BOUND_ENTRY_KEYS`]) of the entry object spanning
+/// `object_open` to `entry_end`. A `source` that is not an object is
+/// [`SourcePlan::Kept`]; `transport-options` goes whatever its shape.
+pub(super) fn plan_member_drop(
+    content: &str,
+    object_open: usize,
+    entry_end: usize,
+    key: &str,
+) -> SourcePlan {
     let members = top_level_members(content, object_open, entry_end);
-    let Some(index) = members.iter().position(|m| m.key == "source") else {
+    let Some(index) = members.iter().position(|m| m.key == key) else {
         return SourcePlan::None;
     };
-    if content.as_bytes()[members[index].value_start] != b'{' {
+    if key == "source" && content.as_bytes()[members[index].value_start] != b'{' {
         return SourcePlan::Kept;
     }
     match member_removal_range(content, &members, index) {
         Some(range) => SourcePlan::Remove(range),
         None => SourcePlan::None,
     }
+}
+
+/// [`plan_member_drop`] for the entry's `source`.
+#[cfg(test)]
+fn plan_source_drop(content: &str, object_open: usize, entry_end: usize) -> SourcePlan {
+    plan_member_drop(content, object_open, entry_end, "source")
 }
 
 /// `block` (a whole `"dist": {…}` member) without its top-level `mirrors`;
@@ -283,12 +297,16 @@ pub(super) struct DistSpan {
 
 /// Splice the redirected dist (or, when `rewritten_dist` is `None` because
 /// the dist is already redirected, the current one) into the entry, dropping
-/// the entry's top-level `source` and the dist's `mirrors` (warned about when
-/// the lock's dist had them, whether or not `rewritten_dist` still does).
-/// The recorded edit spans the dist block AND the removed `source` member,
-/// so the ledger's fragment revert restores both byte-for-byte. `None` — no
-/// edit, no ledger growth — when nothing changes (an idempotent re-run over
-/// a healed lock).
+/// the dist's `mirrors` and the entry's origin-bound members
+/// ([`super::ORIGIN_BOUND_ENTRY_KEYS`]: `source`, `transport-options`),
+/// each warned about when the lock had it, whether or not `rewritten_dist`
+/// still does. The recorded edit spans the dist block AND every removed
+/// member, so a ledger fragment revert restores them byte-for-byte. The
+/// upstream restore (`rollback`/`remove` without a ledger) rebuilds only
+/// `dist` and `source` from packagist: `transport-options` do not come back,
+/// which the warning says and the restore warns about again.
+/// `None` — no edit, no ledger growth — when nothing changes (an idempotent
+/// re-run over a healed lock).
 pub(super) fn apply_dist_edit(
     content: &mut String,
     span: DistSpan,
@@ -314,41 +332,87 @@ pub(super) fn apply_dist_edit(
             ),
         });
     }
-    let plan = match entry_object_start(content, entry_start) {
-        Some(object_open) => plan_source_drop(content, object_open, entry_end),
+    let object_open = entry_object_start(content, entry_start);
+    let plan = |text: &str, end: usize, key: &str| match object_open {
+        Some(open) => plan_member_drop(text, open, end, key),
         None => SourcePlan::None,
     };
-    if plan == SourcePlan::Kept {
-        warnings.push(RewriteWarning {
-            code: "redirect_composer_source_kept".into(),
-            detail: format!(
-                "{composer_name}'s source is not an object and was left in place; a failed \
-                 hosted download may fall back to it"
-            ),
-        });
+    // The span every change falls in: the dist plus each member's own
+    // removal range in the original text.
+    let (mut span_start, mut span_end) = (dist_start, dist_end);
+    for key in super::ORIGIN_BOUND_ENTRY_KEYS {
+        match plan(content, entry_end, key) {
+            SourcePlan::Remove(r) => {
+                span_start = span_start.min(*r.start());
+                span_end = span_end.max(*r.end());
+                if key == "transport-options" {
+                    warnings.push(RewriteWarning {
+                        code: "redirect_composer_transport_options_removed".into(),
+                        detail: format!(
+                            "{composer_name}'s transport-options were removed; they carry \
+                             the original repository's download options (auth headers, \
+                             client certificates, proxy) and Composer would send them to \
+                             the hosted patch host; rollback cannot restore them, so re-lock \
+                             {composer_name} at its locked version after removing the patch \
+                             (a plain `composer update` may also move it and its dependents)"
+                        ),
+                    });
+                }
+            }
+            SourcePlan::Kept => warnings.push(RewriteWarning {
+                code: "redirect_composer_source_kept".into(),
+                detail: format!(
+                    "{composer_name}'s source is not an object and was left in place; a failed \
+                     hosted download may fall back to it"
+                ),
+            }),
+            SourcePlan::None => {}
+        }
     }
-    let removal = match plan {
-        SourcePlan::Remove(range) => Some(range),
-        SourcePlan::None | SourcePlan::Kept => None,
-    };
-    let (span_start, span_end) = match &removal {
-        Some(r) => (dist_start.min(*r.start()), dist_end.max(*r.end())),
-        None => (dist_start, dist_end),
-    };
-    let original = content[span_start..=span_end].to_string();
-    let mut pieces: Vec<(usize, usize, &str)> = vec![(dist_start, dist_end, dist.as_str())];
-    if let Some(r) = &removal {
-        pieces.push((*r.start(), *r.end(), ""));
+    // Every change falls inside the entry object (from its `{`, or the dist
+    // when there is none, to its closing `}`), so the edits are made on a
+    // copy of that region alone and spliced back once: the work per
+    // redirected package is bounded by its entry, not by the lock.
+    let lo = object_open.map_or(dist_start, |open| open.min(dist_start));
+    let region = &content[lo..=entry_end];
+    // Splice the dist, then drop the members one at a time, re-scanning
+    // after each so two adjacent removals never leave a dangling comma.
+    let mut updated = region.to_string();
+    updated.replace_range(dist_start - lo..=dist_end - lo, &dist);
+    for key in super::ORIGIN_BOUND_ENTRY_KEYS {
+        let end = (entry_end - lo + updated.len()).saturating_sub(region.len());
+        let drop = match object_open {
+            Some(open) => plan_member_drop(&updated, open - lo, end, key),
+            None => SourcePlan::None,
+        };
+        if let SourcePlan::Remove(r) = drop {
+            updated.replace_range(r, "");
+        }
     }
-    pieces.sort_by(|a, b| b.0.cmp(&a.0));
-    let mut replacement = original.clone();
-    for (start, end, text) in pieces {
-        replacement.replace_range(start - span_start..=end - span_start, text);
-    }
-    if replacement == original {
+    if updated == region {
         return None;
     }
-    content.replace_range(span_start..=span_end, &replacement);
+    // Widen the span to cover every byte that changed (a removal that took
+    // the comma before it reaches past its own planned range).
+    let prefix = region
+        .bytes()
+        .zip(updated.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let max_suffix = region.len().min(updated.len()) - prefix;
+    let suffix = region
+        .bytes()
+        .rev()
+        .zip(updated.bytes().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let span_start = span_start.min(lo + prefix);
+    let span_end = span_end.max(lo + region.len() - suffix - 1);
+    let new_end = span_end + updated.len() - region.len();
+    let original = content[span_start..=span_end].to_string();
+    let replacement = updated[span_start - lo..=new_end - lo].to_string();
+    content.replace_range(lo..=entry_end, &updated);
     Some(FileEdit {
         path: "composer.lock".into(),
         kind: "redirect_composer_dist".into(),
@@ -483,6 +547,69 @@ mod tests {
             edit.new,
             Some(Value::String("\"dist\": {\"url\": \"b\"}".into()))
         );
+    }
+
+    /// #399 / B02: the repository's `transport-options` (auth headers,
+    /// client certs, proxy) are dropped with `source`, wherever the two sit
+    /// relative to each other and to the dist, with valid JSON left behind,
+    /// one warning, and an edit whose `original` restores both.
+    #[test]
+    fn transport_options_are_dropped_with_source_in_any_layout() {
+        let to = r#""transport-options": {"http": {"header": ["X-Private-Token: s3cret"]}}"#;
+        let src = r#""source": {"url": "g"}"#;
+        for members in [
+            vec!["NAME", "DIST", src, to],
+            vec!["NAME", src, to, "DIST"],
+            vec![to, "NAME", "DIST", src],
+            vec!["NAME", to, "DIST"],
+            vec!["NAME", "DIST", to],
+        ] {
+            let render = |dist: &str| {
+                let body: Vec<String> = members
+                    .iter()
+                    .map(|m| match *m {
+                        "NAME" => "\"name\": \"p/q\"".to_string(),
+                        "DIST" => format!("\"dist\": {{\"url\": \"{dist}\"}}"),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                format!("[{{{}}}]", body.join(", "))
+            };
+            let mut content = render("a");
+            let original = content.clone();
+            let span = span_of(&content);
+            let mut warnings = Vec::new();
+            let edit = apply_dist_edit(
+                &mut content,
+                span,
+                Some("\"dist\": {\"url\": \"b\"}"),
+                "p/q",
+                &mut warnings,
+            )
+            .unwrap();
+            let parsed: Value = serde_json::from_str(&content)
+                .unwrap_or_else(|e| panic!("{members:?}: {e}: {content}"));
+            let entry = parsed[0].as_object().unwrap();
+            let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["dist", "name"], "{members:?}");
+            assert!(!content.contains("s3cret"), "{content}");
+            assert_eq!(entry["dist"]["url"], "b", "{members:?}");
+            let codes: Vec<&str> = warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(codes, vec!["redirect_composer_transport_options_removed"]);
+            // The fragment revert: swapping `new` back for `original`
+            // restores the lock byte for byte.
+            let (Some(Value::String(was)), Some(Value::String(now))) = (edit.original, edit.new)
+            else {
+                panic!("string fragments");
+            };
+            assert_eq!(content.replacen(&now, &was, 1), original, "{members:?}");
+            // A re-run over the healed entry is a no-op.
+            let span = span_of(&content);
+            let mut again = Vec::new();
+            assert!(apply_dist_edit(&mut content, span, None, "p/q", &mut again).is_none());
+            assert!(again.is_empty());
+        }
     }
 
     #[test]

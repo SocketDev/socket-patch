@@ -317,12 +317,13 @@ fn run_resolved_within(
     let output = match output_within(command, budget) {
         Ok(output) => output,
         Err(BoundedError::TimedOut) => {
-            if crate::utils::env_compat::is_debug_enabled() {
-                eprintln!(
-                    "[socket-patch debug] probe `{bin} {}` did not answer within {budget:?}; treating it as absent",
+            crate::utils::env_compat::debug_log(
+                "debug",
+                &format!(
+                    "probe `{bin} {}` did not answer within {budget:?}; treating it as absent",
                     args.join(" ")
-                );
-            }
+                ),
+            );
             return None;
         }
         Err(BoundedError::Spawn(_)) => return None,
