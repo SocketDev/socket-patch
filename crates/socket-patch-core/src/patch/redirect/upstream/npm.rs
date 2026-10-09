@@ -981,7 +981,11 @@ pub(crate) async fn restore_pnpm_locks(
 /// `.npmrc` `//host/path/:_authToken` / `:_auth` / `:username` +
 /// `:_password` whose path covers the registry URL. `$VAR` / `${VAR}` in a
 /// bunfig value and `${VAR}` in an `.npmrc` value read `var`, as Bun
-/// expands them. A private scope registry answers 401 without them.
+/// expands them, but only for the [`BUN_EXPANDED_VARS`] token variables:
+/// these files come with the project, and any other reference (say
+/// `$GITHUB_TOKEN`) would hand that secret to a host the project names.
+/// It expands to nothing instead. A private scope registry answers 401
+/// without them.
 fn bun_lookup_registry(
     npmrc: Option<&str>,
     bunfig: Option<&str>,
@@ -991,6 +995,7 @@ fn bun_lookup_registry(
 ) -> Option<ProjectRegistry> {
     use super::super::npmrc::npmrc_top_level_value;
 
+    let var = &|key: &str| BUN_EXPANDED_VARS.contains(&key).then(|| var(key)).flatten();
     fn url(value: &str) -> Option<String> {
         let value = value.trim().trim_matches(['"', '\'']);
         (value.starts_with("https://") || value.starts_with("http://")).then(|| value.to_string())
@@ -1089,6 +1094,11 @@ fn bun_lookup_registry(
         None => configured(),
     }
 }
+
+/// The variables a project's bunfig.toml / .npmrc may expand into the
+/// registry and credentials a Bun restore sends: the conventional npm
+/// token variables, nothing else.
+const BUN_EXPANDED_VARS: &[&str] = &["NPM_TOKEN", "NODE_AUTH_TOKEN", "BUN_AUTH_TOKEN"];
 
 /// `value` with each `${VAR}` (and, for a bunfig value, `$VAR`) replaced
 /// by `var(VAR)`, empty when unset.
@@ -1585,7 +1595,7 @@ mod tests {
 
     #[test]
     fn bun_registry_userinfo_goes_on_the_request_not_the_base() {
-        let vars = |key: &str| (key == "TOKEN").then(|| "s3cret".to_string());
+        let vars = |key: &str| (key == "NPM_TOKEN").then(|| "s3cret".to_string());
         let lookup = |npmrc: Option<&str>, bunfig: Option<&str>, env: Option<&str>, name: &str| {
             bun_lookup_registry(npmrc, bunfig, env, &vars, name).map(|r| (r.base, r.authorization))
         };
@@ -1599,9 +1609,9 @@ mod tests {
         // bunfig `$VAR` / `${VAR}`, an .npmrc `${VAR}` and the environment's
         // registry: the expanded secret never reaches the base that
         // bun.lock, bun.lockb and upstream_registry_fallback print.
-        let bunfig = "[install]\nregistry = \"https://ci:$TOKEN@b.example/npm/\"\n\n\
+        let bunfig = "[install]\nregistry = \"https://ci:$NPM_TOKEN@b.example/npm/\"\n\n\
                       [install.scopes]\n\
-                      corp = { url = \"https://u:${TOKEN}@corp.example/\", token = \"own\" }\n";
+                      corp = { url = \"https://u:${NPM_TOKEN}@corp.example/\", token = \"own\" }\n";
         assert_eq!(
             lookup(None, Some(bunfig), None, "a"),
             Some(("https://b.example/npm/".to_string(), basic("ci:s3cret")))
@@ -1616,7 +1626,7 @@ mod tests {
         );
         assert_eq!(
             lookup(
-                Some("@s:registry=https://x:${TOKEN}@s.example/\n"),
+                Some("@s:registry=https://x:${NPM_TOKEN}@s.example/\n"),
                 None,
                 None,
                 "@s/w"
@@ -1637,8 +1647,9 @@ mod tests {
     #[test]
     fn bun_sends_the_credentials_its_settings_give_each_registry() {
         let vars = |key: &str| match key {
-            "CORP_TOKEN" => Some("from-env".to_string()),
-            "NPMRC_TOKEN" => Some("npmrc-env".to_string()),
+            "NODE_AUTH_TOKEN" => Some("from-env".to_string()),
+            "BUN_AUTH_TOKEN" => Some("npmrc-env".to_string()),
+            "GITHUB_TOKEN" => Some("not-for-registries".to_string()),
             _ => None,
         };
         let auth = |npmrc: Option<&str>, bunfig: Option<&str>, env: Option<&str>, name: &str| {
@@ -1650,12 +1661,14 @@ mod tests {
         // from username + password.
         let bunfig = "[install]\nregistry = { url = \"https://b.example/\", token = \"bt\" }\n\n\
                       [install.scopes]\n\
-                      corp = { url = \"https://corp.example/npm/\", token = \"$CORP_TOKEN\" }\n\
-                      braced = { url = \"https://br.example/\", token = \"x${CORP_TOKEN}y\" }\n\
+                      corp = { url = \"https://corp.example/npm/\", token = \"$NODE_AUTH_TOKEN\" }\n\
+                      braced = { url = \"https://br.example/\", token = \"x${NODE_AUTH_TOKEN}y\" }\n\
                       basic = { url = \"https://ba.example/\", username = \"u\", password = \"p\" }\n\
                       bare = \"https://bare.example/\"\n\
                       own = { token = \"own\" }\n\
-                      unset = { url = \"https://un.example/\", token = \"$NOPE\" }\n";
+                      unset = { url = \"https://un.example/\", token = \"$NOPE\" }\n\
+                      other = { url = \"https://ot.example/\", token = \"${GITHUB_TOKEN}\" }\n\
+                      inurl = \"https://u:$GITHUB_TOKEN@iu.example/\"\n";
         assert_eq!(
             auth(None, Some(bunfig), None, "@corp/w"),
             some("https://corp.example/npm/", Some("Bearer from-env"))
@@ -1676,6 +1689,25 @@ mod tests {
             auth(None, Some(bunfig), None, "@unset/w"),
             some("https://un.example/", None)
         );
+        // A variable that is not a registry token variable is never
+        // expanded: the project's files cannot send it anywhere.
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@other/w"),
+            some("https://ot.example/", None)
+        );
+        let (base, authorization) = auth(None, Some(bunfig), None, "@inurl/w").unwrap();
+        assert_eq!(base, "https://iu.example/");
+        let sent = authorization.and_then(|a| {
+            use base64::Engine as _;
+            let encoded = a.strip_prefix("Basic ")?.to_string();
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        });
+        assert!(
+            !String::from_utf8_lossy(&sent.unwrap_or_default()).contains("not-for-registries"),
+            "the userinfo expanded $GITHUB_TOKEN"
+        );
         // A token-only scope: the configured default registry, its own token.
         assert_eq!(
             auth(None, Some(bunfig), Some("https://e.example/"), "@own/w"),
@@ -1683,7 +1715,7 @@ mod tests {
         );
         // ...and with no default registry configured, npmjs with that
         // token (a private npmjs scope), still not the environment's.
-        let npmjs_scope = "[install.scopes]\nown = { token = \"$CORP_TOKEN\" }\n\
+        let npmjs_scope = "[install.scopes]\nown = { token = \"$NODE_AUTH_TOKEN\" }\n\
                            none = { username = \"u\" }\n";
         for env in [None, Some("https://e.example/")] {
             assert_eq!(
@@ -1713,7 +1745,7 @@ mod tests {
                      @legacy:registry=https://lg.example/r/\n\
                      registry=https://n.example/\n\
                      //corp.example/:_authToken=host-wide\n\
-                     //corp.example/npm/private/:_authToken=${NPMRC_TOKEN}\n\
+                     //corp.example/npm/private/:_authToken=${BUN_AUTH_TOKEN}\n\
                      //n.example/:_authToken=default\n\
                      //nb.example/:_auth=dTpw\n\
                      //lg.example/r/:username=u\n//lg.example/r/:_password=cA==\n";
