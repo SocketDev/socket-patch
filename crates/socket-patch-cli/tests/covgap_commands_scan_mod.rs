@@ -32,36 +32,27 @@
 //! `cli_scan_silent.rs` pattern) so ambient developer/CI configuration
 //! cannot reroute the branch under test. Network tests use wiremock.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "common/pty_io.rs"]
 mod pty_io;
 #[path = "vlt_hosted_common/mod.rs"]
 mod vlt_hosted_common;
 #[path = "vlt_hosted_common/vendored.rs"]
 mod vlt_vendored;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const OLD_UUID: &str = "99999999-9999-4999-8999-999999999999";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn write_root_package_json(root: &Path) {
     std::fs::write(

@@ -912,7 +912,10 @@ async fn generate_vex(
     let wrote_to_file = match &params.output {
         Some(_) if params.dry_run => false,
         Some(path) => {
-            if let Err(e) = tokio::fs::write(path, format!("{serialized}\n")).await {
+            let bytes = format!("{serialized}\n");
+            if let Err(e) =
+                socket_patch_core::utils::fs::write_user_output(path, bytes.as_bytes()).await
+            {
                 // The raw io::Error names neither the file nor the operation.
                 return Err(fail(
                     common,

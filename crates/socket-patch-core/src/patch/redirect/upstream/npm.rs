@@ -517,6 +517,7 @@ fn berry_registry_locator(
 }
 
 use crate::formats::pnpm::workspace::yaml_top_level_value;
+use crate::formats::text::strip_bom;
 
 /// The registry a berry restore reads `name`'s version document from:
 /// `.yarnrc.yml`'s `npmRegistryServer`. A scoped package may resolve
@@ -524,9 +525,8 @@ use crate::formats::pnpm::workspace::yaml_top_level_value;
 /// it keeps the default registry's document.
 fn berry_lookup_registry(yarnrc: Option<&str>, name: &str) -> Option<String> {
     let text = yarnrc?;
+    // `top_level_key` skips the first line's BOM (`formats::text`).
     let has_scopes = text
-        .strip_prefix('\u{feff}')
-        .unwrap_or(text)
         .lines()
         .filter_map(crate::formats::pnpm::workspace::top_level_key)
         .any(|(key, _)| key == "npmScopes");
@@ -573,7 +573,7 @@ async fn restore_berry(
 
     let mut pkg: Option<serde_json::Value> = pkg_text
         .as_deref()
-        .and_then(|t| serde_json::from_str(t.strip_prefix('\u{feff}').unwrap_or(t)).ok())
+        .and_then(|t| serde_json::from_str(strip_bom(t)).ok())
         .filter(serde_json::Value::is_object);
     let mut pkg_changed = false;
 
@@ -3388,6 +3388,35 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// The `npmScopes` probe and `yaml_top_level_value` skip one leading
+    /// BOM (`formats::text`, through `top_level_key`); a second one is
+    /// content, so the first key is not `npmScopes`.
+    #[test]
+    fn berry_scopes_probe_reads_past_one_bom_only() {
+        let rc = "npmScopes:\n  s:\n    npmRegistryServer: https://s.example\n\
+                  npmRegistryServer: https://m.example/\n";
+        for bom in ["", "\u{feff}"] {
+            let rc = format!("{bom}{rc}");
+            assert_eq!(berry_lookup_registry(Some(&rc), "@s/a"), None);
+        }
+        let rc = format!("\u{feff}\u{feff}{rc}");
+        assert_eq!(
+            berry_lookup_registry(Some(&rc), "@s/a").as_deref(),
+            Some("https://m.example/")
+        );
+        let rc = "npmRegistryServer: https://m.example/\n";
+        for bom in ["", "\u{feff}"] {
+            assert_eq!(
+                yaml_top_level_value(&format!("{bom}{rc}"), "npmRegistryServer").as_deref(),
+                Some("https://m.example/")
+            );
+        }
+        assert_eq!(
+            yaml_top_level_value(&format!("\u{feff}\u{feff}{rc}"), "npmRegistryServer"),
+            None
+        );
     }
 
     #[test]

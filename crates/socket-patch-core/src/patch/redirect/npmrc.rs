@@ -33,6 +33,8 @@
 //! and — when the project file is silent — the user / global / builtin
 //! config files ([`resolve_outer_allow_remote`]).
 
+use crate::formats::text::{split_bom, BOM};
+
 /// Repo-relative path of the project `.npmrc` the auto-config edits.
 pub const NPMRC_REL: &str = ".npmrc";
 
@@ -51,12 +53,11 @@ pub const NPMRC_ALLOW_REMOTE_LINE: &str = "allow-remote=all";
 /// The exact `.npmrc` the auto-config CREATES when none existed.
 pub const NPMRC_CREATED: &str = "allow-remote=all\n";
 
-const BOM: char = '\u{feff}';
-
 /// ECMAScript whitespace — what npm's `ini` means by `\s` and by
 /// `String.prototype.trim` (WhiteSpace + LineTerminator). Rust's
 /// `char::is_whitespace` differs only by U+0085 (NEL: not JS whitespace)
-/// and U+FEFF (the BOM: JS whitespace).
+/// and U+FEFF (the BOM: JS whitespace, so npm trims it off any key or
+/// value, not only at the start of the file).
 fn is_js_ws(c: char) -> bool {
     c == BOM || (c.is_whitespace() && c != '\u{85}')
 }
@@ -83,7 +84,7 @@ fn has_lone_cr(text: &str) -> bool {
 }
 
 /// npm `ini`'s section header — `^\[([^\]]*)\]\s*$` matched against the
-/// UNTRIMMED line: an indented `  [sec]` or a BOM-prefixed `\u{feff}[sec]`
+/// UNTRIMMED line: an indented `  [sec]` or a BOM-prefixed `[sec]`
 /// is NOT a header to npm (it parses as a top-level key), so it must not
 /// end the top-level scope here either.
 fn is_section_header(line: &str) -> bool {
@@ -98,7 +99,7 @@ fn is_section_header(line: &str) -> bool {
 /// with lone `\r`s, several npm lines) hold a real section header? `line0`
 /// is true for the file's first line, which carries the BOM `bom` the
 /// callers strip off before splitting (npm does NOT strip it, so a
-/// `\u{feff}[sec]` first line is no header).
+/// BOM-prefixed `[sec]` first line is no header).
 fn holds_section_header(bom: &str, line: &str, line0: bool) -> bool {
     let owned;
     let line = if line0 && !bom.is_empty() {
@@ -732,10 +733,7 @@ pub fn plan_npmrc_allow_remote_with(existing: Option<&str>, outer: &OuterAllowRe
                 .into(),
         );
     }
-    let (bom, body) = match text.strip_prefix(BOM) {
-        Some(rest) => (&text[..BOM.len_utf8()], rest),
-        None => ("", text),
-    };
+    let (bom, body) = split_bom(text);
     let crlf = crate::utils::line_endings::terminator(body) == "\r\n";
     let line = if crlf {
         format!("{NPMRC_ALLOW_REMOTE_LINE}\r")
@@ -901,6 +899,23 @@ mod tests {
             panic!("append expected");
         };
         assert_eq!(text, "\u{feff}[x]\nallow-remote=all\n[sec]\ny=1\n");
+    }
+
+    /// One leading BOM is split off and put back byte-exact
+    /// (`formats::text::split_bom`); a second one stays in the body, where
+    /// npm's JS trim drops it from the key.
+    #[test]
+    fn npmrc_splice_keeps_one_bom_and_reads_a_second_as_whitespace() {
+        for bom in ["", "\u{feff}"] {
+            assert_eq!(
+                plan_npmrc_allow_remote(Some(&format!("{bom}a=1\n"))),
+                NpmrcPlan::Append(format!("{bom}a=1\nallow-remote=all\n"))
+            );
+        }
+        assert_eq!(
+            plan_npmrc_allow_remote(Some("\u{feff}\u{feff}allow-remote=none\n")),
+            NpmrcPlan::UserSet("none".into())
+        );
     }
 
     /// The spliced line takes `line_endings::terminator`'s style: the

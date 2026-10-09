@@ -32,10 +32,10 @@ use serde::{Deserialize, Serialize};
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes};
-use crate::utils::purl::patch_matches;
 use crate::utils::purl_key::PurlKey;
 use crate::utils::serde::serialize_sorted;
 use crate::utils::socket_dir::{prune_empty_dirs, remove_file_and_prune, write_json_ledger};
+use crate::utils::target::Target;
 
 use super::parse_memo::ParseMemo;
 use super::path::VENDOR_DIR;
@@ -362,12 +362,27 @@ impl VendorEntry {
     }
 
     /// Does this entry, stored under ledger `key`, match a remove/rollback
-    /// identifier? By its ledger key or by its base purl (mirroring the
-    /// manifest matching of [`patch_matches`]; a golang key is case-encoded
-    /// while `base_purl` holds the decoded spelling users type), or by uuid.
-    pub fn matches_identifier(&self, key: &str, identifier: &str) -> bool {
-        patch_matches(key, &self.uuid, identifier)
-            || patch_matches(&self.base_purl, &self.uuid, identifier)
+    /// target? By its ledger key or by its base purl (the manifest rule,
+    /// [`Target::matches_patch`]; a golang key is case-encoded while
+    /// `base_purl` holds the decoded spelling users type), or by uuid.
+    pub fn matches_target(&self, key: &str, target: &Target) -> bool {
+        target.matches_patch(key, &self.uuid) || target.matches_patch(&self.base_purl, &self.uuid)
+    }
+
+    /// The purl that names this entry's package for
+    /// [`Target::ambiguity`]: the decoded `base_purl` when `target`
+    /// reaches the entry through it, otherwise the ledger `key`. A golang
+    /// key is case-encoded (`!core`) and so can miss a last-segment name
+    /// that its `base_purl` (`Core`) matches; feeding the key alone would
+    /// skip the refusal while [`Self::matches_target`] still selects the
+    /// entry. One purl per entry, so an encoded key and its decoded base
+    /// never count as two packages.
+    pub fn ambiguity_purl<'a>(&'a self, key: &'a str, target: &Target) -> &'a str {
+        if target.matches_patch(&self.base_purl, &self.uuid) {
+            &self.base_purl
+        } else {
+            key
+        }
     }
 
     /// Does this entry, stored under ledger `key`, own the manifest purl
@@ -1164,20 +1179,49 @@ mod tests {
         entry.ecosystem = "golang".into();
         entry.base_purl = "pkg:golang/github.com/BurntSushi/toml@1.0.0".into();
         let key = "pkg:golang/github.com/!burnt!sushi/toml@1.0.0";
-        assert!(entry.matches_identifier(key, key));
-        assert!(entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@1.0.0"));
-        assert!(entry.matches_identifier(key, UUID));
-        assert!(!entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@2.0.0"));
-        assert!(!entry.matches_identifier(key, "00000000-0000-4000-8000-000000000000"));
+        assert!(entry.matches_target(key, &Target::parse(key)));
+        assert!(entry.matches_target(
+            key,
+            &Target::parse("pkg:golang/github.com/BurntSushi/toml@1.0.0")
+        ));
+        assert!(entry.matches_target(key, &Target::parse(UUID)));
+        assert!(!entry.matches_target(
+            key,
+            &Target::parse("pkg:golang/github.com/BurntSushi/toml@2.0.0")
+        ));
+        assert!(!entry.matches_target(key, &Target::parse("00000000-0000-4000-8000-000000000000")));
+
+        // A last-segment name reaching the entry only through its decoded
+        // base purl is counted under that purl, never under the encoded key.
+        let name = Target::parse("Toml");
+        assert_eq!(entry.ambiguity_purl(key, &name), entry.base_purl);
+        let mut core = sample_entry();
+        core.ecosystem = "golang".into();
+        core.base_purl = "pkg:golang/github.com/x/Core@1.0.0".into();
+        let core_key = "pkg:golang/github.com/x/!core@1.0.0";
+        // Another last-segment-only match: a full-name match such as
+        // `pkg:npm/core` would settle the name on its own.
+        let other = "pkg:npm/@x/core@1.0.0";
+        let core_name = Target::parse("core");
+        assert!(core.matches_target(core_key, &core_name));
+        assert!(core_name
+            .ambiguity([core.ambiguity_purl(core_key, &core_name), other])
+            .is_some());
+        // One entry, encoded key plus decoded base: one package.
+        let sushi = Target::parse("toml");
+        assert_eq!(sushi.ambiguity([entry.ambiguity_purl(key, &sushi)]), None);
 
         // A qualified pypi key: the base identifier covers it, another
         // variant's qualifier does not.
         let mut entry = sample_entry();
         entry.base_purl = "pkg:pypi/requests@2.28.0".into();
         let key = "pkg:pypi/requests@2.28.0?artifact_id=abc";
-        assert!(entry.matches_identifier(key, "pkg:pypi/requests@2.28.0"));
-        assert!(entry.matches_identifier(key, key));
-        assert!(!entry.matches_identifier(key, "pkg:pypi/requests@2.28.0?artifact_id=zzz"));
+        assert!(entry.matches_target(key, &Target::parse("pkg:pypi/requests@2.28.0")));
+        assert!(entry.matches_target(key, &Target::parse(key)));
+        assert!(!entry.matches_target(
+            key,
+            &Target::parse("pkg:pypi/requests@2.28.0?artifact_id=zzz")
+        ));
     }
 
     /// `covers_purl`: the exact key, a qualifier-stripped twin of the key

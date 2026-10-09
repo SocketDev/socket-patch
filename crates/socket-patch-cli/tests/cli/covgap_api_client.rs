@@ -6,16 +6,14 @@
 //! stderr *text* — the "you configured the sha512- storage hash, not the
 //! token" hint — which only a spawned process can observe.
 
+use crate::common::binary;
+
 use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-
-fn binary() -> std::path::PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Parse the command's stdout as JSON, failing with the raw bytes on error
 /// (same discipline as `api_client_errors_e2e::json_stdout`).

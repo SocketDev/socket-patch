@@ -60,7 +60,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -183,11 +183,6 @@ fn stage_patch_with_vuln(proj: &Path, purl: &str, file_key: &str, before: &[u8],
     )
     .unwrap();
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
-}
-
-fn parse_envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("vendor --json output is not JSON: {e}\nstdout:\n{stdout}"))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
@@ -510,7 +505,7 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
@@ -699,7 +694,7 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         code, 0,
         "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env2 = parse_envelope(&stdout);
+    let env2 = parse_json_envelope(&stdout);
     assert_eq!(env2["summary"]["failed"], 0, "re-run must not fail: {env2}");
     assert_eq!(
         std::fs::read(&gemfile_path).unwrap(),
@@ -728,7 +723,7 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
     assert_eq!(
@@ -879,7 +874,7 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
 
@@ -1003,7 +998,7 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
         code, 0,
         "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env2 = parse_envelope(&stdout);
+    let env2 = parse_json_envelope(&stdout);
     assert_eq!(env2["summary"]["failed"], 0, "re-run must not fail: {env2}");
     assert_eq!(
         std::fs::read(&gemfile_path).unwrap(),
@@ -1033,7 +1028,7 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
     assert_eq!(
         std::fs::read(&gemfile_path).unwrap(),
@@ -1207,7 +1202,7 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
         code, 0,
         "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["found"], 1, "envelope: {env}");
     assert_eq!(env["downloaded"], 1, "envelope: {env}");
@@ -1473,7 +1468,7 @@ fn assert_vendor_refuses_unloaded_gemfile(proj: &Path, purl: &str, loaded: &str,
         code, 0,
         "vendor must not succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["summary"]["applied"], 0, "nothing vendored: {env}");
     let event = env["events"]
         .as_array()
@@ -1595,7 +1590,7 @@ fn gem_vendor_refuses_an_eval_gemfile_direct_dep() {
         code, 0,
         "vendor must not succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["summary"]["applied"], 0, "nothing vendored: {env}");
     let event = env["events"]
         .as_array()
@@ -1758,7 +1753,7 @@ fn gem_vendor_second_gem_section_fresh_checkout_and_revert() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
 
@@ -1843,7 +1838,7 @@ fn gem_vendor_second_gem_section_fresh_checkout_and_revert() {
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
     assert_eq!(
         std::fs::read(&gemfile_path).unwrap(),
@@ -1900,7 +1895,7 @@ fn gem_vendor_drops_positional_constraints() {
             code, 0,
             "{gemfile:?}: vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
-        let env = parse_envelope(&stdout);
+        let env = parse_json_envelope(&stdout);
         assert_eq!(env["summary"]["applied"], 1, "{gemfile:?}: {env}");
         let wired = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
 

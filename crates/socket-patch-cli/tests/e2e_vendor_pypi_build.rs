@@ -54,18 +54,20 @@
 //! older releases, whose lanes run in the `vendored_uv_*` tests. The pip
 //! capstones below keep their own `uv` discovery.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 #[path = "vex_e2e_common/uv.rs"]
 mod uv_vex;
 #[path = "vex_e2e_common/mod.rs"]
@@ -110,10 +112,6 @@ fn manifestless_vex(fresh: &Path, what: &str, patched: &[u8], original: &[u8]) {
 const ORACLE: &str = "import six; print(six.SOCKET_PATCHED)";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run socket-patch with ambient `SOCKET_*` + `VIRTUAL_ENV` scrubbed
 /// (`VIRTUAL_ENV` is a python-crawler discovery input and must not leak from
@@ -238,13 +236,6 @@ fn assert_tool_ok(out: &Output, context: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Locate `<venv>/lib/python3.X/site-packages` (PEP-405 Unix layout).
@@ -856,6 +847,24 @@ fn uv_vendor_revert_keeps_wheel_while_subdir_export_references_it() {
 #[serial_test::serial]
 fn uv_vendor_revert_keeps_wheel_while_subdir_pylock_references_it() {
     uv_vendor_revert_keeps_wheel_while_export_at("uv-export-subdir-pylock", "deploy/pylock.toml");
+}
+
+/// #1252: the same keep for an export under a name that is neither
+/// `*.txt` nor a Python lock name (Rye's `requirements.lock`, which
+/// `uv export -o` keeps writing after a Rye -> uv move), at the root and
+/// in a subdirectory. Before the fix the probe skipped the file by its
+/// extension, so the revert deleted the wheel it installs.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_keeps_wheel_while_lock_named_export_references_it() {
+    uv_vendor_revert_keeps_wheel_while_export_at(
+        "uv-export-requirements-lock",
+        "requirements.lock",
+    );
+    uv_vendor_revert_keeps_wheel_while_export_at(
+        "uv-export-subdir-requirements-lock",
+        "deploy/requirements.lock",
+    );
 }
 
 fn uv_vendor_revert_keeps_wheel_while_export_at(tag: &str, out: &str) {

@@ -514,6 +514,12 @@ struct YarnFixture {
 
 /// package.json + (berry: .yarnrc.yml) + real install. `None` = skip.
 fn stage_yarn_fixture(tag: &str, pm: &str, berry: bool) -> Option<YarnFixture> {
+    stage_yarn_fixture_with(tag, pm, berry, &format!(r#""{DEP}":"{DEP_VERSION}""#))
+}
+
+/// [`stage_yarn_fixture`] with the root manifest's `dependencies` body
+/// spelled out (e.g. a direct dep plus an `npm:` alias of it).
+fn stage_yarn_fixture_with(tag: &str, pm: &str, berry: bool, deps: &str) -> Option<YarnFixture> {
     if !has_corepack_pm(pm) {
         println!("SKIP mode_migration_npm ({tag}): `corepack {pm}` unavailable");
         return None;
@@ -524,7 +530,7 @@ fn stage_yarn_fixture(tag: &str, pm: &str, berry: bool) -> Option<YarnFixture> {
     std::fs::write(
         proj.join("package.json"),
         format!(
-            r#"{{"name":"mode-migration-npm","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+            r#"{{"name":"mode-migration-npm","version":"0.0.0","private":true,"dependencies":{{{deps}}}}}"#
         ),
     )
     .unwrap();
@@ -1153,6 +1159,186 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
         std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
         fx.orig,
         "rollback installs the pristine registry bytes"
+    );
+}
+
+// ── yarn classic `npm:` alias copy beside a direct copy (#1081, #1158) ────
+// yarn 1.22.22 locks `"lp": "npm:left-pad@1.3.0"` next to a direct
+// `left-pad@1.3.0` as two blocks. The hosted rewriter pins the direct block
+// and leaves the alias block on the registry
+// (`redirect_yarn_classic_alias_skipped`), so the alias copy installs
+// unpatched: the run must neither attest that copy nor un-patch a vendored
+// one.
+
+/// The direct + `npm:` alias manifest dependencies.
+const ALIAS_DEPS: &str = r#""left-pad":"1.3.0","lp":"npm:left-pad@1.3.0""#;
+
+/// [`stage_yarn_fixture_with`] for [`ALIAS_DEPS`] under yarn classic, or
+/// `None` (skip) when the release under test merges the alias and direct
+/// keys into one block (every release before 1.22.22): that block is
+/// pinned whole, and there is no separate alias copy to probe.
+fn stage_classic_alias_fixture(tag: &str) -> Option<YarnFixture> {
+    let fx = stage_yarn_fixture_with(tag, &yarn_classic_vex::yarn_classic(), false, ALIAS_DEPS)?;
+    let lock = read(&fx.proj, "yarn.lock");
+    if !lock.lines().any(|l| l.starts_with("\"lp@npm:left-pad@")) {
+        println!(
+            "N/A {tag}: {} locks the alias in the direct block:\n{lock}",
+            yarn_classic_vex::yarn_classic()
+        );
+        return None;
+    }
+    Some(fx)
+}
+
+/// #1158: a vendored → hosted takeover whose hosted rewrite would pin the
+/// direct block but skip the alias block the vendored wiring had patched is
+/// retracted: the package stays vendored, byte for byte, and both copies
+/// keep installing the patched bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_takeover_keeps_vendored_alias_copy_patched() {
+    if !yarn_classic_vex::installs_file_tarballs(&yarn_classic_vex::yarn_classic_version()) {
+        println!("N/A classic alias takeover: cannot install vendored `file:` tarballs");
+        return;
+    }
+    let Some(fx) = stage_classic_alias_fixture("classic-alias-takeover") else {
+        return;
+    };
+    let proj = fx.proj.clone();
+
+    stage_patch(&proj, &fx.orig, &fx.patched);
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
+    let lock_vendored = read(&proj, "yarn.lock");
+    assert_eq!(
+        lock_vendored.matches(".socket/vendor/").count(),
+        2,
+        "vendoring wires the direct AND the alias block:\n{lock_vendored}"
+    );
+    let state_vendored = read(&proj, ".socket/vendor/state.json");
+
+    let tgz_path = fx.tmp.path().join("patched.tgz");
+    build_patched_tgz(&proj.join("node_modules").join(DEP), &fx.patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let server = MockServer::start().await;
+    mount_hosted_mocks(&server, &tgz, &fx.orig, &fx.patched, None).await;
+    let (code, stdout, stderr) = run_hosted_scan(&proj, &server.uri());
+    assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("redirect_takeover_kept_vendored")
+            && stdout.contains("redirect_yarn_classic_alias_skipped"),
+        "the takeover is retracted, naming the alias skip: {stdout}"
+    );
+    assert!(
+        !stdout.contains("redirect_takeover_reverted_vendored"),
+        "the package must not be announced fully hosted: {stdout}"
+    );
+    assert_eq!(
+        read(&proj, "yarn.lock"),
+        lock_vendored,
+        "the vendored lock stays byte-identical"
+    );
+    assert_eq!(
+        read(&proj, ".socket/vendor/state.json"),
+        state_vendored,
+        "the vendored ledger entry is kept"
+    );
+    assert!(
+        proj.join(format!(".socket/vendor/npm/{UUID_V}")).exists(),
+        "the committed vendored artifact is kept"
+    );
+
+    let fresh = fresh_checkout(&proj, fx.tmp.path(), "classic-alias-takeover", false);
+    let fresh_cache = fx.tmp.path().join("fresh-cache-classic-alias-takeover");
+    let ci = corepack(
+        &fresh,
+        &yarn_classic_vex::yarn_classic(),
+        &["install", "--frozen-lockfile", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+    );
+    assert!(
+        ci.status.success(),
+        "fresh-checkout install must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    for copy in [DEP, "lp"] {
+        let installed = std::fs::read(fresh.join("node_modules").join(copy).join("index.js"))
+            .unwrap_or_else(|e| panic!("node_modules/{copy}: {e}"));
+        assert!(
+            installed.starts_with(MARKER.as_bytes()),
+            "node_modules/{copy} must stay PATCHED"
+        );
+    }
+}
+
+/// #1081: an in-run `scan --mode hosted --vex` whose rewrite pinned the
+/// direct block but skipped the alias block never writes `not_affected` for
+/// the package: that copy installs unpatched, as standalone `vex` says.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_hosted_vex_never_attests_over_a_skipped_alias_copy() {
+    let Some(fx) = stage_classic_alias_fixture("classic-alias-vex") else {
+        return;
+    };
+    let proj = fx.proj.clone();
+    let tgz_path = fx.tmp.path().join("patched.tgz");
+    build_patched_tgz(&proj.join("node_modules").join(DEP), &fx.patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_mocks(&server, &tgz, &fx.orig, &fx.patched, None).await;
+    let vex_path = fx.tmp.path().join("in-run.vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            server.uri().as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert!(
+        stdout.contains("redirect_yarn_classic_alias_skipped"),
+        "the rewrite skips the alias block (exit {code}): {stdout}\n{stderr}"
+    );
+    let lock = read(&proj, "yarn.lock");
+    assert!(lock.contains(&hosted_url), "direct block pinned:\n{lock}");
+    let doc = std::fs::read_to_string(&vex_path).unwrap_or_default();
+    let attested = serde_json::from_str::<serde_json::Value>(&doc)
+        .ok()
+        .and_then(|v| v["statements"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .any(|st| {
+            st["status"] == "not_affected"
+                && st["products"]
+                    .as_array()
+                    .is_some_and(|ps| ps.iter().any(|p| p.to_string().contains(PURL)))
+        });
+    assert!(
+        !attested,
+        "the in-run VEX must not attest {PURL} over the unpatched alias copy \
+         (exit {code}):\n{doc}\nstdout: {stdout}"
     );
 }
 

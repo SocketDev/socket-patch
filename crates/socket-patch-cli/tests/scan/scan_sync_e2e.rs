@@ -4,26 +4,15 @@
 //! full `scan -> get -> apply` pipeline against a mock API + a real
 //! file fixture.
 
-use std::path::{Path, PathBuf};
+use crate::common::{binary, git_sha256};
 
-use sha2::{Digest, Sha256};
+use std::path::Path;
+
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn write_npm_package(root: &Path, name: &str, version: &str, content: &[u8]) {
     let pkg_dir = root.join("node_modules").join(name);

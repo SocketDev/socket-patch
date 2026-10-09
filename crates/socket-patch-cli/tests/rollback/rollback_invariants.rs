@@ -4,14 +4,10 @@
 //! installed packages. Nothing reaches a real registry; network cases hit an
 //! unroutable localhost port.
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use sha2::{Digest, Sha256};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// A `rollback` command with the full `SOCKET_*` environment scrubbed and the
 /// working directory pinned. All tests build their child process through here
@@ -37,15 +33,6 @@ fn rollback_cmd(cwd: &Path) -> Command {
         }
     }
     cmd
-}
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 const MANIFEST_JSON: &str = r#"{
