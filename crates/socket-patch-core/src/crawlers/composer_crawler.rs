@@ -500,6 +500,25 @@ fn parse_config_vendor_dir(composer_json: &str) -> Option<String> {
 /// environment, the same trust level as `CARGO_HOME` / `NUGET_PACKAGES` /
 /// `MAVEN_REPO_LOCAL`, which are all honored verbatim.
 async fn resolve_local_vendor_dir(cwd: &Path) -> Option<PathBuf> {
+    let manifest = crate::utils::fs::read_regular_to_string(&cwd.join("composer.json"))
+        .await
+        .ok();
+    vendor_dir_from(cwd, manifest.as_deref())
+}
+
+/// The blocking twin of [`resolve_local_vendor_dir`], for the human
+/// next-step hints that name the installed package directory a user has
+/// to remove before `composer install` (#658): those are formatted on a
+/// synchronous path after the run, and must name the directory Composer
+/// actually installed into, not a hardcoded `vendor/`.
+pub fn resolve_local_vendor_dir_sync(cwd: &Path) -> Option<PathBuf> {
+    let manifest = crate::utils::fs::read_regular_to_string_sync(&cwd.join("composer.json")).ok();
+    vendor_dir_from(cwd, manifest.as_deref())
+}
+
+/// The shared resolution of the two entry points above, given the
+/// composer.json text (`None` when it is missing or unreadable).
+fn vendor_dir_from(cwd: &Path, composer_json: Option<&str>) -> Option<PathBuf> {
     // A set-but-empty value counts as unset (twin of the MAVEN_REPO_LOCAL
     // and NUGET_PACKAGES rules): honoring `""` would resolve the vendor
     // tree to the project root itself.
@@ -513,7 +532,7 @@ async fn resolve_local_vendor_dir(cwd: &Path) -> Option<PathBuf> {
         return Some(cwd.join(from_env));
     }
 
-    match read_config_vendor_dir(&cwd.join("composer.json")).await {
+    match composer_json.and_then(parse_config_vendor_dir) {
         Some(configured) => normalize_config_vendor_dir(&configured)
             .filter(|normalized| path_safety::is_safe_multi_segment(normalized))
             .map(|normalized| cwd.join(normalized)),
@@ -532,17 +551,6 @@ fn normalize_config_vendor_dir(raw: &str) -> Option<String> {
         return None;
     }
     crate::utils::relpath::resolve_rel("", raw, 0).filter(|segments| !segments.is_empty())
-}
-
-/// Read `config.vendor-dir` from a composer.json on disk. Read with
-/// [`crate::utils::fs::read_regular_to_string`] for the same reason
-/// installed.json is: the manifest belongs to the untrusted project, and
-/// a FIFO planted at that path would wedge a plain read forever.
-async fn read_config_vendor_dir(manifest_path: &Path) -> Option<String> {
-    let content = crate::utils::fs::read_regular_to_string(manifest_path)
-        .await
-        .ok()?;
-    parse_config_vendor_dir(&content)
 }
 
 /// The directory an installed.json `install-path` may not escape.

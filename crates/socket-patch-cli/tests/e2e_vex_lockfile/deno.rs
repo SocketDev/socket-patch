@@ -280,35 +280,29 @@ fn deno_ledger_claims_are_dead() {
     state.entries.insert(
         JSR_PURL.to_string(),
         VendorEntry {
-            ecosystem: "jsr".to_string(),
-            base_purl: JSR_PURL.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: rel.clone(),
-                sha256: "0".repeat(64),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: vec![WiringRecord {
-                file: "deno.lock".to_string(),
-                kind: "deno_lock_entry".to_string(),
-                action: WiringAction::Rewritten,
-                key: None,
-                original: None,
-                new: None,
-            }],
-            lock: None,
-            took_over_go_patches: false,
             detached: true,
             record: Some(record(UUID)),
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "jsr".to_string(),
+                JSR_PURL.to_string(),
+                UUID.to_string(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel.clone(),
+                    sha256: "0".repeat(64),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                vec![WiringRecord {
+                    file: "deno.lock".to_string(),
+                    kind: "deno_lock_entry".to_string(),
+                    action: WiringAction::Rewritten,
+                    key: None,
+                    original: None,
+                    new: None,
+                }],
+            )
         },
     );
     fx.put(

@@ -6,9 +6,20 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
 
 ## Defaults and stored state
 
-- Bare `scan` and `get` now patch in hosted mode. `scan` never prompts;
-  hosted and vendored `get` do not prompt either. Use `scan --dry-run` for a preview
-  or `--mode agent` to retain in-place patching. Global scans and a mode-less
+- Bare `scan` and `get` now patch in hosted mode when the project has no patch
+  state yet. `scan` never prompts; hosted and vendored `get` do not prompt either.
+  `scan` discovers patches from project dependency files and writes hosted
+  references. Supported lockfiles work from a fresh checkout before installing
+  dependencies; install or resolve first where the selected
+  [mode or ecosystem](ecosystems.md) requires it, such as agent mode or
+  sbt / scala-cli. Use `scan --dry-run` for a preview or `--mode agent` to retain
+  in-place patching.
+- A bare `scan` or `get` keeps the mode a project already uses: a project with a
+  vendor ledger (`.socket/vendor/state.json`) stays vendored, and one whose
+  `.socket/manifest.json` holds patches stays in agent mode. Switching modes needs an
+  explicit `--mode` (for example `scan --mode hosted` converts a vendored project in
+  place). A project holding both agent and vendored patches must pass `--mode`
+  (`mode_ambiguous`, exit 2). Global scans and a mode-less
   `scan --prune` do not acquire new patches; `--prune` still performs cleanup.
 - Hosted state lives in dependency files. No command writes
   `.socket/vendor/redirect-state.json`. Legacy hosted records can still supply
@@ -19,8 +30,10 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
 - `rollback` now removes patch records and unused artifacts as well as restoring
   dependencies. Pass `--preserve-state` to retain local state for reuse.
 - `scan` / `get --mode vendored` need no agent manifest. Commit
-  `.socket/vendor/state.json` with the artifacts. `repair` no longer reconstructs
-  a missing ledger from lockfiles.
+  `.socket/vendor/state.json` with the artifacts. `repair` restores missing agent
+  patch data or missing/corrupt vendored artifacts using existing records. It no
+  longer reconstructs a missing vendor ledger from lockfiles; restore the ledger
+  from version control.
 - Vendored Cargo patches move into workspace-root `Cargo.toml` and use
   `<version>+socket.<uuid>` versions. Re-running vendoring or repair migrates
   older wiring. The tag is visible in `CARGO_PKG_VERSION`; see
@@ -35,6 +48,26 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
   `get --json` and `vex --json` report it as `api_auth_fallback` in `warnings[]`. Set `--org` or
   `SOCKET_ORG_SLUG` to get org patches. The org is resolved once per run, so an
   embedded `--vex` no longer resolves it again.
+
+## Service-only vendoring
+
+v4 could build patched artifacts locally, with `auto` as the default acquisition
+policy. v5 downloads new artifacts only from the patch service:
+
+- `--vendor-source build` and `SOCKET_VENDOR_SOURCE=build` are rejected as usage
+  errors (exit 2). Remove that configuration or change it to `service`.
+- `service` is the new default. `--vendor-source auto` and
+  `SOCKET_VENDOR_SOURCE=auto` remain compatibility aliases for `service`; they no
+  longer select a local build fallback.
+- Missing or pending service artifacts, network errors, and integrity mismatches
+  do not trigger a local build fallback, even when the original package is installed.
+
+Healthy committed artifacts can still be reused offline. Commit `.socket/vendor/`,
+including `state.json`, and the dependency-file changes the CLI reports. Installing
+those patched packages needs neither Socket API access nor the Socket Patch CLI;
+unpatched dependencies still need their normal registry, mirror, or cache.
+Fetching a new artifact or redownloading a missing or corrupt one requires service
+access. See [vendoring and offline installs](usage.md#vendoring-and-offline-installs).
 
 ## JSON output
 
@@ -73,6 +106,23 @@ Remove the old CLI with the manager that installed it (`pip uninstall socket-pat
 [supported channel](../README.md#installation), update CI bootstrap commands, and
 run `socket-patch --version` to check which binary your shell finds.
 
+## Support tiers
+
+v5 keeps every lockfile format in the support matrix, including the ones the package
+managers have retired. The [v5 support tiers](ecosystems.md#v5-support-tiers) say how
+mature each one is.
+
+- **Beta:** Maven and Gradle in hosted and vendored mode, and sbt / Mill / scala-cli.
+  They work for the documented build shapes. Run the build before you rely on the
+  result or on a `--vex` document.
+- **Legacy:** binary `bun.lockb` (hosted and vendored), vendored pnpm 7/8 locks
+  (lockfileVersion 5.4 / 6.0) and vlt locks from before 1.0.0-rc.15. They keep
+  working in v5, with an upgrade path and an undo path for each. Plan to move to text
+  `bun.lock`, pnpm 9+ or vlt 1.0+; a future major release may stop writing these
+  formats.
+- No v5.x minor or patch release removes a format or makes one refuse that v5.0
+  accepts. See the [support policy](ecosystems.md#support-policy).
+
 ## Retire `setup` hooks
 
 `socket-patch setup` is removed. Existing hooks may still call `apply`, but v5 no
@@ -90,7 +140,7 @@ Remove only the Socket-managed portions of old hooks, preserving other commands:
 | npm / pnpm / yarn / bun | Remove the Socket Patch `apply --silent --ecosystems npm` command from `package.json`'s `postinstall` and `dependencies` scripts; remove empty script keys |
 | Composer | Remove `socket-patch apply --offline --silent --ecosystems composer` from `post-install-cmd` and `post-update-cmd` |
 | Python | Remove `socket-patch[hook]` from requirements or project dependencies, and uninstall `socket-patch-hook` in affected environments |
-| Bundler | Remove the managed `plugin "socket-patch", path: ...` Gemfile block; run `bundle plugin uninstall socket-patch`; remove `.socket/bundler-plugin/`, `.socket/gem-plugin-stamp`, and its `.socket/.gitignore` entry |
+| Bundler | Remove the managed `plugin "socket-patch", path: ...` Gemfile block; remove `.socket/bundler-plugin/`, `.socket/gem-plugin-stamp`, and its `.socket/.gitignore` entry. Then, in **every** checkout that ran `bundle install` under v4 (each developer machine and persistent CI runner, not only yours), run `bundle plugin uninstall socket-patch` or delete `.bundle/plugin/`: the registration lives in the uncommitted `.bundle/`, and once the plugin directory is gone Bundler 2.3–2.5 fail every `bundle install` with a `LoadError` (2.6+ warn on each run). `scan` and `apply` report a leftover registration as `gem_bundler_plugin_stale` |
 
 Use `socket-patch list` to inspect the remaining patch set. For agent projects,
 run `socket-patch apply` once after migration to confirm the manifest still applies.
@@ -158,12 +208,15 @@ whole root, not a `vendor_jvm_degraded` warning on mixed Maven + Gradle roots.
 | `scan --apply` | `scan --mode agent` |
 | `scan --vendor` | `scan --mode vendored` |
 | `get --no-apply` | `get --save-only` (`SOCKET_SAVE_ONLY` is unchanged) |
+| `--vendor-source build`, `SOCKET_VENDOR_SOURCE=build` | Remove the setting or use `service`; `auto` is now a service-only alias |
 | `socket-patch download` | `socket-patch get` |
 | `socket-patch gc` | `socket-patch repair` |
+| `--download-mode`, `SOCKET_DOWNLOAD_MODE` | No replacement; patch content is always fetched as per-file blobs |
 | `SOCKET_FORCE` | Pass `--force` to the one command that needs it (`apply`, `vendor`, `--update`); the variable is now ignored |
 
 A removed spelling is a usage error (exit 2). `scan --sync` stays as the
 shorthand for `scan --mode agent --prune`.
 
-Legacy `.socket/packages/` archives are no longer read. Patch data uses diff
-archives or blobs; cleanup commands remove obsolete package archives.
+Legacy `.socket/packages/` and `.socket/diffs/` archives are no longer read.
+Patch data uses per-file blobs (`.socket/blobs/`); cleanup commands remove the
+obsolete archives.
