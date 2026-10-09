@@ -851,6 +851,11 @@ pub const DEFAULT_GOPROXY: &str = "https://proxy.golang.org";
 /// the module matches GONOPROXY (defaulting to GOPRIVATE). Falling back to a
 /// public proxy there would send a private module path off the machine.
 /// A non-empty `SOCKET_GOPROXY` is an explicit choice and always wins.
+///
+/// GOPROXY / GONOPROXY / GOPRIVATE resolve as go resolves them: the
+/// environment, then the `go env -w` file ([`crate::utils::go_env`]), so a
+/// GOPRIVATE set with `go env -w` keeps a private path off the public
+/// proxy and a mirror set that way is used (#344).
 pub(crate) fn goproxy_base(module: &str) -> Result<String, String> {
     if let Ok(v) = std::env::var("SOCKET_GOPROXY") {
         let v = v.trim_end_matches('/').to_string();
@@ -858,7 +863,7 @@ pub(crate) fn goproxy_base(module: &str) -> Result<String, String> {
             return Ok(v);
         }
     }
-    let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    let nonempty = |key: &str| crate::utils::go_env::go_env(key).filter(|v| !v.trim().is_empty());
     if let Some((key, patterns)) = nonempty("GONOPROXY")
         .map(|v| ("GONOPROXY", v))
         .or_else(|| nonempty("GOPRIVATE").map(|v| ("GOPRIVATE", v)))
@@ -1987,12 +1992,61 @@ mod tests {
         );
     }
 
+    /// #344: GOPROXY / GOPRIVATE / GONOPROXY written with `go env -w` (the
+    /// `$GOENV` file) are honored like the environment variables: a private
+    /// module is refused rather than requested from the public proxy, and a
+    /// mirror is used. The environment still wins over the file.
+    #[test]
+    #[serial_test::serial]
+    fn goproxy_base_reads_the_go_env_file() {
+        let keys = [
+            "GOENV",
+            "GOPROXY",
+            "GOPRIVATE",
+            "GONOPROXY",
+            "SOCKET_GOPROXY",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("env");
+        std::fs::write(
+            &file,
+            "GOPROXY=http://127.0.0.1:18702\nGOPRIVATE=example.com\n",
+        )
+        .unwrap();
+        for k in &keys[1..] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("GOENV", &file);
+        let private = goproxy_base("example.com/upstream");
+        let public = goproxy_base("golang.org/x/text");
+        std::env::set_var("GOPROXY", "https://env.example");
+        let env_wins = goproxy_base("golang.org/x/text");
+        std::env::set_var("GOENV", "off");
+        std::env::remove_var("GOPROXY");
+        let off = goproxy_base("example.com/upstream");
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let err = private.unwrap_err();
+        assert!(err.contains("matches GOPRIVATE"), "{err}");
+        assert_eq!(public.as_deref(), Ok("http://127.0.0.1:18702"));
+        assert_eq!(env_wins.as_deref(), Ok("https://env.example"));
+        assert_eq!(off.as_deref(), Ok(DEFAULT_GOPROXY));
+    }
+
     #[test]
     #[serial_test::serial]
     fn goproxy_base_env_precedence() {
         const MODULE: &str = "example.com/m";
         let saved_socket = std::env::var("SOCKET_GOPROXY").ok();
         let saved = std::env::var("GOPROXY").ok();
+        // No `go env -w` file: the developer's own must not leak in.
+        let saved_goenv = std::env::var("GOENV").ok();
+        std::env::set_var("GOENV", "off");
 
         // SOCKET_GOPROXY wins over GOPROXY (trailing slash trimmed).
         std::env::set_var("SOCKET_GOPROXY", "https://socket.example/");
@@ -2018,6 +2072,10 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("GOPROXY", v),
             None => std::env::remove_var("GOPROXY"),
+        }
+        match saved_goenv {
+            Some(v) => std::env::set_var("GOENV", v),
+            None => std::env::remove_var("GOENV"),
         }
         assert_eq!(socket_wins.as_deref(), Ok("https://socket.example"));
         assert_eq!(
