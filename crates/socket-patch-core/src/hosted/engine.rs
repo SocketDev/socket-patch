@@ -638,28 +638,28 @@ pub async fn read_candidate_files(
     // why the tree could not be listed) and every lock is read. The project
     // files themselves stay out of the candidate texts. NuGet is disk-only
     // (the in-memory engine refuses it).
-    if candidates.iter().any(|c| c.dep.ecosystem == "nuget") {
-        if !matches!(view, ProjectView::Memory(_)) {
-            let mut lines: Vec<String> = Vec::new();
-            match crate::vendor::nuget_config::governed_locks_in(view).await {
-                Ok(governed) => {
-                    for (project, detail) in &governed.unresolved {
-                        lines.push(format!("unresolved\t{project}\t{detail}"));
-                    }
-                    for rel in governed.locks {
-                        if !out.files.contains_key(&rel) {
-                            out.read(view, unreadable, &rel).await;
-                        }
-                        lines.push(format!("lock\t{rel}"));
-                    }
+    if candidates.iter().any(|c| c.dep.ecosystem == "nuget")
+        && !matches!(view, ProjectView::Memory(_))
+    {
+        let mut lines: Vec<String> = Vec::new();
+        match crate::vendor::nuget_config::governed_locks_in(view).await {
+            Ok(governed) => {
+                for (project, detail) in &governed.unresolved {
+                    lines.push(format!("unresolved\t{project}\t{detail}"));
                 }
-                Err(why) => lines.push(format!("error\t{why}")),
+                for rel in governed.locks {
+                    if !out.files.contains_key(&rel) {
+                        out.read(view, unreadable, &rel).await;
+                    }
+                    lines.push(format!("lock\t{rel}"));
+                }
             }
-            out.files.insert(
-                crate::patch::redirect::NUGET_LOCKS_KEY.to_string(),
-                lines.join("\n"),
-            );
+            Err(why) => lines.push(format!("error\t{why}")),
         }
+        out.files.insert(
+            crate::patch::redirect::NUGET_LOCKS_KEY.to_string(),
+            lines.join("\n"),
+        );
     }
 
     for path in view.python_lock_paths() {
