@@ -639,9 +639,9 @@ pub async fn read_candidate_files(
     // files themselves stay out of the candidate texts. NuGet is disk-only
     // (the in-memory engine refuses it).
     if candidates.iter().any(|c| c.dep.ecosystem == "nuget") {
-        if let Some(root) = view.disk_root() {
+        if !matches!(view, ProjectView::Memory(_)) {
             let mut lines: Vec<String> = Vec::new();
-            match crate::vendor::nuget_config::governed_locks_on_disk(root) {
+            match crate::vendor::nuget_config::governed_locks_in(view).await {
                 Ok(governed) => {
                     for (project, detail) in &governed.unresolved {
                         lines.push(format!("unresolved\t{project}\t{detail}"));

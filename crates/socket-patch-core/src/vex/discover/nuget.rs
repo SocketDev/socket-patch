@@ -291,11 +291,16 @@ enum Lock {
 /// `contentHash` must agree across them, as within one lock.
 async fn load_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> Lock {
     let mut rels = vec![PACKAGES_LOCK.to_string()];
-    if let Some(root) = ctx.disk_root() {
+    // On disk only (the in-memory engine refuses NuGet). Walked through the
+    // view, never its raw root: a re-scan's read cache keeps recording.
+    if !matches!(
+        ctx.view,
+        crate::vendor::lock_inventory::ProjectView::Memory(_)
+    ) {
         // The writers refuse a tree whose locks they cannot all find; a
         // reader that fell back to the root lock alone would take a pinned
         // member lock for no lock at all, so it is unusable here too.
-        match crate::vendor::nuget_config::governed_locks_on_disk(root) {
+        match crate::vendor::nuget_config::governed_locks_in(&ctx.view).await {
             Ok(governed) => {
                 if let Some((project, detail)) = governed.unresolved.first() {
                     out.diag(
