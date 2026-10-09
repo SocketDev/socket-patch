@@ -858,6 +858,21 @@ fn uv_vendor_revert_keeps_wheel_while_subdir_pylock_references_it() {
     uv_vendor_revert_keeps_wheel_while_export_at("uv-export-subdir-pylock", "deploy/pylock.toml");
 }
 
+/// #1252: the same keep for an export under a name that is neither
+/// `*.txt` nor a Python lock name (Rye's `requirements.lock`, which
+/// `uv export -o` keeps writing after a Rye -> uv move), at the root and
+/// in a subdirectory. Before the fix the probe skipped the file by its
+/// extension, so the revert deleted the wheel it installs.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_keeps_wheel_while_lock_named_export_references_it() {
+    uv_vendor_revert_keeps_wheel_while_export_at("uv-export-requirements-lock", "requirements.lock");
+    uv_vendor_revert_keeps_wheel_while_export_at(
+        "uv-export-subdir-requirements-lock",
+        "deploy/requirements.lock",
+    );
+}
+
 fn uv_vendor_revert_keeps_wheel_while_export_at(tag: &str, out: &str) {
     let Some((uv, python)) = capstone_uv(tag) else {
         return;

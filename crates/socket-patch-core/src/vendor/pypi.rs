@@ -6099,8 +6099,7 @@ wheels = [
     /// entry; once the file stops naming the wheel the next revert cleans up.
     #[tokio::test]
     async fn requirements_revert_keeps_artifact_for_subdir_requirements_file() {
-        use crate::vendor::pypi_requirements::wire_requirements;
-        for (file, content) in [
+        assert_revert_keeps_artifact_for(&[
             (
                 "requirements/lock.txt",
                 "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
@@ -6113,7 +6112,41 @@ wheels = [
                 "deploy/requirements/prod.txt",
                 "./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
             ),
-        ] {
+        ])
+        .await;
+    }
+
+    /// #1252: `uv export -o` and `uv pip compile -o` write any file name,
+    /// and Rye's `requirements.lock` / `requirements-dev.lock` keep being
+    /// written after a Rye -> uv move. Such an export at the root or in a
+    /// subdirectory installs from the wheel exactly like a `*.txt` one, so
+    /// the revert keeps the wheel until the export stops naming it.
+    #[tokio::test]
+    async fn requirements_revert_keeps_artifact_for_lock_named_export() {
+        assert_revert_keeps_artifact_for(&[
+            (
+                "requirements.lock",
+                "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+            (
+                "requirements-dev.lock",
+                "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+            (
+                "deploy/requirements.lock",
+                "./../.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+        ])
+        .await;
+    }
+
+    /// Wires the root `requirements.txt`, writes each `(file, content)`
+    /// export naming the wheel, and checks that the dry run and the wet
+    /// revert keep the wheel for it, and that the revert reclaims the
+    /// artifact once the export stops naming it.
+    async fn assert_revert_keeps_artifact_for(cases: &[(&str, &str)]) {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        for &(file, content) in cases {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path();
             tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
