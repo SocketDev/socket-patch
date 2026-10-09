@@ -8,6 +8,10 @@
 //! update re-wires and reverts to pristine, a re-run needs no jar source,
 //! and a tampered ledger or an escaping symlink is refused.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -27,10 +31,6 @@ const MEMBER: &str = "META-INF/NOTICE.txt";
 enum Shape {
     Reactor,
     Gradle,
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
 fn purl(name: &str) -> String {

@@ -7,15 +7,13 @@
 //! depending on the live Socket API. The real-API end-to-end suite
 //! lives in `e2e_scan.rs` (gated behind `#[ignore]`).
 
-use std::path::{Path, PathBuf};
+use crate::common::binary;
+
+use std::path::Path;
 use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG_SLUG: &str = "test-org";
 

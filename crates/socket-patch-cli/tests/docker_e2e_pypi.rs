@@ -17,6 +17,10 @@
 
 #![cfg(feature = "docker-e2e")]
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 use std::process::Command;
 
 use base64::Engine;
@@ -61,14 +65,6 @@ fn cov_docker_args() -> Vec<String> {
         "-e".into(),
         "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
     ]
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Plain SHA256 (NOT git-blob) of the content — used as an independent

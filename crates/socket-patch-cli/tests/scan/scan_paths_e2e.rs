@@ -20,15 +20,13 @@
 //!   under `--json` or `--vex`, or an unparseable glob is a usage error
 //!   (exit 2).
 
+use crate::common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG: &str = "test-org";
 const ROOT_PURL: &str = "pkg:npm/root-dep@1.0.0";

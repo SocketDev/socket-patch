@@ -35,13 +35,16 @@
 //! cannot reach the registry — unless `SOCKET_PATCH_NPM_E2E_REQUIRED` is
 //! set; every assertion after that is hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -64,10 +67,6 @@ const DEP_VERSION: &str = "1.3.0";
 const ORG: &str = "test-org";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run the socket-patch binary with a scrubbed environment: every ambient
 /// `SOCKET_*` var is removed (so a developer's `SOCKET_DRY_RUN=1` etc. can't
@@ -94,15 +93,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// scrubbed, private cache/home sandbox, `SOCKET_PATCH_NPM_E2E_BIN`).
 fn npm(cwd: &Path, args: &[&str]) -> Output {
     npm_e2e_common::npm(cwd, args)
-}
-
-/// Git-blob SHA-256 (`sha256("blob <len>\0" ++ bytes)`) — the hash format
-/// socket-patch records in manifests.
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Standard base64 — the encoding of a view response's inline `blobContent`.

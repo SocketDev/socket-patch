@@ -1,20 +1,17 @@
 //! Scan vendoring previews, lock failures and corrupt legacy manifests.
 
+use crate::common::{binary, git_sha256};
+
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::fs::OpenOptions;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use fs2::FileExt;
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -26,14 +23,6 @@ const BEFORE: &[u8] = b"before\n";
 const AFTER: &[u8] = b"after\n";
 /// base64 of AFTER, inlined as the view response's blobContent.
 const AFTER_B64: &str = "YWZ0ZXIK";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// A vendorable npm project: root package.json, a v3 package-lock with a
 /// registry-resolved left-pad entry, and the installed package.
