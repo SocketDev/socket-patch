@@ -2852,13 +2852,18 @@ async fn scan_empty_detail_results_exit_alike_in_human_and_json() {
     }
 }
 
-/// #1062: a human `--dry-run --prune` previews the GC the `--json` arm
-/// previews (`gc` block), instead of skipping it.
+/// #1062: a human `--dry-run --prune` previews the GC (once) in every
+/// mode the `--json` arm previews it (`gc` block); vendored skipped it.
 #[tokio::test]
 async fn scan_dry_run_prune_previews_gc_in_human_and_json() {
     let purl = "pkg:npm/minimist@1.2.2";
     let stale = "pkg:npm/left-pad@1.3.0";
-    for mode in [&["--mode", "agent"][..], &["--prune"][..]] {
+    // Agent, vendored, and report-only (no mode; `--prune` below).
+    for mode in [
+        &["--mode", "agent"][..],
+        &["--mode", "vendored"][..],
+        &[][..],
+    ] {
         let mock = MockServer::start().await;
         mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
         mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
@@ -2887,9 +2892,12 @@ async fn scan_dry_run_prune_previews_gc_in_human_and_json() {
                     "{extra:?}: {v}"
                 );
             } else {
-                assert!(
-                    stdout.contains("[dry-run] GC would prune 1 manifest entry"),
-                    "{extra:?}: the human dry run previews the GC; stdout={stdout}"
+                assert_eq!(
+                    stdout
+                        .matches("[dry-run] GC would prune 1 manifest entry")
+                        .count(),
+                    1,
+                    "{extra:?}: the human dry run previews the GC once; stdout={stdout}"
                 );
             }
             assert_eq!(
