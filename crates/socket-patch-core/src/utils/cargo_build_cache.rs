@@ -126,7 +126,7 @@ fn workspace_root(cwd: &Path) -> PathBuf {
     }
     for dir in cwd.ancestors() {
         let manifest = dir.join("Cargo.toml");
-        if let Ok(text) = std::fs::read_to_string(&manifest) {
+        if let Ok(text) = crate::utils::fs::read_regular_to_string_sync(&manifest) {
             if text
                 .parse::<toml_edit::DocumentMut>()
                 .is_ok_and(|d| d.contains_key("workspace"))
@@ -162,9 +162,9 @@ impl ConfigDirs {
         }
         let mut out = ConfigDirs::default();
         for (dot_cargo, base) in files {
-            let text = ["config.toml", "config"]
-                .iter()
-                .find_map(|f| std::fs::read_to_string(dot_cargo.join(f)).ok());
+            let text = ["config.toml", "config"].iter().find_map(|f| {
+                crate::utils::fs::read_regular_to_string_sync(&dot_cargo.join(f)).ok()
+            });
             let Some(doc) = text.and_then(|t| t.parse::<toml_edit::DocumentMut>().ok()) else {
                 continue;
             };
