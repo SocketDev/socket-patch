@@ -94,8 +94,8 @@ fn check_fails_on_an_unpatched_npm_package() {
     assert_eq!(code, 1, "stderr={stderr}");
     let env = parse_json_envelope(stdout.trim());
     assert_eq!(env["status"], "partialFailure", "{env}");
-    let failed: Vec<Value> = events(&env)
-        .into_iter()
+    let failed: Vec<&Value> = events(&env)
+        .iter()
         .filter(|e| e["action"] == "failed")
         .collect();
     assert_eq!(failed.len(), 1, "{env}");

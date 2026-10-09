@@ -208,7 +208,7 @@ fn find_event_matches_action_and_optional_code() {
     // with the envelope.
     let env2 = env.clone();
     let err = std::panic::catch_unwind(move || {
-        find_event(&env2, "failed", Some("other")).clone();
+        find_event(&env2, "failed", Some("other"))["purl"].to_string()
     })
     .unwrap_err();
     let msg = err.downcast_ref::<String>().unwrap();
