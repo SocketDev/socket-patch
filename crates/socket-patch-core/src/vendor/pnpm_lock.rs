@@ -316,7 +316,12 @@ impl NpmLockBackend for PnpmBackend {
         // would make (#734). A later run on pnpm >= 10.5 adds the mirror.
         let ws_edit = if dialect == PnpmDialect::V9
             && !(ws_text.as_deref().is_none_or(workspace::is_keyless)
-                && pinned_pre_10_5(project_root, &pkg_bytes).await)
+                && (pinned_pre_10_5(project_root, &pkg_bytes).await
+                    // A keyless file the lock was installed from as a
+                    // multi-package workspace: pnpm <= 10.4, which reads
+                    // package.json overrides and whose members a root-only
+                    // scaffold would drop.
+                    || (ws_text.is_some() && workspace::lock_has_member_importers(lock.lines()))))
         {
             apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring)
                 .map_err(|e| format!("{PNPM_WORKSPACE} surgery failed: {e}"))?
@@ -6474,6 +6479,7 @@ snapshots:
         for user_ws in [
             "",
             "\n",
+            "\u{feff}\n",
             "# pnpm settings go here\n",
             "---\n",
             "%YAML 1.2\n---\n",
@@ -6503,6 +6509,21 @@ snapshots:
             assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
             assert_eq!(fx.read(PNPM_WORKSPACE).await, user_ws, "byte-exact revert");
         }
+
+        // A lock with member importers was installed from the keyless file
+        // by pnpm <= 10.4 (every nested package): no workspace edit.
+        let member_lock = P1_BEFORE_LOCK.replacen("\npackages:", "\n  sub: {}\n\npackages:", 1);
+        assert_ne!(member_lock, P1_BEFORE_LOCK);
+        let fx = fixture_with(P1_BEFORE_PKG, &member_lock).await;
+        write_ws(&fx, "# pnpm settings go here\n").await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry
+            .unwrap()
+            .wiring
+            .iter()
+            .all(|r| r.file != PNPM_WORKSPACE));
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, "# pnpm settings go here\n");
 
         // Pinned to pnpm 10.4.1: the keyless file is left alone (#734).
         let pinned_pkg =

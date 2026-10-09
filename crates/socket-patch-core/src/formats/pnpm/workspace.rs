@@ -13,7 +13,7 @@
 //!
 //! Pure text in, answers out; the editors own the reads and writes.
 
-use crate::formats::text::strip_bom;
+use crate::formats::text::{split_bom, strip_bom};
 
 /// The parsed key (quotes removed) and its inline value (comment and
 /// surrounding blanks stripped; `""` for a block-valued key) when `line` is
@@ -117,8 +117,9 @@ pub(crate) fn block_insert_point(lines: &[String]) -> Result<usize, String> {
         (Some(i), _) => i + 1,
         (None, Some(end)) => end,
         // Blank lines only: the new key opens the file, so its trailing
-        // newlines stay where they are.
-        (None, None) => 0,
+        // newlines stay where they are — after a BOM line, though, which
+        // must stay the stream's first bytes.
+        (None, None) => usize::from(lines.first().is_some_and(|l| !split_bom(l).0.is_empty())),
     })
 }
 
@@ -143,6 +144,22 @@ pub(crate) fn is_keyless(text: &str) -> bool {
             || ((is_marker(line, "---") || is_marker(line, "..."))
                 && strip_comment(&line[3..]).trim().is_empty())
     })
+}
+
+/// Whether a pnpm lock's project document (`lines`) lists an importer
+/// besides the root `.`. A pnpm-workspace.yaml with no keys reads as every
+/// nested package on pnpm 8–10.4 (`packages` defaults to `['.', '**']`) but
+/// as the root alone on pnpm >= 10.5, so a lock made from one with member
+/// importers comes from pnpm <= 10.4, and the root-only
+/// [`PACKAGES_SCAFFOLD`] would drop those members.
+pub(crate) fn lock_has_member_importers(lines: &[String]) -> bool {
+    let Some((start, end)) = super::lines::section_bounds(lines, "importers") else {
+        return false;
+    };
+    lines[start + 1..end]
+        .iter()
+        .filter_map(|line| super::lines::parse_key_line(line.strip_suffix('\r').unwrap_or(line), 2))
+        .any(|(key, _, _)| key != ".")
 }
 
 /// `text` with the contiguous run of lines `block` removed, when that
@@ -460,6 +477,24 @@ mod tests {
     }
 
     #[test]
+    fn member_importers_mark_a_pre_10_5_workspace() {
+        let lock = |importers: &str| {
+            lines(&format!(
+                "lockfileVersion: '9.0'\n\nimporters:\n\n{importers}\npackages: {{}}\n"
+            ))
+        };
+        assert!(!lock_has_member_importers(&lock(
+            "  .:\n    dependencies: {}\n"
+        )));
+        assert!(lock_has_member_importers(&lock(
+            "  .:\n    dependencies: {}\n\n  sub:\n    dependencies: {}\n"
+        )));
+        assert!(!lock_has_member_importers(&lines(
+            "lockfileVersion: '9.0'\n"
+        )));
+    }
+
+    #[test]
     fn keyless_documents_and_their_splices() {
         for text in [
             "",
@@ -509,6 +544,8 @@ mod tests {
         assert_eq!(block_insert_point(&lines("# only a comment\n")), Ok(1));
         assert_eq!(block_insert_point(&lines("")), Ok(0));
         assert_eq!(block_insert_point(&lines("\n\n")), Ok(0));
+        assert_eq!(block_insert_point(&lines("\u{feff}\n")), Ok(1));
+        assert_eq!(block_insert_point(&lines("\u{feff}")), Ok(1));
         for text in [
             "{a: 1}\n",
             "[a]\n",

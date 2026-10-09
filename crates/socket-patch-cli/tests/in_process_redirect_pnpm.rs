@@ -470,6 +470,43 @@ async fn hosted_trust_edit_scaffolds_packages_in_a_keyless_workspace_yaml() {
         "the scaffold-only file goes with the pin"
     );
 
+    // A BOM-only file keeps its BOM first; several (empty) documents are
+    // not spliced into at all.
+    for (user_ws, want) in [
+        ("\u{feff}\n", format!("\u{feff}\n{ADDED}")),
+        ("---\n---\n", "---\n---\n".to_string()),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        let ws_path = tmp.path().join("pnpm-workspace.yaml");
+        std::fs::write(&ws_path, user_ws).unwrap();
+        assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            want,
+            "{user_ws:?}"
+        );
+    }
+
+    // A lock installed from the keyless file as a multi-package workspace
+    // (pnpm <= 10.4 reads one as every nested package): a root-only
+    // scaffold would drop the members, so the file stays untouched.
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lock_path = tmp.path().join("pnpm-lock.yaml");
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    let with_member = lock.replacen("\npackages:", "\n  sub: {}\n\npackages:", 1);
+    assert_ne!(with_member, lock);
+    std::fs::write(&lock_path, with_member).unwrap();
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(&ws_path, "# pnpm settings go here\n").unwrap();
+    assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).unwrap(),
+        "# pnpm settings go here\n",
+        "a keyless multi-package workspace is left alone"
+    );
+
     // Pinned to pnpm 9.15.9: the keyless file stays untouched (#734).
     let tmp = tempfile::tempdir().unwrap();
     write_pnpm_project(tmp.path());

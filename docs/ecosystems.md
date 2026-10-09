@@ -123,7 +123,9 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   remains enforced. pnpm <=10 does not need the setting. An existing
   `pnpm-workspace.yaml` with no keys (empty or only comments) gets the
   root-only `packages:` list with the key, because pnpm 8–10.4 refuse a
-  workspace file that has keys but no `packages`. A project with no
+  workspace file that has keys but no `packages`. When the lock lists
+  workspace members (pnpm 8–10.4 read a keyless file as every nested
+  package), the file is left alone. A project with no
   `pnpm-workspace.yaml` (or a keyless one) that pins pnpm 9.0–10.4 (`packageManager`,
   `devEngines`, `engines.pnpm`, or the pnpm that last installed
   `node_modules`) gets no file: there a root-only workspace makes

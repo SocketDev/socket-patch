@@ -308,6 +308,26 @@ fn trust_configured_detail(server: &str, how: &str, undo: Option<&str>, dry_run:
     )
 }
 
+/// The keyless-workspace variant (#1096): pnpm-workspace.yaml holds no keys
+/// and the lock lists workspace members, which only pnpm <= 10.4 install
+/// from such a file (as every nested package). Those releases never read
+/// `trustLockfile` and refuse a workspace file holding a key without
+/// `packages`, while a root-only `packages` would drop the members, so
+/// nothing is written.
+pub fn pnpm_trust_keyless_members_detail(server: &str, dry_run: bool) -> String {
+    let was = if dry_run { "would be" } else { "was" };
+    format!(
+        "{}. {PNPM_WORKSPACE_REL} has no keys and pnpm-lock.yaml lists workspace \
+         members, which only pnpm <=10.4 installs from such a file; that pnpm does \
+         not read `trustLockfile` and refuses a workspace file holding keys but no \
+         `packages`, so nothing {was} written. After upgrading to pnpm >=11, list the \
+         members under `packages:` in {PNPM_WORKSPACE_REL} and re-run \
+         `socket-patch scan --mode hosted`, or install with \
+         `pnpm install --trust-lockfile`. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
 /// The single-package variant on pnpm 9.0–10.4 (#734): the project has no
 /// pnpm-workspace.yaml and every pin it carries (`pins`, as prose) is a
 /// pnpm that never reads `trustLockfile` but would treat a created file as
@@ -381,7 +401,12 @@ pub fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
     };
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
     if crate::formats::pnpm::workspace::is_keyless(text) {
-        let anchor = block_insert_point(&lines).unwrap_or(lines.len());
+        // Several (empty) documents: a splice would land in the last one,
+        // while pnpm reads the first.
+        let anchor = match block_insert_point(&lines) {
+            Ok(anchor) => anchor,
+            Err(why) => return TrustPlan::Unsupported(why),
+        };
         lines.splice(anchor..anchor, TRUST_SCAFFOLD_LINES.map(str::to_string));
         return TrustPlan::Scaffold(lines.join("\n"));
     }
