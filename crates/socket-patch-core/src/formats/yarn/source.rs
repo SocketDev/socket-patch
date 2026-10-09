@@ -129,7 +129,7 @@ pub(crate) fn classic_copy_real_name(
 
 /// `name` of a `package.json`.
 pub(crate) fn manifest_name(bytes: &[u8]) -> Option<String> {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let bytes = crate::formats::text::strip_bom_bytes(bytes);
     serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()?
         .get("name")?
