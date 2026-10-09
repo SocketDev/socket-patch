@@ -701,7 +701,6 @@ mod tests {
             "self-closed-repositories",
             "depmgmt-comment",
             "self-closed-depmgmt",
-            "profile-literal",
         ] {
             let out = run(&fixture(case)).await;
             assert_refs(&out, &[(FX_PURL, FX_UUID, WiringMode::Hosted)]);

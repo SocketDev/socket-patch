@@ -565,7 +565,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   expanded in place, so Maven never sees a duplicated tag). A GA declared only in such
   markup counts as transitive and gets the top-level pin; a base literal inside
   `<profiles>` is left as-is and reported (`redirect_maven_profile_dependency_unpatched`),
-  because an active profile's literal beats the pin. The grant serves the main jar only:
+  because an active profile's literal beats the pin, and when a profile holds the GA's
+  only declaration nothing is pinned. The grant serves the main jar only:
   a `<classifier>` variant (sources, tests, a native build) keeps its version
   (`redirect_maven_classifier_unsupported`), and the literal-or-pin decision is made from
   the classifier-less declarations.

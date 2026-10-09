@@ -2359,7 +2359,16 @@ async fn maven_goldens_round_trip() {
     // resolver lines were the user's is not derivable; they stay (warned).
     // no-suffix-fallback: a same-GAV repository is tied to no artifact, so
     // discovery reports no pin to restore.
-    let not_invertible = ["mvn-config-merge", "no-suffix-fallback"];
+    // self-closed-repositories / self-closed-depmgmt: the rewriter expanded
+    // the user's `<x/>` to hold its entry; the restore removes the entry and
+    // leaves the equivalent empty `<x></x>` (asserted in the upstream
+    // maven unit tests).
+    let not_invertible = [
+        "mvn-config-merge",
+        "no-suffix-fallback",
+        "self-closed-repositories",
+        "self-closed-depmgmt",
+    ];
     let mut ran = 0;
     for case in load("maven/pom") {
         let name = case.dir.file_name().unwrap().to_string_lossy().into_owned();

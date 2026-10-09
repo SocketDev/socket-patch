@@ -472,7 +472,6 @@ mod tests {
             "classifier-sources-sibling",
             "classifier-only-transitive-main",
             "depmgmt-comment",
-            "profile-literal",
         ] {
             let (outcome, after) = run(&[("pom.xml", fixture(case, "expected", "pom.xml"))]).await;
             assert!(

@@ -7192,18 +7192,31 @@ fn rewrite_maven_pom(
         }
         // A `<profiles>` declaration is read only while its profile is
         // active, and then its literal beats the top-level pin: it is never
-        // edited, and a base literal there is reported as unpatched.
+        // edited, and a base literal there is reported as unpatched. When
+        // that is the GA's only declaration, nothing this pom always reads
+        // uses it, and a top-level pin would be inert exactly when the
+        // profile pulls it in: the dep is skipped rather than reported
+        // redirected.
         let (profiled, matches): (Vec<_>, Vec<_>) = live.into_iter().partition(|m| m.in_profile);
-        for m in &profiled {
-            if m.version_text.as_deref() == Some(dep.version.as_str()) {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_maven_profile_dependency_unpatched".into(),
-                    detail: format!(
-                        "{group_id}:{artifact_id} <version>{}</version> inside <profiles> is not \
-                         edited; while that profile is active it resolves the unpatched artifact",
-                        dep.version
-                    ),
-                });
+        let profile_literal = profiled
+            .iter()
+            .any(|m| m.version_text.as_deref() == Some(dep.version.as_str()));
+        if profile_literal {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_profile_dependency_unpatched".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id} <version>{}</version> inside <profiles> is not \
+                     edited; while that profile is active it resolves the unpatched artifact{}",
+                    dep.version,
+                    if matches.is_empty() {
+                        " (no declaration outside <profiles>, so nothing is pinned)"
+                    } else {
+                        ""
+                    }
+                ),
+            });
+            if matches.is_empty() {
+                continue;
             }
         }
         let has_live_repo = !live_maven_repositories_with_id(pom_text, &repo_id).is_empty();
