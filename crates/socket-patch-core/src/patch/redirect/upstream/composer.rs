@@ -32,6 +32,7 @@ use crate::crawlers::composer_crawler::normalize_version;
 use crate::formats::composer::hosted::{
     find_composer_entry, find_composer_member, json_string_field, ComposerEntry,
 };
+use crate::utils::redact::url_hostname;
 
 const COMPOSER_LOCK: &str = "composer.lock";
 /// The `notification-url` composer records for packagist packages.
@@ -141,11 +142,13 @@ fn packagist_declares_options(composer_json: Option<&str>) -> bool {
     };
     let packagist_with_options = |r: &Value| {
         r.get("options").is_some_and(|o| !o.is_null())
-            && r.get("url").and_then(Value::as_str).is_some_and(|u| {
-                let host = u.split("://").nth(1).unwrap_or(u);
-                let host = host.split(['/', ':']).next().unwrap_or("");
-                host == "packagist.org" || host.ends_with(".packagist.org")
-            })
+            && r.get("url")
+                .and_then(Value::as_str)
+                .and_then(url_hostname)
+                .is_some_and(|host| {
+                    let host = host.to_ascii_lowercase();
+                    host == "packagist.org" || host.ends_with(".packagist.org")
+                })
     };
     match doc.get("repositories") {
         Some(Value::Array(a)) => a.iter().any(packagist_with_options),
@@ -514,6 +517,10 @@ mod tests {
         assert!(!packagist_declares_options(Some(
             r#"{"repositories": {"private": {"type": "composer", "url": "https://r.example",
                 "options": {"http": {"header": ["X-Token: t"]}}}}}"#
+        )));
+        assert!(packagist_declares_options(Some(
+            r#"{"repositories": [{"type": "composer", "url": "https://u:p@repo.packagist.org",
+                "options": {"ssl": {"verify_peer": false}}}]}"#
         )));
         assert!(!packagist_declares_options(Some(
             r#"{"repositories": [{"type": "composer", "url": "https://packagist.org.evil.example",
