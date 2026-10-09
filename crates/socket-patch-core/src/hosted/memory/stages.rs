@@ -157,6 +157,9 @@ pub(crate) struct Planned {
     /// `(artifact url, sha512)` of every npm tarball whose own
     /// package.json a yarn berry pin needs (#718).
     pub(crate) npm_manifests: Vec<(String, Option<String>)>,
+    /// `(artifact url, sha512)` of every npm tarball whose sha1 a yarn
+    /// classic pin needs because its grant carries none (#558).
+    pub(crate) npm_sha1s: Vec<(String, String)>,
     /// The vlt artifact preflight, judged offline (no network here, so
     /// every in-scope dep is withheld instead of pinned: `--offline`
     /// parity).
@@ -210,6 +213,10 @@ pub(crate) async fn plan(
         .into_iter()
         .map(|dep| (dep.artifact_url.clone(), dep.integrity.sha512.clone()))
         .collect();
+    let npm_sha1s = engine::yarn_classic_sha1_targets(&candidates, &read.files)
+        .into_iter()
+        .filter_map(|dep| Some((dep.artifact_url.clone(), dep.integrity.sha512.clone()?)))
+        .collect();
     Ok(Planned {
         project,
         candidates,
@@ -218,6 +225,7 @@ pub(crate) async fn plan(
         read,
         wheels,
         npm_manifests,
+        npm_sha1s,
         vlt_preflight,
     })
 }
@@ -241,11 +249,12 @@ pub(crate) struct RewriteRefused {
     pub(crate) skipped: Vec<SkippedPatch>,
 }
 
-/// Wheel metadata and served npm manifests (keyed by artifact URL) → the
-/// engine's rewrite → the guard.
+/// Wheel metadata, served npm manifests and served npm tarballs' sha1s
+/// (each keyed by artifact URL) → the engine's rewrite → the guard.
 pub(crate) async fn rewrite(
     planned: Planned,
     artifact_metadata: &BTreeMap<String, Result<Option<String>, String>>,
+    artifact_sha1s: &BTreeMap<String, Result<String, String>>,
     options: StageOptions,
 ) -> Result<Rewritten, RewriteRefused> {
     let Planned {
@@ -256,6 +265,7 @@ pub(crate) async fn rewrite(
         read,
         wheels,
         npm_manifests,
+        npm_sha1s,
         vlt_preflight,
     } = planned;
     let skipped_before = skipped.clone();
@@ -300,6 +310,25 @@ pub(crate) async fn rewrite(
                 }
             }
             Some(Ok(None)) | None => {
+                unavailable.insert(url.clone());
+            }
+        }
+    }
+    for (url, _) in &npm_sha1s {
+        match artifact_sha1s.get(url) {
+            Some(Ok(sha1)) => engine::set_derived_sha1(&mut candidates, url, sha1),
+            Some(Err(detail)) => {
+                if unavailable.insert(url.clone()) {
+                    for dep in candidates
+                        .iter()
+                        .map(|c| &c.dep)
+                        .filter(|d| &d.artifact_url == url)
+                    {
+                        skipped.push(engine::npm_tarball_unavailable(dep, detail));
+                    }
+                }
+            }
+            None => {
                 unavailable.insert(url.clone());
             }
         }

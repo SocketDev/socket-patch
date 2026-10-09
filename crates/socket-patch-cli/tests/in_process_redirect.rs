@@ -41,6 +41,8 @@ const PURL: &str = "pkg:npm/in-proc-redirect@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const HOSTED_URL: &str = "http://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
+/// The grant's sha1: yarn classic pins it as `resolved`'s `#` fragment (#558).
+const PATCHED_SHA1: &str = "5ba15ba15ba15ba15ba15ba15ba15ba15ba15ba1";
 const GHSA: &str = "GHSA-rdir-aaaa-bbbb";
 
 fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
@@ -114,7 +116,7 @@ async fn mock_reference(server: &MockServer) {
                     "artifacts": [{
                         "kind": "tarball",
                         "url": HOSTED_URL,
-                        "integrity": { "sha512": PATCHED_SHA512 }
+                        "integrity": { "sha512": PATCHED_SHA512, "sha1": PATCHED_SHA1 }
                     }],
                     "registryOverride": null
                 }
@@ -1155,7 +1157,7 @@ async fn scan_redirect_rewrites_correct_entry_in_crlf_classic_lock() {
         "the decoy entry must stay byte-identical: {lock}"
     );
     assert!(
-        lock.contains(&format!("resolved \"{HOSTED_URL}\"\r\n"))
+        lock.contains(&format!("resolved \"{HOSTED_URL}#{PATCHED_SHA1}\"\r\n"))
             && lock.contains(&format!("integrity {PATCHED_SHA512}\r\n")),
         "the target entry must pin the hosted patch: {lock}"
     );

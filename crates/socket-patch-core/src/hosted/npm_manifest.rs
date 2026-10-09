@@ -43,6 +43,32 @@ pub async fn fetch_hosted_npm_manifest(
     decode_hosted_npm_manifest(&bytes, sha512)
 }
 
+/// The sha1 (hex) of a served npm tarball, for the yarn classic hosted
+/// pin's `resolved "<url>#<sha1>"` fragment when the grant carries no sha1
+/// (#558). Yarn 1 names its cache slot after that fragment, so a
+/// fragmentless URL shares the slot of any fragmentless upstream copy of the
+/// same version and installs its bytes. The bytes must match the grant's
+/// sha512: that is what the pin's `integrity` line names, and a sha1 taken
+/// from any other bytes would pin a tarball yarn then refuses.
+pub fn decode_hosted_npm_sha1(bytes: &[u8], sha512: &str) -> Result<String, String> {
+    crate::vendor::registry_fetch::verify_sri(bytes, sha512)
+        .map_err(|_| "hosted tarball does not match its published sha512".to_string())?;
+    Ok(crate::utils::digest::sha1_hex_of(bytes))
+}
+
+/// Download the served tarball and take its sha1 ([`decode_hosted_npm_sha1`]).
+pub async fn fetch_hosted_npm_sha1(
+    client: &ApiClient,
+    url: &str,
+    sha512: &str,
+) -> Result<String, String> {
+    let bytes = client
+        .download_artifact(url)
+        .await
+        .map_err(|error| format!("cannot fetch the hosted tarball: {error}"))?;
+    decode_hosted_npm_sha1(&bytes, sha512)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,6 +87,18 @@ mod tests {
             builder.append_data(&mut header, path, *data).unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn sha1_is_taken_from_bytes_matching_the_sha512() {
+        let bytes = tgz(&[("package/package.json", br#"{"name":"left-pad"}"#)]);
+        let sri = sha512_sri_of(&bytes);
+        assert_eq!(
+            decode_hosted_npm_sha1(&bytes, &sri).unwrap(),
+            crate::utils::digest::sha1_hex_of(&bytes)
+        );
+        let other = sha512_sri_of(b"other bytes");
+        assert!(decode_hosted_npm_sha1(&bytes, &other).is_err());
     }
 
     #[test]

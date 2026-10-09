@@ -1108,6 +1108,60 @@ pub fn yarn_berry_manifest_targets<'a>(
         .collect()
 }
 
+/// The npm deps whose yarn classic pin needs the sha1 of the served
+/// tarball (#558): the grant carries a sha512 but no sha1, and the
+/// project's `yarn.lock` is a classic lock that names the package. Yarn 1
+/// keys its cache slot by the `resolved` URL's `#<sha1>` fragment, so the
+/// pin must carry one. One per distinct artifact URL.
+pub fn yarn_classic_sha1_targets<'a>(
+    candidates: &'a [Candidate],
+    files: &BTreeMap<String, String>,
+) -> Vec<&'a DepOverride> {
+    let Some(lock) = files
+        .get("yarn.lock")
+        .filter(|lock| !crate::formats::yarn::is_berry_lock(lock))
+    else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    candidates
+        .iter()
+        .map(|c| &c.dep)
+        .filter(|dep| dep.ecosystem == "npm")
+        .filter(|dep| dep.integrity.sha1.is_none() && dep.integrity.sha512.is_some())
+        .filter(|dep| lock.contains(crate::patch::redirect::full_name(dep).as_str()))
+        .filter(|dep| seen.insert(dep.artifact_url.clone()))
+        .collect()
+}
+
+/// Record the sha1 derived from the served tarball at `url` on every
+/// candidate granted that artifact.
+pub fn set_derived_sha1(candidates: &mut [Candidate], url: &str, sha1: &str) {
+    for candidate in candidates
+        .iter_mut()
+        .filter(|c| c.dep.artifact_url == url && c.dep.integrity.sha1.is_none())
+    {
+        candidate.dep.integrity.sha1 = Some(sha1.to_string());
+    }
+}
+
+/// The skip recorded for an npm dep whose served tarball could not be
+/// fetched or did not match its grant's sha512, so no sha1 could be
+/// derived for its yarn classic pin (the grant token in `detail` is
+/// redacted to `<hosted artifact>`).
+pub fn npm_tarball_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
+    SkippedPatch {
+        purl: format!(
+            "pkg:npm/{}@{}",
+            crate::patch::redirect::full_name(dep),
+            dep.version
+        ),
+        uuid: dep.patch_uuid.clone(),
+        reason: "npm_tarball_unavailable".to_string(),
+        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+    }
+}
+
 /// The skip recorded for an npm dep whose served `package.json` could not
 /// be fetched (the grant token in `detail` is redacted to `<hosted
 /// artifact>`).

@@ -133,7 +133,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   a reliable substitute. Run `socket-patch vex` after installation to verify
   the patched files. See the [compatibility matrix and workflow](testing/pnpm-compatibility.md).
 - **yarn classic** — the `yarn.lock` entry's `resolved` / `integrity` are
-  rewritten to the hosted tarball. A project that sets `yarn-offline-mirror`
+  rewritten to the hosted tarball. `resolved` always carries the tarball's
+  `#<sha1>` fragment: yarn 1 names its cache slot after it, so a fragmentless
+  URL would share the slot of an unpatched copy of the same version and a warm
+  cache would install those bytes (or fail the integrity check). When the grant
+  carries no sha1, the scan downloads the served tarball, checks it against the
+  grant's sha512 and pins the sha1 of those bytes. If that download or check
+  fails, the patch is skipped as `npm_tarball_unavailable`. A project that sets `yarn-offline-mirror`
   is refused with `redirect_yarn_classic_offline_mirror`. The mirror is
   resolved the way yarn 1 resolves it: the project's `.yarnrc` / `.npmrc`,
   the user's (`~/.yarnrc`, which `yarn config set` writes, and `~/.npmrc`),

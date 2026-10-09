@@ -1042,6 +1042,34 @@ pub(crate) async fn run_redirect_selected(
             }
         }
     }
+    // A yarn classic pin needs the served tarball's sha1 as its `resolved`
+    // fragment: yarn 1 keys its cache slot by it (#558). When the grant
+    // carries only a sha512, the scan downloads the tarball, checks it
+    // against that sha512 and pins the sha1 of those bytes. A tarball that
+    // cannot be fetched or verified drops its patch rather than pin a
+    // fragmentless URL a warm cache serves stale bytes for.
+    let sha1_targets: Vec<(String, String, DepOverride)> =
+        engine::yarn_classic_sha1_targets(&candidates, &read.files)
+            .into_iter()
+            .filter_map(|dep| {
+                let sha512 = dep.integrity.sha512.clone()?;
+                Some((dep.artifact_url.clone(), sha512, dep.clone()))
+            })
+            .collect();
+    for (url, sha512, dep) in sha1_targets {
+        status.set(format!("Fetching hosted tarball for {}...", dep.name));
+        match socket_patch_core::hosted::npm_manifest::fetch_hosted_npm_sha1(
+            api_client, &url, &sha512,
+        )
+        .await
+        {
+            Ok(sha1) => engine::set_derived_sha1(&mut candidates, &url, &sha1),
+            Err(detail) => {
+                unavailable_python_artifacts.insert(url.clone());
+                skipped.push(engine::npm_tarball_unavailable(&dep, &detail));
+            }
+        }
+    }
     status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
     // The Pipfile.lock reference shape depends on the installing Pipenv
@@ -2033,6 +2061,9 @@ fn describe_skip_reason(reason: &str) -> String {
         "python_metadata_unavailable" => "the hosted wheel's metadata could not be fetched".into(),
         "npm_manifest_unavailable" => {
             "the hosted tarball's package.json could not be fetched".into()
+        }
+        "npm_tarball_unavailable" => {
+            "the hosted tarball could not be fetched or did not match its sha512".into()
         }
         "redirect_bun_lock_unsupported" | "redirect_bun_lockb_invalid" => {
             "the Bun lockfile blocks the vendored-to-hosted migration (see the warning)".into()

@@ -3762,6 +3762,23 @@ fn rewrite_yarn_classic_with(
             });
             continue;
         };
+        // Yarn 1 files a tarball in its cache under the `resolved` URL's
+        // `#<sha1>` fragment; a fragmentless hosted URL shares the slot of
+        // any fragmentless upstream copy of this version, so a warm cache
+        // installs those bytes or fails the integrity check (#558). The
+        // hosted flows derive the sha1 from the served tarball when the
+        // grant carries none; a dep that still lacks one is never pinned.
+        let Some(sha1) = dep.integrity.sha1.clone() else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_classic_missing_sha1".into(),
+                detail: format!(
+                    "{fname}@{} has no sha1 for the yarn.lock `resolved` fragment, so it \
+                     is not pinned: yarn 1 would share the cache slot of an unpatched copy",
+                    dep.version
+                ),
+            });
+            continue;
+        };
         let mut matched_any = false;
         let mut pinned_any = false;
         let mut alias_skipped = false;
@@ -3962,15 +3979,9 @@ fn rewrite_yarn_classic_with(
                 continue;
             }
             pinned_any = true;
-            let frag = dep
-                .integrity
-                .sha1
-                .as_ref()
-                .map(|s| format!("#{s}"))
-                .unwrap_or_default();
             let pinned = repin_classic_block(
                 &block.lines,
-                &format!("{}{frag}", dep.artifact_url),
+                &format!("{}#{sha1}", dep.artifact_url),
                 &sha512,
             );
             if pinned != block.lines {
@@ -8114,6 +8125,10 @@ fn rewrite_golang(
 mod tests {
     use super::*;
 
+    /// The sha1 an npm grant carries (or the hosted flow derives from the
+    /// served tarball, #558): yarn classic pins it as `resolved`'s fragment.
+    const NPM_SHA1: &str = "5ha1";
+
     fn npm_override(name: &str, version: &str, url: &str, sha512: &str) -> DepOverride {
         DepOverride {
             ecosystem: "npm".into(),
@@ -8126,6 +8141,7 @@ mod tests {
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(sha512.into()),
+                sha1: Some(NPM_SHA1.into()),
                 ..Default::default()
             },
         }
@@ -10808,7 +10824,7 @@ mod tests {
         assert!(
             out.contains(
                 "left-pad@^1.3.0:\r\n  version \"1.3.0\"\r\n  \
-                 resolved \"http://p.test/lp.tgz\"\r\n  integrity sha512-PATCHED==\r\n"
+                 resolved \"http://p.test/lp.tgz#5ha1\"\r\n  integrity sha512-PATCHED==\r\n"
             ),
             "the target entry must pin the hosted artifact: {out}"
         );
@@ -10861,7 +10877,7 @@ mod tests {
         let want = lock.replace(
             "resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
              integrity sha512-UPSTREAMupstream==",
-            "resolved \"http://p.test/lp.tgz\"\n  integrity sha512-PATCHED==",
+            "resolved \"http://p.test/lp.tgz#5ha1\"\n  integrity sha512-PATCHED==",
         );
         assert_eq!(r.files["yarn.lock"], want);
     }
@@ -10882,7 +10898,7 @@ mod tests {
         let mut r = RewriteResult::default();
         rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(
-            r.files["yarn.lock"].contains("  resolved \"http://p.test/$1/$name/lp.tgz\"\n"),
+            r.files["yarn.lock"].contains("  resolved \"http://p.test/$1/$name/lp.tgz#5ha1\"\n"),
             "{}",
             r.files["yarn.lock"]
         );
@@ -11277,7 +11293,10 @@ mod tests {
             rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
             assert_eq!(r.edits.len(), 1, "{copy}: {:?}", r.edits);
             let out = &r.files["yarn.lock"];
-            assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+            assert!(
+                out.contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+                "{out}"
+            );
             assert!(out.ends_with(copy), "{copy}: copy byte-identical:\n{out}");
             let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
             assert_eq!(
@@ -11343,7 +11362,10 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
         assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         let out = &r.files["yarn.lock"];
-        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(
+            out.contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+            "{out}"
+        );
         assert!(
             out.contains(file_block),
             "file: block byte-identical:\n{out}"
@@ -11406,7 +11428,7 @@ mod tests {
             let mut r = RewriteResult::default();
             rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
             assert!(
-                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz\""),
+                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz#5ha1\""),
                 "the registry block is still pinned: {:?}",
                 r.files
             );
@@ -11489,7 +11511,10 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
         assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         let out = &r.files["yarn.lock"];
-        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(
+            out.contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+            "{out}"
+        );
         assert!(out.contains(git_block), "git block byte-identical:\n{out}");
         assert!(r
             .warnings
@@ -11591,7 +11616,7 @@ mod tests {
         assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
         let out = r.files.get("yarn.lock").expect("must rewrite");
         assert!(
-            out.contains("resolved \"http://p.test/lp.tgz\"")
+            out.contains("resolved \"http://p.test/lp.tgz#5ha1\"")
                 && out.contains("left-pad@^1.3.0, \"safe-pad@npm:left-pad@^1.3.0\":"),
             "merged key preserved, resolution repointed: {out}"
         );
@@ -20815,6 +20840,44 @@ packages:
         );
     }
 
+    /// #558: a yarn classic pin without a sha1 would have no `#<sha1>`
+    /// fragment, so yarn 1 would file the hosted tarball in the cache slot
+    /// of a fragmentless upstream copy and install its bytes. The rewriter
+    /// refuses such a dep and leaves the lock untouched.
+    #[test]
+    fn issue_558_yarn_classic_refuses_a_dep_without_sha1() {
+        let mut ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", "sha512-P==");
+        ovr.integrity.sha1 = None;
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz\"\n  \
+             integrity sha512-UP==\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "no fragmentless pin: {:?}",
+            r.files
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_yarn_classic_missing_sha1"]
+        );
+
+        ovr.integrity.sha1 = Some("abc123".into());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files["yarn.lock"].contains("  resolved \"http://p.test/lp.tgz#abc123\"\n"),
+            "{:?}",
+            r.files
+        );
+    }
+
     /// The pypi twins of the missing-integrity legs: requirements.txt and
     /// uv.lock each warn for a granted dep with no sha256.
     #[test]
@@ -21913,7 +21976,7 @@ packages:
         assert!(
             out.contains(
                 "left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
-                 resolved \"http://p.test/lp.tgz\"\n  integrity sha512-PATCHED=="
+                 resolved \"http://p.test/lp.tgz#5ha1\"\n  integrity sha512-PATCHED=="
             ),
             "integrity inserted after the repointed resolved: {out}"
         );
@@ -23158,7 +23221,10 @@ packages:
             out.contains("not-a-key-line"),
             "keyless block preserved: {out}"
         );
-        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(
+            out.contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+            "{out}"
+        );
     }
 
     /// An EXPLICIT `.yarnrc.yml` `compressionLevel: 0` (the supported value,

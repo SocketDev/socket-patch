@@ -33,6 +33,8 @@ const PURL: &str = "pkg:npm/covgap-hosted@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const HOSTED_URL: &str = "http://patch.test/patch/npm/covgap-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/covgap-hosted-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
+/// The grant's sha1: yarn classic pins it as `resolved`'s `#` fragment (#558).
+const PATCHED_SHA1: &str = "5ba15ba15ba15ba15ba15ba15ba15ba15ba15ba1";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const GHSA: &str = "GHSA-cvgp-hstd-aaaa";
 
@@ -94,7 +96,7 @@ async fn mock_granted_reference(server: &MockServer, uuid: &str, purl: &str, url
                 "artifacts": [{
                     "kind": "tarball",
                     "url": url,
-                    "integrity": { "sha512": PATCHED_SHA512 }
+                    "integrity": { "sha512": PATCHED_SHA512, "sha1": PATCHED_SHA1 }
                 }],
                 "registryOverride": null
             }
