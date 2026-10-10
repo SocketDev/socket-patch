@@ -442,13 +442,13 @@ fn write_redirect_ledger(p: &Proj, ledger_purl: &str, record: PatchRecord) {
 /// (the shape every current vendor writer persists).
 fn write_vendor_ledger(p: &Proj, sha: &str, record: PatchRecord) {
     let mut state = VendorState::new();
-    state.entries.insert(
-        api_purl(),
-        VendorEntry {
-            ecosystem: "pypi".to_string(),
-            base_purl: purl(),
-            uuid: record.uuid.clone(),
-            artifact: VendorArtifact {
+    let mut entry = VendorEntry {
+        flavor: Some("poetry".to_string()),
+        ..VendorEntry::new(
+            "pypi".to_string(),
+            purl(),
+            record.uuid.clone(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: vendored_rel(&record.uuid),
                 sha256: sha.to_string(),
@@ -456,7 +456,7 @@ fn write_vendor_ledger(p: &Proj, sha: &str, record: PatchRecord) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![WiringRecord {
+            vec![WiringRecord {
                 file: "poetry.lock".to_string(),
                 kind: "poetry_lock_package".to_string(),
                 action: WiringAction::Rewritten,
@@ -464,18 +464,10 @@ fn write_vendor_ledger(p: &Proj, sha: &str, record: PatchRecord) {
                 original: None,
                 new: None,
             }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: Some(record),
-            flavor: Some("poetry".to_string()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
-    );
+        )
+    };
+    entry.record = Some(record);
+    state.entries.insert(api_purl(), entry);
     p.write(
         ".socket/vendor/state.json",
         serde_json::to_string_pretty(&state).unwrap(),
