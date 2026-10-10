@@ -470,6 +470,10 @@ pub enum UnattestedKind {
     /// shrinkwrap, resolves the package from the registry and writes a
     /// fresh package-lock.json, so only npm <= 11 installs the patch.
     NpmShrinkwrapOnly,
+    /// A hosted Maven pin in a reactor root (`<modules>` / `<subprojects>`,
+    /// #261): a module's own literal `<version>` overrides it, and only the
+    /// root pom is read, so the reactor may build the upstream jar.
+    MavenReactorRoot,
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,

@@ -117,7 +117,10 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   the repointed entry under `--locked`, 0.5.5 accepts it — the effective
   boundary is 0.5.5; the advisory keeps its `0_5_6` name.
 - Transitive targets are wired through `[tool.uv] override-dependencies` plus
-  a `[tool.uv.sources]` entry. uv applies sources to overrides only from
+  a `[tool.uv.sources]` entry. Hosted mode puts a `# socket-patch hosted: …`
+  comment line above the override entry it adds; rollback / remove remove
+  only a marked entry, so a user's own `<name>==<version>` override survives
+  the round trip (#411). uv applies sources to overrides only from
   0.5.6: on 0.2.35–0.5.3 `--frozen` installs the patched wheel from the lock,
   but a plain `uv sync` re-resolves the override against the registry and
   reinstalls the pristine wheel (and rewrites the lock). The CLI cannot tell
@@ -146,16 +149,42 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   vendored `uv.lock` / `pyproject.toml` writer (including the appended
   `[manifest]` and `[package.metadata]` fragments and their revert) keep the
   file's convention.
+- uv workspaces are refused from the root (`pypi_uv_workspace_unsupported` /
+  `redirect_uv_project_unsupported`) and from a member directory: a member
+  listed by the nearest ancestor `[tool.uv.workspace] members` (no
+  standalone `[project]` in between) installs from the root's `uv.lock`,
+  whatever locks sit in the member, so both modes refuse it before writing
+  (`redirect_workspace_lockfile_elsewhere` hosted,
+  `pypi_uv_workspace_unsupported` vendored) instead of rewriting a
+  Hatch-configured member as a lockless Hatch project (#1138).
 - A script lock requires its paired script and a valid PEP 723 metadata block.
   Missing metadata or an incompatible existing source is reported before either
   file is rewritten.
+- A PEP 508 direct reference to the patched package (`six @ https://…whl`,
+  `six @ git+…`) in `[project]` dependencies, an extra, a `[dependency-groups]`
+  group, the legacy `[tool.uv] dev-dependencies` or a PEP 723 script, or a
+  lock entry resolved from a direct URL (uv.lock `source = { url }`, pylock
+  `archive = { url }`), is the user's own source. Both modes refuse it before
+  any file is written: vendored with `pypi_uv_source_already_exists`, hosted
+  with `redirect_uv_project_unsupported` / `redirect_uv_script_unsupported` /
+  `redirect_uv_lock_unsupported` (#767). Before, vendored left a lock that
+  `uv sync --locked` rejects, and hosted replaced the user's URL with one its
+  own rollback then refused to restore.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751
   rewriting selects the exact package version; duplicate entries for the same
   name and version are refused when source selection is ambiguous.
-- Hosted requirements select exact `==`/`===` pins or identifiable archive URLs.
-  Other versions remain unchanged. A bare requirement is rewritten only when
+- Lock-only discovery (a fresh checkout, no venv) queries the patch API with
+  every PEP 440 spelling of an exact pure-release pin as well as the one
+  written (`six==1.16` asks for `@1.16` and `@1.16.0`; `==1.16.0` also asks for
+  `@1.16`), so it finds the patch the registry keys under its own spelling, as a
+  venv-backed run does, and reports the package as not installed (#604).
+- Hosted requirements select exact `==`/`===` pins or socket-patch's own
+  hosted archive URLs. A user-authored direct reference to the patched release
+  (`name @ <url>` on any other origin, `files.pythonhosted.org` and `file://`
+  included) is refused with `redirect_requirements_direct_reference` and left
+  unchanged. Other versions remain unchanged. A bare requirement is rewritten only when
   one row and one override version identify the selection. Ranges, wildcard
   pins, opaque URLs, and ambiguous unpinned rows are reported as
   `redirect_requirements_version_ambiguous` and preserved.

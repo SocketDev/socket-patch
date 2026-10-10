@@ -8,7 +8,7 @@ use crate::formats::yarn::blocks::{
     berry_field, classic_field, live_blocks, scan_blocks, LockBlock,
 };
 use crate::formats::yarn::patterns::{
-    parse_berry_locator, pattern_real_name, split_berry_key_patterns, split_key_patterns,
+    classic_pattern_real_name, parse_berry_locator, split_berry_key_patterns, split_key_patterns,
     split_pattern, split_resolved_sha1, BerryLocator,
 };
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
@@ -181,7 +181,7 @@ fn classic_registry_view(text: &str) -> Vec<LockfileEntry> {
         if yarn_classic_lock::block_points_into_vendor(&block.lines) {
             continue;
         }
-        let Some(name) = patterns.first().and_then(|p| pattern_real_name(p)) else {
+        let Some(name) = patterns.first().and_then(|p| classic_pattern_real_name(p)) else {
             continue;
         };
         let Some(version) = classic_field(&block.lines, "version") else {

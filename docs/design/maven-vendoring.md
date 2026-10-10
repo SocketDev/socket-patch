@@ -80,6 +80,20 @@ produce specific warnings; the backend does not silently claim those
 unsupported declarations are patched. An enforcer repository ban omits the
 fallback repository and warns that the tail requires Maven 3.9.2 or newer.
 
+A local root's pin beats every management from outside the checkout, so it is
+weighed against that management first: the parents a local root resolves from
+a repository (`<relativePath/>`, a corporate or Spring Boot parent) and every
+`<scope>import</scope>` BOM of the reactor and of those parents, read from the
+local caches or the registry like other upstream metadata. Properties follow
+Maven's order (the reactor's own values override an external parent's). When
+that management, or a literal an external parent declares, sets the artifact to
+another version than the patch's base, the root is not pinned
+(`conflicting_managed_version`); when a needed POM is in no cache and cannot be
+fetched, the root is not pinned either (`management_unresolved`, resolve the
+project once and vendor again). A re-run after a BOM bump drops the pin the
+same way. `vendor --check` reads that metadata from the local repository only
+and accepts either decision when some of it is missing.
+
 Maven 3.9.2+ can read the repository tail without copying jars into `~/.m2` and
 without routing through mirrors. Older Maven versions use the fallback file
 repository, which copies the suffixed artifact into the local cache. A

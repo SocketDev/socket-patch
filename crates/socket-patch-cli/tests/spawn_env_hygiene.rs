@@ -68,7 +68,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "covgap_commands_vendor.rs",
     "covgap_commands_vex.rs",
     "covgap_utils_socket_cli_config.rs",
-    "diff_created_file_e2e.rs",
     "e2e_cargo.rs",
     "e2e_composer.rs",
     "e2e_composer_version_identity.rs",
