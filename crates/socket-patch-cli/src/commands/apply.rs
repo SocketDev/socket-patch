@@ -1192,6 +1192,31 @@ pub(crate) async fn run_locked(
                     })
             }));
 
+            // Cargo keys a registry / `cargo vendor` crate's compiled
+            // artifacts on its package id, never its source bytes: a
+            // project built before this apply would keep linking the
+            // pre-patch rlib (#387). Invalidate this project's compiled
+            // copies of every crate whose bytes just changed.
+            // The warnings also ride the report, for a nested caller's
+            // envelope (`scan` / `get`).
+            let mut cache_warnings: Vec<RunWarning> = Vec::new();
+            if !args.common.dry_run {
+                let rewritten = results.iter().filter(|r| {
+                    r.success
+                        && !r.files_patched.is_empty()
+                        && r.package_path != VENDOR_OWNED_MARKER
+                });
+                cache_warnings.extend(
+                    socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                        &args.common.cwd,
+                        rewritten.map(|r| r.package_key.as_str()),
+                    )
+                    .into_iter()
+                    .map(|(code, detail)| RunWarning { code, detail }),
+                );
+                run_warnings.extend(cache_warnings.iter().cloned());
+            }
+
             // Run-level advisories + best-effort fallback-home skips on the
             // human path: one gated stderr line each. `--silent` is
             // errors-only, and under `--json` the envelope copies below are
@@ -1423,7 +1448,8 @@ pub(crate) async fn run_locked(
 
             // The mismatch overwrites, for a nested caller's envelope (the
             // JSON events above are the standalone apply's copy).
-            let warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
+            let mut warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
+            warnings.extend(cache_warnings);
             // A requested-but-failed VEX flips an otherwise-successful
             // apply to a non-zero exit (fail-the-command contract).
             if success && !vex_failed {

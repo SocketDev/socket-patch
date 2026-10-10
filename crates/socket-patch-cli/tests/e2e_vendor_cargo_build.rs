@@ -943,6 +943,102 @@ fn cargo_vendor_reports_applied_event() {
     );
 }
 
+/// #336: an agent-mode apply patches the crate in the SHARED registry
+/// cache; a later `vendor` moves the crate onto a committed copy but leaves
+/// that cache edit behind. A bare `rollback` must restore the cache copy
+/// too — not report success, drop the manifest entry and GC the only blobs
+/// that could restore it while every other project on the machine keeps
+/// building the patched crate.
+#[test]
+fn cargo_rollback_after_agent_to_vendored_restores_shared_cache() {
+    agent_to_vendored_rollback_restores_shared_cache(false);
+}
+
+/// #336 behind a `cargo vendor` dir: the project crawl then searches only
+/// `vendor/`, which hides the registry cache. The rollback still drops the
+/// record, so it must still find and restore the patched cache copy.
+#[test]
+fn cargo_rollback_after_agent_to_vendored_restores_cache_behind_cargo_vendor_dir() {
+    agent_to_vendored_rollback_restores_shared_cache(true);
+}
+
+fn agent_to_vendored_rollback_restores_shared_cache(cargo_vendor_dir: bool) {
+    if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (agent-then-vendor)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) =
+        stage_fixture(tmp.path(), "agent-then-vendor")
+    else {
+        return;
+    };
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let lib = crate_dir.join("src/lib.rs");
+    let orig = std::fs::read(&lib).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+    std::fs::write(proj.join(".socket/blobs").join(git_sha256(&orig)), &orig).unwrap();
+    let cwd = proj.to_str().unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["apply", "--json", "--offline", "--cwd", cwd],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&lib).unwrap(),
+        patched,
+        "apply must patch the cache copy"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["vendor", "--json", "--offline", "--cwd", cwd],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    if cargo_vendor_dir {
+        std::fs::create_dir_all(proj.join("vendor")).unwrap();
+    }
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["rollback", "--json", "--offline", "--cwd", cwd],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(
+        std::fs::read(&lib).unwrap(),
+        orig,
+        "rollback must restore the shared registry-cache copy: {env}"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert!(
+        manifest["patches"].get(&purl).is_none(),
+        "a fully rolled-back entry leaves the manifest: {manifest}"
+    );
+    let ledger =
+        std::fs::read_to_string(proj.join(".socket/vendor/state.json")).unwrap_or_default();
+    assert!(
+        !ledger.contains(&purl),
+        "the vendored leg must have reverted the ledger entry: {ledger}"
+    );
+}
+
 /// get-driven twin (v3.6): `get <uuid> --mode vendored --vendor-source build`
 /// must reach the capstone's committed state through scan's vendored engine —
 /// no manifest (the ledger records the patch), the patched copy under `.socket/vendor/cargo/<uuid>/`,
