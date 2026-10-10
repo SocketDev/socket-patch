@@ -143,7 +143,8 @@ pub struct GetArgs {
     pub all_releases: bool,
 
     /// How to consume the patches: the same modes as `scan --mode`
-    /// [default: hosted; agent with `--save-only` or `--global`]
+    /// [default: the mode the project's patch state already records, else
+    /// hosted; agent with `--save-only` or `--global`]
     // agent = record in .socket/manifest.json + blobs and apply in place;
     // hosted = rewrite lockfiles so the patched deps resolve to Socket's
     // hosted patch server (no manifest, no blobs, no ledger: the lockfile
@@ -1016,16 +1017,34 @@ pub async fn run(args: GetArgs) -> i32 {
             "Only one of --id, --cve, --ghsa, or --package can be specified",
         );
     }
-    // v5: hosted by default, like scan. `--save-only` (records a manifest
-    // entry) and global installs (no project lockfile) mean agent mode.
-    // Usage errors exit 2, like clap's and scan's (v5.0).
-    let mode = args
-        .mode
-        .unwrap_or(if args.save_only || args.common.is_global() {
-            super::scan::ScanMode::Agent
-        } else {
-            super::scan::ScanMode::Hosted
-        });
+    // v5: with no `--mode`, like scan, the project keeps the mode its
+    // state already records (#1088) and a project with no state is hosted.
+    // `--save-only` (records a manifest entry) and global installs (no
+    // project lockfile) mean agent mode. Usage errors exit 2, like clap's
+    // and scan's (v5.0).
+    let mode = match args.mode {
+        Some(mode) => mode,
+        None if args.save_only || args.common.is_global() => super::scan::ScanMode::Agent,
+        None => match super::mode_from_project_state(&args.common).await {
+            Ok(mode) => {
+                if !args.common.json && !args.common.silent {
+                    if let Some(note) = super::kept_mode_note(mode) {
+                        eprintln!("{note}");
+                    }
+                }
+                mode
+            }
+            Err(message) => {
+                return usage_error(
+                    JsonCommand::Get,
+                    args.common.json,
+                    args.common.dry_run,
+                    "mode_ambiguous",
+                    &message,
+                );
+            }
+        },
+    };
     // Global installs have no project lockfile: an explicit hosted or
     // vendored mode would rewire the cwd project, not the global copy.
     if let Some(conflict) = super::global_mode_conflict(&args.common, mode) {
@@ -1117,7 +1136,6 @@ pub async fn run(args: GetArgs) -> i32 {
         )],
         _ => Vec::new(),
     };
-    let download_mode = args.common.download_mode.clone();
     // Set to `true` after the first 401/403 from the authenticated
     // endpoint triggered a rebuild against the public proxy. Plumbed
     // through to every subsequent telemetry event so we can track the
@@ -1211,7 +1229,6 @@ pub async fn run(args: GetArgs) -> i32 {
                     &patch.uuid,
                     &patch.tier,
                     &ecosystem_from_purl(&patch.purl),
-                    &download_mode,
                     fallback_to_proxy,
                     &telemetry,
                 )
@@ -1468,19 +1485,18 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if accessible.is_empty() {
         if args.common.json {
-            let mut result = serde_json::json!({
-                "status": "paid_required",
-                "found": search_response.patches.len(),
-                "downloaded": 0,
-                "applied": 0,
-                "patches": search_response.patches.iter().map(|p| serde_json::json!({
-                    "purl": p.purl,
-                    "uuid": p.uuid,
-                    "tier": p.tier,
-                })).collect::<Vec<_>>(),
-            });
-            fold_narrowing_into_result(&mut result, &[], &org_warnings);
-            print_json(&result);
+            let records = search_response
+                .patches
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "purl": p.purl,
+                        "uuid": p.uuid,
+                        "tier": p.tier,
+                    })
+                })
+                .collect();
+            print_json(&paid_required_json(records, &org_warnings));
         } else if !args.common.silent {
             let all: Vec<&PatchSearchResult> = search_response.patches.iter().collect();
             if id_type == TargetKind::Name && !quiet {
@@ -1638,13 +1654,11 @@ pub async fn run(args: GetArgs) -> i32 {
         print!("{}", format_selected_patches(&selected, color));
     }
 
-    // Agent-mode dry run: preview against the manifest, write nothing.
-    // (Hosted/vendored dry runs are handled inside their engines.) The
-    // per-release variant narrowing the wet run applies inside the
-    // download engine runs here too, so the preview names only the
-    // variants a wet run would fetch.
-    if args.common.dry_run && mode == super::scan::ScanMode::Agent {
-        let (selected, variant_warnings, _views) = filter_to_installed_releases(
+    // Agent wet runs and vendored runs narrow variants in their download
+    // engines. Hosted runs and agent previews need the same narrowing here.
+    let agent_preview = args.common.dry_run && mode == super::scan::ScanMode::Agent;
+    let selected = if agent_preview || mode == super::scan::ScanMode::Hosted {
+        let (selected, variant_warnings, _) = filter_to_installed_releases(
             &selected,
             args.all_releases,
             &args.common.crawler_options(),
@@ -1652,19 +1666,23 @@ pub async fn run(args: GetArgs) -> i32 {
             &api_client,
         )
         .await;
-        let mut narrow_warnings = narrow_warnings;
         narrow_warnings.extend(
             variant_warnings
                 .into_iter()
                 .map(|w| ("release_narrowing".to_string(), w)),
         );
+        selected
+    } else {
+        selected
+    };
+    if agent_preview {
         return agent_dry_run(&args, &selected, &narrow_skips, &narrow_warnings).await;
     }
 
     // Agent mode confirms before acting (default YES). Dry runs skip the
     // prompt: nothing mutates, so nothing to confirm. Hosted and vendored
     // runs never prompt (v5.0), like `scan`.
-    if mode == super::scan::ScanMode::Agent && !args.common.dry_run {
+    if mode == super::scan::ScanMode::Agent {
         let prompt = format_confirm_prompt(args.save_only, selected.len());
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if !quiet {
@@ -1676,30 +1694,6 @@ pub async fn run(args: GetArgs) -> i32 {
 
     match mode {
         super::scan::ScanMode::Hosted => {
-            // Per-release VARIANT narrowing (the finer layer under the
-            // coarse version narrowing above). Agent/vendored runs get it
-            // inside the download engines; hosted never downloads, so run
-            // it here — otherwise every PyPI wheel/sdist, gem platform, and
-            // Maven classifier variant of the installed version would be
-            // granted and rewritten, not just the installed distribution.
-            // Same fallbacks as everywhere else: uninstalled/unmatched
-            // bases keep all variants with a warning; --all-releases
-            // passes through. (The views it fetched are not needed here:
-            // hosted never downloads.)
-            let (selected, variant_warnings, _views) = filter_to_installed_releases(
-                &selected,
-                args.all_releases,
-                &args.common.crawler_options(),
-                quiet,
-                &api_client,
-            )
-            .await;
-            let mut narrow_warnings = narrow_warnings;
-            narrow_warnings.extend(
-                variant_warnings
-                    .into_iter()
-                    .map(|w| ("release_narrowing".to_string(), w)),
-            );
             return run_get_hosted(
                 &args,
                 &api_client,
@@ -1751,6 +1745,25 @@ pub async fn run(args: GetArgs) -> i32 {
     code
 }
 
+/// `get --json`'s one paid-plan shape (CLI_CONTRACT.md, `paid_required`):
+/// the legacy top-level `status: "paid_required"` with the refused
+/// `patches` records and nothing downloaded or applied. No `events`, no
+/// `error`: it is a clean outcome (exit 0).
+fn paid_required_json(
+    records: Vec<serde_json::Value>,
+    org_warnings: &[(String, String)],
+) -> serde_json::Value {
+    let mut result = serde_json::json!({
+        "status": "paid_required",
+        "found": records.len(),
+        "downloaded": 0,
+        "applied": 0,
+        "patches": records,
+    });
+    fold_narrowing_into_result(&mut result, &[], org_warnings);
+    result
+}
+
 /// `paid_required` for the uuid path: the patch exists but the caller
 /// (on the public proxy) cannot download it. A clean outcome, exit 0.
 /// `purl` is `None` when the proxy refused with 403 before naming it.
@@ -1768,15 +1781,7 @@ async fn report_paid_required_uuid(
         if let Some(purl) = purl {
             record["purl"] = serde_json::json!(purl);
         }
-        let mut result = serde_json::json!({
-            "status": "paid_required",
-            "found": 1,
-            "downloaded": 0,
-            "applied": 0,
-            "patches": [record],
-        });
-        fold_narrowing_into_result(&mut result, &[], org_warnings);
-        print_json(&result);
+        print_json(&paid_required_json(vec![record], org_warnings));
     } else if !args.common.silent {
         let name = purl.map(|p| normalize_purl(p).into_owned());
         println!(
@@ -2176,7 +2181,6 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         global_prefix: args.common.global_prefix.clone(),
         json: args.common.json,
         silent: args.common.silent,
-        download_mode: args.common.download_mode.clone(),
         all_releases: args.all_releases,
         strict: args.common.strict,
         ecosystems: args.common.ecosystems.clone(),
@@ -3875,7 +3879,6 @@ mod tests {
             global_prefix: None,
             json: true,
             silent: true,
-            download_mode: "diff".to_string(),
             all_releases: false,
             strict: false,
             ecosystems: None,
@@ -4571,7 +4574,6 @@ mod tests {
             global_prefix: None,
             json: true,
             silent: true,
-            download_mode: "diff".to_string(),
             all_releases: false,
             strict: false,
             ecosystems: None,
@@ -5676,7 +5678,6 @@ mod tests {
             nested.org.is_none() && nested.api_token.is_none(),
             "API fields are never threaded through params: the nested apply runs on the run's client"
         );
-        assert_eq!(nested.download_mode, "diff");
         assert!(nested.silent, "json || silent params run a quiet apply");
         assert!(!nested.json && !nested.dry_run);
     }

@@ -17,7 +17,10 @@
 //!
 //! Reads are FIFO-safe and capped ([`MAX_FILES`], [`MAX_FILE_BYTES`]);
 //! `.scala-build` and `.bloop` must be real directories (a symlink there is
-//! no evidence), and symlinked project files are skipped.
+//! no evidence), and symlinked project files are skipped. A project file
+//! that is over the cap, unreadable or not a Bloop project fails closed (no
+//! evidence at all), as the sbt reader does: it could be the record naming
+//! a conflicting version.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -33,7 +36,7 @@ use crate::utils::fs::read_regular_to_bytes_sync;
 pub const BLOOP_DIR: &str = ".scala-build/.bloop";
 /// Most project files read; over it there is no evidence at all.
 pub const MAX_FILES: usize = 256;
-/// Largest project file read; a bigger one is skipped.
+/// Largest project file read; a bigger one means no evidence at all.
 pub const MAX_FILE_BYTES: u64 = 8 << 20;
 /// Source extensions scala-cli compiles from a directory input.
 const SOURCE_EXTENSIONS: &[&str] = &["scala", "sc", "java"];
@@ -199,12 +202,26 @@ pub fn discover(root: &Path) -> Option<ScalaEvidence> {
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-            debug_log(&format!("scala-cli evidence: skipping {}", path.display()));
+        if !meta.is_file() {
             continue;
         }
+        // A project file that cannot be read whole (over the cap, a read
+        // error, a truncated or foreign record) could be the one naming a
+        // conflicting version: no evidence at all, as for sbt
+        // (`formats::sbt::evidence::resolution`), never a partial one.
+        if meta.len() > MAX_FILE_BYTES {
+            debug_log(&format!(
+                "scala-cli evidence: {} is over the {MAX_FILE_BYTES}-byte cap",
+                path.display()
+            ));
+            return None;
+        }
         let (Ok(bytes), Ok(written)) = (read_regular_to_bytes_sync(&path), meta.modified()) else {
-            continue;
+            debug_log(&format!(
+                "scala-cli evidence: cannot read {}",
+                path.display()
+            ));
+            return None;
         };
         let mtime = compiled_at(&dir.join(name.trim_end_matches(".json")), written);
         let Some(project) = parse_bloop(&bytes) else {
@@ -212,7 +229,7 @@ pub fn discover(root: &Path) -> Option<ScalaEvidence> {
                 "scala-cli evidence: {} is not a Bloop project",
                 path.display()
             ));
-            continue;
+            return None;
         };
         if !project.workspace_dir.as_deref().is_some_and(same_workspace) {
             continue;
@@ -717,7 +734,18 @@ mod tests {
             &dir.join("big.json"),
             &" ".repeat(MAX_FILE_BYTES as usize + 1),
         );
-        assert_eq!(discover(&root), None, "an oversized file is skipped");
+        assert_eq!(discover(&root), None, "an oversized file is no evidence");
+        write(
+            &dir.join("p.json"),
+            &bloop_json("p", &root, &[], &[("g", "a", "1", &[])]),
+        );
+        assert_eq!(
+            discover(&root),
+            None,
+            "an oversized project file fails closed beside a readable one"
+        );
+        std::fs::remove_file(dir.join("big.json")).unwrap();
+        assert!(discover(&root).is_some());
         for n in 0..=MAX_FILES {
             write(&dir.join(format!("p{n}.txt")), "");
         }
@@ -730,6 +758,81 @@ mod tests {
             None,
             "over the file cap there is no evidence"
         );
+    }
+
+    /// #1270: a truncated, oversized or foreign `-test` twin (or newest
+    /// project) used to be skipped, so the gate judged the main project's
+    /// resolution alone and passed a `test.dep` at another version. Every
+    /// unreadable record now fails closed, as the sbt reader does.
+    #[test]
+    fn an_unreadable_project_file_hides_no_conflict() {
+        use crate::vendor::jvm::coursier_gate::gate;
+        use crate::vendor::jvm::sbt_gate::GateStop;
+        let code = |e: Option<&ScalaEvidence>, root: &Path| match gate(root, e, "g", "a", "1.0.0") {
+            Ok(_) => "ok",
+            Err(GateStop::Skip(w)) => w.code,
+            Err(GateStop::Refuse(r)) => r.code,
+            Err(GateStop::Silent) => "silent",
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = root.join("main.scala");
+        let test_src = root.join("main.test.scala");
+        write(&main, "//> using dep g:a:1.0.0\n");
+        write(&test_src, "//> using test.dep g:a:2.0.0\n");
+        let t0 = SystemTime::now() - Duration::from_secs(600);
+        set_mtime(&main, t0);
+        set_mtime(&test_src, t0);
+        let dir = root.join(BLOOP_DIR);
+        let p = dir.join("sc_p.json");
+        let twin = dir.join("sc_p-test.json");
+        let twin_body = bloop_json(
+            "sc_p-test",
+            &root,
+            &[&main, &test_src],
+            &[("g", "a", "2.0.0", &[("", "/c/a-2.jar")])],
+        );
+        write(
+            &p,
+            &bloop_json(
+                "sc_p",
+                &root,
+                &[&main],
+                &[("g", "a", "1.0.0", &[("", "/c/a-1.jar")])],
+            ),
+        );
+        let reset = |body: &str| {
+            write(&twin, body);
+            set_mtime(&p, t0 + Duration::from_secs(100));
+            set_mtime(&twin, t0 + Duration::from_secs(90));
+        };
+
+        reset(&twin_body);
+        let e = discover(&root).unwrap();
+        assert_eq!(e.files.len(), 2);
+        assert_eq!(e.resolution.versions("g", "a"), ["1.0.0", "2.0.0"]);
+        assert_eq!(code(Some(&e), &root), "vendor_scala_cli_version_conflict");
+
+        let oversized = format!("{twin_body}{}", " ".repeat(MAX_FILE_BYTES as usize));
+        for (why, body) in [
+            ("truncated", &twin_body[..twin_body.len() / 2]),
+            ("not a Bloop project", "{\"version\":\"1.4.0\"}"),
+            ("oversized", oversized.as_str()),
+        ] {
+            reset(body);
+            let e = discover(&root);
+            assert_eq!(e, None, "a {why} -test twin is no evidence");
+            assert_eq!(
+                code(e.as_ref(), &root),
+                "vendor_scala_cli_resolution_missing",
+                "a {why} -test twin never lets the gate pass"
+            );
+        }
+        // The newest main project unreadable: no older project stands in.
+        reset(&twin_body);
+        write(&p, "{");
+        set_mtime(&p, t0 + Duration::from_secs(100));
+        assert_eq!(discover(&root), None);
     }
 
     #[cfg(unix)]

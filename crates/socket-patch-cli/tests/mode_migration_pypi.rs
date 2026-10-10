@@ -852,6 +852,67 @@ fn uv_remove_script_six(root: &Path) {
 /// `vendor --check` stayed red and its own `scan --prune` remedy looped.
 #[tokio::test]
 async fn script_lock_unwinds_after_uv_remove_script() {
+    assert_script_lock_unwinds(stage_script_lock, uv_remove_script_six).await;
+}
+
+/// A PEP 723 script whose six arrives only TRANSITIVELY (through
+/// python-dateutil), with its `.py.lock`; returns its wiring files.
+fn stage_transitive_script_lock(root: &Path) -> &'static [&'static str] {
+    std::fs::write(
+        root.join("job.py"),
+        "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"python-dateutil==2.8.2\"]\n# ///\nimport six\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("job.py.lock"),
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{{ name = \"python-dateutil\", specifier = \"==2.8.2\" }}]\n\n[[package]]\nname = \"python-dateutil\"\nversion = \"2.8.2\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\ndependencies = [{{ name = \"six\" }}]\nwheels = [{{ url = \"https://files.pythonhosted.org/python_dateutil-2.8.2-py2.py3-none-any.whl\", hash = \"sha256:{}\" }}]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\nwheels = [{{ url = \"https://files.pythonhosted.org/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{WHEEL_SHA}\" }}]\n",
+            "d".repeat(64)
+        ),
+    )
+    .unwrap();
+    &["job.py", "job.py.lock"]
+}
+
+/// What `uv remove --script job.py python-dateutil` leaves of the vendored
+/// [`stage_transitive_script_lock`] (checked against uv 0.11.19): the
+/// dependency and both lock units go, while the script's `[tool.uv]`
+/// override + source and the lock's `[manifest] overrides` socket-patch
+/// wrote stay, still naming the vendored wheel.
+fn uv_remove_script_parent(root: &Path) {
+    let script = std::fs::read_to_string(root.join("job.py")).unwrap();
+    std::fs::write(
+        root.join("job.py"),
+        script.replace("\"python-dateutil==2.8.2\"", ""),
+    )
+    .unwrap();
+    let lock = std::fs::read_to_string(root.join("job.py.lock")).unwrap();
+    let overrides = lock
+        .lines()
+        .find(|line| line.starts_with("overrides = "))
+        .expect("the vendored lock carries the override");
+    std::fs::write(
+        root.join("job.py.lock"),
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\n{overrides}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// #1287: the script lane of a vendored TRANSITIVE package whose parent
+/// `uv remove --script` dropped: every unwind retires the entry instead of
+/// drift-keeping it, and `vendor --check` turns green.
+#[tokio::test]
+async fn transitive_script_lock_unwinds_after_uv_remove_of_its_parent() {
+    assert_script_lock_unwinds(stage_transitive_script_lock, uv_remove_script_parent).await;
+}
+
+/// Vendor the script lock `stage` writes, apply `remove` (a `uv remove
+/// --script`), then every unwind must retire the entry (see
+/// [`script_lock_unwinds_after_uv_remove_script`]). Files the unwind
+/// restores must no longer name the vendored wheel.
+async fn assert_script_lock_unwinds(stage: StageFn, remove: fn(&Path)) {
     let server = MockServer::start().await;
     mount_hosted_api(&server, true).await;
     let uri = server.uri();
@@ -876,13 +937,16 @@ async fn script_lock_unwinds_after_uv_remove_script() {
         hosted_scan_args(&uri),
     ] {
         let (_tmp, root) = project();
-        let files = stage_script_lock(&root);
+        let files = stage(&root);
         vendor_project(&root, files);
-        uv_remove_script_six(&root);
+        remove(&root);
         let removed: Vec<String> = files
             .iter()
             .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
             .collect();
+        // What remains after the unwind: the user's own content, with any
+        // surviving socket-patch wiring gone.
+        let transitive = removed.iter().any(|text| text.contains(UUID));
         let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
         assert_eq!(code, 1, "{unwind:?}: the removal is flagged first: {env:#}");
 
@@ -915,11 +979,15 @@ async fn script_lock_unwinds_after_uv_remove_script() {
             std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap_or_default();
         assert!(!ledger.contains(UUID), "{unwind:?}: {ledger}");
         for (f, text) in files.iter().zip(&removed) {
-            assert_eq!(
-                &std::fs::read_to_string(root.join(f)).unwrap(),
-                text,
-                "{unwind:?}: {f} stays as uv left it"
-            );
+            let after = std::fs::read_to_string(root.join(f)).unwrap();
+            if transitive {
+                assert!(
+                    !after.contains(UUID) && !after.contains("override"),
+                    "{unwind:?}: {f} is unwired:\n{after}"
+                );
+            } else {
+                assert_eq!(&after, text, "{unwind:?}: {f} stays as uv left it");
+            }
         }
         // `vendor --revert` and `rollback` keep the manifest record, so
         // check then reports the patch as not vendored; the unwinds that
@@ -2181,4 +2249,228 @@ async fn pypi_unwinds_name_the_reinstall_a_plain_sync_skips() {
         !env.to_string().contains("pypi_reinstall_required"),
         "{env:#}"
     );
+}
+
+// ── #479: a Hatch-derived pylock.toml ────────────────────────────────────
+
+/// The pylock `hatch lock` writes for a locked environment (uv locker),
+/// pinning six from PyPI.
+const HATCH_PYLOCK: &str = "lock-version = \"1.0\"\ncreated-by = \"uv\"\nrequires-python = \">=3.9\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\nindex = \"https://pypi.org/simple\"\nsdist = { url = \"https://files.pythonhosted.org/packages/71/39/six-1.16.0.tar.gz\", upload-time = 2021-05-05T14:18:18Z, size = 34041, hashes = { sha256 = \"SDIST_SHA\" } }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl\", upload-time = 2021-05-05T14:18:17Z, size = 11053, hashes = { sha256 = \"WHEEL_SHA\" } }]\n";
+
+const HATCH_LOCKED_PYPROJECT: &str = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.hatch.envs.default]\nlocked = true\ninstaller = \"uv\"\n";
+
+/// #479: Hatch 1.17+ derives `pylock.toml` from pyproject for a locked
+/// environment and regenerates it on the next sync, so a scan that rewrote
+/// only the lock (success, no warning) never patched a Hatch environment.
+/// Hosted must wire pyproject too (with a warning to re-lock); vendored must route to the Hatch lane,
+/// whose uv-installer refusal applies, and write nothing.
+#[tokio::test]
+async fn hatch_locked_env_pylock_wires_pyproject() {
+    let pylock = HATCH_PYLOCK
+        .replace("SDIST_SHA", SDIST_SHA)
+        .replace("WHEEL_SHA", WHEEL_SHA);
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+
+    let (_tmp, root) = project();
+    std::fs::write(root.join("pyproject.toml"), HATCH_LOCKED_PYPROJECT).unwrap();
+    std::fs::write(root.join("pylock.toml"), &pylock).unwrap();
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "hosted: {env:#}");
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let pyproject = std::fs::read_to_string(root.join("pyproject.toml")).unwrap();
+    assert!(
+        pyproject.contains(&format!("six @ {hosted_url}")),
+        "pyproject is wired:\n{pyproject}"
+    );
+    let lock = std::fs::read_to_string(root.join("pylock.toml")).unwrap();
+    assert!(
+        lock.contains(&hosted_url),
+        "the lock stays consistent with pyproject until Hatch regenerates it:\n{lock}"
+    );
+    assert!(
+        env.to_string().contains("redirect_hatch_lock_regenerated"),
+        "{env:#}"
+    );
+    let (_tmp, root) = project();
+    std::fs::write(root.join("pyproject.toml"), HATCH_LOCKED_PYPROJECT).unwrap();
+    std::fs::write(root.join("pylock.toml"), &pylock).unwrap();
+    stage_manifest(&root);
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_ne!(code, 0, "vendored: {env:#}");
+    assert!(env.to_string().contains("pip installer"), "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("pyproject.toml")).unwrap(),
+        HATCH_LOCKED_PYPROJECT
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pylock.toml")).unwrap(),
+        pylock
+    );
+}
+
+// ── #604: PEP 440-equivalent lock-only pins ──────────────────────────────
+
+/// #604: on a fresh checkout (no venv), `six==1.16` (or `==1.16.0.0`,
+/// `==01.16.0`) is the release the patch API keys as `six@1.16.0`. Hosted
+/// mode must find the patch and rewrite the pin, as it does when a venv
+/// holds six 1.16.0, and report the package as not installed.
+#[tokio::test]
+async fn lock_only_pep440_equivalent_pin_is_patched() {
+    use wiremock::matchers::body_string_contains;
+    for pin in ["1.16", "1.16.0.0", "01.16.0"] {
+        let server = MockServer::start().await;
+        // The API matches purls exactly: only `@1.16.0` has the patch.
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .and(body_string_contains(PURL))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [{ "purl": PURL, "patches": [{
+                    "uuid": UUID, "purl": PURL, "tier": "free", "cveIds": [], "ghsaIds": [],
+                    "severity": "high", "title": "pep440 fixture"
+                }]}],
+                "canAccessPaidPatches": false,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [], "canAccessPaidPatches": false,
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let hosted_url = mount_hosted_api(&server, true).await;
+        let (_tmp, root) = project();
+        std::fs::write(
+            root.join("requirements.txt"),
+            format!("idna==3.7\nsix=={pin}\n"),
+        )
+        .unwrap();
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "{pin}: {env:#}");
+        assert_eq!(env["redirect"]["redirected"], 1, "{pin}: {env:#}");
+        assert_eq!(env["packages"][0]["purl"], PURL, "{pin}: {env:#}");
+        assert_eq!(env["packages"][0]["notInstalled"], true, "{pin}: {env:#}");
+        let requirements = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        assert!(
+            requirements.contains(&format!("six @ {hosted_url}")),
+            "{pin}: the pin is rewritten:\n{requirements}"
+        );
+    }
+}
+
+// ── #1138: a uv workspace member ─────────────────────────────────────────
+
+/// A uv workspace (root `pyproject.toml` with `[tool.uv.workspace]` and its
+/// `uv.lock`) whose member `packages/a` carries `member`'s Hatch
+/// configuration; `six` 1.16.0 is installed in the run's venv. Returns the
+/// member directory.
+fn stage_uv_workspace_member(ws: &Path, member: &[(&str, &str)]) -> std::path::PathBuf {
+    std::fs::write(
+        ws.join("pyproject.toml"),
+        "[project]\nname = \"root\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"a\"]\n\n[tool.uv.workspace]\nmembers = [\"packages/*\"]\n\n[tool.uv.sources]\na = { workspace = true }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ws.join("uv.lock"),
+        "version = 1\nrequires-python = \">=3.9\"\n\n[manifest]\nmembers = [\"a\", \"root\"]\n",
+    )
+    .unwrap();
+    let dir = ws.join("packages/a");
+    for (rel, text) in member {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    // The venv `run_raw` points at (beside the member) holds six 1.16.0.
+    let site = dir.join("../empty-venv").join(if cfg!(windows) {
+        "Lib/site-packages"
+    } else {
+        "lib/python3.11/site-packages"
+    });
+    let dist_info = site.join("six-1.16.0.dist-info");
+    std::fs::create_dir_all(&dist_info).unwrap();
+    std::fs::write(
+        dist_info.join("METADATA"),
+        "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+    )
+    .unwrap();
+    std::fs::write(site.join("six.py"), ORIG).unwrap();
+    dir
+}
+
+/// Every file under `root` outside `.socket/` and the test venv (relative
+/// path → bytes).
+fn tree(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if path
+                .components()
+                .any(|c| c.as_os_str() == ".socket" || c.as_os_str() == "empty-venv")
+            {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.insert(rel, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// #1138: a scan from a uv workspace member whose own files are Hatch-shaped
+/// (the hatchling backend `uv init --package` scaffolds before uv 0.8, or a
+/// `hatch.toml`) used to rewrite the member as a lockless Hatch project in
+/// both modes, exit 0 `success`, while the root `uv.lock` went stale and
+/// `uv sync --frozen` installed the unpatched release. Both modes must fail
+/// closed, name the workspace root and write nothing.
+#[tokio::test]
+async fn uv_workspace_hatch_member_is_refused_in_both_modes() {
+    const HATCHLING: &str = "[project]\nname = \"a\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n";
+    const PLAIN: &str = "[project]\nname = \"a\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n";
+    for member in [
+        &[("pyproject.toml", HATCHLING)][..],
+        &[
+            ("pyproject.toml", PLAIN),
+            ("hatch.toml", "[envs.default]\n"),
+        ][..],
+    ] {
+        let (_tmp, ws) = project();
+        let dir = stage_uv_workspace_member(&ws, member);
+        let before = tree(&ws);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&dir, &server);
+        assert_eq!(code, 1, "hosted: {env:#}");
+        assert_eq!(
+            env["error"]["code"], "redirect_workspace_lockfile_elsewhere",
+            "hosted: {env:#}"
+        );
+        let message = env["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("uv workspace"), "{message}");
+        assert_eq!(tree(&ws), before, "hosted wrote nothing");
+
+        stage_manifest(&dir);
+        let (code, env) = run_cli(&dir, &["vendor"], &[]);
+        assert_ne!(code, 0, "vendored: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_uv_workspace_unsupported"),
+            "vendored: {env:#}"
+        );
+        assert_eq!(tree(&ws), before, "vendored wrote nothing");
+    }
 }

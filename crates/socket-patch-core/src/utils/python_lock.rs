@@ -886,6 +886,37 @@ fn plan_python_lock_rewrite(
     if pep751 && (package.contains_key("vcs") || package.contains_key("directory")) {
         return Ok(None);
     }
+    // An entry resolved from a direct URL (uv.lock `source = { url }`, a
+    // pylock `archive = { url }`) is the user's own source choice unless it
+    // is socket-patch's earlier hosted artifact for this release (#767).
+    let direct_url = if pep751 {
+        package
+            .get("archive")
+            .and_then(Item::as_table_like)
+            .and_then(|archive| archive.get("url"))
+            .and_then(Item::as_str)
+    } else {
+        // Both spellings: `source = { url = … }` and uv 0.2's string
+        // `source = "direct+…"`.
+        UvSource::of(package).and_then(UvSource::url)
+    };
+    if let Some(url) = direct_url {
+        let ours = match artifact {
+            ArtifactSource::Url(location) => {
+                url == location
+                    || crate::utils::python_script::same_hosted_artifact(
+                        url, location, &name, version,
+                    )
+            }
+            ArtifactSource::Path(_) => false,
+        };
+        if !ours {
+            return Err(format!(
+                "the lock resolves {name}=={version} from the direct reference {url}; refusing \
+                 to overwrite a user-authored source"
+            ));
+        }
+    }
     let location = artifact.location();
     let filename = location
         .split(['?', '#'])
@@ -1219,6 +1250,49 @@ version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [{ url = "https://pypi.org/urllib3-2.0.0-py3-none-any.whl", hash = "sha256:other" }]
 "#;
+
+    /// #767: a lock entry resolved from the user's own direct URL (uv.lock
+    /// `source = { url }`, pylock `archive = { url }`) is refused in both
+    /// modes; the hosted rewrite's own earlier artifact is still replaced.
+    #[test]
+    fn user_direct_url_entries_are_refused() {
+        const USER: &str =
+            "https://files.pythonhosted.org/packages/d9/urllib3-1.26.18-py2.py3-none-any.whl";
+        let uv_lock = format!(
+            "version = 1\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"urllib3\"\n\
+             version = \"1.26.18\"\nsource = {{ url = \"{USER}\" }}\n\
+             wheels = [{{ url = \"{USER}\", hash = \"sha256:aa\" }}]\n"
+        );
+        let pylock = format!(
+            "lock-version = \"1.0\"\ncreated-by = \"uv\"\n\n[[packages]]\nname = \"urllib3\"\n\
+             version = \"1.26.18\"\narchive = {{ url = \"{USER}\", hashes = {{ sha256 = \"aa\" }} }}\n"
+        );
+        let legacy = format!(
+            "version = 1\nrequires-python = \">=3.9\"\n\n[[distribution]]\nname = \"urllib3\"\n\
+             version = \"1.26.18\"\nsource = \"direct+{USER}\"\n\
+             sdist = {{ url = \"{USER}\", hash = \"sha256:aa\" }}\n"
+        );
+        for lock in [&uv_lock, &pylock, &legacy] {
+            for artifact in [
+                ArtifactSource::Url(URL),
+                ArtifactSource::Path(".socket/vendor/pypi/u/urllib3-1.26.18-py2.py3-none-any.whl"),
+            ] {
+                let err =
+                    rewrite_python_lock(lock, "urllib3", "1.26.18", artifact, SHA256).unwrap_err();
+                assert!(err.contains("user-authored source"), "{err}");
+            }
+            // The hosted rewrite's own artifact (a re-scan) is not the user's.
+            let ours = lock.replace(USER, URL);
+            assert!(rewrite_python_lock(
+                &ours,
+                "urllib3",
+                "1.26.18",
+                ArtifactSource::Url(URL),
+                SHA256
+            )
+            .is_ok());
+        }
+    }
 
     #[test]
     fn hosted_native_uses_direct_source_and_keeps_other_versions() {

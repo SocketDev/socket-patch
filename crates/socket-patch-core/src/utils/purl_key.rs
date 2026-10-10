@@ -173,6 +173,43 @@ fn composer_identity(canonical: &str) -> Option<String> {
     ))
 }
 
+/// `pkg:pypi/<name>@<v>` purls for every other spelling of `purl`'s pure
+/// release (`@1.16` → `@1.16.0`, see
+/// [`crate::utils::pep440::equivalent_release_spellings`]): the lockfile
+/// spells a pin as the user wrote it (`six==1.16`), while the patch API
+/// keys the release as the registry published it (#604). Empty for any
+/// other purl.
+pub fn pypi_equivalent_purls(purl: &str) -> Vec<String> {
+    let canonical = canonical_base_purl(purl);
+    let Some((name, version)) = canonical
+        .strip_prefix("pkg:pypi/")
+        .and_then(|rest| rest.rsplit_once('@'))
+    else {
+        return Vec::new();
+    };
+    crate::utils::pep440::equivalent_release_spellings(version)
+        .into_iter()
+        .map(|spelling| format!("pkg:pypi/{name}@{spelling}"))
+        .collect()
+}
+
+/// Whether two PyPI purls name the same release under PEP 440 equality
+/// (`@1.16` and `@1.16.0`), the way pip resolves an `==` pin. `false` for
+/// anything that is not two PyPI purls of one (PEP 503) name.
+pub fn pypi_same_release(a: &str, b: &str) -> bool {
+    let (a, b) = (canonical_base_purl(a), canonical_base_purl(b));
+    let split = |purl: &str| -> Option<(String, String)> {
+        let (name, version) = purl.strip_prefix("pkg:pypi/")?.rsplit_once('@')?;
+        Some((name.to_string(), version.to_string()))
+    };
+    match (split(&a), split(&b)) {
+        (Some((name_a, version_a)), Some((name_b, version_b))) => {
+            name_a == name_b && crate::utils::pep440::versions_equal(&version_a, &version_b)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 #[path = "purl_key_nuget_vendor_tests.rs"]
 mod nuget_vendor_tests;
