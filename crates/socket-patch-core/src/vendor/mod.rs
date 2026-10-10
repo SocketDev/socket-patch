@@ -225,11 +225,14 @@ pub fn yarn_classic_workspace_member_risk(project_root: &Path) -> Option<VendorW
         return None;
     }
     let manifest = read_regular_to_string_sync(&project_root.join("package.json")).ok()?;
-    let manifest: serde_json::Value = serde_json::from_str(crate::formats::text::strip_bom(&manifest)).ok()?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(crate::formats::text::strip_bom(&manifest)).ok()?;
     let workspaces = manifest.get("workspaces")?;
-    let globs = workspaces
-        .as_array()
-        .or_else(|| workspaces.get("packages").and_then(serde_json::Value::as_array))?;
+    let globs = workspaces.as_array().or_else(|| {
+        workspaces
+            .get("packages")
+            .and_then(serde_json::Value::as_array)
+    })?;
     if globs.is_empty() {
         return None;
     }
@@ -2126,7 +2129,10 @@ mod berry_migration_risk_tests {
         for (lock, pkg) in [
             (Some(WIRED_V1), Some(r#"{"name":"x"}"#)),
             (Some(WIRED_V1), Some(r#"{"name":"x","workspaces":[]}"#)),
-            (Some(WIRED_V1), Some(r#"{"name":"x","workspaces":{"packages":[]}}"#)),
+            (
+                Some(WIRED_V1),
+                Some(r#"{"name":"x","workspaces":{"packages":[]}}"#),
+            ),
             (Some(WIRED_V1), None),
             (Some(UNWIRED_V1), Some(r#"{"name":"x","workspaces":["a"]}"#)),
             (None, Some(r#"{"name":"x","workspaces":["a"]}"#)),

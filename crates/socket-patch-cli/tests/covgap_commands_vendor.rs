@@ -1194,14 +1194,6 @@ async fn vendor_state_write_failure_reports_failed_event() {
     );
 }
 
-/// #627: a symlinked lockfile (a lock shared with another checkout) is
-/// refused like hosted mode refuses it — `redirect_symlinked_file_unsupported`,
-/// exit 1 — instead of being renamed over: the link survives, its target
-/// keeps the pre-run bytes, and no ledger names wiring that was never
-/// written. A dry run predicts it with a `vendor_would_refuse_symlinked_file`
-/// advisory. Covers npm's `package-lock.json` and yarn classic's `yarn.lock`
-/// (the issue's report), both written through the shared group commit.
-#[cfg(unix)]
 /// #691: yarn 1 resolves the vendored `file:./.socket/vendor/…` tarball
 /// against the directory it runs in, so in a workspaces project every
 /// cold-cache install run from a member directory fails once vendoring
@@ -1248,6 +1240,14 @@ fn yarn_classic_workspaces_vendor_warns_about_member_dir_installs() {
     }
 }
 
+/// #627: a symlinked lockfile (a lock shared with another checkout) is
+/// refused like hosted mode refuses it — `redirect_symlinked_file_unsupported`,
+/// exit 1 — instead of being renamed over: the link survives, its target
+/// keeps the pre-run bytes, and no ledger names wiring that was never
+/// written. A dry run predicts it with a `vendor_would_refuse_symlinked_file`
+/// advisory. Covers npm's `package-lock.json` and yarn classic's `yarn.lock`
+/// (the issue's report), both written through the shared group commit.
+#[cfg(unix)]
 #[tokio::test]
 async fn vendor_refuses_a_symlinked_lock_instead_of_replacing_it() {
     let yarn_lock = format!(
