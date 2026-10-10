@@ -561,7 +561,9 @@ own coordinates spell their path); then every **Ivy** cache (`-Dsbt.ivy.home=<h>
 `<h>/cache`, then `~/.ivy2/cache`, whose package directory is the module's `jars/` / `bundles/` / `orbits/`).
 Every existing location is kept (an empty value counts as unset; a relative one resolves against the
 project); an Ivy home whose path does not end in `<…ivy…>/cache` is skipped. The crawl is **not scoped** to
-the build: as for `~/.m2`, every cached GAV is queried and patched. `--global-prefix` names exactly one
+the build: every cached GAV is queried and patched (a pure Maven build's `~/.m2` crawl is
+scoped to the coordinates its poms reach; see `docs/ecosystems.md`, "A Maven project's scan is
+scoped to its dependency graph"). `--global-prefix` names exactly one
 root, its layout read from its path. Patch keys are whole files in the package directory (`<a>-<v>.jar`),
 the same parity as `~/.m2`. A GAV cached in several roots (say `~/.m2`, a Coursier cache and an Ivy cache)
 is patched and restored in **every** root, one summary event per copy, since the build loads whichever its

@@ -702,6 +702,20 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
   *mismatch* fails.
+* **A Maven project's scan is scoped to its dependency graph.** The Maven local
+  repository is shared by every project on the machine, so in project mode (no
+  `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or
+  sbt / Mill / scala-cli build beside it) keeps only the coordinates its poms reach:
+  every reactor declaration (modules and profiles included, any scope), then each
+  artifact's own non-optional `compile` / `runtime` dependencies, read from the poms the
+  repository already holds, with versions from properties, parents, management and
+  imported BOMs (the reactor's management applies to transitives, as in Maven). A
+  version that cannot be determined (an undefined property, a range, a pom not in the
+  repository) admits every cached version of that artifact. Artifacts another project
+  cached are not scanned, so hosted mode never pins them and `vex` never attests them.
+  A project that has never been resolved therefore finds nothing; resolve it once
+  (`mvn -q dependency:resolve`) and scan again. An unreadable root `pom.xml` leaves the
+  crawl unscoped.
 * **Local-repository discovery reads coordinates from the path.** `scan` (and every
   other crawl of `~/.m2/repository`) takes a POM's groupId / artifactId / version from
   its directory when the file sits at the canonical
