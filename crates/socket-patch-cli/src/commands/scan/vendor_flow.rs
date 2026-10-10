@@ -266,7 +266,8 @@ pub(crate) async fn preview_vendor(
 /// (its per-package advisories are uncounted `skipped` events, as in
 /// `vendor`), its warnings and sidecars join the outer ones, and a failed
 /// or partially failed engine run marks the outer run `partialFailure`.
-/// The engine's own top-level error (if any) is the caller's to report.
+/// The engine's own top-level error (if any) becomes the outer run's
+/// `error` (a caller that aborts with its own error overrides it).
 pub(crate) fn merge_vendor_envelope(env: &mut Envelope, venv: Envelope) {
     let (to, from) = (&mut env.summary, &venv.summary);
     to.discovered += from.discovered;
@@ -286,7 +287,15 @@ pub(crate) fn merge_vendor_envelope(env: &mut Envelope, venv: Envelope) {
     );
     env.warnings.extend(venv.warnings);
     env.sidecars.extend(venv.sidecars);
-    if venv.summary.failed > 0 || matches!(venv.status, Status::PartialFailure | Status::Error) {
+    // A hard engine error (an unreadable vendor ledger, a refused group
+    // commit, `vendor_commit_failed`) keeps its `{code, message}`: the
+    // engine returns `Ok` with the error marked, so dropping it here would
+    // leave a bare `partialFailure` with no code.
+    if let Some(error) = venv.error {
+        env.mark_error(error);
+    } else if venv.summary.failed > 0
+        || matches!(venv.status, Status::PartialFailure | Status::Error)
+    {
         env.mark_partial_failure();
     }
 }
@@ -1810,5 +1819,39 @@ mod ui_format_tests {
             "Error (lock_held): Another socket-patch process is operating in this directory.\n  \
              Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock."
         );
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_vendor_envelope;
+    use crate::json_envelope::{Command, Envelope, EnvelopeError, Status};
+
+    /// The engine marks a hard error (e.g. `vendor_state_unreadable`) and
+    /// still returns `Ok`: the merged scan envelope must carry that
+    /// `{code, message}`, not a bare `partialFailure`.
+    #[test]
+    fn merge_carries_the_engine_error() {
+        let mut env = Envelope::new(Command::Scan);
+        let mut venv = Envelope::new(Command::Vendor);
+        venv.mark_error(EnvelopeError::new(
+            "vendor_state_unreadable",
+            "cannot read .socket/vendor/state.json",
+        ));
+        merge_vendor_envelope(&mut env, venv);
+        assert_eq!(env.status, Status::Error);
+        let error = env.error.expect("the engine error is carried");
+        assert_eq!(error.code, "vendor_state_unreadable");
+    }
+
+    /// A partially failed engine run without an error stays partialFailure.
+    #[test]
+    fn merge_without_error_marks_partial_failure() {
+        let mut env = Envelope::new(Command::Scan);
+        let mut venv = Envelope::new(Command::Vendor);
+        venv.mark_partial_failure();
+        merge_vendor_envelope(&mut env, venv);
+        assert_eq!(env.status, Status::PartialFailure);
+        assert!(env.error.is_none());
     }
 }
