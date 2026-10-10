@@ -2146,28 +2146,22 @@ mod tests {
             tier: "free".into(),
         };
         let entry = |uuid: &str, detached: bool| VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: "pkg:npm/insync@1.0.0".into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/npm/{uuid}/insync-1.0.0.tgz"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             detached,
             record: Some(record.clone()),
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                "pkg:npm/insync@1.0.0".into(),
+                uuid.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/npm/{uuid}/insync-1.0.0.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         };
 
         // In sync: judged from the record, zero fetches, nothing cached.
@@ -2299,20 +2293,6 @@ mod tests {
         let ledger = HashMap::from([(
             "pkg:npm/embedded@1.0.0".to_string(),
             VendorEntry {
-                ecosystem: "npm".into(),
-                base_purl: "pkg:npm/embedded@1.0.0".into(),
-                uuid: "u-embedded".into(),
-                artifact: VendorArtifact {
-                    yarn_berry10c0: None,
-                    path: ".socket/vendor/npm/u-embedded/embedded-1.0.0.tgz".into(),
-                    sha256: String::new(),
-                    size: None,
-                    platform_locked: None,
-                    file_inventory: None,
-                },
-                wiring: Vec::new(),
-                lock: None,
-                took_over_go_patches: false,
                 detached: true,
                 record: Some(PatchRecord {
                     uuid: "u-embedded".into(),
@@ -2329,12 +2309,20 @@ mod tests {
                     license: "MIT".into(),
                     tier: "free".into(),
                 }),
-                flavor: None,
-                uv: None,
-                pnpm: None,
-                poetry: None,
-                pdm: None,
-                pipenv: None,
+                ..VendorEntry::new(
+                    "npm".into(),
+                    "pkg:npm/embedded@1.0.0".into(),
+                    "u-embedded".into(),
+                    VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: ".socket/vendor/npm/u-embedded/embedded-1.0.0.tgz".into(),
+                        sha256: String::new(),
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    Vec::new(),
+                )
             },
         )]);
 

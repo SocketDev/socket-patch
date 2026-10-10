@@ -7,10 +7,39 @@
 //! dist reference to the patch uuid; a hosted redirect keeps it and drops
 //! the entry's `source`, so an entry that had no `source` changes nothing
 //! Composer compares. Composer 1 never reinstalls a changed package. In both
-//! cases `vendor/<vendor>/<name>` must be removed first.
+//! cases `<vendor-dir>/<vendor>/<name>` must be removed first, where
+//! `<vendor-dir>` is the directory Composer installs into
+//! (`COMPOSER_VENDOR_DIR`, else `config.vendor-dir`, else `vendor`): a hint
+//! naming `vendor/` in a project that relocated it sends the user to delete
+//! a path that does not exist, and `composer install` then leaves the
+//! package unpatched (#658).
+
+use std::path::Path;
 
 use serde_json::{Map, Value};
 use socket_patch_core::patch::redirect::FileEdit;
+
+/// The project's Composer vendor directory as the hints print it: relative
+/// to `cwd` with `/` separators when it lies inside the project (`vendor`,
+/// `lib`, `deps/php`), else the absolute path `COMPOSER_VENDOR_DIR` named.
+/// A `config.vendor-dir` the crawler refuses (absolute, or climbing out of
+/// the project) prints as the `<vendor-dir>` placeholder rather than a
+/// directory that would be wrong.
+pub(crate) fn vendor_dir_label(cwd: &Path) -> String {
+    let Some(dir) =
+        socket_patch_core::crawlers::composer_crawler::resolve_local_vendor_dir_sync(cwd)
+    else {
+        return "<vendor-dir>".to_string();
+    };
+    match dir.strip_prefix(cwd) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        _ => dir.display().to_string(),
+    }
+}
 
 const VENDOR_PREFIX: &str = ".socket/vendor/composer/";
 
@@ -45,15 +74,21 @@ pub(crate) fn vendored_composer_packages(lock_text: &str) -> Vec<String> {
 
 /// The lines to print after a vendored run that left `packages` wired, or
 /// nothing when none are.
-pub(crate) fn vendored_reinstall_hints(packages: &[String]) -> Vec<String> {
+/// `vendor_dir` is the [`vendor_dir_label`] the package dirs are under.
+pub(crate) fn vendored_reinstall_hints(packages: &[String], vendor_dir: &str) -> Vec<String> {
     if packages.is_empty() {
         return Vec::new();
     }
-    let dirs: Vec<String> = packages.iter().map(|p| format!("vendor/{p}")).collect();
+    let dirs: Vec<String> = packages
+        .iter()
+        .map(|p| format!("{vendor_dir}/{p}"))
+        .collect();
     vec![
-        "Run `composer install` to update vendor/ — vendoring rewires composer.lock only, so \
-         the installed vendor/ tree keeps the unpatched bytes until Composer reinstalls it."
-            .to_string(),
+        format!(
+            "Run `composer install` to update {vendor_dir}/ — vendoring rewires composer.lock \
+             only, so the installed {vendor_dir}/ tree keeps the unpatched bytes until Composer \
+             reinstalls it."
+        ),
         format!(
             "Composer 1 does not reinstall a locked package whose dist changed: remove {} \
              first, then run `composer install`.",
@@ -65,8 +100,13 @@ pub(crate) fn vendored_reinstall_hints(packages: &[String]) -> Vec<String> {
 /// The reinstall example for a hosted run's next steps when it rewrote
 /// `composer.lock`. `edits` are the run's rewrite edits: a redirected entry
 /// whose edit removed no `source` must have its vendor dir removed on every
-/// Composer version.
-pub(crate) fn hosted_reinstall_hint(files: &[String], edits: &[FileEdit]) -> Option<String> {
+/// Composer version. `vendor_dir` is the [`vendor_dir_label`] the package
+/// dirs are under.
+pub(crate) fn hosted_reinstall_hint(
+    files: &[String],
+    edits: &[FileEdit],
+    vendor_dir: &str,
+) -> Option<String> {
     if !files.iter().any(|f| f == "composer.lock") {
         return None;
     }
@@ -74,21 +114,20 @@ pub(crate) fn hosted_reinstall_hint(files: &[String], edits: &[FileEdit]) -> Opt
         .iter()
         .filter(|e| e.path == "composer.lock" && e.kind == "redirect_composer_dist")
         .filter(|e| !removes_source(e))
-        .filter_map(|e| Some(format!("vendor/{}", e.key.as_deref()?.to_lowercase())))
+        .filter_map(|e| Some(format!("{vendor_dir}/{}", e.key.as_deref()?.to_lowercase())))
         .collect();
     unchanged.sort_unstable();
     unchanged.dedup();
     if unchanged.is_empty() {
-        return Some(
+        return Some(format!(
             " (e.g. `composer install`; on Composer 1 first remove the patched packages' \
-             vendor/<vendor>/<name> directories)"
-                .to_string(),
-        );
+             {vendor_dir}/<vendor>/<name> directories)"
+        ));
     }
     Some(format!(
         " (e.g. `composer install`; first remove {} — Composer does not reinstall a package \
          whose lock entry has no `source` when only its dist url changes — and on Composer 1 \
-         every other patched package's vendor/<vendor>/<name> directory)",
+         every other patched package's {vendor_dir}/<vendor>/<name> directory)",
         unchanged.join(", ")
     ))
 }
@@ -146,8 +185,8 @@ mod tests {
 
     #[test]
     fn vendored_hints_name_every_package_dir() {
-        assert!(vendored_reinstall_hints(&[]).is_empty());
-        let hints = vendored_reinstall_hints(&["a/b".to_string(), "c/d".to_string()]);
+        assert!(vendored_reinstall_hints(&[], "vendor").is_empty());
+        let hints = vendored_reinstall_hints(&["a/b".to_string(), "c/d".to_string()], "vendor");
         assert_eq!(hints.len(), 2);
         assert!(
             hints[0].starts_with("Run `composer install`"),
@@ -163,8 +202,8 @@ mod tests {
 
     #[test]
     fn hosted_hint_needs_a_rewritten_composer_lock() {
-        assert!(hosted_reinstall_hint(&["package-lock.json".to_string()], &[]).is_none());
-        let hint = hosted_reinstall_hint(&["composer.lock".to_string()], &[]).unwrap();
+        assert!(hosted_reinstall_hint(&["package-lock.json".to_string()], &[], "vendor").is_none());
+        let hint = hosted_reinstall_hint(&["composer.lock".to_string()], &[], "vendor").unwrap();
         assert!(hint.contains("composer install") && hint.contains("Composer 1"));
     }
 
@@ -200,14 +239,70 @@ mod tests {
             &format!(r#"{NEW_DIST}, "extra": {{"source": {{}}}}"#),
         );
         for edits in [vec![with_source.clone()], vec![source_after_extra]] {
-            let hint = hosted_reinstall_hint(&files, &edits).unwrap();
+            let hint = hosted_reinstall_hint(&files, &edits, "vendor").unwrap();
             assert!(hint.contains("on Composer 1 first remove"), "{hint}");
         }
 
         let dist_only = dist_edit("Acme/Lib", OLD_DIST, NEW_DIST);
-        let hint = hosted_reinstall_hint(&files, &[with_source, dist_only]).unwrap();
+        let hint =
+            hosted_reinstall_hint(&files, &[with_source.clone(), dist_only.clone()], "vendor")
+                .unwrap();
         assert!(hint.contains("first remove vendor/acme/lib —"), "{hint}");
         assert!(!hint.contains("vendor/psr/log"), "{hint}");
         assert!(hint.contains("on Composer 1"), "{hint}");
+
+        // A relocated vendor dir is the one named (#658).
+        let hint = hosted_reinstall_hint(&files, &[with_source, dist_only], "lib").unwrap();
+        assert!(hint.contains("first remove lib/acme/lib —"), "{hint}");
+        assert!(
+            hint.contains("patched package's lib/<vendor>/<name>"),
+            "{hint}"
+        );
+        assert!(!hint.contains("vendor/"), "{hint}");
+        let hint = hosted_reinstall_hint(&files, &[], "lib").unwrap();
+        assert!(
+            hint.contains("remove the patched packages' lib/<vendor>/<name>"),
+            "{hint}"
+        );
+    }
+
+    /// #658: with `config.vendor-dir: lib` the vendored hints name
+    /// `lib/<vendor>/<name>`, the directory Composer installed into.
+    #[test]
+    fn vendored_hints_name_a_relocated_vendor_dir() {
+        let hints = vendored_reinstall_hints(&["acme/tool".to_string()], "lib");
+        assert!(hints[0].contains("update lib/"), "{}", hints[0]);
+        assert!(
+            hints[1].contains("remove lib/acme/tool first"),
+            "{}",
+            hints[1]
+        );
+        assert!(!hints.join("\n").contains("vendor/"), "{hints:?}");
+    }
+
+    /// The label follows Composer's own resolution: `config.vendor-dir`
+    /// (normalized, `/`-separated) else `vendor`; a refused value prints a
+    /// placeholder instead of a wrong path. `COMPOSER_VENDOR_DIR` is left
+    /// unset by the test environment, as everywhere in this crate.
+    #[test]
+    fn vendor_dir_label_follows_config_vendor_dir() {
+        let label = |json: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(json) = json {
+                std::fs::write(dir.path().join("composer.json"), json).unwrap();
+            }
+            vendor_dir_label(dir.path())
+        };
+        assert_eq!(label(None), "vendor");
+        assert_eq!(label(Some("{}")), "vendor");
+        assert_eq!(label(Some(r#"{"config":{"vendor-dir":"lib"}}"#)), "lib");
+        assert_eq!(
+            label(Some(r#"{"config":{"vendor-dir":"./deps\\php/"}}"#)),
+            "deps/php"
+        );
+        assert_eq!(
+            label(Some(r#"{"config":{"vendor-dir":"../outside"}}"#)),
+            "<vendor-dir>"
+        );
     }
 }

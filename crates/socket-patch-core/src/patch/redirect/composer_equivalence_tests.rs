@@ -96,6 +96,13 @@ fn entry(i: usize, rng: &mut Rng) -> String {
             fields.push(dist_block(i, rng));
         }
     }
+    // Origin-bound download options, which the rewrite drops with `source`
+    // (chosen by index, not the rng, so every other case keeps its input).
+    if i % 11 == 5 {
+        fields.push(format!(
+            "\"transport-options\": {{\n{I}    \"http\": {{ \"header\": [\"Authorization: Bearer t{i}\"] }}\n{I}}}"
+        ));
+    }
     if rng.chance(40) {
         fields.push(format!(
             "\"authors\": [\n{I}    {{\n{I}        \"name\": \"{}\",\n{I}        \"email\": \"a@b.c\"\n{I}    }}\n{I}]",
@@ -249,6 +256,7 @@ fn in_place_composer_rewrite_matches_golden() {
         "redirect_composer_no_dist",
         "redirect_composer_no_dist_url",
         "redirect_composer_dist_mirrors_removed",
+        "redirect_composer_transport_options_removed",
     ] {
         assert!(codes.contains(code), "no case reached {code}: {codes:?}");
     }

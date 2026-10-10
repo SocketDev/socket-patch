@@ -19,7 +19,7 @@
 //!    `proj/proj/.socket/manifest.json`, hit the no-manifest clean no-op,
 //!    and report success (`applied: 1`, exit 0) without patching anything.
 //!
-//! 3. `run_nested_apply` threaded cwd/global/silent/download-mode/strict
+//! 3. `run_nested_apply` threaded cwd/global/silent/strict
 //!    and the four API flags into the nested `ApplyArgs` but left
 //!    `ecosystems` at `GlobalArgs::default()` (`None`), so a download
 //!    scoped with `--ecosystems <x>` (`scan --ecosystems gem --sync`, or
@@ -94,7 +94,6 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
             api_url: Some(api_url),
             json: true,
             no_telemetry: true,
-            download_mode: "diff".to_string(),
             ..GlobalArgs::default()
         },
         identifier: identifier.to_string(),

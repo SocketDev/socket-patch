@@ -7,8 +7,15 @@ flags, response fields, and diagnostic codes live in the
 
 ## Select patches
 
-A bare `scan` applies hosted patches without prompting. Use `--dry-run` to inspect
-what it would change, and `--json` for a machine-readable result:
+A bare `scan` discovers patches from project dependency files and applies them
+without prompting, in the mode the project already uses: hosted (writing hosted
+references) for a new project, vendored or agent if `.socket/` already holds
+patches in that mode. Pass `--mode` to choose or switch modes. Supported lockfiles
+work from a fresh checkout before installing dependencies. Agent mode needs
+installed packages, and some ecosystems need resolution records first (see
+[sbt and scala-cli](#sbt-and-scala-cli) and the [ecosystem notes](ecosystems.md)).
+Use `--dry-run` to inspect what would change, and `--json` for a machine-readable
+result:
 
 ```sh
 socket-patch scan --dry-run --json
@@ -36,9 +43,12 @@ Replace the example identifiers with the advisory or package you need. `get` als
 accepts a patch UUID or an exact package name, which covers every installed version
 of that package. `remove` and `rollback` take the same names. A short name that
 names several packages (`core` for `@angular/core` and `@babel/core`) is refused:
-use the full name or a purl. `get` defaults to hosted mode; `--save-only` and
-global targeting default to agent mode instead. Hosted and vendored `get` do not
-prompt. Agent-mode searches can offer an interactive choice.
+use the full name or a purl. Near names are only suggestions, and `--ecosystems`
+scopes both `get` searches and UUID selection. See the
+[v5 targeting changes](migrating-to-v5.md#package-targeting) for target forms,
+ambiguity rules, and no-match statuses. `get` defaults to hosted mode; `--save-only`
+and global targeting default to agent mode instead. Hosted and vendored `get` do
+not prompt. Agent-mode searches can offer an interactive choice.
 
 For each package version, automatic selection prefers the highest severity among
 downloadable patches, then the most distinct advisories fixed, then the newest
@@ -101,8 +111,8 @@ owns archive construction, including Yarn Berry cache checksums. Python
 vendoring accepts both wheels and source distributions supplied by the service.
 
 `--vendor-source service` is the default. `auto` remains an alias for the same
-behavior; `build` is rejected. A missing artifact, pending build, network error,
-or integrity mismatch fails without a local build fallback. Healthy committed
+behavior; `build` is rejected. Missing or pending service artifacts, network errors,
+and integrity mismatches do not trigger a local build fallback. Healthy committed
 artifacts can be reused offline.
 
 `repair` redownloads missing or corrupt artifacts and checks them against the
@@ -221,10 +231,10 @@ The removed `setup` command is covered in the [migration guide](migrating-to-v5.
 | Command | Effect |
 | --- | --- |
 | `list` | Show agent records, vendor records, and hosted pins; an empty project succeeds |
-| `rollback [PURL\|UUID\|PATH]...` | Restore selected patches, or all patches when no target is given, and remove their local state |
-| `remove <PURL\|UUID>` | Restore and remove one patch |
+| `rollback [NAME\|PURL\|UUID\|PATH]...` | Restore selected patches, or all patches when no target is given, and remove their local state |
+| `remove <NAME\|PURL\|UUID>` | Restore and remove matching patches; a name or versionless PURL selects every recorded version |
 | `vendor --revert` | Undo vendoring from its recorded edits and remove the vendored artifacts |
-| `repair` | Restore missing patch data or damaged vendored artifacts and clean unused data |
+| `repair` | Restore missing agent patch data or missing/corrupt vendored artifacts using existing records, and clean unused data |
 | `scan --mode agent --prune` | Patch discovered packages and remove records for dependencies that left the project |
 
 Use `--dry-run` to preview. `rollback --preserve-state` and

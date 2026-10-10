@@ -720,6 +720,74 @@ pub(super) fn still_references_artifact(restored: &str, original: &str, uuid: &s
     restored.contains(&needle) && !original.contains(&needle)
 }
 
+/// Whether `name` (PEP 503) left the live lock `text` altogether: no unit
+/// of that name, and no unit lists it among its `dependencies` (#1287).
+/// For a script lock, `script` is the live script, which must not declare
+/// it either. That is a dependency the user dropped (`uv remove --script`
+/// of the parent of a transitive package), not a hand edit of its unit.
+fn package_vanished(text: &str, name: &str, script: Option<&str>) -> bool {
+    let Ok(doc) = text.parse::<DocumentMut>() else {
+        return false;
+    };
+    let (collection, _) = crate::utils::python_lock::lock_package_collection(&doc);
+    let names = |item: Option<&Item>| -> bool {
+        item.and_then(Item::as_array).is_some_and(|deps| {
+            deps.iter().any(|dep| {
+                dep.as_inline_table()
+                    .and_then(|t| t.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| canonicalize_pypi_name(n) == name)
+            })
+        })
+    };
+    let in_lock = doc
+        .get(collection)
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|packages| {
+            packages.iter().any(|unit| {
+                unit.get("name")
+                    .and_then(Item::as_str)
+                    .is_some_and(|n| canonicalize_pypi_name(n) == name)
+                    || names(unit.get("dependencies"))
+            })
+        });
+    let declared = script.is_some_and(|script| {
+        script_metadata(script).ok().is_some_and(|(_, metadata)| {
+            metadata.parse::<DocumentMut>().ok().is_some_and(|doc| {
+                doc.get("dependencies")
+                    .and_then(Item::as_array)
+                    .is_some_and(|deps| {
+                        deps.iter().filter_map(Value::as_str).any(|spec| {
+                            canonicalize_pypi_name(crate::vendor::common::pep508_name(spec)) == name
+                        })
+                    })
+            })
+        })
+    });
+    !in_lock && !declared
+}
+
+/// `text` with every lock unit named `name` (PEP 503) dropped: the vendored
+/// unit of a dependency that has since left the lock, which the document
+/// restore then no longer tries to pair (#1287).
+fn without_package(text: &str, name: &str) -> Result<String, String> {
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|error| format!("invalid recorded TOML: {error}"))?;
+    let (collection, _) = crate::utils::python_lock::lock_package_collection(&doc);
+    if let Some(packages) = doc
+        .get_mut(collection)
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        packages.retain(|unit| {
+            unit.get("name")
+                .and_then(Item::as_str)
+                .is_none_or(|n| canonicalize_pypi_name(n) != name)
+        });
+    }
+    Ok(doc.to_string())
+}
+
 pub(super) async fn revert_python_locks(
     entry: &VendorEntry,
     root: &Path,
@@ -750,6 +818,25 @@ pub(super) async fn revert_python_locks(
             }
             Ok(_) => {}
             Err((_, error)) => return RevertOutcome::failed(error),
+        }
+    }
+    // The vendored package's PEP 503 name, and each script lock's live
+    // script (read once, before any record is reverted).
+    let package_name = entry
+        .base_purl
+        .strip_prefix("pkg:pypi/")
+        .and_then(|rest| rest.rsplit_once('@'))
+        .map(|(name, _)| canonicalize_pypi_name(name));
+    let mut script_texts = std::collections::BTreeMap::new();
+    for record in entry.wiring.iter().filter(|r| r.kind == KIND) {
+        if let Some(script) = record
+            .file
+            .strip_suffix(".lock")
+            .filter(|s| s.ends_with(".py"))
+        {
+            if let Ok(text) = read_file(&root.join(script)).await {
+                script_texts.insert(record.file.as_str(), text);
+            }
         }
     }
     for record in entry.wiring.iter().rev() {
@@ -787,6 +874,40 @@ pub(super) async fn revert_python_locks(
         let live = match read_file(&root.join(&record.file)).await {
             Ok(live) => live,
             Err((_, error)) => return RevertOutcome::failed(error),
+        };
+        // #1287: the vendored package's own unit is gone from the lock along
+        // with every dependent (`uv remove` of the parent of a transitive
+        // package), while the overrides it was wired through survive. That
+        // unit has nothing left to restore: drop it from both recorded
+        // documents so the rest of the record reverts normally.
+        let (original_owned, new_owned);
+        let (original, new) = if record.kind == KIND
+            && package_name.as_deref().is_some_and(|name| {
+                package_vanished(
+                    &live,
+                    name,
+                    script_texts.get(record.file.as_str()).map(String::as_str),
+                )
+            }) {
+            let name = package_name.as_deref().unwrap_or_default();
+            match (without_package(original, name), without_package(new, name)) {
+                (Ok(o), Ok(n)) => {
+                    warnings.push(VendorWarning::new(
+                        super::LOCK_ENTRY_REMOVED_CODE,
+                        format!(
+                            "{}: the {name} unit no longer exists and nothing depends on it \
+                             (the dependency was removed); its other wiring is restored",
+                            record.file
+                        ),
+                    ));
+                    original_owned = o;
+                    new_owned = n;
+                    (original_owned.as_str(), new_owned.as_str())
+                }
+                (Err(error), _) | (_, Err(error)) => return RevertOutcome::failed(error),
+            }
+        } else {
+            (original, new)
         };
         let restored = if record.kind == SCRIPT_KIND {
             (|| {
@@ -1708,6 +1829,71 @@ mod tests {
         tokio::fs::write(root.join("job.py"), script).await.unwrap();
         write_pylock(root, "job.py.lock", lock).await;
         (script.to_string(), lock.to_string())
+    }
+
+    /// A script whose `one` arrives only TRANSITIVELY (through `parent`),
+    /// vendored: wired through the script's `[tool.uv]` override + source
+    /// and the lock's `[manifest] overrides`.
+    async fn vendor_transitive_script_pair(root: &Path) -> (VendorEntry, String, String) {
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"attrs\", specifier = \">=20\"}, {name = \"parent\", specifier = \"==1\"}]\n\n[[package]]\nname = \"attrs\"\nversion = \"25.3.0\"\nsource = {registry = \"https://pypi.org/simple\"}\n\n[[package]]\nname = \"one\"\nversion = \"1\"\nsource = {registry = \"https://pypi.org/simple\"}\n\n[[package]]\nname = \"parent\"\nversion = \"1\"\nsource = {registry = \"https://pypi.org/simple\"}\ndependencies = [{name = \"one\"}]\n";
+        let script = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"parent==1\", \"attrs>=20\"]\n# ///\nimport one\n";
+        write_pylock(root, "job.py.lock", lock).await;
+        tokio::fs::write(root.join("job.py"), script).await.unwrap();
+        let project = load_python_locks(root, "one", "1", UUID).await.unwrap();
+        let wheel =
+            ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/one-1-py3-none-any.whl";
+        let records = wire_python_locks(&project, root, "one", "1", wheel, &"a".repeat(64))
+            .await
+            .unwrap();
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/one@1",
+            "uuid": UUID,
+            "artifact": { "path": wheel, "sha256": "a".repeat(64) },
+            "wiring": serde_json::to_value(&records).unwrap(),
+            "flavor": "python-lock",
+        }))
+        .unwrap();
+        let wired_script = std::fs::read_to_string(root.join("job.py")).unwrap();
+        let wired_lock = std::fs::read_to_string(root.join("job.py.lock")).unwrap();
+        (entry, wired_script, wired_lock)
+    }
+
+    /// #1287: `uv remove --script job.py parent` drops the transitive
+    /// `one`'s unit (and its parent's) but keeps the script's `[tool.uv]`
+    /// override + source and the lock's `[manifest] overrides`, which still
+    /// name the uuid. The vanished unit is removed, not drift, and the
+    /// surviving wiring reverts, so the script and lock end up as uv writes
+    /// them for the project without `one`.
+    #[tokio::test]
+    async fn script_revert_after_uv_remove_of_the_transitive_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (entry, wired_script, wired_lock) = vendor_transitive_script_pair(root).await;
+        let removed_script = wired_script.replace("\"parent==1\", ", "");
+        let mut removed_lock = wired_lock.replace(", {name = \"parent\", specifier = \"==1\"}", "");
+        let one = removed_lock.find("\n[[package]]\nname = \"one\"").unwrap();
+        removed_lock.truncate(one);
+        tokio::fs::write(root.join("job.py"), &removed_script)
+            .await
+            .unwrap();
+        write_pylock(root, "job.py.lock", &removed_lock).await;
+
+        let outcome = revert_python_locks(&entry, root, false).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        let script = std::fs::read_to_string(root.join("job.py")).unwrap();
+        let lock = std::fs::read_to_string(root.join("job.py.lock")).unwrap();
+        assert_eq!(
+            script,
+            "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"attrs>=20\"]\n# ///\nimport one\n"
+        );
+        assert!(
+            !lock.contains(UUID) && !lock.contains("overrides"),
+            "{lock}"
+        );
+        assert!(lock.contains("name = \"attrs\""), "{lock}");
     }
 
     /// #1214: after `uv remove --script` drops the vendored dependency from a

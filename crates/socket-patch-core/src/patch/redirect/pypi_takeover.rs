@@ -126,28 +126,21 @@ mod tests {
 
     fn entry(flavor: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: "u".into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: ".socket/vendor/pypi/u/six-1.16.0-py2.py3-none-any.whl".into(),
-                sha256: "0".repeat(64),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some(flavor.into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "pypi".into(),
+                "pkg:pypi/six@1.16.0".into(),
+                "u".into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: ".socket/vendor/pypi/u/six-1.16.0-py2.py3-none-any.whl".into(),
+                    sha256: "0".repeat(64),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
         }
     }
 
