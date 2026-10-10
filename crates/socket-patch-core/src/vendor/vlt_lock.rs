@@ -1246,16 +1246,15 @@ pub async fn keep_vlt_links(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor_vlt<'a>(
     purl: &str,
-    installed_dir: impl Into<PackageSource<'a>>,
+    _installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
-    let installed_dir = installed_dir.into();
     let coords = match guard_coordinates(purl, record) {
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
@@ -1317,22 +1316,11 @@ pub(crate) async fn vendor_vlt<'a>(
     )
     .await;
 
-    let (staged, result) = match stage_patch_dir(
-        purl,
-        installed_dir,
-        project_root,
-        record,
-        sources,
-        dry_run,
-        force,
-        &mut warnings,
-        service,
-    )
-    .await
-    {
-        Ok(pair) => pair,
-        Err(outcome) => return *outcome,
-    };
+    let (staged, result) =
+        match stage_patch_dir(purl, project_root, record, dry_run, &mut warnings, service).await {
+            Ok(pair) => pair,
+            Err(outcome) => return *outcome,
+        };
     if result.success {
         warnings.extend(reinstall);
     }
