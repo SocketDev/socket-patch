@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
-use crate::patch::path_safety::is_safe_single_segment;
+use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::fs::{
     atomic_write_artifact, atomic_write_bytes_preserving_mode, read_regular_to_string,
 };
@@ -122,8 +122,8 @@ struct NugetPrelude {
     source_key: String,
     config_path: Option<PathBuf>,
     config_text: Option<String>,
-    lock_path: PathBuf,
-    lock_text: Option<String>,
+    /// Every lock the projects under the root restore into (#353, #514).
+    locks: Vec<LockFile>,
     /// nuget.config already carries this uuid's source.
     config_wired: bool,
     /// ...and the committed nupkg plus the lock pin are in sync (the hot
@@ -197,17 +197,40 @@ async fn nuget_prelude(
         },
         None => None,
     };
-    let lock_path = project_root.join(PACKAGES_LOCK);
-    let lock_text: Option<String> = match read_regular_to_string(&lock_path).await {
-        Ok(t) => Some(t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    // Every lock a project under the root restores into: the root config
+    // routes all of them, so each must be pinned with it (#353, #514).
+    let governed = match super::nuget_config::governed_locks_on_disk(project_root) {
+        Ok(governed) => governed,
         Err(e) => {
             return Err(refused(
                 "vendor_nuget_lock_unreadable",
-                format!("unreadable {}: {e}", lock_path.display()),
+                format!("cannot list the project's NuGet locks: {e}"),
             ));
         }
     };
+    if let Some((project, detail)) = governed.unresolved.first() {
+        return Err(refused(
+            "vendor_nuget_lock_path_unresolved",
+            format!(
+                "{project}: {detail}; the lock it restores into cannot be pinned, so {name} is \
+                 not vendored (set a literal NuGetLockFilePath, or remove it)"
+            ),
+        ));
+    }
+    let mut locks: Vec<LockFile> = Vec::with_capacity(governed.locks.len());
+    for rel in governed.locks {
+        let path = project_root.join(&rel);
+        match read_regular_to_string(&path).await {
+            Ok(text) => locks.push(LockFile { rel, path, text }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(refused(
+                    "vendor_nuget_lock_unreadable",
+                    format!("unreadable {}: {e}", path.display()),
+                ));
+            }
+        }
+    }
 
     // The idempotent hot path's test (see `vendor_nuget`): a live
     // `<packageSources>` source under our key. A commented-out one — or the
@@ -220,13 +243,16 @@ async fn nuget_prelude(
     // only the patched one: a framework that locks another version could no
     // longer restore (NU1102). Refused before anything is wired (#593).
     if !config_wired {
-        if let Some(Ok(doc)) = lock_text.as_deref().map(lock_value) {
+        for lock in &locks {
+            let Ok(doc) = lock_value(&lock.text) else {
+                continue;
+            };
             let others = crate::formats::nuget::lock::other_versions(&doc, name, &version_norm);
             if !others.is_empty() {
                 return Err(refused(
                     "vendor_nuget_lock_other_version",
                     crate::formats::nuget::lock::other_versions_detail(
-                        PACKAGES_LOCK,
+                        &lock.rel,
                         name,
                         &version_norm,
                         &others,
@@ -244,17 +270,22 @@ async fn nuget_prelude(
             .is_some_and(|bytes| zip_bytes_match_after_hashes(bytes, &record.files));
         // Only worth computing when the artifact itself is in sync (a stale
         // nupkg rebuilds regardless of what the lock pins).
-        let lock_ok = match (&lock_text, &nupkg_bytes) {
-            (None, _) => true,
-            (Some(text), Some(bytes)) if nupkg_ok => {
+        let lock_ok = match &nupkg_bytes {
+            _ if locks.is_empty() => true,
+            Some(bytes) if nupkg_ok => {
                 let expected = sha512_base64_of(bytes);
                 // Pinned at our bytes, or no matching resolved entry at
                 // all — the same absence `edit_lock` tolerates with a
                 // warning on the first run. Treating absence as stale
                 // would misreport "missing or stale; rebuilt" on every
                 // rerun with nothing to actually pin.
-                lock_pinned(text, name, &version_norm, &expected)
-                    || matches!(edit_lock(text, name, &version_norm, &expected), Ok(None))
+                locks.iter().all(|lock| {
+                    lock_pinned(&lock.text, name, &version_norm, &expected)
+                        || matches!(
+                            edit_lock(&lock.text, name, &version_norm, &expected),
+                            Ok(None)
+                        )
+                })
             }
             _ => false,
         };
@@ -271,8 +302,7 @@ async fn nuget_prelude(
         source_key,
         config_path,
         config_text,
-        lock_path,
-        lock_text,
+        locks,
         config_wired,
         in_sync,
     })
@@ -331,8 +361,7 @@ pub async fn vendor_nuget(
         source_key,
         config_path,
         config_text,
-        lock_path,
-        lock_text,
+        locks,
         config_wired,
         in_sync,
     } = match nuget_prelude(purl, project_root, record).await {
@@ -395,32 +424,39 @@ pub async fn vendor_nuget(
             // pre-vendor contentHash from the entry being replaced and
             // re-attaches the untouched config records.
             let mut wiring: Vec<WiringRecord> = Vec::new();
-            if let Some(text) = &lock_text {
-                let new_hash = sha512_base64_of(&bytes);
-                match edit_lock(text, name, &version_norm, &new_hash) {
+            let new_hash = sha512_base64_of(&bytes);
+            // Locks already re-pinned, put back if a later one fails: the
+            // projects must agree on one nupkg (the rebuilt artifact stays,
+            // the config routes to it).
+            let mut written: Vec<(&LockFile, &str)> = Vec::new();
+            for lock in &locks {
+                match edit_lock(&lock.text, name, &version_norm, &new_hash) {
                     Ok(Some(edit)) => {
                         LOCK_VALUE_MEMO.invalidate();
                         if let Err(e) =
-                            atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes())
+                            atomic_write_bytes_preserving_mode(&lock.path, edit.text.as_bytes())
                                 .await
                         {
+                            unwind_locks(&written).await;
                             result.success = false;
-                            result.error = Some(format!("failed to rewrite {PACKAGES_LOCK}: {e}"));
+                            result.error = Some(format!("failed to rewrite {}: {e}", lock.rel));
                             return done(result, None, warnings);
                         }
+                        written.push((lock, lock.text.as_str()));
                         wiring.push(WiringRecord {
-                            file: PACKAGES_LOCK.to_string(),
+                            file: lock.rel.clone(),
                             kind: LOCK_WIRING_KIND.to_string(),
                             action: WiringAction::Rewritten,
                             key: Some(name.to_string()),
                             original: None,
-                            new: Some(Value::String(new_hash)),
+                            new: Some(Value::String(new_hash.clone())),
                         });
                     }
                     Ok(None) => {}
                     Err(detail) => {
+                        unwind_locks(&written).await;
                         result.success = false;
-                        result.error = Some(detail);
+                        result.error = Some(format!("{}: {detail}", lock.rel));
                         return done(result, None, warnings);
                     }
                 }
@@ -537,21 +573,26 @@ pub async fn vendor_nuget(
     }
 
     // ── packages.lock.json pinning (a failure here unwinds the config) ────
-    let mut lock_record: Option<WiringRecord> = None;
-    if let Some(text) = &lock_text {
-        match edit_lock(text, name, &version_norm, &new_hash) {
+    let mut lock_records: Vec<WiringRecord> = Vec::new();
+    // The locks already re-pinned, with their pre-vendor text, so a later
+    // failure puts every one of them back with the config.
+    let mut written: Vec<(&LockFile, &str)> = Vec::new();
+    for lock in &locks {
+        match edit_lock(&lock.text, name, &version_norm, &new_hash) {
             Ok(Some(edit)) => {
                 LOCK_VALUE_MEMO.invalidate();
                 if let Err(e) =
-                    atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes()).await
+                    atomic_write_bytes_preserving_mode(&lock.path, edit.text.as_bytes()).await
                 {
+                    unwind_locks(&written).await;
                     unwind_config(&config_target, config_text.as_deref(), &uuid_dir).await;
                     result.success = false;
-                    result.error = Some(format!("failed to write {PACKAGES_LOCK}: {e}"));
+                    result.error = Some(format!("failed to write {}: {e}", lock.rel));
                     return done(result, None, warnings);
                 }
-                lock_record = Some(WiringRecord {
-                    file: PACKAGES_LOCK.to_string(),
+                written.push((lock, lock.text.as_str()));
+                lock_records.push(WiringRecord {
+                    file: lock.rel.clone(),
                     kind: LOCK_WIRING_KIND.to_string(),
                     action: WiringAction::Rewritten,
                     key: Some(name.to_string()),
@@ -566,24 +607,28 @@ pub async fn vendor_nuget(
                 warnings.push(VendorWarning::new(
                     "vendor_nuget_lock_entry_absent",
                     format!(
-                        "{PACKAGES_LOCK} has no resolved entry for {name} {version_norm}; the \
-                         vendored feed still serves it but its contentHash is not pinned"
+                        "{} has no resolved entry for {name} {version_norm}; the vendored feed \
+                         still serves it but its contentHash is not pinned there",
+                        lock.rel
                     ),
                 ));
             }
             Err(detail) => {
+                unwind_locks(&written).await;
                 unwind_config(&config_target, config_text.as_deref(), &uuid_dir).await;
                 result.success = false;
-                result.error = Some(detail);
+                result.error = Some(format!("{}: {detail}", lock.rel));
                 return done(result, None, warnings);
             }
         }
-    } else {
+    }
+    if locks.is_empty() {
         warnings.push(VendorWarning::new(
             "vendor_nuget_no_lockfile",
             format!(
-                "no {PACKAGES_LOCK} (RestorePackagesWithLockFile is off); the vendored feed \
-                 forces {name} from the patched copy but its contentHash is not pinned"
+                "no project under the root restores into a {PACKAGES_LOCK} (or a \
+                 packages.<Project>.lock.json); the vendored feed serves {name} from the patched \
+                 copy but its contentHash is not pinned"
             ),
         ));
     }
@@ -627,9 +672,7 @@ pub async fn vendor_nuget(
     // Application order: config source, config mapping, then the lock pin.
     // Revert runs them in reverse (lock → mapping → source).
     let mut wiring = vec![source_record, mapping_record];
-    if let Some(rec) = lock_record {
-        wiring.push(rec);
-    }
+    wiring.extend(lock_records);
 
     let entry = nuget_entry(base_purl, record, copy_rel, &nupkg_bytes, wiring);
 
@@ -710,9 +753,15 @@ pub async fn revert_nuget_opts(
     // record, then the authoritative config restore.
     for w in entry.wiring.iter().rev() {
         let restored = match w.kind.as_str() {
-            LOCK_WIRING_KIND => {
-                revert_lock_record(&project_root.join(PACKAGES_LOCK), w, dry_run).await
-            }
+            // SECURITY: state.json is committed and tamper-able; the lock
+            // path is joined under the root and written through, so only a
+            // plain relative path is accepted (a `../`, an absolute path
+            // would make the restore an arbitrary file write).
+            LOCK_WIRING_KIND if !is_safe_multi_segment(&w.file) => Err(format!(
+                "refusing revert: unsafe wiring file path {:?}",
+                w.file
+            )),
+            LOCK_WIRING_KIND => revert_lock_record(&project_root.join(&w.file), w, dry_run).await,
             // Audit-only: the whole-file config restore lives on the source
             // record, so there is nothing to undo here.
             CONFIG_MAPPING_WIRING_KIND => Ok(true),
@@ -1356,6 +1405,21 @@ async fn revert_lock_record(
         .await
         .map_err(|e| format!("failed to restore {}: {e}", lock_path.display()))?;
     Ok(true)
+}
+
+/// One project lock: its root-relative path, absolute path and text.
+struct LockFile {
+    rel: String,
+    path: PathBuf,
+    text: String,
+}
+
+/// Put back the locks a failed vendor already re-pinned.
+async fn unwind_locks(written: &[(&LockFile, &str)]) {
+    for (lock, original) in written {
+        let _ = atomic_write_bytes_preserving_mode(&lock.path, original.as_bytes()).await;
+    }
+    LOCK_VALUE_MEMO.invalidate();
 }
 
 /// Restore the config to its pre-vendor state (or delete a created file) after
@@ -2061,6 +2125,155 @@ mod tests {
         );
         assert!(!root.join("nuget.config").exists());
         assert!(!root.join(".socket").exists());
+    }
+
+    /// #353: a solution layout keeps each project's lock beside it. The
+    /// root nuget.config routes every project, so the member lock is pinned
+    /// (and recorded under its own path) and revert restores it.
+    #[tokio::test]
+    async fn member_project_lock_is_pinned_and_reverted() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let app = root.join("src/App");
+        tokio::fs::create_dir_all(&app).await.unwrap();
+        tokio::fs::write(
+            app.join("App.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />",
+        )
+        .await
+        .unwrap();
+        let lock = lock_json("ORIGINALcachedhash==");
+        tokio::fs::write(app.join(PACKAGES_LOCK), &lock)
+            .await
+            .unwrap();
+        // Build output is never walked.
+        tokio::fs::create_dir_all(app.join("obj")).await.unwrap();
+        tokio::fs::write(app.join("obj/Stray.csproj"), "<Project />")
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_nuget_no_lockfile"),
+            "{warnings:?}"
+        );
+        let nupkg = tokio::fs::read(root.join(copy_rel())).await.unwrap();
+        let pinned = tokio::fs::read_to_string(app.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned,
+            lock.replace("ORIGINALcachedhash==", &sha512_base64_of(&nupkg))
+        );
+        let entry = entry.unwrap();
+        let files: Vec<&str> = entry
+            .wiring
+            .iter()
+            .filter(|w| w.kind == LOCK_WIRING_KIND)
+            .map(|w| w.file.as_str())
+            .collect();
+        assert_eq!(files, ["src/App/packages.lock.json"]);
+
+        // The re-run is the in-sync hot path.
+        let (_r, rerun_entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(
+            rerun_entry.is_none(),
+            "already vendored: nothing re-recorded"
+        );
+
+        let reverted = revert_nuget(&entry, root, false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        assert_eq!(
+            tokio::fs::read_to_string(app.join(PACKAGES_LOCK))
+                .await
+                .unwrap(),
+            lock
+        );
+    }
+
+    /// #514: `packages.<Project>.lock.json` is the lock NuGet reads when it
+    /// exists; it is pinned (the plain name beside it is not NuGet's).
+    #[tokio::test]
+    async fn named_project_lock_is_pinned() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        tokio::fs::write(root.join("app.csproj"), "<Project />")
+            .await
+            .unwrap();
+        let lock = lock_json("ORIGINALcachedhash==");
+        tokio::fs::write(root.join("packages.app.lock.json"), &lock)
+            .await
+            .unwrap();
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_nuget_no_lockfile"),
+            "{warnings:?}"
+        );
+        let pinned = tokio::fs::read_to_string(root.join("packages.app.lock.json"))
+            .await
+            .unwrap();
+        assert!(!pinned.contains("ORIGINALcachedhash=="), "{pinned}");
+        let entry = entry.unwrap();
+        assert!(entry
+            .wiring
+            .iter()
+            .any(|w| w.kind == LOCK_WIRING_KIND && w.file == "packages.app.lock.json"));
+    }
+
+    /// #514: a `NuGetLockFilePath` this reader cannot evaluate is refused
+    /// before anything is written, rather than left on its upstream hash.
+    #[tokio::test]
+    async fn unresolvable_lock_file_path_is_refused() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        tokio::fs::write(
+            root.join("app.csproj"),
+            "<Project><PropertyGroup><NuGetLockFilePath>$(BaseDir)app.lock.json</NuGetLockFilePath></PropertyGroup></Project>",
+        )
+        .await
+        .unwrap();
+        let (code, detail) =
+            unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "vendor_nuget_lock_path_unresolved");
+        assert!(detail.contains("app.csproj"), "{detail}");
+        assert!(!root.join("nuget.config").exists());
+        assert!(!root.join(".socket").exists());
+    }
+
+    /// A tampered lock record naming a path outside the root is refused.
+    #[tokio::test]
+    async fn revert_refuses_an_unsafe_lock_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = entry_with_wiring(
+            UUID,
+            vec![WiringRecord {
+                file: "../outside/packages.lock.json".to_string(),
+                kind: LOCK_WIRING_KIND.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some("Newtonsoft.Json".to_string()),
+                original: Some(Value::String("A==".to_string())),
+                new: Some(Value::String("B==".to_string())),
+            }],
+        );
+        let outcome = revert_nuget(&entry, dir.path(), false).await;
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unsafe wiring file path")),
+            "{:?}",
+            outcome.error
+        );
     }
 
     /// #623: dotnet restores a BOM'd lock, so vendor pins it (the BOM kept)

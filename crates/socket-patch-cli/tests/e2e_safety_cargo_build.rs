@@ -1069,3 +1069,142 @@ fn apply_normalizes_package_prefix_in_cargo_checksum() {
         "sidecar record must still report .cargo-checksum.json:rewritten; got {cargo}"
     );
 }
+
+// ── Warm build cache (#387) ───────────────────────────────────────────
+
+/// Where the warm-cache scenario's build artifacts live.
+enum TargetDirSpec {
+    /// cargo's default `<project>/target`.
+    Default,
+    /// `CARGO_TARGET_DIR` pointing outside the project, seen by both cargo
+    /// and socket-patch.
+    Env,
+    /// `build.target-dir` in the project's `.cargo/config.toml`.
+    Config,
+}
+
+/// `cargo run --offline --frozen` WITHOUT wiping the build cache: what a
+/// developer checkout or a CI job with a cached `target/` does next.
+fn warm_run(consumer: &Path, cargo_home: &Path, target_env: Option<&Path>) -> String {
+    let mut cmd = cargo_e2e_matrix::cargo_command(consumer, cargo_home);
+    cmd.env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .args(["run", "-q", "--offline", "--frozen"]);
+    if let Some(t) = target_env {
+        cmd.env("CARGO_TARGET_DIR", t);
+    }
+    let out = cmd.output().expect("cargo run");
+    assert!(
+        out.status.success(),
+        "cargo run failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// #387: build, apply, build — the second build must link the patched
+/// crate, not reuse the pre-apply rlib cargo keyed on the package id; then
+/// rollback, build — it must link the original again.
+fn warm_cache_round_trip(spec: TargetDirSpec) {
+    if !cargo_e2e_matrix::cargo_available("e2e_safety_cargo_build") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let consumer = stage_consumer(root.path());
+    let cargo_home = root.path().join(".cargo-home");
+    generate_lockfile(&consumer, &cargo_home);
+
+    let ext_target = root.path().join("ext-target");
+    let target_env = match spec {
+        TargetDirSpec::Env => Some(ext_target.as_path()),
+        _ => None,
+    };
+    if let TargetDirSpec::Config = spec {
+        let cfg = consumer.join(".cargo/config.toml");
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        std::fs::write(
+            &cfg,
+            format!("[build]\ntarget-dir = \"cfg-target\"\n\n{text}"),
+        )
+        .unwrap();
+    }
+    // socket-patch sees the same CARGO_TARGET_DIR as cargo (an empty value
+    // reads as unset — the ambient one must not leak in).
+    let ext = ext_target.to_string_lossy().to_string();
+    let sp_env: Vec<(&str, &str)> = vec![
+        ("CARGO_HOME", cargo_home.to_str().unwrap()),
+        (
+            "CARGO_TARGET_DIR",
+            if target_env.is_some() {
+                ext.as_str()
+            } else {
+                ""
+            },
+        ),
+        ("CARGO_BUILD_TARGET_DIR", ""),
+        ("CARGO_BUILD_BUILD_DIR", ""),
+    ];
+
+    assert_eq!(warm_run(&consumer, &cargo_home, target_env), "world");
+    let built_in = match spec {
+        TargetDirSpec::Default => consumer.join("target"),
+        TargetDirSpec::Env => ext_target.clone(),
+        TargetDirSpec::Config => consumer.join("cfg-target"),
+    };
+    assert!(
+        built_in.is_dir(),
+        "the baseline build must populate {built_in:?}"
+    );
+
+    let (before, _after) = stage_socket_manifest(&consumer);
+    write_blob(
+        &consumer.join(".socket"),
+        &before,
+        ORIGINAL_LIB_RS.as_bytes(),
+    );
+    let cwd = consumer.to_str().unwrap();
+    let (code, stdout, stderr) =
+        common::run_with_env(&consumer, &["apply", "--json", "--cwd", cwd], &sp_env);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        env["warnings"].as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "a fully invalidated build cache warns about nothing: {env}"
+    );
+    assert_eq!(
+        warm_run(&consumer, &cargo_home, target_env),
+        "PATCHED",
+        "the next build after apply must compile the patched sources, not reuse the \
+         pre-apply rlib"
+    );
+
+    let (code, stdout, stderr) =
+        common::run_with_env(&consumer, &["rollback", "--json", "--cwd", cwd], &sp_env);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        warm_run(&consumer, &cargo_home, target_env),
+        "world",
+        "the next build after rollback must compile the original sources, not reuse the \
+         patched rlib"
+    );
+}
+
+#[test]
+#[ignore]
+fn warm_build_cache_relinks_after_apply_and_rollback() {
+    warm_cache_round_trip(TargetDirSpec::Default);
+}
+
+#[test]
+#[ignore]
+fn warm_build_cache_in_cargo_target_dir_relinks() {
+    warm_cache_round_trip(TargetDirSpec::Env);
+}
+
+#[test]
+#[ignore]
+fn warm_build_cache_in_config_target_dir_relinks() {
+    warm_cache_round_trip(TargetDirSpec::Config);
+}

@@ -268,6 +268,16 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   vendored wiring alike, so the packages install unpatched. A run that leaves such a pin
   warns (`redirect_yarn_classic_berry_migration_risk` / `yarn_classic_berry_migration_risk`)
   unless `package.json` pins yarn classic through `"packageManager": "yarn@1…"`.
+- **yarn classic workspaces, vendored** — vendored mode wires
+  `resolved "file:./.socket/vendor/…"`, relative to the workspace root. Yarn 1 looks a
+  relative `file:` tarball up from the directory it runs in, so on a cold yarn cache
+  `yarn install`, `yarn add` or `yarn workspace <name> …` run from a member directory
+  fails ("Tarball is not in network and can not be located in cache"), whether or not the
+  member depends on the patched package (yarn 1.7.0, 1.10.1 and 1.22.22; no relative
+  spelling installs from both). Installs from the workspace root work, and warm the cache
+  for later member-directory commands. A vendored run in such a project warns
+  `yarn_classic_workspace_member_install_risk`; hosted mode, which pins an absolute URL,
+  is not affected.
 - **yarn classic git dependencies** — yarn 1 fetches a git pattern (`git+https:`,
   `git+ssh:`, `git:`, `ssh:`, a `….git` url, or a bare `https://github.com/<owner>/<repo>`)
   with git, using the lock entry's `resolved` as the remote, so a rewritten `resolved`
@@ -1056,6 +1066,27 @@ Agent mode patches the crate in place wherever the crawler finds it. For a non-v
 crate that means the **shared** `$CARGO_HOME/registry` cache: the patch affects every
 project on the machine, and is silently reset by `cargo clean` or a cache prune. Use
 `--mode vendored` for a project-local, committable patch.
+
+Nothing deletes a crate from the cache when the project stops using it, so the
+manifest record stays the only way to restore that copy: `rollback` (and `remove`)
+also restore it after the crate was moved to vendored mode, and `scan --prune` /
+`--sync` keep the record of a crate the lock no longer resolves while its cache copy
+is still patched (`cargo_cache_patch_kept`; `socket-patch rollback <purl>` restores
+the copy and drops the record).
+
+Cargo never re-checks a registry or `cargo vendor` crate's source files: it reuses the
+crate's compiled artifacts while the package id is unchanged. So after `apply` or
+`rollback` changes a crate's bytes, socket-patch deletes that crate's fingerprints
+(`.fingerprint/<crate>-<hash>/`, or `build/<crate>/<hash>/fingerprint/` in the newer
+build-dir layout; every version, profile and target triple) in the
+project's build directories, and the next `cargo build` recompiles it and relinks its
+dependents. Those directories are `CARGO_TARGET_DIR` / `CARGO_BUILD_TARGET_DIR`,
+`CARGO_BUILD_BUILD_DIR`, `build.target-dir` / `build.build-dir` from the project's
+`.cargo/config.toml` files and `$CARGO_HOME/config.toml`, and `<workspace root>/target`.
+A fingerprint that can't be removed, or a `build.build-dir` using
+`{workspace-path-hash}`, adds a `cargo_build_cache_stale` warning that names the crates
+to `cargo clean -p`. Other projects that share the registry cache keep their own build
+caches: run `cargo clean -p <crate>` there too.
 
 Run `cargo fetch` before `apply` on a fresh checkout or CI runner. Cargo unpacks a
 locked crate into `registry/src` only when it fetches or builds, so on a cold or pruned

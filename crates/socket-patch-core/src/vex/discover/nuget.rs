@@ -57,12 +57,16 @@
 //! refuses is [`DIAG_LOCKFILE_UNPARSEABLE`]); a source listed in
 //! `<disabledPackageSources>` with `value="true"` wires nothing (diagnosed).
 //!
+//! The lock is every lock the root config governs: the root
+//! `packages.lock.json` plus, on disk, each lock a project under the root
+//! restores into (member projects, `packages.<Project>.lock.json`, a literal
+//! `NuGetLockFilePath`; [`crate::formats::nuget::lock::governed_locks`], the
+//! discovery both writers pin through).
+//!
 //! Non-goals (documented, not guessed): parent-directory / user-level
-//! configs and per-project locks below the root (the redirect rewriter only
-//! edits the root pair too); `<clear />` inheritance semantics (neither
-//! writer emits one); a non-Socket source that ALSO maps the exact id (the
-//! lock's `contentHash` is what makes such a restore fail); custom
-//! `NuGetLockFilePath` names.
+//! configs; `<clear />` inheritance semantics (neither writer emits one); a
+//! non-Socket source that ALSO maps the exact id (the lock's `contentHash`
+//! is what makes such a restore fail).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -70,8 +74,8 @@ use serde_json::Value;
 
 use super::{
     parse_json, simple_purl, socket_patch_name_uuid, vendor_ref, vendor_uuid_dir, DiscoverCtx,
-    Discovery, PatchedRef, UnlockedPin, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
-    DIAG_REF_UNATTRIBUTABLE,
+    Discovery, PatchedRef, UnlockedPin, WiringMode, DIAG_LOCKFILE_UNPARSEABLE,
+    DIAG_LOCKFILE_UNREADABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::nuget::lock::nuget_lock_entries;
 use crate::formats::nuget::{parse_config, NugetConfig};
@@ -281,41 +285,88 @@ enum Lock {
     Parsed(BTreeMap<String, BTreeMap<String, Pins>>),
 }
 
+/// Every lock the root config governs: the root `packages.lock.json`, and on
+/// disk each lock a project under the root restores into (#353, #514; the
+/// writers pin all of them). Their entries are merged: one version's
+/// `contentHash` must agree across them, as within one lock.
 async fn load_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> Lock {
-    if !ctx.exists(PACKAGES_LOCK).await {
-        return Lock::Absent;
-    }
-    let Some(bytes) = ctx.read_bytes(PACKAGES_LOCK, out).await else {
-        return Lock::Unusable;
-    };
-    let doc: Value = match parse_json(PACKAGES_LOCK, &bytes) {
-        Ok(Value::Object(doc)) => Value::Object(doc),
-        Ok(_) => {
-            out.diag(
-                DIAG_LOCKFILE_UNPARSEABLE,
-                PACKAGES_LOCK,
-                format!("{PACKAGES_LOCK} is not a JSON object"),
-            );
-            return Lock::Unusable;
-        }
-        Err(detail) => {
-            out.diag(DIAG_LOCKFILE_UNPARSEABLE, PACKAGES_LOCK, detail);
-            return Lock::Unusable;
-        }
-    };
-    let mut index: BTreeMap<String, BTreeMap<String, Pins>> = BTreeMap::new();
-    for entry in nuget_lock_entries(&doc) {
-        let pins = index
-            .entry(entry.id.to_ascii_lowercase())
-            .or_default()
-            .entry(entry.resolved.trim().to_string())
-            .or_default();
-        match entry.content_hash {
-            Some(hash) if !hash.trim().is_empty() => {
-                pins.hashes.insert(hash.trim().to_string());
+    let mut rels = vec![PACKAGES_LOCK.to_string()];
+    // On disk only (the in-memory engine refuses NuGet). Walked through the
+    // view, never its raw root: a re-scan's read cache keeps recording.
+    if !matches!(
+        ctx.view,
+        crate::vendor::lock_inventory::ProjectView::Memory(_)
+    ) {
+        // The writers refuse a tree whose locks they cannot all find; a
+        // reader that fell back to the root lock alone would take a pinned
+        // member lock for no lock at all, so it is unusable here too.
+        match crate::vendor::nuget_config::governed_locks_in(&ctx.view).await {
+            Ok(governed) => {
+                if let Some((project, detail)) = governed.unresolved.first() {
+                    out.diag(
+                        DIAG_LOCKFILE_UNREADABLE,
+                        project,
+                        format!("{project}: {detail}; its NuGet lock cannot be located"),
+                    );
+                    return Lock::Unusable;
+                }
+                for rel in governed.locks {
+                    if !rels.contains(&rel) {
+                        rels.push(rel);
+                    }
+                }
             }
-            _ => pins.unpinned = true,
+            Err(why) => {
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    PACKAGES_LOCK,
+                    format!("cannot list the project's NuGet locks: {why}"),
+                );
+                return Lock::Unusable;
+            }
         }
+    }
+    let mut index: BTreeMap<String, BTreeMap<String, Pins>> = BTreeMap::new();
+    let mut any = false;
+    for rel in &rels {
+        if !ctx.exists(rel).await {
+            continue;
+        }
+        any = true;
+        let Some(bytes) = ctx.read_bytes(rel, out).await else {
+            return Lock::Unusable;
+        };
+        let doc: Value = match parse_json(rel, &bytes) {
+            Ok(Value::Object(doc)) => Value::Object(doc),
+            Ok(_) => {
+                out.diag(
+                    DIAG_LOCKFILE_UNPARSEABLE,
+                    rel,
+                    format!("{rel} is not a JSON object"),
+                );
+                return Lock::Unusable;
+            }
+            Err(detail) => {
+                out.diag(DIAG_LOCKFILE_UNPARSEABLE, rel, detail);
+                return Lock::Unusable;
+            }
+        };
+        for entry in nuget_lock_entries(&doc) {
+            let pins = index
+                .entry(entry.id.to_ascii_lowercase())
+                .or_default()
+                .entry(entry.resolved.trim().to_string())
+                .or_default();
+            match entry.content_hash {
+                Some(hash) if !hash.trim().is_empty() => {
+                    pins.hashes.insert(hash.trim().to_string());
+                }
+                _ => pins.unpinned = true,
+            }
+        }
+    }
+    if !any {
+        return Lock::Absent;
     }
     Lock::Parsed(index)
 }
@@ -1382,6 +1433,57 @@ mod tests {
         let out = run(&p).await;
         assert_refs(&out, &[]);
         assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
+    }
+
+    /// #353 / #514: with no root lock, the version and pin come from the
+    /// member-project (or named) lock the root config governs.
+    #[tokio::test]
+    async fn hosted_version_and_pin_come_from_a_member_lock() {
+        let cfg = config(
+            &[(&socket_key(UUID_A), &index_url(UUID_A))],
+            &[(&socket_key(UUID_A), "Newtonsoft.Json")],
+        );
+        for (project, lock_rel) in [
+            ("src/App/App.csproj", "src/App/packages.lock.json"),
+            ("app.csproj", "packages.app.lock.json"),
+        ] {
+            let p = Project::new();
+            p.write("nuget.config", &cfg);
+            p.write(project, "<Project />");
+            p.write(
+                lock_rel,
+                lock(&[("net8.0", "Newtonsoft.Json", "13.0.1", Some(HASH))]),
+            );
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[(
+                    "pkg:nuget/newtonsoft.json@13.0.1",
+                    UUID_A,
+                    WiringMode::Hosted,
+                )],
+            );
+            assert!(out.refs[0].lockfile_basis_ok(), "{lock_rel}");
+        }
+        // A project whose lock cannot be located: no ref is read off a
+        // partial lock set (the writers refuse such a tree too).
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(
+            "app.csproj",
+            "<Project><PropertyGroup><NuGetLockFilePath>$(X).json</NuGetLockFilePath></PropertyGroup></Project>",
+        );
+        p.write(
+            "packages.lock.json",
+            lock(&[("net8.0", "Newtonsoft.Json", "13.0.1", Some(HASH))]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert!(
+            diag_codes(&out).contains(&DIAG_LOCKFILE_UNREADABLE),
+            "{:?}",
+            diag_codes(&out)
+        );
     }
 
     /// Two Socket sources mapping the same id are both emitted — precedence
