@@ -2184,6 +2184,64 @@ async fn pipenv_vendor_wires_the_exported_requirements_too() {
     assert_both_vendored(&root, "takeover");
 }
 
+// ── #479: a Hatch-derived pylock.toml ────────────────────────────────────
+
+/// The pylock `hatch lock` writes for a locked environment (uv locker),
+/// pinning six from PyPI.
+const HATCH_PYLOCK: &str = "lock-version = \"1.0\"\ncreated-by = \"uv\"\nrequires-python = \">=3.9\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\nindex = \"https://pypi.org/simple\"\nsdist = { url = \"https://files.pythonhosted.org/packages/71/39/six-1.16.0.tar.gz\", upload-time = 2021-05-05T14:18:18Z, size = 34041, hashes = { sha256 = \"SDIST_SHA\" } }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl\", upload-time = 2021-05-05T14:18:17Z, size = 11053, hashes = { sha256 = \"WHEEL_SHA\" } }]\n";
+
+const HATCH_LOCKED_PYPROJECT: &str = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.hatch.envs.default]\nlocked = true\ninstaller = \"uv\"\n";
+
+/// #479: Hatch 1.17+ derives `pylock.toml` from pyproject for a locked
+/// environment and regenerates it on the next sync, so a scan that rewrote
+/// only the lock (success, no warning) never patched a Hatch environment.
+/// Hosted must wire pyproject too (with a warning to re-lock); vendored must route to the Hatch lane,
+/// whose uv-installer refusal applies, and write nothing.
+#[tokio::test]
+async fn hatch_locked_env_pylock_wires_pyproject() {
+    let pylock = HATCH_PYLOCK
+        .replace("SDIST_SHA", SDIST_SHA)
+        .replace("WHEEL_SHA", WHEEL_SHA);
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+
+    let (_tmp, root) = project();
+    std::fs::write(root.join("pyproject.toml"), HATCH_LOCKED_PYPROJECT).unwrap();
+    std::fs::write(root.join("pylock.toml"), &pylock).unwrap();
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "hosted: {env:#}");
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let pyproject = std::fs::read_to_string(root.join("pyproject.toml")).unwrap();
+    assert!(
+        pyproject.contains(&format!("six @ {hosted_url}")),
+        "pyproject is wired:\n{pyproject}"
+    );
+    let lock = std::fs::read_to_string(root.join("pylock.toml")).unwrap();
+    assert!(
+        lock.contains(&hosted_url),
+        "the lock stays consistent with pyproject until Hatch regenerates it:\n{lock}"
+    );
+    assert!(
+        env.to_string().contains("redirect_hatch_lock_regenerated"),
+        "{env:#}"
+    );
+    let (_tmp, root) = project();
+    std::fs::write(root.join("pyproject.toml"), HATCH_LOCKED_PYPROJECT).unwrap();
+    std::fs::write(root.join("pylock.toml"), &pylock).unwrap();
+    stage_manifest(&root);
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_ne!(code, 0, "vendored: {env:#}");
+    assert!(env.to_string().contains("pip installer"), "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("pyproject.toml")).unwrap(),
+        HATCH_LOCKED_PYPROJECT
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pylock.toml")).unwrap(),
+        pylock
+    );
+}
+
 // ── #604: PEP 440-equivalent lock-only pins ──────────────────────────────
 
 /// #604: on a fresh checkout (no venv), `six==1.16` (or `==1.16.0.0`,
