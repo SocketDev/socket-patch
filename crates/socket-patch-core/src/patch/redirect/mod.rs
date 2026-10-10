@@ -6077,7 +6077,13 @@ fn nuget_xml_attribute(value: &str) -> String {
         .replace('\r', "&#xD;")
 }
 
-use crate::formats::nuget::lock::PACKAGES_LOCK;
+/// The synthetic candidate key carrying the locks the engine found every
+/// project under the root restoring into (#353, #514), one per line:
+/// `lock\t<rel>`, `unresolved\t<project>\t<why>` for a `NuGetLockFilePath`
+/// it cannot evaluate, or `error\t<why>` when it could not list the tree.
+/// Absent (the in-memory engine, unit tests), the root `packages.lock.json`
+/// is the one lock. Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
+pub const NUGET_LOCKS_KEY: &str = "<socket-patch:nuget-locks>";
 
 fn rewrite_nuget(
     files: &BTreeMap<String, String>,
@@ -6116,21 +6122,64 @@ fn rewrite_nuget(
     // (the npm twin does the same). An ABSENT lock is fine — config-only.
     // Read past a UTF-8 BOM the way dotnet does (#623); the write below
     // keeps it.
-    let lock_text = files.get(PACKAGES_LOCK);
-    let mut lock: Option<Value> = match lock_text {
-        None => None,
-        Some(text) => match crate::formats::nuget::lock::parse_lock(text) {
-            Ok(parsed) => Some(parsed),
+    //
+    // Every lock a project under the root restores into: the root config
+    // routes them all, so each is pinned with it (#353, #514). The engine
+    // reads the project files and their locks; the same pure discovery
+    // re-derives which keys are locks here.
+    let lock_rels: Vec<String> = match files.get(NUGET_LOCKS_KEY) {
+        None => vec![crate::formats::nuget::lock::PACKAGES_LOCK.to_string()],
+        Some(found) => {
+            let mut rels = Vec::new();
+            for line in found.lines() {
+                let mut fields = line.splitn(3, '\t');
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some("lock"), Some(rel), None) => rels.push(rel.to_string()),
+                    (Some("unresolved"), Some(project), Some(detail)) => {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_nuget_lock_path_unresolved".into(),
+                            detail: format!(
+                                "{project}: {detail}; the lock it restores into cannot be \
+                                 pinned, so nuget redirect is skipped (set a literal \
+                                 NuGetLockFilePath, or remove it)"
+                            ),
+                        });
+                        return;
+                    }
+                    (Some("error"), Some(why), _) => {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_nuget_lock_unreadable".into(),
+                            detail: format!(
+                                "cannot list the project's NuGet locks ({why}); nuget redirect \
+                                 skipped"
+                            ),
+                        });
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            rels
+        }
+    };
+    // Read past a UTF-8 BOM the way dotnet does (#623); the write below
+    // keeps it.
+    let mut locks: Vec<(String, &String, Value, bool)> = Vec::new();
+    for rel in lock_rels {
+        let Some(text) = files.get(&rel) else {
+            continue;
+        };
+        match crate::formats::nuget::lock::parse_lock(text) {
+            Ok(parsed) => locks.push((rel, text, parsed, false)),
             Err(_) => {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_nuget_lock_unparseable".into(),
-                    detail: "packages.lock.json is not valid JSON; nuget redirect skipped".into(),
+                    detail: format!("{rel} is not valid JSON; nuget redirect skipped"),
                 });
                 return;
             }
-        },
-    };
-    let mut lock_changed = false;
+        }
+    }
 
     for dep in &nuget {
         let Some(ov) = registry_override_of_kind(dep, "nuget-v3") else {
@@ -6169,21 +6218,24 @@ fn rewrite_nuget(
         // another version could no longer restore it, and re-pinning that
         // entry would silently swap in the patched version (#593). Refused
         // before anything is wired.
-        if let Some(lock_val) = &lock {
+        let other_version = locks.iter().find_map(|(rel, _, lock_val, _)| {
             let others =
                 crate::formats::nuget::lock::other_versions(lock_val, &id_lower, &version_norm);
-            if !others.is_empty() {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_nuget_lock_other_version".into(),
-                    detail: crate::formats::nuget::lock::other_versions_detail(
-                        PACKAGES_LOCK,
-                        &dep.name,
-                        &version_norm,
-                        &others,
-                    ),
-                });
-                continue;
-            }
+            (!others.is_empty()).then(|| {
+                crate::formats::nuget::lock::other_versions_detail(
+                    rel,
+                    &dep.name,
+                    &version_norm,
+                    &others,
+                )
+            })
+        });
+        if let Some(detail) = other_version {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_lock_other_version".into(),
+                detail,
+            });
+            continue;
         }
 
         let unwritable = || RewriteWarning {
@@ -6231,7 +6283,7 @@ fn rewrite_nuget(
 
         // Only the entries at the patched version: another version of the
         // id is a different package (#593).
-        if let Some(lock_val) = lock.as_mut() {
+        for (rel, _, lock_val, lock_changed) in locks.iter_mut() {
             for (id, obj) in
                 crate::formats::nuget::lock::locked_at_mut(lock_val, &id_lower, &version_norm)
             {
@@ -6245,9 +6297,9 @@ fn rewrite_nuget(
                     "contentHash": obj.get("contentHash").cloned().unwrap_or(Value::Null),
                 });
                 obj.insert("contentHash".into(), Value::String(content_hash.clone()));
-                lock_changed = true;
+                *lock_changed = true;
                 result.edits.push(FileEdit {
-                    path: PACKAGES_LOCK.into(),
+                    path: rel.clone(),
                     kind: "redirect_nuget_lock".into(),
                     action: "rewritten".into(),
                     key: Some(id.to_string()),
@@ -6264,13 +6316,12 @@ fn rewrite_nuget(
     if config_changed {
         result.files.insert(config_path.into(), config);
     }
-    if lock_changed {
-        if let (Some(lock_val), Some(original)) = (lock, lock_text) {
+    for (rel, original, lock_val, changed) in locks {
+        if changed {
             // In the lock's own layout: its BOM, indent and line endings.
-            result.files.insert(
-                PACKAGES_LOCK.into(),
-                serialize_json_like(&lock_val, original),
-            );
+            result
+                .files
+                .insert(rel, serialize_json_like(&lock_val, original));
         }
     }
 }
@@ -23533,6 +23584,83 @@ packages:
             lock.replace("ORIGINALHASH==", "PATCHED=="),
             "only the hash changes; BOM and CRLF layout kept"
         );
+    }
+
+    fn simple_lock(hash: &str) -> String {
+        format!(
+            "{{\n  \"version\": 1,\n  \"dependencies\": {{\n    \"net8.0\": {{\n      \"Newtonsoft.Json\": {{\n        \"type\": \"Direct\",\n        \"requested\": \"[13.0.3, )\",\n        \"resolved\": \"13.0.3\",\n        \"contentHash\": \"{hash}\"\n      }}\n    }}\n  }}\n}}\n"
+        )
+    }
+
+    /// #353 / #514: member-project locks and named locks the root config
+    /// governs (the engine's walk, carried by [`NUGET_LOCKS_KEY`]) are
+    /// re-pinned under their own paths with the config.
+    #[test]
+    fn nuget_member_and_named_locks_are_repinned() {
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            "src/App/packages.lock.json".to_string(),
+            simple_lock("ORIGINALHASH=="),
+        );
+        files.insert(
+            "src/Lib/packages.Lib.lock.json".to_string(),
+            simple_lock("ORIGINALHASH=="),
+        );
+        files.insert(
+            NUGET_LOCKS_KEY.to_string(),
+            "lock\tsrc/App/packages.lock.json\nlock\tsrc/Lib/packages.Lib.lock.json".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        for rel in [
+            "src/App/packages.lock.json",
+            "src/Lib/packages.Lib.lock.json",
+        ] {
+            assert_eq!(
+                r.files.get(rel).map(String::as_str),
+                Some(simple_lock("PATCHED==").as_str()),
+                "{rel}"
+            );
+        }
+        let lock_paths: Vec<&str> = r
+            .edits
+            .iter()
+            .filter(|e| e.kind == "redirect_nuget_lock")
+            .map(|e| e.path.as_str())
+            .collect();
+        assert_eq!(
+            lock_paths,
+            [
+                "src/App/packages.lock.json",
+                "src/Lib/packages.Lib.lock.json"
+            ]
+        );
+        // Without the walk (in memory, unit tests) only the root lock is one:
+        // a member lock is never mistaken for one.
+        files.remove(NUGET_LOCKS_KEY);
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(!r.files.contains_key("src/App/packages.lock.json"));
+    }
+
+    /// #514: an unresolvable `NuGetLockFilePath`, or a project tree the
+    /// engine could not list, skips the nuget redirect with nothing written.
+    #[test]
+    fn nuget_unknowable_locks_skip_the_redirect() {
+        for (walk, code) in [
+            (
+                "lock\tpackages.lock.json\nunresolved\tapp.csproj\tNuGetLockFilePath `$(X)/l.json` references MSBuild properties or items",
+                "redirect_nuget_lock_path_unresolved",
+            ),
+            ("error\tunreadable src", "redirect_nuget_lock_unreadable"),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("nuget.config".to_string(), default_nuget_config());
+            files.insert(NUGET_LOCKS_KEY.to_string(), walk.to_string());
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+            assert_eq!(warning_codes(&r), vec![code]);
+        }
     }
 
     /// #593: a multi-targeting lock resolving the patched id at another
