@@ -28,25 +28,14 @@ use socket_patch_core::utils::target::is_uuid_shaped;
 #[derive(Parser)]
 #[command(
     name = "socket-patch",
-    about = "Patch vulnerable dependencies with Socket's security patches",
+    about = "Apply security fixes to the dependency versions you already use",
     version,
     propagate_version = true,
-    after_help = "Patch a project:\n  \
-        socket-patch scan --dry-run   Preview hosted changes from dependency files\n  \
-        socket-patch scan             Write hosted references for dependencies with patches\n  \
-        socket-patch get              Patch one package, CVE, GHSA or patch UUID\n  \
-        socket-patch list             Show the patches in this project\n\n\
-        Supported lockfiles work from a fresh checkout; install dependencies after scanning.\n\n\
-        Undo:\n  \
-        socket-patch remove           Unwind one patch (by PURL or UUID)\n  \
-        socket-patch rollback         Unwind every patch\n\n\
-        Ship:\n  \
-        socket-patch vex              Emit an OpenVEX document for your vulnerability scanner\n  \
-        socket-patch vendor           Eject the patches into .socket/vendor/ for offline installs\n\n\
-        Repair artifacts (agent and vendored):\n  \
-        socket-patch repair           Restore missing or corrupt artifacts; clean unused ones\n\n\
-        Agent mode (`scan --mode agent` edits installed files in place):\n  \
-        socket-patch apply            Re-apply .socket/manifest.json after each install (e.g. in CI)"
+    after_help = "Quick start:\n  \
+        socket-patch scan --dry-run   Preview patches and dependency-file changes\n  \
+        socket-patch scan             Apply patches, then run your package manager's install\n  \
+        socket-patch vex -O vex.json  Generate OpenVEX after installing\n\n\
+        Use 'socket-patch <command> -h' for common options, or '--help' for all options."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -71,8 +60,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Find patches from project dependency files; write hosted lockfile
-    /// references by default (preview with --dry-run)
+    /// Find and apply available patches (preview with --dry-run)
     ///
     /// Rewrites lockfiles and related dependency files to use Socket-hosted
     /// patched packages without prompting. Use `scan --dry-run` to preview
@@ -84,34 +72,29 @@ pub enum Commands {
     /// files, and sbt / scala-cli need their build tool's resolution records.
     Scan(commands::scan::ScanArgs),
 
-    /// Patch one package, CVE, GHSA or patch UUID (hosted mode by default)
+    /// Apply patches for a package, advisory, or patch UUID
     Get(commands::get::GetArgs),
 
-    /// List the patches in this project: hosted and vendored lockfile
-    /// references plus any agent-mode manifest entries
+    /// Show this project's patches in every mode
     List(commands::list::ListArgs),
 
-    /// Remove one patch by PURL or UUID: unwind its hosted or vendored
-    /// wiring, or roll back its agent-mode files and drop it from the
-    /// manifest
+    /// Restore and remove patches matching a package, PURL, or UUID
     Remove(commands::remove::RemoveArgs),
 
-    /// Undo patches: restore original files and unwind hosted or vendored
-    /// lockfile wiring
+    /// Restore selected patches, or all patches when no target is given
     Rollback(commands::rollback::RollbackArgs),
 
-    /// Generate an OpenVEX 0.2.0 document for the vulnerabilities the
-    /// project's patches fix
+    /// Generate OpenVEX for vulnerabilities addressed by verified patches
     Vex(commands::vex::VexArgs),
 
-    /// Eject patched dependencies into committable `.socket/vendor/` and
-    /// rewire lockfiles to use them (`--revert` undoes it)
+    /// Store patched dependencies in .socket/vendor/ for offline installs
     ///
-    /// Fresh checkouts then build with the patches, with no socket-patch or
-    /// Socket API needed.
+    /// Rewire dependency files to use the committed artifacts. Unpatched
+    /// dependencies still need their normal registry or cache. Use --revert
+    /// to undo vendoring.
     Vendor(commands::vendor::VendorArgs),
 
-    /// Agent mode: apply the patches in `.socket/manifest.json` in place
+    /// Reapply agent-mode patches after installing dependencies
     Apply(commands::apply::ApplyArgs),
 
     /// Restore agent or vendored patch artifacts and clean up unused ones
@@ -224,38 +207,23 @@ fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
 /// argument stays in `--help` and parses exactly as before.
 pub fn cli_command() -> clap::Command {
     use clap::CommandFactory;
-    let mut cmd = Cli::command();
-    let subs: Vec<String> = cmd
-        .get_subcommands()
-        .map(|s| s.get_name().to_string())
-        .collect();
-    for name in subs {
-        cmd = cmd.mut_subcommand(&name, |mut sub| {
-            let hidden_own = short_help_hidden_own(&name);
-            let extra = short_help_extra_globals(&name);
-            let ids: Vec<(String, bool)> = sub
-                .get_arguments()
-                .map(|a| {
-                    (
-                        a.get_id().to_string(),
-                        a.get_help_heading() == Some(args::GLOBAL_OPTIONS),
-                    )
-                })
-                .collect();
-            for (id, global) in ids {
-                let keep = if global {
-                    SHORT_HELP_GLOBALS.contains(&id.as_str()) || extra.contains(&id.as_str())
-                } else {
-                    !hidden_own.contains(&id.as_str())
-                };
-                if !keep {
-                    sub = sub.mut_arg(&id, |a| a.hide_short_help(true));
-                }
+    Cli::command().mut_subcommands(|sub| {
+        let hidden_own = short_help_hidden_own(sub.get_name());
+        let extra = short_help_extra_globals(sub.get_name());
+        sub.mut_args(|arg| {
+            let id = arg.get_id().as_str();
+            let keep = if arg.get_help_heading() == Some(args::GLOBAL_OPTIONS) {
+                SHORT_HELP_GLOBALS.contains(&id) || extra.contains(&id)
+            } else {
+                !hidden_own.contains(&id)
+            };
+            if keep {
+                arg
+            } else {
+                arg.hide_short_help(true)
             }
-            sub
-        });
-    }
-    cmd
+        })
+    })
 }
 
 /// Parse `argv` against [`cli_command`].

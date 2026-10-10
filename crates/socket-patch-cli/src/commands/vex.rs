@@ -113,9 +113,9 @@ pub struct VexArgs {
 /// set.
 #[derive(Args, Default, Clone)]
 pub struct VexEmbedArgs {
-    /// Generate an OpenVEX 0.2.0 document at this path after a successful
-    /// run. The document is always written to the file (never stdout), so
-    /// it never races the command's own `--json` output.
+    /// Write OpenVEX to this path after a successful run.
+    ///
+    /// The document is written to the file, leaving stdout for command output.
     #[arg(long = "vex", env = "SOCKET_VEX")]
     pub vex: Option<PathBuf>,
 

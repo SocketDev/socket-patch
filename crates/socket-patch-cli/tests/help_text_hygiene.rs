@@ -6,6 +6,36 @@
 use clap::CommandFactory;
 use socket_patch_cli::Cli;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
+#[test]
+fn help_never_prints_api_token_values() {
+    let command = Cli::command();
+    for sub in command.get_subcommands() {
+        for variable in ["SOCKET_API_TOKEN", "SOCKET_CLI_API_TOKEN"] {
+            let output = hermetic::binary_command()
+                .args([sub.get_name(), "--help"])
+                .env(variable, "help-must-not-print-this-token")
+                .output()
+                .expect("run help");
+            assert!(output.status.success(), "{} --help", sub.get_name());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("SOCKET_API_TOKEN"),
+                "token setting stays discoverable"
+            );
+            assert!(
+                !stdout.contains("help-must-not-print-this-token")
+                    && !stderr.contains("help-must-not-print-this-token"),
+                "{} --help exposed {variable}",
+                sub.get_name()
+            );
+        }
+    }
+}
+
 /// Tokens that only make sense to someone reading the source.
 const DEV_TOKENS: &[&str] = &[
     "clap",
@@ -151,9 +181,7 @@ fn vex_product_list_renders_one_item_per_line() {
 fn root_command_list_uses_the_verb_form() {
     let text = long_help(&[]);
     assert!(
-        text.contains(
-            "Undo patches: restore original files and unwind hosted or vendored lockfile wiring"
-        ),
+        text.contains("Restore selected patches, or all patches when no target is given"),
         "{text}"
     );
     assert!(!text.contains("Rollback patches"), "{text}");
@@ -165,7 +193,7 @@ fn root_command_list_uses_the_verb_form() {
     );
 }
 
-/// v5 leads with scan, vex, vendor and list; the agent-mode commands follow.
+/// The command list starts with discovery and inspection; the footer gives a quick start.
 #[test]
 fn root_command_list_leads_with_the_v5_workflow() {
     let text = long_help(&[]);
@@ -186,7 +214,9 @@ fn root_command_list_leads_with_the_v5_workflow() {
         "{text}"
     );
     assert!(
-        text.contains("Patch a project:") && text.contains("Agent mode ("),
+        text.contains("Quick start:")
+            && text.contains("socket-patch scan --dry-run")
+            && text.contains("socket-patch vex -O vex.json"),
         "{text}"
     );
     assert!(!text.contains("older agent-mode"), "{text}");
@@ -197,7 +227,7 @@ fn vendor_and_repair_summaries_read_as_one_line() {
     let text = long_help(&[]);
     assert!(
         text.lines().any(|l| l
-            == "  vendor    Eject patched dependencies into committable `.socket/vendor/` and rewire lockfiles to use them (`--revert` undoes it)"),
+            == "  vendor    Store patched dependencies in .socket/vendor/ for offline installs"),
         "{text}"
     );
     assert!(

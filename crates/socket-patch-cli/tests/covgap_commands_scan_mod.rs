@@ -1623,6 +1623,8 @@ mod pty {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
+        // These tests assert VT rendering, even when the parent has TERM=dumb.
+        cmd.env("TERM", "xterm-256color");
         // Scrub the flag-bound SOCKET_* surface so ambient configuration
         // cannot reroute the run; keep telemetry disabled and the
         // update notifier off — this child gets a REAL terminal, so the
