@@ -720,14 +720,15 @@ pub fn stale_global_package_detail(id: &str, version: &str, dir: &Path, how: &st
          `dotnet restore` keeps the upstream bytes (or fails NU1403 against the re-pinned lock). \
          Delete that directory (NuGet downloads the patched package again on the next restore) \
          and run `dotnet restore`; `dotnet nuget locals global-packages --clear` works too, but \
-         empties the WHOLE folder, every package of every project on this machine. Other machines and CI runners that restore a cached global packages \
-         folder must drop that entry too (key the CI cache on packages.lock.json with no \
+         empties the WHOLE folder, every package of every project on this machine. Other \
+         machines and CI runners that restore a cached global packages folder must drop that \
+         entry too (key the CI cache on packages.lock.json with no \
          fallback restore key)",
         dir.display()
     )
 }
 
-/// The ledger entry for a vendored nupkg:/// The ledger entry for a vendored nupkg: `wiring` is the config + lock
+/// The ledger entry for a vendored nupkg: `wiring` is the config + lock
 /// records on a full vendor, only the re-pinned lock record on an
 /// artifact-only rebuild (see the hot path).
 fn nuget_entry(
