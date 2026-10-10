@@ -300,6 +300,50 @@ fn hosted_pins_come_from_the_manifest_project() {
     }
 }
 
+/// `vex` builds one project's document: with the manifest (and so the
+/// ledgers and wiring) in `b`, the product is detected in `b` too, never
+/// from `--cwd`'s package.json.
+#[test]
+fn vex_detects_the_product_in_the_manifest_project() {
+    let f = fixture();
+    let a64 = "a".repeat(64);
+    let b64 = "b".repeat(64);
+    std::fs::write(
+        f.b.join(".socket/manifest.json"),
+        format!(
+            r#"{{"patches":{{"pkg:npm/lodash@4.17.20":{{
+  "uuid":"{UUID}","exportedAt":"2024-01-01T00:00:00Z",
+  "files":{{"package/index.js":{{"beforeHash":"{a64}","afterHash":"{b64}"}}}},
+  "vulnerabilities":{{"GHSA-aaaa-bbbb-cccc":{{"cves":["CVE-2024-1111"],
+    "summary":"s","severity":"high","description":"d"}}}},
+  "description":"d","license":"MIT","tier":"free"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    for (dir, name) in [(&f.a, "cwd-app"), (&f.b, "manifest-app")] {
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+    }
+    let out = f.a.parent().unwrap().join("vex.json");
+    let r = run(
+        &f,
+        &[
+            "vex",
+            "--json",
+            "--no-verify",
+            "--output",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let doc = std::fs::read_to_string(&out).unwrap();
+    assert!(doc.contains("pkg:npm/manifest-app@1.0.0"), "{doc}");
+    assert!(!doc.contains("cwd-app"), "{doc}");
+}
+
 /// A manifest file outside any `.socket/` directory relocates only the
 /// manifest: the project, and so the ledger rollback reverts, stays `--cwd`.
 #[test]

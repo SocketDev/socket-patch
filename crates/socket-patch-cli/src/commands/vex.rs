@@ -376,8 +376,14 @@ pub async fn run(args: VexArgs) -> i32 {
         api_client: RunApiClient::new(),
     };
 
-    let manifest_path = args.common.resolved_manifest_path();
-    match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
+    // One project for the whole document (#745): the ledgers and the
+    // wiring discovery are the manifest's project's, so product detection,
+    // the installed-copy crawl and the pnpm / PnP guards run there too
+    // (`cwd` moved to it; a no-op in the default layout). Mixing them would
+    // let another project's wiring vouch for this one's packages.
+    let common = args.common.at_project_root();
+    let manifest_path = common.resolved_manifest_path();
+    match generate_vex_from_manifest_path(&common, &params, &manifest_path).await {
         Ok(mut summary) => {
             run_warnings.append(&mut summary.warnings);
             summary.warnings = run_warnings;
