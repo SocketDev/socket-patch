@@ -169,7 +169,7 @@ pub(crate) async fn governed_locks_in(
                 "more than {WALK_DIR_BUDGET} directories under the project root"
             ));
         }
-        let entries = view.list_dir(&rel).await.map_err(|e| {
+        let entries = view.list_dir_strict(&rel).await.map_err(|e| {
             format!(
                 "unreadable {}: {e}",
                 if rel.is_empty() { "." } else { &rel }
@@ -285,5 +285,23 @@ mod tests {
                 "src/Lib/Lib.csproj"
             ]
         );
+    }
+
+    /// The view walk fails closed on a directory name it cannot spell, like
+    /// the disk walk: a member project under it would otherwise drop out of
+    /// the governed locks. (Linux: APFS refuses non-UTF-8 names.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn view_walk_fails_closed_on_a_non_utf8_dir() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let odd = root.join(std::ffi::OsStr::from_bytes(b"m\xffember"));
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("M.csproj"), "<Project />").unwrap();
+        std::fs::write(root.join("App.csproj"), "<Project />").unwrap();
+        assert!(super::project_files(root).is_err());
+        let view = crate::vendor::lock_inventory::ProjectView::Disk(root);
+        assert!(super::governed_locks_in(&view).await.is_err());
     }
 }
