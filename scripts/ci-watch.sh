@@ -43,6 +43,8 @@ query='query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullReq
   state headRefOid mergeQueueEntry{position state}
   commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}'
 
+errf=$(mktemp) || exit 2
+trap 'rm -f "$errf"' EXIT
 seen="" head="" queued="" was_in_queue=0 settled_before=-1 rollup_before="" polls=0
 total=0 pending=1 fail=0
 while true; do
@@ -64,9 +66,15 @@ while true; do
   if [ "$settled_before" = -1 ] || [ "$rollup" != "$rollup_before" ] || [ $((polls % 5)) = 0 ]; then
     # gh pr checks pages through every check; its exit status is 8 while any
     # is pending and 1 when one failed, so only its output is trusted.
-    checks=$(gh pr checks "$pr" -R "$repo" --json name,bucket 2>/dev/null)
+    checks=$(gh pr checks "$pr" -R "$repo" --json name,bucket 2>"$errf")
     if ! jq -e 'type == "array"' <<<"$checks" >/dev/null 2>&1; then
-      echo "warn: gh pr checks returned no JSON"; checks='[]'
+      # Keep the last counts and retry this fetch on the next poll; the
+      # paginated call is the expensive one, so back off on a rate limit.
+      rollup_before=""
+      if grep -qiE 'rate limit|HTTP 403|HTTP 429' "$errf"; then
+        echo "warn: GitHub rate limit hit; pausing 10 minutes"; sleep 600; continue
+      fi
+      echo "warn: gh pr checks returned no JSON"; sleep "$interval"; continue
     fi
     total=$(jq 'length' <<<"$checks")
     pending=$(jq '[.[] | select(.bucket == "pending")] | length' <<<"$checks")
@@ -99,8 +107,11 @@ while true; do
     CLOSED) echo "DONE closed"; exit 1 ;;
   esac
 
+  # gh pr checks lists only check runs that exist; the rollup also counts
+  # expected and re-queued ones, so both must agree before calling it done.
   if [ "$merge" = 0 ]; then
-    if [ "$total" -gt 0 ] && [ "$pending" = 0 ]; then
+    if [ "$total" -gt 0 ] && [ "$pending" = 0 ] \
+      && { [ "$rollup" = SUCCESS ] || [ "$rollup" = FAILURE ] || [ "$rollup" = ERROR ]; }; then
       if [ "$fail" = 0 ]; then echo "DONE checks pass ($total checks)"; exit 0; fi
       echo "DONE checks fail ($fail of $total failed)"; exit 1
     fi
