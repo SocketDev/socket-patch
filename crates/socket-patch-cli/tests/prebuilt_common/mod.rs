@@ -155,7 +155,6 @@ async fn mount_project_with_roots(server: &MockServer, root: &Path, extra: Vec<P
     let blobs = root.join(".socket/blobs");
     let sources = PatchSources {
         blobs_path: &blobs,
-        diffs_path: None,
         mem_blobs: None,
     };
     let mut roots = vec![root.to_path_buf()];
@@ -549,7 +548,6 @@ pub async fn mount_view_from_source(
     }
     let sources = PatchSources {
         blobs_path: tmp.path(),
-        diffs_path: None,
         mem_blobs: Some(&blobs),
     };
     let package = archive(purl, &source, &record, &sources).await.unwrap();

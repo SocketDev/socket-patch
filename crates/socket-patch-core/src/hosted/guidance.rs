@@ -2,24 +2,6 @@
 //! and npm `allow-remote` auto-config planners and every warning text they
 //! emit, shared verbatim by the disk and in-memory engines.
 
-/// `scheme://[user[:pass]@]host[:port]/…` → `host[:port]`, NEVER userinfo.
-/// For user-facing messages that name where a lockfile now points — the
-/// hosted artifact host follows `--api-url`, so hardcoding `patch.socket.dev`
-/// would misname it in custom-server environments. The port is kept (it is
-/// part of the authority the lock records); credentials are stripped: a
-/// credentialed artifact URL (`https://user:secret@host/…`) must never leak
-/// `user:secret` into the warning text or the persisted `--json` envelope —
-/// both land in CI logs. Split by hand because this crate has no URL-parser
-/// dependency (reqwest is dev-only here); per RFC 3986 a raw `@` in the
-/// authority can ONLY be the userinfo terminator (it is percent-encoded
-/// everywhere else), so the tail after the LAST `@` is exactly host[:port].
-pub fn url_host(url: &str) -> Option<&str> {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    (!host.is_empty()).then_some(host)
-}
-
 /// Repo-relative path of the pnpm workspace manifest the trustLockfile
 /// auto-config edits (the same file the vendor backend's override surface
 /// uses).

@@ -2774,3 +2774,199 @@ async fn scan_agent_json_mismatch_overwrite_reaches_the_apply_block() {
         b"after\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1062: human / JSON parity when every detail query succeeds but is empty
+// ---------------------------------------------------------------------------
+
+/// Mount a by-package response that succeeds with NO patch records (the
+/// batch said the package has one; the detail query found none to offer).
+async fn mount_by_package_empty(mock: &MockServer, purl: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{}",
+            encode_purl(purl)
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// #1062: when every detail query succeeds but returns no records, scan
+/// has nothing to select. That is a successful run with no applicable
+/// patches in every mode, so the human arm must exit like the `--json`
+/// arm (0), not report a fetch failure and exit 1.
+#[tokio::test]
+async fn scan_empty_detail_results_exit_alike_in_human_and_json() {
+    let purl = "pkg:npm/minimist@1.2.2";
+    // `--prune` alone is report-only (no mode); `--dry-run` keeps every
+    // mode read-only.
+    let modes: [&[&str]; 4] = [
+        &["--mode", "agent"],
+        &["--mode", "vendored"],
+        &["--mode", "hosted"],
+        &["--prune"],
+    ];
+    for mode in modes {
+        for dry in [false, true] {
+            let mock = MockServer::start().await;
+            mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+            mount_by_package_empty(&mock, purl).await;
+
+            let mut codes = Vec::new();
+            for json in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                write_root_package_json(tmp.path());
+                write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+                let mut extra: Vec<&str> = mode.to_vec();
+                if dry {
+                    extra.push("--dry-run");
+                }
+                if json {
+                    extra.push("--json");
+                }
+                let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &extra);
+                assert!(
+                    !stderr.contains("could not fetch patch details"),
+                    "{extra:?}: no query failed, so no fetch failure; stderr={stderr}"
+                );
+                if json {
+                    let v: serde_json::Value =
+                        serde_json::from_str(stdout.trim()).expect("valid JSON");
+                    assert_ne!(v["status"], "error", "{extra:?}: {v}");
+                }
+                codes.push((code, stdout, stderr));
+            }
+            let (human, json) = (&codes[0], &codes[1]);
+            assert_eq!(
+                human.0, json.0,
+                "{mode:?} dry={dry}: human and --json exit alike\n\
+                 human stdout={}\nhuman stderr={}\njson stdout={}\njson stderr={}",
+                human.1, human.2, json.1, json.2
+            );
+            assert_eq!(human.0, 0, "{mode:?} dry={dry}: nothing to do is a success");
+        }
+    }
+}
+
+/// #1062: a human `--dry-run --prune` previews the GC (once) where the
+/// `--json` arm previews it (`gc` block).
+#[tokio::test]
+async fn scan_dry_run_prune_previews_gc_in_human_and_json() {
+    let purl = "pkg:npm/minimist@1.2.2";
+    let stale = "pkg:npm/left-pad@1.3.0";
+    // Agent and report-only (no mode; `--prune` below). Vendored mode's
+    // human GC on early exits is #1127.
+    for mode in [&["--mode", "agent"][..], &[][..]] {
+        let mock = MockServer::start().await;
+        mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+        mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+        for json in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_root_package_json(tmp.path());
+            write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+            // A recorded patch for a package that is not installed: the
+            // GC would prune its entry.
+            seed_manifest(tmp.path(), &[(stale, OLD_UUID)]);
+            let manifest = tmp.path().join(".socket/manifest.json");
+            let before = std::fs::read(&manifest).unwrap();
+            let mut extra: Vec<&str> = mode.to_vec();
+            extra.extend(["--prune", "--dry-run", "--yes"]);
+            if json {
+                extra.push("--json");
+            }
+            let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &extra);
+            assert_eq!(code, 0, "{extra:?}: stdout={stdout}; stderr={stderr}");
+            if json {
+                let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+                assert!(
+                    v["gc"]["prunableManifestEntries"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|p| p == stale)),
+                    "{extra:?}: {v}"
+                );
+            } else {
+                assert_eq!(
+                    stdout
+                        .matches("[dry-run] GC would prune 1 manifest entry")
+                        .count(),
+                    1,
+                    "{extra:?}: the human dry run previews the GC once; stdout={stdout}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(&manifest).unwrap(),
+                before,
+                "{extra:?}: a dry run writes nothing"
+            );
+        }
+    }
+}
+
+/// #1062: when some detail queries fail and the rest succeed with no
+/// records, the human run still warns per failed package (the `--json`
+/// arm adds a `patch_details_failed` warning each) and exits like it.
+#[tokio::test]
+async fn scan_partial_failure_with_empty_results_still_warns() {
+    let empty = "pkg:npm/minimist@1.2.2";
+    let bad = "pkg:npm/lodash@4.17.20";
+    let mock = MockServer::start().await;
+    let patch = |purl: &str| {
+        serde_json::json!({
+            "uuid": UUID, "purl": purl, "tier": "free", "cveIds": [],
+            "ghsaIds": [], "severity": "high", "title": "t"
+        })
+    };
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [
+                {"purl": empty, "patches": [patch(empty)]},
+                {"purl": bad, "patches": [patch(bad)]},
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    mount_by_package_empty(&mock, empty).await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{}",
+            encode_purl(bad)
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+
+    let mut codes = Vec::new();
+    for json in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+        write_npm_package(tmp.path(), "lodash", "4.17.20", b"x\n");
+        let mut extra = vec!["--mode", "agent", "--dry-run"];
+        if json {
+            extra.push("--json");
+        }
+        let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &extra);
+        if json {
+            let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+            assert!(
+                v["warnings"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|w| w["code"] == "patch_details_failed")),
+                "{v}"
+            );
+        } else {
+            assert!(
+                stderr.contains(&format!("Warning: could not fetch details for {bad}")),
+                "the failed package is named; stderr={stderr}"
+            );
+        }
+        codes.push(code);
+    }
+    assert_eq!(codes[0], codes[1], "human and --json exit alike");
+}

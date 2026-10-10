@@ -258,8 +258,9 @@ pub(crate) fn rewrite_composer_lock(
         };
         let rewritten = (!already_redirected).then_some(rewritten);
         // Drops the entry's `source` wherever it sits and the dist's
-        // `mirrors` (see `composer_source`); the edit spans both, so the
-        // ledger's fragment revert restores them byte-for-byte.
+        // `mirrors` (see `composer_source`); the edit spans both, so a
+        // ledger fragment revert restores them byte-for-byte (the upstream
+        // restore does not bring `transport-options` back; it warns).
         let span = composer_source::DistSpan {
             entry_start,
             entry_end,

@@ -201,24 +201,21 @@ impl Ctx<'_> {
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_pnpm_legacy<'a>(
     purl: &str,
-    installed_dir: impl Into<PackageSource<'a>>,
+    _installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     super::pnpm_lock::vendor_pnpm_dialect(
         purl,
-        installed_dir.into(),
         project_root,
         record,
-        sources,
         vendored_at,
         dry_run,
-        force,
         service,
         PnpmDialect::Legacy,
     )

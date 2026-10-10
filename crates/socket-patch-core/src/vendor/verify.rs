@@ -852,11 +852,11 @@ mod tests {
     }
 
     fn entry(eco: &str, uuid: &str, rel_path: &str) -> VendorEntry {
-        VendorEntry {
-            ecosystem: eco.into(),
-            base_purl: "pkg:npm/x@1.0.0".into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            eco.into(),
+            "pkg:npm/x@1.0.0".into(),
+            uuid.into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel_path.into(),
                 sha256: String::new(),
@@ -864,18 +864,8 @@ mod tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+            Vec::new(),
+        )
     }
 
     fn write_tgz(dest: &Path, member: &str, bytes: &[u8]) {

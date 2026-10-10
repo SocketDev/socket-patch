@@ -253,11 +253,11 @@ async fn write_ledger_entry(root: &Path, eco: &str) {
     let mut state = VendorState::default();
     state.entries.insert(
         PURL.to_string(),
-        VendorEntry {
-            ecosystem: eco.into(),
-            base_purl: PURL.into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            eco.into(),
+            PURL.into(),
+            UUID.into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: format!(".socket/vendor/{eco}/{UUID}/left-pad-1.3.0.tgz"),
                 sha256: String::new(),
@@ -265,18 +265,8 @@ async fn write_ledger_entry(root: &Path, eco: &str) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
+            Vec::new(),
+        ),
     );
     save_state(root, &state).await.unwrap();
 }

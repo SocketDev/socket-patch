@@ -4,7 +4,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::ArtifactSource;
-use crate::vendor::common::{pep508_name, pyproject_dependency_specs};
+use crate::vendor::common::{is_pep508_direct_reference, pep508_name, pyproject_dependency_specs};
 
 pub(crate) fn script_metadata(text: &str) -> Result<(Range<usize>, String), String> {
     let mut offset = 0;
@@ -65,7 +65,12 @@ fn dependency_name(specifier: &str) -> String {
 /// package that `current` may replace: a rotated grant token on the same
 /// artifact path, or (the shared PyPI recognizer) a superseding patch uuid
 /// for the same name and version on Socket's patch server.
-fn same_hosted_artifact(previous: &str, current: &str, name: &str, version: &str) -> bool {
+pub(crate) fn same_hosted_artifact(
+    previous: &str,
+    current: &str,
+    name: &str,
+    version: &str,
+) -> bool {
     if crate::vendor::lock_inventory::pypi::replaceable_hosted_pin(previous, current, name, version)
     {
         return true;
@@ -155,6 +160,7 @@ fn rewrite_sources(
     direct: bool,
     layout: SourcesLayout,
 ) -> Result<(), String> {
+    let hosted = matches!(artifact, ArtifactSource::Url(_));
     let (key, location) = match artifact {
         ArtifactSource::Url(location) => ("url", location),
         ArtifactSource::Path(location) => ("path", location),
@@ -220,11 +226,73 @@ fn rewrite_sources(
                     "Python project already overrides {name}; revert it before applying a patch"
                 ));
             }
+        } else if hosted {
+            push_hosted_override(overrides, specifier);
         } else {
             overrides.push(specifier);
         }
     }
     Ok(())
+}
+
+/// Refuse when one of `specs` declares `name` (canonical) as a PEP 508
+/// direct reference (`six @ https://…`, `six @ git+…`): that is the user's
+/// own source, the `[project]` spelling of a `[tool.uv.sources]` entry, and
+/// a source added beside it would silently replace it (hosted) or leave a
+/// lock uv rejects (vendored) (#767).
+fn refuse_direct_reference<'a>(
+    file: &str,
+    name: &str,
+    specs: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    match specs
+        .into_iter()
+        .find(|spec| dependency_name(spec) == name && is_pep508_direct_reference(spec))
+    {
+        Some(spec) => Err(format!(
+            "{file} declares {name} as the PEP 508 direct reference {spec:?}; refusing to \
+             overwrite a user-authored source"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The comment the hosted rewrite puts on the line above each
+/// `override-dependencies` entry it adds. v5 hosted mode keeps no ledger,
+/// so this comment is the only evidence the upstream restore has that the
+/// entry is socket-patch's to remove: an entry without it, even one spelled
+/// exactly `<name>==<version>`, is the user's own pin and is kept (#411).
+pub(crate) const HOSTED_OVERRIDE_MARK: &str =
+    "# socket-patch hosted: pins a patched transitive dependency; rollback removes it";
+
+/// Whether an `override-dependencies` element carries
+/// [`HOSTED_OVERRIDE_MARK`] (the hosted rewrite added it).
+pub(crate) fn is_hosted_override(value: &Value) -> bool {
+    value
+        .decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .is_some_and(|prefix| prefix.contains(HOSTED_OVERRIDE_MARK))
+}
+
+/// Append `specifier` to `overrides` on its own line, under
+/// [`HOSTED_OVERRIDE_MARK`]. An array the rewrite just created (empty) is
+/// laid out multi-line with a trailing comma; an existing array keeps its
+/// other elements as they were. Removing the element again (its decor goes
+/// with it) restores the array's original bytes.
+fn push_hosted_override(overrides: &mut Array, specifier: String) {
+    const INDENT: &str = "    ";
+    let created = overrides.is_empty();
+    let mut value = Value::from(specifier);
+    value
+        .decor_mut()
+        .set_prefix(format!("\n{INDENT}{HOSTED_OVERRIDE_MARK}\n{INDENT}"));
+    value.decor_mut().set_suffix("");
+    overrides.push_formatted(value);
+    if created {
+        overrides.set_trailing_comma(true);
+        overrides.set_trailing("\n");
+    }
 }
 
 fn contains_dependency(item: Option<&Item>, name: &str) -> bool {
@@ -258,6 +326,20 @@ pub fn rewrite_project_metadata(
         .and_then(Item::as_table_like)
         .and_then(|tool| tool.get("uv"))
         .and_then(Item::as_table_like);
+    let legacy_dev = tool_uv
+        .and_then(|uv| uv.get("dev-dependencies"))
+        .and_then(Item::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    refuse_direct_reference(
+        "pyproject.toml",
+        &name,
+        pyproject_dependency_specs(&document)
+            .into_iter()
+            .map(|(_, spec)| spec)
+            .chain(legacy_dev),
+    )?;
     let direct = pyproject_dependency_specs(&document)
         .into_iter()
         .any(|(_, spec)| dependency_name(spec) == name)
@@ -296,6 +378,16 @@ pub fn rewrite_script_metadata(
         .parse()
         .map_err(|error| format!("invalid script metadata: {error}"))?;
     let name = canonicalize_pypi_name(name);
+    refuse_direct_reference(
+        "the script metadata",
+        &name,
+        document
+            .get("dependencies")
+            .and_then(Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    )?;
     let direct = contains_dependency(document.get("dependencies"), &name);
     rewrite_sources(
         &mut document,
@@ -324,6 +416,57 @@ mod tests {
         let crlf_majority = "# /// script\r\n# dependencies = []\r\n# ///\r\nprint('x')\n";
         let out = replace_script_metadata(crlf_majority, "dependencies = [\"a\"]\n").unwrap();
         assert!(out.contains("# dependencies = [\"a\"]\r\n# ///"), "{out:?}");
+    }
+
+    /// #767: a PEP 508 direct reference to the patched package, wherever
+    /// the project or script declares it, is the user's own source: the
+    /// rewrite refuses instead of adding a `[tool.uv.sources]` entry beside it.
+    #[test]
+    fn direct_references_to_the_package_are_refused() {
+        const URL: &str = "https://patch.socket.dev/six-1.16.0-py2.py3-none-any.whl";
+        const WHEEL: &str =
+            "https://files.pythonhosted.org/packages/d9/six-1.16.0-py2.py3-none-any.whl";
+        let head = "[project]\nname = \"app\"\nversion = \"0.1.0\"\n";
+        for (deps, tail) in [
+            (format!("[\"six @ {WHEEL}\", \"idna==3.7\"]"), String::new()),
+            (
+                "[\"Six[x]@git+https://github.com/benjaminp/six@1.16.0\"]".to_string(),
+                String::new(),
+            ),
+            (
+                "[\"idna==3.7\"]".to_string(),
+                format!("\n[project.optional-dependencies]\nx = [\"six @ {WHEEL}\"]\n"),
+            ),
+            (
+                "[\"idna==3.7\"]".to_string(),
+                format!("\n[dependency-groups]\ndev = [\"six @ {WHEEL}\"]\n"),
+            ),
+            (
+                "[\"idna==3.7\"]".to_string(),
+                format!("\n[tool.uv]\ndev-dependencies = [\"six @ {WHEEL}\"]\n"),
+            ),
+        ] {
+            let text = format!("{head}dependencies = {deps}\n{tail}");
+            let err = rewrite_project_metadata(&text, "six", "1.16.0", ArtifactSource::Url(URL))
+                .unwrap_err();
+            assert!(err.contains("PEP 508 direct reference"), "{err}\n{text}");
+        }
+        let script =
+            format!("# /// script\n# dependencies = [\"six @ {WHEEL}\"]\n# ///\nimport six\n");
+        for artifact in [
+            ArtifactSource::Url(URL),
+            ArtifactSource::Path("w/six-1.16.0-py2.py3-none-any.whl"),
+        ] {
+            let err = rewrite_script_metadata(&script, "six", "1.16.0", artifact).unwrap_err();
+            assert!(err.contains("PEP 508 direct reference"), "{err}");
+        }
+        // Another package's direct reference is not this one's source.
+        let other = format!("{head}dependencies = [\"six==1.16.0\", \"idna @ {WHEEL}\"]\n");
+        assert!(
+            rewrite_project_metadata(&other, "six", "1.16.0", ArtifactSource::Url(URL))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -574,7 +717,7 @@ mod rendering_tests {
         .unwrap();
         assert_eq!(
             transitive,
-            format!("[project]\nname = \"p\"\ndependencies = [\"requests\"]\n\n[tool.uv]\noverride-dependencies = [\"alpha==1.0.0\"]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n")
+            format!("[project]\nname = \"p\"\ndependencies = [\"requests\"]\n\n[tool.uv]\noverride-dependencies = [\n    {HOSTED_OVERRIDE_MARK}\n    \"alpha==1.0.0\",\n]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n")
         );
         assert_settled(&transitive);
         // An existing `[tool.uv]` header gains the sources as its own
@@ -760,7 +903,7 @@ mod rendering_tests {
         .unwrap();
         assert_eq!(
             transitive,
-            format!("[tool.ruff]\nline-length = 100\n\n[tool.uv]\noverride-dependencies = [\"alpha==1.0.0\"]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n\n[project]\nname = \"p\"\ndependencies = [\"requests\"]\n")
+            format!("[tool.ruff]\nline-length = 100\n\n[tool.uv]\noverride-dependencies = [\n    {HOSTED_OVERRIDE_MARK}\n    \"alpha==1.0.0\",\n]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n\n[project]\nname = \"p\"\ndependencies = [\"requests\"]\n")
         );
         assert_settled(&transitive);
 
@@ -820,7 +963,7 @@ mod rendering_tests {
         .unwrap();
         assert_eq!(
             transitive,
-            format!("tool.uv.sources.other = {{ git = \"https://example.test/other\" }}\ntool.uv.sources.alpha = {{ url = \"{URL}\" }}\ntool.uv.override-dependencies = [\"alpha==1.0.0\"]\n\n[project]\nname = \"p\"\ndependencies = [\"other\"]\n")
+            format!("tool.uv.sources.other = {{ git = \"https://example.test/other\" }}\ntool.uv.sources.alpha = {{ url = \"{URL}\" }}\ntool.uv.override-dependencies = [\n    {HOSTED_OVERRIDE_MARK}\n    \"alpha==1.0.0\",\n]\n\n[project]\nname = \"p\"\ndependencies = [\"other\"]\n")
         );
         assert_settled(&transitive);
     }
@@ -848,7 +991,7 @@ mod rendering_tests {
             ),
             (
                 "# /// script\n# dependencies = [\"requests\", \"beta\"]\n#\n# [tool.uv.sources]\n# beta = { git = \"https://example.test/beta\" }\n# ///\nprint('x')\n",
-                format!("# /// script\n# dependencies = [\"requests\", \"beta\"]\n#\n# [tool.uv]\n# override-dependencies = [\"alpha==1.0.0\"]\n#\n# [tool.uv.sources]\n# beta = {{ git = \"https://example.test/beta\" }}\n# alpha = {{ url = \"{URL}\" }}\n# ///\nprint('x')\n"),
+                format!("# /// script\n# dependencies = [\"requests\", \"beta\"]\n#\n# [tool.uv]\n# override-dependencies = [\n#     {HOSTED_OVERRIDE_MARK}\n#     \"alpha==1.0.0\",\n# ]\n#\n# [tool.uv.sources]\n# beta = {{ git = \"https://example.test/beta\" }}\n# alpha = {{ url = \"{URL}\" }}\n# ///\nprint('x')\n"),
             ),
         ];
         for (script, expected) in cases {

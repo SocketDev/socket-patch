@@ -221,9 +221,10 @@ pub fn resolve_api_base_url() -> String {
     env_non_empty("SOCKET_API_URL")
         .or_else(|| {
             load().and_then(|c| c.api_base_url.clone()).inspect(|url| {
-                if crate::utils::env_compat::is_debug_enabled() {
-                    eprintln!("[socket-patch debug] api base url: `{url}` from socket-cli config");
-                }
+                crate::utils::env_compat::debug_log(
+                    "debug",
+                    &format!("api base url: `{url}` from socket-cli config"),
+                );
             })
         })
         .unwrap_or_else(|| crate::constants::DEFAULT_SOCKET_API_URL.to_string())

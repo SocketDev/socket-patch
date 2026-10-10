@@ -127,24 +127,21 @@ const REVERT_ALLOWLIST: [&str; 3] = [PNPM_LOCK, PACKAGE_JSON, PNPM_WORKSPACE];
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_pnpm<'a>(
     purl: &str,
-    installed_dir: impl Into<PackageSource<'a>>,
+    _installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     vendor_pnpm_dialect(
         purl,
-        installed_dir.into(),
         project_root,
         record,
-        sources,
         vendored_at,
         dry_run,
-        force,
         service,
         PnpmDialect::V9,
     )
@@ -172,16 +169,12 @@ impl PnpmDialect {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn vendor_pnpm_dialect(
     purl: &str,
-    installed_dir: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
     service: Option<&super::VendorServiceConfig>,
     dialect: PnpmDialect,
 ) -> VendorOutcome {
@@ -189,13 +182,10 @@ pub(super) async fn vendor_pnpm_dialect(
         &PnpmBackend { dialect },
         NpmVendorRequest {
             purl,
-            installed_dir,
             project_root,
             record,
-            sources,
             vendored_at,
             dry_run,
-            force,
             service,
         },
     )
