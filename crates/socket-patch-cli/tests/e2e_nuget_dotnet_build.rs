@@ -773,37 +773,60 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
     let backend = Backend::start(HOSTED_UUID, &pristine, &patched, Some(&nupkg));
     let uri = backend.uri();
 
-    // `scan --mode hosted --vex`: the real rewriter + the in-run VEX.
-    let embedded = fixture.join("scan.vex.json");
-    let (code, env, stderr) = socket_patch(
-        &fixture,
-        &store_fx,
-        &[
-            "scan",
-            "--mode",
-            "hosted",
-            "--json",
-            "--yes",
-            "--api-url",
-            &uri,
-            "--org",
-            ORG,
-            "--api-token",
-            "fake-token",
-            "--patch-server-url",
-            &uri,
-            "--vex",
-            embedded.to_str().unwrap(),
-            "--vex-product",
-            PRODUCT,
-        ],
-    );
+    // `scan --mode hosted`: the real rewriter. The fixture restore left the
+    // UPSTREAM copy in the global packages folder, which NuGet would restore
+    // instead of asking the Socket source (#352): the run says so, names
+    // the directory to delete, and keeps saying so on re-runs until it is.
+    let hosted_args = [
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake-token",
+        "--patch-server-url",
+        &uri,
+    ];
+    let (code, env, stderr) = socket_patch(&fixture, &store_fx, &hosted_args);
     assert_eq!(
         code,
         Some(0),
         "SDK {sdk} scan --mode hosted: {env:#}\n{stderr}"
     );
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let stale_dir = pkg_dir(&store_fx);
+    let warned = env.to_string();
+    assert!(
+        warned.contains("redirect_nuget_stale_global_package")
+            && warned.contains(&stale_dir.display().to_string()),
+        "SDK {sdk}: the warm global packages folder is reported: {env:#}"
+    );
+    // The prescribed remedy, then the idempotent re-run with the in-run VEX.
+    std::fs::remove_dir_all(&stale_dir).unwrap();
+    let embedded = fixture.join("scan.vex.json");
+    let mut vex_args = hosted_args.to_vec();
+    vex_args.extend([
+        "--vex",
+        embedded.to_str().unwrap(),
+        "--vex-product",
+        PRODUCT,
+    ]);
+    let (code, env, stderr) = socket_patch(&fixture, &store_fx, &vex_args);
+    assert_eq!(
+        code,
+        Some(0),
+        "SDK {sdk} scan --mode hosted --vex: {env:#}\n{stderr}"
+    );
+    assert!(
+        !env.to_string()
+            .contains("redirect_nuget_stale_global_package"),
+        "SDK {sdk}: nothing stale once the copy is gone: {env:#}"
+    );
     let doc: Value = serde_json::from_slice(&std::fs::read(&embedded).unwrap()).unwrap();
     assert_attested(&doc, PURL, HOSTED_UUID, Marker::Redirected, &vulns());
     let config = std::fs::read_to_string(fixture.join("nuget.config")).unwrap();
@@ -915,6 +938,13 @@ fn nuget_vendored_dotnet_restore_then_manifestless_vex() {
         code,
         Some(0),
         "SDK {sdk} scan --mode vendored: {env:#}\n{stderr}"
+    );
+    // The fixture restore's UPSTREAM copy in the global packages folder
+    // would shadow the vendored feed on this machine (#352): reported.
+    assert!(
+        env.to_string()
+            .contains("vendor_nuget_stale_global_package"),
+        "SDK {sdk}: the warm global packages folder is reported: {env:#}"
     );
     let doc: Value = serde_json::from_slice(&std::fs::read(&embedded).unwrap()).unwrap();
     assert_attested(&doc, PURL, VENDORED_UUID, Marker::Vendored, &vulns());
