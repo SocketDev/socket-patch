@@ -9,7 +9,9 @@
 //! * `CVE-YYYY-N…` / `GHSA-xxxx-xxxx-xxxx` (any case) name an advisory;
 //! * a `pkg:` token is a purl — with a version it names one release (a base
 //!   purl covers every release variant, a `?qualified` one exactly one
-//!   variant); without a version it names every installed version;
+//!   variant); without a version it names every installed version of the
+//!   same package ([`package_identity`], the [`PurlKey`] identity: case
+//!   folds only where the ecosystem folds it, PyPI, NuGet and Composer);
 //! * anything else is a package name, matched EXACTLY (full name or last
 //!   segment, case-insensitive, PEP 503 for PyPI) by
 //!   [`crate::policy::package_spec_matches`] — the matcher `scan --package`
@@ -17,8 +19,10 @@
 //!   major-version suffix (`v2` in `github.com/x/y/v2`) is never a name.
 //!
 //! A name's last-segment rule can select several packages (`core` →
-//! `@angular/core` and `@babel/core`). `get`, `remove` and `rollback` act
-//! on one package per name, so they refuse such a name
+//! `@angular/core` and `@babel/core`), and its case-insensitive rule
+//! several case-distinct ones (`jsonstream` → npm's `JSONStream` and
+//! `jsonstream`, Go's `Sirupsen` and `sirupsen`). `get`, `remove` and
+//! `rollback` act on one package per name, so they refuse such a name
 //! ([`Target::ambiguity`]) and ask for the full name or a purl;
 //! `scan --package` and `socket.yml` keep selecting all of them.
 //!
@@ -29,7 +33,8 @@ use std::fmt;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::policy::package_spec_matches;
-use crate::utils::purl::{canonical_purl, is_purl, purl_matches_identifier, strip_purl_qualifiers};
+use crate::utils::purl::{is_purl, purl_matches_identifier, strip_purl_qualifiers};
+use crate::utils::purl_key::{canonical_base_purl, PurlKey};
 
 /// What a target token names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,8 +68,10 @@ pub struct Target {
     kind: TargetKind,
     text: String,
     /// Set by [`Target::settle`] when a name's full-name match won over
-    /// last-segment ones: the name then selects only that full name.
-    full_name_only: bool,
+    /// last-segment ones, or its exact-case spelling over case-distinct
+    /// packages: the name then selects only that package
+    /// ([`package_identity`]).
+    only: Option<String>,
 }
 
 impl fmt::Display for Target {
@@ -97,7 +104,7 @@ impl Target {
         Self {
             kind,
             text: token.to_string(),
-            full_name_only: false,
+            only: None,
         }
     }
 
@@ -128,14 +135,23 @@ impl Target {
     }
 
     /// Does this target select the installed package `purl`? Purls and
-    /// names only: a versioned purl selects that release (qualifiers
-    /// ignored), a versionless purl or a name selects every version.
+    /// names only: a versioned purl selects that release ([`PurlKey`],
+    /// qualifiers ignored), a versionless purl or a name selects every
+    /// version.
     pub fn matches_package(&self, purl: &str) -> bool {
         match self.kind {
-            TargetKind::Purl => package_spec_matches(&self.text, purl),
+            TargetKind::Purl if purl_has_version(&self.text) => PurlKey::same(purl, &self.text),
+            TargetKind::Purl => self.same_package(purl),
             TargetKind::Name => self.name_matches(purl),
             TargetKind::Uuid | TargetKind::Cve | TargetKind::Ghsa => false,
         }
+    }
+
+    /// A versionless purl target: does `purl` have the target's
+    /// [`package_identity`]?
+    fn same_package(&self, purl: &str) -> bool {
+        package_identity(&self.text)
+            .is_some_and(|target| package_identity(purl).is_some_and(|other| other == target))
     }
 
     /// The name rule: [`package_spec_matches`], except that a Go
@@ -146,8 +162,10 @@ impl Target {
             return false;
         }
         package_spec_matches(&self.text, purl)
-            && (!self.full_name_only
-                || package_identity(purl).is_some_and(|identity| self.is_full_name_of(&identity)))
+            && self
+                .only
+                .as_ref()
+                .is_none_or(|only| package_identity(purl).as_ref() == Some(only))
     }
 
     /// For a package name, the distinct packages it selects among `purls`
@@ -165,11 +183,17 @@ impl Target {
     /// ones (`lodash` beside `@types/lodash`) selects only the full name
     /// from then on; every other target comes back unchanged.
     ///
+    /// Packages are counted by [`package_identity`], so case-distinct
+    /// npm, Go, Maven, cargo and gem packages are two. A name typed with
+    /// an uppercase letter settles on its exact-case spelling among them
+    /// (`JSONStream`); an all-lowercase name reaching both is ambiguous
+    /// (`jsonstream`), since lowercase is how any name may be typed.
+    ///
     /// `get`, `remove` and `rollback` refuse an ambiguous name instead of
     /// acting on every package it reaches by last segment, and act on the
     /// settled target so they never select more than the check allowed.
     pub fn settle<'a>(&self, purls: impl IntoIterator<Item = &'a str>) -> Result<Target, String> {
-        if self.kind != TargetKind::Name || self.full_name_only {
+        if self.kind != TargetKind::Name || self.only.is_some() {
             return Ok(self.clone());
         }
         let mut packages: Vec<String> = purls
@@ -187,10 +211,22 @@ impl Target {
             .filter(|identity| self.is_full_name_of(identity))
             .cloned()
             .collect();
-        let mut settled = self.clone();
+        let mut narrowed = false;
         if !full.is_empty() {
-            settled.full_name_only = full.len() < packages.len();
+            narrowed = full.len() < packages.len();
             packages = full;
+        }
+        let typed = self.text.trim();
+        if packages.len() > 1 && typed.chars().any(char::is_uppercase) {
+            let exact: Vec<String> = packages
+                .iter()
+                .filter(|identity| identity_name(identity) == Some(&typed.replace(':', "/")))
+                .cloned()
+                .collect();
+            if exact.len() == 1 {
+                narrowed = true;
+                packages = exact;
+            }
         }
         if packages.len() > 1 {
             return Err(format!(
@@ -199,23 +235,25 @@ impl Target {
                 packages.join(", ")
             ));
         }
+        let mut settled = self.clone();
+        if narrowed {
+            settled.only = packages.pop();
+        }
         Ok(settled)
     }
 
     /// Is this name the full name of the package `identity` (as
-    /// [`package_identity`] returns it), not just its last segment?
+    /// [`package_identity`] returns it, in any case), not just its last
+    /// segment?
     fn is_full_name_of(&self, identity: &str) -> bool {
-        let Some((ty, name)) = identity
-            .strip_prefix("pkg:")
-            .and_then(|rest| rest.split_once('/'))
-        else {
+        let Some(name) = identity_name(identity) else {
             return false;
         };
         let spec = self.text.trim().to_lowercase();
-        if ty == "pypi" {
+        if identity.starts_with("pkg:pypi/") {
             return name == canonicalize_pypi_name(&spec);
         }
-        name == spec.replace(':', "/")
+        name.to_lowercase() == spec.replace(':', "/")
     }
 
     /// Does this target select the recorded patch `(purl, uuid)` — a
@@ -225,7 +263,9 @@ impl Target {
     /// * Versioned or qualified purl: the record's purl, with release-variant
     ///   rules ([`purl_matches_identifier`]: a base purl covers every
     ///   variant, a qualified one exactly one).
-    /// * Versionless purl / name: every recorded version of the package.
+    /// * Versionless purl: every recorded version of the same package
+    ///   ([`package_identity`]).
+    /// * Name: every recorded version of the package.
     ///   A name is also compared to the uuid verbatim, so a non-canonical
     ///   recorded uuid stays addressable.
     /// * CVE / GHSA: nothing (records carry no advisory index).
@@ -235,19 +275,22 @@ impl Target {
             TargetKind::Purl if self.text.contains('?') || purl_has_version(&self.text) => {
                 purl_matches_identifier(purl, &self.text)
             }
-            TargetKind::Purl => package_spec_matches(&self.text, purl),
+            TargetKind::Purl => self.same_package(purl),
             TargetKind::Name => uuid == self.text || self.name_matches(purl),
             TargetKind::Cve | TargetKind::Ghsa => false,
         }
     }
 }
 
-/// A package's identity: its purl without version, qualifiers or subpath,
-/// decoded and lowercased (`pkg:npm/@babel/core`), the PyPI name in its
-/// PEP 503 form. Two purls with the same identity are versions (or
-/// release variants) of one package.
+/// A package's identity: the [`PurlKey`] spelling of its purl
+/// ([`canonical_base_purl`]) without the version (`pkg:npm/@babel/core`).
+/// Case folds only where the ecosystem folds it (PyPI's PEP 503 form,
+/// NuGet and Composer names); npm, Go, Maven, cargo and gem names keep
+/// their case, so `JSONStream` and `jsonstream` are two packages. Two
+/// purls with the same identity are versions (or release variants) of one
+/// package.
 pub fn package_identity(purl: &str) -> Option<String> {
-    let canonical = canonical_purl(purl).to_lowercase();
+    let canonical = canonical_base_purl(purl);
     let rest = canonical.strip_prefix("pkg:")?;
     let (ty, coord) = rest.split_once('/')?;
     let name = match coord.rfind('@').filter(|&i| i > 0) {
@@ -257,12 +300,15 @@ pub fn package_identity(purl: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let name = if ty == "pypi" {
-        canonicalize_pypi_name(name)
-    } else {
-        name.to_string()
-    };
     Some(format!("pkg:{ty}/{name}"))
+}
+
+/// The name part of a [`package_identity`].
+fn identity_name(identity: &str) -> Option<&str> {
+    identity
+        .strip_prefix("pkg:")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_, name)| name)
 }
 
 /// `v2`, `v3`, …: a Go module path's major-version suffix.
@@ -560,8 +606,17 @@ mod tests {
     #[test]
     fn package_identity_drops_version_and_qualifiers() {
         assert_eq!(
-            package_identity("pkg:npm/%40Babel/core@7.0.0").as_deref(),
+            package_identity("pkg:npm/%40babel/core@7.0.0").as_deref(),
             Some("pkg:npm/@babel/core")
+        );
+        // Case folds only where the ecosystem folds it (#1292).
+        assert_eq!(
+            package_identity("pkg:npm/JSONStream@1.3.5").as_deref(),
+            Some("pkg:npm/JSONStream")
+        );
+        assert_eq!(
+            package_identity("pkg:NuGet/Newtonsoft.Json@13.0.3").as_deref(),
+            Some("pkg:nuget/newtonsoft.json")
         );
         assert_eq!(
             package_identity("pkg:pypi/Typing_Extensions@4?artifact_id=x").as_deref(),
@@ -572,6 +627,111 @@ mod tests {
             Some("pkg:golang/github.com/x/y/v2")
         );
         assert_eq!(package_identity("lodash"), None);
+    }
+
+    /// Versioned and versionless purl targets share one case rule, the
+    /// [`PurlKey`] identity: case-distinct packages stay distinct where
+    /// the ecosystem is case-sensitive, and fold where it is not (#1292).
+    #[test]
+    fn purl_targets_agree_on_case_in_every_ecosystem() {
+        // (record, other case spelling, does the ecosystem fold case)
+        let cases = [
+            ("pkg:npm/JSONStream@1.3.5", "pkg:npm/jsonstream", false),
+            (
+                "pkg:golang/github.com/Sirupsen/logrus@v1.0.0",
+                "pkg:golang/github.com/sirupsen/logrus",
+                false,
+            ),
+            ("pkg:maven/Org.X/y@1.0", "pkg:maven/org.x/y", false),
+            ("pkg:cargo/Serde@1.0.0", "pkg:cargo/serde", false),
+            ("pkg:gem/Rails@7.0.0", "pkg:gem/rails", false),
+            (
+                "pkg:pypi/Typing_Extensions@4.0.0",
+                "pkg:pypi/typing-extensions",
+                true,
+            ),
+            (
+                "pkg:nuget/Newtonsoft.Json@13.0.3",
+                "pkg:nuget/newtonsoft.json",
+                true,
+            ),
+            (
+                "pkg:composer/Monolog/Monolog@3.0.2",
+                "pkg:composer/monolog/monolog",
+                true,
+            ),
+        ];
+        for (record, other, folds) in cases {
+            let version = &record[record.rfind('@').unwrap()..];
+            let versioned = Target::parse(&format!("{other}{version}"));
+            let versionless = Target::parse(other);
+            for t in [&versioned, &versionless] {
+                assert_eq!(t.matches_patch(record, "u"), folds, "{t} vs {record}");
+                assert_eq!(t.matches_package(record), folds, "{t} vs {record}");
+            }
+            // The record's own spelling always selects it.
+            let own = Target::parse(&record[..record.rfind('@').unwrap()]);
+            assert!(
+                own.matches_patch(record, "u") && own.matches_package(record),
+                "{record}"
+            );
+            let own = Target::parse(record);
+            assert!(
+                own.matches_patch(record, "u") && own.matches_package(record),
+                "{record}"
+            );
+        }
+    }
+
+    /// A name reaching case-distinct packages is ambiguous when typed in
+    /// lowercase and settles on the exact-case spelling otherwise (#1292).
+    #[test]
+    fn case_distinct_packages_are_two_packages() {
+        let npm = ["pkg:npm/JSONStream@1.3.5", "pkg:npm/jsonstream@0.0.1"];
+        let msg = Target::parse("jsonstream")
+            .ambiguity(npm)
+            .expect("ambiguous");
+        assert!(
+            msg.contains("pkg:npm/JSONStream, pkg:npm/jsonstream"),
+            "{msg}"
+        );
+        let upper = Target::parse("JSONStream").settle(npm).unwrap();
+        assert!(upper.matches_patch(npm[0], "u1"));
+        assert!(!upper.matches_patch(npm[1], "u2"));
+        assert!(upper.matches_package(npm[0]) && !upper.matches_package(npm[1]));
+        // A spelling matching neither exactly stays ambiguous.
+        assert!(Target::parse("JsonStream").ambiguity(npm).is_some());
+        // Go: last segment and full path alike.
+        let go = [
+            "pkg:golang/github.com/Sirupsen/logrus@v1.0.0",
+            "pkg:golang/github.com/sirupsen/logrus@v1.8.1",
+        ];
+        assert!(Target::parse("logrus").ambiguity(go).is_some());
+        assert!(Target::parse("github.com/sirupsen/logrus")
+            .ambiguity(go)
+            .is_some());
+        let settled = Target::parse("github.com/Sirupsen/logrus")
+            .settle(go)
+            .unwrap();
+        assert!(settled.matches_patch(go[0], "u") && !settled.matches_patch(go[1], "u"));
+        // A versionless purl selects its own case only.
+        let purl = Target::parse("pkg:npm/jsonstream");
+        assert!(!purl.matches_patch(npm[0], "u1") && purl.matches_patch(npm[1], "u2"));
+        assert_eq!(purl.ambiguity(npm), None);
+        // A name still matches one package typed in any case.
+        assert!(Target::parse("LODASH").matches_patch("pkg:npm/lodash@4.17.21", "u"));
+        assert_eq!(
+            Target::parse("Lodash").ambiguity(["pkg:npm/lodash@4.17.21"]),
+            None
+        );
+        // Case-folding ecosystems still count one package.
+        assert_eq!(
+            Target::parse("newtonsoft.json").ambiguity([
+                "pkg:nuget/Newtonsoft.Json@13.0.3",
+                "pkg:nuget/newtonsoft.json@12.0.1"
+            ]),
+            None
+        );
     }
 
     #[test]

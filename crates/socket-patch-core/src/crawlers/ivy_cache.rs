@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use super::coursier_cache::{existing_dedup, jvm_option_values, log_source, TargetOs};
 use super::maven_crawler::parse_pom_group_artifact_version;
 use super::types::CrawledPackage;
+use crate::formats::xml::attr as attribute;
 use crate::utils::fs::{open_regular_file_sync, read_regular_to_bytes_sync};
 use crate::vendor::jvm::layout::is_path_safe;
 
@@ -266,30 +267,6 @@ fn info_agrees(ivy: &Path, org: &str, module: &str, rev: &str) -> bool {
     [("organisation", org), ("module", module), ("revision", rev)]
         .iter()
         .all(|(attr, want)| attribute(tag, attr).is_none_or(|got| got == *want))
-}
-
-/// The value of `name="…"` (or `'…'`) inside one tag's text.
-fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let mut rest = tag;
-    while let Some(at) = rest.find(name) {
-        let before = rest[..at].chars().last();
-        let after = rest[at + name.len()..].trim_start();
-        rest = &rest[at + name.len()..];
-        if !before.is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let Some(after) = after.strip_prefix('=') else {
-            continue;
-        };
-        let after = after.trim_start();
-        let quote = after.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
-        }
-        let body = &after[1..];
-        return body.find(quote).map(|end| &body[..end]);
-    }
-    None
 }
 
 /// Whether `text`'s root element is `<project` (after a BOM, the XML

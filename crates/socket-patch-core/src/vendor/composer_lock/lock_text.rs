@@ -13,6 +13,7 @@
 use serde_json::Value;
 
 use crate::formats::composer::source::{top_level_members, value_end_at};
+use crate::formats::json::escape_non_ascii;
 use crate::utils::line_endings::{majority_terminator, LineEndings};
 use crate::vendor::common::{detect_indent, serialize_json};
 
@@ -141,24 +142,6 @@ fn escapes_unicode(text: &str) -> bool {
                 .and_then(|hex| u16::from_str_radix(hex, 16).ok())
                 .is_some_and(|unit| unit >= 0x80)
     })
-}
-
-/// Every non-ASCII character as PHP writes it: lowercase `\uXXXX`, with a
-/// surrogate pair above the BMP. Non-ASCII only occurs inside strings in
-/// serde_json output.
-fn escape_non_ascii(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c.is_ascii() {
-            out.push(c);
-            continue;
-        }
-        let mut units = [0u16; 2];
-        for unit in c.encode_utf16(&mut units) {
-            out.push_str(&format!("\\u{unit:04x}"));
-        }
-    }
-    out
 }
 
 #[cfg(test)]

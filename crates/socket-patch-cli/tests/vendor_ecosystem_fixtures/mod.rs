@@ -15,14 +15,9 @@ mod prebuilt_common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
+use sha2::Digest as _;
 
-pub fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
+use crate::common::git_sha256;
 
 /// Every ecosystem fixture, by name.
 pub const ALL: &[&str] = &[

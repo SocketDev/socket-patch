@@ -9,6 +9,23 @@ pub fn is_debug_enabled() -> bool {
     )
 }
 
+/// `message` made safe for a `SOCKET_DEBUG` line (every URL in it through
+/// [`redact_urls_in`](crate::utils::redact::redact_urls_in)), or `None`
+/// when debug output is off. Debug lines quote grant URLs and `--api-url`s,
+/// and debug output is routinely pasted into CI logs and bug reports.
+pub fn debug_message(message: &str) -> Option<std::borrow::Cow<'_, str>> {
+    is_debug_enabled().then(|| crate::utils::redact::redact_urls_in(message))
+}
+
+/// Print a `SOCKET_DEBUG` line as `[socket-patch <channel>] <message>`,
+/// URLs redacted. The one debug printer: every core debug line goes
+/// through it (or through [`debug_message`] when it is held back first).
+pub fn debug_log(channel: &str, message: &str) {
+    if let Some(message) = debug_message(message) {
+        eprintln!("[socket-patch {channel}] {message}");
+    }
+}
+
 /// Strict-airgap gate: `SOCKET_OFFLINE` is `"1"` or `"true"`. It lives
 /// here as the single definition of the vocabulary shared by every offline
 /// gate (telemetry kill-switch, API-client advisory and org-slug
@@ -75,6 +92,53 @@ fn promote_aliases(aliases: &[(&str, &str)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every core `SOCKET_DEBUG` line is printed by [`debug_log`] (or, held
+    /// back first, by the API client from [`debug_message`]), so every URL
+    /// in it is redacted: a module that prints its own `[socket-patch …]`
+    /// line again fails here.
+    #[test]
+    fn debug_lines_have_one_printer() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        let mut printers = Vec::new();
+        for path in files {
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n");
+            let production = text
+                .find("#[cfg(test)]\nmod tests {")
+                .map_or(text.as_str(), |at| &text[..at]);
+            let raw = production.matches("\"[socket-patch ").count();
+            if raw > 0 {
+                printers.push((rel, raw));
+            }
+        }
+        printers.sort();
+        assert_eq!(
+            printers,
+            vec![
+                ("api/client.rs".to_string(), 2),
+                ("utils/env_compat.rs".to_string(), 1)
+            ]
+        );
+    }
 
     /// Peer-alias promotion copies a set alias onto the unset canonical
     /// name.

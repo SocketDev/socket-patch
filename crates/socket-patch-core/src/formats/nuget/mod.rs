@@ -10,6 +10,8 @@
 //! and DOCTYPEs are skipped; an unterminated tag or comment, an unquoted
 //! attribute or a mismatched close tag makes the whole file `None`.
 
+pub(crate) mod lock;
+
 use std::collections::BTreeSet;
 use std::ops::Range;
 
@@ -289,6 +291,20 @@ fn decode_entities(raw: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Encode `value` for a double-quoted attribute: the inverse of
+/// [`parse_config`]'s decoding, so a key read as `a&b` is written back as
+/// `a&amp;b` and keeps its identity.
+pub(crate) fn xml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        // Literal XML attribute whitespace would be normalized to spaces.
+        .replace('\t', "&#x9;")
+        .replace('\n', "&#xA;")
+        .replace('\r', "&#xD;")
 }
 
 #[cfg(test)]
