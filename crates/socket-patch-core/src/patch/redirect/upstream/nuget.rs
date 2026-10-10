@@ -10,8 +10,9 @@
 //! one the user wrote), and a config it created from scratch (identical to
 //! a user's default config, so it is kept and a warning says so).
 //!
-//! Every lock entry of the id gets nuget.org's `contentHash` back (the
-//! catalog `packageHash`, see [`UpstreamClient::nuget_content_hash`]) — only
+//! Every lock entry of the id gets nuget.org's `contentHash` back (NuGet's
+//! signature-excluded content hash of the `.nupkg` nuget.org serves — not
+//! the catalog `packageHash`, see [`UpstreamClient::nuget_content_hash`]) — only
 //! when the restored config resolves the id from nuget.org alone: another
 //! feed (or several) may serve different bytes, and socket-patch cannot
 //! tell which one the original lock came from, so such a pin is refused.
@@ -458,8 +459,6 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const UUID: &str = "66666666-6666-6666-6666-666666666666";
-    const UPSTREAM: &str =
-        "ckEKf1MtNHGmiyXVMOQUWA1NhmENd95EZ8h2znGTaccCdgF/RgjlfKWRH+iEdgEx68wOpY+UFhWisuq3tHFA==";
     const PATCHED: &str = "PATCHEDcontenthashPATCHEDcontenthashAA==";
 
     fn index_url() -> String {
@@ -488,27 +487,41 @@ mod tests {
         )
     }
 
+    /// A tiny `.nupkg`, with or without a repository signature entry
+    /// (appended last, where NuGet's signer puts it).
+    fn nupkg(signed: bool) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts =
+            zip::write::SimpleFileOptions::default().last_modified_time(zip::DateTime::default());
+        let mut files: Vec<(&str, &[u8])> = vec![
+            ("newtonsoft.json.nuspec", b"<package />"),
+            ("LICENSE.md", b"The MIT License (MIT)"),
+        ];
+        if signed {
+            files.push((".signature.p7s", b"repository-signature"));
+        }
+        for (name, data) in files {
+            zw.start_file(name, opts).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
+    /// The lock's original `contentHash`: NuGet's content hash, which
+    /// excludes the signature, i.e. the hash of the unsigned archive.
+    fn upstream() -> String {
+        crate::utils::digest::sha512_base64_of(&nupkg(false))
+    }
+
+    /// nuget.org's flat container serving the SIGNED package.
     async fn nuget_org() -> MockServer {
         let server = MockServer::start().await;
-        let catalog = format!("{}/catalog0/data/newtonsoft.json.13.0.3.json", server.uri());
         Mock::given(method("GET"))
             .and(path(
-                "/v3/registration5-gz-semver2/newtonsoft.json/13.0.3.json",
+                "/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
             ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "catalogEntry": catalog })),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/catalog0/data/newtonsoft.json.13.0.3.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "Newtonsoft.Json",
-                "version": "13.0.3",
-                "packageHash": UPSTREAM,
-                "packageHashAlgorithm": "SHA512",
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(nupkg(true)))
             .mount(&server)
             .await;
         server
@@ -549,7 +562,13 @@ mod tests {
             outcome.pins
         );
         assert_eq!(config, USER_MAPPING);
-        assert_eq!(lock_after, lock(UPSTREAM));
+        // #624: the signature-excluded content hash, never the hash of the
+        // signed file as served (what the catalog's packageHash records).
+        assert_ne!(
+            upstream(),
+            crate::utils::digest::sha512_base64_of(&nupkg(true))
+        );
+        assert_eq!(lock_after, lock(&upstream()));
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
     }
 
@@ -613,7 +632,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(app.join(PACKAGES_LOCK)).unwrap(),
-            lock(UPSTREAM)
+            lock(&upstream())
         );
     }
 
@@ -624,7 +643,7 @@ mod tests {
         let (outcome, config, lock_after) = run(&hosted_config(&default), false).await;
         assert_eq!(outcome.pins[0].status, PinStatus::Restored);
         assert_eq!(config, default);
-        assert_eq!(lock_after, lock(UPSTREAM));
+        assert_eq!(lock_after, lock(&upstream()));
         assert!(outcome
             .warnings
             .iter()
