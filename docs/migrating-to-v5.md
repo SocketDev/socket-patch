@@ -43,7 +43,9 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
   read and written in the manifest's project, never in `--cwd`'s. Hosted and
   vendored `scan` / `get` and `vendor` (other than `--check`) rewire `--cwd`'s
   lockfiles, so they refuse a manifest in another project with
-  `manifest_path_foreign_project` (exit 2). Run them from the manifest's project.
+  `manifest_path_foreign_project` (exit 2). So do `apply --vex` and agent-mode
+  `scan --vex`, which patch `--cwd` but would attest the manifest's project.
+  Run them from the manifest's project, or use standalone `vex`.
   A manifest file outside a `.socket/` directory (`--manifest-path
   state/patches.json`) moves only the manifest; the project stays `--cwd`.
 - `list` succeeds on an empty project. Hosted results identify lockfiles instead

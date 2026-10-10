@@ -462,3 +462,73 @@ fn every_ledger_access_is_rooted_at_project_root() {
         offenders.join("\n")
     );
 }
+
+/// The embedded `--vex` of `apply` and agent-mode `scan`: the run patches
+/// `--cwd`'s installed copies but the document's sources (product,
+/// ledgers, lockfile wiring) belong to the manifest's project, so a foreign
+/// manifest is refused before anything runs — no document is written.
+#[test]
+fn embedded_vex_refuses_a_foreign_manifest() {
+    for argv in [
+        &["apply", "--json", "--offline"][..],
+        &["apply", "--json", "--offline", "--dry-run"][..],
+        &["scan", "--mode", "agent", "--json", "--offline"][..],
+        &["scan", "--sync", "--json", "--offline"][..],
+    ] {
+        let f = fixture();
+        let vex = f.a.join("out.vex.json");
+        let mut full: Vec<&str> = argv.to_vec();
+        let vex_arg = vex.to_str().unwrap();
+        full.extend(["--vex", vex_arg]);
+        let r = run(&f, &full);
+        assert_eq!(r.code, Some(2), "{argv:?}\n{}", r.out);
+        assert!(
+            r.out.contains("manifest_path_foreign_project") && r.out.contains("--vex"),
+            "{argv:?}\n{}",
+            r.out
+        );
+        assert!(!vex.exists(), "{argv:?}: no document is written");
+    }
+}
+
+/// The refusal is only for a manifest in ANOTHER project: an explicit
+/// path to `--cwd`'s own manifest — spelled as the default, with `./`, or
+/// through a `..` detour back into `--cwd` — is the same project, and the
+/// embedded `--vex` runs (an empty manifest attests nothing; not refused).
+#[test]
+fn embedded_vex_allows_the_cwd_projects_own_manifest() {
+    for manifest in [
+        ".socket/manifest.json",
+        "./.socket/manifest.json",
+        "../b/.socket/manifest.json",
+    ] {
+        for argv in [
+            &["apply", "--json", "--offline"][..],
+            &["scan", "--mode", "agent", "--json", "--offline"][..],
+        ] {
+            let f = fixture();
+            let vex = f.b.join("out.vex.json");
+            let out = hermetic::binary_command()
+                .args(argv)
+                .arg("--vex")
+                .arg(&vex)
+                .arg("--cwd")
+                .arg(&f.b)
+                .args(["--manifest-path", manifest])
+                .current_dir(&f.b)
+                .output()
+                .expect("run socket-patch");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !text.contains("manifest_path_foreign_project")
+                    && !text.contains("in another project"),
+                "{manifest} {argv:?}\n{text}"
+            );
+            assert_ne!(out.status.code(), Some(2), "{manifest} {argv:?}\n{text}");
+        }
+    }
+}

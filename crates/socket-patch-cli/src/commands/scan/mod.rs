@@ -1772,6 +1772,15 @@ async fn run_scan(
             Err(message) => return scan_usage_error(&args, "mode_ambiguous", &message),
         }
     }
+    // Hosted and vendored mode refused a foreign manifest above; agent mode
+    // (and a report-only scan) still refuses one under `--vex`: it patches
+    // `--cwd`'s installed copies, the document attests the manifest's
+    // project (#745).
+    if let Some(message) =
+        crate::commands::foreign_manifest_vex_conflict(&args.common, &args.vex, "scan")
+    {
+        return scan_usage_error(&args, crate::commands::FOREIGN_MANIFEST_PROJECT, &message);
+    }
 
     // The repo's socket.yml policy, read once per invocation before any
     // write (an invalid file fails the run closed).

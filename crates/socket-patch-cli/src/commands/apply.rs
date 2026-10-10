@@ -809,6 +809,22 @@ fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
 
 pub async fn run(args: ApplyArgs) -> i32 {
     apply_env_toggles(&args.common);
+    // `--vex` attests the manifest's project but this run patches `--cwd`'s
+    // installed copies: refuse a manifest in another project before
+    // anything is read (#745). `--check` never generates a document.
+    if !args.check {
+        if let Some(message) =
+            crate::commands::foreign_manifest_vex_conflict(&args.common, &args.vex, "apply")
+        {
+            return crate::json_envelope::usage_error(
+                Command::Apply,
+                args.common.json,
+                args.common.dry_run,
+                crate::commands::FOREIGN_MANIFEST_PROJECT,
+                &message,
+            );
+        }
+    }
     let manifest_path = args.common.resolved_manifest_path();
 
     // No manifest → nothing to apply: a clean exit-0 no-op (load-bearing

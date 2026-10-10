@@ -180,6 +180,35 @@ pub(crate) fn foreign_manifest_conflict(
     ))
 }
 
+/// The usage error for an embedded `--vex` (`apply`, agent-mode `scan`)
+/// when `--manifest-path` resolves into another project, or `None` (no
+/// `--vex`, or the manifest is `--cwd`'s own). Same code as
+/// [`foreign_manifest_conflict`]. These forms patch `--cwd`'s installed
+/// copies, but the document's other sources — product, ledgers, lockfile
+/// wiring — belong to the manifest's project (#745), so one document would
+/// attest one project from another's state. Re-rooting the run instead
+/// would verify copies the run never patched. Standalone `vex` runs wholly
+/// in the manifest's project and stays allowed. `host` names the command.
+pub(crate) fn foreign_manifest_vex_conflict(
+    common: &crate::args::GlobalArgs,
+    vex: &vex::VexEmbedArgs,
+    host: &str,
+) -> Option<String> {
+    if vex.vex.is_none() || !common.manifest_project_is_foreign() {
+        return None;
+    }
+    let root = common.project_root();
+    Some(format!(
+        "--vex cannot be used with a --manifest-path in another project: {host} patches the \
+         installed packages of --cwd ({}), but the manifest belongs to {}, so the VEX \
+         document would mix the two projects. Run it from the manifest's project (--cwd {}), \
+         drop --manifest-path, or generate the document separately with `socket-patch vex`",
+        common.cwd.display(),
+        root.display(),
+        root.display(),
+    ))
+}
+
 /// The flag that put a run in global scope, as usage errors name it
 /// (`SOCKET_GLOBAL` / `SOCKET_GLOBAL_PREFIX` set the same fields).
 pub(crate) fn global_scope_flag(common: &crate::args::GlobalArgs) -> &'static str {
