@@ -967,3 +967,107 @@ fn nuget_vendored_dotnet_restore_then_manifestless_vex() {
         None,
     );
 }
+
+// ── solution layout: member and named locks (#353, #514) ──────────────
+
+/// A solution layout: `nuget.config` at the root, one project under
+/// `src/App/` with its own `packages.lock.json`, and one under `src/Named/`
+/// whose lock is the per-project `packages.named.lock.json`. Vendoring from
+/// the root must pin BOTH locks, so a fresh checkout restores each project
+/// (`--locked-mode`, cold cache) with the patched bytes instead of NU1403.
+#[test]
+#[ignore = "real .NET SDK + nuget.org: run with --ignored (CI e2e matrix pins each SDK major)"]
+fn nuget_vendored_solution_member_and_named_locks_restore() {
+    let sb = Sandbox::new();
+    let Some(dn) = Dotnet::probe("vendored-solution", &sb) else {
+        return;
+    };
+    let sdk = dn.version.clone();
+    let root = sb.dir("solution");
+    let store_fx = sb.dir("store-solution");
+    std::fs::write(root.join("nuget.config"), REGISTRY_CONFIG).unwrap();
+    let projects = [("src/App", "app"), ("src/Named", "named")];
+    for (dir, name) in projects {
+        let d = root.join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("{name}.csproj")), dn.csproj()).unwrap();
+        dn.restore_ok(&sb, &d, &store_fx, &[], "member restore from nuget.org");
+    }
+    // NuGet reads (and writes) the per-project name once it exists.
+    std::fs::rename(
+        root.join("src/Named/packages.lock.json"),
+        root.join("src/Named/packages.named.lock.json"),
+    )
+    .unwrap();
+    assert!(!root.join("packages.lock.json").exists());
+
+    let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
+    let mut patched = pristine.clone();
+    patched.extend_from_slice(MARKER);
+    let upstream = std::fs::read(pkg_dir(&store_fx).join(NUPKG_NAME)).unwrap();
+    let nupkg = patched_nupkg(&upstream, &patched);
+    let backend = Backend::start(VENDORED_UUID, &pristine, &patched, Some(&nupkg));
+    let uri = backend.uri();
+
+    let (code, env, stderr) = socket_patch(
+        &root,
+        &store_fx,
+        &[
+            "scan",
+            "--mode",
+            "vendored",
+            "--vendor-source",
+            "service",
+            "--json",
+            "--yes",
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake-token",
+        ],
+    );
+    assert_eq!(code, Some(0), "SDK {sdk}: {env:#}\n{stderr}");
+    assert!(
+        !env.to_string().contains("vendor_nuget_no_lockfile"),
+        "the member locks were found: {env:#}"
+    );
+    let artifact = root.join(format!(".socket/vendor/nuget/{VENDORED_UUID}/{NUPKG_NAME}"));
+    let pin = content_hash(&std::fs::read(&artifact).unwrap());
+    for lock in [
+        "src/App/packages.lock.json",
+        "src/Named/packages.named.lock.json",
+    ] {
+        let text = std::fs::read_to_string(root.join(lock)).unwrap();
+        assert!(text.contains(&pin), "SDK {sdk}: {lock} re-pinned: {text}");
+    }
+
+    // Fresh checkout of the committable files, cold cache, each project.
+    let checkout = sb.dir("solution-checkout");
+    std::fs::copy(root.join("nuget.config"), checkout.join("nuget.config")).unwrap();
+    copy_tree(&root.join(".socket"), &checkout.join(".socket"));
+    strip_manifest(&checkout);
+    let blobs = checkout.join(".socket/blobs");
+    if blobs.exists() {
+        std::fs::remove_dir_all(blobs).unwrap();
+    }
+    for (dir, name) in projects {
+        let (from, to) = (root.join(dir), checkout.join(dir));
+        std::fs::create_dir_all(&to).unwrap();
+        for entry in std::fs::read_dir(&from).unwrap() {
+            let entry = entry.unwrap();
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if file.ends_with(".csproj") || file.ends_with(".lock.json") {
+                std::fs::copy(entry.path(), to.join(&file)).unwrap();
+            }
+        }
+        let store = sb.dir(&format!("store-checkout-{name}"));
+        dn.restore_ok(&sb, &to, &store, &["--locked-mode"], "member fresh restore");
+        assert_eq!(
+            std::fs::read(pkg_dir(&store).join(FILE_KEY)).unwrap(),
+            patched,
+            "SDK {sdk}: {dir} restored the PATCHED {FILE_KEY}"
+        );
+    }
+}

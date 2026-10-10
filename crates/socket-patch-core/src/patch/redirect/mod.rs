@@ -1896,6 +1896,23 @@ fn rewrite_cargo(
             });
             continue;
         }
+        // The crate must resolve to crates.io (or an earlier Socket pin): a
+        // `[patch]` override — in the root manifest, a project or user
+        // cargo config, as a path or a git fork — resolves it elsewhere, and
+        // a Socket pin would silently replace the user's override with the
+        // crates.io-based patched bytes while the stale `[patch]` entry
+        // breaks `--locked` (#480). The lock is the authority (it sees every
+        // config in the chain) and is checked on the lock planner's own
+        // parse below; without one, the override tables the rewriter can
+        // read answer here.
+        if cargo_lock.is_none() {
+            if let Some(how) = cargo_patch_override_table(&manifests, files, &dep.name) {
+                result
+                    .warnings
+                    .push(cargo_overridden_warning(&dep.name, &dep.version, &how));
+                continue;
+            }
+        }
         // A pin reaches only the declarations it sits on: every OTHER lock
         // package depending on the crate — a registry/git crate, or a path
         // package whose manifest was not planned (outside the project, behind
@@ -1953,7 +1970,19 @@ fn rewrite_cargo(
         let lock_commit = if let Some(lock_text) = cargo_lock.as_ref() {
             // A lock that does not parse never reaches here: the dependents
             // check above refuses it.
-            let plan = CargoLock::parse(lock_text).map_or(CargoLockPlan::NotFound, |lock| {
+            let parsed = CargoLock::parse(lock_text).ok();
+            let overridden = parsed.as_ref().and_then(|lock| {
+                cargo_lock_override_source(lock, &dep.name, &dep.version, || {
+                    cargo_patch_override_table(&manifests, files, &dep.name)
+                })
+            });
+            if let Some(how) = overridden {
+                result
+                    .warnings
+                    .push(cargo_overridden_warning(&dep.name, &dep.version, &how));
+                continue;
+            }
+            let plan = parsed.map_or(CargoLockPlan::NotFound, |lock| {
                 lock.plan_hosted(lock_text, &dep.name, &dep.version, index_url, &cksum)
             });
             match plan {
@@ -2215,6 +2244,142 @@ fn cargo_manifest_package_id(
         },
     };
     Some((name.to_string(), version.to_string()))
+}
+
+/// Whether a Cargo.lock `source` (or a `[patch.<url>]` key) names crates.io,
+/// in either the git-index or the sparse spelling. Compared the way cargo's
+/// `CanonicalUrl` does: host casing, a trailing `/` and a `.git` suffix do
+/// not make a different source (and github paths are case-insensitive).
+fn is_crates_io_source(source: &str) -> bool {
+    let url = source.trim();
+    let url = url
+        .strip_prefix("registry+")
+        .or_else(|| url.strip_prefix("sparse+"))
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    let url = url.trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    url == "https://github.com/rust-lang/crates.io-index" || url == "https://index.crates.io"
+}
+
+/// Whether a Cargo.lock `source` is a Socket per-patch sparse index
+/// (`sparse+…/<patch uuid>/index/`) — an earlier generation's pin, which a
+/// re-run legitimately repoints.
+fn is_socket_cargo_index(source: &str) -> bool {
+    source
+        .trim()
+        .strip_prefix("sparse+")
+        .map(|url| url.trim_end_matches('/'))
+        .and_then(|url| url.strip_suffix("/index"))
+        .and_then(|url| url.rsplit('/').next())
+        .is_some_and(crate::patch::path_safety::is_canonical_uuid)
+}
+
+/// How Cargo.lock says `crate_name@version` is overridden: its one
+/// `[[package]]` block resolves to something other than crates.io or a
+/// Socket index. A git / other-registry `source` is always a user `[patch]`
+/// override (no Socket wiring produces one). A block with NO `source` is a
+/// `[patch]` path override only when `visible_override` finds the override
+/// table entry: the same sourceless shape is what a vendored → hosted
+/// takeover's revert leaves for a crate vendored before any lock existed
+/// (its `[patch]` wiring already gone), which the planner then pins. A path
+/// DECLARATION is refused before this. `None` when it is a crates.io /
+/// Socket block, absent or ambiguous (the lock planner refuses those).
+fn cargo_lock_override_source(
+    lock: &CargoLock,
+    crate_name: &str,
+    version: &str,
+    visible_override: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let mut hits = lock
+        .packages()
+        .iter()
+        .filter(|p| p.name == crate_name && p.version == version);
+    let (Some(pkg), None) = (hits.next(), hits.next()) else {
+        return None;
+    };
+    match pkg.source.as_deref() {
+        None => visible_override()
+            .map(|table| format!("Cargo.lock resolves it to a local path through the {table}")),
+        Some(s) if is_crates_io_source(s) || is_socket_cargo_index(s) => None,
+        Some(s) if s.starts_with("git+") => {
+            Some("Cargo.lock resolves it from a git source — a `[patch]` git override".to_string())
+        }
+        Some(_) => Some(
+            "Cargo.lock resolves it from a registry other than crates.io — a `[patch]` \
+             registry override"
+                .to_string(),
+        ),
+    }
+}
+
+/// The `redirect_cargo_dep_overridden` refusal for `name@version`, `how`
+/// naming the override.
+fn cargo_overridden_warning(name: &str, version: &str, how: &str) -> RewriteWarning {
+    RewriteWarning {
+        code: "redirect_cargo_dep_overridden".into(),
+        detail: format!(
+            "{name}@{version} is overridden in this project ({how}), so it does not resolve to \
+             the crates.io package the patch targets; pinning it to the Socket registry would \
+             drop the override and break `cargo --locked` — dependency skipped (nothing \
+             rewritten). Remove the override to use hosted mode, or patch the overriding \
+             source yourself"
+        ),
+    }
+}
+
+/// With no Cargo.lock: a crates.io `[patch]` entry for `crate_name` (keyed
+/// by it, or renamed with `package = "<crate_name>"`) in the root manifest
+/// or the project cargo config — `[patch.crates-io]` or the index-URL
+/// spelling. Vendored-mode entries (a path under `.socket/`) are Socket's
+/// own wiring, not a user override.
+fn cargo_patch_override_table(
+    manifests: &[(String, String)],
+    files: &BTreeMap<String, String>,
+    crate_name: &str,
+) -> Option<String> {
+    let root = manifests
+        .iter()
+        .find(|(k, _)| k == "Cargo.toml")
+        .map(|(k, t)| (k.as_str(), t.as_str()));
+    let configs = [".cargo/config.toml", ".cargo/config"]
+        .into_iter()
+        .filter_map(|k| files.get(k).map(|t| (k, t.as_str())));
+    for (path, text) in root.into_iter().chain(configs) {
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            continue;
+        };
+        let Some(patch) = doc.get("patch").and_then(toml_edit::Item::as_table_like) else {
+            continue;
+        };
+        for (registry, table) in patch.iter() {
+            if registry != "crates-io" && !is_crates_io_source(registry) {
+                continue;
+            }
+            let Some(table) = table.as_table_like() else {
+                continue;
+            };
+            for (key, entry) in table.iter() {
+                let field = |name: &str| {
+                    entry
+                        .as_table_like()
+                        .and_then(|t| t.get(name))
+                        .and_then(toml_edit::Item::as_str)
+                };
+                if field("package").unwrap_or(key) != crate_name {
+                    continue;
+                }
+                if field("path").is_some_and(|p| {
+                    let p = p.trim_start_matches("./");
+                    p.starts_with(".socket/") || p.starts_with(".socket\\")
+                }) {
+                    continue;
+                }
+                return Some(format!("`[patch.{registry}]` entry `{key}` in {path}"));
+            }
+        }
+    }
+    None
 }
 
 /// The Cargo.lock packages that depend on `crate_name@version` and that a
@@ -5912,7 +6077,13 @@ fn nuget_xml_attribute(value: &str) -> String {
         .replace('\r', "&#xD;")
 }
 
-use crate::formats::nuget::lock::PACKAGES_LOCK;
+/// The synthetic candidate key carrying the locks the engine found every
+/// project under the root restoring into (#353, #514), one per line:
+/// `lock\t<rel>`, `unresolved\t<project>\t<why>` for a `NuGetLockFilePath`
+/// it cannot evaluate, or `error\t<why>` when it could not list the tree.
+/// Absent (the in-memory engine, unit tests), the root `packages.lock.json`
+/// is the one lock. Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
+pub const NUGET_LOCKS_KEY: &str = "<socket-patch:nuget-locks>";
 
 fn rewrite_nuget(
     files: &BTreeMap<String, String>,
@@ -5951,21 +6122,64 @@ fn rewrite_nuget(
     // (the npm twin does the same). An ABSENT lock is fine — config-only.
     // Read past a UTF-8 BOM the way dotnet does (#623); the write below
     // keeps it.
-    let lock_text = files.get(PACKAGES_LOCK);
-    let mut lock: Option<Value> = match lock_text {
-        None => None,
-        Some(text) => match crate::formats::nuget::lock::parse_lock(text) {
-            Ok(parsed) => Some(parsed),
+    //
+    // Every lock a project under the root restores into: the root config
+    // routes them all, so each is pinned with it (#353, #514). The engine
+    // reads the project files and their locks; the same pure discovery
+    // re-derives which keys are locks here.
+    let lock_rels: Vec<String> = match files.get(NUGET_LOCKS_KEY) {
+        None => vec![crate::formats::nuget::lock::PACKAGES_LOCK.to_string()],
+        Some(found) => {
+            let mut rels = Vec::new();
+            for line in found.lines() {
+                let mut fields = line.splitn(3, '\t');
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some("lock"), Some(rel), None) => rels.push(rel.to_string()),
+                    (Some("unresolved"), Some(project), Some(detail)) => {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_nuget_lock_path_unresolved".into(),
+                            detail: format!(
+                                "{project}: {detail}; the lock it restores into cannot be \
+                                 pinned, so nuget redirect is skipped (set a literal \
+                                 NuGetLockFilePath, or remove it)"
+                            ),
+                        });
+                        return;
+                    }
+                    (Some("error"), Some(why), _) => {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_nuget_lock_unreadable".into(),
+                            detail: format!(
+                                "cannot list the project's NuGet locks ({why}); nuget redirect \
+                                 skipped"
+                            ),
+                        });
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            rels
+        }
+    };
+    // Read past a UTF-8 BOM the way dotnet does (#623); the write below
+    // keeps it.
+    let mut locks: Vec<(String, &String, Value, bool)> = Vec::new();
+    for rel in lock_rels {
+        let Some(text) = files.get(&rel) else {
+            continue;
+        };
+        match crate::formats::nuget::lock::parse_lock(text) {
+            Ok(parsed) => locks.push((rel, text, parsed, false)),
             Err(_) => {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_nuget_lock_unparseable".into(),
-                    detail: "packages.lock.json is not valid JSON; nuget redirect skipped".into(),
+                    detail: format!("{rel} is not valid JSON; nuget redirect skipped"),
                 });
                 return;
             }
-        },
-    };
-    let mut lock_changed = false;
+        }
+    }
 
     for dep in &nuget {
         let Some(ov) = registry_override_of_kind(dep, "nuget-v3") else {
@@ -6004,21 +6218,24 @@ fn rewrite_nuget(
         // another version could no longer restore it, and re-pinning that
         // entry would silently swap in the patched version (#593). Refused
         // before anything is wired.
-        if let Some(lock_val) = &lock {
+        let other_version = locks.iter().find_map(|(rel, _, lock_val, _)| {
             let others =
                 crate::formats::nuget::lock::other_versions(lock_val, &id_lower, &version_norm);
-            if !others.is_empty() {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_nuget_lock_other_version".into(),
-                    detail: crate::formats::nuget::lock::other_versions_detail(
-                        PACKAGES_LOCK,
-                        &dep.name,
-                        &version_norm,
-                        &others,
-                    ),
-                });
-                continue;
-            }
+            (!others.is_empty()).then(|| {
+                crate::formats::nuget::lock::other_versions_detail(
+                    rel,
+                    &dep.name,
+                    &version_norm,
+                    &others,
+                )
+            })
+        });
+        if let Some(detail) = other_version {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_lock_other_version".into(),
+                detail,
+            });
+            continue;
         }
 
         let unwritable = || RewriteWarning {
@@ -6066,7 +6283,7 @@ fn rewrite_nuget(
 
         // Only the entries at the patched version: another version of the
         // id is a different package (#593).
-        if let Some(lock_val) = lock.as_mut() {
+        for (rel, _, lock_val, lock_changed) in locks.iter_mut() {
             for (id, obj) in
                 crate::formats::nuget::lock::locked_at_mut(lock_val, &id_lower, &version_norm)
             {
@@ -6080,9 +6297,9 @@ fn rewrite_nuget(
                     "contentHash": obj.get("contentHash").cloned().unwrap_or(Value::Null),
                 });
                 obj.insert("contentHash".into(), Value::String(content_hash.clone()));
-                lock_changed = true;
+                *lock_changed = true;
                 result.edits.push(FileEdit {
-                    path: PACKAGES_LOCK.into(),
+                    path: rel.clone(),
                     kind: "redirect_nuget_lock".into(),
                     action: "rewritten".into(),
                     key: Some(id.to_string()),
@@ -6099,13 +6316,12 @@ fn rewrite_nuget(
     if config_changed {
         result.files.insert(config_path.into(), config);
     }
-    if lock_changed {
-        if let (Some(lock_val), Some(original)) = (lock, lock_text) {
+    for (rel, original, lock_val, changed) in locks {
+        if changed {
             // In the lock's own layout: its BOM, indent and line endings.
-            result.files.insert(
-                PACKAGES_LOCK.into(),
-                serialize_json_like(&lock_val, original),
-            );
+            result
+                .files
+                .insert(rel, serialize_json_like(&lock_val, original));
         }
     }
 }
@@ -13480,6 +13696,143 @@ mod tests {
             cargo_lock_with("serde", "1.0.190"),
         );
         files
+    }
+
+    /// The serde block of [`cargo_lock_with`] resolved by a user override
+    /// instead of crates.io: no `source` (a path override) or `source`.
+    fn cargo_lock_overridden(source: Option<&str>) -> String {
+        let source = source.map_or(String::new(), |s| format!("source = \"{s}\"\n"));
+        format!(
+            "# This file is automatically @generated by Cargo.\n\
+             version = 3\n\
+             \n\
+             [[package]]\n\
+             name = \"app\"\n\
+             version = \"0.1.0\"\n\
+             dependencies = [\n \"serde\",\n]\n\
+             \n\
+             [[package]]\n\
+             name = \"serde\"\n\
+             version = \"1.0.190\"\n\
+             {source}"
+        )
+    }
+
+    fn assert_cargo_override_refused(files: &BTreeMap<String, String>, what: &str) {
+        let r = rewrite_registry_redirect(files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "{what}: nothing rewritten: {:?}",
+            r.files
+        );
+        assert!(r.edits.is_empty(), "{what}: {:?}", r.edits);
+        assert!(r.confirmed_cargo_uuids.is_empty(), "{what}");
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            vec!["redirect_cargo_dep_overridden"],
+            "{what}: {:?}",
+            r.warnings
+        );
+    }
+
+    /// #480: a root `[patch.crates-io]` (or its URL spelling) path override
+    /// resolves the crate to a local path — the lock block has no `source`.
+    /// Pinning the declaration to the Socket registry silently drops the
+    /// user's override and splices a source into the sourceless block, so
+    /// the next `cargo fetch --locked` fails. Hosted mode refuses it.
+    #[test]
+    fn cargo_patch_crates_io_path_override_is_refused() {
+        for table in [
+            "[patch.crates-io]",
+            "[patch.\"https://github.com/rust-lang/crates.io-index\"]",
+            // Spellings cargo canonicalizes to the same crates.io source.
+            "[patch.\"https://github.com/rust-lang/crates.io-index.git\"]",
+            "[patch.\"https://GitHub.com/Rust-Lang/crates.io-index/\"]",
+            "[patch.\"sparse+https://Index.Crates.io/\"]",
+        ] {
+            let mut files = cargo_files(&format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies]\nserde = \"1.0.190\"\n\n\
+                 {table}\nserde = {{ path = \"serde-local\" }}\n"
+            ));
+            files.insert("Cargo.lock".into(), cargo_lock_overridden(None));
+            assert_cargo_override_refused(&files, table);
+        }
+    }
+
+    /// #480: the override can live in `.cargo/config.toml` (cargo merges
+    /// `[patch]` across the config chain), or point at a git fork — the lock
+    /// then carries the git source, which a repoint would overwrite.
+    #[test]
+    fn cargo_config_and_git_overrides_are_refused_from_the_lock_source() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n";
+        let mut config = cargo_files(manifest);
+        config.insert("Cargo.lock".into(), cargo_lock_overridden(None));
+        config.insert(
+            ".cargo/config.toml".into(),
+            "[patch.crates-io]\nserde = { path = \"local/serde\" }\n".into(),
+        );
+        assert_cargo_override_refused(&config, "config override");
+
+        let mut git = cargo_files(&format!(
+            "{manifest}\n[patch.crates-io]\nserde = {{ git = \"file:///fork\" }}\n"
+        ));
+        git.insert(
+            "Cargo.lock".into(),
+            cargo_lock_overridden(Some("git+file:///fork#0123456789abcdef")),
+        );
+        assert_cargo_override_refused(&git, "git override");
+
+        // A sourceless block with NO override table entry is the shape a
+        // vendored -> hosted takeover's revert leaves for a crate vendored
+        // before any lock existed: it is pinned, not refused.
+        let mut reverted = cargo_files(manifest);
+        reverted.insert("Cargo.lock".into(), cargo_lock_overridden(None));
+        let r = rewrite_registry_redirect(&reverted, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// #480, lockless: no lock to read the resolution from, so an override
+    /// of the crate in the root manifest or project config is refused from
+    /// the override table itself (an aliased `package = "serde"` entry too).
+    #[test]
+    fn cargo_lockless_override_is_refused_from_the_patch_table() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n";
+        let mut root = BTreeMap::new();
+        root.insert(
+            "Cargo.toml".to_string(),
+            format!("{manifest}\n[patch.crates-io]\nserde = {{ path = \"serde-local\" }}\n"),
+        );
+        assert_cargo_override_refused(&root, "lockless root override");
+
+        let mut aliased = BTreeMap::new();
+        aliased.insert("Cargo.toml".to_string(), manifest.to_string());
+        aliased.insert(
+            ".cargo/config.toml".to_string(),
+            "[patch.\"https://github.com/rust-lang/crates.io-index\"]\n\
+             fork = { path = \"fork\", package = \"serde\" }\n"
+                .into(),
+        );
+        assert_cargo_override_refused(&aliased, "lockless aliased config override");
+    }
+
+    /// Control for #480: an override of an UNRELATED crate leaves the
+    /// patched crate on crates.io, so it is still redirected.
+    #[test]
+    fn cargo_override_of_another_crate_still_redirects() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n\n\
+             [patch.crates-io]\nitoa = { path = \"itoa-local\" }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        assert!(r.files["Cargo.lock"].contains(&cargo_index_url()));
     }
 
     /// A crate declared in BOTH [dev-dependencies] and
@@ -23231,6 +23584,83 @@ packages:
             lock.replace("ORIGINALHASH==", "PATCHED=="),
             "only the hash changes; BOM and CRLF layout kept"
         );
+    }
+
+    fn simple_lock(hash: &str) -> String {
+        format!(
+            "{{\n  \"version\": 1,\n  \"dependencies\": {{\n    \"net8.0\": {{\n      \"Newtonsoft.Json\": {{\n        \"type\": \"Direct\",\n        \"requested\": \"[13.0.3, )\",\n        \"resolved\": \"13.0.3\",\n        \"contentHash\": \"{hash}\"\n      }}\n    }}\n  }}\n}}\n"
+        )
+    }
+
+    /// #353 / #514: member-project locks and named locks the root config
+    /// governs (the engine's walk, carried by [`NUGET_LOCKS_KEY`]) are
+    /// re-pinned under their own paths with the config.
+    #[test]
+    fn nuget_member_and_named_locks_are_repinned() {
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            "src/App/packages.lock.json".to_string(),
+            simple_lock("ORIGINALHASH=="),
+        );
+        files.insert(
+            "src/Lib/packages.Lib.lock.json".to_string(),
+            simple_lock("ORIGINALHASH=="),
+        );
+        files.insert(
+            NUGET_LOCKS_KEY.to_string(),
+            "lock\tsrc/App/packages.lock.json\nlock\tsrc/Lib/packages.Lib.lock.json".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        for rel in [
+            "src/App/packages.lock.json",
+            "src/Lib/packages.Lib.lock.json",
+        ] {
+            assert_eq!(
+                r.files.get(rel).map(String::as_str),
+                Some(simple_lock("PATCHED==").as_str()),
+                "{rel}"
+            );
+        }
+        let lock_paths: Vec<&str> = r
+            .edits
+            .iter()
+            .filter(|e| e.kind == "redirect_nuget_lock")
+            .map(|e| e.path.as_str())
+            .collect();
+        assert_eq!(
+            lock_paths,
+            [
+                "src/App/packages.lock.json",
+                "src/Lib/packages.Lib.lock.json"
+            ]
+        );
+        // Without the walk (in memory, unit tests) only the root lock is one:
+        // a member lock is never mistaken for one.
+        files.remove(NUGET_LOCKS_KEY);
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(!r.files.contains_key("src/App/packages.lock.json"));
+    }
+
+    /// #514: an unresolvable `NuGetLockFilePath`, or a project tree the
+    /// engine could not list, skips the nuget redirect with nothing written.
+    #[test]
+    fn nuget_unknowable_locks_skip_the_redirect() {
+        for (walk, code) in [
+            (
+                "lock\tpackages.lock.json\nunresolved\tapp.csproj\tNuGetLockFilePath `$(X)/l.json` references MSBuild properties or items",
+                "redirect_nuget_lock_path_unresolved",
+            ),
+            ("error\tunreadable src", "redirect_nuget_lock_unreadable"),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("nuget.config".to_string(), default_nuget_config());
+            files.insert(NUGET_LOCKS_KEY.to_string(), walk.to_string());
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+            assert_eq!(warning_codes(&r), vec![code]);
+        }
     }
 
     /// #593: a multi-targeting lock resolving the patched id at another

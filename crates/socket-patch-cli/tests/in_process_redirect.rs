@@ -1968,6 +1968,10 @@ fn hosted_unwind_json(
             "SOCKET_NPM_REGISTRY",
             format!("{}/npm-registry", registry.uri()),
         )
+        // The yarn berry restore reads these like yarn does (#1017): an
+        // ambient value must not steer the fixtures' registry.
+        .env_remove("YARN_NPM_REGISTRY_SERVER")
+        .env_remove("YARN_RC_FILENAME")
         .output()
         .unwrap_or_else(|e| panic!("run socket-patch {}: {e}", command[0]));
     let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
@@ -6250,6 +6254,192 @@ async fn hosted_json_reports_an_unpinned_row_for_a_granted_patch_nothing_pins() 
     assert_eq!(rows[0]["uuid"], UUID, "{env:#}");
     assert_eq!(rows[0]["action"], "unpinned", "{env:#}");
     assert_eq!(rows[0]["errorCode"], "redirect_unconfirmed", "{env:#}");
+}
+
+// ── #1017: the berry restore reads the registry from every yarn source ──────
+
+/// Where a #1017 cell configures the project's mirror.
+#[derive(Debug, Clone, Copy)]
+enum MirrorSource {
+    /// `YARN_NPM_REGISTRY_SERVER`, no key in any rc.
+    Env,
+    /// A parent directory's `.yarnrc.yml`.
+    ParentRc,
+    /// The home directory's `.yarnrc.yml` (the project is not under it).
+    HomeRc,
+    /// The project rc's `npmRegistryServer: "${UNSET:-<mirror>}"`.
+    Interpolated,
+}
+
+/// #1017: #908's mirror restore, with the mirror set the other ways yarn
+/// reads it. Each cell pins the project hosted, rolls it back, and needs
+/// the mirror's `::__archiveUrl=` binding back byte-exactly — reading the
+/// default registry instead silently writes a bare `name@npm:<v>` locator
+/// whose conventional tarball the mirror 404s.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_rollback_reads_the_registry_from_every_yarn_source() {
+    for source in [
+        MirrorSource::Env,
+        MirrorSource::ParentRc,
+        MirrorSource::HomeRc,
+        MirrorSource::Interpolated,
+    ] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+        mock_reference_with_berry_url(&server, &hosted_url).await;
+        mock_view(&server).await;
+        let integrity = vlt_hosted_common::sha512_sri(&upstream_tarball());
+        mock_npm_registry_advertising(
+            &server,
+            &integrity,
+            &format!(
+                "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+                server.uri()
+            ),
+        )
+        .await;
+        let mirror = format!("{}/mirror", server.uri());
+        let advertised = format!("{}/cdn/files/{NAME}-{VERSION}.tgz", server.uri());
+        Mock::given(method("GET"))
+            .and(path(format!("/mirror/{NAME}/{VERSION}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": NAME,
+                "version": VERSION,
+                "dist": { "tarball": advertised, "integrity": integrity },
+            })))
+            .mount(&server)
+            .await;
+        let binding = |t: &str| {
+            t.replace(
+                &format!("resolution: \"{NAME}@npm:{VERSION}\""),
+                &format!(
+                    "resolution: \"{NAME}@npm:{VERSION}::__archiveUrl={}\"",
+                    socket_patch_core::utils::uri::encode_uri_component(&advertised)
+                ),
+            )
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("work").join("proj");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        write_berry_project_spelled(&project, binding);
+        let mut project_rc = "nodeLinker: node-modules\n".to_string();
+        let mut envs: Vec<(&str, String)> = vec![("HOME", home.display().to_string())];
+        match source {
+            MirrorSource::Env => envs.push(("YARN_NPM_REGISTRY_SERVER", mirror.clone())),
+            MirrorSource::ParentRc => std::fs::write(
+                tmp.path().join("work").join(".yarnrc.yml"),
+                format!("npmRegistryServer: \"{mirror}\"\n"),
+            )
+            .unwrap(),
+            MirrorSource::HomeRc => std::fs::write(
+                home.join(".yarnrc.yml"),
+                format!("npmRegistryServer: \"{mirror}\"\n"),
+            )
+            .unwrap(),
+            MirrorSource::Interpolated => project_rc.push_str(&format!(
+                "npmRegistryServer: \"${{SOCKET_PATCH_TEST_UNSET_REG:-{mirror}}}\"\n"
+            )),
+        }
+        std::fs::write(project.join(".yarnrc.yml"), &project_rc).unwrap();
+        let lock_path = project.join("yarn.lock");
+        let pristine = std::fs::read_to_string(&lock_path).unwrap();
+
+        let env = run_redirect_subprocess_with(
+            &project,
+            &server.uri(),
+            &["--patch-server-url", &server.uri()],
+        );
+        assert_eq!(env["redirect"]["redirected"], 1, "{source:?}: {env:#}");
+
+        let out = scrubbed_cli()
+            .args([
+                "rollback",
+                "--json",
+                "--yes",
+                "--patch-server-url",
+                &server.uri(),
+                "--cwd",
+                project.to_str().unwrap(),
+            ])
+            .env(
+                "SOCKET_NPM_REGISTRY",
+                format!("{}/npm-registry", server.uri()),
+            )
+            .env_remove("YARN_NPM_REGISTRY_SERVER")
+            .env_remove("YARN_RC_FILENAME")
+            .env_remove("SOCKET_PATCH_TEST_UNSET_REG")
+            .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
+            .output()
+            .unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{source:?}: rollback stdout must be JSON: {e}\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(out.status.code(), Some(0), "{source:?}: rollback: {env:#}");
+        let restored = std::fs::read_to_string(&lock_path).unwrap();
+        let checksum = berry_checksum_of(&restored);
+        assert_eq!(
+            restored,
+            pristine.replace(
+                &format!("10c0/{}", "3".repeat(128)),
+                &format!("10c0/{checksum}")
+            ),
+            "{source:?}: rollback keeps the mirror's __archiveUrl binding"
+        );
+    }
+}
+
+/// #1017: a registry yarn itself cannot resolve (an rc reference to an
+/// unset variable with no default) is not silently replaced by the default
+/// registry: the restore says so with `upstream_registry_fallback`.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_rollback_warns_when_the_registry_cannot_be_known() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    mock_reference_with_berry_url(&server, &hosted_url).await;
+    mock_view(&server).await;
+    let conventional = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+    mock_npm_registry_advertising(
+        &server,
+        &vlt_hosted_common::sha512_sri(&upstream_tarball()),
+        &conventional,
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_project(tmp.path());
+    let env = run_redirect_subprocess_with(
+        tmp.path(),
+        &server.uri(),
+        &["--patch-server-url", &server.uri()],
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    std::fs::write(
+        tmp.path().join(".yarnrc.yml"),
+        "nodeLinker: node-modules\nnpmRegistryServer: \"${SOCKET_PATCH_TEST_UNSET_REG}\"\n",
+    )
+    .unwrap();
+    let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    let codes: Vec<&str> = env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"upstream_registry_fallback"), "{env:#}");
 }
 
 // ── #1131: the restored `npm:` entry takes the registry's `bin:` back ───────

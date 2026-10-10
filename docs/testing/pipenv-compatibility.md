@@ -73,6 +73,11 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
 - **Line endings.** Pipenv preserves a CRLF lock (git autocrlf); so do both
   rewriters and both rollbacks, and a checkout that converted the file
   between the redirect and the rollback still restores.
+- **Reinstall after an unwind.** Pipenv never reinstalls a release that is
+  already present, so after `rollback`, `remove` or `vendor --revert` a plain
+  `pipenv sync` keeps the patched build. The unwind warns
+  `vendor_pypi_reinstall_required` / `redirect_pypi_reinstall_required` with
+  the uninstall-and-sync remedy (#477).
 - **Vendored refusal for 7–11.** Those releases cannot reliably consume
   vendored wheel references; hosted mode covers them.
 - **Command availability.** `--ignore-pipfile` and `--venv` arrive with

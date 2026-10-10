@@ -3413,4 +3413,127 @@ snapshots:
         );
         assert_no_registry_request(&mock).await;
     }
+
+    /// #1197: pnpm 7–11 keep a removed package's `.pnpm/<name>@<version>`
+    /// entry for up to 7 days (pnpm 12 an upgraded-away one until `pnpm
+    /// prune`). Nothing links to it and neither lock has it, so the
+    /// vendored scan skips it instead of failing it
+    /// `vendor_lock_entry_not_found` on every run: the current lockfile
+    /// pnpm writes beside the entries (`.pnpm/lock.yaml`) is the record of
+    /// what is installed.
+    #[tokio::test]
+    async fn vendored_scan_skips_a_pnpm_store_entry_the_install_dropped() {
+        let mock = MockServer::start().await;
+        let scope = [PNPM_SCOPE[0], PNPM_SCOPE[2]];
+        mount_patch_api(&mock, &scope, "package/index.js").await;
+        // The real batch endpoint answers only for the purls it is asked
+        // about: a scan that reports the orphan gets its patch.
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                let packages: Vec<serde_json::Value> = scope
+                    .iter()
+                    .filter(|(purl, _)| body.contains(purl))
+                    .map(|(purl, uuid)| {
+                        serde_json::json!({
+                            "purl": purl,
+                            "patches": [{
+                                "uuid": uuid, "purl": purl, "tier": "free",
+                                "cveIds": ["CVE-2026-0001"], "ghsaIds": [],
+                                "severity": "high", "title": "plan target"
+                            }]
+                        })
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "packages": packages,
+                    "canAccessPaidPatches": false,
+                }))
+            })
+            .with_priority(1)
+            .mount(&mock)
+            .await;
+        let registry = format!("{}/registry", mock.uri());
+        let uri = mock.uri();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "scope-test", "version": "0.0.0", "dependencies": { "pkg-a": "1.0.0" } }"#,
+        )
+        .unwrap();
+        let lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      pkg-a:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  pkg-a@1.0.0:
+    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}
+
+snapshots:
+
+  pkg-a@1.0.0: {}
+";
+        std::fs::write(root.join("pnpm-lock.yaml"), lock).unwrap();
+        let store = root.join("node_modules/.pnpm");
+        for name in ["pkg-a", "pkg-y"] {
+            let pkg = store.join(format!("{name}@1.0.0/node_modules/{name}"));
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            ".pnpm/pkg-a@1.0.0/node_modules/pkg-a",
+            root.join("node_modules/pkg-a"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        {
+            let pkg = root.join("node_modules/pkg-a");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                r#"{"name":"pkg-a","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+        }
+        std::fs::write(store.join("lock.yaml"), lock).unwrap();
+
+        let (code, stdout, stderr) = run_cli_env(
+            root,
+            &api_argv(&uri, &["scan", "--mode", "vendored"]),
+            &[("SOCKET_NPM_REGISTRY", registry.as_str())],
+        );
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("valid JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
+        assert_eq!(code, 0, "{v}");
+        assert_eq!(v["status"], "success", "{v}");
+        assert!(
+            !stdout.contains("vendor_lock_entry_not_found") && !stdout.contains("pkg-y"),
+            "the orphaned entry is not scanned: {v}"
+        );
+        assert_eq!(
+            events_for(&v, "pkg:npm/pkg-a@1.0.0").first(),
+            Some(&("applied", "")),
+            "{v}"
+        );
+    }
 }
