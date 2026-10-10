@@ -379,7 +379,13 @@ moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
 `node_modules/.vlt`, Bun's isolated-linker store `node_modules/.bun`,
 Deno's isolated `nodeModulesDir` store `node_modules/.deno`, and
 `node_modules/.store`, written by npm's `install-strategy=linked` and by
-Yarn 4's pnpm linker (where each entry's `package/` dir is the copy). A recorded virtual store outside the project is not
+Yarn 4's pnpm linker (where each entry's `package/` dir is the copy).
+pnpm 7–12 keep the entry of a removed or upgraded-away package for a
+while after `pnpm remove` or an upgrade (pnpm 7–11 for up to 7 days, pnpm
+12 until `pnpm prune`). Scans skip such an entry when the current
+lockfile pnpm writes in the store (`node_modules/.pnpm/lock.yaml`) no
+longer lists its package, so a vendored scan does not fail on a package
+the install dropped. `rollback` still reaches it. A recorded virtual store outside the project is not
 listed: other projects on the machine load the same files, so patching it
 in place would patch them as well. For pnpm's global virtual store
 (`enableGlobalVirtualStore`, `<store>/v<N>/links` under the pnpm store
