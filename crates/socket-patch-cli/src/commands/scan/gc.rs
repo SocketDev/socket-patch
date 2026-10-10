@@ -158,7 +158,7 @@ async fn run_gc(
     socket_dir: &Path,
     dry_run: bool,
 ) -> GcSummary {
-    let sweep = ArtifactReferences::for_apply(manifest)
+    let sweep = ArtifactReferences::active(manifest)
         .sweep(socket_dir, dry_run)
         .await;
     let mut warnings = Vec::new();
@@ -1310,28 +1310,21 @@ mod tests {
         state.entries.insert(
             PURL.to_string(),
             socket_patch_core::vendor::VendorEntry {
-                ecosystem: "npm".into(),
-                base_purl: PURL.into(),
-                uuid: UUID.into(),
-                artifact: socket_patch_core::vendor::state::VendorArtifact {
-                    yarn_berry10c0: None,
-                    path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
-                    sha256: String::new(),
-                    size: None,
-                    platform_locked: None,
-                    file_inventory: None,
-                },
-                wiring: Vec::new(),
-                lock: None,
-                took_over_go_patches: false,
-                detached: false,
-                record: None,
                 flavor: Some("package-lock".into()),
-                uv: None,
-                pnpm: None,
-                poetry: None,
-                pdm: None,
-                pipenv: None,
+                ..socket_patch_core::vendor::VendorEntry::new(
+                    "npm".into(),
+                    PURL.into(),
+                    UUID.into(),
+                    socket_patch_core::vendor::state::VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
+                        sha256: String::new(),
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    Vec::new(),
+                )
             },
         );
         socket_patch_core::vendor::save_state(tmp.path(), &state)
@@ -1431,42 +1424,35 @@ mod tests {
         state.entries.insert(
             PURL.to_string(),
             socket_patch_core::vendor::VendorEntry {
-                ecosystem: "npm".into(),
-                base_purl: PURL.into(),
-                uuid: UUID.into(),
-                artifact: socket_patch_core::vendor::state::VendorArtifact {
-                    yarn_berry10c0: None,
-                    path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
-                    sha256: String::new(),
-                    size: None,
-                    platform_locked: None,
-                    file_inventory: None,
-                },
-                wiring: vec![WiringRecord {
-                    file: "package-lock.json".into(),
-                    kind: "npm_lock_entry".into(),
-                    action: WiringAction::Rewritten,
-                    key: Some("node_modules/gone".into()),
-                    original: Some(serde_json::json!({
-                        "version": "1.0.0",
-                        "resolved": "https://registry.npmjs.org/gone/-/gone-1.0.0.tgz",
-                    })),
-                    new: Some(serde_json::json!({
-                        "version": "1.0.0",
-                        "resolved":
-                            format!("file:.socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
-                    })),
-                }],
-                lock: None,
-                took_over_go_patches: false,
-                detached: false,
-                record: None,
                 flavor: Some("package-lock".into()),
-                uv: None,
-                pnpm: None,
-                poetry: None,
-                pdm: None,
-                pipenv: None,
+                ..socket_patch_core::vendor::VendorEntry::new(
+                    "npm".into(),
+                    PURL.into(),
+                    UUID.into(),
+                    socket_patch_core::vendor::state::VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
+                        sha256: String::new(),
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    vec![WiringRecord {
+                        file: "package-lock.json".into(),
+                        kind: "npm_lock_entry".into(),
+                        action: WiringAction::Rewritten,
+                        key: Some("node_modules/gone".into()),
+                        original: Some(serde_json::json!({
+                            "version": "1.0.0",
+                            "resolved": "https://registry.npmjs.org/gone/-/gone-1.0.0.tgz",
+                        })),
+                        new: Some(serde_json::json!({
+                            "version": "1.0.0",
+                            "resolved":
+                                format!("file:.socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
+                        })),
+                    }],
+                )
             },
         );
         socket_patch_core::vendor::save_state(tmp.path(), &state)

@@ -1161,6 +1161,97 @@ async fn scan_prune_reverts_unused_vendored_entry() {
     );
 }
 
+/// #1155: `npm install left-pad@1.3.1` after vendoring 1.3.0 keeps the
+/// `node_modules/left-pad` key but locks the new version from the
+/// registry. The vendored version left the lock graph just as after
+/// `npm uninstall`, so `scan --prune` must revert the entry in one run.
+/// It used to call the moved entry drift and keep it forever, so the
+/// prune remedy `vendor --check` names never converged.
+#[tokio::test]
+async fn scan_prune_reverts_vendored_entry_after_version_upgrade() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}"))
+        .exists());
+
+    // What `npm install left-pad@1.3.1` leaves behind.
+    let lock = serde_json::json!({
+        "name": "scan-vendor-test",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "scan-vendor-test",
+                "version": "0.0.0",
+                "dependencies": { "left-pad": "^1.3.1" }
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded==",
+                "license": "WTFPL"
+            }
+        }
+    });
+    let mut lock_bytes = serde_json::to_vec_pretty(&lock).unwrap();
+    lock_bytes.push(b'\n');
+    std::fs::write(tmp.path().join("package-lock.json"), &lock_bytes).unwrap();
+    std::fs::write(
+        tmp.path().join("node_modules/left-pad/package.json"),
+        br#"{"name":"left-pad","version":"1.3.1"}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(binary())
+        .args([
+            "scan",
+            "--json",
+            "--prune",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        v["gc"]["revertedVendoredEntries"],
+        serde_json::json!([PURL]),
+        "gc must revert the upgraded-away entry: {v}"
+    );
+    assert_eq!(
+        v["gc"]["keptVendoredEntries"],
+        serde_json::json!([]),
+        "nothing resolves through the artifact, so nothing is kept: {v}"
+    );
+    assert!(
+        !tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
+        "artifact dir removed"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_bytes,
+        "the user's upgraded lock is left exactly as they wrote it"
+    );
+}
+
 /// #541, npm package-lock flavor: after `npm uninstall left-pad` re-locks
 /// the project without the vendored dependency, a vendored rescan skips
 /// the stale ledger entry with a `vendor_ledger_entry_unwired` warning
@@ -1316,8 +1407,8 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
 
 /// Interactive (non-JSON) `scan --mode vendored` pre-verifies patch baselines:
 /// installed content matching NEITHER hash is annotated before vendoring
-/// starts, and the run still vendors (auto-force) with the
-/// `vendor_content_mismatch_overwritten` warning on stderr.
+/// starts, and the run still vendors the server's verified artifact (no
+/// mismatch warning: vendoring never reads the installed bytes).
 #[tokio::test]
 async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
     let mock = MockServer::start().await;

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::pnpm_layout::MODULES_YAML as PNPM_MODULES_YAML;
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
 use crate::formats::text::strip_bom;
@@ -42,7 +43,8 @@ const SKIP_DIRS: &[&str] = &[
 ///   store and the projects' own `node_modules` hold only links to their
 ///   direct deps.
 ///
-/// - pnpm's `modulesDir` (see [`pnpm_modules_dirs`]): pnpm installs the
+/// - pnpm's `modulesDir` (see
+///   [`super::pnpm_layout::configured_modules_dirs`]): pnpm installs the
 ///   project there instead of `node_modules`, and from pnpm 10.12 its
 ///   virtual store follows (`<modulesDir>/.pnpm`), so nothing of the
 ///   install is under a dir named `node_modules` (#661).
@@ -56,91 +58,17 @@ pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     if start_path.join("rush.json").is_file() {
         roots.push(start_path.join("common").join("temp").join("node_modules"));
     }
-    roots.extend(pnpm_modules_dirs(start_path));
+    roots.extend(super::pnpm_layout::configured_modules_dirs(start_path));
     roots.retain(|root| root.is_dir());
     let mut seen = HashSet::new();
     roots.retain(|root| seen.insert(root.clone()));
     roots
 }
 
-/// The project's pnpm `modulesDir` install roots, other than
-/// `node_modules` itself:
-/// - the configured setting ([`pnpm_modules_dir_setting`]), resolved
-///   against the project like pnpm does, and honored only strictly inside
-///   it (the value comes from the scanned project and names a tree apply
-///   WRITES into; see [`resolve_modules_folder`]);
-/// - any direct child dir holding pnpm's `.modules.yaml` install record,
-///   which pnpm writes into whatever modules dir it used. That finds an
-///   install whose `modulesDir` came from pnpm's global config or the
-///   environment, which the project's files do not show.
-fn pnpm_modules_dirs(start_path: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(dir) =
-        pnpm_modules_dir_setting(start_path).and_then(|raw| resolve_modules_folder(&[], &raw))
-    {
-        dirs.push(start_path.join(dir));
-    }
-    let Some((entries, _)) = read_dir_entries_sync(start_path) else {
-        return dirs;
-    };
-    for entry in entries {
-        let name = entry.file_name();
-        if name == OsStr::new("node_modules") || !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let dir = start_path.join(name);
-        if std::fs::symlink_metadata(dir.join(PNPM_MODULES_YAML)).is_ok_and(|m| m.is_file()) {
-            dirs.push(dir);
-        }
-    }
-    dirs
-}
-
-/// The raw pnpm `modulesDir` setting that applies to the project at
-/// `start_path`: `modulesDir:` in the nearest `pnpm-workspace.yaml` at or
-/// above it (the workspace's settings file on pnpm 10+, which wins over
-/// `.npmrc`), else `modules-dir` from the nearest `.npmrc` at or above it
-/// that sets it (pnpm up to 10). Read with
-/// [`crate::utils::fs::read_regular_to_string_sync`]: the files belong to
-/// the (untrusted) project.
-fn pnpm_modules_dir_setting(start_path: &Path) -> Option<String> {
-    let read = |path: PathBuf| crate::utils::fs::read_regular_to_string_sync(&path).ok();
-    let from_workspace = start_path
-        .ancestors()
-        .find_map(|dir| read(dir.join("pnpm-workspace.yaml")))
-        .and_then(|yaml| {
-            crate::formats::text::strip_bom(&yaml)
-                .lines()
-                .filter_map(crate::formats::pnpm::workspace::top_level_key)
-                .rfind(|(key, _)| key == "modulesDir")
-                .map(|(_, value)| unquote_yaml_scalar(value))
-        });
-    from_workspace
-        .or_else(|| {
-            start_path.ancestors().find_map(|dir| {
-                let npmrc = read(dir.join(".npmrc"))?;
-                crate::patch::redirect::npmrc::npmrc_top_level_value(&npmrc, "modules-dir")
-            })
-        })
-        .filter(|value| !value.is_empty())
-}
-
-/// A YAML flow scalar's value: quotes removed (`''` is a literal quote
-/// inside single quotes), a plain scalar as is.
-fn unquote_yaml_scalar(raw: &str) -> String {
-    if raw.starts_with('"') {
-        if let Ok(value) = serde_json::from_str::<String>(raw) {
-            return value;
-        }
-    } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-        return inner.replace("''", "'");
-    }
-    raw.to_string()
-}
-
 /// Whether the installed pnpm tree of the project at `project` keeps its
 /// virtual store where the crawler does not look: a `.modules.yaml` in
-/// `node_modules` or a pnpm modules dir ([`pnpm_modules_dirs`]) records a
+/// `node_modules` or a pnpm modules dir
+/// ([`super::pnpm_layout::configured_modules_dirs`]) records a
 /// `virtualStoreDir` outside the project, as pnpm's global virtual store
 /// (`enableGlobalVirtualStore`) and a `virtualStoreDir` that climbs out
 /// do. Only direct deps are linked into the project then, so a package
@@ -148,7 +76,7 @@ fn unquote_yaml_scalar(raw: &str) -> String {
 /// and must not be read as absent (#696). `false` with no pnpm install.
 pub fn pnpm_store_outside_project(project: &Path) -> bool {
     let mut modules_dirs = vec![project.join("node_modules")];
-    modules_dirs.extend(pnpm_modules_dirs(project));
+    modules_dirs.extend(super::pnpm_layout::configured_modules_dirs(project));
     modules_dirs.iter().any(|nm| {
         let Ok(text) = crate::utils::fs::read_regular_to_string_sync(&nm.join(PNPM_MODULES_YAML))
         else {
@@ -242,7 +170,7 @@ fn yarnrc_modules_folder(start_path: &Path) -> Option<String> {
 /// resolved lexically, and a value that is absolute, drive-qualified, or
 /// resolves outside the project or to the project itself fails closed —
 /// the project then discovers nothing there, as before.
-fn resolve_modules_folder(project_in_rc_dir: &[String], raw: &str) -> Option<String> {
+pub(super) fn resolve_modules_folder(project_in_rc_dir: &[String], raw: &str) -> Option<String> {
     if raw.starts_with(['/', '\\']) {
         return None;
     }
@@ -1351,10 +1279,6 @@ fn decode_npm_store_entry_name(entry_name: &str) -> Option<(String, String)> {
     }
     Some((key[..at].to_string(), version.to_string()))
 }
-
-/// The `node_modules` child in which pnpm records its install state,
-/// including where the virtual store lives.
-const PNPM_MODULES_YAML: &str = ".modules.yaml";
 
 /// The `virtualStoreDir` value of a `.modules.yaml`: JSON on pnpm 10+,
 /// YAML before (a top-level `virtualStoreDir:` scalar, maybe quoted).

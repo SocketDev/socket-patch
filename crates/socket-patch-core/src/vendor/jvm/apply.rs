@@ -30,9 +30,9 @@ use super::super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::super::{RevertOpts, RevertOutcome, VendorWarning};
 use super::{
     coursier_tree, gradle, layout, maven_reactor, op_of, op_str, sbt, scala_cli, sha256_hex,
-    Coords, JvmPlan, JvmUnplan, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND, CREATED_DIR_KIND,
-    DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND, SBT_FRAGMENT_KIND,
-    SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
+    Coords, JvmPlan, JvmUnplan, ReadFn, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND,
+    CREATED_DIR_KIND, DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
+    SBT_FRAGMENT_KIND, SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
 };
 
 /// Whether `entry` was written by this backend: it has wiring and every
@@ -865,6 +865,33 @@ pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, Str
     wired
 }
 
+/// [`maven_reactor::ExternalPoms`] for `patch` from the Maven local
+/// repository `local_repo` alone (`None` entries: not there).
+fn local_external_poms(
+    read: ReadFn<'_>,
+    patch: &super::JvmPatch<'_>,
+    local_repo: Option<&Path>,
+) -> maven_reactor::ExternalPoms {
+    let mut known = maven_reactor::ExternalPoms::new();
+    loop {
+        let need = maven_reactor::external_poms_needed(read, patch, &known);
+        if need.is_empty() {
+            return known;
+        }
+        for (g, a, v) in need {
+            let bytes = local_repo.and_then(|repo| {
+                let path = repo
+                    .join(g.replace('.', "/"))
+                    .join(&a)
+                    .join(&v)
+                    .join(format!("{a}-{v}.pom"));
+                read_regular_to_bytes_sync(&path).ok()
+            });
+            known.insert((g, a, v), bytes);
+        }
+    }
+}
+
 /// Verify every recorded file plus the effective wiring, without writes or network I/O.
 pub fn check_entry(
     root: &Path,
@@ -944,8 +971,26 @@ pub fn check_entry(
         patched_members: &patched,
     };
     let config = !entry.wiring.iter().any(|w| op_of(w) == "config_none");
-    let plan = super::plan_with_config(shape_of(&entry.wiring), &read, &list, &patch, config)
+    // The management a Maven pin would override from outside the checkout
+    // (#488), read from the local repository only (no network). When some
+    // of it is not there, either decision `vendor` could have made is in
+    // sync: the pin it wrote when it could read it, or none.
+    let shape = shape_of(&entry.wiring);
+    let external = if matches!(shape, Shape::MavenReactor | Shape::Mixed) {
+        Some(local_external_poms(&read, &patch, local_repo))
+    } else {
+        None
+    };
+    let plan = super::plan_with_external(shape, &read, &list, &patch, config, external.as_ref())
         .map_err(|e| e.detail)?;
+    let incomplete = external
+        .as_ref()
+        .is_some_and(|known| known.values().any(Option::is_none));
+    let plan = if incomplete && !plan.writes.is_empty() {
+        super::plan_with_config(shape, &read, &list, &patch, config).map_err(|e| e.detail)?
+    } else {
+        plan
+    };
     if let Some(w) = plan.writes.first() {
         return Err(format!("vendored wiring or metadata drifted: {}", w.rel));
     }
