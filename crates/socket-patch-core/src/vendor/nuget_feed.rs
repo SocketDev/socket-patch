@@ -20,7 +20,7 @@ use super::common::{
 use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
 use super::revert::{self, KeepPolicy};
-use super::service_fetch::{service_archive_copy, ServiceCopy};
+use super::service_fetch::service_archive_copy;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -28,7 +28,7 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 
 /// Project-relative lockfile this backend pins (optional — NuGet only writes
 /// it when `RestorePackagesWithLockFile`/`--use-lock-file` is set).
-const PACKAGES_LOCK: &str = "packages.lock.json";
+use crate::formats::nuget::lock::{locked_at, PACKAGES_LOCK};
 
 /// Wiring-record discriminators. `nuget_config_source` carries the WHOLE-FILE
 /// pre/post `nuget.config` snapshot (the authoritative revert record);
@@ -104,48 +104,6 @@ pub(crate) fn is_plain_nuget_token(s: &str) -> bool {
 /// way); the version goes through [`normalize_nuget_version`].
 pub(crate) fn nupkg_leaf(id_lower: &str, version: &str) -> String {
     format!("{id_lower}.{}.nupkg", normalize_nuget_version(version))
-}
-
-/// One `packages.lock.json` `dependencies.<tfm>.<id>` entry that restores
-/// from a source: its raw id key, `resolved` and `contentHash` strings.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct NugetLockEntry<'a> {
-    pub(crate) id: &'a str,
-    pub(crate) resolved: &'a str,
-    pub(crate) content_hash: Option<&'a str>,
-}
-
-/// Every entry of a parsed `packages.lock.json`, target framework by target
-/// framework, in document-key order. Frameworks that are not objects and
-/// entries without a string `resolved` (`type: "Project"` references, which
-/// nothing restores from a source) are skipped; strings are raw (callers
-/// trim / normalize / compare ids as they need).
-pub(crate) fn nuget_lock_entries(doc: &Value) -> impl Iterator<Item = NugetLockEntry<'_>> {
-    doc.get("dependencies")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|frameworks| frameworks.values())
-        .filter_map(Value::as_object)
-        .flatten()
-        .filter_map(|(id, entry)| {
-            Some(NugetLockEntry {
-                id,
-                resolved: entry.get("resolved").and_then(Value::as_str)?,
-                content_hash: entry.get("contentHash").and_then(Value::as_str),
-            })
-        })
-}
-
-/// The lock entries of package `id` (case-insensitive) whose `resolved`
-/// normalizes to `version_norm` — the entries the vendored nupkg replaces.
-fn locked_at<'a>(
-    doc: &'a Value,
-    id: &'a str,
-    version_norm: &'a str,
-) -> impl Iterator<Item = NugetLockEntry<'a>> {
-    nuget_lock_entries(doc).filter(move |e| {
-        e.id.eq_ignore_ascii_case(id) && normalize_nuget_version(e.resolved) == version_norm
-    })
 }
 
 /// Everything [`vendor_nuget`] decides before it can first ask the patch
@@ -258,6 +216,25 @@ async fn nuget_prelude(
         .as_deref()
         .and_then(crate::formats::nuget::parse_config)
         .is_some_and(|parsed| parsed.sources.iter().any(|(key, _)| *key == source_key));
+    // The mapping routes every version of the id to this feed, which serves
+    // only the patched one: a framework that locks another version could no
+    // longer restore (NU1102). Refused before anything is wired (#593).
+    if !config_wired {
+        if let Some(Ok(doc)) = lock_text.as_deref().map(lock_value) {
+            let others = crate::formats::nuget::lock::other_versions(&doc, name, &version_norm);
+            if !others.is_empty() {
+                return Err(refused(
+                    "vendor_nuget_lock_other_version",
+                    crate::formats::nuget::lock::other_versions_detail(
+                        PACKAGES_LOCK,
+                        name,
+                        &version_norm,
+                        &others,
+                    ),
+                ));
+            }
+        }
+    }
     let in_sync = config_wired && {
         // One guarded read of the committed nupkg serves both the member-hash
         // check and the lock's content-hash pin.
@@ -669,11 +646,11 @@ fn nuget_entry(
     nupkg_bytes: &[u8],
     wiring: Vec<WiringRecord>,
 ) -> VendorEntry {
-    VendorEntry {
-        ecosystem: "nuget".to_string(),
+    VendorEntry::new(
+        "nuget".to_string(),
         base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
+        record.uuid.clone(),
+        VendorArtifact {
             yarn_berry10c0: None,
             // A `.nupkg` is a single verifiable file; record its plain sha256
             // for tooling (harvest re-derives per-entry git hashes from the
@@ -685,17 +662,7 @@ fn nuget_entry(
             file_inventory: None,
         },
         wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    }
+    )
 }
 
 /// Revert a NuGet vendor entry: undo the lock pin, restore/delete the
@@ -820,7 +787,7 @@ async fn materialise_patched_nupkg(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
     match service_archive_copy(service, record, name, ".nupkg", warnings).await {
-        ServiceCopy::Used(bytes) => {
+        Ok(bytes) => {
             if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
                 if !config_wired {
                     let _ = remove_tree(uuid_dir).await;
@@ -833,7 +800,7 @@ async fn materialise_patched_nupkg(
                 already_patched_result(purl, nupkg_path, &record.files),
             ))
         }
-        ServiceCopy::HardFail(outcome) => Err(outcome),
+        Err(outcome) => Err(outcome),
     }
 }
 
@@ -1284,7 +1251,9 @@ static LOCK_VALUE_MEMO: ParseMemo<Value> = ParseMemo::new();
 /// [`PACKAGES_LOCK`] as JSON, reusing the run's parse while `text` is the
 /// text it came from.
 fn lock_value(text: &str) -> Result<Arc<Value>, serde_json::Error> {
-    LOCK_VALUE_MEMO.parse(text.as_bytes(), || serde_json::from_str::<Value>(text))
+    LOCK_VALUE_MEMO.parse(text.as_bytes(), || {
+        crate::formats::nuget::lock::parse_lock(text)
+    })
 }
 
 /// Rewrite `contentHash` to `new_hash` for every framework entry of `id`
@@ -2062,6 +2031,72 @@ mod tests {
         let mut out = Vec::new();
         f.read_to_end(&mut out).ok()?;
         Some(out)
+    }
+
+    /// #593: a lock that also resolves the patched id at another version
+    /// (a multi-targeting project) is refused before anything is written:
+    /// the exact-id mapping would send that framework to a feed that only
+    /// serves the patched version (NU1102).
+    #[tokio::test]
+    async fn lock_with_the_id_at_another_version_is_refused_untouched() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let lock = lock_json("ORIGINALcachedhash==").replacen(
+            "\"resolved\": \"13.0.3\"",
+            "\"resolved\": \"12.0.3\"",
+            1,
+        );
+        tokio::fs::write(root.join(PACKAGES_LOCK), &lock)
+            .await
+            .unwrap();
+        let (code, detail) =
+            unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "vendor_nuget_lock_other_version");
+        assert!(detail.contains("12.0.3"), "{detail}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+                .await
+                .unwrap(),
+            lock
+        );
+        assert!(!root.join("nuget.config").exists());
+        assert!(!root.join(".socket").exists());
+    }
+
+    /// #623: dotnet restores a BOM'd lock, so vendor pins it (the BOM kept)
+    /// and revert restores it byte-identically.
+    #[tokio::test]
+    async fn bom_lock_is_pinned_and_reverted_byte_identically() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let lock = format!("\u{feff}{}", lock_json("ORIGINALcachedhash=="));
+        tokio::fs::write(root.join(PACKAGES_LOCK), &lock)
+            .await
+            .unwrap();
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            !warnings.iter().any(|w| w.code.contains("lock")),
+            "{warnings:?}"
+        );
+        let pinned = tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        let nupkg = tokio::fs::read(root.join(copy_rel())).await.unwrap();
+        assert_eq!(
+            pinned,
+            lock.replace("ORIGINALcachedhash==", &sha512_base64_of(&nupkg))
+        );
+        let entry = entry.expect("ledger entry");
+        let reverted = revert_nuget(&entry, root, false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+                .await
+                .unwrap(),
+            lock
+        );
     }
 
     #[tokio::test]
@@ -2855,11 +2890,11 @@ mod tests {
         let root = dir.path().join("proj");
         tokio::fs::create_dir_all(&root).await.unwrap();
 
-        let entry = VendorEntry {
-            ecosystem: "nuget".to_string(),
-            base_purl: PURL.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
+        let entry = VendorEntry::new(
+            "nuget".to_string(),
+            PURL.to_string(),
+            UUID.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: copy_rel(),
                 sha256: String::new(),
@@ -2867,7 +2902,7 @@ mod tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![WiringRecord {
+            vec![WiringRecord {
                 file: "../outside.txt".to_string(),
                 kind: CONFIG_SOURCE_WIRING_KIND.to_string(),
                 action: WiringAction::Rewritten,
@@ -2875,17 +2910,7 @@ mod tests {
                 original: Some(Value::String("EVIL".to_string())),
                 new: Some(Value::String("precious".to_string())),
             }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        };
+        );
         let outcome = revert_nuget(&entry, &root, false).await;
         assert!(
             !outcome.success,
@@ -3669,11 +3694,11 @@ mod tests {
     // ── revert entry validation edges ──────────────────────────────────────
 
     fn entry_with_wiring(uuid: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
-        VendorEntry {
-            ecosystem: "nuget".to_string(),
-            base_purl: PURL.to_string(),
-            uuid: uuid.to_string(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "nuget".to_string(),
+            PURL.to_string(),
+            uuid.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: copy_rel(),
                 sha256: String::new(),
@@ -3682,17 +3707,7 @@ mod tests {
                 file_inventory: None,
             },
             wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+        )
     }
 
     /// A tampered state.json uuid must refuse the revert fail-closed before

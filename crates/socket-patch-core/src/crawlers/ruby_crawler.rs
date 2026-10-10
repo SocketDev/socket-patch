@@ -1410,6 +1410,103 @@ pub fn config_path_ignored_warning(value: &str) -> (&'static str, String) {
     )
 }
 
+/// The name v4's `socket-patch setup` registered its Bundler plugin under.
+const SOCKET_BUNDLER_PLUGIN: &str = "socket-patch";
+
+/// The stable warning `(code, detail)` for a Bundler plugin registration
+/// that v4's `setup` left behind and v5 can no longer remove (#1295).
+///
+/// v4's `setup --remove` cleared `.bundle/plugin/index` (#210); v5 dropped
+/// `setup`, and `.bundle/` is never committed, so every checkout that ran
+/// `bundle install` under v4 keeps a registration pointing at the deleted
+/// `.socket/bundler-plugin/`. Bundler 2.3–2.5 then abort every
+/// `bundle install` with a `LoadError`, and 2.6+ warn on each run. The
+/// crawler stays print-free: scan and apply surface it on their own
+/// warning channels, as with [`config_path_ignored_warning`].
+///
+/// `None` unless the app config dir's `plugin/index` registers
+/// `socket-patch` at a path that no longer exists. A registration whose
+/// directory is still there is a v4 setup that is still wired, which
+/// Bundler loads fine.
+pub async fn stale_plugin_registration_warning(root: &Path) -> Option<(&'static str, String)> {
+    stale_plugin_registration_warning_with_env(
+        root,
+        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+    )
+    .await
+}
+
+pub(crate) async fn stale_plugin_registration_warning_with_env(
+    root: &Path,
+    app_config_env: Option<&OsStr>,
+) -> Option<(&'static str, String)> {
+    let index = bundler_app_config_dir(root, app_config_env)
+        .join("plugin")
+        .join("index");
+    let text = crate::utils::fs::read_regular_to_string(&index)
+        .await
+        .ok()?;
+    let registered = registered_plugin_path(&text, SOCKET_BUNDLER_PLUGIN)?;
+    let path = Path::new(&registered);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if crate::utils::fs::file_exists(&path).await {
+        return None;
+    }
+    Some((
+        "gem_bundler_plugin_stale",
+        format!(
+            "Bundler still registers the removed v4 socket-patch plugin at \"{registered}\" \
+             (in {}); Bundler 2.3-2.5 fail every `bundle install` with a LoadError and \
+             newer versions warn on each run. Run `bundle plugin uninstall socket-patch` \
+             in this checkout (or delete its .bundle/plugin directory) to clear it",
+            index.display()
+        ),
+    ))
+}
+
+/// The path `name` is registered at under `plugin_paths:` in a Bundler
+/// plugin index. Bundler writes the index with its own YAML serializer
+/// (`Bundler::YAMLSerializer`): top-level keys at column 0, one
+/// `  name: "path"` line per plugin beneath, so a line scan reads it
+/// exactly. Quotes are optional, for indexes written by other tools.
+fn registered_plugin_path(index: &str, name: &str) -> Option<String> {
+    fn unquote(s: &str) -> &str {
+        let s = s.trim();
+        for q in ['"', '\''] {
+            if let Some(inner) = s.strip_prefix(q).and_then(|t| t.strip_suffix(q)) {
+                return inner;
+            }
+        }
+        s
+    }
+    let mut in_section = false;
+    for line in index.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with([' ', '\t']) {
+            in_section = line == "plugin_paths:";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((key, value)) = line.trim_start().split_once(": ") else {
+            continue;
+        };
+        if unquote(key) == name {
+            let value = unquote(value);
+            return (!value.is_empty()).then(|| value.to_string());
+        }
+    }
+    None
+}
+
 /// The ambient home directory ([`home_dir`]) as an env value — the
 /// `~`-expansion base for ambient runs; tests inject theirs through the
 /// `_with_env` seams.
@@ -3404,6 +3501,111 @@ mod tests {
         assert!(
             !detail.contains(r"C:\\Users"),
             "Debug escaping must not double backslashes: {detail}"
+        );
+    }
+
+    /// A `.bundle/plugin/index` as Bundler 4.0.18 writes it after
+    /// `bundle install` with v4's managed `plugin "socket-patch", path:`
+    /// block, with `dir` standing for the registered plugin directory.
+    fn v4_plugin_index(dir: &str) -> String {
+        format!(
+            "---\ncommands:\nhooks:\n  before-install-all:\n  - \"socket-patch\"\n\
+             load_paths:\n  socket-patch:\n  - \"{dir}/lib\"\nplugin_paths:\n  \
+             socket-patch: \"{dir}\"\nsources:\n"
+        )
+    }
+
+    #[test]
+    fn registered_plugin_path_reads_bundlers_index() {
+        let index = v4_plugin_index("/app/.socket/bundler-plugin");
+        assert_eq!(
+            registered_plugin_path(&index, "socket-patch").as_deref(),
+            Some("/app/.socket/bundler-plugin")
+        );
+        assert_eq!(registered_plugin_path(&index, "other"), None);
+        // CRLF, unquoted values and a different plugin before ours.
+        let crlf = "---\r\nplugin_paths:\r\n  other: /x\r\n  socket-patch: /y\r\n";
+        assert_eq!(
+            registered_plugin_path(crlf, "socket-patch").as_deref(),
+            Some("/y")
+        );
+        // `bundle plugin uninstall socket-patch` leaves the keys empty.
+        let cleared = "---\ncommands:\nhooks:\nload_paths:\nplugin_paths:\nsources:\n";
+        assert_eq!(registered_plugin_path(cleared, "socket-patch"), None);
+        // The name under another section is not a registration.
+        let elsewhere = "---\nload_paths:\n  socket-patch: \"/z\"\nplugin_paths:\n";
+        assert_eq!(registered_plugin_path(elsewhere, "socket-patch"), None);
+    }
+
+    /// #1295: v5 has no `setup --remove`, so a checkout that ran
+    /// `bundle install` under v4 keeps the registration after the
+    /// migration commit deletes `.socket/bundler-plugin/`. That stale
+    /// registration (and only that) must produce the warning.
+    #[tokio::test]
+    async fn stale_plugin_registration_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let plugin_dir = root.join(".socket").join("bundler-plugin");
+        let index_dir = root.join(".bundle").join("plugin");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let dir = plugin_dir.display().to_string();
+        std::fs::write(index_dir.join("index"), v4_plugin_index(&dir)).unwrap();
+
+        // Still wired (v4 setup in place): Bundler loads it fine.
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        assert_eq!(
+            stale_plugin_registration_warning_with_env(root, None).await,
+            None
+        );
+
+        // The migration commit removed the plugin dir: stale.
+        std::fs::remove_dir_all(&plugin_dir).unwrap();
+        let (code, detail) = stale_plugin_registration_warning_with_env(root, None)
+            .await
+            .expect("a registration at a missing path must warn");
+        assert_eq!(code, "gem_bundler_plugin_stale");
+        assert!(detail.contains(&dir), "detail names the path: {detail}");
+        assert!(
+            detail.contains("bundle plugin uninstall socket-patch"),
+            "detail carries the remedy: {detail}"
+        );
+
+        // After `bundle plugin uninstall socket-patch`: nothing to report.
+        std::fs::write(
+            index_dir.join("index"),
+            "---\ncommands:\nhooks:\nload_paths:\nplugin_paths:\nsources:\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stale_plugin_registration_warning_with_env(root, None).await,
+            None
+        );
+    }
+
+    /// The index lives under the app config dir, so a `BUNDLE_APP_CONFIG`
+    /// that moves it is followed, and the default `.bundle/` is not read.
+    #[tokio::test]
+    async fn stale_plugin_registration_follows_bundle_app_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let missing = root.join(".socket").join("bundler-plugin");
+        let index_dir = root.join("cfg").join("plugin");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(
+            index_dir.join("index"),
+            v4_plugin_index(&missing.display().to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            stale_plugin_registration_warning_with_env(root, None).await,
+            None,
+            "no index under the default .bundle/"
+        );
+        assert!(
+            stale_plugin_registration_warning_with_env(root, Some(OsStr::new("cfg")))
+                .await
+                .is_some(),
+            "a relative BUNDLE_APP_CONFIG resolves against the root"
         );
     }
 

@@ -646,7 +646,6 @@ pub async fn lock_text_refusals(
     let nowhere = nowhere_buf.as_path();
     let no_sources = PatchSources {
         blobs_path: nowhere,
-        diffs_path: None,
         mem_blobs: None,
     };
     let mut refusals = Vec::with_capacity(packages.len());
@@ -917,7 +916,6 @@ mod lock_text_refusal_tests {
         let nowhere = root.join("not-installed");
         let sources = PatchSources {
             blobs_path: &nowhere,
-            diffs_path: None,
             mem_blobs: None,
         };
         for (i, code) in [
@@ -2046,28 +2044,21 @@ mod tests {
 
     fn probe_entry(flavor: Option<&str>) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: "pkg:npm/left-pad@1.3.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: flavor.map(str::to_string),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                "pkg:npm/left-pad@1.3.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 

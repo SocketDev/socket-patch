@@ -17,6 +17,7 @@ mod hosted_management_refusals;
 mod hosted_symlinked_files;
 mod hosted_wheel_metadata_order;
 mod hosted_yarn_berry_manifest;
+mod hosted_yarn_classic_sha1;
 mod scan_batch_sizing_e2e;
 mod scan_ecosystems_scope_e2e;
 mod scan_invariants;

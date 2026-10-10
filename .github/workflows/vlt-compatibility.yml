@@ -131,7 +131,7 @@ env:
 jobs:
   matrix-coverage:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -146,7 +146,7 @@ jobs:
   # matrix-coverage above still checks it, the rest is skipped.
   changes:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.gate.outputs.matrix }}
@@ -182,7 +182,7 @@ jobs:
         exclude:
           # macOS legs run on push to main (and nightly where scheduled), not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -291,7 +291,7 @@ jobs:
           - {os: windows-latest, vlt: '1.2.0', linker: auto, suites: e2e_safety_vlt}
           - {os: windows-latest, vlt: '1.2.0', linker: hardlink, suites: e2e_safety_vlt}
           - {os: ubuntu-latest, vlt: '1.2.0', linker: hardlink, cache_root: /dev/shm/vlt-e2e-cache, suites: e2e_safety_vlt}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     # The capstones resolve fixtures through the build job's checkout path,
     # which is the same on every runner of one OS.
@@ -405,14 +405,14 @@ jobs:
           - {os: macos-latest, vlt: '1.2.0'}
           - {os: macos-latest, vlt: '1.2.0', linker: auto, suites: e2e_safety_vlt}
           - {os: macos-latest, vlt: '1.2.0', linker: hardlink, suites: e2e_safety_vlt}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     steps: *install-proof-steps
 
   plan:
     needs: changes
     if: needs.changes.outputs.matrix == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 5
     outputs:
       native: ${{ steps.plan.outputs.native }}
@@ -444,7 +444,7 @@ jobs:
       # Each job runs its cells against the public patch service.
       max-parallel: 6
       matrix: ${{ fromJSON(needs.plan.outputs.native) }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -508,7 +508,7 @@ jobs:
   lock-diff:
     needs: [changes, native]
     if: ${{ !cancelled() && needs.changes.outputs.matrix == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -555,7 +555,7 @@ jobs:
         exclude:
           # macOS legs run on push to main (and nightly where scheduled), not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -624,7 +624,7 @@ jobs:
     # Advisory until the socket-patch release that adds vlt support (with the
     # forward-compatible ledger handling) is the latest published one.
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

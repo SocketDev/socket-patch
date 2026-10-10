@@ -17,13 +17,13 @@
 //!   files (a hand edit after the crash) is set aside whole, never
 //!   half-applied.
 
+#[path = "common/mod.rs"]
+mod common;
+
 #[path = "vendor_ecosystem_fixtures/mod.rs"]
 mod fx;
 
-#[path = "common/envelope.rs"]
-mod envelope;
-
-use envelope::{event_triples, parse_json_envelope};
+use common::envelope::{event_triples, parse_json_envelope};
 use fx::{masked_tree, Fixture};
 
 const OFF: (&str, &str) = ("SOCKET_PATCH_SWITCH_OFF", "group_commit");
