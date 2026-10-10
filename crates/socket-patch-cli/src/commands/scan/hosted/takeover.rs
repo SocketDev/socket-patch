@@ -253,6 +253,11 @@ impl Takeover {
                         outcome.error.as_deref().unwrap_or("unknown error")
                     ),
                 }))
+            } else if let Some(residual) = residual_only_keep(&outcome) {
+                // Nothing drifted: another project file (an exported
+                // requirements file) still installs from the vendored
+                // wheel (#1184). Name it, not a drift.
+                Some(residual_takeover_warning(&purl, &residual))
             } else if revert_keeps_wiring(&outcome) {
                 // A wiring record drifted and was left in place, so the
                 // project may still resolve through the vendored artifact
@@ -550,6 +555,59 @@ fn revert_keeps_wiring(outcome: &RevertOutcome) -> bool {
             .warnings
             .iter()
             .any(|w| w.code == "vendor_revert_residual_reference")
+}
+
+/// The `vendor_revert_residual_reference` detail of a revert whose ONLY
+/// keep signal is a file that still references the artifact.
+fn residual_only_keep(outcome: &RevertOutcome) -> Option<String> {
+    if outcome.drift_skipped() {
+        return None;
+    }
+    outcome
+        .warnings
+        .iter()
+        .find(|w| w.code == socket_patch_core::vendor::RESIDUAL_REFERENCE_CODE)
+        .map(|w| {
+            // `kept <dir>: <file> still resolves through it, and deleting …`:
+            // only the clause naming the file; the revert's own remedy is
+            // not this command's.
+            let detail = w.detail.as_str();
+            detail
+                .split_once(": ")
+                .map_or(detail, |(_, rest)| rest)
+                .split(", and deleting")
+                .next()
+                .unwrap_or(detail)
+                .to_string()
+        })
+}
+
+/// The refusal for a takeover whose vendored wheel another project file
+/// still installs from.
+///
+/// The order matters: the refusal leaves the lock vendored, so re-exporting
+/// from it now would name the wheel again. The file is pinned by hand
+/// first; only after the hosted scan has rewired the lock is a re-export
+/// safe.
+fn residual_takeover_warning(purl: &str, residual: &str) -> serde_json::Value {
+    let pin = purl
+        .strip_prefix("pkg:pypi/")
+        .map(|rest| rest.split(['?', '#']).next().unwrap_or(rest))
+        .and_then(|rest| rest.split_once('@'))
+        .map_or_else(
+            || "the registry release".to_string(),
+            |(name, version)| format!("`{name}=={version}`"),
+        );
+    serde_json::json!({
+        "code": "redirect_vendored_revert_failed",
+        "detail": format!(
+            "{purl} is vendored and another project file still installs from its \
+             vendored wheel ({residual}), so it is left in place; NOT switched to hosted — \
+             first replace the wheel path in that file with {pin} by hand (the lock is \
+             still vendored, so a re-export now would name the wheel again), re-run \
+             `scan --mode hosted`, and only then re-export the file from the rewired lock"
+        ),
+    })
 }
 
 /// The refusal for a takeover whose vendored wiring drifted since vendoring.

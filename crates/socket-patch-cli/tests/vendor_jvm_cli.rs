@@ -949,6 +949,7 @@ fn gradle_vendor_429_crlf_checkout_checks_and_reverts_clean() {
         "proj/.socket/vendor/.gitattributes",
         "proj/.socket/vendor/gradle-index.tsv",
         "proj/.socket/vendor/gradle/.gitattributes",
+        "proj/.socket/vendor/gradle/.gitignore",
         FOO_METADATA,
     ];
     for rel in text_files {

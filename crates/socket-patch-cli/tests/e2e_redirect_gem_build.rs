@@ -440,6 +440,10 @@ enum Driver {
     /// A modifier adjacent to a top-level constant is still a modifier,
     /// not a hash label (`if::ENV`, #340).
     ScanVexScopedConstantModifier,
+    /// [`Driver::ScanVex`] on a gem declared inside the user's own
+    /// `source "<upstream>" do` block (#1056): bundler locks it with a `!`
+    /// source pin, which the unwind must keep.
+    ScanVexSourceBlock,
     /// A heredoc option continues beyond the declaration's physical line.
     ScanVexHeredocDeclaration,
     /// A double-quoted interpolation can itself contain a heredoc opener.
@@ -521,6 +525,7 @@ impl Driver {
             Driver::ScanVexCustomLockfile => "scan --mode hosted (lockfile custom.lock)",
             Driver::ScanVexTwin => "scan --mode hosted (Gemfile + gems.rb twin)",
             Driver::ScanVexGroupBlock => "scan --mode hosted (gem in a group block)",
+            Driver::ScanVexSourceBlock => "scan --mode hosted (gem in a source block)",
             Driver::ScanVexSemicolonJoinedDeclaration => {
                 "scan --mode hosted (two `;`-joined gem declarations)"
             }
@@ -814,6 +819,10 @@ async fn redirect_scanned_project(
             "source \"{}/upstream\"\n\ngroup :development do\n  gem \"{DEP}\"\nend\n",
             server.uri()
         ),
+        Driver::ScanVexSourceBlock => format!(
+            "source \"{up}/upstream\"\n\nsource \"{up}/upstream\" do\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
+            up = server.uri()
+        ),
         Driver::ScanVexEvalGemfile => {
             std::fs::write(proj.join("Gemfile.common"), format!("gem \"{DEP}\"\n")).unwrap();
             format!(
@@ -1061,6 +1070,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexDuplicateDeclaration
         | Driver::ScanVexEvalGemfile
         | Driver::ScanVexGroupBlock
+        | Driver::ScanVexSourceBlock
         | Driver::ScanVexCustomGitSource
         | Driver::ScanVexMultiLineDeclaration
         | Driver::ScanVexConditionalDeclaration
@@ -1263,6 +1273,7 @@ async fn redirect_scanned_project(
     match driver {
         Driver::ScanVex
         | Driver::ScanVexGroupBlock
+        | Driver::ScanVexSourceBlock
         | Driver::ScanVexTrailingSemicolonDeclaration => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert_eq!(
@@ -2326,6 +2337,106 @@ async fn gem_hosted_group_block_pin_survives_a_refused_vendored_takeover() {
                  view {fetched} time(s)"
             );
         }
+    }
+}
+
+/// #1056: a gem the user declared inside their own `source "…" do` block
+/// is locked as `name (= v)!`. After the hosted scan converges (an
+/// unfrozen install), `rollback` / `remove` must hand back the exact
+/// pre-scan pair, `!` included, so a FROZEN install of the restored pair
+/// still succeeds (it exited 16 when the unwind dropped the `!`).
+/// Converged without CHECKSUMS so the restore needs no rubygems.org sha.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.2); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_unwind_keeps_a_source_block_bang() {
+    for command in ["rollback", "remove"] {
+        let Some(fx) = redirect_scanned_project(
+            &format!("source-block {command}"),
+            Spelling::Gemfile,
+            false,
+            true,
+            None,
+            Driver::ScanVexSourceBlock,
+        )
+        .await
+        else {
+            return;
+        };
+        if !fx.bundler.at_least(2, 2) {
+            println!(
+                "SKIP e2e_redirect_gem_build (source-block unwind): bundler {} merges every \
+                 rubygems source into one GEM section",
+                fx.bundler.version
+            );
+            return;
+        }
+        let pristine_lock = String::from_utf8(fx.pristine_lock.clone()).unwrap();
+        assert!(
+            pristine_lock.contains(&format!("  {DEP} (= {DEP_VERSION})!\n")),
+            "bundler pins a source-block gem with `!` (test premise):\n{pristine_lock}"
+        );
+        // Converge the mixed pair: the lock now resolves from the registry.
+        let install = bundle(&fx.proj, &["install"]);
+        assert!(
+            install.status.success(),
+            "converging install:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        let lock = std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap();
+        assert!(
+            lock.contains(&format!("remote: {}", fx.index_url)),
+            "converged:\n{lock}"
+        );
+
+        let api = fx._server.uri();
+        let cwd = fx.proj.to_str().expect("utf8 tmp path");
+        let mut argv = vec![command];
+        if command == "remove" {
+            argv.extend([PURL, "--yes"]);
+        }
+        argv.extend([
+            "--json",
+            "--cwd",
+            cwd,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &api,
+        ]);
+        let (code, stdout, stderr) = run_socket(&fx.proj, &argv);
+        assert_eq!(code, 0, "{command}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap(),
+            pristine_lock,
+            "{command}: the lock comes back byte for byte, `!` included"
+        );
+        assert_eq!(
+            std::fs::read(fx.proj.join(fx.gemfile_name)).unwrap(),
+            fx.pristine_gemfile,
+            "{command}: the Gemfile comes back byte for byte"
+        );
+        let fresh = stage_fresh_checkout(&fx, &format!("source-block-{command}"));
+        let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
+        assert!(
+            install.status.success(),
+            "{command}: frozen install of the restored pair:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        assert_eq!(
+            std::fs::read(fresh_installed_lib(
+                &fresh,
+                &format!("{DEP}-{DEP_VERSION}"),
+                "vuln_gem.rb"
+            ))
+            .unwrap(),
+            orig_lib().into_bytes(),
+            "{command}: the upstream bytes are installed"
+        );
     }
 }
 
