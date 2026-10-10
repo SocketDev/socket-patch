@@ -176,7 +176,6 @@ mod regression_tests {
             &primary,
             &files,
             &PatchSources::blobs_only(&blobs),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -220,7 +219,6 @@ mod regression_tests {
             &primary,
             &files,
             &PatchSources::blobs_only(&blobs),
-            None,
             false,
             MismatchPolicy::Force,
         )
@@ -249,7 +247,6 @@ mod regression_tests {
             &primary,
             &files,
             &PatchSources::blobs_only(&blobs),
-            None,
             true,
             MismatchPolicy::Warn,
         )
@@ -273,7 +270,6 @@ mod regression_tests {
             &primary,
             &files,
             &PatchSources::blobs_only(&blobs),
-            None,
             false,
             MismatchPolicy::Warn,
         )

@@ -34,10 +34,9 @@ use toml_edit::{DocumentMut, Item};
 
 use super::client::PypiFile;
 use super::pypi::{
-    by_uuid, fetch_release_files, multiline_toml_array, pin_of, read_or_refuse, refuse_all_in,
-    toml_quote, toml_value, universal_release,
+    fetch_release_files, multiline_toml_array, pin_of, toml_quote, toml_value, universal_release,
 };
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::poetry_lock::is_multiline_array;
 use crate::utils::python_lock::preserve_line_endings;
