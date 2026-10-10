@@ -149,11 +149,11 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
     let mut state = VendorState::new();
     state.entries.insert(
         purl.to_string(),
-        VendorEntry {
-            ecosystem: "cargo".to_string(),
-            base_purl: purl.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "cargo".to_string(),
+            purl.to_string(),
+            UUID.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
@@ -161,18 +161,8 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![wiring],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
+            vec![wiring],
+        ),
     );
     let dir = cwd.join(".socket/vendor");
     std::fs::create_dir_all(&dir).unwrap();
@@ -606,28 +596,22 @@ fn write_detached_vendor_state(cwd: &Path, purl: &str, rel_path: &str, record: P
     state.entries.insert(
         purl.to_string(),
         VendorEntry {
-            ecosystem: "cargo".to_string(),
-            base_purl: purl.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: rel_path.to_string(),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: vec![wiring],
-            lock: None,
-            took_over_go_patches: false,
             detached: true,
             record: Some(record),
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "cargo".to_string(),
+                purl.to_string(),
+                UUID.to_string(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel_path.to_string(),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                vec![wiring],
+            )
         },
     );
     let dir = cwd.join(".socket/vendor");
@@ -984,28 +968,22 @@ fn detached_matrix_entry(
     wiring: WiringRecord,
 ) -> VendorEntry {
     VendorEntry {
-        ecosystem: eco.to_string(),
-        base_purl: purl.to_string(),
-        uuid: uuid.to_string(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: rel_path.to_string(),
-            sha256,
-            size: None,
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring: vec![wiring],
-        lock: None,
-        took_over_go_patches: false,
         detached: true,
         record: Some(record),
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
+        ..VendorEntry::new(
+            eco.to_string(),
+            purl.to_string(),
+            uuid.to_string(),
+            VendorArtifact {
+                yarn_berry10c0: None,
+                path: rel_path.to_string(),
+                sha256,
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            vec![wiring],
+        )
     }
 }
 
@@ -2621,21 +2599,6 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
     state.entries.insert(
         purl.to_string(),
         VendorEntry {
-            ecosystem: "npm".to_string(),
-            base_purl: purl.to_string(),
-            uuid: uuid.to_string(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: rel.clone(),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            // What `repair`'s reconstruction records for npm.
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             detached: true,
             record: Some(make_record(
                 uuid,
@@ -2645,11 +2608,20 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
                 &["CVE-2026-31"],
             )),
             flavor: Some("pnpm".to_string()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".to_string(),
+                purl.to_string(),
+                uuid.to_string(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel.clone(),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         },
     );
     std::fs::create_dir_all(cwd.join(".socket/vendor")).unwrap();
@@ -2742,20 +2714,6 @@ fn pnpm_bundled_copy_blocks_vex_but_not_vendor_check() {
         state.entries.insert(
             purl.to_string(),
             VendorEntry {
-                ecosystem: "npm".to_string(),
-                base_purl: purl.to_string(),
-                uuid: uuid.to_string(),
-                artifact: VendorArtifact {
-                    yarn_berry10c0: None,
-                    path: rel.clone(),
-                    sha256,
-                    size: None,
-                    platform_locked: None,
-                    file_inventory: None,
-                },
-                wiring: Vec::new(),
-                lock: None,
-                took_over_go_patches: false,
                 detached: true,
                 record: Some(make_record(
                     uuid,
@@ -2765,11 +2723,20 @@ fn pnpm_bundled_copy_blocks_vex_but_not_vendor_check() {
                     &["CVE-2026-1033"],
                 )),
                 flavor: Some("pnpm".to_string()),
-                uv: None,
-                pnpm: None,
-                poetry: None,
-                pdm: None,
-                pipenv: None,
+                ..VendorEntry::new(
+                    "npm".to_string(),
+                    purl.to_string(),
+                    uuid.to_string(),
+                    VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: rel.clone(),
+                        sha256,
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    Vec::new(),
+                )
             },
         );
         std::fs::create_dir_all(cwd.join(".socket/vendor")).unwrap();

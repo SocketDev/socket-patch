@@ -54,14 +54,9 @@ fn normalize_source(source: &str) -> String {
 }
 
 fn source_host(source: &str) -> Option<&str> {
-    let (_, rest) = source.split_once("://")?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host_port = authority.rsplit('@').next()?;
-    if host_port.starts_with('[') {
-        Some(&host_port[..=host_port.find(']')?])
-    } else {
-        host_port.split(':').next()
-    }
+    source
+        .contains("://")
+        .then(|| crate::utils::redact::url_hostname(source))?
 }
 
 /// `Settings.key_for` normalizes HTTP(S) keys before re-encoding them. A

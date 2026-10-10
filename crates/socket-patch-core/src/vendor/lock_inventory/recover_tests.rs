@@ -5,11 +5,11 @@ use super::*;
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
 fn entry(eco: &str, base_purl: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
-    VendorEntry {
-        ecosystem: eco.into(),
-        base_purl: base_purl.into(),
-        uuid: UUID.into(),
-        artifact: VendorArtifact {
+    VendorEntry::new(
+        eco.into(),
+        base_purl.into(),
+        UUID.into(),
+        VendorArtifact {
             yarn_berry10c0: None,
             path: format!(".socket/vendor/{eco}/{UUID}/x"),
             sha256: String::new(),
@@ -18,17 +18,7 @@ fn entry(eco: &str, base_purl: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
             file_inventory: None,
         },
         wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    }
+    )
 }
 
 fn rec(kind: &str, original: serde_json::Value) -> WiringRecord {

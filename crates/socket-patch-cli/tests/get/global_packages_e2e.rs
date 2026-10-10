@@ -21,14 +21,11 @@
 //! that crashes, swallows the PURL, or silently reports success no
 //! longer slips through.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use crate::cache_env;
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+use crate::common::binary;
 
 /// Build a `socket-patch` `Command` with the ambient `SOCKET_*` env
 /// surface scrubbed (mirrors `common::run_with_env`). The binary binds
