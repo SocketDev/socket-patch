@@ -64,6 +64,13 @@ concurrency:
 # commit. ci-ok treats skipped jobs as passing. hosted-e2e is not scoped:
 # it always runs, and its step-level HOSTED_E2E_DISABLED switch is the only
 # bypass.
+# MERGE-QUEUE REUSE: a push to main whose exact SHA already passed this
+# workflow in the merge queue (scripts/ci-reuse-merge-group.py, run by
+# clippy) only compiles, to refresh the main-only caches, and skips the
+# test steps and test-only jobs the queue already ran. Jobs the queue never
+# runs (test-release, e2e-full, yarn-berry-full, cargo-vex-matrix-full) and
+# hosted-e2e still run. API errors, missing evidence and direct pushes run
+# everything.
 jobs:
   # Required independently of ci-ok so the merge queue sees a compile/lint
   # failure immediately. Expensive jobs also depend on this preflight.
@@ -71,11 +78,25 @@ jobs:
     if: github.event.pull_request.draft != true
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.merge-queue.outputs.reuse }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      # Main remains the cache writer. Skip duplicate test execution only
+      # when this workflow passed in the merge queue on the identical SHA.
+      - name: Check merge-queue validation
+        id: merge-queue
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-reuse-merge-group.py
 
       - name: Install Rust
         # rustup is pre-installed on GitHub-hosted runners. `toolchain
@@ -141,6 +162,7 @@ jobs:
         run: node crates/socket-patch-node/npm/scripts/build-addon.mjs
 
       - name: Smoke-test addon
+        if: needs.clippy.outputs.reuse != 'true'
         run: node --test crates/socket-patch-node/npm/test/smoke.mjs
 
   # Check the standalone installer, release scripts, and native installer
@@ -287,17 +309,22 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
         # Two legs per OS (scripts/ci-test-shard.py): one leg linked ~240
-        # test binaries and ran them serially for ~26 min, the merge queue's
-        # critical path. Shard 1 = unit tests + doctests + a third of the
-        # integration targets; shard 2 = the rest.
+        # test binaries and ran them serially for ~26 min. Windows balances
+        # measured runtime plus linking work (scripts/ci-test-durations.json);
+        # macOS keeps the count split. Shard 1 also owns unit tests and
+        # doctests.
         shard: [1, 2]
         exclude:
           # macOS legs run on main, the merge queue and nightly, not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
+          # One compile-only cache writer per OS is enough for an already
+          # tested SHA.
+          - shard: ${{ needs.clippy.outputs.reuse == 'true' && 2 || 0 }}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 50
     env:
       VEXCTL_VERSION: v0.3.0
+      CI_TEST_TIMINGS: ${{ matrix.os == 'windows-latest' && 'scripts/ci-test-durations.json' || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -324,7 +351,12 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Warm the test cache after merge-queue validation
+        if: needs.clippy.outputs.reuse == 'true'
+        run: cargo test --locked --workspace --no-run
+
       - name: Install Go (for vexctl)
+        if: needs.clippy.outputs.reuse != 'true'
         id: go
         # The `vex` subcommand emits OpenVEX documents; tests/e2e_vex.rs
         # validates the output with vexctl when it's on PATH. vexctl is
@@ -348,13 +380,14 @@ jobs:
         # version, the Go toolchain and the runner, so it is cached under
         # exactly those. Saved from main only, like the cargo cache.
         id: vexctl-cache
-        if: runner.os == 'macOS'
+        if: needs.clippy.outputs.reuse != 'true' && runner.os == 'macOS'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/vexctl-bin
           key: vexctl-${{ env.VEXCTL_VERSION }}-go${{ steps.go.outputs.go-version }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install vexctl
+        if: needs.clippy.outputs.reuse != 'true'
         # Linux / Windows: the v0.3.0 release binary, checked against the
         # sha256 pinned here (from the release's vexctl_checksums.txt).
         # Compiling it took ~80s on ubuntu and ~180s on windows, the
@@ -418,7 +451,8 @@ jobs:
 
       - name: Save vexctl (macOS)
         if: >-
-          runner.os == 'macOS'
+          needs.clippy.outputs.reuse != 'true'
+          && runner.os == 'macOS'
           && github.ref == 'refs/heads/main'
           && steps.vexctl-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
@@ -427,6 +461,7 @@ jobs:
           key: ${{ steps.vexctl-cache.outputs.cache-primary-key }}
 
       - name: Run tests
+        if: needs.clippy.outputs.reuse != 'true'
         # Default features only: `--all-features` would also RUN the
         # docker-e2e suites, which soft-skip as "ok" here (no images, and
         # macOS/Windows have no Docker) — fake greens hiding a broken
@@ -539,7 +574,15 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Warm the coverage cache after merge-queue validation
+        if: needs.clippy.outputs.reuse == 'true'
+        run: |
+          cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
+          source "$RUNNER_TEMP/coverage-env.sh"
+          cargo test --locked --workspace --no-run
+
       - name: Install Go (for vexctl and the real-go suites)
+        if: needs.clippy.outputs.reuse != 'true'
         # This job is the Linux leg of `test` (see there): same Go pin.
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
@@ -547,6 +590,7 @@ jobs:
           cache: false
 
       - name: Install vexctl
+        if: needs.clippy.outputs.reuse != 'true'
         # The v0.3.0 Linux release binary, as in `test`'s vexctl step.
         env:
           VEXCTL_VERSION: v0.3.0
@@ -563,10 +607,12 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
 
       - name: Run tests with coverage
+        if: needs.clippy.outputs.reuse != 'true'
         # Two-step pattern: `--no-report` runs instrumented tests and
-        # collects the raw profile data, then the two `report` calls
-        # emit lcov + summary from the same data. Avoids re-running
-        # tests twice. The output filename matches the `*.lcov`
+        # collects raw profiles, then one `report` exports LCOV. The
+        # summary is derived from that file (scripts/ci-lcov-summary.py)
+        # instead of a second `report` that merges the profiles and scans
+        # every instrumented object again. The output filename matches the `*.lcov`
         # gitignore pattern so a stray local run can't accidentally
         # commit a 600 KB report.
         #
@@ -584,10 +630,11 @@ jobs:
           cargo llvm-cov --workspace --no-fail-fast \
             --no-report
           cargo llvm-cov report --lcov --output-path coverage-host.lcov
-          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+          python3 scripts/ci-lcov-summary.py coverage-host.lcov | tee coverage-summary.txt
 
       - name: Publish coverage summary to job summary
-        # Render the per-file table cargo-llvm-cov prints as a fenced
+        if: needs.clippy.outputs.reuse != 'true'
+        # Render the per-file LCOV line/function/branch totals as a fenced
         # block in the GitHub Actions job summary so reviewers don't
         # need to crack open the artifact for a quick look.
         run: |
@@ -603,6 +650,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload host LCOV artifact
+        if: needs.clippy.outputs.reuse != 'true'
         uses: ./.github/actions/upload-artifact
         with:
           name: coverage-host
@@ -613,7 +661,7 @@ jobs:
   # Dockerfile.base compiles the full-LTO release binary inside Docker, with
   # no cache. Build it once per run and hand the image to every docker leg.
   docker-base:
-    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')
+    if: (github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     timeout-minutes: 30
@@ -735,6 +783,12 @@ jobs:
           file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
           tags: socket-patch-test-${{ matrix.ecosystem }}:latest
           load: true
+          # Warm only what the blocking agent_sbt_ slice below runs. The
+          # nightly e2e-docker job and sbt-compatibility.yml keep
+          # Dockerfile.sbt's full defaults.
+          build-args: |
+            ${{ matrix.ecosystem == 'sbt' && 'SBT_WARM_VERSIONS=1.2.8 1.13.0' || '' }}
+            ${{ matrix.ecosystem == 'sbt' && 'SBT_WARM_TOOLS=0' || '' }}
 
       - name: Configure docker-e2e coverage hooks
         # Mount the instrumented socket-patch that the test step's own
@@ -899,6 +953,8 @@ jobs:
   e2e-build:
     if: github.event.pull_request.draft != true
     needs: clippy
+    outputs:
+      reuse: ${{ needs.clippy.outputs.reuse }}
     strategy:
       fail-fast: false
       matrix:
@@ -931,12 +987,14 @@ jobs:
           cargo test --locked -p socket-patch-cli --all-features --tests --no-run --message-format=json-render-diagnostics > target-build.json
 
       - name: Bundle the binaries the legs run
+        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
         shell: bash
         env:
           BUNDLE_OS: ${{ matrix.os }}
         run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/e2e-bin
 
       - name: Compress the e2e binaries
+        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
         # Compress the bundle as one stream so identical Rust code across
         # test binaries shares a dictionary. Zstd is on every runner image.
         # The 128 MiB window cuts the Linux artifact from ~200 MB to ~94 MB;
@@ -947,6 +1005,7 @@ jobs:
           tar -C target/e2e-bin -cf - . | zstd -q -f -10 --long=27 -o target/e2e-bin.tar.zst
 
       - uses: ./.github/actions/upload-artifact
+        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
         with:
           name: e2e-bin-${{ matrix.os }}
           path: target/e2e-bin.tar.zst
@@ -957,6 +1016,8 @@ jobs:
   e2e-build-windows:
     if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
+    outputs:
+      reuse: ${{ needs.clippy.outputs.reuse }}
     strategy:
       fail-fast: false
       matrix:
@@ -969,6 +1030,8 @@ jobs:
   e2e-build-macos:
     if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
+    outputs:
+      reuse: ${{ needs.clippy.outputs.reuse }}
     strategy:
       fail-fast: false
       matrix:
@@ -979,6 +1042,7 @@ jobs:
     steps: *e2e-build-steps
 
   e2e:
+    if: needs.e2e-build.outputs.reuse != 'true'
     # These jobs consume e2e-build's binaries and can run alongside unit tests.
     needs: [e2e-build]
     strategy:
@@ -1684,7 +1748,7 @@ jobs:
   # repository variable CI_SCOPE is `full`, nightly, or on dispatch. See the
   # LEAN SCOPE note at the top of `jobs:`.
   e2e-extended:
-    if: (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: needs.e2e-build.outputs.reuse != 'true' && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: [e2e-build]
     strategy:
       fail-fast: false
@@ -1799,7 +1863,7 @@ jobs:
     steps: *e2e-steps
 
   e2e-windows:
-    if: (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: needs.e2e-build-windows.outputs.reuse != 'true' && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: [e2e-build-windows]
     strategy:
       fail-fast: false
@@ -1835,7 +1899,7 @@ jobs:
   # The macOS rows run on main, the merge queue and nightly, not on every
   # PR push, so PRs stop queueing on the small macOS runner pool.
   e2e-macos:
-    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: (github.event_name != 'pull_request' && needs.e2e-build-macos.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # These jobs consume e2e-build's binaries and can run alongside unit tests.
     needs: [e2e-build-macos]
     strategy:
@@ -2045,7 +2109,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy preflight.
-    if: github.event.pull_request.draft != true
+    if: github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true'
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 40
@@ -2089,7 +2153,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy preflight.
-    if: github.event.pull_request.draft != true
+    if: github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true'
     needs: clippy
     strategy:
       fail-fast: false
@@ -2130,7 +2194,7 @@ jobs:
   # nightly, not on every PR push, so PRs stop queueing on the small
   # macOS runner pool.
   yarn-berry-e2e-macos:
-    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: (github.event_name != 'pull_request' && needs.clippy.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
     needs: clippy
     strategy:
@@ -2169,6 +2233,7 @@ jobs:
   # toolchain x lock cross off pull_request. Each leg also runs
   # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
+    if: needs.e2e-build.outputs.reuse != 'true'
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     # e2e-build only (its binaries; only the matching OS build is needed);
     # see yarn-classic-matrix on test/coverage.
@@ -2248,7 +2313,7 @@ jobs:
 
   cargo-vex-matrix-windows:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    if: (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: needs.e2e-build-windows.outputs.reuse != 'true' && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: [e2e-build-windows]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
@@ -2263,7 +2328,7 @@ jobs:
 
   # The macOS rows run on main, the merge queue and nightly, not per PR push.
   cargo-vex-matrix-macos:
-    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: (github.event_name != 'pull_request' && needs.e2e-build-macos.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     needs: [e2e-build-macos]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
@@ -2337,6 +2402,7 @@ jobs:
       - name: Install Rust
         run: scripts/rustup-retry.sh toolchain install
       - name: Pull the old cargos under test
+        if: needs.clippy.outputs.reuse != 'true'
         run: |
           docker pull rust:1.41-slim
           docker pull rust:1.56-slim
@@ -2345,7 +2411,11 @@ jobs:
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Warm the shared Linux dev cache after merge-queue validation
+        if: needs.clippy.outputs.reuse == 'true'
+        run: cargo test --locked -p socket-patch-cli --test e2e_vendor_cargo_build --no-run
       - name: Vendored manifest [patch] on old cargo
+        if: needs.clippy.outputs.reuse != 'true'
         shell: bash
         env:
           SOCKET_PATCH_CARGO_E2E_REQUIRED: '1'
