@@ -655,13 +655,15 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   repository and `<dependencyManagement>` pin always land in the project's own top-level
   sections (an existing self-closed `<repositories/>` or `<dependencyManagement/>` is
   expanded in place, so Maven never sees a duplicated tag). A GA declared only in such
-  markup counts as transitive and gets the top-level pin; a base literal inside
-  `<profiles>` is left as-is and reported (`redirect_maven_profile_dependency_unpatched`),
-  because an active profile's literal beats the pin, and when a profile holds the GA's
-  only declaration nothing is pinned. The grant serves the main jar only:
-  a `<classifier>` variant (sources, tests, a native build) keeps its version
+  markup counts as transitive and gets the top-level pin; a versioned declaration inside
+  `<profiles>` (a literal or a `${property}`) is left as-is and reported
+  (`redirect_maven_profile_dependency_unpatched`), because an active profile's version
+  beats the pin, and when a profile holds the GA's only declaration nothing is pinned.
+  The grant serves the main jar only: a `<classifier>` variant keeps its version
   (`redirect_maven_classifier_unsupported`), and the literal-or-pin decision is made from
-  the classifier-less declarations.
+  the classifier-less declarations. A `sources` / `javadoc` variant at the patched release
+  only warns; any other variant there (tests, a native build) would keep unpatched code on
+  a classpath, so the dep is not redirected.
 * **Multi-module reactors are vendored-only (hosted Maven).** Hosted mode reads only
   the root `pom.xml`, and a module's own literal `<version>` always beats a root
   `<dependencyManagement>` pin, so a root pin would leave that module on the unpatched

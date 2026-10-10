@@ -75,15 +75,27 @@ fn shift_pos(pos: &mut usize, at: usize, delta: isize) {
     }
 }
 
-fn shift_element(e: &mut Element, at: usize, delta: isize) {
-    for pos in [
-        &mut e.start,
-        &mut e.inner_start,
-        &mut e.inner_end,
-        &mut e.end,
-    ] {
+/// An end-side offset (just past a `>`) moves on a pure insertion only when
+/// the text lands strictly before it: text inserted right where an element
+/// ends lies outside it.
+fn shift_end(pos: &mut usize, at: usize, delta: isize, insertion: bool) {
+    if !insertion || *pos > at {
         shift_pos(pos, at, delta);
     }
+}
+
+fn shift_element(e: &mut Element, at: usize, delta: isize, insertion: bool) {
+    // A self-closed element's inner offsets sit at its end.
+    let self_closed = e.inner_start == e.end;
+    shift_pos(&mut e.start, at, delta);
+    if self_closed {
+        shift_end(&mut e.inner_start, at, delta, insertion);
+        shift_end(&mut e.inner_end, at, delta, insertion);
+    } else {
+        shift_pos(&mut e.inner_start, at, delta);
+        shift_pos(&mut e.inner_end, at, delta);
+    }
+    shift_end(&mut e.end, at, delta, insertion);
 }
 
 /// The element `<name>…</name>` whose open tag starts `text[at..]`, with
@@ -180,8 +192,9 @@ impl PomIndex {
         self.repos.iter().any(|r| r.id.as_deref() == Some(id))
     }
 
-    /// Every offset at or past `at` moves by `delta`.
-    fn shift(&mut self, at: usize, delta: isize) {
+    /// Every offset at or past `at` moves by `delta` (on a pure
+    /// `insertion`, an element end exactly at `at` stays: see [`shift_end`]).
+    fn shift(&mut self, at: usize, delta: isize, insertion: bool) {
         for d in &mut self.deps {
             if let Some((s, e)) = &mut d.version_inner {
                 shift_pos(s, at, delta);
@@ -198,7 +211,7 @@ impl PomIndex {
             .into_iter()
             .flatten()
         {
-            shift_element(e, at, delta);
+            shift_element(e, at, delta, insertion);
         }
         shift_pos(&mut self.project_close, at, delta);
     }
@@ -208,9 +221,9 @@ impl PomIndex {
         pom.replace_range(start..end, text);
         let delta = text.len() as isize - (end - start) as isize;
         if start == end {
-            self.shift(start, delta);
+            self.shift(start, delta, true);
         } else {
-            self.shift(end, delta);
+            self.shift(end, delta, false);
         }
     }
 
@@ -466,6 +479,35 @@ mod tests {
             assert!(!index.refresh_repository_url(&mut pom, "r0", "https://h/rotated"));
             assert_eq!(pom.matches("<repositories").count(), 1, "{pom}");
             assert_eq!(pom.matches("<dependencyManagement").count(), 1, "{pom}");
+        }
+    }
+
+    /// A section inserted right before `</project>` lands outside a
+    /// self-closed section that ends there, so expanding that section
+    /// afterwards keeps the new one.
+    #[test]
+    fn insertion_after_a_self_closed_section_stays_outside_it() {
+        for tail in ["<repositories/>", "<dependencyManagement/>"] {
+            for dm_first in [true, false] {
+                let mut pom = format!(
+                    "<project>\n  <dependencies>\n    <dependency><groupId>g</groupId><artifactId>a</artifactId></dependency>\n  </dependencies>\n  {tail}</project>\n"
+                );
+                let mut index = PomIndex::build(&pom).unwrap();
+                if dm_first {
+                    index.insert_dependency_management(&mut pom, "g", "a", "1-socket.1");
+                    assert_in_step(&index, &pom);
+                }
+                index.insert_repository(&mut pom, "r", "https://h/r");
+                assert_in_step(&index, &pom);
+                if !dm_first {
+                    index.insert_dependency_management(&mut pom, "g", "a", "1-socket.1");
+                    assert_in_step(&index, &pom);
+                }
+                assert!(pom.contains("<version>1-socket.1</version>"), "{pom}");
+                assert!(pom.contains("<id>r</id>"), "{pom}");
+                assert_eq!(pom.matches("<repositories").count(), 1, "{pom}");
+                assert_eq!(pom.matches("<dependencyManagement").count(), 1, "{pom}");
+            }
         }
     }
 }

@@ -7344,6 +7344,12 @@ fn rewrite_maven_pom(
         let (variants, live): (Vec<_>, Vec<_>) = all_matches
             .into_iter()
             .partition(|m| m.classifier.is_some());
+        // A variant that carries code onto a classpath (tests, a native
+        // build, a JDK-specific jar) at the patched release would keep the
+        // unpatched bytes there while the GA counts as redirected and VEX
+        // attests it: the dep is skipped. `sources` / `javadoc` jars are
+        // never executed, so they only warn.
+        let mut executable_variant = false;
         for variant in &variants {
             let Some(v) = variant.version_text.as_deref() else {
                 continue;
@@ -7352,34 +7358,45 @@ fn rewrite_maven_pom(
                 || crate::formats::maven::split_socket_version(v)
                     .is_some_and(|(base, _)| base == dep.version);
             if names_release {
+                let classifier = variant.classifier.as_deref().unwrap_or_default();
+                let executable = !matches!(classifier, "sources" | "javadoc");
+                executable_variant |= executable;
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_classifier_unsupported".into(),
                     detail: format!(
-                        "{group_id}:{artifact_id}:{} <version>{v}</version> is a classifier variant; \
-                         the Socket patch covers only the main jar, so it is left as-is",
-                        variant.classifier.as_deref().unwrap_or_default()
+                        "{group_id}:{artifact_id}:{classifier} <version>{v}</version> is a \
+                         classifier variant; the Socket patch covers only the main jar, so it \
+                         is left as-is{}",
+                        if executable {
+                            " and the dep is not redirected (that variant would keep the \
+                             unpatched code on the classpath)"
+                        } else {
+                            ""
+                        }
                     ),
                 });
             }
         }
+        if executable_variant {
+            continue;
+        }
         // A `<profiles>` declaration is read only while its profile is
-        // active, and then its literal beats the top-level pin: it is never
-        // edited, and a base literal there is reported as unpatched. When
-        // that is the GA's only declaration, nothing this pom always reads
-        // uses it, and a top-level pin would be inert exactly when the
-        // profile pulls it in: the dep is skipped rather than reported
-        // redirected.
+        // active, and then its own `<version>` (a literal or a `${property}`)
+        // beats the top-level pin: it is never edited, and is reported as
+        // unpatched. When versioned profile declarations are the GA's only
+        // ones, nothing this pom always reads uses it, and a top-level pin
+        // would be inert exactly when the profile pulls it in: the dep is
+        // skipped rather than reported redirected. A versionless profile
+        // declaration takes the managed version, so the pin covers it.
         let (profiled, matches): (Vec<_>, Vec<_>) = live.into_iter().partition(|m| m.in_profile);
-        let profile_literal = profiled
-            .iter()
-            .any(|m| m.version_text.as_deref() == Some(dep.version.as_str()));
-        if profile_literal {
+        let profile_version = profiled.iter().find_map(|m| m.version_text.as_deref());
+        if let Some(profile_version) = profile_version {
             result.warnings.push(RewriteWarning {
                 code: "redirect_maven_profile_dependency_unpatched".into(),
                 detail: format!(
-                    "{group_id}:{artifact_id} <version>{}</version> inside <profiles> is not \
-                     edited; while that profile is active it resolves the unpatched artifact{}",
-                    dep.version,
+                    "{group_id}:{artifact_id} <version>{profile_version}</version> inside <profiles> \
+                     is not edited; while that profile is active it resolves that version, not \
+                     the patched artifact{}",
                     if matches.is_empty() {
                         " (no declaration outside <profiles>, so nothing is pinned)"
                     } else {
@@ -7816,10 +7833,13 @@ static MAVEN_REPOSITORY_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// The `<repository>` elements of `pom` whose `<id>` is `id`, as byte spans.
+/// A commented-out twin is not one: the rewriter writes a live repository
+/// beside it, and rollback must still find exactly that one.
 pub(crate) fn maven_repositories_with_id(pom: &str, id: &str) -> Vec<(usize, usize)> {
+    let masked = crate::formats::xml::blank_non_markup(pom).unwrap_or_else(|_| pom.to_string());
     MAVEN_REPOSITORY_RE
-        .find_iter(pom)
-        .filter(|m| maven_tag_text_in(pom, "id", m.start(), m.end()).as_deref() == Some(id))
+        .find_iter(&masked)
+        .filter(|m| maven_tag_text_in(&masked, "id", m.start(), m.end()).as_deref() == Some(id))
         .map(|m| (m.start(), m.end()))
         .collect()
 }
@@ -8506,6 +8526,80 @@ mod tests {
 
     fn warning_codes(r: &RewriteResult) -> Vec<&str> {
         r.warnings.iter().map(|w| w.code.as_str()).collect()
+    }
+
+    /// A profile's own `<version>` (a property or any literal) beats the
+    /// top-level pin while the profile is active: when the profile holds the
+    /// GA's only versioned declaration nothing is pinned, and beside a
+    /// top-level declaration it is reported unpatched.
+    #[test]
+    fn maven_versioned_profile_declarations_are_never_pinned_over() {
+        let profile = |version: &str| {
+            format!(
+                "  <profiles>\n    <profile>\n      <id>p</id>\n      <dependencies>\n        <dependency>\n          <groupId>org.slf4j</groupId>\n          <artifactId>slf4j-api</artifactId>\n          <version>{version}</version>\n        </dependency>\n      </dependencies>\n    </profile>\n  </profiles>\n</project>\n"
+            )
+        };
+        for version in ["${slf4j.version}", "1.7.30", "1.7.36"] {
+            let only = pom_with_dep("", "")
+                .replace(
+                    "  <dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n    </dependency>\n  </dependencies>\n",
+                    "",
+                )
+                .replace("</project>\n", &profile(version));
+            assert!(!only.contains("<dependencies>\n    <dependency>"), "{only}");
+            let files = BTreeMap::from([("pom.xml".to_string(), only)]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(r.files.is_empty(), "{version}: {:?}", r.files);
+            assert!(
+                warning_codes(&r).contains(&"redirect_maven_profile_dependency_unpatched"),
+                "{version}: {:?}",
+                r.warnings
+            );
+
+            let both = pom_with_dep("\n      <version>1.7.36</version>", "")
+                .replace("</project>\n", &profile(version));
+            let files = BTreeMap::from([("pom.xml".to_string(), both)]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let out = r.files.get("pom.xml").expect("top-level pinned");
+            assert!(
+                out.contains(&format!("<version>{version}</version>")),
+                "{out}"
+            );
+            assert!(
+                warning_codes(&r).contains(&"redirect_maven_profile_dependency_unpatched"),
+                "{version}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// A classifier variant at the patched release that carries code
+    /// (`tests`, a native build) keeps the unpatched bytes on a classpath,
+    /// so the dep is not redirected; a `sources` / `javadoc` jar only warns.
+    #[test]
+    fn maven_executable_classifier_variant_blocks_the_redirect() {
+        let variant = |classifier: &str| {
+            pom_with_dep("\n      <version>1.7.36</version>", "").replace(
+                "  </dependencies>",
+                &format!("    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n      <classifier>{classifier}</classifier>\n    </dependency>\n  </dependencies>"),
+            )
+        };
+        for classifier in ["tests", "linux-x86_64"] {
+            let files = BTreeMap::from([("pom.xml".to_string(), variant(classifier))]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(r.files.is_empty(), "{classifier}: {:?}", r.files);
+            assert!(warning_codes(&r).contains(&"redirect_maven_classifier_unsupported"));
+        }
+        for classifier in ["sources", "javadoc"] {
+            let files = BTreeMap::from([("pom.xml".to_string(), variant(classifier))]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let out = r.files.get("pom.xml").expect("main jar pinned");
+            assert!(
+                out.contains(&format!("<version>{MAVEN_SUFFIXED}</version>")),
+                "{out}"
+            );
+            assert!(warning_codes(&r).contains(&"redirect_maven_classifier_unsupported"));
+        }
     }
 
     /// Fail-closed literal pin: the `<version>` is rewritten to the suffixed

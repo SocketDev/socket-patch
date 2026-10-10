@@ -157,29 +157,37 @@ fn restore_pin(
     // The GA's literal versions where Maven reads them for the main jar:
     // not commented out, outside `<build>` / `<reporting>` / `<profiles>`,
     // no classifier — the same scope the rewriter decides "transitive" by.
-    let versioned = match crate::formats::maven::PomScope::new(&text).and_then(|s| s.dependencies())
-    {
-        Ok(deps) => deps
-            .iter()
-            .filter(|d| {
-                d.group.as_deref() == Some(group)
-                    && d.artifact.as_deref() == Some(artifact)
-                    && !d.in_profile
-                    && d.classifier.is_none()
-                    && d.version_inner.is_some()
-            })
-            .count(),
-        Err(_) => matches.iter().filter(|m| m.version.is_some()).count(),
-    };
     let sections = dm_sections(&text);
     let managed = |pos: usize| sections.iter().any(|(s, e)| pos >= *s && pos < *e);
-    // A versionless direct declaration with nothing but this pom's own
-    // `<dependencyManagement>` to manage it: that entry is the user's.
-    let entry_is_users = matches
-        .iter()
-        .any(|m| m.version.is_none() && !managed(m.start))
-        && !text.contains("<parent>")
-        && !text.contains("<scope>import</scope>");
+    let scoped = crate::formats::maven::PomScope::new(&text).and_then(|s| s.dependencies());
+    // In the same scope: a versionless direct declaration with nothing but
+    // this pom's own `<dependencyManagement>` to manage it means that entry
+    // is the user's (a commented, plugin, profile or classifier sibling is
+    // not such a declaration).
+    let (versioned, versionless_direct) = match &scoped {
+        Ok(deps) => {
+            let main = || {
+                deps.iter().filter(|d| {
+                    d.group.as_deref() == Some(group)
+                        && d.artifact.as_deref() == Some(artifact)
+                        && !d.in_profile
+                        && d.classifier.is_none()
+                })
+            };
+            (
+                main().filter(|d| d.version_inner.is_some()).count(),
+                main().any(|d| d.version_inner.is_none() && !managed(d.element.start)),
+            )
+        }
+        Err(_) => (
+            matches.iter().filter(|m| m.version.is_some()).count(),
+            matches
+                .iter()
+                .any(|m| m.version.is_none() && !managed(m.start)),
+        ),
+    };
+    let entry_is_users =
+        versionless_direct && !text.contains("<parent>") && !text.contains("<scope>import</scope>");
 
     let masked = crate::formats::xml::blank_non_markup(&text).unwrap_or_else(|_| text.clone());
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
@@ -205,14 +213,16 @@ fn restore_pin(
         text.replace_range(s..e, &with);
     }
 
-    if text.contains(&suffixed) {
+    // A comment naming the pin (a commented-out earlier wiring) is inert.
+    let live = crate::formats::xml::blank_non_markup(&text).unwrap_or_else(|_| text.clone());
+    if live.contains(&suffixed) {
         return Err(format!(
             "pom.xml still names {suffixed} outside a <dependency> version (a property or \
              plugin configuration socket-patch did not write)"
         ));
     }
     let name = generation::hosted_pin_name(uuid);
-    if text.contains(&name) {
+    if live.contains(&name) {
         return Err(format!("pom.xml still names {name}"));
     }
     Ok(text)
@@ -484,6 +494,75 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// A versionless sibling Maven does not read for the main jar (in a
+    /// comment, a plugin, a profile, or with a classifier) does not make the
+    /// rewriter's own `<dependencyManagement>` pin look user-written: the
+    /// pin is removed, not rewritten to the base version.
+    #[tokio::test]
+    async fn versionless_out_of_scope_siblings_keep_the_pin_authored() {
+        let sibling = "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>";
+        for extra in [
+            format!("<!-- {sibling}</dependency> -->"),
+            format!("{sibling}<classifier>sources</classifier></dependency>"),
+            format!(
+                "<build><plugins><plugin><artifactId>p</artifactId><dependencies>{sibling}</dependency></dependencies></plugin></plugins></build>"
+            ),
+            format!(
+                "<profiles><profile><id>x</id><dependencies>{sibling}</dependency></dependencies></profile></profiles>"
+            ),
+        ] {
+            // Beside the project's own (first) `</dependencies>`: inside it
+            // for a dependency, right after it otherwise.
+            let with = |mut pom: String| {
+                let close = "  </dependencies>\n";
+                let at = pom.find(close).expect("project dependencies");
+                if extra.starts_with("<dependency>") {
+                    pom.insert_str(at, &format!("    {extra}\n"));
+                } else {
+                    pom.insert_str(at + close.len(), &format!("  {extra}\n"));
+                }
+                pom
+            };
+            let input = with(fixture("transitive-depmgmt", "input", "pom.xml"));
+            let expected = with(fixture("transitive-depmgmt", "expected", "pom.xml"));
+            let (outcome, after) = run(&[("pom.xml", expected)]).await;
+            assert!(
+                matches!(outcome.pins[0].status, PinStatus::Restored),
+                "{extra}: {:?}",
+                outcome.pins[0].status
+            );
+            assert_eq!(after["pom.xml"], input, "{extra}");
+        }
+    }
+
+    /// A commented-out twin of the Socket repository (an earlier wiring the
+    /// user commented out) does not block rollback of the live one the
+    /// rewriter wrote beside it, and stays as it is.
+    #[tokio::test]
+    async fn a_commented_repository_twin_does_not_block_restore() {
+        let twin = |pom: String| {
+            pom.replacen(
+                "<id>old-mirror</id>",
+                &format!("<id>socket-patch-{UUID}</id>"),
+                1,
+            )
+        };
+        let (outcome, after) = run(&[(
+            "pom.xml",
+            twin(fixture("commented-repositories", "expected", "pom.xml")),
+        )])
+        .await;
+        assert!(
+            matches!(outcome.pins[0].status, PinStatus::Restored),
+            "{:?}",
+            outcome.pins[0].status
+        );
+        assert_eq!(
+            after["pom.xml"],
+            twin(fixture("commented-repositories", "input", "pom.xml"))
+        );
     }
 
     /// An expanded self-closed section restores to an empty (still single)
