@@ -34,7 +34,8 @@ use toml_edit::{DocumentMut, Item};
 
 use super::client::PypiFile;
 use super::pypi::{
-    fetch_release_files, multiline_toml_array, pin_of, toml_quote, toml_value, universal_release,
+    fetch_release_files, is_pypi_simple, multiline_toml_array, pin_of, toml_quote, toml_value,
+    universal_release,
 };
 use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
@@ -309,6 +310,120 @@ pub(crate) async fn restore_poetry(
 
 // ── pdm.lock ─────────────────────────────────────────────────────────────────
 
+/// The `url`s of a `static_urls` lock's file entries outside `skip` (the
+/// hosted packages): inline `files` and lock_version 2 `[metadata.files]`.
+fn pdm_file_urls(doc: &DocumentMut, skip: &BTreeSet<usize>) -> Vec<String> {
+    fn urls_in(item: Option<&Item>, out: &mut Vec<String>) {
+        let Some(files) = item.and_then(Item::as_array) else {
+            return;
+        };
+        for file in files.iter().filter_map(|f| f.as_inline_table()) {
+            if let Some(url) = file.get("url").and_then(|u| u.as_str()) {
+                out.push(url.to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(packages) = doc.get("package").and_then(Item::as_array_of_tables) {
+        for (index, package) in packages.iter().enumerate() {
+            if !skip.contains(&index) {
+                urls_in(package.get("files"), &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Whether `url` is one of PyPI's own file hosts.
+fn is_pypi_file_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "https"
+            && matches!(
+                u.host_str(),
+                Some("files.pythonhosted.org" | "pypi.org" | "pypi.python.org")
+            )
+    })
+}
+
+/// Why a `static_urls` `pdm.lock` cannot get PyPI's file URLs back (#413):
+/// such a lock records where PDM downloaded every file, and the restore
+/// only knows PyPI's. When the project installs from another index — a
+/// `[[tool.pdm.source]]` in its `pyproject.toml` (one named `pypi`
+/// replaces PyPI; any other may have served the package), a project
+/// `pypi.url` (`.pdm.toml`, then `pdm.toml`), or, failing both, the index
+/// the lock's other packages were downloaded from — writing PyPI's URLs
+/// would make `pdm sync` bypass that mirror (or fail where only the mirror
+/// is reachable).
+/// Like the uv and Pipenv restores, refuse rather than guess.
+async fn pdm_static_index_refusal(
+    view: &mut View<'_>,
+    rel: &str,
+    doc: &DocumentMut,
+    hits: &[LockHit],
+) -> Option<String> {
+    let dir = match rel.rfind('/') {
+        Some(i) => &rel[..=i],
+        None => "",
+    };
+    let mut foreign: Vec<(String, String)> = Vec::new();
+    let pyproject = format!("{dir}pyproject.toml");
+    if let Ok(Some(text)) = view.read(&pyproject).await {
+        if let Ok(project) = text.parse::<DocumentMut>() {
+            let sources = project
+                .get("tool")
+                .and_then(|t| t.get("pdm"))
+                .and_then(|p| p.get("source"))
+                .and_then(Item::as_array_of_tables);
+            for source in sources.into_iter().flatten() {
+                let url = source.get("url").and_then(Item::as_str).unwrap_or("");
+                if !is_pypi_simple(url) {
+                    foreign.push((
+                        url.to_string(),
+                        format!("`[[tool.pdm.source]]` in {pyproject}"),
+                    ));
+                }
+            }
+        }
+    }
+    // PDM overlays the legacy `.pdm.toml` on `pdm.toml`, so the first of
+    // the two that sets `pypi.url` is the project's.
+    for name in [".pdm.toml", "pdm.toml"] {
+        let config_rel = format!("{dir}{name}");
+        let Ok(Some(text)) = view.read(&config_rel).await else {
+            continue;
+        };
+        let Ok(config) = text.parse::<DocumentMut>() else {
+            continue;
+        };
+        let Some(url) = config
+            .get("pypi")
+            .and_then(|p| p.get("url"))
+            .and_then(Item::as_str)
+        else {
+            continue;
+        };
+        if !is_pypi_simple(url) {
+            foreign.push((url.to_string(), format!("`pypi.url` in {config_rel}")));
+        }
+        break;
+    }
+    if foreign.is_empty() {
+        let skip: BTreeSet<usize> = hits.iter().map(|h| h.index).collect();
+        if let Some(url) = pdm_file_urls(doc, &skip)
+            .into_iter()
+            .find(|u| !is_pypi_file_url(u))
+        {
+            foreign.push((url, format!("another package's file in {rel}")));
+        }
+    }
+    let (url, origin) = foreign.into_iter().next()?;
+    Some(format!(
+        "{rel} is a static_urls lock and the project installs from {url} ({origin}), not \
+         PyPI; the restore can only re-derive PyPI's file URLs, which would make `pdm sync` \
+         bypass that index, so the original URLs are not derivable"
+    ))
+}
+
 pub(crate) async fn restore_pdm(
     view: &mut View<'_>,
     pins: &[&HostedPin],
@@ -347,6 +462,14 @@ pub(crate) async fn restore_pdm(
             }
         };
         let static_urls = flags.iter().any(|f| f == "static_urls");
+        if static_urls {
+            if let Some(why) = pdm_static_index_refusal(view, rel, &doc, &hits).await {
+                for hit in &hits {
+                    result.refuse(&hit.uuid, why.clone());
+                }
+                continue;
+            }
+        }
         // lock_version 2 (PDM 0.x/1.x) always recorded every release file.
         let cross_platform = version == "2" || flags.iter().any(|f| f == "cross_platform");
         let released = fetch_release_files(&wanted(&hits, &result), ctx, &mut result).await;
