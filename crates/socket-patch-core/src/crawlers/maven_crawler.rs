@@ -2543,6 +2543,7 @@ mod tests {
     /// poms reach; the rest of the shared local repository (cached by other
     /// projects) is not this project's. `--global` still lists everything.
     #[tokio::test]
+    #[serial_test::serial]
     async fn project_mode_crawl_keeps_only_the_projects_graph() {
         let dir = tempfile::tempdir().unwrap();
         let (cwd, repo) = (dir.path().join("app"), dir.path().join("m2"));
