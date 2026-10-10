@@ -1037,6 +1037,115 @@ async fn restore_berry(
     view.write(rel, doc.render(&moved));
 }
 
+/// Retire the leftover hosted `resolutions` selectors of a yarn berry root
+/// `package.json` (#1203): `yarn remove` / `yarn up` deleted the lock entry
+/// a hosted pin keyed by its tarball URL but left its selector, which now
+/// routes nothing. Each in-scope pin's selectors are re-checked against
+/// the sibling `yarn.lock` as the view holds it (the berry restore may
+/// have run first) and dropped with a `hosted_resolution_orphaned`
+/// warning; the lock itself is not touched. A pin with no such selector
+/// left is not handled here, so it is refused like any unrestorable pin.
+pub(crate) async fn retire_stale_selectors(
+    view: &mut View<'_>,
+    pins: &[&HostedPin],
+    files: &[String],
+    ctx: &Ctx<'_>,
+) -> FormatResult {
+    use crate::vendor::lock_inventory::yarn::{berry_entries, berry_selector_routes_nothing};
+
+    let mut result = FormatResult::default();
+    let pins = by_uuid(pins);
+    for rel in files {
+        let Some(text) = read_or_refuse(view, rel, &pins, &mut result).await else {
+            continue;
+        };
+        let dir_prefix = match rel.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/"),
+            None => String::new(),
+        };
+        let lock_rel = format!("{dir_prefix}yarn.lock");
+        let lock = match view.read(&lock_rel).await {
+            Ok(Some(lock)) if crate::formats::yarn::is_berry_lock(strip_bom(&lock)) => {
+                berry_entries(strip_bom(&lock))
+            }
+            _ => {
+                refuse_all_in(
+                    &pins,
+                    rel,
+                    &mut result,
+                    format!("{rel} routes a hosted patch but {lock_rel} is not a yarn berry lock"),
+                );
+                continue;
+            }
+        };
+        let Some(mut pkg) = serde_json::from_str::<Value>(strip_bom(&text))
+            .ok()
+            .filter(Value::is_object)
+        else {
+            refuse_all_in(
+                &pins,
+                rel,
+                &mut result,
+                format!("{rel} is not a JSON object"),
+            );
+            continue;
+        };
+        let Some(table) = pkg.get_mut("resolutions").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let stale: Vec<(String, String, String)> = table
+            .iter()
+            .filter_map(|(selector, value)| {
+                let url = value.as_str()?;
+                let uuid = ctx.hosted_uuid(url)?;
+                (pins.contains_key(uuid.as_str())
+                    && berry_selector_routes_nothing(&lock, selector, url))
+                .then(|| (selector.clone(), url.to_string(), uuid))
+            })
+            .collect();
+        if stale.is_empty() {
+            continue;
+        }
+        for (selector, _, _) in &stale {
+            table.shift_remove(selector);
+        }
+        if table.is_empty() {
+            if let Some(obj) = pkg.as_object_mut() {
+                obj.shift_remove("resolutions");
+            }
+        }
+        match crate::vendor::common::JsonLayout::of(&text)
+            .render(&pkg)
+            .map(String::from_utf8)
+        {
+            Ok(Ok(rendered)) => view.write(rel, rendered),
+            _ => {
+                refuse_all_in(
+                    &pins,
+                    rel,
+                    &mut result,
+                    format!("{rel} could not be re-serialized"),
+                );
+                continue;
+            }
+        }
+        // The detail names the selector, never its URL (which carries the
+        // grant token).
+        for (selector, _url, uuid) in stale {
+            result.warnings.push((
+                "hosted_resolution_orphaned",
+                format!(
+                    "{rel}: removed the hosted `resolutions` entry `{selector}`; no \
+                     {lock_rel} entry installs it any more (the package was removed or moved \
+                     to another version), so it was leftover wiring"
+                ),
+            ));
+            result.handled.insert(uuid);
+        }
+    }
+    result
+}
+
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
 
 /// What decides whether pnpm records a resolution's `tarball:` in the lock
