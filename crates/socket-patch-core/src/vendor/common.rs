@@ -105,19 +105,11 @@ pub(crate) fn done(
     }
 }
 
-/// Shared helper the vendor backends delegate to: the fail-closed refusals
-/// for a `--vendor-source=service` run that cannot reach the service —
-/// combined with `--offline`, or with no API client configured — checked
-/// before any service consultation. Every backend's service helper treats
-/// `!service_enabled()` as "build locally", so this is the one gate that
-/// keeps `service` mode from silently building.
+/// Refuse network acquisition when offline or without an API client.
 pub(crate) fn service_offline_conflict(
     service: Option<&VendorServiceConfig>,
 ) -> Option<VendorOutcome> {
     let cfg = service?;
-    if !cfg.source.requires_service() {
-        return None;
-    }
     if cfg.offline {
         return Some(refused(
             "vendor_service_offline_conflict",
@@ -350,6 +342,16 @@ pub(crate) fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
 /// The backup sibling the old copy is parked at mid-swap: `<copy>.socket-old`.
 pub(crate) fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
     swap_sibling_for(copy_dir, ".socket-old")
+}
+
+/// Remove a failed stage, optionally unwind a fresh UUID directory, and prune
+/// empty parents. Existing wired copies must survive failed rebuilds.
+pub(crate) async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
+    let _ = remove_tree(stage).await;
+    if unwind_uuid_dir {
+        let _ = remove_tree(uuid_dir).await;
+    }
+    prune_empty_vendor_levels(uuid_dir).await;
 }
 
 /// Swap a fully-built stage into place without a destructive window: park the
@@ -605,6 +607,27 @@ pub(crate) fn pep508_name(spec: &str) -> &str {
         .map(|(i, _)| i)
         .unwrap_or(s.len());
     &s[..end]
+}
+
+/// Whether a dependency spec is a PEP 508 direct reference
+/// (`name[extras] @ <url>`: an `https://` / `file://` archive, a
+/// `git+…` checkout, …) rather than a registry requirement. Such a
+/// declaration is the user's own source choice, which neither writer may
+/// overwrite (#767).
+pub(crate) fn is_pep508_direct_reference(spec: &str) -> bool {
+    let spec = spec.trim_start();
+    let name = pep508_name(spec);
+    if name.is_empty() {
+        return false;
+    }
+    let mut rest = spec[name.len()..].trim_start();
+    if rest.starts_with('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        rest = rest[end + 1..].trim_start();
+    }
+    rest.starts_with('@')
 }
 
 /// The lock's `[[package]]` tables whose `name` canonicalizes (PEP 503) to

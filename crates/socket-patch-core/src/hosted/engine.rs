@@ -39,6 +39,7 @@ use crate::patch::redirect::{
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
+use crate::utils::redact::url_host;
 use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
@@ -51,7 +52,7 @@ use super::guidance::{
     pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_not_needed_detail,
     pnpm_trust_policy_preamble, pnpm_trust_rush_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    url_host, TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
+    TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
     PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
@@ -1096,24 +1097,47 @@ pub fn wheel_targets<'a>(
     out
 }
 
+/// `text` about one hosted artifact made safe to show: every URL in it
+/// through [`crate::utils::redact::redact_urls_in`], and then the grant
+/// token of `artifact_url` wherever it is still spelled as a path level.
+/// The second pass is what knowing the artifact adds: its token is the
+/// level before `patch_uuid`, so a URL served under a root the shape-based
+/// redactor does not recognise (a custom `--api-url` server) or with a
+/// non-canonical patch id is still covered.
+pub fn redact_artifact_text(text: &str, artifact_url: &str, patch_uuid: &str) -> String {
+    let text = crate::utils::redact::redact_urls_in(text);
+    match crate::patch::redirect::grant_token_path_segment(artifact_url, patch_uuid) {
+        Some(token) if token != crate::utils::redact::REDACTED => text.replace(
+            &format!("/{token}/"),
+            &format!("/{}/", crate::utils::redact::REDACTED),
+        ),
+        _ => text.into_owned(),
+    }
+}
+
 /// The skip recorded for a pypi dep whose wheel metadata could not be
-/// fetched (the grant token in `detail` is redacted to `<hosted artifact>`).
+/// fetched (`detail` redacted by [`redact_artifact_text`]).
 pub fn wheel_metadata_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
     SkippedPatch {
         purl: format!("pkg:pypi/{}@{}", dep.name, dep.version),
         uuid: dep.patch_uuid.clone(),
         reason: "python_metadata_unavailable".to_string(),
-        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+        detail: Some(redact_artifact_text(
+            detail,
+            &dep.artifact_url,
+            &dep.patch_uuid,
+        )),
     }
 }
 
 /// The npm candidates whose yarn berry pin needs the served tarball's own
 /// `package.json`, in candidate order: yarn builds a tarball entry's `bin:`
 /// from that manifest, not from the registry metadata the locked `npm:`
-/// entry came from, and the two spell bin paths differently (#718). Only an
-/// entry the pin would re-key that carries a `bin:` map needs it (see
-/// `berry_pin_needs_manifest`; a fork alias never counts), so a berry
-/// project without bins fetches nothing.
+/// entry came from, and the two spell bin paths differently (#718); only the
+/// npm resolver adds an implicit `node-gyp` dependency (#737). Only an entry
+/// the pin would re-key that carries a `bin:` map or that dependency needs it
+/// (see `berry_pin_needs_manifest`; a fork alias never counts), so a berry
+/// project with neither fetches nothing.
 pub fn yarn_berry_manifest_targets<'a>(
     candidates: &'a [Candidate],
     files: &BTreeMap<String, String>,
@@ -1138,9 +1162,105 @@ pub fn yarn_berry_manifest_targets<'a>(
         .collect()
 }
 
+/// The npm deps whose yarn classic pin reads the served tarball, one per
+/// distinct artifact URL: the project's `yarn.lock` is a classic lock that
+/// names the package, the grant carries a sha512, and either the grant has
+/// no sha1 for the `resolved` fragment yarn 1 keys its cache slot on
+/// (#558), or the lock doesn't pin this artifact yet, so the tarball's own
+/// dependencies must be checked against the lock (#591).
+/// A lock the project's offline mirror refuses outright (`yarn_outer`: the
+/// mirror settings outside the project files) needs none.
+pub fn yarn_classic_artifact_targets<'a>(
+    candidates: &'a [Candidate],
+    files: &BTreeMap<String, String>,
+    yarn_outer: &OuterYarnMirror,
+) -> Vec<&'a DepOverride> {
+    let Some(lock) = files
+        .get("yarn.lock")
+        .filter(|lock| !crate::formats::yarn::is_berry_lock(lock))
+    else {
+        return Vec::new();
+    };
+    if crate::patch::redirect::yarn_classic_hosted_refused(files, yarn_outer) {
+        return Vec::new();
+    }
+    let mut seen = BTreeSet::new();
+    candidates
+        .iter()
+        .map(|c| &c.dep)
+        .filter(|dep| dep.ecosystem == "npm" && dep.integrity.sha512.is_some())
+        .filter(|dep| {
+            classic_locks_registry_copy(lock, &crate::patch::redirect::full_name(dep), &dep.version)
+        })
+        .filter(|dep| {
+            dep.integrity.sha1.is_none() || !lock.contains(&format!("\"{}#", dep.artifact_url))
+        })
+        .filter(|dep| seen.insert(dep.artifact_url.clone()))
+        .collect()
+}
+
+/// Whether a classic `lock` has a registry block of `name@version`: the
+/// only copy a hosted pin rewrites (a git, `file:`, `link:` or remote
+/// tarball copy is skipped by name, so it needs no served tarball). Read
+/// by the blocks' real names, as the rewriter does, so `lodash` never
+/// matches a `lodash.debounce` block.
+fn classic_locks_registry_copy(lock: &str, name: &str, version: &str) -> bool {
+    use crate::formats::yarn::blocks::{classic_field, scan_blocks};
+    use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
+    use crate::formats::yarn::source::{classic_copy_source, CopySource};
+    if !lock.contains(name) {
+        return false;
+    }
+    scan_blocks(lock).iter().any(|block| {
+        let patterns = split_key_patterns(&block.key);
+        classic_key_real_name(&patterns) == Some(name)
+            && classic_field(&block.lines, "version") == Some(version)
+            && classic_copy_source(&patterns, classic_field(&block.lines, "resolved"))
+                == CopySource::Registry
+    })
+}
+
+/// Record what the served tarball at `url` yielded: its sha1 on every
+/// candidate granted that artifact without one, and its manifest (keyed by
+/// URL) for the rewriter.
+pub fn record_classic_artifact(
+    candidates: &mut [Candidate],
+    manifests: &mut BTreeMap<String, String>,
+    url: &str,
+    artifact: &crate::hosted::npm_manifest::HostedClassicArtifact,
+) {
+    for candidate in candidates
+        .iter_mut()
+        .filter(|c| c.dep.artifact_url == url && c.dep.integrity.sha1.is_none())
+    {
+        candidate.dep.integrity.sha1 = Some(artifact.sha1.clone());
+    }
+    manifests.insert(url.to_string(), artifact.manifest.clone());
+}
+
+/// The skip recorded for an npm dep whose served tarball could not be
+/// fetched, did not match its grant's sha512 or had no readable
+/// package.json, so its yarn classic pin could not be checked (`detail`
+/// redacted by [`redact_artifact_text`]).
+pub fn npm_tarball_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
+    SkippedPatch {
+        purl: format!(
+            "pkg:npm/{}@{}",
+            crate::patch::redirect::full_name(dep),
+            dep.version
+        ),
+        uuid: dep.patch_uuid.clone(),
+        reason: "npm_tarball_unavailable".to_string(),
+        detail: Some(redact_artifact_text(
+            detail,
+            &dep.artifact_url,
+            &dep.patch_uuid,
+        )),
+    }
+}
+
 /// The skip recorded for an npm dep whose served `package.json` could not
-/// be fetched (the grant token in `detail` is redacted to `<hosted
-/// artifact>`).
+/// be fetched (`detail` redacted by [`redact_artifact_text`]).
 pub fn npm_manifest_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
     SkippedPatch {
         purl: format!(
@@ -1150,7 +1270,11 @@ pub fn npm_manifest_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch
         ),
         uuid: dep.patch_uuid.clone(),
         reason: "npm_manifest_unavailable".to_string(),
-        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+        detail: Some(redact_artifact_text(
+            detail,
+            &dep.artifact_url,
+            &dep.patch_uuid,
+        )),
     }
 }
 
@@ -2819,8 +2943,93 @@ mod tests {
     use super::*;
     use crate::vendor::lock_inventory::MemoryProject;
 
+    const GRANT: &str = "GRANTTOKEN0123";
+    const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+
+    fn grant_dep(ecosystem: &str, artifact_url: String) -> DepOverride {
+        DepOverride {
+            ecosystem: ecosystem.into(),
+            name: "left-pad".into(),
+            namespace: None,
+            version: "1.3.0".into(),
+            token: GRANT.into(),
+            patch_uuid: PATCH_UUID.into(),
+            artifact_url,
+            registry_override: None,
+            integrity: crate::patch::redirect::Integrity::default(),
+        }
+    }
+
+    /// The hosted skip details reach `--json`: neither the grant token nor
+    /// any userinfo survives, however reqwest re-renders the URL (a
+    /// trailing `/`, a different quoting) and under whatever root the
+    /// server serves it (a custom `--api-url` with no `/patch/` level).
+    #[test]
+    fn hosted_skip_details_never_carry_the_grant_token() {
+        for (url, uuid) in [
+            (
+                format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{GRANT}/{PATCH_UUID}/left-pad-1.3.0.tgz"),
+                PATCH_UUID,
+            ),
+            (
+                format!("https://u:pw@api.corp.example/serve/{GRANT}/{PATCH_UUID}/left-pad-1.3.0.tgz"),
+                PATCH_UUID,
+            ),
+            // A non-canonical patch id: the shape-based redactor cannot
+            // tell its level is a uuid, the dep can.
+            (
+                format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{GRANT}/patch-42/x.tgz"),
+                "patch-42",
+            ),
+        ] {
+            let mut dep = grant_dep("npm", url.clone());
+            dep.patch_uuid = uuid.into();
+            let detail = format!(
+                "error sending request for url ({url}?x=1): connection refused (proxy https://p:pw@proxy:3128)"
+            );
+            for skip in [
+                npm_manifest_unavailable(&dep, &detail),
+                wheel_metadata_unavailable(&dep, &detail),
+            ] {
+                let got = skip.detail.unwrap();
+                assert!(!got.contains(GRANT), "{url}: {got}");
+                assert!(!got.contains("u:pw") && !got.contains("p:pw"), "{got}");
+                assert!(got.contains("connection refused"), "{got}");
+            }
+        }
+        let dep = grant_dep("npm", format!("https://h/serve/{GRANT}/{PATCH_UUID}/a.tgz"));
+        assert_eq!(
+            redact_artifact_text("no url here", &dep.artifact_url, &dep.patch_uuid),
+            "no url here"
+        );
+    }
+
     fn reference(value: serde_json::Value) -> PackageVendorResult {
         serde_json::from_value(value).unwrap()
+    }
+
+    /// #558 review: the served tarball is fetched only for a lock that
+    /// really locks a registry copy of the package, read by block names
+    /// (`lodash` is not `lodash.debounce`) and copy source (a git or
+    /// `file:` copy is never pinned).
+    #[test]
+    fn classic_registry_copy_is_matched_by_block_name_and_source() {
+        let lock = "# yarn lockfile v1\n\n\
+                    lodash.debounce@^4.0.8:\n  version \"4.17.21\"\n  \
+                    resolved \"https://registry.yarnpkg.com/lodash.debounce/-/x.tgz#aa\"\n\n\
+                    left-pad@git+https://github.com/x/left-pad.git:\n  version \"1.3.0\"\n  \
+                    resolved \"git+https://github.com/x/left-pad.git#abc\"\n\n\
+                    is-odd@^3.0.0:\n  version \"3.0.1\"\n  \
+                    resolved \"https://registry.yarnpkg.com/is-odd/-/is-odd-3.0.1.tgz#bb\"\n";
+        assert!(!classic_locks_registry_copy(lock, "lodash", "4.17.21"));
+        assert!(!classic_locks_registry_copy(lock, "left-pad", "1.3.0"));
+        assert!(!classic_locks_registry_copy(lock, "is-odd", "3.0.0"));
+        assert!(classic_locks_registry_copy(lock, "is-odd", "3.0.1"));
+        assert!(classic_locks_registry_copy(
+            lock,
+            "lodash.debounce",
+            "4.17.21"
+        ));
     }
 
     #[test]

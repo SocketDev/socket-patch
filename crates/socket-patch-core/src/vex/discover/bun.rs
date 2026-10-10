@@ -9,8 +9,8 @@
 //! unreadable; a dangling link does not, #735), else `bun.lockb`: the
 //! shared [`bun_text_lock_drives`] predicate. A
 //! stale binary lock left beside a text lock wires nothing, so it must not
-//! become a ref (rule 10 — the same gate `vendor::bun_workspace` and
-//! `lock_inventory::wired_vendor_integrity` apply).
+//! become a ref (rule 10 — the same gate `vendor::bun_workspace`
+//! applies).
 //!
 //! ## Shapes recognized
 //!
