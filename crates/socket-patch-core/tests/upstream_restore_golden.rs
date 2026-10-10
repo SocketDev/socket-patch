@@ -2535,36 +2535,60 @@ async fn maven_config_merge_keeps_the_resolver_lines() {
     );
 }
 
-/// Serve nuget.org's registration leaf and catalog entry for every package
-/// the `input/` lock pins, with the contentHash it records.
-async fn nuget_mock(case: &Case) -> MockServer {
+/// A deterministic repository-signed `.nupkg` for `id@version` and its
+/// NuGet content hash (the signature excluded, so: the hash of the same
+/// archive without the signature entry, #624).
+fn signed_nupkg(id: &str, version: &str) -> (Vec<u8>, String) {
+    use std::io::Write as _;
+    let build = |signed: bool| {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts =
+            zip::write::SimpleFileOptions::default().last_modified_time(zip::DateTime::default());
+        zw.start_file(format!("{id}.nuspec"), opts).unwrap();
+        write!(
+            zw,
+            "<package><metadata><id>{id}</id><version>{version}</version></metadata></package>"
+        )
+        .unwrap();
+        if signed {
+            zw.start_file(".signature.p7s", opts).unwrap();
+            zw.write_all(b"repository-signature").unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    };
+    let unsigned = build(false);
+    let hash = {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&unsigned))
+    };
+    (build(true), hash)
+}
+
+/// Serve nuget.org's flat-container `.nupkg` for every package the
+/// `input/` lock pins, and re-key the case's locks to that package's
+/// content hash.
+async fn nuget_mock(case: &mut Case) -> MockServer {
     let server = MockServer::start().await;
     let lock: serde_json::Value =
         serde_json::from_str(case.input.get("packages.lock.json").unwrap()).unwrap();
     for fw in lock["dependencies"].as_object().unwrap().values() {
         for (id, entry) in fw.as_object().unwrap() {
             let (id, version) = (id.to_lowercase(), entry["resolved"].as_str().unwrap());
-            let catalog = format!("{}/catalog0/data/{id}.{version}.json", server.uri());
+            let (bytes, hash) = signed_nupkg(&id, version);
             Mock::given(method("GET"))
                 .and(path(format!(
-                    "/v3/registration5-gz-semver2/{id}/{version}.json"
+                    "/v3-flatcontainer/{id}/{version}/{id}.{version}.nupkg"
                 )))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({ "catalogEntry": catalog })),
-                )
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
                 .mount(&server)
                 .await;
-            Mock::given(method("GET"))
-                .and(path(format!("/catalog0/data/{id}.{version}.json")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "id": id,
-                    "version": version,
-                    "packageHash": entry["contentHash"],
-                    "packageHashAlgorithm": "SHA512",
-                })))
-                .mount(&server)
-                .await;
+            let original = entry["contentHash"].as_str().unwrap();
+            for files in [&mut case.input, &mut case.expected] {
+                for text in files.values_mut() {
+                    *text = text.replace(original, &hash);
+                }
+            }
         }
     }
     server
@@ -2591,7 +2615,8 @@ async fn nuget_goldens_round_trip() {
         if NUGET_NOT_INVERTIBLE.contains(&name.as_str()) {
             continue;
         }
-        let server = nuget_mock(&case).await;
+        let mut case = case;
+        let server = nuget_mock(&mut case).await;
         let _env = EnvGuard::set(&[("SOCKET_NUGET_URL", server.uri())]);
         let (after, statuses) = run_case(&case).await;
         assert_round_trip(&case, &after, &statuses);
@@ -2608,7 +2633,8 @@ async fn nuget_non_invertible_goldens_restore_or_refuse_as_documented() {
             .into_iter()
             .find(|c| c.dir.ends_with(name))
             .unwrap();
-        let server = nuget_mock(&case).await;
+        let mut case = case;
+        let server = nuget_mock(&mut case).await;
         let _env = EnvGuard::set(&[("SOCKET_NUGET_URL", server.uri())]);
         let (after, statuses) = run_case(&case).await;
         let [(_, status)] = &statuses[..] else {
