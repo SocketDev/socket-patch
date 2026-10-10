@@ -203,6 +203,11 @@ pub struct PnpmMeta {
     /// `pnpm-workspace.yaml`; revert removes just that section once emptied.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub created_workspace_overrides: bool,
+    /// Vendor added the root-only `packages:` scaffold to a pre-existing
+    /// `pnpm-workspace.yaml` that had no keys (#1096); revert removes it
+    /// with the emptied `overrides:` section.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_workspace_packages: bool,
 }
 
 /// pypi/poetry bookkeeping.
@@ -455,6 +460,7 @@ impl VendorState {
                 pnpm.created_pnpm_table |= m.created_pnpm_table;
                 pnpm.created_workspace_file |= m.created_workspace_file;
                 pnpm.created_workspace_overrides |= m.created_workspace_overrides;
+                pnpm.created_workspace_packages |= m.created_workspace_packages;
             }
         }
         (uv, pnpm)
@@ -618,6 +624,7 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
                 meta.created_pnpm_table |= prev_meta.created_pnpm_table;
                 meta.created_workspace_file |= prev_meta.created_workspace_file;
                 meta.created_workspace_overrides |= prev_meta.created_workspace_overrides;
+                meta.created_workspace_packages |= prev_meta.created_workspace_packages;
             }
             None => entry.pnpm = Some(prev_meta.clone()),
         }
@@ -1676,6 +1683,7 @@ mod tests {
             created_pnpm_table: true,
             created_workspace_file: true,
             created_workspace_overrides: false,
+            created_workspace_packages: false,
         };
         let mut state = VendorState::new();
         for (key, entry) in [
@@ -1824,6 +1832,7 @@ mod tests {
             created_pnpm_table: true,
             created_workspace_file: true,
             created_workspace_overrides: false,
+            created_workspace_packages: false,
         });
 
         // The re-vendor under a NEW uuid probes the surfaces as pre-existing.

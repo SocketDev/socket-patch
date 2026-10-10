@@ -2604,6 +2604,28 @@ mod tests {
         }
     }
 
+    /// #1096: an existing file with no keys at all (empty, comments only,
+    /// bare document markers) gains the root-only `packages` scaffold with
+    /// the trust key — pnpm 8.x–10.4 refuse a workspace file holding a key
+    /// but no `packages` — inside the document, every user byte intact.
+    #[test]
+    fn plan_workspace_trust_scaffolds_packages_in_a_keyless_file() {
+        const ADDED: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+        for (user, want) in [
+            ("", ADDED.to_string()),
+            ("\n", format!("{ADDED}\n")),
+            ("# settings\n", format!("# settings\n{ADDED}")),
+            ("---\n", format!("---\n{ADDED}")),
+            ("%YAML 1.2\n---\n", format!("%YAML 1.2\n---\n{ADDED}")),
+            ("---\n...\n", format!("---\n{ADDED}...\n")),
+        ] {
+            match plan_workspace_trust(Some(user)) {
+                TrustPlan::Scaffold(text) => assert_eq!(text, want, "{user:?}"),
+                _ => panic!("a keyless file must plan a Scaffold: {user:?}"),
+            }
+        }
+    }
+
     /// An existing workspace file gains exactly one line after its last
     /// non-empty line; every other byte — including a trailing blank line and
     /// comments — is preserved so a revert can remove exactly that line.
