@@ -584,14 +584,28 @@ fn residual_only_keep(outcome: &RevertOutcome) -> Option<String> {
 
 /// The refusal for a takeover whose vendored wheel another project file
 /// still installs from.
+///
+/// The order matters: the refusal leaves the lock vendored, so re-exporting
+/// from it now would name the wheel again. The file is pinned by hand
+/// first; only after the hosted scan has rewired the lock is a re-export
+/// safe.
 fn residual_takeover_warning(purl: &str, residual: &str) -> serde_json::Value {
+    let pin = purl
+        .strip_prefix("pkg:pypi/")
+        .map(|rest| rest.split(['?', '#']).next().unwrap_or(rest))
+        .and_then(|rest| rest.split_once('@'))
+        .map_or_else(
+            || "the registry release".to_string(),
+            |(name, version)| format!("`{name}=={version}`"),
+        );
     serde_json::json!({
         "code": "redirect_vendored_revert_failed",
         "detail": format!(
             "{purl} is vendored and another project file still installs from its \
              vendored wheel ({residual}), so it is left in place; NOT switched to hosted — \
-             point that file back at the registry release (re-export it once the hosted \
-             scan has rewired the lock), then re-run `scan --mode hosted`"
+             first replace the wheel path in that file with {pin} by hand (the lock is \
+             still vendored, so a re-export now would name the wheel again), re-run \
+             `scan --mode hosted`, and only then re-export the file from the rewired lock"
         ),
     })
 }

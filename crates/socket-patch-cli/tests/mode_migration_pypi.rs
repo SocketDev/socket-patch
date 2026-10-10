@@ -2401,6 +2401,7 @@ async fn pipenv_residual_export_takeover_refusal_names_the_export() {
         .to_string();
     assert!(
         detail.contains("requirements.txt")
+            && detail.contains("`six==1.16.0`")
             && detail.contains("re-export")
             && !detail.contains("edited since vendoring")
             && !detail.contains("vendor --revert"),
@@ -2410,5 +2411,20 @@ async fn pipenv_residual_export_takeover_refusal_names_the_export() {
         std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
         vendored,
         "the package stays vendored"
+    );
+
+    // The prescribed order converges: pin the file by hand, then the
+    // hosted scan takes the package over.
+    std::fs::write(
+        root.join("requirements.txt"),
+        "-i https://pypi.org/simple\nsix==1.16.0\n",
+    )
+    .unwrap();
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert!(
+        !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+        "the takeover reclaims the vendored wheel: {env:#}"
     );
 }
