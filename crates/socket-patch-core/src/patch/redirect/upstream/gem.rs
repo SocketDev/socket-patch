@@ -514,7 +514,7 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let code = trimmed.split('#').next().unwrap_or_default().trim_end();
+    let code = ruby_code(trimmed).trim_end();
     if code == "do" || code.ends_with(" do") || (code.ends_with('|') && code.contains(" do |")) {
         return format!("{}  ", indent_of(prev));
     }
@@ -541,7 +541,7 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
 fn in_source_block(text: &str, at: usize) -> bool {
     let mut open: Vec<bool> = Vec::new();
     for line in text[..at].lines() {
-        let code = line.split('#').next().unwrap_or_default().trim();
+        let code = ruby_code(line).trim();
         let opens = code == "do"
             || code.ends_with(" do")
             || code.ends_with(")do")
@@ -558,6 +558,26 @@ fn in_source_block(text: &str, at: usize) -> bool {
         }
     }
     open.contains(&true)
+}
+
+/// `line` without its trailing `#` comment. A `#` inside a quoted string
+/// (`"https://#{host}/"` interpolation, a URL fragment) is code, not a
+/// comment.
+fn ruby_code(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => return &line[..i],
+            None => {}
+        }
+    }
+    line
 }
 
 /// Whether the (comment-stripped, trimmed) line opens a keyword construct
@@ -1423,6 +1443,14 @@ mod tests {
             "source \"https://x\" do\n  gem \"a\" if true\nend\ngem \"rails\"\n"
         ));
         assert!(!at("if true\n  gem \"a\"\nend\ngem \"rails\"\n"));
+        // A `#` inside a string (`#{}` interpolation) is no comment: the
+        // trailing `do` still opens the source block.
+        assert!(at(
+            "source \"https://#{ENV[\"HOST\"]}/gems\" do\n  gem \"rails\"\nend\n"
+        ));
+        assert!(at(
+            "source 'https://x/#frag' do # comment\n  gem \"rails\"\nend\n"
+        ));
     }
 
     /// A hosted Gemfile + lock pair for `rails 7.0.0` (a direct gem), from
