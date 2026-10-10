@@ -385,6 +385,39 @@ pub(super) fn check_target_guards(
         }
     }
 
+    // A PEP 508 direct reference (`six @ https://…`, `six @ git+…`) in
+    // `[project]` / `[dependency-groups]` / the legacy `dev-dependencies` is
+    // the same user-authored source spelled in the requirement itself: a
+    // `[tool.uv.sources]` path beside it leaves the lock's root requirement
+    // carrying both `url` and `path`, which `uv sync --locked` rejects
+    // (#767).
+    let legacy_dev = p
+        .pyproject
+        .get("tool")
+        .and_then(|t| item_get(t, "uv"))
+        .and_then(|u| item_get(u, "dev-dependencies"))
+        .and_then(Item::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    if let Some(spec) = pyproject_dependency_specs(&p.pyproject)
+        .into_iter()
+        .map(|(_, spec)| spec)
+        .chain(legacy_dev)
+        .find(|spec| {
+            canonicalize_pypi_name(pep508_name(spec)) == canon_name
+                && super::common::is_pep508_direct_reference(spec)
+        })
+    {
+        return Err((
+            "pypi_uv_source_already_exists",
+            format!(
+                "pyproject.toml declares {canon_name} as the PEP 508 direct reference {spec:?}; \
+                 refusing to overwrite a user-authored source"
+            ),
+        ));
+    }
+
     // A user override pins this package already; layering ours on top would
     // change resolution behind the user's back.
     if let Some(overrides) = p
@@ -829,22 +862,49 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     // fragment carried it has nothing left to restore; it warns
     // `vendor_lock_entry_removed` so the revert converges. Probed once,
     // before any record is reverted, so only the user's own edits count.
+    //
+    // #1287: for a TRANSITIVE package, `uv remove <parent>` drops only its
+    // `[[package]]` unit; the `[tool.uv]` override + source and the lock's
+    // `[manifest]` records this entry wrote survive verbatim (uv never
+    // touches them). Those are this entry's own references, which the loop
+    // below reverts, not the user's: they are set aside before probing.
     let uuid_lower = entry.uuid.to_ascii_lowercase();
-    let unreferenced = ![&pyproject_text, &lock_text]
-        .iter()
-        .any(|text| text.to_ascii_lowercase().contains(&uuid_lower));
+    let in_pyproject = |kind: &str| matches!(kind, "uv_sources_entry" | "uv_override");
+    let own_fragments_removed = |text: &str, pyproject: bool| {
+        let mut residual = text.to_string();
+        for rec in &entry.wiring {
+            let Some(new) = rec.new.as_ref().and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if in_pyproject(&rec.kind) != pyproject || new.is_empty() {
+                continue;
+            }
+            if let Some(at) = residual.find(new) {
+                residual.replace_range(at..at + new.len(), "");
+            }
+        }
+        residual.to_ascii_lowercase()
+    };
+    let unreferenced = !own_fragments_removed(&pyproject_text, true).contains(&uuid_lower)
+        && !own_fragments_removed(&lock_text, false).contains(&uuid_lower);
+    // The pre-revert texts: a record is removed only when its OWN fragment
+    // is gone from them (a surviving one is reverted, or is drift).
+    let (pyproject_before, lock_before) = (pyproject_text.clone(), lock_text.clone());
     let removed = |rec: &WiringRecord| {
-        let carried_uuid = rec
-            .new
-            .as_ref()
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|new| new.to_ascii_lowercase().contains(&uuid_lower));
-        (unreferenced && carried_uuid).then(|| {
+        let new = rec.new.as_ref().and_then(serde_json::Value::as_str);
+        let carried_uuid = new.is_some_and(|new| new.to_ascii_lowercase().contains(&uuid_lower));
+        let before = if in_pyproject(&rec.kind) {
+            &pyproject_before
+        } else {
+            &lock_before
+        };
+        let gone = new.is_some_and(|new| !before.contains(new));
+        (unreferenced && carried_uuid && gone).then(|| {
             VendorWarning::new(
                 super::LOCK_ENTRY_REMOVED_CODE,
                 format!(
-                    "{} entry for {:?} no longer exists and nothing references {needle} any \
-                     more (the dependency was removed); nothing to restore",
+                    "{} entry for {:?} no longer exists and nothing else references {needle} \
+                     (the dependency was removed); nothing to restore",
                     rec.kind, rec.key
                 ),
             )
@@ -2451,28 +2511,22 @@ wheels = [
 
     fn entry_for(wiring: Vec<WiringRecord>, meta: UvMeta) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: REL_WHEEL.into(),
-                sha256: WHEEL_SHA.into(),
-                size: Some(11053),
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("uv".into()),
             uv: Some(meta),
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "pypi".into(),
+                "pkg:pypi/six@1.16.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: REL_WHEEL.into(),
+                    sha256: WHEEL_SHA.into(),
+                    size: Some(11053),
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
         }
     }
 
@@ -2792,6 +2846,34 @@ wheels = [
         assert_eq!(err.0, "pypi_uv_source_already_exists");
     }
 
+    /// #767: a PEP 508 direct reference to the target in any declaration
+    /// table refuses before the wheel is built or anything is written.
+    #[tokio::test]
+    async fn guards_refuse_a_direct_reference_declaration() {
+        const WHEEL: &str = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl";
+        for pyproject in [
+            DIRECT_REGISTRY_PYPROJECT.replace("\"six==1.16.0\"", &format!("\"six @ {WHEEL}\"")),
+            DIRECT_REGISTRY_PYPROJECT.replace(
+                "\"six==1.16.0\"",
+                "\"six @ git+https://github.com/benjaminp/six@1.16.0\"",
+            ),
+            format!(
+                "{}\n[dependency-groups]\ndev = [\"six @ {WHEEL}\"]\n",
+                DIRECT_REGISTRY_PYPROJECT.replace("[\"six==1.16.0\"]", "[]")
+            ),
+            format!(
+                "{}\n[project.optional-dependencies]\nx = [\"six @ {WHEEL}\"]\n",
+                DIRECT_REGISTRY_PYPROJECT.replace("[\"six==1.16.0\"]", "[]")
+            ),
+        ] {
+            let tmp = write_pair(&pyproject, DIRECT_REGISTRY_LOCK).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let err = check_target_guards(&p, "six", UUID).unwrap_err();
+            assert_eq!(err.0, "pypi_uv_source_already_exists", "{pyproject}");
+            assert!(err.1.contains("PEP 508 direct reference"), "{}", err.1);
+        }
+    }
+
     #[tokio::test]
     async fn untested_lock_revision_is_a_warning_not_a_refusal() {
         let tmp = write_pair(
@@ -2949,6 +3031,74 @@ wheels = [
         assert!(!outcome.lock_entry_removed(), "{:?}", outcome.warnings);
         let (_, lock) = read_pair(tmp.path()).await;
         assert_eq!(lock, edited);
+    }
+
+    /// #1287: `uv remove python-dateutil` after vendoring its transitive
+    /// `six` drops only six's `[[package]]` unit (captured from uv 0.11.19):
+    /// the `[tool.uv]` override + source and the lock's `[manifest]
+    /// overrides` this entry wrote survive verbatim. Those are its own
+    /// references, so the vanished unit is REMOVED, not drift, and the
+    /// surviving records revert: both files end up as uv writes them for
+    /// the project without six.
+    #[tokio::test]
+    async fn revert_after_uv_remove_of_the_parent_is_not_drift() {
+        const REMOVED_PYPROJECT: &str = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\
+            requires-python = \">=3.10\"\ndependencies = []\n";
+        const UNWIRED_LOCK: &str = "version = 1\nrevision = 3\nrequires-python = \">=3.10\"\n\n\
+            [[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\n";
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let entry = entry_for(wiring, meta);
+        let (wired_pyproject, _) = read_pair(tmp.path()).await;
+        // What `uv remove python-dateutil` leaves (uv 0.11.19).
+        let after_remove_pyproject = wired_pyproject.replace(
+            "dependencies = [\"python-dateutil==2.8.2\"]",
+            "dependencies = []",
+        );
+        let after_remove_lock = format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.10\"\n\n[manifest]\n\
+             overrides = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]\n\n[[package]]\n\
+             name = \"proj\"\nversion = \"0.1.0\"\nsource = {{ virtual = \".\" }}\n"
+        );
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &after_remove_pyproject)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &after_remove_lock)
+            .await
+            .unwrap();
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, REMOVED_PYPROJECT);
+        assert_eq!(lock, UNWIRED_LOCK);
+
+        // A user's own edit that still routes through the uuid dir (here a
+        // second source line naming the wheel) keeps everything.
+        let edited = format!("{after_remove_pyproject}# other = {{ path = \"{REL_WHEEL}\" }}\n");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &edited)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &after_remove_lock)
+            .await
+            .unwrap();
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        assert_eq!(read_pair(tmp.path()).await, (edited, after_remove_lock));
     }
 
     #[tokio::test]

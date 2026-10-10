@@ -269,14 +269,18 @@ pub(crate) fn berry_lock_locks(lock: &str, name: &str, version: &str) -> bool {
     })
 }
 
-/// The entries of the berry lock `lock` that carry a `bin:` map: the only
-/// ones whose pin needs the served tarball's own package.json (#718).
-/// Scanned once per lock, so the per-dep check in
-/// [`berry_pin_needs_manifest`] only walks these (usually none).
+/// The entries of the berry lock `lock` that carry a `bin:` map (#718) or
+/// the npm resolver's implicit `node-gyp` dependency (#737): the only ones
+/// whose pin needs the served tarball's own package.json. Scanned once per
+/// lock, so the per-dep check in [`berry_pin_needs_manifest`] only walks
+/// these (usually none).
 pub(crate) fn berry_bin_entries(lock: &str) -> Vec<LockBlock> {
     scan_blocks(lock)
         .into_iter()
-        .filter(|block| block.lines.iter().skip(1).any(|l| is_body_field(l, "bin")))
+        .filter(|block| {
+            block.lines.iter().skip(1).any(|l| is_body_field(l, "bin"))
+                || super::berry_entry::has_implicit_node_gyp(&block.lines)
+        })
         .collect()
 }
 

@@ -13,7 +13,9 @@ use socket_patch_core::api::client::{
     is_fallback_candidate, ApiClient, ApiError,
 };
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
-use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
+use socket_patch_core::crawlers::ruby_crawler::{
+    config_path_ignored_warning, stale_plugin_registration_warning,
+};
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
@@ -102,6 +104,53 @@ const BATCH_BODY_BYTE_CAP: usize = 256 * 1024;
 /// authenticated API and [`DEFAULT_PROXY_BATCH_SIZE`] on the public proxy.
 /// Floored at 1: `--batch-size 0` is otherwise unvalidated and would make
 /// the chunking below panic, so it degrades to one-package batches.
+/// `purls` plus, for each lockfile-only PyPI purl among them, its other
+/// PEP 440 spellings of the same release (#604), deduplicated in order.
+fn with_pypi_equivalents(purls: &[String], lockfile_only: &HashSet<PurlKey>) -> Vec<String> {
+    let mut out = purls.to_vec();
+    let mut seen: HashSet<PurlKey> = purls.iter().map(|p| PurlKey::new(p)).collect();
+    for purl in purls {
+        if !lockfile_only_contains(lockfile_only, purl) {
+            continue;
+        }
+        for spelling in socket_patch_core::utils::purl_key::pypi_equivalent_purls(purl) {
+            if seen.insert(PurlKey::new(&spelling)) {
+                out.push(spelling);
+            }
+        }
+    }
+    out
+}
+
+/// Mark each API purl that names a lockfile-only PyPI pin under another
+/// PEP 440 spelling (`@1.16.0` for a lock's `@1.16`, #604) as lockfile-only
+/// too, so the `notInstalled` flag, the `[NOT INSTALLED]` marker and the
+/// vendored baseline pre-check treat it as the package it is. A spelling an
+/// installed copy already carries is left alone.
+fn adopt_pypi_equivalents(
+    packages: &[BatchPackagePatches],
+    scanned: &[String],
+    lockfile_only: &mut HashSet<PurlKey>,
+) {
+    let scanned_keys: HashSet<PurlKey> = scanned.iter().map(|p| PurlKey::new(p)).collect();
+    let lock_only_pypi: Vec<&String> = scanned
+        .iter()
+        .filter(|p| p.starts_with("pkg:pypi/") && lockfile_only_contains(lockfile_only, p))
+        .collect();
+    for pkg in packages {
+        let key = PurlKey::new(&pkg.purl);
+        if scanned_keys.contains(&key) {
+            continue;
+        }
+        if lock_only_pypi
+            .iter()
+            .any(|lock| socket_patch_core::utils::purl_key::pypi_same_release(lock, &pkg.purl))
+        {
+            lockfile_only.insert(key);
+        }
+    }
+}
+
 fn effective_batch_size(requested: Option<usize>, use_public_proxy: bool) -> usize {
     requested
         .unwrap_or(if use_public_proxy {
@@ -262,8 +311,10 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
-    /// How discovered patches are consumed [default: hosted]. A `--prune`
-    /// or `--global` scan with no mode only reports
+    /// How discovered patches are consumed [default: the mode the
+    /// project's patch state already records, else hosted]. Switching an
+    /// existing vendored or agent-mode project to another mode needs this
+    /// flag. A `--prune` or `--global` scan with no mode only reports
     // `--sync` also selects agent; combining it with a different `--mode`
     // is rejected in `resolve_mode_flags`.
     #[arg(long = "mode", value_enum)]
@@ -489,7 +540,6 @@ async fn discover_selected(
     // Some queries failed, some succeeded: a `--json` run has no stderr
     // warning (`warn` is human-only), so each failed package becomes a
     // run-level `warnings[]` entry — never a silent drop from the envelope.
-    let fetched = all_search_results.len();
     let offers = select_accessible(all_search_results, can_access_paid_patches, policy);
     if let Some(result) = json_warnings {
         for (purl, e) in &failures {
@@ -503,18 +553,15 @@ async fn discover_selected(
     }
     Ok(Discovered {
         offers,
-        fetched,
         failed: failures,
     })
 }
 
-/// [`discover_selected`]'s result: the offers, how many records came back
-/// (before the tier filter), and each failed detail query as `(purl,
-/// error)` (a failure for a package with no recorded patch makes a capped
-/// run's data incomplete).
+/// [`discover_selected`]'s result: the offers and each failed detail
+/// query as `(purl, error)` (a failure for a package with no recorded
+/// patch makes a capped run's data incomplete).
 struct Discovered {
     offers: rollout::Offers,
-    fetched: usize,
     failed: Vec<(String, String)>,
 }
 
@@ -672,8 +719,9 @@ fn open_paragraph(opened: &mut bool) {
 /// arm treats an empty merged set as a fetch failure). The two output
 /// knobs are human-only: `show_progress` shows the status-line counter on
 /// stderr, `warn` prints a warning per failed package once the loop is
-/// done — only when some query succeeded (when every one failed, the
-/// caller's error line carries the cause instead, so nothing repeats).
+/// done — only when some query succeeded, even with no records (when
+/// every one failed, the caller's error line carries the cause instead,
+/// so nothing repeats).
 async fn fetch_patch_details(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
@@ -715,7 +763,8 @@ async fn fetch_patch_details(
         }
     }
     status.finish();
-    if warn && !results.is_empty() {
+    // Not when every query failed: the caller's error line names it.
+    if warn && failures.len() < packages.len() {
         for (purl, e) in &failures {
             eprintln!("Warning: could not fetch details for {purl}: {e}");
         }
@@ -822,7 +871,6 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         global_prefix: args.common.global_prefix.clone(),
         json,
         silent,
-        download_mode: args.common.download_mode.clone(),
         all_releases: args.all_releases,
         strict: args.common.strict,
         ecosystems: args.common.ecosystems.clone(),
@@ -1545,10 +1593,14 @@ fn project_dirs(
 /// name, as if each were `--cwd`. The exit code is the worst of the runs.
 /// `--json` takes one directory, so stdout stays one document. Every
 /// directory must be inside the repository root the policy was read from.
+///
+/// `mode_inferred`: the mode came from `--cwd`'s state rather than
+/// `--mode`, so each directory takes its mode from its own state.
 async fn run_project_dirs(
     args: ScanArgs,
     telemetry: &mut PendingTelemetry,
     invocation: &InvocationPolicy,
+    mode_inferred: bool,
 ) -> i32 {
     let usage = |code: &str, message: &str| {
         usage_error(
@@ -1622,6 +1674,9 @@ async fn run_project_dirs(
         child.paths.clear();
         child.common.cwd = dir.clone();
         child.rollout.carry = Some(carry.clone());
+        if mode_inferred {
+            child.mode = None;
+        }
         code = code.max(Box::pin(run_scan(child, telemetry, Some(invocation), *explicit)).await);
     }
     code
@@ -1659,6 +1714,9 @@ async fn run_scan(
 ) -> i32 {
     apply_env_toggles(&args.common);
 
+    // Whether the user chose the mode (`--mode`, or `--sync` = agent).
+    // Without it, the mode comes from the project's own state below.
+    let mode_explicit = args.mode.is_some() || args.sync;
     // Resolve `--mode`/`--sync` into `args.mode` (see
     // `resolve_mode_flags`). `--sync` with another mode is a usage error
     // (exit 2); under --json it prints the coded error on stdout.
@@ -1675,6 +1733,24 @@ async fn run_scan(
             "invalid_args"
         };
         return scan_usage_error(&args, code, &message);
+    }
+    // A bare scan keeps the mode the project already has (#1088): only an
+    // explicit `--mode` converts a vendored or agent-mode project. The
+    // hosted default above is the only one this replaces (a `--prune` or
+    // global scan with no mode stays report-only).
+    let mode_inferred = !mode_explicit && args.mode == Some(ScanMode::Hosted);
+    if mode_inferred {
+        match crate::commands::mode_from_project_state(&args.common).await {
+            Ok(mode) => {
+                if !args.common.json && !args.common.silent {
+                    if let Some(note) = crate::commands::kept_mode_note(mode) {
+                        eprintln!("{note}");
+                    }
+                }
+                args.mode = Some(mode);
+            }
+            Err(message) => return scan_usage_error(&args, "mode_ambiguous", &message),
+        }
     }
 
     // The repo's socket.yml policy, read once per invocation before any
@@ -1699,7 +1775,7 @@ async fn run_scan(
     if matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
         && !args.paths.is_empty()
     {
-        return Box::pin(run_project_dirs(args, telemetry, invocation)).await;
+        return Box::pin(run_project_dirs(args, telemetry, invocation, mode_inferred)).await;
     }
 
     let mut policy = Box::new(ScanPolicy::for_root(
@@ -1829,7 +1905,10 @@ async fn run_scan(
     // that have NO installed copy (fresh clone, partial install). They join
     // discovery and are flagged "not yet installed". Scoped to the crawled
     // ecosystems.
-    let lockfile_only = lockfile_supplement(&ctx, &all_crawled, crawl_scope).await;
+    let mut lockfile_only = lockfile_supplement(&ctx, &all_crawled, crawl_scope).await;
+    // Counted once: #604 adds the API's spellings of lockfile-only PyPI pins
+    // to `lockfile_only.purls` after the batch query.
+    let lockfile_only_count = lockfile_only.purls.len();
     // Unsupported layouts and malformed binary Bun locks, kept on empty
     // scans too: an unreadable graph is not evidence of no dependencies.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
@@ -1850,6 +1929,16 @@ async fn run_scan(
     if let Some(value) = skipped_bundle_config_path {
         if args.common.ecosystem_selected(Ecosystem::Gem) {
             let (code, detail) = config_path_ignored_warning(&value);
+            layout_refusals.push((code.to_string(), detail));
+        }
+    }
+    // A Bundler plugin registration v4's `setup` left in this checkout,
+    // pointing at a plugin dir the v5 migration deleted (#1295).
+    if args.common.ecosystem_selected(Ecosystem::Gem)
+        && !args.common.global
+        && args.common.global_prefix.is_none()
+    {
+        if let Some((code, detail)) = stale_plugin_registration_warning(&args.common.cwd).await {
             layout_refusals.push((code.to_string(), detail));
         }
     }
@@ -2266,8 +2355,8 @@ async fn run_scan(
         plural(package_count, "package", "packages")
     ));
     if human {
-        if !lockfile_only.purls.is_empty() {
-            eprintln!("{}", render::lockfile_only_note(lockfile_only.purls.len()));
+        if lockfile_only_count > 0 {
+            eprintln!("{}", render::lockfile_only_note(lockfile_only_count));
         }
         print_layout_refusals(&layout_refusals, args.common.silent);
         policy.print_warnings(args.common.silent);
@@ -2276,7 +2365,12 @@ async fn run_scan(
     // Query API in batches
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
     let mut can_access_paid_patches = false;
-    let chunks: Vec<&[String]> = batch_chunks(&all_purls, batch_size, BATCH_BODY_BYTE_CAP);
+    // #604: a lockfile-only PyPI pin is spelled as the user wrote it
+    // (`six==1.16` → `@1.16`) while the API keys the release as the
+    // registry published it (`@1.16.0`); pip treats both as one release
+    // (PEP 440). Ask for its equivalent spellings too.
+    let query_purls = with_pypi_equivalents(&all_purls, &lockfile_only.purls);
+    let chunks: Vec<&[String]> = batch_chunks(&query_purls, batch_size, BATCH_BODY_BYTE_CAP);
     let total_batches = chunks.len();
     let mut batch_error_count = 0usize;
     let mut last_batch_error: Option<String> = None;
@@ -2387,6 +2481,13 @@ async fn run_scan(
     // drives the table, the `--json` `packages` array and the apply order,
     // which operators diff across runs.
     all_packages_with_patches.sort_by(|a, b| a.purl.cmp(&b.purl));
+    // #604: a patch the API returned under an equivalent spelling of a
+    // lockfile-only PyPI pin is that lockfile-only package.
+    adopt_pypi_equivalents(
+        &all_packages_with_patches,
+        &all_purls,
+        &mut lockfile_only.purls,
+    );
 
     // If every batch errored, surface a full scan failure rather than
     // silently reporting zero patches.
@@ -2401,7 +2502,7 @@ async fn run_scan(
                 "status": "error",
                 "error": { "code": API_BATCH_FAILED, "message": err },
                 "scannedPackages": package_count,
-                "lockfileOnlyPackages": lockfile_only.purls.len(),
+                "lockfileOnlyPackages": lockfile_only_count,
                 "packagesWithPatches": 0,
                 "totalPatches": 0,
                 "freePatches": 0,
@@ -2481,7 +2582,7 @@ async fn run_scan(
         let mut result = serde_json::json!({
             "status": "success",
             "scannedPackages": package_count,
-            "lockfileOnlyPackages": lockfile_only.purls.len(),
+            "lockfileOnlyPackages": lockfile_only_count,
             "packagesWithPatches": all_packages_with_patches.len(),
             "totalPatches": total_patches,
             "freePatches": free_patches,
@@ -2544,6 +2645,7 @@ async fn run_scan(
                 batch_error_count > 0,
                 &mut stage,
                 prior_discovery,
+                prune,
             )
             .await;
         }
@@ -2791,15 +2893,18 @@ async fn run_scan(
     let silent = args.common.silent;
 
     // Every human-path exit that did not fail: the `--prune` GC first
-    // (not vendored, which runs its own, nor hosted, which runs none), then
-    // the embedded VEX. An early "nothing to apply" exit still runs the GC.
+    // (not hosted, which runs none), then the embedded VEX. An early
+    // "nothing to apply" exit still runs the GC, vendored mode included:
+    // its wet vendor step runs its own GC and never reaches this closure,
+    // but the early exits (nothing patched, paid-only, nothing selected,
+    // `--dry-run`) must reconcile the ledger like the JSON arm (#1127).
     let (args_ref, manifest_ref, socket_ref) = (&args, &manifest_path, &socket_dir);
     let client_ref: &ApiClient = &api_client;
     let (scanned_ref, vendored_ref) = (&scanned_purls, &vendored_purls);
     let policy_ref: &ScanPolicy = &policy;
     let finish_human = move |code: i32| async move {
         policy_ref.print_human(silent, verbose);
-        if prune && !vendor && !hosted && code == 0 {
+        if prune && !hosted && code == 0 {
             gc::run_human_gc(
                 &args_ref.common,
                 manifest_ref,
@@ -2843,10 +2948,11 @@ async fn run_scan(
 
     // The by-package records every arm selects from, fetched before the
     // table so its `[UPDATE]` markers are the same UPGRADE rows the
-    // selection acts on (§5.1). Discovery said these packages HAVE
-    // patches, so an empty merged set is a fetch failure.
-    // A failed discovery still prints the table first; its exit code is
-    // returned below it.
+    // selection acts on (§5.1). Only `discover_selected`'s own `Err`
+    // (every query failed) is a fetch failure: queries that succeed with
+    // no records leave nothing to select, in every arm and in `--json`
+    // alike (#1062). A failed discovery still prints the table first; its
+    // exit code is returned below it.
     let mut discovery_failure: Option<i32> = None;
     let rows: Vec<rollout::Row> = if downloadable_count == 0 {
         Vec::new()
@@ -2864,13 +2970,6 @@ async fn run_scan(
         )
         .await
         {
-            // The agent / vendored / report-only arms need records to show:
-            // an empty merged set is a fetch failure there.
-            Ok(discovered) if !hosted && discovered.fetched == 0 => {
-                eprintln!("{}", render::fetch_details_failed(&discovered.failed));
-                discovery_failure = Some(1);
-                Vec::new()
-            }
             Ok(discovered) => {
                 let rows = classified_rows(
                     &mut stage,

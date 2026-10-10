@@ -264,7 +264,7 @@ fn metadata_client(
     timeouts: &UpdateTimeouts,
     redirects: reqwest::redirect::Policy,
 ) -> Result<reqwest::Client, UpdateError> {
-    reqwest::Client::builder()
+    crate::utils::http::client_builder()
         .user_agent(crate::constants::USER_AGENT)
         .connect_timeout(timeouts.connect)
         .timeout(timeouts.metadata)

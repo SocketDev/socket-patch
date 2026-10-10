@@ -235,9 +235,10 @@ async fn unfetchable_served_manifest_skips_the_patch() {
     assert_eq!(skipped.len(), 1, "{doc:#}");
     assert_eq!(skipped[0]["purl"], PURL, "{doc:#}");
     let detail = skipped[0]["detail"].as_str().unwrap();
+    // The URL is quoted with its grant-token level redacted.
     assert!(
-        !detail.contains(&server.uri()),
-        "the hosted URL is redacted: {detail}"
+        !detail.contains(TOKEN) && detail.contains(&format!("/<redacted>/{UUID}/")),
+        "the grant token is redacted: {detail}"
     );
     assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
     assert_eq!(
