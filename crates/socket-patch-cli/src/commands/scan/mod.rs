@@ -1510,6 +1510,17 @@ fn emit_scan_error(common: &GlobalArgs, error: EnvelopeError) {
     emit_scan(&env);
 }
 
+/// The ecosystems `purls` span, by CLI name, sorted and deduplicated.
+fn scanned_ecosystems(purls: &[String]) -> Vec<String> {
+    purls
+        .iter()
+        .filter_map(|purl| Ecosystem::from_purl(purl))
+        .map(|eco| eco.cli_name().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 pub async fn run(args: ScanArgs) -> i32 {
     // Scan's telemetry sends run off the critical path: each is spawned
     // where its event fires and flushed before the first stdout write that
@@ -2050,6 +2061,23 @@ async fn run_scan(
             read_set: read_set.as_ref(),
         })
     };
+    // Telemetry: the mode this run was asked for, and the modes the
+    // project is already wired for (it may hold more than one mid-migration).
+    let requested_mode = args.mode.map_or("report", ScanMode::cli_name);
+    let project_modes: Vec<&str> = [
+        (
+            !hosted_pin_list.is_empty() || !hosted_unlocked_pins.is_empty(),
+            "hosted",
+        ),
+        (!vendored_purls.is_empty(), "vendored"),
+        (
+            existing_manifest.is_some_and(|m| !m.patches.is_empty()),
+            "agent",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(present, mode)| present.then_some(mode))
+    .collect();
     let hosted_state = (!args.common.is_global())
         .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
     let redirect_state = hosted_state.as_ref();
@@ -2233,12 +2261,10 @@ async fn run_scan(
             0,
             0,
             false,
-            args.common
-                .ecosystems
-                .clone()
-                .unwrap_or_default()
-                .as_slice(),
+            &[],
             false,
+            requested_mode,
+            &project_modes,
             &telemetry_auth,
         );
         // The result prints right away: nothing to overlap the send with.
@@ -2536,19 +2562,19 @@ async fn run_scan(
     }
     let total_patches = free_patches + paid_patches;
 
-    // Telemetry: record the scan outcome with the per-tier counts.
+    // Telemetry: record the scan outcome with the per-tier counts and the
+    // ecosystems the crawl actually found (not the `--ecosystems` filter,
+    // which is empty on a default run).
     spawn_patch_scanned(
         telemetry,
         package_count,
         free_patches,
         paid_patches,
         can_access_paid_patches,
-        args.common
-            .ecosystems
-            .clone()
-            .unwrap_or_default()
-            .as_slice(),
+        &scanned_ecosystems(&all_purls),
         fallback_to_proxy,
+        requested_mode,
+        &project_modes,
         &telemetry_auth,
     );
 
@@ -3121,6 +3147,7 @@ async fn run_scan(
             None,
             npm_crawl.as_ref(),
             Some(rollout::Gate::new(&mut stage, rows).with_prior(prior_discovery)),
+            "scan",
         )
         .await;
     }

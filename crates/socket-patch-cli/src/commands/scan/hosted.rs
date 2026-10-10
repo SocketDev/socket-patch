@@ -71,11 +71,22 @@ fn emit_json_error(
     code: &str,
     message: &str,
 ) {
+    emit_scan(&json_error_envelope(common, scan_result, code, message));
+}
+
+/// The envelope [`emit_json_error`] prints, built without printing it, so
+/// [`run_redirect_selected`] can send its failure telemetry first.
+fn json_error_envelope(
+    common: &crate::args::GlobalArgs,
+    scan_result: Option<Envelope>,
+    code: &str,
+    message: &str,
+) -> Envelope {
     let mut env = scan_result.unwrap_or_else(|| scan_envelope(common));
     env.mark_error(EnvelopeError::new(code, message));
     // The rollout block describes a successful run only.
     env.extra.remove("rollout");
-    emit_scan(&env);
+    env
 }
 
 /// The hosted run's `redirect` payload: `{mode: "hosted", rewrittenFiles}`
@@ -160,10 +171,16 @@ fn refuse(
     common: &crate::args::GlobalArgs,
     scan_result: Option<Envelope>,
     refusal: &socket_patch_core::hosted::engine::Refusal,
+    json_error: &mut Option<Envelope>,
 ) -> i32 {
     eprintln!("Error ({}): {}", refusal.code, refusal.message);
     if common.json {
-        emit_json_error(common, scan_result, &refusal.code, &refusal.message);
+        *json_error = Some(json_error_envelope(
+            common,
+            scan_result,
+            &refusal.code,
+            &refusal.message,
+        ));
     }
     1
 }
@@ -182,6 +199,7 @@ fn refuse(
 fn acquire_hosted_lock(
     common: &crate::args::GlobalArgs,
     scan_result: &mut Option<Envelope>,
+    json_error: &mut Option<Envelope>,
 ) -> Result<LockGuard, i32> {
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
@@ -196,7 +214,12 @@ fn acquire_hosted_lock(
                 crate::commands::lock_cli::format_lock_error(&socket_dir, &err, timeout)
             );
             if common.json {
-                emit_json_error(common, scan_result.take(), code, &message);
+                *json_error = Some(json_error_envelope(
+                    common,
+                    scan_result.take(),
+                    code,
+                    &message,
+                ));
             }
             Err(1)
         }
@@ -662,6 +685,7 @@ pub(super) async fn run_redirect(
         scan_result,
         npm_prior,
         Some(super::rollout::Gate::new(stage, rows).with_prior(prior)),
+        "scan",
     )
     .await
 }
@@ -751,8 +775,71 @@ fn discovery_after_writes<'d>(
 /// would get a bare scan envelope without its own payload).
 /// `prune_requested` only feeds the `redirect_prune_ignored` warning —
 /// `get` passes `false`.
+///
+/// Telemetry: a run with a non-empty selection reports `patch_applied`
+/// (`mode: "hosted"`, sent before the result prints) or, on a non-zero
+/// exit before that point, `patch_apply_failed`. `command` names the
+/// caller (`scan` / `get`) in the event's context.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_redirect_selected(
+    common: &crate::args::GlobalArgs,
+    vex: &crate::commands::vex::VexEmbedArgs,
+    prune_requested: bool,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    selected: &[(String, String)],
+    scan_result: Option<Envelope>,
+    npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    rollout: Option<super::rollout::Gate<'_>>,
+    command: &'static str,
+) -> i32 {
+    let mut telemetry = HostedTelemetry {
+        command,
+        auth: socket_patch_core::telemetry::TelemetryAuth::for_client(api_client),
+        sent: false,
+        json_error: None,
+    };
+    let code = run_redirect_selected_untracked(
+        common,
+        vex,
+        prune_requested,
+        api_client,
+        selected,
+        scan_result,
+        npm_prior,
+        rollout,
+        &mut telemetry,
+    )
+    .await;
+    if code != 0 && !telemetry.sent && !selected.is_empty() {
+        socket_patch_core::telemetry::track_patch_hosted_failed(
+            command,
+            "hosted redirect failed",
+            common.dry_run,
+            &telemetry.auth,
+        )
+        .await;
+    }
+    // The `--json` error envelope prints only after the failure event went
+    // out, so a consumer that closes stdout on it cannot drop the event.
+    if let Some(envelope) = telemetry.json_error.take() {
+        emit_scan(&envelope);
+    }
+    code
+}
+
+/// Where [`run_redirect_selected`]'s outcome event goes, and whether the
+/// success event already went out.
+struct HostedTelemetry {
+    command: &'static str,
+    auth: socket_patch_core::telemetry::TelemetryAuth,
+    sent: bool,
+    /// A `--json` error envelope a failure path built, printed by
+    /// [`run_redirect_selected`] after the failure event is sent.
+    json_error: Option<Envelope>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_redirect_selected_untracked(
     common: &crate::args::GlobalArgs,
     vex: &crate::commands::vex::VexEmbedArgs,
     prune_requested: bool,
@@ -763,6 +850,7 @@ pub(crate) async fn run_redirect_selected(
     // `scan`'s rollout gate: NEW rows past the budget are deferred after
     // every write-free eligibility check below (§5.2). `get` passes `None`.
     mut rollout: Option<super::rollout::Gate<'_>>,
+    telemetry: &mut HostedTelemetry,
 ) -> i32 {
     use socket_patch_core::hosted::engine::{
         self, Candidate, CandidateFiles, RewriteOptions, SkippedPatch,
@@ -813,12 +901,12 @@ pub(crate) async fn run_redirect_selected(
                     format_error_line(&message)
                 );
                 if common.json {
-                    emit_json_error(
+                    telemetry.json_error = Some(json_error_envelope(
                         common,
                         scan_result.take(),
                         "reference_resolve_failed",
                         &message,
-                    );
+                    ));
                 }
                 return 1;
             }
@@ -853,6 +941,7 @@ pub(crate) async fn run_redirect_selected(
             common,
             scan_result.take(),
             &engine::bun_lockb_symlink_refusal(),
+            &mut telemetry.json_error,
         );
     }
     // A workspace member whose lock lives in an ancestor directory (pnpm
@@ -867,7 +956,12 @@ pub(crate) async fn run_redirect_selected(
     )
     .await
     {
-        return refuse(common, scan_result.take(), &refusal);
+        return refuse(
+            common,
+            scan_result.take(),
+            &refusal,
+            &mut telemetry.json_error,
+        );
     }
 
     // vlt artifact preflight: before any takeover or rewrite (dry runs
@@ -928,7 +1022,7 @@ pub(crate) async fn run_redirect_selected(
         })
     });
     let mut lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
-        match acquire_hosted_lock(common, &mut scan_result) {
+        match acquire_hosted_lock(common, &mut scan_result, &mut telemetry.json_error) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
         }
@@ -972,7 +1066,14 @@ pub(crate) async fn run_redirect_selected(
     .await
     {
         Ok(t) => t,
-        Err(refusal) => return refuse(common, scan_result.take(), &refusal),
+        Err(refusal) => {
+            return refuse(
+                common,
+                scan_result.take(),
+                &refusal,
+                &mut telemetry.json_error,
+            )
+        }
     };
     takeover
         .stage(common, &group, &mut candidates, &mut skipped)
@@ -1305,7 +1406,7 @@ pub(crate) async fn run_redirect_selected(
     } = takeover.finish(common.dry_run, &mut vendor_state, &done.rewrite.warnings);
     // A takeover writes the vendored ledger: hold the lock for it too.
     if lock.is_none() && !common.dry_run && !takeover_migrated.is_empty() {
-        match acquire_hosted_lock(common, &mut scan_result) {
+        match acquire_hosted_lock(common, &mut scan_result, &mut telemetry.json_error) {
             Ok(guard) => lock = Some(guard),
             Err(code) => return code,
         }
@@ -1328,13 +1429,23 @@ pub(crate) async fn run_redirect_selected(
     // hosted → upstream restore's staged flush) already refuses linked
     // files, so the write side must too.
     if let Some(refusal) = engine::guard(&view, &done, &candidates) {
-        return refuse(common, scan_result.take(), &refusal);
+        return refuse(
+            common,
+            scan_result.take(),
+            &refusal,
+            &mut telemetry.json_error,
+        );
     }
     // Defense in depth for the Gradle planner: a settings file it plans to
     // CREATE (it never read one) must not already be on disk, or the
     // atomic write would replace the user's settings with the apply line.
     if let Some(refusal) = created_settings_over_existing(&common.cwd, &done) {
-        return refuse(common, scan_result.take(), &refusal);
+        return refuse(
+            common,
+            scan_result.take(),
+            &refusal,
+            &mut telemetry.json_error,
+        );
     }
 
     if !common.dry_run {
@@ -1416,12 +1527,12 @@ pub(crate) async fn run_redirect_selected(
     {
         eprintln!("{}", format_error_line(&message));
         if common.json {
-            emit_json_error(
+            telemetry.json_error = Some(json_error_envelope(
                 common,
                 scan_result.take(),
                 "lockfile_write_failed",
                 &message,
-            );
+            ));
         }
         return 1;
     }
@@ -1724,6 +1835,19 @@ pub(crate) async fn run_redirect_selected(
         &confirmed,
         &skipped,
     );
+    // Sent before the result prints: a consumer that closes stdout early
+    // (SIGPIPE on the first write) must not lose it.
+    if !selected.is_empty() {
+        socket_patch_core::telemetry::track_patch_hosted(
+            telemetry.command,
+            confirmed.len(),
+            done.rewritten.len(),
+            common.dry_run,
+            &telemetry.auth,
+        )
+        .await;
+    }
+    telemetry.sent = true;
     if common.json {
         // Record the redirect outcome into the caller's envelope (scan's
         // discovery payload, or get's narrowing events): per-patch events
@@ -2346,6 +2470,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
     scan_result: Option<Envelope>,
     npm_prior: Option<&'a crate::ecosystem_dispatch::NpmCrawlSnapshot>,
     rollout: Option<super::rollout::Gate<'a>>,
+    command: &'static str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_redirect_selected(
         common,
@@ -2356,6 +2481,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
         scan_result,
         npm_prior,
         rollout,
+        command,
     ))
 }
 

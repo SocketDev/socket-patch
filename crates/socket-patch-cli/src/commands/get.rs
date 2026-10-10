@@ -2210,6 +2210,7 @@ async fn run_get_hosted(
         None,
         // `get` is explicit intent: the rollout cap never applies.
         None,
+        "get",
     )
     .await
 }

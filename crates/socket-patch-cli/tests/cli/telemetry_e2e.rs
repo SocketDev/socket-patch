@@ -1069,3 +1069,350 @@ async fn scan_delivers_telemetry_before_writing_to_a_closed_stderr() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// hosted mode (the v5 `scan` default)
+// ---------------------------------------------------------------------------
+
+const HOSTED_NAME: &str = "telemetry-hosted";
+const HOSTED_PURL: &str = "pkg:npm/telemetry-hosted@1.0.0";
+const HOSTED_UUID: &str = "11111111-1111-4111-8111-111111111111";
+const HOSTED_URL: &str = "https://patch.socket.dev/patch/npm/telemetry-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/telemetry-hosted-1.0.0.tgz";
+
+/// An npm project whose lockfile resolves [`HOSTED_NAME`] upstream (the
+/// `covgap_commands_scan_hosted.rs` `write_npm_project` shape).
+fn write_hosted_npm_project(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{HOSTED_NAME}": "1.0.0" }} }}"#
+        ),
+    )
+    .unwrap();
+    write_npm_package(root, HOSTED_NAME, "1.0.0");
+    std::fs::write(
+        root.join("package-lock.json"),
+        format!(
+            r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{HOSTED_NAME}": "1.0.0" }} }},
+    "node_modules/{HOSTED_NAME}": {{
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/{HOSTED_NAME}/-/{HOSTED_NAME}-1.0.0.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+/// The API surface a hosted scan of [`write_hosted_npm_project`] reads:
+/// batch discovery, the per-package search, the reference grant (answered
+/// with `reference_status`) and the patch record. Telemetry answers 201.
+async fn setup_hosted_mock(reference_status: u16) -> MockServer {
+    let batch = serde_json::json!({
+        "packages": [{
+            "purl": HOSTED_PURL,
+            "patches": [{
+                "uuid": HOSTED_UUID, "purl": HOSTED_PURL, "tier": "free",
+                "cveIds": [], "ghsaIds": [], "severity": "high",
+                "title": "telemetry hosted fixture"
+            }]
+        }],
+        "canAccessPaidPatches": false,
+    });
+    let mock = setup_mock(batch, None).await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(format!(
+            "^/v0/orgs/{ORG_SLUG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": HOSTED_UUID, "purl": HOSTED_PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/package")))
+        .respond_with(
+            ResponseTemplate::new(reference_status).set_body_json(serde_json::json!({
+                "results": {
+                    HOSTED_UUID: {
+                        "status": "granted",
+                        "url": HOSTED_URL,
+                        "purl": HOSTED_PURL,
+                        "artifacts": [{
+                            "kind": "tarball",
+                            "url": HOSTED_URL,
+                            "integrity": { "sha512": "sha512-PATCHEDpatchedPATCHEDpatched0123456789==" }
+                        }],
+                        "registryOverride": null
+                    }
+                }
+            })),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/view/{HOSTED_UUID}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": HOSTED_UUID,
+            "purl": HOSTED_PURL,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(&mock)
+        .await;
+    mock
+}
+
+/// Every telemetry body the mock received, in order.
+async fn telemetry_bodies(mock: &MockServer) -> Vec<serde_json::Value> {
+    mock.received_requests()
+        .await
+        .expect("wiremock allows recording")
+        .iter()
+        .filter(|req| {
+            req.url
+                .path()
+                .ends_with(&format!("/v0/orgs/{ORG_SLUG}/telemetry"))
+        })
+        .map(|req| serde_json::from_slice(&req.body).expect("telemetry body is JSON"))
+        .collect()
+}
+
+/// v5's default `scan` pins patched dependencies to the hosted patch
+/// server. That IS the patch adoption, so besides `patch_scanned` (with
+/// the ecosystems the crawl found) it reports `patch_applied` tagged
+/// `mode: "hosted"` — the event the backend's adoption views count.
+#[tokio::test]
+async fn hosted_scan_reports_patch_applied_with_hosted_mode() {
+    let mock = setup_hosted_mock(200).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_hosted_npm_project(tmp.path());
+
+    let (code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "scan", &[], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(lock.contains(HOSTED_URL), "the lockfile is pinned: {lock}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("JSON envelope");
+
+    let bodies = telemetry_bodies(&mock).await;
+    let types: Vec<&str> = bodies
+        .iter()
+        .map(|b| b["event_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["patch_scanned", "patch_applied"], "{bodies:#?}");
+
+    let scanned = &bodies[0];
+    assert_eq!(
+        scanned["metadata"]["ecosystems"],
+        serde_json::json!(["npm"])
+    );
+    // Default mode, on a project nothing is wired into yet.
+    assert_eq!(scanned["metadata"]["mode"], "hosted");
+    assert_eq!(scanned["metadata"]["project_modes"], serde_json::json!([]));
+    assert_eq!(scanned["metadata"]["free_patches"], 1);
+
+    let applied = &bodies[1];
+    assert_eq!(applied["context"]["command"], "scan");
+    assert_eq!(applied["metadata"]["mode"], "hosted");
+    // v5.0 records each confirmed pin as an `applied` event tagged
+    // `details.mode: "hosted"` (v4's `redirect.redirected` count).
+    let hosted_applied = doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "applied")
+        .count();
+    assert_eq!(
+        applied["metadata"]["patches_count"], hosted_applied,
+        "patches_count is the envelope's hosted applied events: {doc:#}"
+    );
+    assert_eq!(applied["metadata"]["patches_count"], 1);
+    assert_eq!(
+        applied["metadata"]["files_count"],
+        doc["redirect"]["rewrittenFiles"].as_array().unwrap().len(),
+        "files_count is the envelope's rewrittenFiles: {doc:#}"
+    );
+    assert_eq!(applied["metadata"]["dry_run"], false);
+    assert_eq!(
+        applied["session_id"], scanned["session_id"],
+        "one run, one session"
+    );
+
+    // A re-scan sees the hosted pins the first run wrote.
+    let (code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "scan", &[], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let bodies = telemetry_bodies(&mock).await;
+    let rescanned = bodies
+        .iter()
+        .filter(|b| b["event_type"] == "patch_scanned")
+        .nth(1)
+        .expect("the re-scan's patch_scanned");
+    assert_eq!(
+        rescanned["metadata"]["project_modes"],
+        serde_json::json!(["hosted"])
+    );
+    assert_ne!(rescanned["session_id"], scanned["session_id"]);
+}
+
+/// `patch_scanned` carries the requested mode and the modes the project is
+/// already wired for: here an agent manifest, scanned with `--mode agent`.
+#[tokio::test]
+async fn scan_reports_requested_and_project_modes() {
+    let mock = setup_mock(
+        serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
+        None,
+    )
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::json!({
+            "patches": {
+                "pkg:npm/minimist@1.2.2": {
+                    "uuid": "33333333-3333-4333-8333-333333333333",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {},
+                    "vulnerabilities": {},
+                    "description": "x",
+                    "license": "MIT",
+                    "tier": "free"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cmd(
+        tmp.path(),
+        &mock.uri(),
+        "scan",
+        &["--mode", "agent", "--dry-run"],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let bodies = telemetry_bodies(&mock).await;
+    let scanned = bodies
+        .iter()
+        .find(|b| b["event_type"] == "patch_scanned")
+        .unwrap_or_else(|| panic!("no patch_scanned: {bodies:#?}"));
+    assert_eq!(scanned["metadata"]["mode"], "agent");
+    assert_eq!(
+        scanned["metadata"]["project_modes"],
+        serde_json::json!(["agent"])
+    );
+    assert_eq!(
+        scanned["context"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "every event carries the client version"
+    );
+}
+
+/// A hosted run that fails after selecting patches reports
+/// `patch_apply_failed` (`mode: "hosted"`) and leaves the lockfile alone.
+#[tokio::test]
+async fn hosted_scan_failure_reports_patch_apply_failed() {
+    let mock = setup_hosted_mock(500).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_hosted_npm_project(tmp.path());
+
+    let (code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "scan", &[], &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let bodies = telemetry_bodies(&mock).await;
+    let types: Vec<&str> = bodies
+        .iter()
+        .map(|b| b["event_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        ["patch_scanned", "patch_apply_failed"],
+        "{bodies:#?}"
+    );
+    let failed = &bodies[1];
+    assert_eq!(failed["context"]["command"], "scan");
+    assert_eq!(failed["metadata"]["mode"], "hosted");
+    assert_eq!(failed["error"]["type"], "Error");
+}
+
+/// The `--json` failure envelope (every run here is `--json`) prints only
+/// after `patch_apply_failed` is sent: with stdout closed from the start,
+/// its first write raises SIGPIPE, and the event must already be out.
+#[tokio::test]
+async fn hosted_scan_failure_delivers_telemetry_before_a_closed_stdout() {
+    let mock = setup_hosted_mock(500).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_hosted_npm_project(tmp.path());
+
+    let mut child = build_cmd(tmp.path(), &mock.uri(), "scan", &[], &[])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn socket-patch");
+    drop(child.stdout.take());
+    let status = child.wait().expect("wait socket-patch");
+    assert!(!status.success(), "{status:?}");
+
+    let bodies = telemetry_bodies(&mock).await;
+    let types: Vec<&str> = bodies
+        .iter()
+        .map(|b| b["event_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        ["patch_scanned", "patch_apply_failed"],
+        "{bodies:#?}"
+    );
+}
+
+/// `get --mode hosted` reports through the same path, under its own
+/// command name.
+#[tokio::test]
+async fn hosted_get_reports_patch_applied_under_get() {
+    let mock = setup_hosted_mock(200).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_hosted_npm_project(tmp.path());
+
+    let (code, stdout, stderr) = run_cmd(
+        tmp.path(),
+        &mock.uri(),
+        "get",
+        &[HOSTED_PURL, "--mode", "hosted", "--yes"],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let bodies = telemetry_bodies(&mock).await;
+    let applied: Vec<&serde_json::Value> = bodies
+        .iter()
+        .filter(|b| b["event_type"] == "patch_applied")
+        .collect();
+    assert_eq!(applied.len(), 1, "{bodies:#?}");
+    assert_eq!(applied[0]["context"]["command"], "get");
+    assert_eq!(applied[0]["metadata"]["mode"], "hosted");
+    assert_eq!(applied[0]["metadata"]["patches_count"], 1);
+}
