@@ -2238,6 +2238,46 @@ async fn pypi_unwinds_name_the_reinstall_a_plain_sync_skips() {
             }
         }
     }
+    // `scan --prune` of a vendored entry whose patch left the manifest
+    // (the package stays locked) names the reinstall too.
+    let empty = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [], "canAccessPaidPatches": false,
+        })))
+        .mount(&empty)
+        .await;
+    let empty_uri = empty.uri();
+    for (tool, _, stage, needle) in tools {
+        let (_tmp, root) = project();
+        let files = stage(&root);
+        vendor_project(&root, files);
+        std::fs::write(root.join(".socket/manifest.json"), "{\"patches\":{}}").unwrap();
+        let (code, env) = run_cli(
+            &root,
+            &[
+                "scan",
+                "--mode",
+                "vendored",
+                "--prune",
+                "--yes",
+                "--api-url",
+                &empty_uri,
+                "--org",
+                ORG,
+                "--api-token",
+                "fake-token",
+            ],
+            &[],
+        );
+        assert_eq!(code, 0, "{tool} prune: {env:#}");
+        let text = env.to_string();
+        assert!(
+            text.contains("vendor_pypi_reinstall_required") && text.contains(needle),
+            "{tool} prune names {needle}: {env:#}"
+        );
+    }
     // Control: Poetry reinstalls on a source change, so a Poetry unwind
     // keeps the generic note alone.
     let (_tmp, root) = project();

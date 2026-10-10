@@ -123,22 +123,14 @@ impl<'a> VendoredBackend<'a> {
                     | VendorRevertStep::Preserved
                     | VendorRevertStep::LedgerWriteFailed(_)
             );
-            if let Some(tool) = flavor
-                .as_deref()
-                .and_then(crate::commands::pypi_reinstall::Tool::of_flavor)
-                .filter(|_| unwired)
-            {
-                if let Some(detail) = crate::commands::pypi_reinstall::advisory(
+            if unwired {
+                crate::commands::pypi_reinstall::push_vendor_advisory(
                     &self.common.cwd,
-                    &[(key.clone(), tool)],
+                    key,
+                    flavor.as_deref(),
+                    &mut result.warnings,
                 )
-                .await
-                {
-                    result.warnings.push(VendorWarning::new(
-                        crate::commands::pypi_reinstall::VENDOR_CODE,
-                        detail,
-                    ));
-                }
+                .await;
             }
             out.push(RevertedEntry {
                 key: key.clone(),

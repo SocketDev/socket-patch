@@ -105,9 +105,13 @@ pub(crate) async fn advisory(
         };
         let lock = if *tool == Tool::Pipenv {
             if pipfile_lock.is_none() {
-                let text = tokio::fs::read_to_string(project_root.join("Pipfile.lock"))
-                    .await
-                    .ok();
+                // A regular file only: a FIFO or device here must not
+                // block the unwind.
+                let text = socket_patch_core::utils::fs::read_regular_to_string(
+                    &project_root.join("Pipfile.lock"),
+                )
+                .await
+                .ok();
                 pipfile_lock = Some(text.and_then(|t| serde_json::from_str(&t).ok()));
             }
             pipfile_lock.as_ref().and_then(Option::as_ref)
@@ -132,6 +136,26 @@ pub(crate) async fn advisory(
             .collect::<Vec<_>>()
             .join("; ")
     ))
+}
+
+/// Push the vendored revert's advisory onto `warnings` when the reverted
+/// ledger entry `key` (lockfile flavor `flavor`) is a PyPI package under
+/// PDM, uv or Pipenv. The caller decides the revert unwired the entry.
+pub(crate) async fn push_vendor_advisory(
+    project_root: &std::path::Path,
+    key: &str,
+    flavor: Option<&str>,
+    warnings: &mut Vec<socket_patch_core::vendor::VendorWarning>,
+) {
+    let Some(tool) = flavor.and_then(Tool::of_flavor) else {
+        return;
+    };
+    if let Some(detail) = advisory(project_root, &[(key.to_string(), tool)]).await {
+        warnings.push(socket_patch_core::vendor::VendorWarning::new(
+            VENDOR_CODE,
+            detail,
+        ));
+    }
 }
 
 #[cfg(test)]
