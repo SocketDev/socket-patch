@@ -1018,9 +1018,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 );
             }
         }
-        // Diff archives use the same manifest-uuid keep rule; legacy
-        // package archives are swept whole (parity with repair and scan
-        // --prune).
+        // Obsolete diff and package archives are swept whole (parity with
+        // repair and scan --prune).
         for (dir, noun, result) in [
             ("diffs", DIFF_ARCHIVE, &sweep.diffs),
             ("packages", PACKAGE_ARCHIVE, &sweep.packages),

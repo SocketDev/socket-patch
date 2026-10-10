@@ -218,8 +218,8 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     // The error names the remedy; the per-file record names the blob.
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("socket-patch repair"),
-        "error must carry the repair remedy; got: {err}"
+        err.contains("Re-run without --offline") && !err.contains("repair"),
+        "error must carry the re-run remedy (repair cannot fetch originals, #893); got: {err}"
     );
     let verified = entry["details"]["filesVerified"]
         .as_array()
@@ -242,8 +242,8 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
         "message must name the missing hash; got: {msg}"
     );
     assert!(
-        msg.contains("--offline") && msg.contains("socket-patch repair"),
-        "message must name the offline gate and the repair remedy; got: {msg}"
+        msg.contains("--offline") && msg.contains("Re-run without --offline"),
+        "message must name the offline gate and the re-run remedy; got: {msg}"
     );
 }
 
@@ -270,8 +270,8 @@ fn rollback_offline_missing_blob_human_names_package_and_remedy() {
         "stderr must explain the offline gate; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("socket-patch repair"),
-        "stderr must carry the repair remedy; stderr=\n{stderr}"
+        stderr.contains("Re-run without --offline") && !stderr.contains("socket-patch repair"),
+        "stderr must carry the re-run remedy; stderr=\n{stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -325,8 +325,8 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
     assert_eq!(entry["purl"], "pkg:npm/__rollback_test__@1.0.0");
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("socket-patch repair"),
-        "error must carry the repair remedy; got: {err}"
+        err.contains("patch API is reachable") && !err.contains("repair"),
+        "error must carry the re-run remedy; got: {err}"
     );
     let verified = entry["details"]["filesVerified"]
         .as_array()
@@ -584,11 +584,11 @@ fn rollback_mixed_installed_gated_and_not_installed_entries() {
             .is_empty(),
         "the gated package is installed — path must be reported; stdout=\n{stdout}"
     );
-    // The pinned missing-blob abort survives for the installed package:
-    // engine vocabulary + repair remedy.
+    // The pinned missing-blob abort envelope survives for the installed
+    // package: engine vocabulary + re-run remedy.
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("Cannot roll back: ") && err.contains("socket-patch repair"),
+        err.contains("Cannot roll back: ") && err.contains("Re-run without --offline"),
         "pinned abort error shape; got: {err}"
     );
     let verified = entry["details"]["filesVerified"]

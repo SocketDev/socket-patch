@@ -24,6 +24,10 @@ struct Case {
     /// nothing for the formats the engine must rewrite).
     expect_redirect: bool,
     dry_run: bool,
+    /// Serve a real tarball for every npm grant, its integrity rewritten
+    /// to match: a yarn classic pin reads the served tarball (#558, #591),
+    /// which the fixtures' placeholder hashes could never verify.
+    serve_npm_tarballs: bool,
 }
 
 fn case(fixture: &'static str) -> Case {
@@ -32,6 +36,47 @@ fn case(fixture: &'static str) -> Case {
         extra: Vec::new(),
         expect_redirect: true,
         dry_run: false,
+        serve_npm_tarballs: false,
+    }
+}
+
+/// For each npm patch: a minimal tarball (`package/package.json` naming
+/// the package) served at its artifact URL, with the grant's sha512 and
+/// sha1 set to that tarball's.
+async fn serve_npm_tarballs(server: &MockServer, patches: &mut [common::Patch]) {
+    use sha1::Digest as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    for patch in patches.iter_mut() {
+        let Some(rest) = patch.purl.strip_prefix("pkg:npm/") else {
+            continue;
+        };
+        let (name, version) = rest.rsplit_once('@').unwrap();
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/package.json", manifest.as_bytes())
+            .unwrap();
+        let tgz = builder.into_inner().unwrap().finish().unwrap();
+        let url = patch.reference["url"].as_str().unwrap().to_string();
+        let artifact = &mut patch.reference["artifacts"][0];
+        artifact["integrity"]["sha512"] = Value::String(format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&tgz))
+        ));
+        artifact["integrity"]["sha1"] = Value::String(hex::encode(sha1::Sha1::digest(&tgz)));
+        Mock::given(method("GET"))
+            .and(path(url.strip_prefix(&server.uri()).unwrap().to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
+            .mount(server)
+            .await;
     }
 }
 
@@ -39,7 +84,10 @@ fn case(fixture: &'static str) -> Case {
 async fn assert_parity(case: Case) -> Value {
     let dir = fixtures_root().join("redirect").join(case.fixture);
     let server = MockServer::start().await;
-    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    let mut patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    if case.serve_npm_tarballs {
+        serve_npm_tarballs(&server, &mut patches).await;
+    }
     mount_api(&server, &patches).await;
     let mut files = fixture_files(&dir.join("input"));
     for (rel, bytes) in &case.extra {
@@ -146,7 +194,11 @@ async fn parity_pnpm_existing_workspace() {
 
 #[tokio::test]
 async fn parity_yarn_classic() {
-    assert_parity(case("npm/yarn-classic/basic")).await;
+    assert_parity(Case {
+        serve_npm_tarballs: true,
+        ..case("npm/yarn-classic/basic")
+    })
+    .await;
 }
 
 #[tokio::test]

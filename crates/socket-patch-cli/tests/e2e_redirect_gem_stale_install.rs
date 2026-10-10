@@ -453,6 +453,53 @@ async fn gem_hosted_scan_never_pins_a_version_the_lock_does_not_resolve() {
     );
 }
 
+/// #1125: the same shared-home copy, but the project has no lock at all
+/// (a fresh library clone before `bundle install`). Nothing says which
+/// version the project resolves, so hosted mode must neither rewrite the
+/// user's `~> 2.0` down to the installed 1.0.0 nor append the gem to a
+/// Gemfile that never declared it: it skips with `redirect_gem_no_lockfile`
+/// (whose detail names `bundle lock`) and writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_scan_without_a_lock_pins_nothing() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    for gemfile in [
+        format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"~> 2.0\"\n"),
+        "source \"https://rubygems.org\"\ngem \"tiny-dep\"\n".to_string(),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("Gemfile"), &gemfile).unwrap();
+        materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
+
+        let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+        assert_eq!(
+            env["redirect"]["redirected"], 0,
+            "nothing may be redirected: {env}\nstderr:\n{stderr}"
+        );
+        let hit: Vec<&serde_json::Value> = env["redirect"]["warnings"]
+            .as_array()
+            .expect("redirect.warnings")
+            .iter()
+            .filter(|w| w["code"] == "redirect_gem_no_lockfile")
+            .collect();
+        assert_eq!(hit.len(), 1, "the missing lock must be reported: {env}");
+        assert!(
+            hit[0]["detail"].as_str().unwrap().contains("bundle lock"),
+            "the remedy names `bundle lock`: {env}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            gemfile,
+            "the Gemfile must stay byte-identical"
+        );
+        assert!(!proj.join("Gemfile.lock").exists());
+    }
+}
+
 /// TWO gem homes (two ruby versions under vendor/bundle) both stale: one
 /// warning per home, each naming its own home's paths — multiplicity is
 /// per materialization, not per purl.

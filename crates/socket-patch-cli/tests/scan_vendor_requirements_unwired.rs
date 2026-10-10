@@ -233,3 +233,75 @@ fn reverted_purls(envelope: &serde_json::Value) -> serde_json::Value {
         .map(|e| e["purl"].clone())
         .collect()
 }
+
+/// #1127: the human `--prune` run reverts an unwired entry too, when the
+/// crawl found packages but none of them has a patch. Its early "No patches
+/// available" exit used to skip the GC in vendored mode, while `--json`
+/// ran it. The installed npm package makes sure the crawl is non-empty
+/// (an empty crawl takes the vendored-only GC, which already worked).
+#[tokio::test]
+async fn human_prune_reverts_unwired_entry_when_no_package_is_patched() {
+    let mock = empty_patch_api().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_vendored(root);
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\n").unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "p", "version": "1.0.0", "dependencies": { "ms": "2.1.3" } }"#,
+    )
+    .unwrap();
+    let ms = root.join("node_modules/ms");
+    std::fs::create_dir_all(&ms).unwrap();
+    std::fs::write(
+        ms.join("package.json"),
+        r#"{ "name": "ms", "version": "2.1.3" }"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+        .args([
+            "scan",
+            "--mode",
+            "vendored",
+            "--prune",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+            "--vendor-url",
+            &mock.uri(),
+            "--patch-server-url",
+            &mock.uri(),
+        ])
+        .current_dir(root)
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env_remove("VIRTUAL_ENV")
+        .env_remove("CONDA_PREFIX")
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("No patches available for installed packages."),
+        "the run must take the found-but-unpatched exit: stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("GC: reverted 1 vendored entry"),
+        "the human run must report the vendored GC: stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+        "the dead uuid dir is reclaimed: stdout={stdout}"
+    );
+    let state = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap_or_default();
+    assert!(!state.contains(PURL), "{state}");
+}

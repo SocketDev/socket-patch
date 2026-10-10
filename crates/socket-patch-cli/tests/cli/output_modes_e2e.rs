@@ -314,40 +314,36 @@ fn scan_non_json_no_packages_prints_friendly_message() {
 fn repair_non_json_no_orphans_prints_summary() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), "pkg:npm/repair-target@1.0.0", b"a", b"b");
-    // `write_manifest` writes BOTH the beforeHash and afterHash blobs, but
-    // repair treats `beforeHash` blobs as unused-by-design (they are fetched
-    // on demand during rollback). To exercise the genuine "all in use" path
-    // implied by this test's name, drop the beforeHash blob so the only
-    // remaining blob is the in-use afterHash one.
+    // `write_manifest` writes BOTH the beforeHash and afterHash blobs of
+    // the active patch, and repair keeps both (#893: the beforeHash blob is
+    // an offline rollback's only restore data).
     let blobs = tmp.path().join(".socket/blobs");
     let before_blob = blobs.join(git_sha256(b"a"));
     let after_blob = blobs.join(git_sha256(b"b"));
-    std::fs::remove_file(&before_blob).unwrap();
     assert!(
-        after_blob.exists(),
-        "fixture precondition: afterHash blob present"
+        before_blob.exists() && after_blob.exists(),
+        "fixture precondition: both blobs present"
     );
 
     let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["repair", "--offline"], &[]);
     assert_eq!(code, 0);
-    // With exactly one in-use blob and no orphans, repair must report the
+    // With two in-use blobs and no orphans, repair must report the
     // all-in-use status (not a removal) and finish. The old check accepted
     // any output containing "Repair complete.", so a repair that wrongly
     // deleted the in-use blob — or skipped the cleanup scan entirely — still
     // passed.
     assert!(
-        stdout.contains("Checked 1 blob: in use."),
-        "no-orphan repair must report the single blob as in-use; got: {stdout}"
+        stdout.contains("Checked 2 blobs: all in use."),
+        "no-orphan repair must report both blobs as in use; got: {stdout}"
     );
     assert!(
         stdout.contains("Repair complete."),
         "non-JSON repair should print the completion summary; got: {stdout}"
     );
-    // Critically: the in-use afterHash blob (the patched file content that
-    // `apply` needs) must NOT be deleted by repair.
+    // Critically: neither in-use blob may be deleted by repair.
     assert!(
-        after_blob.exists(),
-        "repair must preserve the in-use afterHash blob"
+        after_blob.exists() && before_blob.exists(),
+        "repair must preserve the active patch's afterHash and beforeHash blobs"
     );
 }
 
@@ -370,12 +366,16 @@ fn repair_non_json_with_orphans_prints_cleanup_summary() {
     assert_eq!(code, 0);
     // The test name promises a *cleanup* summary, so assert the cleanup
     // actually happened — both in the printed summary and on disk. Pin the
-    // exact count (the orphan blob + the by-design-unused beforeHash blob =
-    // 2) so a repair that removes too few OR too many blobs fails here; the
-    // old `contains("Removed")` accepted any nonzero count.
+    // exact count (only the orphan: the active patch's beforeHash blob is
+    // kept, #893) so a repair that removes too few OR too many blobs fails
+    // here; the old `contains("Removed")` accepted any nonzero count.
     assert!(
-        stdout.contains("Removed 2 unused blobs"),
-        "repair with orphans must report exactly 2 removed unused blobs; got: {stdout}"
+        stdout.contains("Removed 1 unused blob ("),
+        "repair with orphans must report exactly 1 removed unused blob; got: {stdout}"
+    );
+    assert!(
+        blobs.join(git_sha256(b"a")).exists(),
+        "repair must keep the active patch's beforeHash blob"
     );
     assert!(
         !orphan.exists(),

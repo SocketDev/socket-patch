@@ -1216,6 +1216,24 @@ fn uv_vendor_revert_after_uv_remove() {
     );
 }
 
+/// #1287: six vendored TRANSITIVELY (through `[tool.uv]
+/// override-dependencies` + sources, here beside a user
+/// `constraint-dependencies` pin), then `uv remove python-dateutil` drops
+/// six's `[[package]]` unit but leaves the `[tool.uv]` lines and the lock's
+/// `[manifest]` records socket-patch wrote. `vendor --revert` must read the
+/// vanished unit as removed and unwind the rest, instead of drift-keeping
+/// everything (which left `vendor --check` red with a prune remedy that
+/// changed nothing).
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_after_uv_remove_of_the_transitive_parent() {
+    uv_relock_then_revert(
+        "uv-remove-parent",
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"python-dateutil==2.8.2\", \"attrs>=20\"]\n\n[tool.uv]\nconstraint-dependencies = [\"six==1.16.0\"]\n",
+        &["remove", "-q", "python-dateutil"],
+    );
+}
+
 /// #821: six in a PEP 735 dev group, then `uv add --dev zipp` rewrites the
 /// whole `requires-dev` group line.
 #[test]

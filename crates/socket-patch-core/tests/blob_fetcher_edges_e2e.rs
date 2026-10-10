@@ -5,12 +5,10 @@
 //! loop).
 
 use socket_patch_core::api::blob_fetcher::{
-    fetch_blobs_by_hash, fetch_missing_blobs, fetch_missing_sources, get_missing_archives,
-    get_missing_blobs, DownloadMode,
+    fetch_blobs_by_hash, fetch_missing_blobs, get_missing_blobs,
 };
 use socket_patch_core::api::client::{ApiClient, ApiClientOptions};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
-use socket_patch_core::patch::apply::PatchSources;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -131,130 +129,6 @@ async fn fetch_blobs_by_hash_empty_set_short_circuits() {
     assert_eq!(result.skipped, 0);
     assert!(result.results.is_empty());
     assert_eq!(dir_entry_count(&blobs), 0, "no blobs should be created");
-}
-
-/// `get_missing_archives` against an empty manifest returns empty
-/// — no patches means no archives to look for.
-#[tokio::test]
-async fn get_missing_archives_empty_manifest_returns_empty_set() {
-    let tmp = tempfile::tempdir().unwrap();
-    let archives_dir = tmp.path().join("archives");
-    std::fs::create_dir(&archives_dir).unwrap();
-    let manifest = PatchManifest::new();
-    let missing = get_missing_archives(&manifest, &archives_dir).await;
-    assert!(missing.is_empty());
-}
-
-/// Discriminator: a non-empty manifest whose archive is absent from disk
-/// must be reported as missing — proving `get_missing_archives` actually
-/// inspects manifest+disk rather than being a constant-empty stub.
-#[tokio::test]
-async fn get_missing_archives_reports_missing_archive() {
-    let tmp = tempfile::tempdir().unwrap();
-    let archives_dir = tmp.path().join("archives");
-    std::fs::create_dir(&archives_dir).unwrap();
-    let manifest = manifest_with_after_hashes(&[&"a".repeat(64)]);
-    let uuid = "11111111-1111-4111-8111-111111111111";
-
-    // Archive absent → reported missing.
-    let missing = get_missing_archives(&manifest, &archives_dir).await;
-    assert_eq!(missing.len(), 1);
-    assert!(missing.contains(uuid));
-
-    // Stage the archive → no longer missing.
-    std::fs::write(archives_dir.join(format!("{uuid}.tar.gz")), b"data").unwrap();
-    let missing = get_missing_archives(&manifest, &archives_dir).await;
-    assert!(
-        missing.is_empty(),
-        "archive present on disk must not be reported missing"
-    );
-}
-
-/// `fetch_missing_sources` with `DownloadMode::Diff` and no diffs_path
-/// returns the empty-result envelope without I/O — covers the "no path
-/// configured" fallback hint documented in the function's rustdoc.
-#[tokio::test]
-async fn fetch_missing_sources_diff_mode_with_no_diffs_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let blobs = tmp.path().join("blobs");
-    std::fs::create_dir(&blobs).unwrap();
-    let sources = PatchSources {
-        blobs_path: &blobs,
-        diffs_path: None,
-        mem_blobs: None,
-    };
-    let manifest = manifest_with_after_hashes(&[&"a".repeat(64)]);
-    let client = dummy_client();
-
-    // Control: File mode against the same manifest genuinely tries to work.
-    let file_mode =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::File, &client, None).await;
-    assert_eq!(file_mode.total, 1, "File mode must find the missing blob");
-    assert_eq!(file_mode.failed, 1, "and attempt (failing) to download it");
-
-    let result =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
-    assert_eq!(
-        result.total, 0,
-        "Diff mode w/o diffs_path must short-circuit"
-    );
-    assert_eq!(result.downloaded, 0);
-    assert_eq!(result.failed, 0);
-    assert_eq!(result.skipped, 0);
-    assert!(result.results.is_empty());
-    assert_eq!(
-        dir_entry_count(&blobs),
-        0,
-        "Diff-mode short-circuit did zero I/O"
-    );
-}
-
-/// `DownloadMode::parse` accepts all documented values plus the
-/// `"blob"` synonym for `File`, and rejects unknown strings.
-#[test]
-fn download_mode_parse_covers_all_branches() {
-    assert_eq!(DownloadMode::parse("diff").unwrap(), DownloadMode::Diff);
-    assert_eq!(DownloadMode::parse("file").unwrap(), DownloadMode::File);
-    assert_eq!(DownloadMode::parse("blob").unwrap(), DownloadMode::File);
-    // Case-insensitive.
-    assert_eq!(DownloadMode::parse("DIFF").unwrap(), DownloadMode::Diff);
-    assert_eq!(DownloadMode::parse("FILE").unwrap(), DownloadMode::File);
-    // `package` was removed; its error is a removal notice (case-insensitive),
-    // distinct from the generic unknown-mode error.
-    for spelling in ["package", "Package"] {
-        let err = DownloadMode::parse(spelling).unwrap_err();
-        assert!(err.contains("removed"), "want removal notice: {err}");
-    }
-    assert_eq!(DownloadMode::parse("Blob").unwrap(), DownloadMode::File);
-    // Unknown value → Err, and the message names the offending input.
-    let err = DownloadMode::parse("invalid").unwrap_err();
-    assert!(
-        err.contains("invalid"),
-        "error should echo the bad value: {err}"
-    );
-    assert!(DownloadMode::parse("").is_err());
-    // A near-miss must not be silently coerced to a valid mode.
-    assert!(DownloadMode::parse("diffs").is_err());
-    assert!(DownloadMode::parse("files").is_err());
-}
-
-/// `DownloadMode::as_tag` round-trips with `parse` for all variants, and
-/// each variant maps to a *distinct* tag.
-#[test]
-fn download_mode_as_tag_round_trips_with_parse() {
-    let variants = [DownloadMode::Diff, DownloadMode::File];
-    let mut seen_tags = HashSet::new();
-    for mode in variants {
-        let tag = mode.as_tag();
-        assert!(
-            seen_tags.insert(tag),
-            "tag {tag:?} must be unique per variant"
-        );
-        assert_eq!(DownloadMode::parse(tag).unwrap(), mode);
-    }
-    // Pin the exact tag strings so a silent rename is caught.
-    assert_eq!(DownloadMode::Diff.as_tag(), "diff");
-    assert_eq!(DownloadMode::File.as_tag(), "file");
 }
 
 /// `fetch_blobs_by_hash` with a hash whose blob is already on disk
@@ -526,173 +400,6 @@ async fn fetch_missing_blobs_accepts_uppercase_manifest_hash() {
     assert_eq!(std::fs::read(blobs.join(&hash_upper)).unwrap(), content);
 }
 
-// ── Archive (diff) download path ─────────────────────────────────────
-//
-// `fetch_missing_diff_archives` (driven via `fetch_missing_sources` in
-// Diff mode) is otherwise only reached on the closed-port
-// transport-error arm. These drive the success-write, 404, and
-// progress-callback arms against a mock proxy. Archives are uuid-named
-// and have no content hash, so the only integrity guarantee is the atomic
-// write — assert no staging litter survives.
-
-/// Build a manifest carrying a set of patch UUIDs (each as its own PURL).
-fn manifest_with_uuids(uuids: &[&str]) -> PatchManifest {
-    let mut patches = HashMap::new();
-    for (i, uuid) in uuids.iter().enumerate() {
-        patches.insert(
-            format!("pkg:npm/test-{i}@1.0.0"),
-            PatchRecord {
-                uuid: (*uuid).to_string(),
-                exported_at: "2024-01-01T00:00:00Z".to_string(),
-                files: HashMap::new(),
-                vulnerabilities: HashMap::new(),
-                description: "test".to_string(),
-                license: "MIT".to_string(),
-                tier: "free".to_string(),
-            },
-        );
-    }
-    PatchManifest {
-        patches,
-        setup: None,
-    }
-}
-
-#[tokio::test]
-async fn fetch_missing_sources_diff_downloads_and_writes_archive() {
-    let uuid = "11111111-1111-4111-8111-111111111111";
-    let archive_bytes = b"\x1f\x8b\x08 fake-but-opaque tar.gz payload";
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path_matcher(format!("/patch/diff/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive_bytes.to_vec()))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let blobs = tmp.path().join("blobs");
-    let diffs = tmp.path().join("diffs");
-    std::fs::create_dir(&blobs).unwrap();
-    std::fs::create_dir(&diffs).unwrap();
-    let sources = PatchSources {
-        blobs_path: &blobs,
-        diffs_path: Some(&diffs),
-        mem_blobs: None,
-    };
-    let manifest = manifest_with_uuids(&[uuid]);
-    let client = proxy_client(&server.uri());
-
-    let result =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
-    assert_eq!(result.total, 1);
-    assert_eq!(result.downloaded, 1, "diff archive must be downloaded");
-    assert_eq!(result.failed, 0);
-    // The result's `hash` field carries the UUID for archive modes.
-    assert_eq!(result.results[0].hash, uuid);
-    // Written under `<uuid>.tar.gz`, byte-for-byte, with no staging litter.
-    assert_eq!(
-        std::fs::read(diffs.join(format!("{uuid}.tar.gz"))).unwrap(),
-        archive_bytes
-    );
-    let names: Vec<String> = std::fs::read_dir(&diffs)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(
-        names,
-        vec![format!("{uuid}.tar.gz")],
-        "no temp files: {names:?}"
-    );
-    // A re-run finds the archive present and short-circuits (no second GET;
-    // the mock's `.expect(1)` would trip on a second request).
-    let again = fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
-    assert_eq!(again.total, 0, "already-present archive → nothing to do");
-}
-
-#[tokio::test]
-async fn fetch_missing_sources_diff_404_is_failure_with_kind_message() {
-    let uuid = "33333333-3333-4333-8333-333333333333";
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path_matcher(format!("/patch/diff/{uuid}")))
-        .respond_with(ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let blobs = tmp.path().join("blobs");
-    let diffs = tmp.path().join("diffs");
-    std::fs::create_dir(&blobs).unwrap();
-    std::fs::create_dir(&diffs).unwrap();
-    let sources = PatchSources {
-        blobs_path: &blobs,
-        diffs_path: Some(&diffs),
-        mem_blobs: None,
-    };
-    let manifest = manifest_with_uuids(&[uuid]);
-    let client = proxy_client(&server.uri());
-
-    let result =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
-    assert_eq!(result.total, 1);
-    assert_eq!(result.downloaded, 0);
-    assert_eq!(result.failed, 1);
-    let err = result.results[0].error.as_deref().unwrap();
-    assert!(err.contains("Diff"), "message should name the kind: {err}");
-    assert!(
-        err.contains("not found"),
-        "message should say not found: {err}"
-    );
-    // Nothing written for a 404.
-    assert_eq!(dir_entry_count(&diffs), 0);
-}
-
-/// The progress callback fires once per downloaded archive with a 1-based
-/// index and the correct total.
-#[tokio::test]
-async fn fetch_missing_sources_diff_invokes_progress_callback() {
-    use std::sync::Mutex;
-    let uuid = "44444444-4444-4444-8444-444444444444";
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path_matcher(format!("/patch/diff/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let blobs = tmp.path().join("blobs");
-    let diffs = tmp.path().join("diffs");
-    std::fs::create_dir(&blobs).unwrap();
-    std::fs::create_dir(&diffs).unwrap();
-    let sources = PatchSources {
-        blobs_path: &blobs,
-        diffs_path: Some(&diffs),
-        mem_blobs: None,
-    };
-    let manifest = manifest_with_uuids(&[uuid]);
-    let client = proxy_client(&server.uri());
-
-    let calls: std::sync::Arc<Mutex<Vec<(String, usize, usize)>>> =
-        std::sync::Arc::new(Mutex::new(Vec::new()));
-    let calls_cb = calls.clone();
-    let cb: socket_patch_core::api::blob_fetcher::OnProgress =
-        Box::new(move |h: &str, idx: usize, total: usize| {
-            calls_cb.lock().unwrap().push((h.to_string(), idx, total));
-        });
-
-    let _ =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, Some(&cb)).await;
-
-    let recorded = calls.lock().unwrap().clone();
-    assert_eq!(recorded, vec![(uuid.to_string(), 1, 1)]);
-}
-
 /// `get_missing_blobs` against a manifest that lists no patches
 /// returns the empty set. Covers the early-return inside the
 /// function — the existing apply tests always stage at least one
@@ -795,72 +502,54 @@ fn stage_len(dir: &Path) -> Option<u64> {
     })
 }
 
-/// Blob and diff downloads stream to disk: the first part of a body is
-/// already in the stage file while the server is still holding back the
-/// rest. Before #571 `fetch_binary` buffered the whole body in memory, so
-/// nothing reached disk until the response completed.
+/// Blob downloads stream to disk: the first part of a body is already in
+/// the stage file while the server is still holding back the rest. Before
+/// #571 `fetch_binary` buffered the whole body in memory, so nothing
+/// reached disk until the response completed.
 #[tokio::test]
-async fn blob_and_diff_bodies_reach_disk_before_the_response_completes() {
+async fn blob_bodies_reach_disk_before_the_response_completes() {
     let head = vec![b'a'; 256 * 1024];
     let tail = vec![b'b'; 256 * 1024];
     let content = [head.clone(), tail.clone()].concat();
     let hash = compute_git_sha256_from_bytes(&content);
-    let uuid = "11111111-1111-4111-8111-111111111111";
 
-    for mode in [DownloadMode::File, DownloadMode::Diff] {
-        let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        let uri = split_body_server(
-            head.clone(),
-            Some(tail.clone()),
-            content.len(),
-            release.clone(),
-        )
-        .await;
-        let tmp = tempfile::tempdir().unwrap();
-        let blobs = tmp.path().join("blobs");
-        let diffs = tmp.path().join("diffs");
-        let (manifest, dir) = match mode {
-            DownloadMode::File => (manifest_with_after_hashes(&[&hash]), blobs.clone()),
-            DownloadMode::Diff => (manifest_with_uuids(&[uuid]), diffs.clone()),
-        };
-        let sources = PatchSources {
-            blobs_path: &blobs,
-            diffs_path: Some(&diffs),
-            mem_blobs: None,
-        };
-        let client = proxy_client(&uri);
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let uri = split_body_server(
+        head.clone(),
+        Some(tail.clone()),
+        content.len(),
+        release.clone(),
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    let manifest = manifest_with_after_hashes(&[&hash]);
+    let client = proxy_client(&uri);
 
-        let watch = async {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let mut streamed = false;
-            while std::time::Instant::now() < deadline {
-                if stage_len(&dir) == Some(head.len() as u64) {
-                    streamed = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let watch = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut streamed = false;
+        while std::time::Instant::now() < deadline {
+            if stage_len(&blobs) == Some(head.len() as u64) {
+                streamed = true;
+                break;
             }
-            // Release the tail either way so the download can finish.
-            release.notify_one();
-            streamed
-        };
-        let (result, streamed) = tokio::join!(
-            fetch_missing_sources(&manifest, &sources, mode, &client, None),
-            watch
-        );
-        assert!(
-            streamed,
-            "{mode:?}: the first {} bytes must be on disk while the rest is held back",
-            head.len()
-        );
-        assert_eq!(result.downloaded, 1, "{mode:?}: {:?}", result.results);
-        let entry = match mode {
-            DownloadMode::File => blobs.join(&hash),
-            DownloadMode::Diff => diffs.join(format!("{uuid}.tar.gz")),
-        };
-        assert_eq!(std::fs::read(&entry).unwrap(), content, "{mode:?}");
-        assert_eq!(dir_entry_count(&dir), 1, "{mode:?}: no stage litter");
-    }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Release the tail either way so the download can finish.
+        release.notify_one();
+        streamed
+    };
+    let (result, streamed) =
+        tokio::join!(fetch_missing_blobs(&manifest, &blobs, &client, None), watch);
+    assert!(
+        streamed,
+        "the first {} bytes must be on disk while the rest is held back",
+        head.len()
+    );
+    assert_eq!(result.downloaded, 1, "{:?}", result.results);
+    assert_eq!(std::fs::read(blobs.join(&hash)).unwrap(), content);
+    assert_eq!(dir_entry_count(&blobs), 1, "no stage litter");
 }
 
 /// A body cut short mid-stream fails that entry with the body-read error
@@ -871,31 +560,23 @@ async fn blob_and_diff_bodies_reach_disk_before_the_response_completes() {
 async fn failed_streams_leave_no_stage_and_no_created_cache_dir() {
     let content = vec![b'c'; 64 * 1024];
     let hash = compute_git_sha256_from_bytes(&content);
-    let uuid = "11111111-1111-4111-8111-111111111111";
     let release = std::sync::Arc::new(tokio::sync::Notify::new());
 
     // Cut short: the server declares twice what it sends, then closes.
     let uri = split_body_server(content.clone(), None, content.len() * 2, release.clone()).await;
-    for mode in [DownloadMode::File, DownloadMode::Diff] {
-        let tmp = tempfile::tempdir().unwrap();
-        let blobs = tmp.path().join("blobs");
-        let diffs = tmp.path().join("diffs");
-        let manifest = match mode {
-            DownloadMode::File => manifest_with_after_hashes(&[&hash]),
-            DownloadMode::Diff => manifest_with_uuids(&[uuid]),
-        };
-        let sources = PatchSources {
-            blobs_path: &blobs,
-            diffs_path: Some(&diffs),
-            mem_blobs: None,
-        };
-        let result =
-            fetch_missing_sources(&manifest, &sources, mode, &proxy_client(&uri), None).await;
-        assert_eq!(result.failed, 1, "{mode:?}");
-        let error = result.results[0].error.as_deref().unwrap();
-        assert!(error.contains("Error reading"), "{mode:?}: {error}");
-        assert!(!blobs.exists() && !diffs.exists(), "{mode:?}: no cache dir");
-    }
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    let result = fetch_missing_blobs(
+        &manifest_with_after_hashes(&[&hash]),
+        &blobs,
+        &proxy_client(&uri),
+        None,
+    )
+    .await;
+    assert_eq!(result.failed, 1);
+    let error = result.results[0].error.as_deref().unwrap();
+    assert!(error.contains("Error reading"), "{error}");
+    assert!(!blobs.exists(), "no cache dir");
 
     // Mismatch: the full body arrives but hashes to something else.
     let wrong = compute_git_sha256_from_bytes(b"something else");

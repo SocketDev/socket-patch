@@ -26,7 +26,7 @@ fn binary() -> PathBuf {
 ///   * `SOCKET_MANIFEST_PATH` / `SOCKET_CWD` could point the binary at a
 ///     different manifest than the fixture each test writes, so the
 ///     manifest-not-found / override assertions would be meaningless;
-///   * `SOCKET_DOWNLOAD_ONLY` / `SOCKET_DOWNLOAD_MODE` / `SOCKET_DRY_RUN`
+///   * `SOCKET_DOWNLOAD_ONLY` / `SOCKET_DRY_RUN`
 ///     could flip the cleanup-vs-download branch out from under the test.
 ///
 /// Scrubbing is by prefix, not an explicit list: an explicit list drifts
@@ -491,11 +491,9 @@ fn repair_download_only_skips_cleanup() {
     // We can't use `run_repair` here because it injects `--offline`,
     // and `--offline` is mutually exclusive with `--download-only`
     // (offline = strict airgap, download-only = network-only). Invoke
-    // the binary directly. We pin `--download-mode file` so the
-    // already-present `afterHash` blob fully satisfies the download
-    // phase — there's nothing missing to fetch, so the test stays
-    // hermetic (no network). The default `diff` mode would instead look
-    // for `<uuid>.tar.gz`, which is absent, and try to hit the network.
+    // the binary directly. The already-present `afterHash` blob fully
+    // satisfies the download phase — there's nothing missing to fetch, so
+    // the test stays hermetic (no network).
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     write_blob(&socket, REFERENCED_HASH, b"patched content");
@@ -503,13 +501,7 @@ fn repair_download_only_skips_cleanup() {
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
     let out = socket_cmd(tmp.path())
-        .args([
-            "repair",
-            "--json",
-            "--download-only",
-            "--download-mode",
-            "file",
-        ])
+        .args(["repair", "--json", "--download-only"])
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -819,8 +811,6 @@ async fn repair_json_reports_unresolved_org_fallback_in_warnings() {
         .args([
             "repair",
             "--json",
-            "--download-mode",
-            "file",
             "--download-only",
             "--api-url",
             &mock.uri(),
@@ -896,13 +886,7 @@ async fn repair_online_downloads_missing_blob() {
     std::fs::write(socket.join("manifest.json"), manifest).unwrap();
 
     let out = socket_cmd(tmp.path())
-        .args([
-            "repair",
-            "--json",
-            "--download-mode",
-            "file",
-            "--download-only",
-        ])
+        .args(["repair", "--json", "--download-only"])
         .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token-for-test")
         .env("SOCKET_ORG_SLUG", ORG_SLUG)
@@ -1126,4 +1110,95 @@ fn repair_silent_suppresses_human_stdout() {
         !socket.join("blobs").join(&orphan).exists(),
         "silent repair must still perform cleanup (orphan should be gone)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Retention: one policy for every patch still in the manifest (#893)
+// ---------------------------------------------------------------------------
+
+/// `repair` (alias `gc`) must keep the beforeHash blob of a patch that is
+/// still in the manifest: it is the only local restore data, and `repair`
+/// cannot download it again (its fetch covers afterHash blobs only). Before
+/// #893 the sweep kept afterHash blobs only, so an offline rollback of a
+/// still-active patch failed after any `repair` and told the user to run
+/// `repair`. A beforeHash blob that only a manifest-absent patch referenced
+/// is still collected.
+#[test]
+fn repair_keeps_active_patch_before_blob_so_offline_rollback_still_works() {
+    const ORIGINAL: &[u8] = b"module.exports = 'original';\n";
+    const PATCHED: &[u8] = b"module.exports = 'patched';\n";
+    let before = git_sha256(ORIGINAL);
+    let after = git_sha256(PATCHED);
+    let purl = "pkg:npm/repair-retention@1.0.0";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "repair-retention-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let pkg = root.join("node_modules/repair-retention");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{ "name": "repair-retention", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), PATCHED).unwrap();
+
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    let manifest = serde_json::json!({
+        "patches": {
+            purl: {
+                "uuid": "22222222-2222-4222-8222-222222222222",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": { "beforeHash": before, "afterHash": after }
+                },
+                "vulnerabilities": {},
+                "description": "retention test patch",
+                "license": "MIT",
+                "tier": "free"
+            }
+        }
+    });
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    // The layout `get` leaves: both blobs of the active patch.
+    write_blob(&socket, &before, ORIGINAL);
+    write_blob(&socket, &after, PATCHED);
+    // An original only a removed patch referenced is still garbage.
+    let stale_original = git_sha256(b"original of a removed patch\n");
+    write_blob(&socket, &stale_original, b"original of a removed patch\n");
+
+    let (code, stdout) = run_repair(root, &[]);
+    assert_eq!(code, 0, "repair must succeed; stdout=\n{stdout}");
+    assert!(
+        socket.join("blobs").join(&before).exists(),
+        "repair must keep the active patch's beforeHash blob; stdout=\n{stdout}"
+    );
+    assert!(socket.join("blobs").join(&after).exists());
+    assert!(
+        !socket.join("blobs").join(&stale_original).exists(),
+        "an original no manifest patch references is still swept"
+    );
+
+    let out = socket_cmd(root)
+        .args(["rollback", "--offline", "--json"])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "offline rollback after repair must succeed; stdout=\n{stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
+    assert_eq!(v["status"], "success", "stdout=\n{stdout}");
+    assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), ORIGINAL);
 }

@@ -519,11 +519,11 @@ pub enum PatchAction {
 
 /// Patch-source strategy used to apply a file. Mirrors the existing
 /// `socket_patch_core::patch::apply::AppliedVia` enum, but lives here so
-/// the JSON layer doesn't depend on core internals.
+/// the JSON layer doesn't depend on core internals. `blob` is the only
+/// value since v5 removed the diff download path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AppliedVia {
-    Diff,
     Blob,
 }
 
@@ -531,7 +531,6 @@ impl AppliedVia {
     pub fn from_core(via: socket_patch_core::patch::apply::AppliedVia) -> Self {
         use socket_patch_core::patch::apply::AppliedVia as Core;
         match via {
-            Core::Diff => AppliedVia::Diff,
             Core::Blob => AppliedVia::Blob,
         }
     }
@@ -1042,7 +1041,7 @@ mod tests {
                 PatchEventFile {
                     path: "package/index.js".into(),
                     verified: true,
-                    applied_via: Some(AppliedVia::Diff),
+                    applied_via: Some(AppliedVia::Blob),
                 },
                 PatchEventFile {
                     path: "package/lib/util.js".into(),
@@ -1056,7 +1055,7 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0]["path"], "package/index.js");
         assert_eq!(files[0]["verified"], true);
-        assert_eq!(files[0]["appliedVia"], "diff");
+        assert_eq!(files[0]["appliedVia"], "blob");
         assert_eq!(files[1]["appliedVia"], "blob");
     }
 
@@ -1251,7 +1250,6 @@ mod tests {
         // codes on these strings.
         for (status, tag) in [
             (Status::NoManifest, "noManifest"),
-            (Status::PaidRequired, "paidRequired"),
             (Status::NotFound, "notFound"),
         ] {
             let mut env = Envelope::new(Command::Remove);
@@ -1346,10 +1344,10 @@ mod tests {
         // ("Exit 1 when status is partialFailure (any events[*].action ==
         // \"failed\")"). `record` enforces that by escalating every
         // non-Error status — including the success-like specials
-        // (`notFound`, `noManifest`, `paidRequired`) — to PartialFailure.
+        // (`notFound`, `noManifest`) — to PartialFailure.
         // Only a hard `Error` outranks it. Pin that so the auto-escalation
         // can't regress to leaving a `failed` event under an exit-0 status.
-        for start in [Status::NotFound, Status::NoManifest, Status::PaidRequired] {
+        for start in [Status::NotFound, Status::NoManifest] {
             let mut env = Envelope::new(Command::Remove);
             env.status = start;
             env.record(
@@ -1366,7 +1364,12 @@ mod tests {
 
     /// The ```jsonc block under `heading` in CLI_CONTRACT.md.
     fn contract_block(heading: &str) -> &'static str {
-        let doc = include_str!("../CLI_CONTRACT.md");
+        // A Windows checkout may carry CRLF line endings.
+        let doc: &'static str = Box::leak(
+            include_str!("../CLI_CONTRACT.md")
+                .replace("\r\n", "\n")
+                .into_boxed_str(),
+        );
         let at = doc
             .find(heading)
             .unwrap_or_else(|| panic!("{heading} missing"));
@@ -1430,7 +1433,7 @@ mod tests {
             .with_files(vec![PatchEventFile {
                 path: "package/index.js".into(),
                 verified: true,
-                applied_via: Some(AppliedVia::Diff),
+                applied_via: Some(AppliedVia::Blob),
             }])
             .with_bytes(1)
             .with_reason("c", "r")

@@ -9,7 +9,7 @@
 
 use clap::Args;
 use socket_patch_core::update::{
-    self as core_update, asset_name_for_target, channel_label, current_version, detect_channel,
+    self as core_update, asset_name_for_target, channel_label_for, current_version, detect_channel,
     fetch_latest_version, is_newer, upgrade_hint_for, ChannelEnv, InstallChannel, UpdateEndpoints,
     UpdateError, UpdateRequest, UpdateTimeouts,
 };
@@ -212,7 +212,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                 format!(
                     "this install is managed by {} — its next upgrade will overwrite \
                      the updated binary.",
-                    channel_label(channel)
+                    channel_label_for(channel, &install_path)
                 ),
             );
         } else {
@@ -223,7 +223,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                     "this socket-patch binary ({}) is managed by {}; update it with `{}` \
                      instead, or pass --force to replace it in place",
                     install_path.display(),
-                    channel_label(channel),
+                    channel_label_for(channel, &install_path),
                     hint
                 ),
             );

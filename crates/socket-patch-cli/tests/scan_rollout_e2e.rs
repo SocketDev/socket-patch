@@ -3,14 +3,17 @@
 //! three packages per run, most severe first, in hosted, agent and vendored
 //! mode; a fourth run changes nothing. Mock API, the built binary.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -75,10 +78,6 @@ fn hosted_decisions(v: &Value) -> Value {
     })
 }
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
 fn uuid(name: &str) -> String {
     let n = PACKAGES.iter().position(|(p, _)| *p == name).unwrap() + 1;
     format!("{n:08x}-1111-4111-8111-{n:012x}")
@@ -101,13 +100,6 @@ fn before(name: &str) -> Vec<u8> {
 
 fn after(name: &str) -> Vec<u8> {
     format!("module.exports = '{name} after';\n").into_bytes()
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn b64(bytes: &[u8]) -> String {

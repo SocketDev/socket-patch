@@ -119,13 +119,29 @@ fn cli_code(project: &Path, args: &[&str]) -> (i32, Value) {
     (output.status.code().unwrap_or(-1), envelope)
 }
 
+/// How many hosted pins a `scan --mode hosted --json` run wrote: its
+/// `applied` events with `details.mode: "hosted"` (v5.0's retired
+/// `redirect.redirected`).
+fn hosted_pin_count(env: &Value) -> usize {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "applied")
+        .count()
+}
+
 /// v5 keeps no hosted ledger, so undoing a hosted pin means restoring the
 /// entry's upstream registry form. For a binary `bun.lockb` only a vendor
 /// takeover rebuilds that record (it refuses a workspace-normalized lock), so
 /// `rollback` REFUSES the pin, naming the checkout remedy, and leaves the
 /// lock exactly as found; the test then applies that remedy (`git checkout --
 /// bun.lockb`, here: the original bytes written back).
-fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &MockServer) {
+fn rollback_refuses_binary_hosted_pin_then_checkout(
+    fixture: &Fixture,
+    server: &MockServer,
+    copy_already_original: bool,
+) {
     let hosted_lock = fixture.lock();
     let uri = server.uri();
     let (code, env) = cli_code(
@@ -133,9 +149,18 @@ fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &
         &["rollback", "--yes", "--patch-server-url", &uri],
     );
     assert_eq!(code, 1, "a binary hosted pin cannot be restored: {env}");
-    // The refused pin is the run's only outcome: a total failure (#1066).
-    assert_eq!(env["status"], "error", "{env}");
-    assert_eq!(env["error"]["code"], "rollback_failed", "{env}");
+    // The refused pin counts as a failure (#1066). After a takeover a
+    // manifest record makes the agent leg find the installed copy already
+    // original, so the run is a partial failure; a hosted-only project has
+    // no other outcome, so the run failed as a whole (`rollback_failed`).
+    if copy_already_original {
+        assert_eq!(env["status"], "partialFailure", "{env}");
+        assert_eq!(rollback_json::already_original(&env), 1, "{env}");
+    } else {
+        assert_eq!(env["status"], "error", "{env}");
+        assert_eq!(env["error"]["code"], "rollback_failed", "{env}");
+        assert_eq!(rollback_json::already_original(&env), 0, "{env}");
+    }
     assert_eq!(env["summary"]["failed"], 1, "{env}");
     let failed_view = rollback_json::hosted_failed(&env);
     let failed = failed_view.as_array().cloned().unwrap_or_default();
@@ -1075,7 +1100,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     );
     fixture.frozen("hosted-again", &fixture.patched, "minimist");
     fixture.manifestless_vex("hosted-again", bun_vex::BunMode::Hosted, &server.uri());
-    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
+    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server, true);
     fixture.pristine();
     fixture.frozen("rolled-back", &fixture.original, "minimist");
 }
@@ -1099,7 +1124,7 @@ async fn binary_shared_bundled_record_hosted_pin_is_managed() {
     let uri = server.uri();
 
     let hosted = scan(project, &server, "hosted", &[]);
-    assert_eq!(hosted["redirect"]["redirected"], 1, "hosted scan: {hosted}");
+    assert_eq!(hosted_pin_count(&hosted), 1, "hosted scan: {hosted}");
     let text = hosted.to_string();
     let shared =
         text.contains("redirect_bun_bundled_instance_skipped") && text.contains("also bundled");
@@ -1181,11 +1206,8 @@ async fn binary_shared_bundled_record_hosted_pin_is_managed() {
     // `rollback` of the same pin refuses it as any binary hosted pin is
     // refused (the checkout remedy), not as contested wiring.
     let hosted = scan(project, &server, "hosted", &[]);
-    assert_eq!(
-        hosted["redirect"]["redirected"], 1,
-        "hosted again: {hosted}"
-    );
-    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
+    assert_eq!(hosted_pin_count(&hosted), 1, "hosted again: {hosted}");
+    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server, true);
     assert_eq!(fixture.lock(), fixture.original_lock);
 }
 
@@ -1286,7 +1308,7 @@ async fn native_binary_alias_and_transitive() {
             bun_vex::BunMode::Hosted,
             &server.uri(),
         );
-        rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
+        rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server, false);
         fixture.pristine();
         fixture.stage();
         let result = cli(&fixture.project, &["vendor", "--offline"]);

@@ -842,7 +842,11 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
             }
             CopyRef::Url(url) => (
                 registry_tarball_name(url, &copy.version),
-                format!("installs it from {url:?}"),
+                // Published in the VEX document: never a credential.
+                format!(
+                    "installs it from {:?}",
+                    crate::utils::redact::redact_url(url)
+                ),
             ),
         };
         let Some(name) = name else {

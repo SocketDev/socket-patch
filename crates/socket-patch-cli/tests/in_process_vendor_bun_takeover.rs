@@ -38,7 +38,9 @@
 //!   6. A project with its own registries (bunfig `[install] registry` and
 //!      `[install.scopes]`, #992): `remove <purl>` and the takeover +
 //!      `vendor --revert` chain keep each registry's tarball URL in the
-//!      slot (`in_process_vendor_bun_takeover/registry.rs`).
+//!      slot (`in_process_vendor_bun_takeover/registry.rs`), including
+//!      registries set only in the user's `.npmrc` or global bunfig
+//!      (#1276).
 //!
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
 //! telemetry hard-disabled; each test runs in its own tempdir.
@@ -356,6 +358,12 @@ fn registry_uri() -> &'static str {
 /// (`SOCKET_PATCH_SERVER_URL`) and the registry is the shared mirror
 /// (`SOCKET_NPM_REGISTRY`). Returns `(exit_code, stdout, stderr)`.
 fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    run_cli_env(cwd, args, &[])
+}
+
+/// [`run_cli`] with `env` set last, over the stand-in `HOME` (a test's own
+/// user-level Bun config, #1276).
+fn run_cli_env(cwd: &Path, args: &[&str], env: &[(&str, String)]) -> (i32, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.current_dir(cwd);
     for (key, _) in std::env::vars() {
@@ -365,16 +373,22 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     }
     // A registry exported by npm (`npm_config_registry`) or Bun would
     // steer the Bun restores off the fixtures' registries (#992).
+    // So would a user-level `.npmrc` / bunfig under `XDG_CONFIG_HOME`
+    // (#1276); `HOME` is the stand-in `prepare_command` pins.
     for key in [
         "BUN_CONFIG_REGISTRY",
         "NPM_CONFIG_REGISTRY",
         "npm_config_registry",
+        "XDG_CONFIG_HOME",
     ] {
         cmd.env_remove(key);
     }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_NPM_REGISTRY", registry_uri());
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -385,7 +399,12 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 
 /// `--json` invocation returning the parsed envelope.
 fn run_json(cwd: &Path, args: &[&str]) -> (i32, Value) {
-    let (code, stdout, stderr) = run_cli(cwd, args);
+    run_json_env(cwd, args, &[])
+}
+
+/// [`run_json`] with [`run_cli_env`]'s extra `env`.
+fn run_json_env(cwd: &Path, args: &[&str], env: &[(&str, String)]) -> (i32, Value) {
+    let (code, stdout, stderr) = run_cli_env(cwd, args, env);
     // The child's stderr rides the harness's captured output so a failing
     // assertion downstream shows the CLI's own diagnostics.
     if !stderr.trim().is_empty() {

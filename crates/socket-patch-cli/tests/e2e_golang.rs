@@ -282,6 +282,83 @@ async fn scan_discovers_go_modules() {
     );
 }
 
+/// #344: a module cache configured with `go env -w GOMODCACHE=…` (the
+/// `$GOENV` file, not the environment) is the one scanned, exactly as
+/// `go env GOMODCACHE` and `go build` resolve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_finds_the_cache_named_by_the_go_env_file() {
+    let server = MockServer::start().await;
+    mount_batch(&server).await;
+    let api_url = server.uri();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("configured-cache");
+    let gin_dir = cache_dir.join("github.com/gin-gonic/gin@v1.9.1");
+    std::fs::create_dir_all(&gin_dir).unwrap();
+    std::fs::write(
+        gin_dir.join("go.mod"),
+        "module github.com/gin-gonic/gin\n\ngo 1.21\n",
+    )
+    .unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("go.mod"),
+        "module example.com/myproject\n\ngo 1.21\n",
+    )
+    .unwrap();
+    // What `go env -w GOMODCACHE=<cache>` writes.
+    let goenv = dir.path().join("goenv");
+    std::fs::write(&goenv, format!("GOMODCACHE={}\n", cache_dir.display())).unwrap();
+    // HOME points at an empty dir so the `$HOME/go/pkg/mod` default finds
+    // nothing.
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let (project2, api) = (project.clone(), api_url.clone());
+    let output = tokio::task::spawn_blocking(move || {
+        common::hermetic::command(&binary())
+            .args(["scan", "--json", "--cwd", project2.to_str().unwrap()])
+            .current_dir(&project2)
+            .env("GOENV", &goenv)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("SOCKET_API_URL", &api)
+            .env("SOCKET_API_TOKEN", "sktsec_dummy_e2e_golang_token_api")
+            .env("SOCKET_ORG_SLUG", ORG)
+            .env_remove("GOMODCACHE")
+            .env_remove("GOPATH")
+            .env_remove("SOCKET_ECOSYSTEMS")
+            .env_remove("SOCKET_GLOBAL")
+            .env_remove("SOCKET_GLOBAL_PREFIX")
+            .env_remove("SOCKET_JSON")
+            .env_remove("SOCKET_SILENT")
+            .env_remove("SOCKET_OFFLINE")
+            .env_remove("SOCKET_PROXY_URL")
+            .env_remove("SOCKET_BATCH_SIZE")
+            .output()
+            .expect("Failed to run socket-patch binary")
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "scan --json must emit JSON ({e}):\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(
+        json["scannedPackages"], 1,
+        "the go env -w GOMODCACHE cache must be crawled; got:\n{json:#}"
+    );
+    let purls = batched_purls(&server).await;
+    assert_eq!(
+        purls,
+        BTreeSet::from(["pkg:golang/github.com/gin-gonic/gin@v1.9.1".to_string()])
+    );
+}
+
 /// Verify `socket-patch scan` discovers AND case-decodes Go modules.
 ///
 /// Go's module cache stores uppercase letters as `!`+lowercase, so

@@ -90,7 +90,6 @@ fn params(root: &Path) -> DownloadParams {
         global_prefix: None,
         json: true,
         silent: true,
-        download_mode: "diff".to_string(),
         strict: false,
         ecosystems: None,
         persist_blobs: true,

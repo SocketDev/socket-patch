@@ -22,6 +22,10 @@
 //! the registry is unreachable for the fixture install; all assertions after
 //! that are hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, cache_env, git_sha256, hermetic};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -32,10 +36,6 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
-#[path = "common/hermetic.rs"]
-mod hermetic;
 // yarn legs: release selection (classic) + the manifest-less VEX matrices.
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
@@ -59,10 +59,6 @@ const YARN_BERRY: &str = "yarn@4.12.0";
 
 // ── self-contained helpers (harness patterns shared with the redirect /
 //    vendor yarn capstones) ──────────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Probe corepack from a NEUTRAL temp dir: a `packageManager` field in an
 /// ancestor `package.json` makes corepack refuse to run a different package
@@ -132,10 +128,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
             std::fs::copy(entry.path(), &to).unwrap();
         }
     }
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    compute_git_sha256_from_bytes(content)
 }
 
 /// Write `.socket/manifest.json` + the after-hash blob so `vendor --offline`

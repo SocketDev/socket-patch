@@ -86,7 +86,6 @@ fn defaults_match_contract() {
     assert!(!a.force);
     assert!(!a.common.json);
     assert!(!a.common.verbose);
-    assert_eq!(a.common.download_mode, "diff");
 
     // The remaining global defaults from the contract table, pinned so a
     // dangerous default-value drift cannot slip through silently — e.g.
@@ -165,14 +164,6 @@ fn vex_passthrough_flags() {
     // Only the two vex booleans should be set; nothing else (e.g. --force) may
     // ride along on the vex passthrough.
     assert_only_true(&a, &["vex_no_verify", "vex_compact"]);
-}
-
-/// The `download_mode` default is pinned separately — it's the one
-/// field whose default value diverges across subcommands historically,
-/// so we assert it explicitly to catch drift.
-#[test]
-fn default_download_mode_is_diff() {
-    assert_eq!(parse_apply(&[]).common.download_mode, "diff");
 }
 
 /// The `manifest_path` default is contract — many scripts hard-code
@@ -497,89 +488,20 @@ fn ecosystems_single_value() {
 }
 
 // ---------------------------------------------------------------------------
-// --download-mode — the parse layer passes tokens through verbatim.
+// --download-mode was removed in v5.0 (patch content is always fetched as
+// per-file blobs): no alias, no warning, a plain unknown-argument error.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn download_mode_diff() {
-    assert_eq!(
-        parse_apply(&["--download-mode", "diff"])
-            .common
-            .download_mode,
-        "diff"
-    );
-}
-
-#[test]
-fn download_mode_package() {
-    assert_eq!(
-        parse_apply(&["--download-mode", "package"])
-            .common
-            .download_mode,
-        "package"
-    );
-}
-
-#[test]
-fn download_mode_file() {
-    assert_eq!(
-        parse_apply(&["--download-mode", "file"])
-            .common
-            .download_mode,
-        "file"
-    );
-}
-
-/// Values pass through verbatim — no lowercasing, trimming, or aliasing at the
-/// parse layer. `package` must not silently normalize to `diff`, etc. This
-/// guards against a parser that quietly coerces input to a default.
-#[test]
-fn download_mode_values_are_not_normalized() {
-    // Case is preserved verbatim (parse does not canonicalize).
-    assert_eq!(
-        parse_apply(&["--download-mode", "DIFF"])
-            .common
-            .download_mode,
-        "DIFF"
-    );
-    // diff/file are the valid runtime tokens; `package` (removed) is still
-    // passed through verbatim by the parse layer.
-    for token in ["diff", "package", "file"] {
-        let got = parse_apply(&["--download-mode", token])
-            .common
-            .download_mode;
-        assert_eq!(
-            got, token,
-            "download-mode `{token}` must round-trip exactly"
-        );
-    }
-}
-
-/// CONTRACT GAP (documented, not a hardening of a passing behavior): the
-/// accepted runtime values are `diff | file` (`blob` is an alias; `package`
-/// is rejected as removed), but the arg is a plain `String` with no
-/// `value_parser`, so clap accepts ANY value at parse time. Invalid values are
-/// only rejected later by `DownloadMode::parse` (socket-patch-core
-/// `api/blob_fetcher.rs`, called from `commands/fetch_stage.rs`). This test pins
-/// the *current* parse-layer behavior so a future move to a real
-/// `value_parser`/enum (which WOULD reject here) is a deliberate, visible
-/// change rather than a silent one. If the enum is enforced at parse, flip the
-/// expectation to assert an `InvalidValue` error.
-#[test]
-fn download_mode_invalid_value_is_only_caught_at_runtime() {
-    match try_parse(&["socket-patch", "apply", "--download-mode", "totally-bogus"]) {
-        Ok(cli) => match cli.command {
-            Commands::Apply(a) => assert_eq!(
-                a.common.download_mode, "totally-bogus",
-                "parse layer currently passes unknown download modes through verbatim"
-            ),
-            _ => panic!("expected Apply"),
-        },
-        Err(err) => panic!(
-            "parse layer unexpectedly rejected an unknown download-mode (kind={:?}); \
-             if the enum is now enforced at parse, update this test to assert InvalidValue",
-            err.kind()
-        ),
+fn download_mode_flag_is_removed() {
+    for value in ["file", "diff"] {
+        match try_parse(&["socket-patch", "apply", "--download-mode", value]) {
+            Ok(_) => panic!("--download-mode {value} must be rejected"),
+            Err(err) => {
+                assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+                assert_eq!(err.exit_code(), 2, "a usage error exits 2");
+            }
+        }
     }
 }
 

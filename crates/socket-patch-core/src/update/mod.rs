@@ -19,7 +19,8 @@ pub mod swap;
 use std::path::{Path, PathBuf};
 
 pub use channel::{
-    channel_label, detect_channel, upgrade_hint, upgrade_hint_for, ChannelEnv, InstallChannel,
+    channel_label, channel_label_for, detect_channel, upgrade_hint, upgrade_hint_for, ChannelEnv,
+    InstallChannel,
 };
 pub use release::{
     asset_name_for_target, current_version, fetch_latest_version, is_newer, parse_release_tag,

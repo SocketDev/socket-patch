@@ -333,7 +333,7 @@ async fn mount_gem_patch_api(mock: &MockServer) {
     mount_gem_routes(mock, AFTER).await;
 }
 
-/// Serve an after-blob for `--download-mode file` repairs.
+/// Serve an after-blob for agent repairs.
 async fn mount_blob_of(mock: &MockServer, content: &'static [u8]) {
     Mock::given(method("GET"))
         .and(path(format!(
@@ -612,11 +612,7 @@ async fn repair_skips_when_manifest_uuid_moved_on() {
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--download-mode", "file"],
-    );
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert!(
@@ -667,11 +663,7 @@ async fn repair_prefers_the_moved_on_manifest_over_an_embedded_record() {
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--download-mode", "file"],
-    );
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert!(
@@ -1583,7 +1575,7 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
     let (code, stdout, stderr) = run_cli_with(
         tmp.path(),
         &mock.uri(),
-        &["repair", "--download-mode", "file"],
+        &["repair"],
         true,
         &[("DENO_DIR", deno_home.path().to_str().unwrap())],
     );
@@ -1618,7 +1610,7 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
     let (code, stdout, stderr) = run_cli_with(
         tmp.path(),
         &mock.uri(),
-        &["repair", "--download-mode", "file"],
+        &["repair"],
         true,
         &[("DENO_DIR", deno_home.path().to_str().unwrap())],
     );

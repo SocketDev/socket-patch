@@ -489,6 +489,25 @@ async fn classic_hosted_project(
         })))
         .mount(&server)
         .await;
+    if tamper_served_tarball {
+        // The scan reads the served tarball once (it checks the dependency
+        // graph against the lock, #591) and verifies it against the grant,
+        // so it would refuse tampered bytes up front. Serve the real bytes
+        // to that read and the tampered ones from then on: the tarball is
+        // swapped after the pin was written, which only yarn's own check of
+        // the pinned hashes can catch.
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(tgz.clone(), "application/octet-stream"),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+    }
     Mock::given(method("GET"))
         .and(path(format!(
             "/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz"
@@ -1533,6 +1552,16 @@ async fn mock_hosted_grant(tgz: &[u8], orig: &[u8], patched: &[u8], title: &str)
             } },
             "description": "x", "license": "MIT", "tier": "free"
         })))
+        .mount(&server)
+        .await;
+    // The hosted tarball itself: the scan reads it before pinning (#591).
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(tgz.to_vec(), "application/octet-stream"),
+        )
         .mount(&server)
         .await;
 

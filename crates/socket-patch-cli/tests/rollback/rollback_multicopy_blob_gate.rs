@@ -11,8 +11,7 @@
 //! and the rollback loop then failed the still-patched nested copy with
 //! `MissingBlob` ("Re-download the patch to enable rollback") on a run that
 //! was online and could have fetched the blob. Every retry failed the same
-//! way. Twin of apply's `mismatch_blob_gaps`, which probes every copy for
-//! exactly this reason.
+//! way.
 //!
 //! The stub server plays the authenticated API so the test is hermetic.
 
