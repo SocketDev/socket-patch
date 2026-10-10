@@ -2774,6 +2774,19 @@ pub(crate) async fn rollback_patches_inner(
         results.push(result);
     }
 
+    // Dropping a `replace` leaves a committed vendor/modules.txt recording
+    // it, which breaks every vendored build until it is regenerated (#343).
+    if !common.dry_run
+        && results
+            .iter()
+            .any(|r| r.success && is_local_go(&r.package_key, common))
+    {
+        let none = std::collections::HashMap::new();
+        warnings.extend(
+            socket_patch_core::vendor::go_consumer_sync::audit_warnings(&common.cwd, &none).await,
+        );
+    }
+
     // The restored crates' compiled copies in this project's build cache
     // still hold the patched code cargo keyed on the package id (#387).
     if !common.dry_run {

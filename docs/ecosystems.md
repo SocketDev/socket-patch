@@ -1268,6 +1268,19 @@ lines, so `go mod tidy -diff` stays clean after a patch update.
 
 This requires a free, publicly retrievable patch reference carrying a `goproxy`
 override. CLI support does not imply a patch is published for a particular module.
+
+### Files go derives from go.mod
+
+Two files the go command derives from `go.mod` can disagree with a new or removed
+socket `replace`, and go then refuses to build. socket-patch does not regenerate
+them (that needs the go toolchain and the whole module graph); `apply`, `vendor`,
+`rollback` and `scan --mode hosted` warn with the command that does, and
+`apply --check` / `vendor --check` report the disagreement as drift until it is run:
+
+| Warning code | When | Fix |
+| --- | --- | --- |
+| `go_vendor_modules_txt_out_of_sync` | A committed `vendor/` directory (`go mod vendor`; `go work vendor` for a workspace) whose `vendor/modules.txt` does not record a socket `replace`, or still records one that was removed. go builds with `-mod=vendor` and fails with "inconsistent vendoring" | `go mod vendor` (or `go work vendor`), then commit `vendor/` |
+| `go_requirements_out_of_sync` | The patched module's own `go.mod` requires a dependency at a version above the one the project's `go.mod` lists (agent and vendored modes; `apply` also reports a requirement the patch added). The default `-mod=readonly` build fails with "updates to go.mod needed" or "missing go.sum entry" | `go mod tidy`, then commit `go.mod` and `go.sum` |
 Paid hosted Go references are unsupported: embedding credentials in module paths
 would expose them to module proxies and change module identity. Use vendored mode
 for those patches; the CLI reports `redirect_golang_unsupported` when the required
