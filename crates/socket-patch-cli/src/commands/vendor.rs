@@ -931,6 +931,23 @@ pub async fn run(args: VendorArgs) -> i32 {
     if args.check {
         return run_check(&args).await;
     }
+    // Every other form rewires (or unwires) `--cwd`'s lockfiles and vendor
+    // ledger: a manifest in another project would split the run (#745).
+    // `--check` above reads the manifest's project throughout.
+    let form = if args.revert {
+        "vendor --revert"
+    } else {
+        "vendor"
+    };
+    if let Some(message) = crate::commands::foreign_manifest_conflict(&args.common, form) {
+        return crate::json_envelope::usage_error(
+            Command::Vendor,
+            args.common.json,
+            args.common.dry_run,
+            crate::commands::FOREIGN_MANIFEST_PROJECT,
+            &message,
+        );
+    }
     apply_env_toggles(&args.common);
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -1216,6 +1233,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     } else {
         None
     };
+    let go_sync_issues = tokio::sync::OnceCell::new();
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1246,6 +1264,26 @@ async fn run_check(args: &VendorArgs) -> i32 {
             // `vex`'s `vendor_unwired`.
             if !discovery.vendor_entry_live(root, entry).await {
                 failure = Some(unwired_check_failure(discovery, root, key, entry).await);
+            }
+        }
+        // The committed copy and its `replace` can be intact while the
+        // project no longer builds: vendor/modules.txt or the go.mod
+        // requirements out of step with the `replace` (#343, #618).
+        if failure.is_none() && entry.ecosystem == "golang" {
+            if let Some((module, _)) = socket_patch_core::utils::purl::parse_golang_purl(key) {
+                let issues: Vec<String> = go_sync_issues
+                    .get_or_init(|| async {
+                        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new())
+                            .await
+                    })
+                    .await
+                    .iter()
+                    .filter(|issue| issue.module() == module)
+                    .map(ToString::to_string)
+                    .collect();
+                if !issues.is_empty() {
+                    failure = Some(issues.join("; "));
+                }
             }
         }
         if vendor::jvm::apply::upstream_unverified(entry) {
@@ -3761,6 +3799,22 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
+    // A vendored Go module builds only if the committed vendor/modules.txt
+    // and the go.mod requirements agree with its `replace` (#343, #618).
+    if !common.dry_run && records.keys().any(|p| p.starts_with("pkg:golang/")) {
+        let warnings = socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+            &common.cwd,
+            &HashMap::new(),
+        )
+        .await;
+        for (code, detail) in warnings {
+            if !common.json && !common.silent {
+                eprintln!("Warning: {detail}");
+            }
+            env.warnings.push(RunWarning { code, detail });
+        }
+    }
+
     // A rolled-back eject's summary would describe a vendoring that was
     // undone: the eject prints it itself once it knows the outcome (#1005).
     match eject {
@@ -4506,8 +4560,13 @@ pub(crate) async fn run_vendor_gc(
     manifest_path: &Path,
     dry_run: bool,
 ) -> VendorGcSummary {
+    // The ledger, its artifacts and their wiring are the manifest's
+    // project's (#745): an agent-mode `scan --prune --manifest-path ../b/…`
+    // collects b's vendored state, never `--cwd`'s.
+    let rooted = common.at_project_root();
+    let common: &GlobalArgs = &rooted;
     let mut out = VendorGcSummary::default();
-    let mut state = match load_state(&common.cwd).await {
+    let mut state = match load_state(&common.project_root()).await {
         Ok(s) if !s.entries.is_empty() => s,
         // No ledger (or unreadable): only the orphan sweep could apply, and
         // without a trustworthy ledger it must not delete anything.
@@ -4621,7 +4680,7 @@ pub(crate) async fn run_vendor_gc(
         // artifacts; a failed ledger/manifest rewrite leaves records for
         // state that is gone, which must not pass silently.
         if ledger_dirty {
-            if let Err(e) = save_state(&common.cwd, &state).await {
+            if let Err(e) = save_state(&common.project_root(), &state).await {
                 let detail = format!(
                     "reverted vendored entries but could not update \
                      .socket/vendor/state.json: {e}"

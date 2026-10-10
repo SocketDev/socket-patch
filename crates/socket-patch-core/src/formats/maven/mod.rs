@@ -44,9 +44,133 @@ pub(crate) struct PomDep {
     /// Trimmed literal version, `${prop}` resolved from the root
     /// `<properties>` when possible; `None` when the declaration has none.
     pub(crate) version: Option<String>,
+    /// The non-empty `<classifier>`: a sibling artifact of the GA (sources,
+    /// tests, a native build), managed and resolved apart from the main jar.
+    pub(crate) classifier: Option<String>,
     /// Inside `<dependencyManagement>`.
     pub(crate) managed: bool,
     pub(crate) in_profile: bool,
+}
+
+/// Where Maven reads a root pom's model from: its text with comments and
+/// CDATA blanked (offsets kept), and the sections that are not the
+/// project's own resolution. `<build>` / `<reporting>` hold plugin
+/// classpaths, `<pluginRepositories>` / `<distributionManagement>` plugin
+/// and deploy repositories; `<profiles>` apply only when activated. Shared
+/// by the VEX reader ([`parse_pom`]) and the hosted rewriter, so the
+/// rewriter edits exactly the markup VEX later attests.
+#[derive(Debug)]
+pub(crate) struct PomScope {
+    /// The pom with comments and CDATA blanked byte-for-byte.
+    pub(crate) masked: String,
+    ignored: Vec<Element>,
+    profiles: Vec<Element>,
+}
+
+impl PomScope {
+    /// Fails (fail-closed) on a pom that is not well-formed where it
+    /// matters: no `<project>`, or an unterminated element or CDATA.
+    pub(crate) fn new(raw: &str) -> Result<PomScope, String> {
+        let masked = blank_non_markup(raw)?;
+        if open_tags(&masked, "project")?.is_empty() || !masked.contains("</project>") {
+            return Err("no <project> element".to_string());
+        }
+        let ignored = [
+            elements(&masked, "build")?,
+            elements(&masked, "reporting")?,
+            elements(&masked, "pluginRepositories")?,
+            elements(&masked, "distributionManagement")?,
+        ]
+        .concat();
+        let profiles = elements(&masked, "profiles")?;
+        Ok(PomScope {
+            masked,
+            ignored,
+            profiles,
+        })
+    }
+
+    /// Inside a plugin / deploy section (never project resolution).
+    pub(crate) fn is_ignored(&self, pos: usize) -> bool {
+        inside(pos, &self.ignored)
+    }
+
+    /// Inside `<profiles>` (read only when that profile is active).
+    pub(crate) fn in_profile(&self, pos: usize) -> bool {
+        inside(pos, &self.profiles)
+    }
+
+    /// Every `<name>` element outside ignored sections (profiles included).
+    pub(crate) fn elements(&self, name: &str) -> Result<Vec<Element>, String> {
+        Ok(elements(&self.masked, name)?
+            .into_iter()
+            .filter(|e| !self.is_ignored(e.start))
+            .collect())
+    }
+
+    /// Every `<name>` element Maven always reads: outside ignored sections
+    /// and profiles.
+    pub(crate) fn live(&self, name: &str) -> Result<Vec<Element>, String> {
+        Ok(self
+            .elements(name)?
+            .into_iter()
+            .filter(|e| !self.in_profile(e.start))
+            .collect())
+    }
+
+    /// The `<` of the closing `</project>` tag.
+    pub(crate) fn project_close(&self) -> Option<usize> {
+        self.masked.rfind("</project>")
+    }
+}
+
+fn inside(pos: usize, set: &[Element]) -> bool {
+    set.iter().any(|e| pos >= e.start && pos < e.end)
+}
+
+/// One `<dependency>` element of a [`PomScope`] (outside ignored sections),
+/// with offsets into the pom.
+#[derive(Debug)]
+pub(crate) struct ScopedDep {
+    pub(crate) element: Element,
+    pub(crate) group: Option<String>,
+    pub(crate) artifact: Option<String>,
+    /// Inner-text byte range of the literal `<version>`, when present.
+    pub(crate) version_inner: Option<(usize, usize)>,
+    /// Trimmed `<version>` text as written (no property resolution).
+    pub(crate) version_text: Option<String>,
+    pub(crate) type_text: Option<String>,
+    /// Trimmed non-empty `<classifier>` text.
+    pub(crate) classifier: Option<String>,
+    pub(crate) in_profile: bool,
+}
+
+impl PomScope {
+    /// Every `<dependency>` outside ignored sections, children read with
+    /// `<exclusions>` blanked (they carry their own groupId/artifactId).
+    pub(crate) fn dependencies(&self) -> Result<Vec<ScopedDep>, String> {
+        let mut out = Vec::new();
+        for dep in self.elements("dependency")? {
+            let body = blank_elements(dep.inner(&self.masked), "exclusions")?;
+            let version = elements(&body, "version")?.into_iter().next();
+            out.push(ScopedDep {
+                element: dep,
+                group: child_text(&body, "groupId")?,
+                artifact: child_text(&body, "artifactId")?,
+                version_inner: version.map(|v| {
+                    (
+                        dep.inner_start + v.inner_start,
+                        dep.inner_start + v.inner_end,
+                    )
+                }),
+                version_text: version.map(|v| v.inner(&body).trim().to_string()),
+                type_text: child_text(&body, "type")?,
+                classifier: child_text(&body, "classifier")?.filter(|c| !c.is_empty()),
+                in_profile: self.in_profile(dep.start),
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// A bounded, dependency-free scan of the pom's element structure — enough
@@ -55,55 +179,33 @@ pub(crate) struct PomDep {
 /// unterminated element or CDATA section is an error (fail-closed: nothing
 /// is discovered from a pom that is not well-formed where it matters).
 pub(crate) fn parse_pom(raw: &str) -> Result<Pom, String> {
-    let text = blank_non_markup(raw)?;
-    if open_tags(&text, "project")?.is_empty() || !text.contains("</project>") {
-        return Err("no <project> element".to_string());
-    }
-    let ignored = [
-        elements(&text, "build")?,
-        elements(&text, "reporting")?,
-        elements(&text, "pluginRepositories")?,
-        elements(&text, "distributionManagement")?,
-    ]
-    .concat();
-    let profiles = elements(&text, "profiles")?;
-    let managed = elements(&text, "dependencyManagement")?;
-    let inside = |pos: usize, set: &[Element]| set.iter().any(|e| pos >= e.start && pos < e.end);
+    let scope = PomScope::new(raw)?;
+    let text = &scope.masked;
+    let managed = elements(text, "dependencyManagement")?;
 
-    let properties = properties(&text, &ignored, &profiles)?;
+    let properties = properties(text, &scope.ignored, &scope.profiles)?;
     let mut pom = Pom::default();
 
-    for repo in elements(&text, "repository")? {
-        if inside(repo.start, &ignored) {
-            continue;
-        }
-        let body = repo.inner(&text);
+    for repo in scope.elements("repository")? {
+        let body = repo.inner(text);
         pom.repos.push(PomRepo {
             id: child_text(body, "id")?.unwrap_or_default(),
             url: child_text(body, "url")?.unwrap_or_default(),
-            in_profile: inside(repo.start, &profiles),
+            in_profile: scope.in_profile(repo.start),
         });
     }
 
-    for dep in elements(&text, "dependency")? {
-        if inside(dep.start, &ignored) {
-            continue;
-        }
-        // `<exclusions>` carry their own groupId/artifactId children.
-        let body = blank_elements(dep.inner(&text), "exclusions")?;
-        let (Some(group), Some(artifact)) = (
-            child_text(&body, "groupId")?,
-            child_text(&body, "artifactId")?,
-        ) else {
+    for dep in scope.dependencies()? {
+        let (Some(group), Some(artifact)) = (dep.group, dep.artifact) else {
             continue;
         };
-        let version = child_text(&body, "version")?.map(|v| resolve_property(&v, &properties));
         pom.deps.push(PomDep {
             group,
             artifact,
-            version,
-            managed: inside(dep.start, &managed),
-            in_profile: inside(dep.start, &profiles),
+            version: dep.version_text.map(|v| resolve_property(&v, &properties)),
+            classifier: dep.classifier,
+            managed: inside(dep.element.start, &managed),
+            in_profile: dep.in_profile,
         });
     }
     Ok(pom)
@@ -195,6 +297,50 @@ fn blank_elements(text: &str, name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::PomScope;
+
+    #[test]
+    fn scope_skips_comments_and_plugin_sections_and_flags_profiles() {
+        let pom = "<project><dependencies>\
+            <!-- <dependency><groupId>g</groupId><artifactId>a</artifactId><version>0</version></dependency> -->\
+            <dependency><groupId>g</groupId><artifactId>a</artifactId><version> 1 </version>\
+              <exclusions><exclusion><groupId>x</groupId><artifactId>y</artifactId></exclusion></exclusions></dependency>\
+            <dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version><classifier>sources</classifier></dependency>\
+            </dependencies>\
+            <build><plugins><plugin><dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>2</version></dependency></dependencies></plugin></plugins></build>\
+            <profiles><profile><repositories/><dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>3</version></dependency></dependencies></profile></profiles>\
+            <repositories/></project>";
+        let scope = PomScope::new(pom).unwrap();
+        let deps = scope.dependencies().unwrap();
+        let seen: Vec<_> = deps
+            .iter()
+            .map(|d| {
+                (
+                    d.group.as_deref().unwrap(),
+                    d.version_text.as_deref().unwrap(),
+                    d.classifier.as_deref(),
+                    d.in_profile,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("g", "1", None, false),
+                ("g", "1", Some("sources"), false),
+                ("g", "3", None, true),
+            ]
+        );
+        let (s, e) = deps[0].version_inner.unwrap();
+        assert_eq!(&pom[s..e], " 1 ", "offsets index the original pom");
+        let repos = scope.live("repositories").unwrap();
+        assert_eq!(repos.len(), 1, "the profile's section is not live");
+        assert_eq!(repos[0].open_tag(pom), "<repositories/>");
+        assert_eq!(scope.project_close(), pom.rfind("</project>"));
+        assert!(PomScope::new("<project><![CDATA[ open</project>").is_err());
+        assert!(PomScope::new("<!-- <project></project> -->").is_err());
+    }
+
     #[test]
     fn suffix_grammar_is_exact() {
         assert_eq!(

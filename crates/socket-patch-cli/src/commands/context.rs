@@ -46,16 +46,12 @@ pub(crate) struct ProjectContext<'a> {
 }
 
 impl<'a> ProjectContext<'a> {
+    /// Every command's context: the ledgers always load from the manifest's
+    /// project, so `--manifest-path` never mixes two projects' state (#745).
     pub(crate) fn new(common: &'a GlobalArgs) -> Self {
-        Self::rooted(common, common.project_root())
-    }
-
-    /// A context whose ledgers load from `root` (commands that read the
-    /// ledgers of `--cwd` rather than of the manifest's project).
-    pub(crate) fn rooted(common: &'a GlobalArgs, root: PathBuf) -> Self {
         Self {
             common,
-            root,
+            root: common.project_root(),
             snapshot: DiskSnapshot::tracked(&common.cwd),
             ledgers: OnceCell::new(),
             locks: OnceCell::new(),

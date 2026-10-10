@@ -474,6 +474,11 @@ pub enum UnattestedKind {
     /// #261): a module's own literal `<version>` overrides it, and only the
     /// root pom is read, so the reactor may build the upstream jar.
     MavenReactorRoot,
+    /// A hosted Maven pin whose GA also has a live executable classifier
+    /// copy (`tests`, a native build; not `sources` / `javadoc`) at another
+    /// version: the classifier-less pin does not retarget it and the grant
+    /// serves only the main jar, so the build runs the public classifier jar.
+    MavenClassifierUnpatched,
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,

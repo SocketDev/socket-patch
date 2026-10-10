@@ -152,12 +152,17 @@ async fn scan_discovers_maven_artifacts() {
     )
     .unwrap();
 
-    // Create a pom.xml in the project directory so local mode activates
+    // A pom.xml in the project directory activates local mode; it declares
+    // both artifacts, since a project-mode crawl keeps only what the
+    // project's poms reach (#265).
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
     std::fs::write(
         project_dir.join("pom.xml"),
-        r#"<project><modelVersion>4.0.0</modelVersion></project>"#,
+        r#"<project><modelVersion>4.0.0</modelVersion><dependencies>
+  <dependency><groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId><version>3.12.0</version></dependency>
+  <dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId><version>32.1.2-jre</version></dependency>
+</dependencies></project>"#,
     )
     .unwrap();
 

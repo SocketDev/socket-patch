@@ -75,25 +75,27 @@ pub async fn run(args: RepairArgs) -> i32 {
         // bare directory would get. Only cheap existence probes (and the
         // read-only lockfile scans) run before the lock, so a project with
         // nothing to repair never grows `.socket/`.
+        // The vendored phase runs at the manifest's project (#745).
         let state_file = args
             .common
-            .cwd
+            .project_root()
             .join(socket_patch_core::vendor::VENDOR_STATE_REL);
         let mut has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok();
         if !has_vendor_traces {
-            let refs =
-                crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd)
-                    .await;
+            let refs = crate::commands::vendored_backend::repair::scan_vendor_references(
+                &args.common.project_root(),
+            )
+            .await;
             has_vendor_traces = !refs.is_empty();
             vendor_references = Some(refs);
         }
         if !has_vendor_traces {
             let legacy_ledger = args
                 .common
-                .cwd
+                .project_root()
                 .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
             let hosted = tokio::fs::metadata(&legacy_ledger).await.is_ok()
-                || !crate::commands::hosted_inventory(&args.common, &args.common.cwd)
+                || !crate::commands::hosted_inventory(&args.common, &args.common.project_root())
                     .await
                     .is_empty();
             if hosted {
@@ -154,8 +156,10 @@ pub async fn run(args: RepairArgs) -> i32 {
     let vendor_references = match vendor_references {
         Some(refs) => refs,
         None => {
-            crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd)
-                .await
+            crate::commands::vendored_backend::repair::scan_vendor_references(
+                &args.common.project_root(),
+            )
+            .await
         }
     };
 
@@ -500,7 +504,7 @@ async fn repair_inner(
     // result (an unreadable ledger is ITS loud failure), while this scoping
     // degrades to "nothing vendored" — a corrupt ledger must not hide the
     // manifest's own missing sources.
-    let ledger = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+    let ledger = socket_patch_core::vendor::load_state(&args.common.project_root()).await;
     let no_entries = std::collections::HashMap::new();
     let vendor_entries = ledger.as_ref().map(|s| &s.entries).unwrap_or(&no_entries);
     // Lockfile vendor references count as vendored even with no ledger

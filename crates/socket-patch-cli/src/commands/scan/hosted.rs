@@ -25,6 +25,7 @@ use crate::json_envelope::{
 
 use super::{discover_selected, emit_scan, scan_envelope, ScanArgs};
 
+mod nuget;
 mod python;
 mod takeover;
 
@@ -1477,6 +1478,15 @@ pub(crate) async fn run_redirect_selected(
         .await
     };
 
+    // NuGet global packages folder probe (#352): a copy extracted from the
+    // upstream bytes shadows the Socket source. Read-only, like the gem
+    // probe; skipped on --dry-run for the same reason.
+    let nuget_stale = if common.dry_run {
+        StaleInstallOutcome::default()
+    } else {
+        nuget::stale_install_warnings(common, &confirmed, &done.overrides).await
+    };
+
     // vlt warm-tree heal: stale installed copies of the Socket-owned nodes
     // are invalidated (classified only on a dry run or
     // with --no-vlt-install-cleanup), and every confirmed vlt purl whose
@@ -1636,6 +1646,7 @@ pub(crate) async fn run_redirect_selected(
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
                 !gem_stale.stale_purls.contains(purl)
+                    && !nuget_stale.stale_purls.contains(purl)
                     && !python_stale.stale_purls.contains(purl)
                     && !vlt_stale.stale_purls.contains(purl)
             })
@@ -1646,6 +1657,7 @@ pub(crate) async fn run_redirect_selected(
         params.known_stale = python_stale
             .stale_purls
             .iter()
+            .chain(&nuget_stale.stale_purls)
             .chain(&vlt_stale.stale_purls)
             .cloned()
             .collect();
@@ -1672,11 +1684,30 @@ pub(crate) async fn run_redirect_selected(
     engine_warnings.extend(done.rush_warnings.iter().cloned());
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
     engine_warnings.extend(done.npm_warnings.iter().cloned());
+    // A hosted Go `replace` breaks a committed vendor/ directory until
+    // `go mod vendor` re-records it in vendor/modules.txt (#343).
+    if !common.dry_run
+        && done
+            .rewritten
+            .iter()
+            .any(|f| f == "go.mod" || f.ends_with("/go.mod"))
+    {
+        for (code, detail) in socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+            &common.cwd,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        {
+            engine_warnings
+                .push(socket_patch_core::patch::redirect::RewriteWarning { code, detail });
+        }
+    }
     let mut warnings: Vec<RunWarning> = engine_warnings
         .iter()
         .map(|w| RunWarning::new(w.code.as_str(), w.detail.as_str()))
         .collect();
     warnings.extend(gem_stale.warnings.iter().map(run_warning_of));
+    warnings.extend(nuget_stale.warnings.iter().map(run_warning_of));
     warnings.extend(python_stale.warnings.iter().map(run_warning_of));
     warnings.extend(vlt_stale.warnings.iter().map(run_warning_of));
     warnings.extend(takeover_pre_warnings.iter().map(run_warning_of));

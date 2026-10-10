@@ -271,6 +271,64 @@ fn wired_pin_in(content: &str, canon_name: &str, record_uuid: &str) -> Option<(S
     })
 }
 
+/// Whether the requirements set beside a Pipenv lock (`pipenv requirements
+/// > requirements.txt`, the Docker / plain-pip install path) pins
+/// `canon_name==version` exactly from the registry in a shape the wiring
+/// rewrites in place, with no vendor line for the package yet (#612).
+/// Vendored Pipenv wires such a pin together with `Pipfile.lock`, as hosted
+/// mode rewrites both; anything else (no pin, a range, extras, an include
+/// outside the root, an existing vendor line) is left to the
+/// `pypi_multiple_lockfiles` warning.
+pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: &str) -> bool {
+    let Ok(files) = collect_requirements_files(root).await else {
+        return false;
+    };
+    if files
+        .iter()
+        .any(|f| vendored_uuid_for(&f.content, canon_name).is_some())
+    {
+        return false;
+    }
+    plan_requirements(root, canon_name, version, "", "")
+        .await
+        .is_ok_and(|plan| {
+            !plan.is_empty()
+                && plan
+                    .iter()
+                    .flat_map(|f| f.records.iter())
+                    .all(|r| r.action == WiringAction::Rewritten)
+        })
+}
+
+/// The `requirements_line` records of a mixed entry (a Pipenv entry that
+/// also wired its exported requirements file, #612).
+pub(super) const RECORD_KIND: &str = "requirements_line";
+
+/// Refuse a wheel path or digest that cannot sit on one requirements line
+/// as a single token: a CR/LF (or any whitespace / control character) would
+/// let a caller-supplied path (a committed ledger's, say) add requirement
+/// lines or options of its own.
+pub(super) fn check_line_tokens(
+    rel_wheel: &str,
+    wheel_sha256_hex: &str,
+) -> Result<(), (&'static str, String)> {
+    let bad_path = rel_wheel.is_empty()
+        || rel_wheel
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '#');
+    let bad_hash = !wheel_sha256_hex.chars().all(|c| c.is_ascii_hexdigit());
+    if bad_path || bad_hash {
+        return Err((
+            "vendor_path_unsafe",
+            format!(
+                "refusing to write the vendored wheel path {rel_wheel:?} (sha256 \
+                 {wheel_sha256_hex:?}) into requirements.txt: it is not a single plain token"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Rewrite every exact pin across the root `requirements.txt` and its `-r`
 /// includes (or append a managed transitive line at the root EOF when the
 /// package is absent). Returns the wiring records in application order.
@@ -281,6 +339,7 @@ pub(super) async fn wire_requirements(
     rel_wheel: &str,
     wheel_sha256_hex: &str,
 ) -> Result<Vec<WiringRecord>, (&'static str, String)> {
+    check_line_tokens(rel_wheel, wheel_sha256_hex)?;
     let plan = plan_requirements(root, canon_name, version, rel_wheel, wheel_sha256_hex).await?;
     write_plan(root, &plan).await
 }
@@ -297,6 +356,7 @@ pub(super) async fn rewire_requirements(
     rel_wheel: &str,
     wheel_sha256_hex: &str,
 ) -> Result<Vec<WiringRecord>, (&'static str, String)> {
+    check_line_tokens(rel_wheel, wheel_sha256_hex)?;
     let files = collect_requirements_files(root).await?;
     let plan = plan_rewire(
         &files,
@@ -613,7 +673,7 @@ async fn plan_requirements(
             lines.splice(*start..*start + *count, [line.clone()]);
             records.push(WiringRecord {
                 file: file.rel.clone(),
-                kind: "requirements_line".to_string(),
+                kind: RECORD_KIND.to_string(),
                 action: WiringAction::Rewritten,
                 key: Some(format!("{}:{}", file.rel, start + 1)),
                 original: Some(serde_json::Value::Array(

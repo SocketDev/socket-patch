@@ -393,6 +393,12 @@ impl DownloadParams {
         crate::args::socket_dir_of(&self.manifest_path, &self.cwd)
     }
 
+    /// The manifest's project, where the vendor ledger lives
+    /// ([`crate::args::GlobalArgs::project_root`]; #745).
+    pub(crate) fn project_root(&self) -> PathBuf {
+        crate::args::project_root_of(&self.manifest_path, &self.cwd)
+    }
+
     fn crawler_options(&self) -> CrawlerOptions {
         CrawlerOptions {
             cwd: self.cwd.clone(),
@@ -1233,7 +1239,7 @@ pub(crate) async fn download_patch_records_reusing(
     // flattened into an empty ledger that then reports a Bun lock remedy.
     // For the classification below it degrades to empty (no detached entry
     // to reuse — the vendor step reports the corruption itself).
-    let vendor_state = load_state(&params.cwd).await;
+    let vendor_state = load_state(&params.project_root()).await;
     // Bun preflight (see `BunVendorRefusal`): this phase feeds the vendor
     // engine, so it must refuse the same projects BEFORE fetching —
     // otherwise the view is downloaded for nothing and a package
@@ -1328,12 +1334,12 @@ pub(crate) const VENDORED_UUID_DRIFT: &str = "vendored_uuid_drift";
 /// function sits on the in-process scan→download→apply chain, whose summed
 /// poll frames must fit Windows' 1 MiB main-thread stack in debug builds.
 pub(crate) async fn warn_on_vendored_uuid_drift(
-    cwd: &Path,
+    project_root: &Path,
     quiet: bool,
     recorded: &[(String, String)],
     warnings: &mut Vec<RunWarning>,
 ) {
-    let Ok(vendor_state) = load_state(cwd).await else {
+    let Ok(vendor_state) = load_state(project_root).await else {
         return;
     };
     if vendor_state.entries.is_empty() {
@@ -1705,7 +1711,7 @@ pub async fn download_and_apply_patches_into(
     // later. (`scan` never hits this: it filters vendored purls before
     // download.) The nested apply below skips the vendored purl either way.
     let mut warnings = release_warnings(batch.warnings);
-    warn_on_vendored_uuid_drift(&params.cwd, quiet, &changed, &mut warnings).await;
+    warn_on_vendored_uuid_drift(&params.project_root(), quiet, &changed, &mut warnings).await;
     env.warnings.extend(warnings);
 
     if !quiet {
