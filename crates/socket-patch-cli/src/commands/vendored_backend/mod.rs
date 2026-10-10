@@ -108,11 +108,30 @@ impl<'a> VendoredBackend<'a> {
         for key in keys {
             // Captured before a clean revert drops the entry.
             let flavor = state.entries.get(key).and_then(|e| e.flavor.clone());
-            let result = revert_vendor_entry(&self.common.cwd, key, state, opts).await;
+            let mut result = revert_vendor_entry(&self.common.cwd, key, state, opts).await;
             let hard_failure = matches!(
                 result.step,
                 VendorRevertStep::Failed(_) | VendorRevertStep::LedgerWriteFailed(_)
             );
+            // The wiring is back on the registry while the installed tree
+            // may still hold the vendored build, which PDM, uv and Pipenv
+            // keep through a plain sync (#477): name the reinstall.
+            let unwired = matches!(
+                result.step,
+                VendorRevertStep::WouldRevert
+                    | VendorRevertStep::Reverted
+                    | VendorRevertStep::Preserved
+                    | VendorRevertStep::LedgerWriteFailed(_)
+            );
+            if unwired {
+                crate::commands::pypi_reinstall::push_vendor_advisory(
+                    &self.common.cwd,
+                    key,
+                    flavor.as_deref(),
+                    &mut result.warnings,
+                )
+                .await;
+            }
             out.push(RevertedEntry {
                 key: key.clone(),
                 flavor,
