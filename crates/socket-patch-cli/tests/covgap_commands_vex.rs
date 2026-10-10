@@ -748,11 +748,11 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
     let mut state = VendorState::new();
     state.entries.insert(
         purl.to_string(),
-        VendorEntry {
-            ecosystem: "golang".to_string(),
-            base_purl: purl.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "golang".to_string(),
+            purl.to_string(),
+            UUID.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
@@ -760,7 +760,7 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![WiringRecord {
+            vec![WiringRecord {
                 file: "go.mod".to_string(),
                 kind: "go_replace".to_string(),
                 action: WiringAction::Added,
@@ -768,17 +768,7 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 original: None,
                 new: None,
             }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
+        ),
     );
     let dir = cwd.join(".socket/vendor");
     std::fs::create_dir_all(&dir).unwrap();

@@ -666,6 +666,39 @@ impl FormatResult {
     }
 }
 
+fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
+    pins.iter().map(|p| (p.uuid.as_str(), *p)).collect()
+}
+
+/// A missing or unreadable file refuses every pin discovery found in it.
+async fn read_or_refuse(
+    view: &mut View<'_>,
+    rel: &str,
+    pins: &BTreeMap<&str, &HostedPin>,
+    result: &mut FormatResult,
+) -> Option<String> {
+    let why = match view.read(rel).await {
+        Ok(Some(text)) => return Some(text),
+        Ok(None) => format!("{rel} no longer exists"),
+        Err(e) => e,
+    };
+    refuse_all_in(pins, rel, result, why);
+    None
+}
+
+fn refuse_all_in(
+    pins: &BTreeMap<&str, &HostedPin>,
+    rel: &str,
+    result: &mut FormatResult,
+    why: String,
+) {
+    for pin in pins.values() {
+        if pin.files.iter().any(|f| f == rel) {
+            result.refuse(&pin.uuid, why.clone());
+        }
+    }
+}
+
 /// Shared context handed to every format restorer.
 pub(crate) struct Ctx<'a> {
     pub client: &'a UpstreamClient,
@@ -917,7 +950,10 @@ mod tests {
     fn bun_lock_remedies_name_the_forced_reinstall() {
         for file in ["bun.lockb", "bun.lock", "packages/app/bun.lockb"] {
             let remedy = checkout_remedy(&[file.to_string()]);
-            assert!(remedy.contains(&format!("`git checkout -- {file}`")), "{remedy}");
+            assert!(
+                remedy.contains(&format!("`git checkout -- {file}`")),
+                "{remedy}"
+            );
             assert!(remedy.ends_with(
                 ", then run `bun install --force` (a plain `bun install` keeps the patched copy)"
             ), "{remedy}");

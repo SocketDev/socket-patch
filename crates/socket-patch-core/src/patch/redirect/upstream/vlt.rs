@@ -27,8 +27,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::npm::{by_uuid, fetch_dists_on, read_or_refuse, refuse_all_in};
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::npm::fetch_dists_on;
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::vendor::vlt_lock_text::{
     brotli_for_slot3, default_registry_alias, entry_text, is_default_registry, nodes_block,
     parse_node_line, registry_base, render_entry_line, render_tuple_with_slots, sniff_lock,

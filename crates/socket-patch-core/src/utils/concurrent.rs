@@ -25,8 +25,6 @@ use std::future::Future;
 
 use futures_util::stream::{self, Stream, StreamExt};
 
-use crate::utils::env_compat::is_debug_enabled;
-
 /// In-flight request cap for the authenticated patch API: the ceiling a
 /// large window reaches ([`api_concurrency_for`]), and the whole cap for
 /// the windows that do not size themselves. Measured with no 429s up to
@@ -167,12 +165,12 @@ fn api_concurrency_override() -> Option<usize> {
     match trimmed.parse::<usize>() {
         Ok(limit) if limit > 0 => Some(limit.min(MAX_API_CONCURRENCY)),
         _ => {
-            if is_debug_enabled() {
-                eprintln!(
-                    "[socket-patch debug] ignoring {API_CONCURRENCY_ENV}={raw:?}: \
-                     expected an integer of 1 or more"
-                );
-            }
+            crate::utils::env_compat::debug_log(
+                "debug",
+                &format!(
+                    "ignoring {API_CONCURRENCY_ENV}={raw:?}: expected an integer of 1 or more"
+                ),
+            );
             None
         }
     }

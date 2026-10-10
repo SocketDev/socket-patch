@@ -73,10 +73,11 @@ use super::{
     Discovery, PatchedRef, UnlockedPin, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
+use crate::formats::nuget::lock::nuget_lock_entries;
 use crate::formats::nuget::{parse_config, NugetConfig};
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::nuget_config::{same_file, CONFIG_NAMES};
-use crate::vendor::nuget_feed::{is_plain_nuget_token, nuget_lock_entries, nupkg_leaf};
+use crate::vendor::nuget_feed::{is_plain_nuget_token, nupkg_leaf};
 use crate::vendor::path::VENDOR_DIR;
 
 /// The lock NuGet writes beside the project (default name).

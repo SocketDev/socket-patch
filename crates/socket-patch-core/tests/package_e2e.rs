@@ -1,7 +1,6 @@
 //! Integration coverage for `socket_patch_core::patch::package`.
 //!
-//! Exercises both `read_archive_to_map` and `read_archive_filtered`
-//! across the happy path, the `package/` prefix stripping rule,
+//! Exercises `read_archive_to_map` across the happy path, the `package/` prefix stripping rule,
 //! the unsafe-path guards (absolute paths, parent traversal,
 //! Windows-style backslash paths), the validate-AFTER-normalize
 //! guards (`package/`-prefixed escapes that only become unsafe once
@@ -9,14 +8,12 @@
 //! (symlinks). Lives in `tests/` so the coverage tool counts it
 //! against the integration bar rather than the lib bar.
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use socket_patch_core::manifest::schema::PatchFileInfo;
-use socket_patch_core::patch::package::{read_archive_filtered, read_archive_to_map, ArchiveError};
+use socket_patch_core::patch::package::{read_archive_to_map, ArchiveError};
 use tar::Builder;
 
 /// Helper: write a small gzipped tar archive containing `(name,
@@ -272,90 +269,4 @@ fn read_archive_to_map_handles_corrupt_gzip() {
     std::fs::write(&archive, b"not a gzip stream").unwrap();
     let result = read_archive_to_map(&archive);
     assert!(result.is_err());
-}
-
-// ── read_archive_filtered ──────────────────────────────────────────
-
-fn make_file_info() -> HashMap<String, PatchFileInfo> {
-    let mut files = HashMap::new();
-    files.insert(
-        "package/index.js".to_string(),
-        PatchFileInfo {
-            before_hash: "a".repeat(64),
-            after_hash: "b".repeat(64),
-        },
-    );
-    files.insert(
-        "lib/util.js".to_string(),
-        PatchFileInfo {
-            before_hash: "c".repeat(64),
-            after_hash: "d".repeat(64),
-        },
-    );
-    files
-}
-
-#[test]
-fn read_archive_filtered_keeps_only_listed_entries() {
-    let tmp = tempfile::tempdir().unwrap();
-    let archive = tmp.path().join("arc.tar.gz");
-    write_archive(
-        &archive,
-        &[
-            ("package/index.js", b"patched index"),
-            ("lib/util.js", b"patched util"),
-            ("bonus/extra.js", b"unwanted"),
-        ],
-    );
-
-    let filtered = read_archive_filtered(&archive, &make_file_info()).unwrap();
-    assert_eq!(
-        filtered.len(),
-        2,
-        "exactly the two listed entries survive: {filtered:?}"
-    );
-    // The listed `package/index.js` key must match the normalized
-    // `index.js` entry, carrying its exact bytes through the filter.
-    assert_eq!(
-        filtered.get("index.js").map(|v| v.as_slice()),
-        Some(b"patched index".as_slice()),
-        "package-prefixed listing must match normalized entry with intact bytes"
-    );
-    assert_eq!(
-        filtered.get("lib/util.js").map(|v| v.as_slice()),
-        Some(b"patched util".as_slice()),
-        "non-prefixed listing must match verbatim with intact bytes"
-    );
-    assert!(
-        !filtered.contains_key("bonus/extra.js"),
-        "filter must drop entries not listed in patch files map"
-    );
-    // And it must not leak the unlisted bytes under any key.
-    assert!(
-        !filtered.values().any(|v| v.as_slice() == b"unwanted"),
-        "unlisted entry bytes must never survive the filter: {filtered:?}"
-    );
-}
-
-#[test]
-fn read_archive_filtered_propagates_unsafe_path_errors() {
-    // If the underlying read trips an unsafe-path guard, filter
-    // must propagate rather than swallow.
-    let tmp = tempfile::tempdir().unwrap();
-    let archive = tmp.path().join("arc.tar.gz");
-    write_raw_archive(&archive, b"/etc/shadow", b"evil");
-    let err = read_archive_filtered(&archive, &make_file_info()).unwrap_err();
-    assert_unsafe_path_containing(err, "/etc/shadow");
-}
-
-#[test]
-fn read_archive_filtered_propagates_package_prefixed_escape() {
-    // The filter delegates to `read_archive_to_map`, so the post-strip
-    // validation must propagate here too. `package//etc/shadow` would
-    // escape the package dir if validation regressed to pre-strip.
-    let tmp = tempfile::tempdir().unwrap();
-    let archive = tmp.path().join("arc.tar.gz");
-    write_raw_archive(&archive, b"package//etc/shadow", b"evil");
-    let err = read_archive_filtered(&archive, &make_file_info()).unwrap_err();
-    assert_unsafe_path_containing(err, "package//etc/shadow");
 }
