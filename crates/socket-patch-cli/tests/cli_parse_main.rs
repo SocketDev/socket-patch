@@ -171,6 +171,12 @@ fn setup_subcommand_is_removed() {
     assert!(text.contains("removed in v5.0"), "{text}");
     assert!(text.contains("socket-patch apply"), "{text}");
     assert!(!text.contains("self-update"), "{text}");
+    // #1295: removing the Bundler plugin by hand also needs the
+    // per-checkout deregistration `setup --remove` used to do.
+    assert!(
+        text.contains("bundle plugin uninstall socket-patch"),
+        "{text}"
+    );
 }
 
 #[test]

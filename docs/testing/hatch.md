@@ -17,6 +17,18 @@ Hatch 0.x continues to use the requirements/pip backend. Existing lockfile
 and requirements routing retains precedence over Hatchling's build marker.
 A build backend alone does not change which existing pip inputs are wired.
 
+Hatch 1.17+ locked environments (`lock-envs = true`, an environment's
+`locked = true` or `lock-filename`) write a `pylock.toml` /
+`pylock.<env>.toml` that Hatch derives from pyproject and regenerates on the
+next sync whenever the dependency hash changes (#479). Such a lock is not an
+install source of its own: hosted mode wires the Hatch declarations as well
+as the lock (warning `redirect_hatch_lock_regenerated`; run `hatch dep lock`
+to refresh the lock, as `hatch dep lock --check` reports it stale until
+then), and vendored mode routes the project to the Hatch lane, whose
+pip-installer requirement refuses the uv installer locked environments use.
+A `pylock.toml` in a Hatch project without locked environments (`uv export`,
+`pip lock`) is still wired as a standalone lock.
+
 A range, transitive-only declaration, dynamic dependency metadata, custom
 environment plugin, source table or conditional override is refused before
 writing. Use agent mode (`scan --mode agent` + `socket-patch apply` in CI) for these shapes. Hosted PEP 735 groups are
