@@ -43,12 +43,33 @@ concurrency:
   group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Linux jobs run on Depot's runners (depot-ubuntu-*-4: 4 vCPU, like GitHub's
+# public-repo ubuntu-latest), which don't draw on the org's shared GitHub-hosted
+# concurrency pool, where merge-queue jobs used to wait behind PR CI. Matrix
+# values stay `ubuntu-latest`/`ubuntu-22.04`, so job names, cache keys and
+# scripts are unchanged; only `runs-on` maps them. Kill switch: set the
+# repository variable DISABLE_DEPOT_RUNNERS=true to fall back to GitHub-hosted
+# runners (the same switch depscan uses). The compile-bound critical-path
+# jobs (clippy, coverage, e2e-build, test-release) use 16-vCPU Depot runners
+# (depot-ubuntu-24.04-16). The compatibility workflows follow
+# the same mapping. Release, publish and merge-queue workflows stay
+# GitHub-hosted (provenance / write tokens).
+# LEAN SCOPE (temporary, while org runner capacity is constrained): unless
+# the repository variable CI_SCOPE is `full`, pull_request, merge_group and
+# push runs use one targeted e2e row per package manager (the rest are in
+# e2e-extended), one row each of the yarn and cargo VEX matrices, and skip
+# the Windows/macOS legs, test, test-release, old cargo toolchains and the
+# sbt Docker coverage slice. Everything runs in the nightly schedule and on
+# workflow_dispatch. Set CI_SCOPE=full to restore the old gate without a
+# commit. ci-ok treats skipped jobs as passing. hosted-e2e is not scoped:
+# it always runs, and its step-level HOSTED_E2E_DISABLED switch is the only
+# bypass.
 jobs:
   # Required independently of ci-ok so the merge queue sees a compile/lint
   # failure immediately. Expensive jobs also depend on this preflight.
   clippy:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -92,7 +113,7 @@ jobs:
   node-addon:
     if: github.event.pull_request.draft != true
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -126,7 +147,7 @@ jobs:
   # test harnesses.
   lint-ecosystems:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -218,7 +239,7 @@ jobs:
   #     tag doesn't already exist.
   release-readiness:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -255,7 +276,7 @@ jobs:
           bash scripts/release-lint.sh --sync-only
 
   test:
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
     # No ubuntu-latest leg: `coverage` runs this same `cargo test
     # --workspace` (debug, default features, plus Go and vexctl) on ubuntu,
@@ -273,7 +294,7 @@ jobs:
         exclude:
           # macOS legs run on main, the merge queue and nightly, not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 50
     env:
       VEXCTL_VERSION: v0.3.0
@@ -432,9 +453,9 @@ jobs:
   test-release:
     # Each PR and main push runs the complete release-mode suite. The merge
     # queue already skips this job because each constituent PR ran it.
-    if: github.event.pull_request.draft != true && github.event_name != 'merge_group'
+    if: (github.event.pull_request.draft != true && github.event_name != 'merge_group') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     strategy:
       fail-fast: false
       matrix:
@@ -486,7 +507,7 @@ jobs:
     # numbers are report-only so contributors get visibility without flaky
     # CI when coverage shifts naturally with test edits. A failing TEST
     # fails the job: this is the Linux leg of `test`.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     timeout-minutes: 35
     permissions:
       contents: read
@@ -592,9 +613,9 @@ jobs:
   # Dockerfile.base compiles the full-LTO release binary inside Docker, with
   # no cache. Build it once per run and hand the image to every docker leg.
   docker-base:
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')
     needs: clippy
-    runs-on: ubuntu-22.04
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -649,8 +670,9 @@ jobs:
     # (glibc 2.36); a binary linked against a newer glibc than the
     # container ships fails to load. ubuntu-22.04's older glibc is
     # the highest base that's forward-compatible with debian:12.
+    if: (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: docker-base
-    runs-on: ubuntu-22.04
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     # sbt's image bakes three JDKs and warm sbt / Mill / scala-cli caches.
     timeout-minutes: ${{ matrix.ecosystem == 'sbt' && 45 || 30 }}
     permissions:
@@ -774,8 +796,9 @@ jobs:
     # Merge the host coverage and per-ecosystem docker coverage into a
     # single lcov.info. lcov(1) handles the union — same files are
     # summed line-by-line so a line covered by ANY test counts.
+    if: (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: [coverage, coverage-docker]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -838,7 +861,7 @@ jobs:
 
   dispatch-tests:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -880,7 +903,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-16' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     env: &e2e-build-env
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -932,25 +955,25 @@ jobs:
           retention-days: 3
 
   e2e-build-windows:
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     env: *e2e-build-env
     steps: *e2e-build-steps
 
   e2e-build-macos:
-    if: github.event_name != 'pull_request'
+    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     env: *e2e-build-env
     steps: *e2e-build-steps
@@ -987,8 +1010,6 @@ jobs:
           # Both capstones share one leg per composer line: the setup is
           # identical and the run step loops over `suite`.
           - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2.2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1'}
           # Real-bundler gem capstones, one leg per bundler era. Boundaries:
           # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
           # pre-CHECKSUMS, 2.6 CHECKSUMS, 4.0.15/4.0.21 before/after the
@@ -997,12 +1018,6 @@ jobs:
           # (no boundary of its own) is in e2e-full.
           # Hosted and vendored share each era's leg (one Ruby + bundler
           # setup; the run step loops over `suite`).
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.6.9'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
           # e2e_scan) are intentionally NOT in the PR matrix — their
@@ -1032,8 +1047,6 @@ jobs:
           # matrix entry is needed for them. e2e_safety_pnpm below needs a
           # real pnpm and is #[ignore]-gated; e2e_safety_cargo_build runs in
           # every cargo-vex-matrix leg (ubuntu, macOS and Windows).
-          - os: ubuntu-latest
-            suite: e2e_safety_pnpm
           # pnpm-on-Windows uses junctions for symlinks and copies
           # (not hardlinks) by default, so the CoW invariant holds
           # vacuously. Test still runs to verify apply doesn't error
@@ -1056,8 +1069,6 @@ jobs:
           - os: ubuntu-latest
             suite: e2e_redirect_npm_build
             npm_required: '1'
-          - os: ubuntu-latest
-            suite: e2e_redirect_rush_sim
           # Hermetic real-bun capstones (wiremock patch service, real `bun
           # install`): hosted (`e2e_redirect_bun_build`), vendored
           # (`e2e_vendor_bun_build`) and the hosted⇄vendored takeover /
@@ -1090,23 +1101,9 @@ jobs:
             suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.4.2'
             test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
-            bun: '1.1.45'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
-            bun: '1.2.23'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
-            bun: '1.3.14'
-            test_filter: --include-ignored
           # The binary bun.lockb era (1.0 / 1.1 lines) through e2e_bun_lockb,
           # which reads the SOCKET_PATCH_BUN_LOCKB_* gates exported for it
           # below.
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.0.36', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
           # Bun >= 1.4 migrating a hosted workspace bun.lockb to bun.lock
           # (#803; its reader must be 1.4+) and a vendored one, then
           # reverting it (#784; skipped by the < 1.2 readers above), and a
@@ -1115,8 +1112,6 @@ jobs:
           # 1.4.2 and 1.3.14 also run the isolated-linker vendored re-run
           # after a late dependent (#861); 1.3 re-hoists a frozen binary lock
           # and refuses one whose trees changed.
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.4.2', test_filter: --include-ignored text_migration workspace_late_dependent binary_shared_bundled_record_hosted_pin_is_managed}
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.3.14', test_filter: --include-ignored workspace_late_dependent}
           # Real-vlt capstones (DESIGN §8.4): wiremock patch service and a local
           # npm registry fed from npmjs, driven by the pinned vlt release
           # (`node vlt.js`, installed below from a sha512-checked `npm pack`).
@@ -1128,31 +1123,10 @@ jobs:
           # 0.0.0-32, B rc.12/rc.14 (rc.14 legs reach public npm), C rc.32,
           # D 1.0.4/1.0.7, E 1.1.1, F 1.2.0.
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-16', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.1.1', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix, vlt_upgrade: '1.2.0'}
           # Linux `auto` hardlinks from the global store; every OS gets the
           # explicit hardlink linker.
-          - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
           # rc.12 gets the definite no-hook advisory; windows rc.14 runs the
           # legacy DepIDs on NTFS with pre-junction symlinks.
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.12', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.7', test_filter: --include-ignored vlt_pinned_matrix}
           # The named corepack pnpm hosted legs (pnpm 7-11, get-uuid,
           # zero-touch, --trust-lockfile). `#[ignore]`d; the pinned matrix
           # inside the same suite runs in pnpm-compatibility.yml, hence the
@@ -1164,13 +1138,7 @@ jobs:
           # re-resolves a transitive override / rejects a repointed
           # constraint under --locked; 0.5.5 keeps both). The other 0.N
           # lines and 0.5.3/0.5.6 are in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.1.45'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.4'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.5'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.1.45', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.4', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.5', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
           # The Poetry / PDM / Hatch / Pipenv / pip / deno manifest-less VEX
           # capstones share ONE test binary (`e2e_vex_build`, a module per
@@ -1181,33 +1149,19 @@ jobs:
           # unix-only). One leg per major / lock format: 1.0 (lock 1.0),
           # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.0 (first lock 2.1 writer),
           # current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.0.10'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.1.15'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.8.5'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.0.1'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
           # Real PDM / Hatch capstones (wiremock Socket API that also serves
           # the hosted wheel; PyPI for the tool bootstrap + six).
           # PDM: lock 2 (1.4), refused 3.1 (1.15) and 4.2 (2.7), 4.3 (2.8),
           # the hishel<1 bootstrap window (2.25) and current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '1.4.5'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '1.15.5'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.7.4'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.8.2'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.25.9'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
           # Hatch: 1.0 (hatch.toml env vendoring refused, needs >= 1.2),
           # 1.2, the virtualenv<21 window (1.9, 1.14) and current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.0.0'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.2.1'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.9.7'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.14.2'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
           # Real Pipenv / pip capstones (mock patch server; the tools are
           # bootstrapped from PyPI). `pipenv:` / `pip:` hold one or more
           # space-separated releases the suite loops over. The middle
           # Pipenv releases are in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2026.8.0'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 23 24 25 26'}
           # Real-Maven hosted + vendored capstones, one leg per Maven line:
@@ -1217,17 +1171,7 @@ jobs:
           # the .mvn/checksums pin) and 3.9.4 (first that enforces it).
           # Lines that run both capstones run them in one leg (one Maven
           # install; the run step loops over `suite`).
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.6.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.8.9'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.4'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.6.3', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.8.9', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '4.0.0-rc-6', test_filter: '--ignored maven_reactor'}
           # Real-Gradle capstones, PR tier: one leg per Gradle line x {agent +
           # hosted, vendor + multi-project} on ubuntu, each on its line's LTS
           # JDK. Every other OS x line x mode cell (and the JDK-ceiling,
@@ -1245,38 +1189,19 @@ jobs:
           # `gradle_hosted_[b-p]` names, and a catch-all that `--skip`s
           # exactly those words, so a new test always lands in some leg
           # (test_ci_gradle_prefixes.py keeps the skip list in sync).
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
           - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
           # Real-sbt hosted (socket-patch.sbt) + vendored
           # (socket-patch-vendor.sbt) capstones on the current 1.x line. The
           # other sbt lines, JDK 21, the agent cells beyond coverage-docker's,
           # Mill, scala-cli and macOS / Windows are sbt-compatibility.yml.
-          - {os: ubuntu-latest, suite: e2e_sbt_build, jvm_tool: sbt, sbt: '1.13.0', test_filter: '--ignored --test-threads=1'}
-          - {os: ubuntu-latest, suite: e2e_sbt_vendor_build, jvm_tool: sbt, sbt: '1.13.0', test_filter: '--ignored --test-threads=1'}
           # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
           # major (the suite pins the major through a sandbox global.json):
           # the oldest and newest here, 7-9 on ubuntu in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '6'}
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '10'}
           # Real deno negative capstone (no hosted/vendored wiring exists for
           # deno; VEX must attest nothing), one leg per major.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '1.46.3'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '2.9.7'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
     # hatch), hence more than the 25 minutes the older legs needed.
@@ -1754,7 +1679,127 @@ jobs:
 
   # Each OS consumes only its own build. A queued macOS runner must not
   # delay Linux or Windows, and a Windows compile must not delay Gradle.
+  # Every other e2e row (older tool versions, extra suites and Gradle/sbt
+  # lines). Same steps and environment as `e2e`; runs only when the
+  # repository variable CI_SCOPE is `full`, nightly, or on dispatch. See the
+  # LEAN SCOPE note at the top of `jobs:`.
+  e2e-extended:
+    if: (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    needs: [e2e-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2.2'}
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.6.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
+          - os: ubuntu-latest
+            suite: e2e_safety_pnpm
+          - os: ubuntu-latest
+            suite: e2e_redirect_rush_sim
+          - os: ubuntu-latest
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
+            bun: '1.1.45'
+            test_filter: --include-ignored
+          - os: ubuntu-latest
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
+            bun: '1.2.23'
+            test_filter: --include-ignored
+          - os: ubuntu-latest
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
+            bun: '1.3.14'
+            test_filter: --include-ignored
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.0.36', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.4.2', test_filter: --include-ignored text_migration workspace_late_dependent binary_shared_bundled_record_hosted_pin_is_managed}
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.3.14', test_filter: --include-ignored workspace_late_dependent}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-16', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.1.1', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix, vlt_upgrade: '1.2.0'}
+          - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.12', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.7', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.1.45'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.4'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.5'}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.1.45', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.4', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.5', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.0.10'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.1.15'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.8.5'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.0.1'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '1.4.5'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '1.15.5'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.7.4'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.8.2'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.25.9'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.0.0'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.2.1'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.9.7'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.14.2'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.6.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.8.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.4'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.6.3', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.8.9', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '4.0.0-rc-6', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
+          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
+          - {os: ubuntu-latest, suite: e2e_sbt_build, jvm_tool: sbt, sbt: '1.13.0', test_filter: '--ignored --test-threads=1'}
+          - {os: ubuntu-latest, suite: e2e_sbt_vendor_build, jvm_tool: sbt, sbt: '1.13.0', test_filter: '--ignored --test-threads=1'}
+          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '6'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '1.46.3'}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+    # The real-toolchain capstones loop several releases per leg (pip,
+    # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
+    # hatch), hence more than the 25 minutes the older legs needed.
+    timeout-minutes: 40
+    # What .cargo/config.toml's [env] gives processes cargo launches; these
+    # legs launch the test binaries themselves.
+    env: *e2e-env
+    steps: *e2e-steps
+
   e2e-windows:
+    if: (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: [e2e-build-windows]
     strategy:
       fail-fast: false
@@ -1782,7 +1827,7 @@ jobs:
           - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: gradle, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     env: *e2e-env
     steps: *e2e-steps
@@ -1790,7 +1835,7 @@ jobs:
   # The macOS rows run on main, the merge queue and nightly, not on every
   # PR push, so PRs stop queueing on the small macOS runner pool.
   e2e-macos:
-    if: github.event_name != 'pull_request'
+    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # These jobs consume e2e-build's binaries and can run alongside unit tests.
     needs: [e2e-build-macos]
     strategy:
@@ -1833,7 +1878,7 @@ jobs:
           - {os: macos-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
           - {os: macos-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: macos-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
     # hatch), hence more than the 25 minutes the older legs needed.
@@ -1884,7 +1929,7 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '7'}
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '9'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
     # legs launch the test binaries themselves.
@@ -1916,7 +1961,7 @@ jobs:
     # pull_request runs of its PR into main) run it too.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease'
     needs: docker-base
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: ${{ matrix.ecosystem == 'sbt' && 45 || 35 }}
     permissions:
       contents: read
@@ -2002,7 +2047,7 @@ jobs:
     # Only wait for the clippy preflight.
     if: github.event.pull_request.draft != true
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -2010,7 +2055,8 @@ jobs:
         # 1.0.2 oldest 1.x; 1.6.0 last that installs nothing for a `file:`
         # tarball; 1.7.0 first vendored-capable; 1.9.4 last without the
         # `integrity` line; 1.10.1 first with it; 1.22.22 current.
-        release: ['1.0.2', '1.6.0', '1.7.0', '1.9.4', '1.10.1', '1.22.22']
+        # LEAN SCOPE: the current release only, unless CI_SCOPE=full / nightly.
+        release: ${{ fromJSON((vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["1.0.2","1.6.0","1.7.0","1.9.4","1.10.1","1.22.22"]' || '["1.22.22"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -2051,12 +2097,9 @@ jobs:
         # 4.0.2 bare-hex checksum writer (4.0.0-4.0.2), 4.1.0 first
         # `10c0/` writer, current, and 4.12.0 on macOS / Windows. The rest
         # of the spread (4.6.0, 4.12.0 on ubuntu) is yarn-berry-full.
-        include:
-          - {os: ubuntu-latest, yarn: '4.0.2'}
-          - {os: ubuntu-latest, yarn: '4.1.0'}
-          - {os: ubuntu-latest, yarn: '4.18.0'}
-          - {os: windows-latest, yarn: '4.12.0'}
-    runs-on: ${{ matrix.os }}
+        # LEAN SCOPE: the newest Linux release only, unless CI_SCOPE=full / nightly.
+        include: ${{ fromJSON((vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '[{"os":"ubuntu-latest","yarn":"4.0.2"},{"os":"ubuntu-latest","yarn":"4.1.0"},{"os":"ubuntu-latest","yarn":"4.18.0"},{"os":"windows-latest","yarn":"4.12.0"}]' || '[{"os":"ubuntu-latest","yarn":"4.18.0"}]') }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 30
     steps: &yarn-berry-steps
       - name: Checkout
@@ -2087,7 +2130,7 @@ jobs:
   # nightly, not on every PR push, so PRs stop queueing on the small
   # macOS runner pool.
   yarn-berry-e2e-macos:
-    if: github.event_name != 'pull_request'
+    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
     needs: clippy
     strategy:
@@ -2098,7 +2141,7 @@ jobs:
         # of the spread (4.6.0, 4.12.0 on ubuntu) is yarn-berry-full.
         include:
           - {os: macos-latest, yarn: '4.12.0'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 30
     steps: *yarn-berry-steps
 
@@ -2113,7 +2156,7 @@ jobs:
         include:
           - {os: ubuntu-latest, yarn: '4.6.0'}
           - {os: ubuntu-latest, yarn: '4.12.0'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 30
     steps: *yarn-berry-steps
 
@@ -2130,7 +2173,7 @@ jobs:
     # e2e-build only (its binaries; only the matching OS build is needed);
     # see yarn-classic-matrix on test/coverage.
     needs: [e2e-build]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
     # legs launch the test binaries themselves.
@@ -2141,12 +2184,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {os: ubuntu-latest, toolchain: '1.93.1', lock: ''}
-          - {os: ubuntu-latest, toolchain: '1.93.1', lock: '1'}
-          - {os: ubuntu-latest, toolchain: stable, lock: '2'}
-          - {os: ubuntu-latest, toolchain: '1.82.0', lock: '3'}
-          - {os: ubuntu-latest, toolchain: '1.93.1', lock: '4'}
+        # LEAN SCOPE: lockfile v4 only, unless CI_SCOPE=full / nightly.
+        include: ${{ fromJSON((vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '[{"os":"ubuntu-latest","toolchain":"1.93.1","lock":""},{"os":"ubuntu-latest","toolchain":"1.93.1","lock":"1"},{"os":"ubuntu-latest","toolchain":"stable","lock":"2"},{"os":"ubuntu-latest","toolchain":"1.82.0","lock":"3"},{"os":"ubuntu-latest","toolchain":"1.93.1","lock":"4"}]' || '[{"os":"ubuntu-latest","toolchain":"1.93.1","lock":"4"}]') }}
     steps: &cargo-vex-steps
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -2209,8 +2248,9 @@ jobs:
 
   cargo-vex-matrix-windows:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
+    if: (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: [e2e-build-windows]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     env: *e2e-env
     strategy:
@@ -2223,10 +2263,10 @@ jobs:
 
   # The macOS rows run on main, the merge queue and nightly, not per PR push.
   cargo-vex-matrix-macos:
-    if: github.event_name != 'pull_request'
+    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     needs: [e2e-build-macos]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
     # legs launch the test binaries themselves.
@@ -2247,7 +2287,7 @@ jobs:
     # merge_group runs the pull_request tier: the queue gates on ci-ok.
     if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
     needs: [e2e-build]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
     # legs launch the test binaries themselves.
@@ -2285,9 +2325,9 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy preflight.
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -2351,7 +2391,7 @@ jobs:
     name: hosted-e2e            # may be a required check; do not rename
     if: github.event.pull_request.draft != true
     needs: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     permissions:
       contents: read
     timeout-minutes: 30
@@ -2555,8 +2595,8 @@ jobs:
   ci-ok:
     name: ci-ok                 # registered as a required check; do not rename
     if: always()
-    needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, e2e-build-windows, e2e-build-macos, e2e, e2e-windows, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-windows, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
-    runs-on: ubuntu-latest
+    needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, e2e-build-windows, e2e-build-macos, e2e, e2e-windows, e2e-extended, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-windows, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 5
     steps:
       - name: Check every needed job

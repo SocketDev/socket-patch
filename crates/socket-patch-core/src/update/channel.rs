@@ -121,28 +121,117 @@ pub fn upgrade_hint(channel: InstallChannel) -> &'static str {
     }
 }
 
-/// [`upgrade_hint`] for the binary at `canonical_exe`. An npm install is
-/// either global (`<prefix>/lib/node_modules`, `%APPDATA%\npm\node_modules`,
-/// a yarn/pnpm `global` store, a Windows version-manager dir such as
-/// nvm-windows' `%APPDATA%\nvm\v20.11.0\node_modules`), where
-/// `npm update -g` is right, or a project dependency
-/// (`<project>/node_modules`), where `-g` would update some other copy and
-/// leave this one alone. A project that vlt installed (its root holds
-/// `vlt-lock.json`) upgrades through vlt, and vlx's cache dir (a project
-/// whose `package.json` is named `vlx`, under `$XDG_DATA_HOME/vlt/vlx/`)
-/// is refreshed by running vlx with `@latest`.
+/// [`upgrade_hint`] for the binary at `canonical_exe`. A `node_modules`
+/// install is upgraded through the package manager that owns it
+/// ([`node_manager`]):
+///
+/// - npm: a global install (`<prefix>/lib/node_modules`,
+///   `%APPDATA%\npm\node_modules`, a yarn `global` store, a Windows
+///   version-manager dir such as nvm-windows'
+///   `%APPDATA%\nvm\v20.11.0\node_modules`) takes `npm update -g`; a
+///   project dependency (`<project>/node_modules`) takes `npm install …`,
+///   since `-g` would update some other copy and leave this one alone.
+/// - pnpm: `pnpm add -g …@latest` for its global store, `pnpm add …@latest`
+///   in a project, and `pnpm update --recursive --latest …` at a workspace
+///   root, which refuses a bare `pnpm add` and whose members may declare the
+///   dependency. npm's commands are wrong here: `npm update -g` never sees
+///   pnpm's global store, and `npm install` in a pnpm project writes a
+///   stray `package-lock.json` and leaves `pnpm-lock.yaml` stale.
+/// - vlt: a project that vlt installed (its root holds `vlt-lock.json`)
+///   upgrades through vlt, and vlx's cache dir (a project whose
+///   `package.json` is named `vlx`, under `$XDG_DATA_HOME/vlt/vlx/`) is
+///   refreshed by running vlx with `@latest`.
 pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'static str {
-    if channel == InstallChannel::Npm && !is_global_npm_install(canonical_exe) {
-        let holder = outermost_node_modules_holder(canonical_exe);
+    if channel != InstallChannel::Npm {
+        return upgrade_hint(channel);
+    }
+    let global = is_global_npm_install(canonical_exe);
+    let holder = outermost_node_modules_holder(canonical_exe);
+    match node_manager(canonical_exe) {
+        NodeManager::Pnpm if global => "pnpm add -g @socketsecurity/socket-patch@latest",
+        NodeManager::Pnpm
+            if holder.is_some_and(|dir| {
+                dir.join(crate::utils::pnpm_workspace::PNPM_WORKSPACE)
+                    .is_file()
+            }) =>
+        {
+            "pnpm update --recursive --latest @socketsecurity/socket-patch"
+        }
+        NodeManager::Pnpm => "pnpm add @socketsecurity/socket-patch@latest",
+        _ if global => upgrade_hint(channel),
+        NodeManager::Vlx => "vlx -y -- @socketsecurity/socket-patch@latest …",
+        NodeManager::Vlt => "vlt install @socketsecurity/socket-patch@latest",
+        NodeManager::Npm => "npm install @socketsecurity/socket-patch@latest",
+    }
+}
+
+/// Short human label for refusal messages ("managed by pnpm"): the
+/// [`channel_label`], naming the npm-family manager for a `node_modules`
+/// install.
+pub fn channel_label_for(channel: InstallChannel, canonical_exe: &Path) -> &'static str {
+    if channel != InstallChannel::Npm {
+        return channel_label(channel);
+    }
+    match node_manager(canonical_exe) {
+        NodeManager::Npm => "npm",
+        NodeManager::Pnpm => "pnpm",
+        NodeManager::Vlt | NodeManager::Vlx => "vlt",
+    }
+}
+
+/// The npm-family manager that owns a `node_modules` install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeManager {
+    Npm,
+    Pnpm,
+    Vlt,
+    Vlx,
+}
+
+/// Classify the owner of the `node_modules` install at `path`. vlt is only
+/// recognized for project installs (its lockfile beside the outermost
+/// `node_modules`, or vlx's cache project); pnpm by its `.pnpm` virtual
+/// store in the canonical path (every isolated-linker install, global or
+/// project), a `pnpm` home above a `global` store, or a `pnpm-lock.yaml`
+/// beside the outermost `node_modules` (`node-linker=hoisted`). Anything
+/// else is npm, which also covers yarn and Bun (no dedicated hint yet).
+fn node_manager(path: &Path) -> NodeManager {
+    let holder = outermost_node_modules_holder(path);
+    if !is_global_npm_install(path) {
         if holder.is_some_and(is_vlx_cache_dir) {
-            return "vlx -y -- @socketsecurity/socket-patch@latest …";
+            return NodeManager::Vlx;
         }
         if holder.is_some_and(|dir| dir.join(crate::constants::npm_family::VLT_LOCK).is_file()) {
-            return "vlt install @socketsecurity/socket-patch@latest";
+            return NodeManager::Vlt;
         }
-        return "npm install @socketsecurity/socket-patch@latest";
     }
-    upgrade_hint(channel)
+    if has_component(path, ".pnpm")
+        || is_pnpm_global_store(path)
+        || holder.is_some_and(|dir| dir.join(crate::constants::npm_family::PNPM_LOCK).is_file())
+    {
+        return NodeManager::Pnpm;
+    }
+    NodeManager::Npm
+}
+
+/// A `global` store below a `pnpm` home (`~/Library/pnpm/global/5`,
+/// `~/.local/share/pnpm/global/v11/<hash>`, `%LOCALAPPDATA%\pnpm\global\5`).
+fn is_pnpm_global_store(path: &Path) -> bool {
+    let names: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(os) => Some(os),
+            _ => None,
+        })
+        .collect();
+    let first_nm = names
+        .iter()
+        .position(|n| *n == "node_modules")
+        .unwrap_or(names.len());
+    names[..first_nm]
+        .iter()
+        .position(|n| *n == "global")
+        .is_some_and(|g| names[..g].iter().any(|n| *n == "pnpm"))
 }
 
 /// vlx installs each package into its own project dir whose generated
@@ -199,7 +288,8 @@ fn is_global_npm_install(path: &Path) -> bool {
     }
 }
 
-/// Short human label for refusal messages ("managed by npm").
+/// Short human label for refusal messages ("managed by npm"); see
+/// [`channel_label_for`] for the npm-family manager of a given path.
 pub fn channel_label(channel: InstallChannel) -> &'static str {
     match channel {
         InstallChannel::Standalone => "standalone",
@@ -526,7 +616,6 @@ mod tests {
             "/usr/local/lib/node_modules/@socketsecurity/socket-patch/node_modules/@socketsecurity/socket-patch-darwin-arm64/bin/socket-patch",
             "/home/u/.nvm/versions/node/v20.1.0/lib/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
             "/home/u/.config/yarn/global/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
-            "/Users/u/Library/pnpm/global/5/node_modules/@socketsecurity/socket-patch-darwin-arm64/bin/socket-patch",
         ];
         for p in global {
             assert_eq!(
@@ -644,6 +733,101 @@ mod tests {
                 )
             ),
             "npm update -g @socketsecurity/socket-patch"
+        );
+    }
+
+    /// #1111: a pnpm install upgrades through pnpm. `npm update -g` is a
+    /// no-op for a pnpm global store, and `npm install` in a pnpm project
+    /// writes a stray package-lock.json and leaves pnpm-lock.yaml stale.
+    #[test]
+    fn pnpm_global_installs_get_pnpm_add_g() {
+        let global = [
+            // pnpm 9/10, macOS default PNPM_HOME.
+            "/Users/u/Library/pnpm/global/5/node_modules/.pnpm/@socketsecurity+socket-patch-darwin-arm64@4.0.0/node_modules/@socketsecurity/socket-patch-darwin-arm64/bin/socket-patch",
+            // The store root itself, as the old table row listed it.
+            "/Users/u/Library/pnpm/global/5/node_modules/@socketsecurity/socket-patch-darwin-arm64/bin/socket-patch",
+            // pnpm 12 (`global/v11/<hash>`), Linux default PNPM_HOME.
+            "/home/u/.local/share/pnpm/global/v11/ab12cd/node_modules/.pnpm/@socketsecurity+socket-patch-linux-x64@4.0.0/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
+            // A custom PNPM_HOME without a `pnpm` component: the virtual
+            // store (`.pnpm`) still names the manager.
+            "/opt/tools/global/5/node_modules/.pnpm/@socketsecurity+socket-patch-linux-x64@4.0.0/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
+        ];
+        for p in global {
+            let p = Path::new(p);
+            assert_eq!(
+                upgrade_hint_for(InstallChannel::Npm, p),
+                "pnpm add -g @socketsecurity/socket-patch@latest",
+                "{}",
+                p.display()
+            );
+            assert_eq!(channel_label_for(InstallChannel::Npm, p), "pnpm");
+        }
+        // Yarn's global store is not pnpm's.
+        let yarn = Path::new(
+            "/home/u/.config/yarn/global/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
+        );
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, yarn),
+            "npm update -g @socketsecurity/socket-patch"
+        );
+        assert_eq!(channel_label_for(InstallChannel::Npm, yarn), "npm");
+    }
+
+    #[test]
+    fn pnpm_project_installs_get_pnpm_add() {
+        let isolated = "node_modules/.pnpm/@socketsecurity+socket-patch-linux-x64@4.0.0/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch";
+        let hoisted = "node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch";
+
+        // The default isolated linker: the `.pnpm` virtual store decides,
+        // even before the first `pnpm install` wrote a lockfile.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
+        let p = project.path().join(isolated);
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p),
+            "pnpm add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(channel_label_for(InstallChannel::Npm, &p), "pnpm");
+        // `node-linker=hoisted` has no `.pnpm`: pnpm-lock.yaml decides.
+        let p = project.path().join(hoisted);
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p),
+            "npm install @socketsecurity/socket-patch@latest"
+        );
+        std::fs::write(project.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p),
+            "pnpm add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(channel_label_for(InstallChannel::Npm, &p), "pnpm");
+
+        // A workspace root refuses a bare `pnpm add` (ERR_PNPM_ADDING_TO_ROOT)
+        // and the dependency may be declared by any member, so update it
+        // wherever it is declared.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("package.json"), "{}").unwrap();
+        std::fs::write(ws.path().join("pnpm-workspace.yaml"), "packages: [a]\n").unwrap();
+        let p = ws.path().join(isolated);
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p),
+            "pnpm update --recursive --latest @socketsecurity/socket-patch"
+        );
+    }
+
+    #[test]
+    fn labels_name_the_owning_node_manager() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
+        let bin = project
+            .path()
+            .join("node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch");
+        assert_eq!(channel_label_for(InstallChannel::Npm, &bin), "npm");
+        std::fs::write(project.path().join("vlt-lock.json"), "{}").unwrap();
+        assert_eq!(channel_label_for(InstallChannel::Npm, &bin), "vlt");
+        // Non-npm channels keep their path-independent label.
+        assert_eq!(
+            channel_label_for(InstallChannel::Homebrew, &bin),
+            channel_label(InstallChannel::Homebrew)
         );
     }
 
