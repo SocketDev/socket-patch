@@ -268,6 +268,16 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   vendored wiring alike, so the packages install unpatched. A run that leaves such a pin
   warns (`redirect_yarn_classic_berry_migration_risk` / `yarn_classic_berry_migration_risk`)
   unless `package.json` pins yarn classic through `"packageManager": "yarn@1…"`.
+- **yarn classic workspaces, vendored** — vendored mode wires
+  `resolved "file:./.socket/vendor/…"`, relative to the workspace root. Yarn 1 looks a
+  relative `file:` tarball up from the directory it runs in, so on a cold yarn cache
+  `yarn install`, `yarn add` or `yarn workspace <name> …` run from a member directory
+  fails ("Tarball is not in network and can not be located in cache"), whether or not the
+  member depends on the patched package (yarn 1.7.0, 1.10.1 and 1.22.22; no relative
+  spelling installs from both). Installs from the workspace root work, and warm the cache
+  for later member-directory commands. A vendored run in such a project warns
+  `yarn_classic_workspace_member_install_risk`; hosted mode, which pins an absolute URL,
+  is not affected.
 - **yarn classic git dependencies** — yarn 1 fetches a git pattern (`git+https:`,
   `git+ssh:`, `git:`, `ssh:`, a `….git` url, or a bare `https://github.com/<owner>/<repo>`)
   with git, using the lock entry's `resolved` as the remote, so a rewritten `resolved`
