@@ -1049,7 +1049,8 @@ project on the machine, and is silently reset by `cargo clean` or a cache prune.
 Cargo never re-checks a registry or `cargo vendor` crate's source files: it reuses the
 crate's compiled artifacts while the package id is unchanged. So after `apply` or
 `rollback` changes a crate's bytes, socket-patch deletes that crate's fingerprints
-(`.fingerprint/<crate>-<hash>/`, every version, profile and target triple) in the
+(`.fingerprint/<crate>-<hash>/`, or `build/<crate>/<hash>/fingerprint/` in the newer
+build-dir layout; every version, profile and target triple) in the
 project's build directories, and the next `cargo build` recompiles it and relinks its
 dependents. Those directories are `CARGO_TARGET_DIR` / `CARGO_BUILD_TARGET_DIR`,
 `CARGO_BUILD_BUILD_DIR`, `build.target-dir` / `build.build-dir` from the project's

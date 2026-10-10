@@ -215,34 +215,74 @@ fn is_fingerprint_of(dir_name: &str, crate_name: &str) -> bool {
         && same_crate(name, crate_name)
 }
 
-/// Every `.fingerprint` directory under `build_dir`: `<profile>/` and
-/// `<triple>/<profile>/`.
-fn fingerprint_dirs(build_dir: &Path) -> Vec<PathBuf> {
+/// Whether `dir_name` is a unit-hash directory of the build-dir layout
+/// cargo uses since `-Zbuild-dir-new-layout` (`<16 lowercase hex>`).
+fn is_unit_hash(dir_name: &str) -> bool {
+    dir_name.len() == 16
+        && dir_name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn subdirs(p: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(p)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Every profile directory under `build_dir` (`<profile>/` and
+/// `<triple>/<profile>/`): one holding a `.fingerprint` directory (the
+/// classic layout) or a `build/` directory (the new layout).
+fn profile_dirs(build_dir: &Path) -> Vec<PathBuf> {
+    let is_profile = |p: &Path| p.join(".fingerprint").is_dir() || p.join("build").is_dir();
     let mut out = Vec::new();
-    let subdirs = |p: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(p)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| e.path())
-            .collect()
-    };
     for level1 in subdirs(build_dir) {
-        let fp = level1.join(".fingerprint");
-        if fp.is_dir() {
-            out.push(fp);
+        if is_profile(&level1) {
+            out.push(level1);
             continue;
         }
-        for level2 in subdirs(&level1) {
-            let fp = level2.join(".fingerprint");
-            if fp.is_dir() {
-                out.push(fp);
-            }
-        }
+        out.extend(subdirs(&level1).into_iter().filter(|p| is_profile(p)));
     }
     out.sort();
     out
+}
+
+/// The fingerprint directories of `crate_names` in one profile directory,
+/// in both layouts cargo writes:
+/// * classic: `.fingerprint/<crate>-<16 hex>/`;
+/// * new (`-Zbuild-dir-new-layout`, the nightly default since 1.100):
+///   `build/<crate>/<16 hex>/fingerprint/`.
+fn crate_fingerprints(profile: &Path, crate_names: &[String]) -> Vec<PathBuf> {
+    let named = |p: &Path, pred: &dyn Fn(&str, &str) -> bool| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .is_some_and(|n| crate_names.iter().any(|c| pred(&n, c)))
+    };
+    let mut hits: Vec<PathBuf> = subdirs(&profile.join(".fingerprint"))
+        .into_iter()
+        .filter(|p| named(p, &is_fingerprint_of))
+        .collect();
+    for pkg in subdirs(&profile.join("build")) {
+        if !named(&pkg, &same_crate) {
+            continue;
+        }
+        for unit in subdirs(&pkg) {
+            let fp = unit.join("fingerprint");
+            if unit
+                .file_name()
+                .is_some_and(|n| is_unit_hash(&n.to_string_lossy()))
+                && fp.is_dir()
+            {
+                hits.push(fp);
+            }
+        }
+    }
+    hits.sort();
+    hits
 }
 
 /// Remove every fingerprint directory of `crate_names` under `dirs`.
@@ -252,22 +292,8 @@ pub fn invalidate(dirs: &[PathBuf], crate_names: &[String]) -> Invalidation {
         return out;
     }
     for dir in dirs {
-        for fp in fingerprint_dirs(dir) {
-            let Ok(entries) = std::fs::read_dir(&fp) else {
-                continue;
-            };
-            let mut hits: Vec<PathBuf> = entries
-                .flatten()
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                .filter(|e| {
-                    let name = e.file_name();
-                    let name = name.to_string_lossy();
-                    crate_names.iter().any(|c| is_fingerprint_of(&name, c))
-                })
-                .map(|e| e.path())
-                .collect();
-            hits.sort();
-            for hit in hits {
+        for profile in profile_dirs(dir) {
+            for hit in crate_fingerprints(&profile, crate_names) {
                 match std::fs::remove_dir_all(&hit) {
                     Ok(()) => out.removed.push(hit),
                     Err(e) => out.failed.push((hit, e.to_string())),
@@ -360,13 +386,43 @@ mod tests {
         let keep1 = mkfp(&target, "debug/.fingerprint/cfg-if-extra-0123456789abcdef");
         let keep2 = mkfp(&target, "debug/.fingerprint/app-0123456789abcdef");
         let keep3 = mkfp(&target, "debug/.fingerprint/cfg-if-notahash");
-        let inv = invalidate(&[target.clone()], &["cfg-if".to_string()]);
+        let inv = invalidate(std::slice::from_ref(&target), &["cfg-if".to_string()]);
         assert!(inv.failed.is_empty());
         assert_eq!(inv.removed.len(), 3, "{:?}", inv.removed);
         for p in [a, b, c] {
             assert!(!p.exists(), "{p:?} must be removed");
         }
         for p in [keep1, keep2, keep3] {
+            assert!(p.exists(), "{p:?} must be kept");
+        }
+    }
+
+    /// The new build-dir layout (`build/<crate>/<hash>/fingerprint/`, the
+    /// nightly default) is invalidated too; the classic layout's build-script
+    /// dirs (`build/<crate>-<hash>/`) and other crates are left alone.
+    #[test]
+    fn invalidates_the_new_build_dir_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("target");
+        let a = mkfp(&target, "debug/build/cfg-if/9a1d16c6d1ca6d4f/fingerprint");
+        let b = mkfp(
+            &target,
+            "aarch64-apple-darwin/release/build/cfg_if/00000000000000aa/fingerprint",
+        );
+        let out = mkfp(&target, "debug/build/cfg-if/9a1d16c6d1ca6d4f/out");
+        let keep1 = mkfp(&target, "debug/build/app/9a1d16c6d1ca6d4f/fingerprint");
+        let keep2 = mkfp(
+            &target,
+            "debug/build/cfg-if-extra/9a1d16c6d1ca6d4f/fingerprint",
+        );
+        let keep3 = mkfp(&target, "debug/build/cfg-if-0123456789abcdef/out");
+        let inv = invalidate(std::slice::from_ref(&target), &["cfg-if".to_string()]);
+        assert!(inv.failed.is_empty());
+        assert_eq!(inv.removed.len(), 2, "{:?}", inv.removed);
+        for p in [a, b] {
+            assert!(!p.exists(), "{p:?} must be removed");
+        }
+        for p in [out, keep1, keep2, keep3] {
             assert!(p.exists(), "{p:?} must be kept");
         }
     }
