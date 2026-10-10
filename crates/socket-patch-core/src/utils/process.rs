@@ -545,6 +545,30 @@ mod tests {
         let _ = path;
     }
 
+    /// Run a command whose program this test just wrote, tolerating
+    /// `ETXTBSY`. `fs::write` closed our handle, but tests run on parallel
+    /// threads: a sibling that forks between our `open` and its own `exec`
+    /// inherits the still-open write fd, and exec'ing the shim in that window
+    /// fails with "Text file busy" (os error 26). That is a fork/exec race,
+    /// not a property of the shim, so retry only that error, briefly — the
+    /// same pattern as `sanity_exec` and the CLI's `exec_freshly_written`.
+    #[cfg(unix)]
+    fn output_of_fresh_shim(make: impl Fn() -> Command) -> Output {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match make().output() {
+                Ok(out) => return out,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("spawn the shim: {e:?}"),
+            }
+        }
+    }
+
     /// An empty executable file — enough for the resolver, which only
     /// stats candidates.
     fn make_executable(path: &Path) {
@@ -668,7 +692,7 @@ mod tests {
             0,
             "no wrapper, no args of its own"
         );
-        let out = command_for(&program).output().expect("spawn the shim");
+        let out = output_of_fresh_shim(|| command_for(&program));
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             format!("resolved:{}", shim.display()),
