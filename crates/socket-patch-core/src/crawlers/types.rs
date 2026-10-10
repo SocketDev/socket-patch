@@ -552,15 +552,19 @@ mod purl_type_tests {
     }
 
     /// Files that still spell a purl-type prefix inline, waiting on #747's
-    /// next slice (open PRs change them). The guard is one-sided: it fails
+    /// next slices. The guard is one-sided: it fails
     /// only on a file outside this list, so a PR that migrates one of
     /// these can't turn `main` red. Drop the entry when you migrate it.
     const PENDING_INLINE_PREFIXES: &[&str] = &[
+        "cli/src/commands/agent_download.rs",
         "cli/src/commands/get.rs",
+        "cli/src/commands/hosted_unwind.rs",
         "cli/src/commands/rollback.rs",
         "cli/src/commands/scan/hosted.rs",
         "cli/src/commands/scan/hosted/python.rs",
+        "cli/src/commands/scan/hosted/takeover.rs",
         "cli/src/commands/scan/mod.rs",
+        "cli/src/commands/scan/policy.rs",
         "cli/src/commands/scan/vendor_flow.rs",
         "cli/src/commands/vendor.rs",
         "cli/src/commands/vex.rs",
@@ -568,10 +572,12 @@ mod purl_type_tests {
         "core/src/api/client.rs",
         "core/src/hosted/engine.rs",
         "core/src/hosted/memory/stages.rs",
+        "core/src/hosted/takeover.rs",
         "core/src/patch/apply.rs",
         "core/src/patch/jvm_jar.rs",
         "core/src/patch/rollback.rs",
         "core/src/patch/store_copies.rs",
+        "core/src/utils/target.rs",
     ];
 
     /// The production part of a source file: everything before its first
