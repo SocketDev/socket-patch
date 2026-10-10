@@ -182,8 +182,13 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
   explicitly disabled by the project. pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
-  remains enforced. pnpm <=10 does not need the setting. A project with no
-  `pnpm-workspace.yaml` that pins pnpm 9.0–10.4 (`packageManager`,
+  remains enforced. pnpm <=10 does not need the setting. An existing
+  `pnpm-workspace.yaml` with no keys (empty or only comments) gets the
+  root-only `packages:` list with the key, because pnpm 8–10.4 refuse a
+  workspace file that has keys but no `packages`. When the lock lists
+  workspace members (pnpm 8–10.4 read a keyless file as every nested
+  package), the file is left alone. A project with no
+  `pnpm-workspace.yaml` (or a keyless one) that pins pnpm 9.0–10.4 (`packageManager`,
   `devEngines`, `engines.pnpm`, or the pnpm that last installed
   `node_modules`) gets no file: there a root-only workspace makes
   `pnpm add <pkg>` fail with `ERR_PNPM_ADDING_TO_ROOT`. Re-run the scan after
