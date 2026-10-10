@@ -1,10 +1,9 @@
 //! Subprocess regression test: agent-mode `get <search-id> --json` must
 //! print exactly ONE JSON document when the download engine hits a HARD
 //! error (here: an unreadable manifest). The engine's fail-closed paths
-//! in `download_and_apply_patches_with` print the `{status: "error"}`
-//! envelope themselves via `report_error` and return it; `run()`'s agent
-//! path must not pretty-print the SAME envelope again (get's `--json`
-//! contract is one document on stdout).
+//! in `download_and_apply_patches_into` record the error into the caller's
+//! envelope and never print, so `run()` prints exactly one document (get's
+//! `--json` contract is one document on stdout).
 //!
 //! Subprocess (not in-process) because the contract is what the spawned
 //! binary PRINTS. Same harness recipe as `get_modes_e2e.rs`.
@@ -83,11 +82,14 @@ async fn search_get_json_engine_hard_error_prints_one_document() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!("stdout must be exactly one JSON document: {e}\nstdout:\n{stdout}")
     });
+    common::envelope::assert_envelope_invariants(&v, "get");
     assert_eq!(v["status"], "error", "envelope drifted: {v}");
+    // The shared manifest-load code (v5.0): unparseable is `manifest_invalid`.
+    assert_eq!(v["error"]["code"], "manifest_invalid", "{v}");
     assert!(
         v["error"]["message"]
             .as_str()
-            .is_some_and(|m| m.contains("Failed to read manifest")),
+            .is_some_and(|m| m.contains("Invalid manifest at")),
         "error message drifted: {v}"
     );
 }

@@ -1315,7 +1315,7 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
             );
             let env = envelope(&out, &report.what("scan --mode hosted"));
             assert!(
-                env["redirect"]["redirected"].as_u64().unwrap_or(0) >= 1,
+                env["summary"]["applied"].as_u64().unwrap_or(0) >= 1,
                 "{}: nothing redirected: {env:#}",
                 report.what("scan --mode hosted")
             );
@@ -1723,8 +1723,17 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
             |f: &str| String::from_utf8_lossy(&std::fs::read(proj.join(f)).unwrap()).contains(uuid);
         match out.status.code() {
             Some(0) => {
+                // v5.0 rollback envelope: restored pins are `rolledBack`
+                // events with `details.mode: "hosted"`.
+                let reverted: Vec<&Value> = env["events"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|e| e["action"] == "rolledBack" && e["details"]["mode"] == "hosted")
+                    .map(|e| &e["purl"])
+                    .collect();
                 assert_eq!(
-                    env["hosted"]["reverted"],
+                    json!(reverted),
                     json!([built.purl]),
                     "{}:\n{}",
                     report.what("revert"),
@@ -1753,8 +1762,12 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                 dump(&out)
             ),
             _ => {
-                let error = env["hosted"]["failed"][0]["error"]
-                    .as_str()
+                let error = env["events"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|e| e["action"] == "failed" && e["details"]["mode"] == "hosted")
+                    .and_then(|e| e["error"].as_str())
                     .unwrap_or_default()
                     .to_string();
                 assert!(

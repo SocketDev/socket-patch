@@ -86,6 +86,9 @@
 //! equal `bun --version`, so a CI leg cannot pass by running the wrong bun
 //! or no bun at all.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "common/mod.rs"]
 mod common;
 use common::binary;
@@ -1190,7 +1193,7 @@ fn assert_unscoped_rollback_restores_pristine(fx: &Fixture, proj: &Path, tag: &s
         "rollback envelope ({tag}): {env:#}"
     );
     assert_eq!(
-        env["hosted"]["failed"],
+        rollback_json::hosted_failed(&env),
         json!([]),
         "rollback ({tag}) must not fail any hosted purl: {env:#}"
     );
@@ -1258,8 +1261,8 @@ fn take_over_to_hosted(fx: &Fixture, proj: &Path, api: &str, hp: &HostedPatch, t
     assert_eq!(code, 0, "hosted scan failed ({tag}): {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
-    let codes = codes_in(&env["redirect"]["warnings"]);
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
+    let codes = codes_in(&env["warnings"]);
     assert!(
         codes
             .iter()
@@ -1401,7 +1404,9 @@ fn take_over_to_vendored(
             );
             let env = envelope(&stdout, &stderr);
             assert_eq!(env["status"], "success", "{env:#}");
-            env["vendor"].clone()
+            // v5.0: the vendor engine's events are merged into scan's
+            // envelope (no nested `vendor`).
+            env
         }
     };
     assert_eq!(vendor_env["status"], "success", "{vendor_env:#}");
@@ -1557,7 +1562,7 @@ async fn bun_hosted_then_vendored_takeover_round_trips_to_registry() {
     let (code, stdout, stderr) = hosted_scan(&proj, &server.uri(), &[]);
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     assert_pure_hosted(&fx, &proj, hp);
     let fresh = fresh_frozen_install(&fx, &proj, "fresh-hosted");
     assert_installed(&fresh, &DEP_A, &fx.a.patched, "hosted fresh install");
@@ -1599,7 +1604,7 @@ async fn bun_hosted_then_vendored_takeover_round_trips_to_registry() {
     let (code, stdout, stderr) = vendored_scan(&by_scan, &server.uri(), &[]);
     assert_eq!(code, 0, "vendored re-run failed: {stdout}\n{stderr}");
     let rerun = envelope(&stdout, &stderr);
-    let codes = event_codes(&rerun["vendor"]);
+    let codes = event_codes(&rerun);
     assert!(
         codes.iter().any(|c| c == "already_vendored")
             && !codes
@@ -1676,10 +1681,13 @@ async fn bun_dry_run_previews_match_wet_outcomes() {
     );
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(env["vendor"]["dryRun"], true, "{env:#}");
-    let preview = env["vendor"]["patches"]
+    assert_eq!(env["dryRun"], true, "{env:#}");
+    let preview = env["events"]
         .as_array()
-        .and_then(|p| p.iter().find(|p| p["purl"] == DEP_A.purl))
+        .and_then(|p| {
+            p.iter()
+                .find(|p| p["purl"] == DEP_A.purl && p["details"]["mode"] == "vendored")
+        })
         .unwrap_or_else(|| {
             panic!(
                 "expected a vendored preview record for {}: {env:#}",
@@ -1687,8 +1695,8 @@ async fn bun_dry_run_previews_match_wet_outcomes() {
             )
         });
     assert_eq!(
-        preview["action"], "would_vendor",
-        "the vendored preview over a live hosted bun redirect must classify `would_vendor` \
+        preview["action"], "verified",
+        "the vendored preview over a live hosted bun redirect must preview vendoring \
          (the wet run takes over and vendors): {env:#}"
     );
     assert!(
@@ -1728,8 +1736,8 @@ async fn bun_dry_run_previews_match_wet_outcomes() {
         "scan --mode hosted --dry-run must succeed: {stdout}\n{stderr}"
     );
     let env = envelope(&stdout, &stderr);
-    assert_eq!(env["redirect"]["dryRun"], true, "{env:#}");
-    let codes = codes_in(&env["redirect"]["warnings"]);
+    assert_eq!(env["dryRun"], true, "{env:#}");
+    let codes = codes_in(&env["warnings"]);
     assert!(
         codes.iter().any(|c| c == "redirect_would_revert_vendored"),
         "the hosted preview must announce the vendored takeover: {codes:?}\n{env:#}"
@@ -1790,7 +1798,7 @@ async fn bun_scoped_rollback_and_remove_unwind_one_of_two_hosted_records() {
     let (code, stdout, stderr) = hosted_scan(&proj, &server.uri(), &[]);
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
-    assert_eq!(env["redirect"]["redirected"], 2, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 2, "{env:#}");
     let lock = read(&proj, "bun.lock");
     for hp in [a, b] {
         assert_eq!(
@@ -1817,9 +1825,12 @@ async fn bun_scoped_rollback_and_remove_unwind_one_of_two_hosted_records() {
     assert_eq!(code, 0, "scoped rollback must succeed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(env["hosted"]["reverted"], json!([DEP_A.purl]), "{env:#}");
-    assert_eq!(env["hosted"]["failed"], json!([]), "{env:#}");
-    assert_eq!(env["hosted"]["unsupported"], json!([]), "{env:#}");
+    assert_eq!(
+        rollback_json::hosted_reverted(&env),
+        json!([DEP_A.purl]),
+        "{env:#}"
+    );
+    assert_eq!(rollback_json::hosted_failed(&env), json!([]), "{env:#}");
     assert_only_a_unwound(&fx, &by_rollback, b, "scoped-rollback");
     // Then the unscoped rollback restores the remaining pin ⇒ pristine.
     assert_unscoped_rollback_restores_pristine(&fx, &by_rollback, "after-scoped-rollback");
@@ -1905,14 +1916,29 @@ async fn bun_rollback_from_each_mixed_state_restores_pristine() {
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["status"], "success", "{env:#}");
     assert_eq!(
-        env["vendoredReverted"],
+        rollback_json::vendored_reverted(&env),
         json!([DEP_A.purl]),
         "rollback must unwire the vendored purl: {env:#}"
     );
-    assert_eq!(env["vendoredFailed"], json!([]), "{env:#}");
+    assert_eq!(rollback_json::vendored_failed(&env), json!([]), "{env:#}");
     assert_pristine_unwound(&fx, &two, "rollback (mixed-2)");
     let fresh = fresh_frozen_install(&fx, &two, "fresh-rolled-back-mixed-2");
     assert_installed(&fresh, &DEP_A, &fx.a.orig, "after rollback (mixed-2)");
     assert_installed(&fresh, &DEP_B, &fx.b.orig, "after rollback (mixed-2)");
     eprintln!("ROLLBACK OK (mixed-2, bun {})", fx.bun_raw);
+}
+
+/// How many hosted pins a `scan --mode hosted --json` run wrote (or would
+/// write, on a dry run): its `applied` / `verified` events with
+/// `details.mode: "hosted"`.
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

@@ -816,12 +816,9 @@ fn test_pypi_macos_global_auto_discovery() {
     // numeric, the packages array must be well-formed, and the patched-subset
     // count cannot exceed the total scanned. These hold regardless of host and
     // reject a malformed/partial envelope that happens to carry a number.
-    for field in [
-        "packagesWithPatches",
-        "totalPatches",
-        "freePatches",
-        "paidPatches",
-    ] {
+    // v5.0 dropped the derivable discovery counters (`packagesWithPatches`,
+    // `totalPatches`, `freePatches`, `paidPatches`).
+    for field in ["scannedPackages", "lockfileOnlyPackages"] {
         assert!(
             scan[field].is_u64(),
             "{field} should be a number, got: {}",
@@ -831,15 +828,10 @@ fn test_pypi_macos_global_auto_discovery() {
     let packages = scan["packages"]
         .as_array()
         .expect("packages should be an array");
-    let with_patches = scan["packagesWithPatches"].as_u64().unwrap();
-    assert_eq!(
-        packages.len() as u64,
-        with_patches,
-        "packages array length must equal packagesWithPatches"
-    );
+    let with_patches = packages.len() as u64;
     assert!(
         with_patches <= scanned,
-        "packagesWithPatches ({with_patches}) cannot exceed scannedPackages ({scanned})"
+        "packages with patches ({with_patches}) cannot exceed scannedPackages ({scanned})"
     );
 }
 

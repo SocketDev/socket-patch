@@ -444,7 +444,7 @@ async fn hosted_takeover_migrates_parent_and_child() {
         assert!(!text.contains(code), "{code}: {env:#}");
     }
     assert_clean_unwind(&env);
-    assert_eq!(env["redirect"]["redirected"], 2, "{env:#}");
+    assert_eq!(hosted_pin_count(&env), 2, "{env:#}");
     let lock = read_lock(root);
     assert!(
         !lock.contains(".socket/vendor/"),
@@ -454,4 +454,19 @@ async fn hosted_takeover_migrates_parent_and_child() {
         assert!(lock.contains(&hosted_url(purl)), "{purl} pinned:\n{lock}");
     }
     assert!(vendored_uuids(root).is_empty());
+}
+
+/// How many hosted pins the run wrote (`applied`) or, on a dry run, would
+/// write (`verified`): the `details.mode: "hosted"` events (v5.0's
+/// `redirect.redirected`).
+fn hosted_pin_count(envelope: &serde_json::Value) -> usize {
+    envelope["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count()
 }

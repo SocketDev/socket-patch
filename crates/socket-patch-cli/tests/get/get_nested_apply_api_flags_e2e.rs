@@ -183,7 +183,7 @@ async fn get_by_uuid_nested_apply_uses_api_flags_not_env() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("valid JSON expected: {e}\nstdout={stdout}"));
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["applied"], 1, "stdout={stdout}");
+    assert_eq!(v["summary"]["applied"], 1, "stdout={stdout}");
 
     let patched = tmp.path().join("node_modules").join(PKG).join("index.js");
     assert_eq!(
@@ -235,7 +235,7 @@ async fn get_by_purl_nested_apply_uses_api_flags_not_env() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("valid JSON expected: {e}\nstdout={stdout}"));
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["applied"], 1, "stdout={stdout}");
+    assert_eq!(v["summary"]["applied"], 1, "stdout={stdout}");
 
     let patched = tmp.path().join("node_modules").join(PKG).join("index.js");
     assert_eq!(

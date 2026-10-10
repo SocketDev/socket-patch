@@ -773,7 +773,7 @@ fn poetry_hosted_fresh_install_then_manifestless_vex() {
         ],
     );
     assert_eq!(code, Some(0), "scan --mode hosted: {env}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
     let lock = std::fs::read_to_string(project.join("poetry.lock")).unwrap();
     let sha = hex::encode(Sha256::digest(&wheel));
     assert!(
@@ -798,7 +798,7 @@ fn poetry_hosted_fresh_install_then_manifestless_vex() {
 
     // Poetry < 1.4 keeps an already-installed same-version package; the
     // writer says so (and, for lock 1.0, names the pip window below).
-    let stale_risk = env["redirect"]["warnings"]
+    let stale_risk = env["warnings"]
         .as_array()
         .into_iter()
         .flatten()
@@ -886,7 +886,7 @@ fn poetry_hosted_fresh_install_then_manifestless_vex() {
     );
     assert_eq!(code, Some(0), "rollback: {env}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        crate::rollback_json::hosted_reverted(&env),
         json!([PURL]),
         "rollback restores the hosted pin: {env}"
     );
@@ -1110,7 +1110,13 @@ fn poetry_vendored_revendors_to_a_superseding_patch() {
     let wired_a = std::fs::read_to_string(project.join("poetry.lock")).unwrap();
     let (code, env) = vendor(&service_b, true);
     assert_eq!(code, Some(0), "dry-run re-vendor: {env}");
-    assert!(env.to_string().contains("would_revendor"), "{env}");
+    // A re-vendor preview is a `verified` event naming the uuid it replaces.
+    assert!(
+        env["events"].as_array().is_some_and(|e| e
+            .iter()
+            .any(|e| e["action"] == "verified" && e["oldUuid"].is_string())),
+        "{env}"
+    );
     assert_eq!(
         std::fs::read_to_string(project.join("poetry.lock")).unwrap(),
         wired_a,

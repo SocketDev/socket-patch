@@ -375,7 +375,7 @@ pub fn vex_doc_attests(path: &Path, t: &PatchTarget) -> bool {
 
 /// The `reason` of the envelope event carrying `code`.
 pub fn event_reason(doc: &Value, code: &str) -> String {
-    [&doc["events"], &doc["vendor"]["events"]]
+    [&doc["events"]]
         .into_iter()
         .filter_map(|e| e.as_array())
         .flatten()

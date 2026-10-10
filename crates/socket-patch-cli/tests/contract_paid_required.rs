@@ -1,10 +1,10 @@
 //! #982: CLI_CONTRACT.md's paid-plan contract matches what ships.
 //!
-//! `get --json` reports a paid-only result through its legacy top-level
-//! `status: "paid_required"` (one emitter), and no command emits the
-//! envelope status `paidRequired`, so the contract must neither list that
-//! status nor describe `paid_required` as an event tag `scan` emits. The
-//! emitted shape itself is pinned by the `--test get paid` tests.
+//! v5.0: `get --json` reports a paid-only result on the shared envelope,
+//! `status: "paidRequired"` with one `skipped` / `paid_required` event per
+//! patch (exit 0). The legacy top-level `status: "paid_required"` shape is
+//! retired, and `scan` never reports the outcome. The emitted shape itself
+//! is pinned by the `--test get paid` tests.
 
 use std::path::Path;
 
@@ -23,34 +23,37 @@ fn contract_paid_required_row_matches_get() {
         .find(|l| l.starts_with("| `paid_required`"))
         .expect("CLI_CONTRACT.md documents `paid_required`");
     assert!(
-        row.contains(r#""status": "paid_required""#),
-        "the row names the status spelling `get` emits: {row}"
+        row.contains("`paidRequired`"),
+        "the row names the envelope status `get` emits: {row}"
     );
     assert!(
-        !row.contains("paidRequired"),
-        "no command emits the envelope status `paidRequired`: {row}"
+        !row.contains(r#""status": "paid_required""#),
+        "the legacy top-level shape is retired: {row}"
     );
     assert!(
         row.contains("`scan` never reports it"),
         "scan has no paid_required outcome: {row}"
     );
     assert!(
-        !contract.contains("\"paidRequired\""),
-        "the envelope status enum must not list `paidRequired`"
+        contract.contains("\"paidRequired\""),
+        "the envelope status enum lists `paidRequired`"
     );
 }
 
 #[test]
-fn get_writes_the_paid_required_shape_once() {
+fn get_emits_the_paid_required_envelope_status() {
     let get = read("src/commands/get.rs");
-    assert_eq!(
-        get.matches(r#""status": "paid_required""#).count(),
-        1,
-        "both paid paths share one emitter"
+    assert!(
+        !get.contains(r#""status": "paid_required""#),
+        "get no longer prints the legacy paid shape"
+    );
+    assert!(
+        get.contains("Status::PaidRequired"),
+        "get reports paid-only results through the envelope status"
     );
     let envelope = read("src/json_envelope.rs");
     assert!(
-        !envelope.contains("PaidRequired"),
-        "the envelope has no paid status variant"
+        envelope.contains("PaidRequired"),
+        "the envelope carries the paid status variant"
     );
 }

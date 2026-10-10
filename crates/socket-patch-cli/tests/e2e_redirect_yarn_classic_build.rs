@@ -570,7 +570,7 @@ async fn classic_hosted_project(
         // #364: the mirror would serve the upstream tarball under the hosted
         // URL's basename, so nothing is pinned, counted or attested.
         assert_eq!(
-            env["redirect"]["redirected"], 0,
+            env["summary"]["applied"], 0,
             "a mirrored project must not count a redirect: {env}"
         );
         assert!(
@@ -604,10 +604,7 @@ async fn classic_hosted_project(
         "{driver:?} --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(
-        env["redirect"]["redirected"], 1,
-        "one dep redirected: {env}"
-    );
+    assert_eq!(env["summary"]["applied"], 1, "one dep redirected: {env}");
 
     // Lockfile pin: hosted URL + #sha1 fragment + the recomputed integrity.
     let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();

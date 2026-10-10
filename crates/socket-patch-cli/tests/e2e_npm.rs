@@ -424,9 +424,9 @@ fn test_npm_global_lifecycle() {
         "scan should match patch {NPM_UUID} for minimist, got patches: {patches:#?}"
     );
     assert!(
-        scan["packagesWithPatches"].as_u64().unwrap_or(0) >= 1,
-        "packagesWithPatches should be >= 1, got: {}",
-        scan["packagesWithPatches"]
+        !packages.is_empty(),
+        "packages (with patches) should be >= 1, got: {}",
+        scan["packages"]
     );
 
     // -- GET: download + apply patch globally --------------------------------
@@ -684,26 +684,17 @@ fn test_npm_macos_global_auto_discovery() {
             scan["scannedPackages"]
         )
     });
-    let with_patches = scan["packagesWithPatches"].as_u64().unwrap_or_else(|| {
-        panic!(
-            "packagesWithPatches should be a number, got: {}",
-            scan["packagesWithPatches"]
-        )
-    });
     let packages = scan["packages"]
         .as_array()
         .expect("scan -g should emit a packages array");
+    // v5.0 dropped `packagesWithPatches`: `packages` lists exactly them.
+    let with_patches = packages.len() as u64;
     // Discovery invariant: every package-with-a-patch was a scanned package,
     // and the `packages` list (packages carrying patches) cannot exceed the
     // total scanned count.
     assert!(
         with_patches <= scanned,
-        "packagesWithPatches ({with_patches}) must not exceed scannedPackages ({scanned})"
-    );
-    assert_eq!(
-        packages.len() as u64,
-        with_patches,
-        "packages array length should equal packagesWithPatches"
+        "packages with patches ({with_patches}) must not exceed scannedPackages ({scanned})"
     );
 }
 

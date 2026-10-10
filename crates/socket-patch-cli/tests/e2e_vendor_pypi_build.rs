@@ -1348,13 +1348,13 @@ async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
     // "applied" (structurally zero — the nested apply never runs).
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["found"], 1, "envelope: {env}");
-    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert_eq!(env["command"], "get", "envelope: {env}");
+    assert_eq!(env["summary"]["downloaded"], 1, "envelope: {env}");
     assert!(
         env.get("applied").is_none(),
         "vendored get must drop 'applied': {env}"
     );
-    assert_vendored_applied(&env["vendor"]);
+    assert_vendored_applied(&env);
 
     // get wrote NO manifest and NO blobs: the ledger's detached entry, keyed
     // by the suite's bare pypi purl, is the record.

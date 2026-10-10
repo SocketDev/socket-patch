@@ -31,7 +31,10 @@ use crate::commands::vlt_preflight::{
     vlt_refusal_for, vlt_vendor_preflight_selected, VltVendorRefusal,
 };
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
-use crate::ui::print_json;
+use crate::json_envelope::{
+    Command as EnvelopeCommand, Envelope, EnvelopeError, PatchAction as EventAction, PatchEvent,
+    RunWarning,
+};
 
 /// The closing error printed when the nested apply failed. Apply's own
 /// per-package `Error: Failed to patch …` lines print above it, even
@@ -52,18 +55,12 @@ pub(crate) enum PatchAction {
     Skipped,
 }
 
-/// Compute the `(status, exit_code)` pair for a download+apply run.
-///
-/// A non-zero exit code must ALWAYS pair with a non-`success` status:
-/// both are derived from the same predicate here so a JSON consumer
-/// reading `status` and a shell reading `$?` can never disagree (a failed
-/// *apply* step must not report `success`).
-pub(crate) fn run_outcome(patches_failed: bool, apply_failed: bool) -> (&'static str, i32) {
-    if patches_failed || apply_failed {
-        ("partial_failure", 1)
-    } else {
-        ("success", 0)
-    }
+/// The exit code of a download+apply run: 1 when a patch failed to
+/// download or the nested apply failed. Every such run also records a
+/// `failed` event ([`record_apply_outcome`] guarantees one for a failed
+/// apply), so the envelope's `partialFailure` status and `$?` agree.
+pub(crate) fn run_outcome(patches_failed: bool, apply_failed: bool) -> i32 {
+    i32::from(patches_failed || apply_failed)
 }
 
 /// Classify what `download_and_apply_patches_with` will do to a given PURL based on
@@ -163,55 +160,41 @@ pub(crate) fn patch_event_metadata(patch: &PatchResponse) -> serde_json::Value {
     serde_json::Value::Object(meta)
 }
 
-/// Merge a metadata object (from [`patch_event_metadata`]) into a
-/// per-patch action record. Convenience wrapper that handles the
-/// unwrap of `Value::Object`.
-pub(crate) fn merge_metadata(record: &mut serde_json::Value, meta: serde_json::Value) {
-    if let (Some(record_obj), serde_json::Value::Object(meta_obj)) = (record.as_object_mut(), meta)
-    {
-        for (k, v) in meta_obj {
-            record_obj.insert(k, v);
-        }
+/// Merge `mode` (`"vendored"` / `"hosted"`) into an event's `details`, the
+/// leg tag every vendored- and hosted-leg event carries (rule shared with
+/// `list`). Agent-mode events carry no mode.
+pub(crate) fn tag_mode(mut event: PatchEvent, mode: Option<&str>) -> PatchEvent {
+    if let Some(mode) = mode {
+        let mut details = event
+            .details
+            .take()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        details["mode"] = serde_json::json!(mode);
+        event.details = Some(details);
     }
+    event
 }
 
-/// Report an error to the caller: a `{status: "error", error: {code,
-/// message}}` object on stdout when `json` is true, otherwise a plain
-/// `Error: ...` on stderr. Every top-level `get` failure goes through here
-/// (or [`report_lock_failure`]) so the error shape cannot drift.
-pub(crate) fn report_error(json: bool, code: &str, message: impl std::fmt::Display) {
-    let message = message.to_string();
-    if json {
-        crate::json_envelope::print_legacy_error(code, &message);
-    } else {
-        eprintln!("Error: {message}");
-    }
-}
-
-/// Report a failed apply-lock acquire in get's legacy error shape — the
-/// `{status: "error", error: {code, message}}` object every other hard
-/// error here uses, with the stable code (`lock_held` / `lock_io`) the
-/// other lock sites emit — and return it for the caller's early-return
-/// guard. The message/code mapping is
-/// [`crate::commands::lock_cli::lock_failure`]'s, so the waited clause and
-/// the I/O rendering cannot drift from `apply`'s.
+/// Report a failed apply-lock acquire: the human lock error on stderr
+/// (unless `json`), and the `{code, message}` (`lock_held` / `lock_io`) the
+/// caller's envelope carries as its top-level `error`. The message/code
+/// mapping is [`crate::commands::lock_cli::lock_failure`]'s, so the waited
+/// clause and the I/O rendering cannot drift from `apply`'s.
 pub(crate) fn report_lock_failure(
     json: bool,
     socket_dir: &Path,
     err: &LockError,
     timeout: Duration,
-) -> serde_json::Value {
+) -> EnvelopeError {
     let (code, message) = lock_failure(err, timeout);
-    let envelope = crate::json_envelope::legacy_error(code, &message);
-    if json {
-        print_json(&envelope);
-    } else {
+    if !json {
         eprint!(
             "{}",
             crate::commands::lock_cli::format_lock_error(socket_dir, err, timeout)
         );
     }
-    envelope
+    EnvelopeError::new(code, message)
 }
 
 /// Decode a base64 string and store it as the blob `blobs_dir/hash`
@@ -700,8 +683,6 @@ pub(crate) struct FetchedPatch {
 
 /// What the shared fetch loop produced over one selection.
 pub(crate) struct FetchBatch {
-    /// Selection size after installed-release narrowing.
-    found: usize,
     skipped: usize,
     /// Manifest store only: the `skipped` patches whose same uuid is
     /// already recorded — still owed a nested apply, since the installed
@@ -713,10 +694,15 @@ pub(crate) struct FetchBatch {
     /// Ledger store only: `(purl, record)` reused from a detached entry
     /// already at the selected uuid (no fetch).
     reused: Vec<(String, PatchRecord)>,
-    /// Per-patch JSON records in selection order (the contract vocabulary).
-    patches_json: Vec<serde_json::Value>,
+    /// Per-patch events in selection order (the envelope vocabulary):
+    /// `downloaded` / `updated` (+ `oldUuid`) with the patch metadata in
+    /// `details`, `skipped` (`already_in_manifest`), `failed` (+ code).
+    /// Ledger-store events carry `details.mode: "vendored"`.
+    events: Vec<PatchEvent>,
     /// Release-narrowing fallbacks (uninstalled base, no matching variant).
     warnings: Vec<String>,
+    /// `Some("vendored")` for the ledger store (see [`tag_mode`]).
+    mode: Option<&'static str>,
 }
 
 impl FetchBatch {
@@ -727,27 +713,34 @@ impl FetchBatch {
         &mut self,
         json: bool,
         line: Option<String>,
-        purl: &str,
-        uuid: &str,
+        (purl, uuid): (&str, &str),
+        error_code: &str,
         error: &str,
-        error_code: Option<&str>,
     ) {
         if let (false, Some(line)) = (json, line) {
             eprintln!("  {line}");
         }
-        let mut record = serde_json::json!({
-            "purl": purl,
-            "uuid": uuid,
-            "action": "failed",
-        });
-        if let Some(code) = error_code {
-            record["errorCode"] = serde_json::json!(code);
-        }
-        record["error"] = serde_json::json!(error);
-        self.patches_json.push(record);
+        self.events.push(tag_mode(
+            PatchEvent::new(EventAction::Failed, purl)
+                .with_uuid(uuid)
+                .with_error(error_code, error),
+            self.mode,
+        ));
         self.failed += 1;
     }
 }
+
+/// `errorCode` of a patch whose view could not be fetched (network error,
+/// 404).
+pub(crate) const DOWNLOAD_FAILED: &str = "download_failed";
+/// `errorCode` of a fetched patch with no file it could record.
+pub(crate) const PATCH_NO_APPLICABLE_FILES: &str = "patch_no_applicable_files";
+/// `errorCode` of a patch whose blob content could not be decoded or
+/// written.
+pub(crate) const BLOB_WRITE_FAILED: &str = "blob_write_failed";
+/// `errorCode` of the `skipped` event for a selected patch the manifest
+/// already records at the same uuid (agent mode still re-applies it).
+pub(crate) const ALREADY_IN_MANIFEST: &str = "already_in_manifest";
 
 /// The vendored-mode preflight verdicts the download phase refuses by
 /// (Bun's project-level one, vlt's per purl); agent downloads pass none.
@@ -944,14 +937,17 @@ pub(crate) async fn fetch_selected_patches(
     }
 
     let mut batch = FetchBatch {
-        found: selected.len(),
         skipped: 0,
         already_recorded: 0,
         failed: 0,
         fetched: Vec::new(),
         reused: Vec::new(),
-        patches_json: Vec::new(),
+        events: Vec::new(),
         warnings,
+        mode: match store {
+            RecordStore::Ledger(_) => Some("vendored"),
+            RecordStore::Manifest(_) => None,
+        },
     };
 
     // The view GETs the loop below makes — every patch past the refusal
@@ -992,10 +988,9 @@ pub(crate) async fn fetch_selected_patches(
             batch.fail(
                 params.json,
                 Some(format!("[error] {purl} ({code}): {detail}")),
-                purl,
-                uuid,
+                (purl, uuid),
+                code,
                 detail,
-                Some(code),
             );
             continue;
         }
@@ -1006,11 +1001,9 @@ pub(crate) async fn fetch_selected_patches(
             if !quiet {
                 eprintln!("{}", format_record_skip(purl, "already vendored"));
             }
-            batch.patches_json.push(serde_json::json!({
-                "purl": purl,
-                "uuid": uuid,
-                "action": "skipped",
-            }));
+            // No event: the reused record goes to the vendor engine, whose
+            // own event (`already_vendored`, `rebuilt`, …) is the package's
+            // account.
             batch.reused.push((purl.to_string(), record));
             batch.skipped += 1;
             continue;
@@ -1024,10 +1017,9 @@ pub(crate) async fn fetch_selected_patches(
             batch.fail(
                 params.json,
                 Some(format!("[error] {purl} ({code}): {detail}")),
-                purl,
-                uuid,
+                (purl, uuid),
+                code,
                 detail,
-                Some(code),
             );
             continue;
         }
@@ -1057,10 +1049,9 @@ pub(crate) async fn fetch_selected_patches(
                 batch.fail(
                     params.json,
                     Some(format!("[fail] {purl} (could not fetch details)")),
-                    purl,
-                    uuid,
+                    (purl, uuid),
+                    DOWNLOAD_FAILED,
                     "could not fetch details",
-                    None,
                 );
                 continue;
             }
@@ -1068,10 +1059,9 @@ pub(crate) async fn fetch_selected_patches(
                 batch.fail(
                     params.json,
                     Some(format!("[fail] {purl} ({e})")),
-                    purl,
-                    uuid,
+                    (purl, uuid),
+                    DOWNLOAD_FAILED,
                     &e.to_string(),
-                    None,
                 );
                 continue;
             }
@@ -1095,11 +1085,11 @@ pub(crate) async fn fetch_selected_patches(
             if !quiet {
                 eprintln!("{}", format_record_skip(&patch.purl, "already in manifest"));
             }
-            batch.patches_json.push(serde_json::json!({
-                "purl": patch.purl,
-                "uuid": patch.uuid,
-                "action": "skipped",
-            }));
+            batch.events.push(
+                PatchEvent::new(EventAction::Skipped, patch.purl.as_str())
+                    .with_uuid(patch.uuid.as_str())
+                    .with_reason(ALREADY_IN_MANIFEST, "already in manifest"),
+            );
             batch.skipped += 1;
             batch.already_recorded += 1;
             continue;
@@ -1119,10 +1109,9 @@ pub(crate) async fn fetch_selected_patches(
                     "[fail] {} (patch has no applicable files)",
                     patch.purl
                 )),
-                &patch.purl,
-                &patch.uuid,
+                (&patch.purl, &patch.uuid),
+                PATCH_NO_APPLICABLE_FILES,
                 "patch has no applicable files",
-                None,
             );
             continue;
         }
@@ -1137,26 +1126,38 @@ pub(crate) async fn fetch_selected_patches(
                     batch.fail(
                         params.json,
                         None,
-                        &patch.purl,
-                        &patch.uuid,
+                        (&patch.purl, &patch.uuid),
+                        BLOB_WRITE_FAILED,
                         "Blob decode or write failed",
-                        None,
                     );
                     continue;
                 }
             }
         }
 
-        let (label, tag) = match (store, &action) {
-            (RecordStore::Ledger(_), _) => ("downloaded", "fetch"),
-            (RecordStore::Manifest(_), PatchAction::Updated { .. }) => ("updated", "update"),
-            (RecordStore::Manifest(_), _) => ("added", "add"),
+        let tag = match (store, &action) {
+            (RecordStore::Ledger(_), _) => "fetch",
+            (RecordStore::Manifest(_), PatchAction::Updated { .. }) => "update",
+            (RecordStore::Manifest(_), _) => "add",
         };
-        let mut record = serde_json::json!({
-            "purl": patch.purl,
-            "uuid": patch.uuid,
-            "action": label,
-        });
+        // Description / severity / vulnerability IDs ride `details` so
+        // PR-comment bots, dashboards, and CLI consumers can render the
+        // patch without a second round-trip to the API.
+        let mut details = patch_event_metadata(&patch);
+        let mut event = match (store, &action) {
+            // A manifest replacement is the envelope's `updated` (+ oldUuid).
+            (RecordStore::Manifest(_), PatchAction::Updated { old_uuid }) => {
+                PatchEvent::new(EventAction::Updated, patch.purl.as_str()).with_old_uuid(old_uuid)
+            }
+            // The vendor ledger tracks patch generations, not the download:
+            // a fetched replacement is still `downloaded`, naming the uuid
+            // it will replace in `details.oldUuid`.
+            (RecordStore::Ledger(_), PatchAction::Updated { old_uuid }) => {
+                details["oldUuid"] = serde_json::json!(old_uuid);
+                PatchEvent::new(EventAction::Downloaded, patch.purl.as_str())
+            }
+            _ => PatchEvent::new(EventAction::Downloaded, patch.purl.as_str()),
+        };
         if let PatchAction::Updated { old_uuid } = &action {
             if !quiet {
                 // Defensive: a malformed/short UUID in the store must not
@@ -1167,15 +1168,11 @@ pub(crate) async fn fetch_selected_patches(
                     crate::ui::short_uuid(old_uuid)
                 );
             }
-            record["oldUuid"] = serde_json::json!(old_uuid);
         } else if !quiet {
             eprintln!("  [{tag}] {}", normalize_purl(&patch.purl));
         }
-        // Splice description / severity / vulnerability IDs into the record
-        // so PR-comment bots, dashboards, and CLI consumers can render the
-        // patch without a second round-trip to the API.
-        merge_metadata(&mut record, patch_event_metadata(&patch));
-        batch.patches_json.push(record);
+        event = event.with_uuid(patch.uuid.as_str()).with_details(details);
+        batch.events.push(tag_mode(event, batch.mode));
         batch.fetched.push(FetchedPatch {
             patch,
             files,
@@ -1186,8 +1183,46 @@ pub(crate) async fn fetch_selected_patches(
     batch
 }
 
-/// Download status and patch records used to verify server artifacts.
-pub(crate) type DetachedDownload = (i32, serde_json::Value, HashMap<String, PatchRecord>);
+/// What the detached (vendored) download phase produced: its exit code
+/// (1 when a patch failed or was refused), the per-patch events (each
+/// `details.mode: "vendored"`) and run-level warnings for the caller's
+/// envelope, how many patches failed, and the records the vendor step
+/// consumes.
+pub(crate) struct DetachedDownload {
+    pub(crate) code: i32,
+    pub(crate) events: Vec<PatchEvent>,
+    pub(crate) warnings: Vec<RunWarning>,
+    pub(crate) failed: usize,
+    pub(crate) records: HashMap<String, PatchRecord>,
+}
+
+impl DetachedDownload {
+    /// Fold the phase's events and warnings into `env` (records via
+    /// [`Envelope::record`], so `summary` and `status` follow) and hand back
+    /// the exit code and the records.
+    pub(crate) fn into_envelope(
+        self,
+        env: &mut Envelope,
+    ) -> (i32, usize, HashMap<String, PatchRecord>) {
+        for event in self.events {
+            env.record(event);
+        }
+        env.warnings.extend(self.warnings);
+        (self.code, self.failed, self.records)
+    }
+}
+
+/// The release-narrowing fallbacks as run-level warnings.
+fn release_warnings(warnings: Vec<String>) -> Vec<RunWarning> {
+    warnings
+        .into_iter()
+        .map(|w| RunWarning::new(RELEASE_NARROWING, w))
+        .collect()
+}
+
+/// Warning code: release narrowing kept every variant of a base (the base
+/// is not installed, or no variant matches the installed distribution).
+pub(crate) const RELEASE_NARROWING: &str = "release_narrowing";
 
 /// [`download_patch_records_with`], handing `prior` (scan's npm crawl of
 /// the untouched tree) to the lock-text refusals' installed-copy lookup.
@@ -1272,29 +1307,28 @@ pub(crate) async fn download_patch_records_preflighted(
     )
     .await;
 
-    let downloaded = batch.fetched.len();
     let mut records: HashMap<String, PatchRecord> = batch.reused.into_iter().collect();
     for FetchedPatch { patch, files, .. } in batch.fetched {
         records.insert(patch.purl.clone(), build_patch_record(&patch, files));
     }
-    let mut result_json = serde_json::json!({
-        "found": batch.found,
-        "downloaded": downloaded,
-        "skipped": batch.skipped,
-        "failed": batch.failed,
-        "detached": true,
-        "patches": batch.patches_json,
-    });
-    if !batch.warnings.is_empty() {
-        result_json["warnings"] = serde_json::json!(batch.warnings);
+    DetachedDownload {
+        code: i32::from(batch.failed > 0),
+        events: batch.events,
+        warnings: release_warnings(batch.warnings),
+        failed: batch.failed,
+        records,
     }
-    (i32::from(batch.failed > 0), result_json, records)
 }
 
-/// Emit a warning (stderr `[note]` + `warnings[]`) for every added/updated
-/// patch record whose purl the vendor ledger still wires at a DIFFERENT
-/// uuid — VEX verification fails closed (`vendor_uuid_mismatch`) until a
-/// `vendor` run refreshes the committed artifact.
+/// Warning code: the manifest now records a patch uuid the vendor ledger
+/// does not wire for that purl (see [`warn_on_vendored_uuid_drift`]).
+pub(crate) const VENDORED_UUID_DRIFT: &str = "vendored_uuid_drift";
+
+/// Emit a warning (stderr `[note]` + `warnings[]`) for every recorded
+/// (`downloaded` / `updated`) `(purl, uuid)` whose purl the vendor ledger
+/// still wires at a DIFFERENT uuid — VEX verification fails closed
+/// (`vendor_uuid_mismatch`) until a `vendor` run refreshes the committed
+/// artifact.
 ///
 /// Kept out of [`download_and_apply_patches_with`]'s body on purpose: that
 /// function sits on the in-process scan→download→apply chain, whose summed
@@ -1302,8 +1336,8 @@ pub(crate) async fn download_patch_records_preflighted(
 pub(crate) async fn warn_on_vendored_uuid_drift(
     project_root: &Path,
     quiet: bool,
-    downloaded_patches: &[serde_json::Value],
-    warnings: &mut Vec<String>,
+    recorded: &[(String, String)],
+    warnings: &mut Vec<RunWarning>,
 ) {
     let Ok(vendor_state) = load_state(project_root).await else {
         return;
@@ -1311,15 +1345,9 @@ pub(crate) async fn warn_on_vendored_uuid_drift(
     if vendor_state.entries.is_empty() {
         return;
     }
-    for rec in downloaded_patches {
-        let (Some(purl), Some(uuid)) = (rec["purl"].as_str(), rec["uuid"].as_str()) else {
-            continue;
-        };
-        if !matches!(rec["action"].as_str(), Some("added" | "updated")) {
-            continue;
-        }
+    for (purl, uuid) in recorded {
         let entry = lookup_entry(&vendor_state.entries, purl);
-        if let Some(entry) = entry.filter(|e| e.uuid != uuid) {
+        if let Some(entry) = entry.filter(|e| &e.uuid != uuid) {
             let w = format!(
                 "{purl} is vendored at patch {} but the manifest now records {uuid}; \
                  run `socket-patch vendor` to refresh the committed artifact",
@@ -1328,7 +1356,7 @@ pub(crate) async fn warn_on_vendored_uuid_drift(
             if !quiet {
                 eprintln!("  [note] {w}");
             }
-            warnings.push(w);
+            warnings.push(RunWarning::new(VENDORED_UUID_DRIFT, w));
         }
     }
 }
@@ -1419,22 +1447,6 @@ pub(crate) async fn run_nested_apply(
     report
 }
 
-/// The nested apply's non-fatal warnings (today the default policy's
-/// `content_mismatch_overwritten` overwrites, #1004) as `get`'s string
-/// `warnings[]` entries, code-prefixed like `get`'s `fold_narrowing_into_result`.
-/// A JSON caller's nested apply is silent, so the envelope is the only
-/// place these surface; a human caller's apply already printed them.
-pub(crate) fn apply_warning_lines(report: Option<&ApplyRunReport>) -> Vec<String> {
-    report
-        .map(|r| {
-            r.warnings
-                .iter()
-                .map(|w| format!("({}) {}", w.code, w.detail))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Whether apply's package key `key` covers the patch record purl
 /// `record`: the same purl, or `key` is the unqualified base of a
 /// qualified record (apply keys a release-variant base by its base purl).
@@ -1444,87 +1456,104 @@ pub(crate) fn apply_key_covers(key: &str, record: &str) -> bool {
         || (!key.trim().contains(['?', '#']) && PurlKey::same(key, record))
 }
 
-/// Fold a failed nested apply into a `get` / `scan --mode agent` JSON
-/// envelope, so `--json` says what the human run prints (#424). Each
-/// `patches[]` record the apply failed becomes the `failed` record shape
-/// (`purl`, `uuid`, `action: "failed"`, `errorCode`, `error`; no metadata,
-/// as on every `failed` record); any other failed manifest patch (one this
-/// run did not select) gets its own `failed` record (`uuid_of` looks up
-/// its uuid); a run-level reason rides the envelope's top-level
-/// `error: {code, message}` (status stays `partial_failure`: the downloads
-/// it reports still landed). `failed` grows by every record marked or
-/// appended here. Returns `applied`: how many of the run's recorded
-/// patches apply really patched (or found already patched).
-pub(crate) fn fold_apply_failures(
-    envelope: &mut serde_json::Value,
-    report: &ApplyRunReport,
+/// Record what the nested apply did to the run's recorded patches
+/// (`recorded`: `(purl, uuid)` of every selected patch now in the manifest)
+/// into `env`, so `--json` says what the human run prints (#424). A clean
+/// apply is one `applied` event per recorded patch. A failed one records a
+/// `failed` event (apply's `errorCode` / `error`) for each recorded patch a
+/// failure covers, `applied` for each one apply reports patched (or already
+/// patched), a `failed` event for each other failing manifest patch (one
+/// this run did not select — the nested apply covers the whole
+/// `--ecosystems`-scoped manifest; `uuid_of` looks up its uuid), and a
+/// purl-less `failed` event for a run-level reason (unreadable manifest,
+/// the yarn PnP refusal, unavailable sources) — so a failed apply always
+/// leaves a `failed` event and the envelope's `partialFailure` agrees with
+/// exit 1. The apply's non-fatal warnings (`content_mismatch_overwritten`,
+/// #1004) join `env.warnings`: a JSON caller's nested apply is silent, so
+/// the envelope is their only channel. `None` (no apply ran) records
+/// nothing.
+pub(crate) fn record_apply_outcome(
+    env: &mut Envelope,
+    recorded: &[(String, String)],
+    report: Option<&ApplyRunReport>,
     uuid_of: impl Fn(&str) -> Option<String>,
-) -> usize {
-    let Some(patches) = envelope["patches"].as_array_mut() else {
-        return 0;
+) {
+    let Some(report) = report else {
+        return;
     };
-    let selected = patches.len();
-    let mut marked = 0usize;
-    for failure in &report.failures {
-        let mut hit = false;
-        for rec in patches.iter_mut().take(selected) {
-            let purl = rec["purl"].as_str().unwrap_or_default();
-            if !apply_key_covers(&failure.purl, purl) {
-                continue;
-            }
-            hit = true;
-            if rec["action"].as_str() != Some("failed") {
-                *rec = serde_json::json!({
-                    "purl": rec["purl"],
-                    "uuid": rec["uuid"],
-                    "action": "failed",
-                    "errorCode": failure.code,
-                    "error": failure.error,
-                });
-                marked += 1;
-            }
+    env.warnings.extend(report.warnings.iter().cloned());
+    if report.code == 0 {
+        for (purl, uuid) in recorded {
+            env.record(
+                PatchEvent::new(EventAction::Applied, purl.as_str()).with_uuid(uuid.as_str()),
+            );
         }
-        let appended = patches[selected..].iter().any(|r| {
-            PurlKey::qualified(r["purl"].as_str().unwrap_or_default())
-                == PurlKey::qualified(&failure.purl)
-        });
-        if !hit && !appended {
-            let mut rec = serde_json::json!({
-                "purl": failure.purl,
-                "action": "failed",
-                "errorCode": failure.code,
-                "error": failure.error,
-            });
-            if let Some(uuid) = uuid_of(&failure.purl) {
-                rec["uuid"] = serde_json::json!(uuid);
-            }
-            patches.push(rec);
+        return;
+    }
+    let mut failed_any = false;
+    for (purl, uuid) in recorded {
+        if let Some(failure) = report
+            .failures
+            .iter()
+            .find(|f| apply_key_covers(&f.purl, purl))
+        {
+            env.record(
+                PatchEvent::new(EventAction::Failed, purl.as_str())
+                    .with_uuid(uuid.as_str())
+                    .with_error(failure.code.as_str(), failure.error.as_str()),
+            );
+            failed_any = true;
+        } else if report.applied.iter().any(|k| apply_key_covers(k, purl)) {
+            env.record(
+                PatchEvent::new(EventAction::Applied, purl.as_str()).with_uuid(uuid.as_str()),
+            );
         }
     }
-    // Recorded patches (added / updated, or the plain already-recorded
-    // skip) that apply reports as patched.
-    let applied = patches[..selected]
-        .iter()
-        .filter(|r| match r["action"].as_str() {
-            Some("added" | "updated") => true,
-            Some("skipped") => r.get("errorCode").is_none(),
-            _ => false,
-        })
-        .filter(|r| {
-            let purl = r["purl"].as_str().unwrap_or_default();
-            report.applied.iter().any(|k| apply_key_covers(k, purl))
-        })
-        .count();
-    let added = marked + (patches.len() - selected);
-    let failed = envelope["failed"].as_u64().unwrap_or(0) as usize + added;
-    envelope["failed"] = serde_json::json!(failed);
+    let mut appended: Vec<&str> = Vec::new();
+    for failure in &report.failures {
+        let explained = recorded
+            .iter()
+            .any(|(purl, _)| apply_key_covers(&failure.purl, purl));
+        let repeated = appended
+            .iter()
+            .any(|p| PurlKey::qualified(p) == PurlKey::qualified(&failure.purl));
+        if explained || repeated {
+            continue;
+        }
+        appended.push(&failure.purl);
+        let mut event = PatchEvent::new(EventAction::Failed, failure.purl.as_str())
+            .with_error(failure.code.as_str(), failure.error.as_str());
+        if let Some(uuid) = uuid_of(&failure.purl) {
+            event = event.with_uuid(uuid);
+        }
+        env.record(event);
+        failed_any = true;
+    }
     if let Some((code, error)) = &report.run_error {
-        crate::json_envelope::set_error_keep_status(
-            envelope,
-            crate::json_envelope::EnvelopeError::new(code, error),
+        env.record(
+            PatchEvent::artifact(EventAction::Failed).with_error(code.as_str(), error.as_str()),
+        );
+        failed_any = true;
+    }
+    if !failed_any {
+        env.record(
+            PatchEvent::artifact(EventAction::Failed)
+                .with_error("apply_failed", "the nested apply failed"),
         );
     }
-    applied
+}
+
+/// [`download_and_apply_patches_into`] over a fresh `get` envelope: the
+/// public entry the in-process tests and embedders drive. Returns `(exit
+/// code, envelope)`; nothing is printed on stdout.
+pub async fn download_and_apply_patches_with(
+    selected: &[PatchSearchResult],
+    params: &DownloadParams,
+    run: &DownloadRun<'_>,
+) -> (i32, Envelope) {
+    let mut env = Envelope::new(EnvelopeCommand::Get);
+    let code = download_and_apply_patches_into(selected, params, run, &mut env).await;
+    (code, env)
 }
 
 /// Download the selected patches into `.socket/` (manifest records +
@@ -1532,12 +1561,17 @@ pub(crate) fn fold_apply_failures(
 /// engine behind `get` and `scan --mode agent`, over the caller's
 /// run-level context (`run`: the client the run already built, plus the
 /// `--lock-timeout` / `--verbose` the manifest lock and the nested apply
-/// honor). Returns `(exit_code, json)`.
-pub async fn download_and_apply_patches_with(
+/// honor). Every outcome is recorded into `env` (per-patch events, run
+/// warnings, or — for a hard failure: the lock refused, an unloadable
+/// manifest, a failed manifest write — its top-level `error`); the CALLER
+/// prints it, so a run never puts two JSON documents on stdout. Returns
+/// the exit code.
+pub async fn download_and_apply_patches_into(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
     run: &DownloadRun<'_>,
-) -> (i32, serde_json::Value) {
+    env: &mut Envelope,
+) -> i32 {
     let quiet = params.quiet();
     let manifest_path = params.manifest_path.clone();
     let socket_dir = params.socket_dir();
@@ -1553,10 +1587,13 @@ pub async fn download_and_apply_patches_with(
     let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout) {
         Ok(guard) => guard,
         Err(e) => {
-            return (
-                1,
-                report_lock_failure(params.json, &socket_dir, &e, lock_timeout),
-            )
+            env.mark_error(report_lock_failure(
+                params.json,
+                &socket_dir,
+                &e,
+                lock_timeout,
+            ));
+            return 1;
         }
     };
 
@@ -1567,12 +1604,14 @@ pub async fn download_and_apply_patches_with(
         // treating it as empty would let the write below replace the file
         // and destroy every tracked patch record.
         Err(e) => {
-            let err = format!("Failed to read manifest: {e}");
-            report_error(params.json, "manifest_unreadable", &err);
-            return (
-                1,
-                crate::json_envelope::legacy_error("manifest_unreadable", &err),
-            );
+            if !params.json {
+                eprintln!("Error: Failed to read manifest: {e}");
+            }
+            env.mark_error(crate::json_envelope::manifest_load_error(
+                &manifest_path,
+                &e,
+            ));
+            return 1;
         }
     };
 
@@ -1593,13 +1632,25 @@ pub async fn download_and_apply_patches_with(
     .await;
 
     // `added` and `updated` are DISJOINT — one patch lands in exactly one,
-    // matching the per-patch `action` vocabulary (CLI_CONTRACT.md) and the
-    // single-uuid flow's summary in `save_and_apply_patch`; `downloaded` is
-    // their sum (a replacement was fetched and applied just like a new
-    // record) and gates the apply step.
+    // matching the per-patch event (`downloaded` / `updated`) and the
+    // single-uuid flow's summary in `save_and_apply_patch`; their sum gates
+    // the apply step.
     let downloaded = batch.fetched.len();
     let mut updated = 0usize;
     let mut new_blobs: Vec<String> = Vec::new();
+    // `(purl, uuid)` of every selected patch now recorded: the fetched ones
+    // and the already-recorded (`skipped`) ones.
+    let mut recorded: Vec<(String, String)> = Vec::new();
+    let mut changed: Vec<(String, String)> = Vec::new();
+    for event in &batch.events {
+        if event.action == EventAction::Skipped
+            && event.error_code.as_deref() == Some(ALREADY_IN_MANIFEST)
+        {
+            if let (Some(purl), Some(uuid)) = (&event.purl, &event.uuid) {
+                recorded.push((purl.clone(), uuid.clone()));
+            }
+        }
+    }
     for FetchedPatch {
         patch,
         files,
@@ -1611,6 +1662,7 @@ pub async fn download_and_apply_patches_with(
             updated += 1;
         }
         new_blobs.extend(created);
+        changed.push((patch.purl.clone(), patch.uuid.clone()));
         manifest
             .patches
             .insert(patch.purl.clone(), build_patch_record(&patch, files));
@@ -1624,19 +1676,23 @@ pub async fn download_and_apply_patches_with(
             // unwind exactly those (a pre-existing record's blobs stay).
             unwind_new_blobs(&blobs_dir, &new_blobs).await;
             let msg = format!("Failed to write manifest: {e}");
-            report_error(params.json, "manifest_write_failed", &msg);
-            return (
-                1,
-                crate::json_envelope::legacy_error("manifest_write_failed", &msg),
-            );
+            if !params.json {
+                eprintln!("Error: {msg}");
+            }
+            env.mark_error(EnvelopeError::new("manifest_write_failed", msg));
+            return 1;
         }
     }
+    for event in batch.events {
+        env.record(event);
+    }
+    recorded.extend(changed.iter().cloned());
     // Every selected patch that is now recorded is owed the nested apply:
     // the fetched ones AND the already-recorded (`skipped`) ones, whose
     // installed copy may be pristine again after a reinstall or a failed
     // earlier apply (#454). Apply is idempotent on already-patched files,
     // so an in-sync re-run stays a no-op on disk.
-    let to_apply = downloaded + batch.already_recorded;
+    let to_apply = recorded.len();
     // The lock outlives the manifest write only when a nested apply follows
     // (it is handed the guard and releases it after its last mutation);
     // otherwise nothing more is written and it is released here.
@@ -1654,14 +1710,9 @@ pub async fn download_and_apply_patches_with(
     // uuid — tell the operator now instead of letting VEX surprise them
     // later. (`scan` never hits this: it filters vendored purls before
     // download.) The nested apply below skips the vendored purl either way.
-    let mut warnings = batch.warnings;
-    warn_on_vendored_uuid_drift(
-        &params.project_root(),
-        quiet,
-        &batch.patches_json,
-        &mut warnings,
-    )
-    .await;
+    let mut warnings = release_warnings(batch.warnings);
+    warn_on_vendored_uuid_drift(&params.project_root(), quiet, &changed, &mut warnings).await;
+    env.warnings.extend(warnings);
 
     if !quiet {
         eprintln!();
@@ -1688,43 +1739,13 @@ pub async fn download_and_apply_patches_with(
             .await,
         );
     }
-    let apply_succeeded = apply_report.as_ref().is_some_and(|r| r.code == 0);
-
-    // An apply step that ran (recorded patches selected, not --save-only)
-    // but failed is a partial failure too — not just download failures. The
-    // `status` field must agree with `exit_code`; reporting `success`
-    // alongside a non-zero exit code misleads JSON consumers (the scan
-    // wrapper recomputes status from the exit code for exactly this
-    // reason, but `get` surfaces this envelope directly).
-    let apply_failed = !apply_succeeded && to_apply > 0 && !params.save_only;
-    let (status, exit_code) = run_outcome(batch.failed > 0, apply_failed);
-    let mut result_json = serde_json::json!({
-        "status": status,
-        "found": batch.found,
-        "downloaded": downloaded,
-        "skipped": batch.skipped,
-        "failed": batch.failed,
-        "applied": if apply_succeeded { to_apply } else { 0 },
-        "updated": updated,
-        "patches": batch.patches_json,
+    let apply_failed = apply_report.as_ref().is_some_and(|r| r.code != 0);
+    // A failed apply records at least one `failed` event, so the status
+    // (`partialFailure`) agrees with the exit code.
+    record_apply_outcome(env, &recorded, apply_report.as_ref(), |purl| {
+        manifest.patches.get(purl).map(|r| r.uuid.clone())
     });
-    // A failed apply: name what failed, and count only what applied.
-    if let Some(report) = apply_report.as_ref().filter(|r| r.code != 0) {
-        let applied = fold_apply_failures(&mut result_json, report, |purl| {
-            manifest.patches.get(purl).map(|r| r.uuid.clone())
-        });
-        result_json["applied"] = serde_json::json!(applied);
-    }
-    // Surface release-narrowing fallbacks (uninstalled package / no
-    // matching variant) so JSON consumers can see why all variants were
-    // kept, and the apply's mismatch overwrites. Omitted entirely when
-    // both were clean.
-    warnings.extend(apply_warning_lines(apply_report.as_ref()));
-    if !warnings.is_empty() {
-        result_json["warnings"] = serde_json::json!(warnings);
-    }
-
-    (exit_code, result_json)
+    run_outcome(batch.failed > 0, apply_failed)
 }
 
 /// Decode a patch view's `blobContent` (canonical base64 as the API

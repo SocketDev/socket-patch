@@ -27,6 +27,21 @@ const UUID: &str = "aaaaaaaa-0000-4000-8000-000000000910";
 const GRANT: &str = "11111111-1111-4111-8111-111111111910";
 const REQUIREMENTS: &str = "typing_extensions==4.12.2\n";
 
+/// How many hosted pins a run wrote (dry run: would write): its
+/// `applied` / `verified` events with `details.mode: "hosted"` (v5.0's
+/// `redirect.redirected`).
+fn hosted_pinned(doc: &Value) -> u64 {
+    doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
+}
+
 fn hosted_wheel() -> Vec<u8> {
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default();
@@ -253,7 +268,7 @@ async fn hosted_packages_allowlist_matches_pep503_spelling() {
     let (code, env) = scan(&root, &server, &["--mode", "hosted"]);
     assert_eq!(code, 0, "{env:#}");
     assert!(filtered_reasons(&env).is_empty(), "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     assert!(
         requirements(&root).contains(UUID),
         "{}",
@@ -272,7 +287,7 @@ async fn hosted_scan_package_flag_matches_pep503_spelling() {
         &["--mode", "hosted", "--package", "typing_extensions"],
     );
     assert_eq!(code, 0, "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     assert!(
         requirements(&root).contains(UUID),
         "{}",

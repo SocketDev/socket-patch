@@ -821,7 +821,7 @@ async fn dotenv_selected_pipenv_install_is_checked_before_vex() {
         });
         assert_eq!(out.status.code(), Some(1), "{case}: {json}");
         assert!(
-            json["redirect"]["warnings"]
+            json["warnings"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -930,7 +930,7 @@ async fn legacy_dotenv_workon_install_is_checked_before_vex() {
             "forward={forward_reference}: {json}"
         );
         assert!(
-            json["redirect"]["warnings"]
+            json["warnings"]
                 .as_array()
                 .unwrap()
                 .iter()

@@ -405,9 +405,9 @@ fn deno_hosted_and_vendored_never_attest_manifest_mode_unchanged() {
         Some(0),
         "deno {v}: scan --mode hosted: {env:#}\n{stderr}"
     );
-    assert_eq!(env["redirect"]["redirected"], 0, "deno {v}: {env:#}");
+    assert_eq!(env["summary"]["applied"], 0, "deno {v}: {env:#}");
     assert!(
-        env["redirect"]["warnings"]
+        env["warnings"]
             .as_array()
             .is_some_and(|w| w.iter().any(|w| w["code"] == "redirect_npm_no_lockfile")),
         "deno {v}: the npm rewriter found no npm lockfile to pin: {env:#}"
@@ -438,7 +438,7 @@ fn deno_hosted_and_vendored_never_attest_manifest_mode_unchanged() {
         "deno {v}: scan --mode vendored: {env:#}\n{stderr}"
     );
     assert!(
-        env["vendor"]["events"].as_array().is_some_and(|e| e
+        env["events"].as_array().is_some_and(|e| e
             .iter()
             .any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_lockfile_missing")),
         "deno {v}: vendoring refuses without an npm-family lockfile: {env:#}"
@@ -453,7 +453,10 @@ fn deno_hosted_and_vendored_never_attest_manifest_mode_unchanged() {
     // vendor ledger alone carries the records), and the refused vendor step
     // recorded nothing in that ledger either — so the failed run left no
     // record anywhere for `vex` to attest from.
-    assert_eq!(env["download"]["detached"], true, "deno {v}: {env:#}");
+    assert!(
+        !project.join(".socket/manifest.json").exists(),
+        "deno {v}: the vendored download writes no manifest: {env:#}"
+    );
     let ledger = project.join(".socket/vendor/state.json");
     if let Ok(state) = std::fs::read_to_string(&ledger) {
         assert!(

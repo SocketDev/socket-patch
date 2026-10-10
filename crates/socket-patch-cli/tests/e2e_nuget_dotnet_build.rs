@@ -798,7 +798,7 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
         Some(0),
         "SDK {sdk} scan --mode hosted: {env:#}\n{stderr}"
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
     let stale_dir = pkg_dir(&store_fx);
     let warned = env.to_string();
     assert!(

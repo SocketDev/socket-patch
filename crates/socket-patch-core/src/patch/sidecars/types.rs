@@ -9,8 +9,10 @@
 //! Every struct/enum derives `serde::Serialize` with stable JSON
 //! key conventions:
 //!   * structs serialize with `#[serde(rename_all = "camelCase")]`;
-//!   * enums serialize as `#[serde(rename_all = "snake_case")]`
-//!     strings.
+//!   * value enums (`SidecarFileAction`, `SidecarSeverity`) serialize
+//!     camelCase, like the envelope's own enums (`action`, `status`);
+//!   * the advisory `code` is a routing tag and serializes snake_case,
+//!     like every other `code` / `errorCode` in the envelope.
 //!
 //! Downstream consumers (CI bots, dashboards, jq pipelines,
 //! telemetry) can rely on the field set and tag spelling — see the
@@ -55,15 +57,16 @@ pub struct SidecarFile {
     pub action: SidecarFileAction,
 }
 
-/// What the fixup did with a sidecar file. Stable snake_case JSON
-/// tag — consumers branch on this without parsing free-form text.
+/// What the fixup did with a sidecar file. Stable camelCase JSON
+/// tag (the envelope's enum convention) — consumers branch on this
+/// without parsing free-form text.
 ///
 /// Variants are added only when an ecosystem actually produces them
 /// (rather than reserved up front). Adding a variant is a
 /// non-breaking change to the JSON contract; renaming or removing
 /// one is breaking.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum SidecarFileAction {
     Rewritten,
     Deleted,
@@ -127,7 +130,7 @@ pub enum SidecarAdvisoryCode {
 /// itself failing — informational consequences of the apply use
 /// `Info` or `Warning`.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum SidecarSeverity {
     Info,
     Warning,
@@ -184,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn file_action_tags_are_snake_case() {
+    fn file_action_tags_are_camel_case() {
         let cases = [
             (SidecarFileAction::Rewritten, "rewritten"),
             (SidecarFileAction::Deleted, "deleted"),
@@ -236,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn severity_tags_are_snake_case() {
+    fn severity_tags_are_camel_case() {
         assert_eq!(
             serde_json::to_value(SidecarSeverity::Info).unwrap(),
             serde_json::Value::String("info".to_string())

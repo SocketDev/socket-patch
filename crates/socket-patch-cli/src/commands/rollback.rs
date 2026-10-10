@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs};
-use crate::commands::hosted_unwind::run_hosted_leg;
+use crate::commands::hosted_unwind::{run_hosted_leg, HostedLegOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{
     KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
@@ -33,7 +33,10 @@ use crate::commands::vendored_backend::{
 use crate::ecosystem_dispatch::{
     distinct_npm_copies, find_all_packages_for_rollback, partition_purls, JvmScope,
 };
-use crate::json_envelope::Command as EnvelopeCommand;
+use crate::json_envelope::{
+    Command as EnvelopeCommand, Envelope, EnvelopeError, GcReport, PatchAction, PatchEvent,
+    PatchEventFile, Status,
+};
 use crate::ui::{plural, StatusLine};
 
 #[derive(Args)]
@@ -621,55 +624,119 @@ pub(crate) fn all_files_already_original(result: &RollbackResult) -> bool {
             .all(|f| f.status == VerifyRollbackStatus::AlreadyOriginal)
 }
 
-/// One `results[]` record of the rollback JSON envelope.
-fn result_to_json(result: &RollbackResult) -> serde_json::Value {
-    serde_json::json!({
-        "purl": result.package_key,
-        "path": result.package_path,
-        "success": result.success,
-        "error": result.error,
-        "filesRolledBack": result.files_rolled_back,
-        // Rollback-side sidecar resync record (e.g. cargo's
-        // `.cargo-checksum.json` rewritten back to original hashes), or
-        // an error-severity advisory when the resync failed. Null when
-        // no sidecar applied — same serialization as `error` above.
-        "sidecar": result.sidecar,
-        "filesVerified": result.files_verified.iter().map(|f| {
-            serde_json::json!({
-                "file": f.file,
-                "status": verify_rollback_status_str(&f.status),
-                "message": f.message,
-                "currentHash": f.current_hash,
-                "expectedHash": f.expected_hash,
-                "targetHash": f.target_hash,
-            })
-        }).collect::<Vec<_>>(),
-    })
+/// The camelCase per-file status a failed event's `details.filesVerified`
+/// carries (the human `--verbose` block keeps the snake_case labels of
+/// [`verify_rollback_status_str`]).
+fn verify_rollback_status_camel(status: &VerifyRollbackStatus) -> &'static str {
+    match status {
+        VerifyRollbackStatus::Ready => "ready",
+        VerifyRollbackStatus::AlreadyOriginal => "alreadyOriginal",
+        VerifyRollbackStatus::HashMismatch => "hashMismatch",
+        VerifyRollbackStatus::NotFound => "notFound",
+        VerifyRollbackStatus::MissingBlob => "missingBlob",
+    }
 }
 
-/// Skipped marker appended to `results[]` for an in-scope manifest entry
-/// with no installed package — apply's `package_not_installed` Skipped
-/// event, rollback-side. Deliberately NOT a result record: no `success`,
-/// no `error`, `path` null (there is no installed tree to name), and it
-/// never counts toward `rolledBack`/`failed` or flips the status —
-/// rollback exits 0 even when ALL in-scope targets land here (see
-/// `RollbackOutcome` for the apply/rollback asymmetry).
-fn skipped_not_installed_json(purl: &str) -> serde_json::Value {
-    serde_json::json!({
-        "purl": purl,
-        "path": null,
-        "skipped": "package_not_installed",
-    })
+/// The `errorCode` of a failed agent-leg result: the first blocking file's
+/// verify status, else the generic `rollback_failed` (a write error, a
+/// local-go redirect that could not be dropped).
+fn rollback_failure_code(result: &RollbackResult) -> &'static str {
+    result
+        .files_verified
+        .iter()
+        .find_map(|f| match f.status {
+            VerifyRollbackStatus::HashMismatch => Some("hash_mismatch"),
+            VerifyRollbackStatus::NotFound => Some("file_not_found"),
+            VerifyRollbackStatus::MissingBlob => Some("missing_blob"),
+            VerifyRollbackStatus::Ready | VerifyRollbackStatus::AlreadyOriginal => None,
+        })
+        .unwrap_or("rollback_failed")
+}
+
+/// The event one agent-leg (in-place) result becomes: `rolledBack` (wet
+/// restore; `files` = the restored files), `verified` (dry-run preview;
+/// `files` = the files that would be restored), `skipped`
+/// `already_original`, or `failed` with the blocking file's code. The
+/// installed copy rides in `details.path`; a failure adds
+/// `details.filesVerified` (per-file camelCase status + hashes).
+fn agent_result_event(result: &RollbackResult, uuid: Option<&str>, dry_run: bool) -> PatchEvent {
+    let file = |path: &str| PatchEventFile {
+        path: path.to_string(),
+        verified: true,
+        applied_via: None,
+    };
+    let mut details = serde_json::json!({ "path": result.package_path });
+    let mut event = if !result.success {
+        details["filesVerified"] = result
+            .files_verified
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "file": f.file,
+                    "status": verify_rollback_status_camel(&f.status),
+                    "message": f.message,
+                    "currentHash": f.current_hash,
+                    "expectedHash": f.expected_hash,
+                    "targetHash": f.target_hash,
+                })
+            })
+            .collect();
+        PatchEvent::new(PatchAction::Failed, result.package_key.clone()).with_error(
+            rollback_failure_code(result),
+            result.error.as_deref().unwrap_or("unknown error"),
+        )
+    } else if all_files_already_original(result) {
+        PatchEvent::new(PatchAction::Skipped, result.package_key.clone()).with_reason(
+            "already_original",
+            "every file already matches its original (beforeHash) content",
+        )
+    } else if dry_run {
+        PatchEvent::new(PatchAction::Verified, result.package_key.clone()).with_files(
+            result
+                .files_verified
+                .iter()
+                .filter(|f| f.status == VerifyRollbackStatus::Ready)
+                .map(|f| file(&f.file))
+                .collect(),
+        )
+    } else if !result.files_rolled_back.is_empty() {
+        PatchEvent::new(PatchAction::RolledBack, result.package_key.clone())
+            .with_files(result.files_rolled_back.iter().map(|f| file(f)).collect())
+    } else {
+        // A successful wet result that restored nothing and is not
+        // "already original": a patch record that lists no files.
+        PatchEvent::new(PatchAction::Skipped, result.package_key.clone())
+            .with_reason("no_files", "the patch record lists no files to restore")
+    };
+    if let Some(uuid) = uuid {
+        event = event.with_uuid(uuid);
+    }
+    event.with_details(details)
+}
+
+/// An in-scope manifest entry with no installed package: `skipped`
+/// `package_not_installed` (apply's event, rollback-side). It never fails
+/// the run — rollback exits 0 even when ALL in-scope targets land here
+/// (see `RollbackOutcome` for the apply/rollback asymmetry).
+fn not_installed_event(purl: &str, uuid: Option<&str>) -> PatchEvent {
+    let event = PatchEvent::new(PatchAction::Skipped, purl).with_reason(
+        "package_not_installed",
+        "no installed package matches this manifest entry",
+    );
+    match uuid {
+        Some(uuid) => event.with_uuid(uuid),
+        None => event,
+    }
 }
 
 /// Per-package failure results for the pre-flight before-blob abort.
 ///
 /// The abort fires before the rollback loop produces any per-package
-/// results, so without these the `--json` envelope claimed `failed: 0`
-/// with empty `results[]` on an exit-1 run — contentless and
+/// results, so without these the `--json` envelope claimed
+/// `summary.failed: 0` with no events on an exit-1 run — contentless and
 /// self-contradictory, and `--json` mutes the stderr explanation the
-/// human path gets. One failed result per affected package keeps the
-/// `failed` counter meaning "packages that failed" (the same per-package
+/// human path gets. One failed result (a `failed` `missing_blob` event)
+/// per affected package keeps `summary.failed` meaning "packages that failed" (the same per-package
 /// semantics as a mid-run failure) and names each missing blob hash plus
 /// the re-run remedy in machine-readable form, using the
 /// engine's own `missing_blob` verify vocabulary. `reason_for` renders
@@ -740,13 +807,25 @@ fn missing_blob_abort_results(
     results
 }
 
-/// Legacy top-level error emission (the pre-envelope rollback shape):
-/// `{status: "error", error: {code, message}}` on `--json`, an `Error:`
-/// stderr line otherwise. Errors print even under --silent ("errors only",
-/// never "nothing").
-fn emit_rollback_error(json: bool, code: &str, msg: &str) {
+/// Rollback's `--json` failure document: a full envelope with
+/// `status: "error"`, empty `events`, a zero `summary` and `error: {code,
+/// message}`.
+fn error_envelope(dry_run: bool, err: EnvelopeError) -> Envelope {
+    let mut env = Envelope::new(EnvelopeCommand::Rollback);
+    env.dry_run = dry_run;
+    env.mark_error(err);
+    env
+}
+
+/// Report a top-level rollback error: the error envelope on `--json`
+/// (message verbatim), an `Error:` stderr line otherwise. Errors print even
+/// under --silent ("errors only", never "nothing").
+fn emit_rollback_error(json: bool, dry_run: bool, code: &str, msg: &str) {
     if json {
-        crate::json_envelope::print_legacy_error(code, msg);
+        println!(
+            "{}",
+            error_envelope(dry_run, EnvelopeError::new(code, msg)).to_pretty_json()
+        );
     } else {
         eprintln!("Error: {}", crate::ui::sentence_case(msg));
     }
@@ -766,7 +845,10 @@ struct VendoredLegOutcome {
     /// artifact, and manifest record all stay (exit 1 — the system is
     /// still patched).
     kept: Vec<(String, String)>,
-    failed: Vec<(String, String)>,
+    /// `(key, errorCode, error)`: `vendor_revert_failed`, or
+    /// `vendor_state_write_failed` when the revert landed but the ledger
+    /// could not be saved.
+    failed: Vec<(String, &'static str, String)>,
     warnings: Vec<(String, String)>,
 }
 
@@ -808,7 +890,7 @@ async fn run_vendored_leg(
                 if !common.json {
                     eprintln!("Error: Failed to revert vendoring for {key}: {why}");
                 }
-                out.failed.push((key, why));
+                out.failed.push((key, "vendor_revert_failed", why));
             }
             VendorRevertStep::Kept(KeepCause::Drift) => out.kept.push((
                 key,
@@ -852,11 +934,237 @@ async fn run_vendored_leg(
                 if !common.json {
                     eprintln!("Error: Failed to revert vendoring for {key}: {why}");
                 }
-                out.failed.push((key, why));
+                out.failed.push((key, "vendor_state_write_failed", why));
             }
         }
     }
     out
+}
+
+/// Hosted-leg failure keys that are not purls: `run_hosted_leg`'s lockfile
+/// write failure (an artifact-level event, `hosted_write_failed`).
+const HOSTED_WRITE_FAILURE_KEY: &str = "files";
+
+/// Everything the main rollback run reports, for [`build_rollback_envelope`].
+struct RollbackReport<'a> {
+    dry_run: bool,
+    /// Whether the run leaves the system unpatched: false drives exit 1 and
+    /// at least `partialFailure`.
+    success: bool,
+    manifest: &'a PatchManifest,
+    results: &'a [RollbackResult],
+    not_installed: &'a [String],
+    vendored: &'a VendoredLegOutcome,
+    vendor_entries: &'a [(String, socket_patch_core::vendor::VendorEntry)],
+    hosted: &'a HostedLegOutcome,
+    hosted_pins: &'a [HostedPin],
+    /// An unscoped run's contested hosted wiring (`hosted_wiring_contested`).
+    contested: Option<&'a str>,
+    /// Manifest entries the run dropped (would drop, on a dry run).
+    removed: &'a [String],
+    gc: Option<GcReport>,
+    warnings: &'a [(String, String)],
+    paths: &'a [String],
+}
+
+/// Rollback's `--json` envelope (v5.0): one event per outcome across the
+/// three legs plus the manifest cleanup, `summary` counted from them.
+///
+/// * agent leg: [`agent_result_event`] per installed copy, then one
+///   `skipped` `package_not_installed` per in-scope entry with no copy;
+/// * vendored leg (`details.mode: "vendored"`): reverted / preserved
+///   entries are `rolledBack` (`verified` on a dry run; preserved adds
+///   `details.preserved: true`), drift-keeps `failed` `vendor_revert_kept`,
+///   failures `failed` with their code;
+/// * hosted leg (`details.mode: "hosted"`): restored pins `rolledBack`
+///   (`verified`), refusals `failed` `hosted_restore_refused`, a lockfile
+///   write failure an artifact-level `failed` `hosted_write_failed`,
+///   contested wiring an artifact-level `failed` `hosted_wiring_contested`;
+/// * manifest cleanup: each dropped entry is `removed` (`verified` on a dry
+///   run) with `details.manifest: true`.
+///
+/// Status: `success` iff `report.success`; a failure with nothing restored,
+/// restorable, already original or not installed is `error`
+/// `rollback_failed` (#1066); anything else is `partialFailure`.
+fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
+    let dry_run = report.dry_run;
+    let mut env = Envelope::new(EnvelopeCommand::Rollback);
+    env.dry_run = dry_run;
+    let restored = if dry_run {
+        PatchAction::Verified
+    } else {
+        PatchAction::RolledBack
+    };
+    let with_uuid = |event: PatchEvent, uuid: Option<&str>| match uuid {
+        Some(uuid) => event.with_uuid(uuid),
+        None => event,
+    };
+
+    // ── agent leg ──
+    let manifest_uuid = |purl: &str| report.manifest.patches.get(purl).map(|p| p.uuid.as_str());
+    for result in report.results {
+        env.record(agent_result_event(
+            result,
+            manifest_uuid(&result.package_key),
+            dry_run,
+        ));
+        if let Some(sidecar) = &result.sidecar {
+            env.sidecars.push(sidecar.clone());
+        }
+    }
+    for purl in report.not_installed {
+        env.record(not_installed_event(purl, manifest_uuid(purl)));
+    }
+
+    // ── vendored leg ──
+    let vendored = |details: serde_json::Value| {
+        let mut d = serde_json::json!({ "mode": "vendored" });
+        if let (Some(d), Some(extra)) = (d.as_object_mut(), details.as_object()) {
+            d.extend(extra.clone());
+        }
+        d
+    };
+    let vendor_uuid = |key: &str| {
+        report
+            .vendor_entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, e)| e.uuid.as_str())
+    };
+    let leg = report.vendored;
+    for key in &leg.reverted {
+        env.record(with_uuid(
+            PatchEvent::new(restored, key.clone()).with_details(vendored(serde_json::json!({}))),
+            vendor_uuid(key),
+        ));
+    }
+    for key in &leg.preserved {
+        env.record(with_uuid(
+            PatchEvent::new(restored, key.clone())
+                .with_details(vendored(serde_json::json!({ "preserved": true }))),
+            vendor_uuid(key),
+        ));
+    }
+    for (key, reason) in &leg.kept {
+        env.record(with_uuid(
+            PatchEvent::new(PatchAction::Failed, key.clone())
+                .with_error("vendor_revert_kept", reason.clone())
+                .with_details(vendored(serde_json::json!({}))),
+            vendor_uuid(key),
+        ));
+    }
+    for (key, code, error) in &leg.failed {
+        env.record(with_uuid(
+            PatchEvent::new(PatchAction::Failed, key.clone())
+                .with_error(*code, error.clone())
+                .with_details(vendored(serde_json::json!({}))),
+            vendor_uuid(key),
+        ));
+    }
+
+    // ── hosted leg ──
+    let hosted = || serde_json::json!({ "mode": crate::commands::HOSTED_MODE_LABEL });
+    let pin_uuid = |purl: &str| {
+        report
+            .hosted_pins
+            .iter()
+            .find(|pin| pin.purl == purl)
+            .map(|pin| pin.uuid.as_str())
+    };
+    let leg = report.hosted;
+    for purl in &leg.reverted {
+        env.record(with_uuid(
+            PatchEvent::new(restored, purl.clone()).with_details(hosted()),
+            pin_uuid(purl),
+        ));
+    }
+    for (purl, error) in &leg.failed {
+        let event = if purl == HOSTED_WRITE_FAILURE_KEY {
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_error("hosted_write_failed", error.clone())
+        } else {
+            with_uuid(
+                PatchEvent::new(PatchAction::Failed, purl.clone())
+                    .with_error("hosted_restore_refused", error.clone()),
+                pin_uuid(purl),
+            )
+        };
+        env.record(event.with_details(hosted()));
+    }
+    for purl in &leg.unsupported {
+        env.record(
+            PatchEvent::new(PatchAction::Failed, purl.clone())
+                .with_error(
+                    "hosted_unsupported",
+                    "this ecosystem has no per-package hosted restore",
+                )
+                .with_details(hosted()),
+        );
+    }
+    if let Some(refusal) = report.contested {
+        env.record(
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_error("hosted_wiring_contested", refusal)
+                .with_details(hosted()),
+        );
+    }
+
+    // ── manifest cleanup ──
+    let removal = if dry_run {
+        PatchAction::Verified
+    } else {
+        PatchAction::Removed
+    };
+    for purl in report.removed {
+        env.record(with_uuid(
+            PatchEvent::new(removal, purl.clone())
+                .with_details(serde_json::json!({ "manifest": true })),
+            manifest_uuid(purl),
+        ));
+    }
+
+    if let Some(gc) = report.gc {
+        env.set_gc(gc);
+    }
+    for (code, detail) in report.warnings {
+        env.warn(code.clone(), detail.clone());
+    }
+    env.set_extra(
+        "hosted",
+        serde_json::json!({ "editedFiles": report.hosted.edited_files.len() }),
+    );
+    env.set_extra("paths", serde_json::json!(report.paths));
+
+    // ── status ──
+    if !report.success {
+        // Run-level failures (a corrupt vendor ledger, a failed manifest
+        // write) carry no event but still leave the system patched.
+        env.mark_partial_failure();
+        let s = &env.summary;
+        let reached_unpatched = s.rolled_back > 0
+            || s.verified > 0
+            || env.events.iter().any(|e| {
+                e.action == PatchAction::Skipped
+                    && matches!(
+                        e.error_code.as_deref(),
+                        Some("already_original" | "package_not_installed")
+                    )
+            });
+        if s.failed > 0 && !reached_unpatched {
+            let message = format!(
+                "nothing was rolled back: {}",
+                plural(s.failed as usize, "patch failed", "patches failed")
+            );
+            env.mark_error(EnvelopeError::new("rollback_failed", message));
+        }
+    } else {
+        debug_assert_eq!(
+            env.status,
+            Status::Success,
+            "a failed event on a success run"
+        );
+    }
+    env
 }
 
 /// Delete a pre-v5 hosted ledger once no hosted pin is left for it to
@@ -982,7 +1290,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // Hosted wiring the lockfiles name but cannot attribute is still
         // hosted state: refuse, naming it, instead of "Manifest not found".
         if let Some(refusal) = hosted_inventory.contested_refusal() {
-            emit_rollback_error(args.common.json, "hosted_wiring_contested", &refusal);
+            emit_rollback_error(
+                args.common.json,
+                args.common.dry_run,
+                "hosted_wiring_contested",
+                &refusal,
+            );
             return 1;
         }
         // Only a pre-v5 hosted ledger left: no lockfile pins it any more,
@@ -992,24 +1305,16 @@ pub async fn run(args: RollbackArgs) -> i32 {
         if project_state && tokio::fs::symlink_metadata(&legacy).await.is_ok() {
             let warning = retire_legacy_redirect_ledger(&args.common).await;
             if args.common.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "success",
-                        "rolledBack": 0,
-                        "alreadyOriginal": 0,
-                        "failed": 0,
-                        "dryRun": args.common.dry_run,
-                        "warnings": warning
-                            .iter()
-                            .map(|(code, detail)| serde_json::json!({
-                                "code": code, "detail": detail,
-                            }))
-                            .collect::<Vec<_>>(),
-                        "legacyRedirectLedgerRemoved": warning.is_none() && !args.common.dry_run,
-                    }))
-                    .expect("serializing an in-memory JSON value cannot fail")
+                let mut env = Envelope::new(EnvelopeCommand::Rollback);
+                env.dry_run = args.common.dry_run;
+                if let Some((code, detail)) = &warning {
+                    env.warn(code.clone(), detail.clone());
+                }
+                env.set_extra(
+                    "legacyRedirectLedgerRemoved",
+                    serde_json::json!(warning.is_none() && !args.common.dry_run),
                 );
+                println!("{}", env.to_pretty_json());
             } else if let Some((_, detail)) = &warning {
                 eprintln!("Warning: {}", crate::ui::sentence_case(detail));
             } else if !args.common.silent {
@@ -1037,6 +1342,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         if !wired.is_empty() {
             emit_rollback_error(
                 args.common.json,
+                args.common.dry_run,
                 "vendor_ledger_missing",
                 "lockfiles still reference .socket/vendor/ artifacts but the vendor ledger \
                  is missing — restore .socket/vendor/state.json from version control, then \
@@ -1045,18 +1351,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
             return 1;
         }
         if args.common.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": {
-                        "code": "manifest_not_found",
-                        "message": "Manifest not found",
-                    },
-                    "path": manifest_path.display().to_string(),
-                }))
-                .expect("serializing an in-memory JSON value cannot fail")
+            let mut env = error_envelope(
+                args.common.dry_run,
+                EnvelopeError::new("manifest_not_found", "Manifest not found"),
             );
+            env.set_extra(
+                "path",
+                serde_json::json!(manifest_path.display().to_string()),
+            );
+            println!("{}", env.to_pretty_json());
         } else {
             // Errors print even under --silent ("errors only", never
             // "nothing"): exit 1 with no message would be undiagnosable.
@@ -1114,14 +1417,29 @@ pub async fn run(args: RollbackArgs) -> i32 {
         match read_manifest(&manifest_path).await {
             Ok(Some(m)) => m,
             Ok(None) => {
-                track_patch_rollback_failed("Invalid manifest", &telemetry).await;
-                emit_rollback_error(args.common.json, "manifest_invalid", "Invalid manifest");
+                // Deleted between the existence probe and the read.
+                let msg = format!("Manifest not found at {}", manifest_path.display());
+                track_patch_rollback_failed(&msg, &telemetry).await;
+                emit_rollback_error(
+                    args.common.json,
+                    args.common.dry_run,
+                    "manifest_not_found",
+                    &msg,
+                );
                 return 1;
             }
             Err(e) => {
                 let msg = e.to_string();
                 track_patch_rollback_failed(&msg, &telemetry).await;
-                emit_rollback_error(args.common.json, "manifest_unreadable", &msg);
+                if args.common.json {
+                    let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+                    println!(
+                        "{}",
+                        error_envelope(args.common.dry_run, err).to_pretty_json()
+                    );
+                } else {
+                    eprintln!("Error: {}", crate::ui::sentence_case(&msg));
+                }
                 return 1;
             }
         }
@@ -1217,7 +1535,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
             Ok(settled) => settled,
             Err(msg) => {
                 track_patch_rollback_failed(&msg, &telemetry).await;
-                emit_rollback_error(args.common.json, "ambiguous_target", &msg);
+                emit_rollback_error(
+                    args.common.json,
+                    args.common.dry_run,
+                    "ambiguous_target",
+                    &msg,
+                );
                 return 1;
             }
         };
@@ -1237,17 +1560,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
             if args.common.json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "error",
-                        "error": { "code": "patch_not_found", "message": msg },
-                        "rolledBack": 0,
-                        "alreadyOriginal": 0,
-                        "failed": 0,
-                        "dryRun": args.common.dry_run,
-                        "vendored": [],
-                        "results": [],
-                    }))
-                    .expect("serializing an in-memory JSON value cannot fail")
+                    error_envelope(
+                        args.common.dry_run,
+                        EnvelopeError::new("patch_not_found", msg)
+                    )
+                    .to_pretty_json()
                 );
             } else {
                 eprintln!("Error: {msg}");
@@ -1313,7 +1630,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 unmatched.1
             );
             track_patch_rollback_failed(&msg, &telemetry).await;
-            emit_rollback_error(args.common.json, "path_glob_no_match", &msg);
+            emit_rollback_error(
+                args.common.json,
+                args.common.dry_run,
+                "path_glob_no_match",
+                &msg,
+            );
             return 1;
         }
         for purl in &path_selected {
@@ -1466,21 +1788,21 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .filter(|pin| hosted_scope.contains(&pin.purl))
                 .cloned()
                 .collect();
-            let mut hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
+            let hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
             // An unscoped rollback promises to unwind EVERY hosted patch:
             // contested wiring it cannot restore fails the leg (a scoped run
             // names its own targets and leaves unrelated wiring alone).
-            if !scoped {
-                if let Some(refusal) = hosted_inventory.contested_refusal() {
-                    if !args.common.json {
-                        eprintln!("Error: {}", crate::ui::sentence_case(&refusal));
-                    }
-                    hosted_leg
-                        .failed
-                        .push(("hosted_wiring_contested".to_string(), refusal));
+            let contested = if scoped {
+                None
+            } else {
+                hosted_inventory.contested_refusal()
+            };
+            if let Some(refusal) = &contested {
+                if !args.common.json {
+                    eprintln!("Error: {}", crate::ui::sentence_case(refusal));
                 }
             }
-            if hosted_leg.failed.is_empty() {
+            if hosted_leg.failed.is_empty() && contested.is_none() {
                 if let Some(warning) = retire_legacy_redirect_ledger(&args.common).await {
                     run_warnings.push(warning);
                 }
@@ -1575,8 +1897,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
             // ── GC ───────────────────────────────────────────────────────
             // Removal retains originals for active patches and crawler misses.
-            let mut gc_json: serde_json::Value = serde_json::json!({ "skipped": true });
-            let mut gc_bytes_freed: u64 = 0;
+            let mut gc: Option<GcReport> = None;
             if cleanup_allowed {
                 let references = ArtifactReferences::after_removal(
                     &manifest,
@@ -1596,14 +1917,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         run_warnings.push(("cleanup_failed".into(), detail));
                     }
                 }
-                let report = crate::json_envelope::GcReport::from_passes(
+                gc = Some(GcReport::from_passes(
                     sweep.blobs.as_ref().ok(),
                     sweep.diffs.as_ref().ok(),
                     sweep.packages.as_ref().ok(),
-                );
-                gc_bytes_freed = report.bytes_freed;
-                gc_json = report.to_value();
+                ));
             }
+            let gc_bytes_freed = gc.map_or(0, |gc| gc.bytes_freed);
 
             // ── run-level warnings ───────────────────────────────────────
             let unwired_any = !vendored_leg.reverted.is_empty()
@@ -1686,7 +2006,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .for_each(|(code, detail)| run_warnings.push((code.clone(), detail.clone())));
             // A restored package whose ownership could not be put back
             // (the engine reports it on `error` with `success: true`) is
-            // restored but worth a note; `results[].error` carries it too.
+            // restored but worth a note, here and in the envelope.
             for r in results.iter().filter(|r| r.success) {
                 if let Some(note) = &r.error {
                     let warning = (
@@ -1709,40 +2029,18 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 && vendored_leg.failed.is_empty()
                 && hosted_leg.failed.is_empty()
                 && hosted_leg.unsupported.is_empty()
+                && contested.is_none()
                 && !vendor_corrupt
                 && manifest_write_failed.is_none();
-            let rolled_back_count = results
+            // Telemetry's count spans every leg (#1066), like the envelope's
+            // `summary.rolledBack`.
+            let rolled_back_total = results
                 .iter()
                 .filter(|r| r.success && !r.files_rolled_back.is_empty())
-                .count();
-            let already_original_count = results
-                .iter()
-                .filter(|r| r.success && all_files_already_original(r))
-                .count();
-            let failed_count = results.iter().filter(|r| !r.success).count();
-            // The top-level counters span every leg (#1066): a vendored or
-            // hosted unwind is a rollback, and a drift-keep, failure or
-            // unsupported hosted target is a failure, exactly as each one
-            // drives the status. A package wired through two legs counts
-            // once per leg; the per-leg arrays below say which.
-            let rolled_back_total = rolled_back_count
+                .count()
                 + vendored_leg.reverted.len()
                 + vendored_leg.preserved.len()
                 + hosted_leg.reverted.len();
-            let failed_total = failed_count
-                + vendored_leg.kept.len()
-                + vendored_leg.failed.len()
-                + hosted_leg.failed.len()
-                + hosted_leg.unsupported.len();
-            // Something failed and nothing reached the unpatched end state
-            // (rolled back, already original, or not installed): the run
-            // failed as a whole, so the status is an error (with `error`),
-            // not a partial failure.
-            let total_failure = !success
-                && failed_total > 0
-                && rolled_back_total == 0
-                && already_original_count == 0
-                && not_installed.is_empty();
 
             if let Some(e) = &manifest_write_failed {
                 if !args.common.json {
@@ -1755,88 +2053,35 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             if args.common.json {
-                // Legacy shape plus the additive duality keys — every key
-                // always present so consumers never null-check.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&{
-                        let mut out = serde_json::json!({
-                        "status": if success { "success" } else { "partial_failure" },
-                        "rolledBack": rolled_back_total,
-                        "alreadyOriginal": already_original_count,
-                        "failed": failed_total,
-                        "dryRun": args.common.dry_run,
-                        "warnings": run_warnings
-                            .iter()
-                            .map(|(code, detail)| serde_json::json!({
-                                "code": code, "detail": detail,
-                            }))
-                            .collect::<Vec<_>>(),
-                        // The legacy "benign, untouched" array is
-                        // reserved-empty in v5.0: acted-on entries land in
-                        // the vendored* arrays below, and the corrupt-ledger
-                        // skip cannot name vendor-owned purls (the detection
-                        // itself needs the ledger) — it surfaces via the
-                        // `vendor_state_unreadable` warning and exit 1.
-                        "vendored": [],
-                        "vendoredReverted": vendored_leg.reverted,
-                        "vendoredPreserved": vendored_leg.preserved,
-                        "vendoredKept": vendored_leg.kept
-                            .iter()
-                            .map(|(key, reason)| serde_json::json!({
-                                "purl": key, "reason": reason,
-                            }))
-                            .collect::<Vec<_>>(),
-                        "vendoredFailed": vendored_leg.failed
-                            .iter()
-                            .map(|(key, error)| serde_json::json!({
-                                "purl": key, "error": error,
-                            }))
-                            .collect::<Vec<_>>(),
-                        "hosted": {
-                            "reverted": hosted_leg.reverted,
-                            "failed": hosted_leg.failed
-                                .iter()
-                                .map(|(purl, error)| serde_json::json!({
-                                    "purl": purl, "error": error,
-                                }))
-                                .collect::<Vec<_>>(),
-                            "unsupported": hosted_leg.unsupported,
-                            "editedFiles": hosted_leg.edited_files.len(),
-                        },
-                        "manifest": {
-                            "removedEntries": removed,
-                            "preserved": args.preserve_state,
-                        },
-                        "gc": gc_json,
-                        "paths": path_scope.raw(),
-                        // Real result records first, then one skipped marker
-                        // per in-scope entry with no installed package —
-                        // apply's `package_not_installed` Skipped event,
-                        // rollback-side. Markers never count toward
-                        // `rolledBack`/`failed` and never flip the status.
-                        "results": results
-                            .iter()
-                            .map(result_to_json)
-                            .chain(not_installed.iter().map(|p| skipped_not_installed_json(p)))
-                            .collect::<Vec<_>>(),
-                        });
-                        if total_failure {
-                            crate::json_envelope::set_error(
-                                &mut out,
-                                crate::json_envelope::EnvelopeError::new(
-                                    "rollback_failed",
-                                    format!(
-                                        "nothing was rolled back: {}",
-                                        plural(failed_total, "patch failed", "patches failed")
-                                    ),
-                                ),
-                            );
-                        }
-                        out
-                    })
-                    .expect("serializing an in-memory JSON value cannot fail")
-                );
+                // The GC was requested (not `--preserve-state`) but could not
+                // run: `gc` stays absent and this warning says why.
+                if !args.preserve_state && gc.is_none() {
+                    let why = if aborted {
+                        "the rollback aborted before restoring anything, so the revert data a \
+                         retry needs was kept"
+                    } else {
+                        "the vendor ledger is unreadable, so artifact ownership cannot be \
+                         established"
+                    };
+                    run_warnings.push(("gc_skipped".into(), format!("artifact GC skipped: {why}")));
+                }
+                let env = build_rollback_envelope(&RollbackReport {
+                    dry_run: args.common.dry_run,
+                    success,
+                    manifest: &manifest,
+                    results: &results,
+                    not_installed: &not_installed,
+                    vendored: &vendored_leg,
+                    vendor_entries: &vendor_entries,
+                    hosted: &hosted_leg,
+                    hosted_pins: &hosted_pins,
+                    contested: contested.as_deref(),
+                    removed: &removed,
+                    gc,
+                    warnings: &run_warnings,
+                    paths: path_scope.raw(),
+                });
+                println!("{}", env.to_pretty_json());
             } else if !args.common.silent && !results.is_empty() {
                 let cwd_abs = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
                 let lines = if args.common.dry_run {
@@ -2004,17 +2249,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
             if args.common.json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "error",
-                        "error": { "code": "rollback_failed", "message": e },
-                        "rolledBack": 0,
-                        "alreadyOriginal": 0,
-                        "failed": 0,
-                        "dryRun": args.common.dry_run,
-                        "vendored": [],
-                        "results": [],
-                    }))
-                    .expect("serializing an in-memory JSON value cannot fail")
+                    error_envelope(
+                        args.common.dry_run,
+                        EnvelopeError::new("rollback_failed", e)
+                    )
+                    .to_pretty_json()
                 );
             } else {
                 // Errors print even under --silent ("errors only", never
@@ -5565,6 +5804,344 @@ mod tests {
         assert!(!bun_reinstall_advised(
             ["redirect_vlt_reinstall_required"].into_iter()
         ));
+    }
+
+    // ── v5.0 envelope (build_rollback_envelope) ─────────────────────────
+
+    fn failed_rb(purl: &str) -> RollbackResult {
+        RollbackResult {
+            package_key: purl.to_string(),
+            package_path: "/p/bad".to_string(),
+            success: false,
+            files_verified: vec![VerifyRollbackResult {
+                file: "index.js".to_string(),
+                status: VerifyRollbackStatus::HashMismatch,
+                message: Some("drifted".to_string()),
+                current_hash: Some("c".to_string()),
+                expected_hash: Some("e".to_string()),
+                target_hash: None,
+            }],
+            files_rolled_back: Vec::new(),
+            error: Some("cannot roll back index.js: drifted".to_string()),
+            sidecar: None,
+        }
+    }
+
+    fn report<'a>(
+        dry_run: bool,
+        success: bool,
+        manifest: &'a PatchManifest,
+        results: &'a [RollbackResult],
+        vendored: &'a VendoredLegOutcome,
+        hosted: &'a HostedLegOutcome,
+    ) -> RollbackReport<'a> {
+        RollbackReport {
+            dry_run,
+            success,
+            manifest,
+            results,
+            not_installed: &[],
+            vendored,
+            vendor_entries: &[],
+            hosted,
+            hosted_pins: &[],
+            contested: None,
+            removed: &[],
+            gc: None,
+            warnings: &[],
+            paths: &[],
+        }
+    }
+
+    /// Every top-level key, status and event action/errorCode is from the
+    /// shared vocabulary, and `summary` equals the event counts.
+    fn assert_envelope_invariants(v: &serde_json::Value) {
+        assert_eq!(v["command"], "rollback", "{v}");
+        let allowed = [
+            "command",
+            "status",
+            "dryRun",
+            "events",
+            "summary",
+            "error",
+            "sidecars",
+            "warnings",
+            "vex",
+            "gc",
+            "hosted",
+            "paths",
+            "path",
+            "legacyRedirectLedgerRemoved",
+        ];
+        for key in v.as_object().unwrap().keys() {
+            assert!(allowed.contains(&key.as_str()), "unexpected key {key}: {v}");
+            assert!(!key.contains('_'), "snake_case key {key}");
+        }
+        assert!(!v["status"].as_str().unwrap().contains('_'), "{v}");
+        let events = v["events"].as_array().unwrap();
+        for action in [
+            "discovered",
+            "downloaded",
+            "applied",
+            "updated",
+            "skipped",
+            "failed",
+            "removed",
+            "verified",
+            "rebuilt",
+            "rolledBack",
+        ] {
+            let n = events.iter().filter(|e| e["action"] == action).count();
+            assert_eq!(v["summary"][action], n, "summary.{action}: {v}");
+        }
+    }
+
+    #[test]
+    fn envelope_maps_every_leg_to_events() {
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert("pkg:npm/a@1.0.0".to_string(), make_record("uuid-a"));
+        let results = vec![
+            rb("pkg:npm/a@1.0.0", "/p/a", VerifyRollbackStatus::Ready, true),
+            rb(
+                "pkg:npm/o@1.0.0",
+                "/p/o",
+                VerifyRollbackStatus::AlreadyOriginal,
+                false,
+            ),
+            failed_rb("pkg:npm/bad@1.0.0"),
+        ];
+        let vendored = VendoredLegOutcome {
+            reverted: vec!["pkg:npm/v@1.0.0".to_string()],
+            preserved: vec!["pkg:npm/vp@1.0.0".to_string()],
+            kept: vec![("pkg:npm/vk@1.0.0".to_string(), "drifted".to_string())],
+            failed: vec![(
+                "pkg:npm/vf@1.0.0".to_string(),
+                "vendor_revert_failed",
+                "boom".to_string(),
+            )],
+            warnings: Vec::new(),
+        };
+        let hosted = HostedLegOutcome {
+            reverted: vec!["pkg:npm/h@1.0.0".to_string()],
+            failed: vec![
+                ("pkg:npm/hf@1.0.0".to_string(), "refused".to_string()),
+                (
+                    HOSTED_WRITE_FAILURE_KEY.to_string(),
+                    "disk full".to_string(),
+                ),
+            ],
+            edited_files: ["package-lock.json".to_string()].into(),
+            ..Default::default()
+        };
+        let not_installed = vec!["pkg:npm/gone@1.0.0".to_string()];
+        let removed = vec!["pkg:npm/a@1.0.0".to_string()];
+        let warnings = vec![("reinstall_required".to_string(), "x".to_string())];
+        let gc = GcReport {
+            removed_blobs: 1,
+            bytes_freed: 42,
+            ..Default::default()
+        };
+        let env = build_rollback_envelope(&RollbackReport {
+            not_installed: &not_installed,
+            removed: &removed,
+            warnings: &warnings,
+            gc: Some(gc),
+            ..report(false, false, &manifest, &results, &vendored, &hosted)
+        });
+        let v = env.to_value();
+        assert_envelope_invariants(&v);
+        assert_eq!(v["status"], "partialFailure");
+        assert!(v.get("error").is_none());
+        assert_eq!(v["summary"]["rolledBack"], 4, "a, v, vp, h: {v}");
+        assert_eq!(v["summary"]["failed"], 5, "bad, vk, vf, hf, files: {v}");
+        assert_eq!(
+            v["summary"]["skipped"], 2,
+            "already original + not installed"
+        );
+        assert_eq!(v["summary"]["removed"], 1);
+        assert_eq!(v["summary"]["bytesFreed"], 42);
+        assert_eq!(v["gc"]["removedBlobs"], 1);
+        assert_eq!(v["hosted"]["editedFiles"], 1);
+        assert_eq!(v["paths"], serde_json::json!([]));
+        assert_eq!(v["warnings"][0]["code"], "reinstall_required");
+
+        let events = v["events"].as_array().unwrap();
+        let find = |action: &str, purl: &str| {
+            events
+                .iter()
+                .find(|e| e["action"] == action && e["purl"] == purl)
+                .unwrap_or_else(|| panic!("no {action} {purl}: {v}"))
+        };
+        let a = find("rolledBack", "pkg:npm/a@1.0.0");
+        assert_eq!(a["uuid"], "uuid-a");
+        assert_eq!(a["files"][0]["path"], "index.js");
+        assert_eq!(a["details"]["path"], "/p/a");
+        assert!(
+            a["details"].get("mode").is_none(),
+            "agent events carry no mode"
+        );
+        assert_eq!(
+            find("skipped", "pkg:npm/o@1.0.0")["errorCode"],
+            "already_original"
+        );
+        let bad = find("failed", "pkg:npm/bad@1.0.0");
+        assert_eq!(bad["errorCode"], "hash_mismatch");
+        assert_eq!(bad["details"]["filesVerified"][0]["status"], "hashMismatch");
+        assert_eq!(
+            find("skipped", "pkg:npm/gone@1.0.0")["errorCode"],
+            "package_not_installed"
+        );
+        assert_eq!(
+            find("rolledBack", "pkg:npm/v@1.0.0")["details"]["mode"],
+            "vendored"
+        );
+        let vp = find("rolledBack", "pkg:npm/vp@1.0.0");
+        assert_eq!(vp["details"]["mode"], "vendored");
+        assert_eq!(vp["details"]["preserved"], true);
+        assert_eq!(
+            find("failed", "pkg:npm/vk@1.0.0")["errorCode"],
+            "vendor_revert_kept"
+        );
+        assert_eq!(
+            find("failed", "pkg:npm/vf@1.0.0")["errorCode"],
+            "vendor_revert_failed"
+        );
+        assert_eq!(
+            find("rolledBack", "pkg:npm/h@1.0.0")["details"]["mode"],
+            "hosted"
+        );
+        assert_eq!(
+            find("failed", "pkg:npm/hf@1.0.0")["errorCode"],
+            "hosted_restore_refused"
+        );
+        let write = events
+            .iter()
+            .find(|e| e["errorCode"] == "hosted_write_failed")
+            .expect("artifact-level write failure");
+        assert!(write.get("purl").is_none());
+        let removed = find("removed", "pkg:npm/a@1.0.0");
+        assert_eq!(removed["details"]["manifest"], true);
+    }
+
+    #[test]
+    fn envelope_dry_run_previews_are_verified() {
+        let manifest = PatchManifest::new();
+        let results = vec![rb(
+            "pkg:npm/a@1.0.0",
+            "/p/a",
+            VerifyRollbackStatus::Ready,
+            false,
+        )];
+        let vendored = VendoredLegOutcome {
+            reverted: vec!["pkg:npm/v@1.0.0".to_string()],
+            ..Default::default()
+        };
+        let hosted = HostedLegOutcome {
+            reverted: vec!["pkg:npm/h@1.0.0".to_string()],
+            ..Default::default()
+        };
+        let removed = vec!["pkg:npm/a@1.0.0".to_string()];
+        let env = build_rollback_envelope(&RollbackReport {
+            removed: &removed,
+            ..report(true, true, &manifest, &results, &vendored, &hosted)
+        });
+        let v = env.to_value();
+        assert_envelope_invariants(&v);
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["dryRun"], true);
+        assert_eq!(v["summary"]["verified"], 4, "{v}");
+        assert_eq!(v["summary"]["rolledBack"], 0);
+        assert_eq!(v["summary"]["removed"], 0);
+        assert_eq!(v["events"][0]["files"][0]["path"], "index.js");
+        assert!(v.get("gc").is_none());
+    }
+
+    #[test]
+    fn envelope_total_failure_is_rollback_failed_error() {
+        let manifest = PatchManifest::new();
+        let results = vec![failed_rb("pkg:npm/bad@1.0.0")];
+        let vendored = VendoredLegOutcome::default();
+        let hosted = HostedLegOutcome::default();
+        let v = build_rollback_envelope(&report(
+            false, false, &manifest, &results, &vendored, &hosted,
+        ))
+        .to_value();
+        assert_envelope_invariants(&v);
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error"]["code"], "rollback_failed");
+        assert_eq!(v["summary"]["failed"], 1);
+        // The failed event survives beside the top-level error.
+        assert_eq!(v["events"][0]["action"], "failed");
+    }
+
+    #[test]
+    fn envelope_run_level_failure_is_partial_without_events() {
+        // A corrupt vendor ledger / failed manifest write: no event, exit 1.
+        let manifest = PatchManifest::new();
+        let vendored = VendoredLegOutcome::default();
+        let hosted = HostedLegOutcome::default();
+        let warnings = vec![("vendor_state_unreadable".to_string(), "bad".to_string())];
+        let v = build_rollback_envelope(&RollbackReport {
+            warnings: &warnings,
+            ..report(false, false, &manifest, &[], &vendored, &hosted)
+        })
+        .to_value();
+        assert_envelope_invariants(&v);
+        assert_eq!(v["status"], "partialFailure");
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn envelope_contested_wiring_is_an_artifact_failure() {
+        let manifest = PatchManifest::new();
+        let results = vec![rb(
+            "pkg:npm/a@1.0.0",
+            "/p/a",
+            VerifyRollbackStatus::Ready,
+            true,
+        )];
+        let vendored = VendoredLegOutcome::default();
+        let hosted = HostedLegOutcome::default();
+        let v = build_rollback_envelope(&RollbackReport {
+            contested: Some("cannot attribute"),
+            ..report(false, false, &manifest, &results, &vendored, &hosted)
+        })
+        .to_value();
+        assert_envelope_invariants(&v);
+        assert_eq!(v["status"], "partialFailure");
+        let e = &v["events"][1];
+        assert_eq!(e["action"], "failed");
+        assert_eq!(e["errorCode"], "hosted_wiring_contested");
+        assert_eq!(e["details"]["mode"], "hosted");
+    }
+
+    #[test]
+    fn error_envelope_is_a_full_envelope() {
+        let v = error_envelope(true, EnvelopeError::new("patch_not_found", "nope")).to_value();
+        assert_envelope_invariants(&v);
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["dryRun"], true);
+        assert_eq!(v["events"], serde_json::json!([]));
+        assert_eq!(v["summary"]["failed"], 0);
+        assert_eq!(v["error"]["code"], "patch_not_found");
+        assert_eq!(v["error"]["message"], "nope");
+    }
+
+    #[test]
+    fn failure_codes_follow_the_blocking_file() {
+        assert_eq!(
+            rollback_failure_code(&failed_rb("pkg:npm/x@1")),
+            "hash_mismatch"
+        );
+        let mut r = failed_rb("pkg:npm/x@1");
+        r.files_verified[0].status = VerifyRollbackStatus::MissingBlob;
+        assert_eq!(rollback_failure_code(&r), "missing_blob");
+        r.files_verified[0].status = VerifyRollbackStatus::NotFound;
+        assert_eq!(rollback_failure_code(&r), "file_not_found");
+        r.files_verified.clear();
+        assert_eq!(rollback_failure_code(&r), "rollback_failed");
     }
 
     /// #477: next to a PyPI reinstall advisory the note must not imply

@@ -963,10 +963,7 @@ async fn bun_hosted_project_with(
         )
     });
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(
-        env["redirect"]["redirected"], 1,
-        "one dep redirected: {env}"
-    );
+    assert_eq!(env["summary"]["applied"], 1, "one dep redirected: {env}");
     match driver {
         HostedDriver::ScanVex => {
             // In-run VEX (step 3 of the module doc): the envelope's vex block
@@ -977,8 +974,10 @@ async fn bun_hosted_project_with(
             assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
-            assert_eq!(
-                env["vex"]["verified"], false,
+            assert!(
+                env["vex"]["warnings"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|w| w["code"] == "vex_hosted_unverified")),
                 "in-run redirect VEX is attested from the fetched record, not hash-verified: {env}"
             );
             let vex_doc: serde_json::Value =
@@ -1005,14 +1004,14 @@ async fn bun_hosted_project_with(
             );
         }
         HostedDriver::GetUuid => {
-            // get's envelope nests the same redirect block into its own base
-            // shape; nothing is downloaded into `.socket/` (the lock IS the
+            // get records the same hosted events and `redirect` payload;
+            // nothing is downloaded into `.socket/` (the lock IS the
             // persistence — parity with `scan --mode hosted`).
             assert_eq!(env["redirect"]["mode"], "hosted", "envelope: {env}");
-            assert_eq!(env["found"], 1, "get keeps its found count: {env}");
-            assert!(
-                env.get("downloaded").is_none() && env.get("applied").is_none(),
-                "hosted get downloads/applies nothing — those keys must be absent: {env}"
+            assert_eq!(env["command"], "get", "envelope: {env}");
+            assert_eq!(
+                env["summary"]["downloaded"], 0,
+                "hosted get downloads nothing: {env}"
             );
             assert!(
                 !proj.join(".socket").join("manifest.json").exists(),
@@ -1838,8 +1837,8 @@ async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
     let env: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("repeat scan output is not JSON: {e}\nstdout:\n{stdout}"));
     assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
-    let codes: Vec<&str> = env["redirect"]["warnings"]
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
+    let codes: Vec<&str> = env["warnings"]
         .as_array()
         .into_iter()
         .flatten()

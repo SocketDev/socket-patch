@@ -14,12 +14,12 @@ use std::time::Duration;
 use crate::args::GlobalArgs;
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{run_vendor_gc, VendorGcSummary};
-use crate::json_envelope::GcReport;
+use crate::json_envelope::{Envelope, GcReport, PatchAction, PatchEvent};
 use crate::ui::sweep_failure;
 
-/// Aggregated outcome of a GC pass (or preview). Serialized into the
-/// `scan --json` output's `gc` sub-object. See CLI_CONTRACT.md for the
-/// stable schema.
+/// Aggregated outcome of a GC pass (or preview), recorded into the `scan
+/// --json` envelope by [`GcSummary::record_into`]. See CLI_CONTRACT.md for
+/// the stable schema.
 #[derive(Debug, Default)]
 pub(super) struct GcSummary {
     /// PURLs removed from the manifest (apply mode) or eligible to be
@@ -94,37 +94,88 @@ impl GcSummary {
         self.vendor_orphan_dirs = v.orphan_dirs;
     }
 
-    /// The `gc` sub-object. One shape for both passes: the artifact half is
-    /// the `gc` object every GC-running command prints (`GcReport`), the
-    /// manifest and vendored halves are scan's. On a `--dry-run` preview the
-    /// counts are what the pass would remove, and the keys only a real pass
-    /// can fill (`keptVendoredEntries`, `failedVendoredEntries`, `skipped`,
-    /// `warnings`) are left out rather than reported as an empty check.
-    pub(super) fn to_json(&self, preview: bool) -> serde_json::Value {
-        let mut json =
-            GcReport::from_passes(Some(&self.blobs), Some(&self.diffs), Some(&self.packages))
-                .to_value();
-        json["prunedManifestEntries"] = serde_json::json!(self.pruned);
-        json["revertedVendoredEntries"] = serde_json::json!(self.vendored_reverted);
-        json["removedVendorOrphanDirs"] = serde_json::json!(self.vendor_orphan_dirs);
-        if preview {
-            return json;
-        }
-        json["keptVendoredEntries"] = serde_json::json!(self.vendored_kept);
-        json["failedVendoredEntries"] = serde_json::json!(self.vendored_failed);
+    /// Record the pass into a `scan` envelope. The artifact sweep is the
+    /// envelope's `gc` (the shared [`GcReport`], counts of what a preview
+    /// would remove), each pruned manifest entry a `removed` event
+    /// (`verified` on a preview) with `details.manifest: true`, each
+    /// reverted vendored entry a `removed` (`verified`) event with
+    /// `errorCode: "vendor_reverted"` and `details.mode: "vendored"`, each
+    /// drift-kept entry a `skipped` / `vendor_revert_kept` event, and each
+    /// entry whose revert failed a `skipped` / `vendor_revert_failed` event
+    /// (a GC revert failure never fails the run, so it is not a `failed`
+    /// event). The orphan `.socket/vendor/<eco>/<uuid>` dirs swept are
+    /// counted in the top-level `removedVendorOrphanDirs`, and the pass's
+    /// warnings join the top-level `warnings`. A pass that could not run
+    /// (lock held, lock I/O) records only a `gc_skipped` warning and no
+    /// `gc`.
+    pub(super) fn record_into(&self, env: &mut Envelope, preview: bool) {
         if let Some((code, message)) = &self.skipped {
-            json["skipped"] = serde_json::json!({ "code": code, "message": message });
+            env.warn(GC_SKIPPED, format!("{message} ({code})"));
+            return;
         }
-        if !self.warnings.is_empty() {
-            json["warnings"] = self
-                .warnings
-                .iter()
-                .map(|(code, detail)| serde_json::json!({ "code": code, "detail": detail }))
-                .collect();
+        let removal = if preview {
+            PatchAction::Verified
+        } else {
+            PatchAction::Removed
+        };
+        for purl in &self.pruned {
+            env.record(
+                PatchEvent::new(removal, purl.as_str())
+                    .with_details(serde_json::json!({ "manifest": true })),
+            );
         }
-        json
+        let vendored = || serde_json::json!({ "mode": "vendored" });
+        for purl in &self.vendored_reverted {
+            env.record(
+                PatchEvent::new(removal, purl.as_str())
+                    .with_reason(
+                        "vendor_reverted",
+                        "vendored entry reverted by the prune GC (its patch left the \
+                         manifest or its dependency left the lockfile)",
+                    )
+                    .with_details(vendored()),
+            );
+        }
+        for purl in &self.vendored_kept {
+            env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.as_str())
+                    .with_reason(
+                        "vendor_revert_kept",
+                        "lock entries were re-resolved since vendoring, so the artifact \
+                         and the manifest/ledger entries were retained",
+                    )
+                    .with_details(vendored()),
+            );
+        }
+        for purl in &self.vendored_failed {
+            env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.as_str())
+                    .with_reason(
+                        "vendor_revert_failed",
+                        "the prune GC could not revert this vendored entry; its ledger \
+                         entry and artifacts were kept",
+                    )
+                    .with_details(vendored()),
+            );
+        }
+        env.set_gc(GcReport::from_passes(
+            Some(&self.blobs),
+            Some(&self.diffs),
+            Some(&self.packages),
+        ));
+        env.set_extra(
+            "removedVendorOrphanDirs",
+            serde_json::json!(self.vendor_orphan_dirs),
+        );
+        for (code, detail) in &self.warnings {
+            env.warn(*code, detail.clone());
+        }
     }
 }
+
+/// Warning code: a requested GC pass could not run (another run holds the
+/// apply lock, or the lock file could not be opened); nothing was swept.
+pub(super) const GC_SKIPPED: &str = "gc_skipped";
 
 /// The orphan blob/diff/package sweep against the (post-prune) manifest.
 /// `dry_run = true` for the preview path; `dry_run = false` for the apply
@@ -369,25 +420,24 @@ async fn preview_apply_gc(
     gc
 }
 
-/// The `gc` sub-object for the JSON paths: a read-only preview under
-/// `--dry-run`, the mutating pass otherwise, both in the one `gc` shape.
-pub(super) async fn gc_json(
+/// The GC for the JSON paths, recorded into `env` (see
+/// [`GcSummary::record_into`]): a read-only preview under `--dry-run`, the
+/// mutating pass otherwise.
+pub(super) async fn gc_into(
     common: &GlobalArgs,
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
     vendored: &HashSet<PurlKey>,
     dry_run: bool,
-) -> serde_json::Value {
-    if dry_run {
-        preview_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored)
-            .await
-            .to_json(true)
+    env: &mut Envelope,
+) {
+    let gc = if dry_run {
+        preview_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored).await
     } else {
-        run_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored)
-            .await
-            .to_json(false)
-    }
+        run_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored).await
+    };
+    gc.record_into(env, dry_run);
 }
 
 /// `1 manifest entry` / `2 manifest entries` (and friends).
@@ -986,13 +1036,17 @@ mod tests {
             )),
             "a lock-contended pass must say why it pruned nothing"
         );
-        let json = gc.to_json(false);
-        assert_eq!(json["skipped"]["code"], "lock_held", "{json}");
-        assert_eq!(
-            json["prunedManifestEntries"],
-            serde_json::json!([]),
+        let json = recorded(&gc, false);
+        assert_eq!(json["warnings"][0]["code"], GC_SKIPPED, "{json}");
+        assert!(
+            json["warnings"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .ends_with("(lock_held)"),
             "{json}"
         );
+        assert!(json.get("gc").is_none(), "a skipped pass has no gc: {json}");
+        assert_eq!(json["events"], serde_json::json!([]), "{json}");
     }
 
     /// `--lock-timeout` reaches the GC acquire: the pass waits (and says
@@ -1067,7 +1121,15 @@ mod tests {
         assert!(blob_path.exists(), "nothing may be swept on a lock fault");
         let m = read_manifest(&manifest_path).await.unwrap().unwrap();
         assert!(m.patches.contains_key("pkg:npm/gone@1.0.0"));
-        assert_eq!(gc.to_json(false)["skipped"]["code"], "lock_io");
+        let json = recorded(&gc, false);
+        assert_eq!(json["warnings"][0]["code"], GC_SKIPPED, "{json}");
+        assert!(
+            json["warnings"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .ends_with("(lock_io)"),
+            "{json}"
+        );
     }
 
     #[tokio::test]
@@ -1275,10 +1337,10 @@ mod tests {
             "preview must not create a manifest file"
         );
         // The serialized degenerate preview is the normal all-zero shape.
-        let json = gc.to_json(true);
-        assert_eq!(json["prunedManifestEntries"], serde_json::json!([]));
-        assert_eq!(json["removedBlobs"], serde_json::json!(0));
-        assert_eq!(json["bytesFreed"], serde_json::json!(0));
+        let json = recorded(&gc, true);
+        assert_eq!(json["events"], serde_json::json!([]));
+        assert_eq!(json["gc"]["removedBlobs"], serde_json::json!(0));
+        assert_eq!(json["gc"]["bytesFreed"], serde_json::json!(0));
 
         // Corrupt manifest, fresh tempdir.
         let tmp = tempfile::tempdir().unwrap();
@@ -1503,18 +1565,21 @@ mod tests {
             "the keep must be counted — the only signal that the entry the \
              preview listed as revertable was deliberately not reclaimed"
         );
+        let json = recorded(&gc, false);
         assert_eq!(
-            gc.to_json(false)["keptVendoredEntries"],
-            serde_json::json!([PURL]),
+            json["events"],
+            serde_json::json!([{
+                "action": "skipped", "purl": PURL, "errorCode": "vendor_revert_kept",
+                "reason": json["events"][0]["reason"], "details": {"mode": "vendored"},
+            }]),
             "scan --prune --json must carry the keep"
         );
         // The revert's own drift warnings (`vendor_lock_entry_drifted`,
         // `vendor_artifact_kept`) are already said by the keep above; they
-        // must not also land in `gc.warnings[]`.
+        // must not also land in `warnings[]`.
         assert!(
-            gc.to_json(false).get("warnings").is_none(),
-            "a drift keep adds no gc warning: {}",
-            gc.to_json(false)
+            json.get("warnings").is_none(),
+            "a drift keep adds no warning: {json}"
         );
         // Nothing reclaimed: manifest record, blob, ledger entry, and
         // artifacts all survive (the drift-keep contract).
@@ -1536,24 +1601,28 @@ mod tests {
         assert!(uuid_dir.exists(), "kept artifacts must survive the sweep");
     }
 
-    /// The `keptVendoredEntries` / `failedVendoredEntries` / `skipped` /
-    /// `warnings` plumbing in isolation: absorbed sorted, serialized on the
-    /// apply shape, absent from the preview shape (a read-only preview
-    /// cannot detect drift, reverts nothing and takes no lock, so emitting
-    /// a constant `[]`/marker would claim a check that never ran). The
-    /// vendored half's typed fields land where they belong: `failed` holds
-    /// only purls, its failed rewrites become `warnings` — never mislabelled
-    /// as `lock_held`; `skipped` is this pass's own lock outcome.
+    /// A pass recorded into a fresh `scan` envelope, serialized.
+    fn recorded(gc: &GcSummary, preview: bool) -> serde_json::Value {
+        let mut env = Envelope::new(crate::json_envelope::Command::Scan);
+        gc.record_into(&mut env, preview);
+        env.to_value()
+    }
+
+    /// The vendored half's typed fields absorb sorted and land where they
+    /// belong in the envelope: kept and failed reverts are `skipped` events
+    /// (`vendor_revert_kept` / `vendor_revert_failed`, `details.mode:
+    /// "vendored"`), failed rewrites top-level warnings — never mislabelled
+    /// as a skipped pass; a pass that could not take the lock is only the
+    /// `gc_skipped` warning, with no `gc`.
     #[test]
-    fn gc_json_shapes_carry_drift_keeps_only_on_apply() {
+    fn record_into_carries_kept_failed_and_skipped_passes() {
         const LOCK_MARKER: &str = "another socket-patch process is operating in this directory";
-        let mut gc = GcSummary {
-            skipped: Some(("lock_held", LOCK_MARKER.into())),
-            ..Default::default()
-        };
+        let mut gc = GcSummary::default();
         gc.absorb_vendor_gc(VendorGcSummary {
             kept: vec!["pkg:npm/b@1.0.0".into(), "pkg:npm/a@1.0.0".into()],
             failed: vec!["pkg:npm/d@1.0.0".into(), "pkg:npm/c@1.0.0".into()],
+            dropped_reverted: vec!["pkg:npm/e@1.0.0".into()],
+            orphan_dirs: 2,
             write_failures: vec![(
                 "vendor_state_write_failed",
                 "reverted vendored entries but could not update .socket/vendor/state.json: EROFS"
@@ -1561,75 +1630,87 @@ mod tests {
             )],
             ..Default::default()
         });
+        gc.pruned = vec!["pkg:npm/gone@1.0.0".into()];
         assert_eq!(
             gc.vendored_kept,
             vec!["pkg:npm/a@1.0.0".to_string(), "pkg:npm/b@1.0.0".to_string()],
             "absorb must sort, like every other purl list"
         );
+        let json = recorded(&gc, false);
+        let rows: Vec<(String, String, String)> = json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["action"].as_str().unwrap().to_string(),
+                    e["purl"].as_str().unwrap().to_string(),
+                    e["errorCode"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let row = |a: &str, p: &str, c: &str| (a.to_string(), p.to_string(), c.to_string());
         assert_eq!(
-            gc.vendored_failed,
-            vec!["pkg:npm/c@1.0.0".to_string(), "pkg:npm/d@1.0.0".to_string()],
-            "failed reverts are absorbed sorted"
+            rows,
+            vec![
+                row("removed", "pkg:npm/gone@1.0.0", ""),
+                row("removed", "pkg:npm/e@1.0.0", "vendor_reverted"),
+                row("skipped", "pkg:npm/a@1.0.0", "vendor_revert_kept"),
+                row("skipped", "pkg:npm/b@1.0.0", "vendor_revert_kept"),
+                row("skipped", "pkg:npm/c@1.0.0", "vendor_revert_failed"),
+                row("skipped", "pkg:npm/d@1.0.0", "vendor_revert_failed"),
+            ],
+            "{json}"
         );
         assert_eq!(
-            gc.skipped,
-            Some(("lock_held", LOCK_MARKER.to_string())),
-            "absorbing the vendored half leaves this pass's own skip reason alone"
+            json["events"][0]["details"],
+            serde_json::json!({"manifest": true})
         );
-        let apply = gc.to_json(false);
+        assert_eq!(json["events"][1]["details"]["mode"], "vendored");
+        assert_eq!(json["summary"]["removed"], 2);
+        assert_eq!(json["summary"]["skipped"], 4);
         assert_eq!(
-            apply["keptVendoredEntries"],
-            serde_json::json!(["pkg:npm/a@1.0.0", "pkg:npm/b@1.0.0"])
+            json["summary"]["failed"], 0,
+            "a GC revert failure never fails the run"
         );
+        assert_eq!(json["status"], "success");
+        assert_eq!(json["removedVendorOrphanDirs"], 2);
+        assert_eq!(json["gc"]["removedBlobs"], 0);
         assert_eq!(
-            apply["failedVendoredEntries"],
-            serde_json::json!(["pkg:npm/c@1.0.0", "pkg:npm/d@1.0.0"])
-        );
-        assert_eq!(apply["revertedVendoredEntries"], serde_json::json!([]));
-        assert_eq!(apply["skipped"]["code"], "lock_held", "{apply}");
-        assert_eq!(
-            apply["warnings"],
+            json["warnings"],
             serde_json::json!([{
                 "code": "vendor_state_write_failed",
                 "detail": "reverted vendored entries but could not update \
                            .socket/vendor/state.json: EROFS",
             }]),
-            "{apply}"
+            "{json}"
         );
-        let preview = gc.to_json(true);
-        for key in [
-            "keptVendoredEntries",
-            "failedVendoredEntries",
-            "skipped",
-            "warnings",
-        ] {
-            assert!(
-                preview.get(key).is_none(),
-                "preview must not claim a check it cannot run ({key}): {preview}"
-            );
-        }
+        // A preview flips the removals to `verified`.
+        let preview = recorded(&gc, true);
+        assert_eq!(preview["events"][0]["action"], "verified");
+        assert_eq!(preview["events"][1]["action"], "verified");
+        assert_eq!(preview["summary"]["removed"], 0);
 
-        // A pass that took its own lock fine reports NO skip and NO
-        // warnings, and the apply shape omits both keys entirely (additive:
-        // absent, not null).
-        let clean = GcSummary::vendor_only(VendorGcSummary::default());
-        assert!(clean.skipped.is_none());
-        let clean_json = clean.to_json(false);
-        assert!(clean_json.get("skipped").is_none(), "{clean_json}");
-        assert!(clean_json.get("warnings").is_none(), "{clean_json}");
-        // A failed rewrite in the vendored half is a warning, never a skip
-        // and never a per-purl failure.
-        let mut io = GcSummary::default();
-        io.absorb_vendor_gc(VendorGcSummary {
-            write_failures: vec![("manifest_write_failed", "could not update manifest".into())],
+        // A pass that could not take its lock: only the warning.
+        let skipped = GcSummary {
+            skipped: Some(("lock_held", LOCK_MARKER.into())),
             ..Default::default()
-        });
-        assert!(io.skipped.is_none(), "the vendored half never sets skipped");
+        };
+        let json = recorded(&skipped, false);
         assert_eq!(
-            io.to_json(false)["warnings"][0]["code"],
-            "manifest_write_failed"
+            json["warnings"],
+            serde_json::json!([{
+                "code": GC_SKIPPED,
+                "detail": format!("{LOCK_MARKER} (lock_held)"),
+            }])
         );
-        assert!(io.vendored_failed.is_empty());
+        assert!(json.get("gc").is_none());
+        assert!(json.get("removedVendorOrphanDirs").is_none());
+
+        // A clean pass: a zero gc, no warnings.
+        let clean = recorded(&GcSummary::vendor_only(VendorGcSummary::default()), false);
+        assert!(clean.get("warnings").is_none(), "{clean}");
+        assert_eq!(clean["gc"]["bytesFreed"], 0);
     }
 
     /// The human GC vocabulary the contract pins (`GC: skipped (<code>):

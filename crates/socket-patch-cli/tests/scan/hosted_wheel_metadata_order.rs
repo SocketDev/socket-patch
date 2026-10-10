@@ -35,6 +35,24 @@ const PKGS: [(&str, &str, &str); 4] = [
     ("ddd-pkg", "4.0.0", "44444444-4444-4444-8444-444444444444"),
 ];
 
+/// The hosted `skipped` events of a scan envelope as v4's
+/// `redirect.skipped[]` rows: `{purl, uuid, reason: <errorCode>, detail:
+/// <reason>}` (v5.0 records them as `details.mode: "hosted"` events).
+fn hosted_skipped(doc: &serde_json::Value) -> Vec<serde_json::Value> {
+    doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "skipped")
+        .map(|e| {
+            serde_json::json!({
+                "purl": e["purl"], "uuid": e["uuid"],
+                "reason": e["errorCode"], "detail": e["reason"],
+            })
+        })
+        .collect()
+}
+
 fn purl(name: &str, version: &str) -> String {
     format!("pkg:pypi/{name}@{version}")
 }
@@ -370,9 +388,7 @@ async fn wheel_metadata_failures_fold_in_dep_order() {
         .unwrap_or_else(|e| panic!("JSON envelope ({e}):\n{stdout}\n{stderr}"));
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
 
-    let skipped: Vec<(String, String)> = doc["redirect"]["skipped"]
-        .as_array()
-        .unwrap_or_else(|| panic!("redirect.skipped: {doc:#}"))
+    let skipped: Vec<(String, String)> = hosted_skipped(&doc)
         .iter()
         .filter(|s| s["reason"] == "python_metadata_unavailable")
         .map(|s| {
@@ -390,7 +406,7 @@ async fn wheel_metadata_failures_fold_in_dep_order() {
         ],
         "metadata failures must be reported in dep order: {doc:#}"
     );
-    for s in doc["redirect"]["skipped"].as_array().unwrap() {
+    for s in &hosted_skipped(&doc) {
         if s["reason"] == "python_metadata_unavailable" {
             let detail = s["detail"].as_str().unwrap();
             // The detail quotes the URL through the shared redactor (this
@@ -400,7 +416,11 @@ async fn wheel_metadata_failures_fold_in_dep_order() {
         }
     }
     // The two good wheels still redirect; the refused two stay upstream.
-    assert_eq!(doc["redirect"]["redirected"], 2, "{doc:#}");
+    assert_eq!(
+        crate::common::envelope::hosted_pins(&doc).len(),
+        2,
+        "{doc:#}"
+    );
     assert_eq!(
         std::fs::read(root.join("uv.lock")).unwrap(),
         lock_before,
@@ -492,19 +512,15 @@ async fn rate_limited_wheel_host_matches_the_serial_outcome() {
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
     let log = log.lock().unwrap().clone();
     assert_eq!(
-        doc["redirect"]["redirected"],
+        crate::common::envelope::hosted_pins(&doc).len(),
         PKGS.len(),
         "every wheel redirects, as in the serial loop: {doc:#}\nwheel requests: {log:?}"
     );
-    let metadata_skips: Vec<&Value> = doc["redirect"]["skipped"]
-        .as_array()
-        .map(|skipped| {
-            skipped
-                .iter()
-                .filter(|s| s["reason"] == "python_metadata_unavailable")
-                .collect()
-        })
-        .unwrap_or_default();
+    let all_skipped = hosted_skipped(&doc);
+    let metadata_skips: Vec<&Value> = all_skipped
+        .iter()
+        .filter(|s| s["reason"] == "python_metadata_unavailable")
+        .collect();
     assert!(
         metadata_skips.is_empty(),
         "no wheel may be skipped: {metadata_skips:?}\nwheel requests: {log:?}"
@@ -617,9 +633,7 @@ async fn a_deferred_wheel_attempt_does_not_buy_a_second_retry_budget() {
         "the flapping wheel gets exactly the serial loop's budget, all of \
          it spent before the host's first 200: {log:?}"
     );
-    let skipped: Vec<String> = doc["redirect"]["skipped"]
-        .as_array()
-        .unwrap_or_else(|| panic!("redirect.skipped: {doc:#}"))
+    let skipped: Vec<String> = hosted_skipped(&doc)
         .iter()
         .filter(|s| s["reason"] == "python_metadata_unavailable")
         .map(|s| s["purl"].as_str().unwrap().to_string())
@@ -630,7 +644,7 @@ async fn a_deferred_wheel_attempt_does_not_buy_a_second_retry_budget() {
         "the exhausted wheel is skipped, as in the serial loop: {doc:#}"
     );
     assert_eq!(
-        doc["redirect"]["redirected"],
+        crate::common::envelope::hosted_pins(&doc).len(),
         PKGS.len() - 1,
         "the other three still redirect: {doc:#}"
     );

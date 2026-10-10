@@ -183,7 +183,8 @@ fn scoped_removal_preserves_other_patches_for_offline_rollback() {
 /// no per-purl `removed` event fires.
 ///
 /// ACTUAL event shape pinned here: for a pure agent-mode patch the wet run
-/// emits ONLY the purl-less artifact carrier (`details.rolledBack: 1`) — the
+/// emits ONLY one `rolledBack` event for the restored copy (no GC carrier,
+/// since GC is skipped) — the
 /// `vendor_state_preserved` Skipped reason exists only for vendored entries
 /// (pinned by the next test). `--offline` proves the restore came from the
 /// staged before-blob, not the network.
@@ -243,25 +244,27 @@ fn preserve_state_restores_but_keeps_entry() {
         "afterHash blob must be kept (GC skipped under --preserve-state)"
     );
 
-    // Envelope events: no per-purl removal, and the artifact carrier reports
-    // the rollback that DID happen.
+    // Envelope events: no per-purl removal, one `rolledBack` event for the
+    // rollback that DID happen, and no GC carrier (GC is skipped).
     assert!(
         removed_event_purls(&v).is_empty(),
         "no per-purl removed event may fire under --preserve-state; envelope={v}"
     );
     let events = v["events"].as_array().expect("events array");
-    let carrier = events
+    let rolled: Vec<_> = events
         .iter()
-        .find(|e| e["action"] == "removed" && e["purl"].is_null())
-        .unwrap_or_else(|| panic!("expected the artifact carrier event: {events:?}"));
-    assert_eq!(
-        carrier["details"]["rolledBack"], 1,
-        "the carrier must report the one rolled-back package; carrier={carrier}"
+        .filter(|e| e["action"] == "rolledBack")
+        .collect();
+    assert_eq!(rolled.len(), 1, "one restored copy; envelope={v}");
+    assert_eq!(rolled[0]["purl"], PRESERVE_PURL);
+    assert_eq!(v["summary"]["rolledBack"], 1, "envelope={v}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["action"] == "removed" && e["purl"].is_null()),
+        "no blobs may be swept under --preserve-state; envelope={v}"
     );
-    assert_eq!(
-        carrier["details"]["blobsRemoved"], 0,
-        "no blobs may be swept under --preserve-state; carrier={carrier}"
-    );
+    assert!(v.get("gc").is_none(), "GC skipped; envelope={v}");
 }
 
 // ---------------------------------------------------------------------------
@@ -524,8 +527,15 @@ fn default_remove_sweeps_archives_too() {
         .find(|e| e["action"] == "removed" && e["purl"].is_null())
         .unwrap_or_else(|| panic!("expected the artifact carrier event: {events:?}"));
     assert_eq!(
-        carrier["details"]["archivesRemoved"], 4,
-        "two diff + two package archives swept; carrier={carrier}"
+        v["gc"]["removedDiffArchives"].as_u64().unwrap()
+            + v["gc"]["removedPackageArchives"].as_u64().unwrap(),
+        4,
+        "two diff + two package archives swept; envelope={v}"
+    );
+    assert_eq!(
+        carrier["details"]["count"],
+        v["gc"]["removedBlobs"].as_u64().unwrap() + 4,
+        "the carrier counts every swept artifact; carrier={carrier}"
     );
 
     // The keep-rule really is manifest-anchored: B's entry survives.
@@ -695,8 +705,9 @@ fn hosted_only_remove_without_manifest_restores_upstream() {
     assert!(
         events.iter().any(|e| e["action"] == "removed"
             && e["purl"] == NPM_PURL
-            && e["errorCode"] == "hosted_reverted"),
-        "removed/hosted_reverted event expected; envelope={v}"
+            && e["errorCode"] == "hosted_reverted"
+            && e["details"]["mode"] == "hosted"),
+        "removed/hosted_reverted event (details.mode hosted) expected; envelope={v}"
     );
     assert_eq!(
         std::fs::read_to_string(&lock_path).unwrap(),
@@ -757,8 +768,17 @@ fn hosted_remove_with_manifest_entry_restores_upstream() {
     assert!(
         events.iter().any(|e| e["action"] == "removed"
             && e["errorCode"] == "hosted_reverted"
-            && e["purl"] == NPM_PURL),
-        "expected a removed/hosted_reverted event: {events:?}"
+            && e["purl"] == NPM_PURL
+            && e["details"]["mode"] == "hosted"),
+        "expected a removed/hosted_reverted event (details.mode hosted): {events:?}"
+    );
+    // The manifest entry's own removal is agent-mode: no mode.
+    assert!(
+        events
+            .iter()
+            .filter(|e| e["action"] == "removed" && e["errorCode"].is_null())
+            .all(|e| e["details"].get("mode").is_none()),
+        "{events:?}"
     );
     assert!(
         events

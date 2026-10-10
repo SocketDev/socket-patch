@@ -27,6 +27,37 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// The hosted `skipped` events as the pre-v5.0 `redirect.skipped[]` rows
+/// (`{purl, uuid, reason: <errorCode>, detail?: <reason>}`).
+fn hosted_skipped(doc: &Value) -> Vec<Value> {
+    doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "skipped")
+        .map(|e| {
+            let mut row = json!({"purl": e["purl"], "uuid": e["uuid"], "reason": e["errorCode"]});
+            if e["reason"].is_string() {
+                row["detail"] = e["reason"].clone();
+            }
+            row
+        })
+        .collect()
+}
+
+/// How many pins a hosted run wrote (`applied`) or would write (`verified`).
+fn hosted_pinned(doc: &Value) -> u64 {
+    doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
+}
+
 const ORG: &str = "test-org";
 const NAME: &str = "dryrun-vendored-takeover";
 const VERSION: &str = "1.0.0";
@@ -317,7 +348,7 @@ fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 }
 
 fn warning_detail<'a>(doc: &'a Value, code: &str) -> Option<&'a str> {
-    doc["redirect"]["warnings"]
+    doc["warnings"]
         .as_array()?
         .iter()
         .find(|w| w["code"] == code)
@@ -357,9 +388,9 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
         vendored_tree,
         "dry-run must leave every file, the vendored tarball included, byte-identical"
     );
-    assert_eq!(doc["redirect"]["dryRun"], true, "envelope: {doc:#}");
+    assert_eq!(doc["dryRun"], true, "envelope: {doc:#}");
 
-    let codes = codes_in(&doc["redirect"]["warnings"]);
+    let codes = codes_in(&doc["warnings"]);
     assert!(
         codes.iter().any(|c| c == "redirect_would_revert_vendored"),
         "the takeover plan must be announced: {doc:#}"
@@ -374,11 +405,12 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
     // The preview must count the migration the wet run lands (below) — the
     // CI-gate signal this envelope exists for.
     assert_eq!(
-        doc["redirect"]["redirected"], 1,
+        hosted_pinned(&doc),
+        1,
         "the dry-run must preview the wet outcome: {doc:#}"
     );
     assert_eq!(
-        doc["redirect"]["skipped"].as_array().map(Vec::len),
+        Some(&hosted_skipped(&doc)).map(Vec::len),
         Some(0),
         "a revertable vendored purl is not skipped: {doc:#}"
     );
@@ -429,7 +461,8 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
     let (code, wet) = scan_hosted_json(root, &server.uri(), /*dry_run=*/ false);
     assert_eq!(code, 0, "wet scan --mode hosted must succeed: {wet:#}");
     assert_eq!(
-        wet["redirect"]["redirected"], 1,
+        hosted_pinned(&wet),
+        1,
         "the wet takeover must land: {wet:#}"
     );
     let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
@@ -476,7 +509,7 @@ async fn dry_run_refuses_unrevertable_vendored_state_like_the_wet_run() {
     let (code, doc) = scan_hosted_json(root, &server.uri(), /*dry_run=*/ true);
     assert_eq!(code, 0, "dry-run scan --mode hosted must succeed: {doc:#}");
 
-    let codes = codes_in(&doc["redirect"]["warnings"]);
+    let codes = codes_in(&doc["warnings"]);
     assert!(
         codes.iter().any(|c| c == "redirect_vendored_revert_failed"),
         "the unrevertable state must be refused in the preview too: {doc:#}"
@@ -486,13 +519,14 @@ async fn dry_run_refuses_unrevertable_vendored_state_like_the_wet_run() {
         "a refused purl must not also be promised a takeover: {doc:#}"
     );
     assert!(
-        doc["redirect"]["skipped"].as_array().is_some_and(|s| s
+        Some(&hosted_skipped(&doc)).is_some_and(|s| s
             .iter()
             .any(|e| e["purl"] == PURL && e["reason"] == "vendored_revert_failed")),
         "the refusal must be accounted as skipped: {doc:#}"
     );
     assert_eq!(
-        doc["redirect"]["redirected"], 0,
+        hosted_pinned(&doc),
+        0,
         "a refused takeover previews as not redirected: {doc:#}"
     );
     assert_eq!(
@@ -655,12 +689,12 @@ async fn dry_run_package_lock_takeover_previews_the_npmrc_write() {
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(tree_snapshot(root), vendored_tree, "dry run writes nothing");
     assert!(
-        codes_in(&doc["redirect"]["warnings"])
+        codes_in(&doc["warnings"])
             .iter()
             .any(|c| c == "redirect_would_revert_vendored"),
         "{doc:#}"
     );
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
     let detail = warning_detail(&doc, "redirect_npm_allow_remote")
         .unwrap_or_else(|| panic!("the .npmrc write must be previewed: {doc:#}"));
     assert!(
@@ -677,7 +711,7 @@ async fn dry_run_package_lock_takeover_previews_the_npmrc_write() {
 
     let (code, wet) = scan_hosted_json(root, &server.uri(), /*dry_run=*/ false);
     assert_eq!(code, 0, "{wet:#}");
-    assert_eq!(wet["redirect"]["redirected"], 1, "{wet:#}");
+    assert_eq!(hosted_pinned(&wet), 1, "{wet:#}");
     assert_eq!(
         std::fs::read_to_string(root.join(".npmrc")).unwrap(),
         "allow-remote=all\n",

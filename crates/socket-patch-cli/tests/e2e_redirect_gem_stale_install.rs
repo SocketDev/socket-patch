@@ -230,11 +230,25 @@ fn hosted_scan_json(proj: &Path, api: &str) -> (i32, String, String) {
     )
 }
 
-fn stale_warnings(env: &serde_json::Value) -> Vec<String> {
-    env["redirect"]["warnings"]
+/// How many hosted pins the run wrote (v5.0: the `applied` / `verified`
+/// events with `details.mode: "hosted"`, formerly `redirect.redirected`).
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
         .as_array()
-        .expect("redirect.warnings")
-        .iter()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
+}
+
+fn stale_warnings(env: &serde_json::Value) -> Vec<String> {
+    env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter(|w| w["code"] == "redirect_gem_stale_install")
         .map(|w| w["detail"].as_str().unwrap_or_default().to_string())
         .collect()
@@ -259,7 +273,7 @@ async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
         "hosted scan must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     let gemfile = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
     assert!(
         gemfile.contains("/patch-registry/gem/"),
@@ -356,7 +370,7 @@ async fn gem_hosted_redirect_over_patched_install_stays_quiet() {
         "hosted scan must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     assert!(
         stale_warnings(&env).is_empty(),
         "an already-patched materialization must never trip the stale warning: {env}"
@@ -381,7 +395,7 @@ async fn gem_hosted_redirect_fresh_checkout_stays_quiet() {
         "hosted scan must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     assert!(
         stale_warnings(&env).is_empty(),
         "a fresh checkout must not trip the stale warning: {env}"
@@ -413,13 +427,14 @@ async fn gem_hosted_scan_never_pins_a_version_the_lock_does_not_resolve() {
     let (_code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
     let env = common::parse_json_envelope(&stdout);
     assert_eq!(
-        env["redirect"]["redirected"], 0,
+        hosted_pinned(&env),
+        0,
         "nothing may be redirected: {env}\nstderr:\n{stderr}"
     );
-    let codes: Vec<&str> = env["redirect"]["warnings"]
+    let codes: Vec<&str> = env["warnings"]
         .as_array()
-        .expect("redirect.warnings")
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(|w| w["code"].as_str())
         .collect();
     assert!(
@@ -461,13 +476,13 @@ async fn gem_hosted_scan_without_a_lock_pins_nothing() {
         let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
         let env = common::parse_json_envelope(&stdout);
         assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-        assert_eq!(
-            env["redirect"]["redirected"], 0,
+        assert!(
+            common::envelope::hosted_pins(&env).is_empty(),
             "nothing may be redirected: {env}\nstderr:\n{stderr}"
         );
-        let hit: Vec<&serde_json::Value> = env["redirect"]["warnings"]
+        let hit: Vec<&serde_json::Value> = env["warnings"]
             .as_array()
-            .expect("redirect.warnings")
+            .expect("warnings")
             .iter()
             .filter(|w| w["code"] == "redirect_gem_no_lockfile")
             .collect();
@@ -547,10 +562,10 @@ async fn gem_hosted_rescan_with_failing_record_fetch_reports_it_and_keeps_the_wi
     let (code, stdout, _) = hosted_scan_json(&proj, &server.uri());
     assert_eq!(code, 0, "{stdout}");
     let env = common::parse_json_envelope(&stdout);
-    let failed = env["redirect"]["warnings"]
+    let failed = env["warnings"]
         .as_array()
-        .expect("warnings")
-        .iter()
+        .into_iter()
+        .flatten()
         .find(|w| w["code"] == "record_fetch_failed")
         .unwrap_or_else(|| panic!("the transient fetch failure is surfaced: {env}"));
     assert_eq!(
@@ -689,7 +704,7 @@ async fn gem_hosted_stale_bundler4_standalone_install_warns_and_is_not_attested(
         &[],
     );
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     let details = stale_warnings(&env);
     assert_eq!(
         details.len(),
@@ -762,10 +777,7 @@ async fn gem_hosted_stale_dot_bundle_install_warns_and_is_not_attested() {
             &[],
         );
         let env = common::parse_json_envelope(&stdout);
-        assert_eq!(
-            env["redirect"]["redirected"], 1,
-            "{config}: envelope: {env}"
-        );
+        assert_eq!(hosted_pinned(&env), 1, "{config}: envelope: {env}");
         let details = stale_warnings(&env);
         assert_eq!(
             details.len(),
@@ -1069,7 +1081,7 @@ async fn gem_hosted_global_gemfile_setting_is_refused() {
         &[("HOME", home.to_str().unwrap())],
     );
     let envelope = common::parse_json_envelope(&stdout);
-    let warnings: Vec<&serde_json::Value> = envelope["redirect"]["warnings"]
+    let warnings: Vec<&serde_json::Value> = envelope["warnings"]
         .as_array()
         .map(|a| a.iter().collect())
         .unwrap_or_default();
@@ -1085,7 +1097,8 @@ async fn gem_hosted_global_gemfile_setting_is_refused() {
         "the refusal must name the global setting and its remedy: {detail}"
     );
     assert_eq!(
-        envelope["redirect"]["redirected"], 0,
+        hosted_pinned(&envelope),
+        0,
         "nothing redirected: {envelope}"
     );
     assert_eq!(
@@ -1157,7 +1170,7 @@ async fn gem_hosted_empty_gemfile_setting_shadows_global_alternative() {
         );
         assert_eq!(code, 0, "{label}: stdout:\n{stdout}\nstderr:\n{stderr}");
         let envelope = common::parse_json_envelope(&stdout);
-        assert_eq!(envelope["redirect"]["redirected"], 1, "{label}: {envelope}");
+        assert_eq!(hosted_pinned(&envelope), 1, "{label}: {envelope}");
         assert!(
             std::fs::read_to_string(proj.join("Gemfile"))
                 .unwrap()

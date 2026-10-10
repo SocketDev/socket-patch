@@ -34,8 +34,8 @@ Shapes (project layouts; `--shapes`):
   vendored-then-hosted             vendored, then the hosted takeover
   already-vendored-workspace       wire a plain project (the cell's mode), add a
                                    workspace member, `bun install`, re-run the same
-                                   mode (a clean no-op: already_vendored / redirected
-                                   1), then `repair` rebuilds a deleted artifact
+                                   mode (a clean no-op: already_vendored / one hosted
+                                   `applied` event), then `repair` rebuilds a deleted artifact
   preexisting-manifest             a foreign .socket/manifest.json record must
                                    survive a refused vendored run
 
@@ -604,56 +604,58 @@ def parse_envelope(output):
     return json.loads(output[output.index('{'):])
 
 
+def mode_events(envelope, mode, *actions):
+    """The v5 envelope's events of one leg (`details.mode` hosted / vendored),
+    narrowed to `actions` when given."""
+    return [e for e in envelope.get('events') or []
+            if (e.get('details') or {}).get('mode') == mode
+            and (not actions or e.get('action') in actions)]
+
+
 def envelope_codes(envelope):
     """(codes about the minimist patch or carrying no purl, codes about other
-    purls) — every channel the CLI reports on: redirect.warnings, top-level
-    warnings, vendor.events, download.patches, patches, error."""
+    purls) — every channel the v5 envelope reports on: top-level warnings
+    (`{code, detail}`), every event's `errorCode`, and `error.code`."""
     mine, others = [], []
 
     def take(purl, code):
         if code:
             (mine if purl in (None, PURL) else others).append(code)
-    for w in envelope.get('redirect', {}).get('warnings', []):
-        take(None, w.get('code'))
-    for w in envelope.get('warnings', []):
+    for w in envelope.get('warnings') or []:
         take(None, w.get('code') if isinstance(w, dict) else w)
-    for e in envelope.get('vendor', {}).get('events', []):
+    for e in envelope.get('events') or []:
         take(e.get('purl'), e.get('errorCode'))
-    for p in envelope.get('download', {}).get('patches', []):
-        take(p.get('purl'), p.get('errorCode'))
-    for p in envelope.get('patches', []):
-        take(p.get('purl'), p.get('errorCode'))
     if isinstance(envelope.get('error'), dict):
         take(None, envelope['error'].get('code'))
     return mine, others
 
 
 def applied_count(envelope, mode):
-    if mode == 'hosted':
-        return envelope.get('redirect', {}).get('redirected', 0)
-    return envelope.get('vendor', {}).get('summary', {}).get('applied', 0)
+    """Pins (hosted) / vendorings (vendored) the run wrote: the leg's
+    `applied` events (`verified` on a dry run). A hosted re-run over an
+    already-pinned lock still reports `applied` for the confirmed pin."""
+    return len(mode_events(envelope, mode, 'applied', 'verified'))
 
 
 def downloaded_count(envelope):
-    return envelope.get('download', {}).get('downloaded', envelope.get('downloaded', 0))
+    return (envelope.get('summary') or {}).get('downloaded', 0)
 
 
 def rerun_clean(code, envelope, mode):
-    """The documented no-op re-run: hosted re-confirms the wiring (redirected 1,
-    nothing rewritten, no warnings beyond advisories); vendored skips exactly
-    one already_vendored purl with nothing failed."""
+    """The documented no-op re-run: hosted re-confirms the wiring (one hosted
+    `applied` event, no warnings beyond advisories); vendored skips exactly
+    one already_vendored purl with nothing applied or failed."""
     if code != 0 or envelope.get('status') != 'success':
         return False
     codes, _ = envelope_codes(envelope)
     if mode == 'hosted':
-        return (envelope.get('redirect', {}).get('redirected') == 1
+        return (applied_count(envelope, mode) == 1
                 and not set(codes) - INFORMATIONAL)
-    vendor = envelope.get('vendor', {})
-    summary, events = vendor.get('summary', {}), vendor.get('events', [])
-    return (summary.get('applied') == 0 and summary.get('skipped') == 1
-            and summary.get('failed') == 0
-            and sum(e.get('errorCode') == 'already_vendored' for e in events) == 1
-            and not any(e.get('action') == 'failed' for e in events)
+    events = mode_events(envelope, mode)
+    return (applied_count(envelope, mode) == 0
+            and sum(e.get('action') == 'skipped' and e.get('errorCode') == 'already_vendored'
+                    for e in events) == 1
+            and not any(e.get('action') == 'failed' for e in envelope.get('events') or [])
             and not set(codes) - INFORMATIONAL - {'already_vendored'})
 
 
@@ -1060,7 +1062,7 @@ def main():
                 checks['unchanged'] = all((project / n).read_bytes() == b for n, b in original.items())
                 checks['unchangedLockPresence'] = all((project / name).exists() == (name in original)
                                                       for name in ['bun.lock', 'bun.lockb'])
-                # Hosted refusals exit 0 with redirected 0 (documented posture);
+                # Hosted refusals exit 0 with no hosted pin (documented posture);
                 # vendored / get refusals exit non-zero and never fetch.
                 checks['exitCodeContract'] = code == 0 if expected['exit'] == 'zero' else code != 0
                 if expected['exit'] == 'nonzero':
@@ -1333,7 +1335,7 @@ def main():
                     # bun.lockb is binary: the v5 upstream restore refuses it
                     # with the version-control remedy and writes nothing; the
                     # cell then applies that remedy.
-                    failed = (rolled.get('hosted') or {}).get('failed') or []
+                    failed = mode_events(rolled, 'hosted', 'failed')
                     checks['rollbackLockbRefused'] = (
                         code == 1 and any(f.get('purl') == PURL and
                                           'git checkout -- bun.lockb' in (f.get('error') or '')

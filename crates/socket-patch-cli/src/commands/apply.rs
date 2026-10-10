@@ -291,7 +291,16 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         // it vanished since (TOCTOU) → nothing to verify. An `Err` means it exists
         // but is unreadable/corrupt: fail-closed (report drift) rather than
         // silently passing — the guard treats exit 0 as "in sync".
-        Ok(None) => return 0,
+        Ok(None) => {
+            // Same answer as the no-manifest exit in `run`.
+            if args.common.json {
+                let mut env = Envelope::new(Command::Apply);
+                env.status = Status::NoManifest;
+                env.dry_run = args.common.dry_run;
+                println!("{}", env.to_pretty_json());
+            }
+            return 0;
+        }
         Err(e) => {
             let msg = format!(
                 "Patch check could not read the manifest ({e}); \
@@ -299,7 +308,10 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             );
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
-                env.mark_error(EnvelopeError::new("manifest_unreadable", msg));
+                env.dry_run = args.common.dry_run;
+                let mut err = crate::json_envelope::manifest_load_error(manifest_path, &e);
+                err.message = msg;
+                env.mark_error(err);
                 println!("{}", env.to_pretty_json());
             } else {
                 // Errors print even under --silent ("errors only", never
@@ -1100,14 +1112,20 @@ pub(crate) async fn run_locked(
         Ok(Some(m)) => m,
         Ok(None) => {
             lock.release();
-            let code = report_apply_failure(&args, "Invalid manifest", &telemetry).await;
-            return ApplyRunReport::run_failure(code, "apply_failed", "Invalid manifest");
+            let err = EnvelopeError::new(
+                "manifest_not_found",
+                format!("Manifest not found at {}", manifest_path.display()),
+            );
+            let code = report_apply_failure(&args, &err, &err.message, &telemetry).await;
+            return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
         Err(e) => {
             lock.release();
-            let error = e.to_string();
-            let code = report_apply_failure(&args, &error, &telemetry).await;
-            return ApplyRunReport::run_failure(code, "apply_failed", error);
+            // One manifest-load mapping for every command (#931):
+            // `manifest_invalid` / `manifest_unreadable`, never `apply_failed`.
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            let code = report_apply_failure(&args, &err, &e.to_string(), &telemetry).await;
+            return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
     };
 
@@ -1519,7 +1537,8 @@ pub(crate) async fn run_locked(
         }
         Err(e) => {
             lock.release();
-            let code = report_apply_failure(&args, &e, &telemetry).await;
+            let err = EnvelopeError::new("apply_failed", e.clone());
+            let code = report_apply_failure(&args, &err, &e, &telemetry).await;
             ApplyRunReport::run_failure(code, "apply_failed", e)
         }
     }
@@ -1529,13 +1548,20 @@ pub(crate) async fn run_locked(
 /// envelope (`--json`) or an `Error:` line that prints even under
 /// `--silent` ("errors only", never "nothing" — exit 1 with no message
 /// would be undiagnosable), exit 1. Shared by the manifest read in `run`
-/// and `apply_patches_inner`'s `Err` arm.
-async fn report_apply_failure(args: &ApplyArgs, error: &str, telemetry: &TelemetryAuth) -> i32 {
+/// and `apply_patches_inner`'s `Err` arm. `err` is the `--json` error
+/// (`apply_failed`, or the manifest-load code); `error` is the plain text
+/// for telemetry and the human line.
+async fn report_apply_failure(
+    args: &ApplyArgs,
+    err: &EnvelopeError,
+    error: &str,
+    telemetry: &TelemetryAuth,
+) -> i32 {
     track_patch_apply_failed(error, args.common.dry_run, telemetry).await;
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;
-        env.mark_error(EnvelopeError::new("apply_failed", error.to_string()));
+        env.mark_error(err.clone());
         println!("{}", env.to_pretty_json());
     } else {
         eprintln!("Error: {}", crate::ui::sentence_case(error));

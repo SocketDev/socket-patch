@@ -321,9 +321,9 @@ fn corrupt_vendor_state_fails_revert_closed() {
     );
 }
 
-/// A present-but-corrupt manifest is `invalid_manifest`, exit 1 (the
-/// documented vendor exit contract; distinct from the missing-manifest
-/// clean no-op).
+/// A present-but-corrupt manifest is `manifest_invalid` (the shared
+/// manifest-load mapping, #931), exit 1 (the documented vendor exit
+/// contract; distinct from the missing-manifest clean no-op).
 #[test]
 fn corrupt_manifest_fails_closed() {
     let fx = npm_fixture();
@@ -332,7 +332,7 @@ fn corrupt_manifest_fails_closed() {
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_eq!(code, 1, "corrupt manifest must fail the run: {env:#}");
     assert_eq!(env["status"], "error");
-    assert_eq!(env["error"]["code"], "invalid_manifest");
+    assert_eq!(env["error"]["code"], "manifest_invalid");
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
 }
 
@@ -1432,7 +1432,7 @@ fn sri_of(bytes: &[u8]) -> String {
 }
 
 /// Human corrupt-manifest surface: the `Error: could not read manifest`
-/// stderr line beside the `invalid_manifest` exit contract section 1 pins
+/// stderr line beside the `manifest_invalid` exit contract section 1 pins
 /// under --json.
 #[test]
 fn human_corrupt_manifest_prints_could_not_read() {

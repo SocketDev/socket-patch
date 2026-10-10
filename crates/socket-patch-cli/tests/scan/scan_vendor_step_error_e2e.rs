@@ -210,11 +210,18 @@ async fn scan_vendor_download_error_preserves_the_vendor_envelope() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout must be one JSON object ({e}); stdout={stdout}"));
-    assert_eq!(v["status"], "partial_failure", "{v}");
-    assert_eq!(v["download"]["downloaded"], 1, "{v}");
-    assert_eq!(v["download"]["detached"], true, "{v}");
-    assert_eq!(v["vendor"]["status"], "partialFailure", "{v}");
-    let events = v["vendor"]["events"].as_array().unwrap();
+    assert_eq!(v["status"], "partialFailure", "{v}");
+    crate::common::envelope::assert_envelope_invariants(&v, "scan");
+    assert_eq!(v["summary"]["downloaded"], 1, "{v}");
+    // The download event, then the vendor engine's (all `details.mode:
+    // "vendored"`; no nested vendor envelope).
+    let all = v["events"].as_array().unwrap();
+    assert!(
+        all.iter().all(|e| e["details"]["mode"] == "vendored"),
+        "{v}"
+    );
+    assert_eq!(all[0]["action"], "downloaded", "{v}");
+    let events: Vec<&serde_json::Value> = all[1..].iter().collect();
     assert_eq!(events.len(), 1, "{v}");
     assert_eq!(events[0]["purl"], PURL, "{v}");
     assert_eq!(events[0]["errorCode"], "apply_failed", "{v}");

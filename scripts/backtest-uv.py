@@ -1005,6 +1005,41 @@ def variant_matrix(version):
     }
 
 
+def scan_observation(envelope, command):
+    """The observation fields of one `scan --json` run, read from the v5
+    envelope by the run's `--mode`. Hosted: `rewrittenFiles` (kept on
+    `redirect`), `redirected` (the hosted `applied` events — `verified` on a
+    dry run) and `warnings` (the run-level `warnings[].code`, plus
+    `error.code` when the run refused). Vendored: `vendorSummary` (the
+    vendored `applied` / `failed` event counts) and `vendorErrors` (the
+    vendored `failed` events)."""
+    mode = command[command.index('--mode') + 1] if '--mode' in command else None
+    events = [
+        e
+        for e in envelope.get('events') or []
+        if (e.get('details') or {}).get('mode') == mode
+    ]
+    if mode == 'hosted':
+        codes = [w.get('code') for w in envelope.get('warnings') or []]
+        if (envelope.get('error') or {}).get('code'):
+            codes.append(envelope['error']['code'])
+        return {
+            'rewrittenFiles': (envelope.get('redirect') or {}).get('rewrittenFiles', []),
+            'redirected': sum(e.get('action') in ('applied', 'verified') for e in events),
+            'warnings': codes,
+        }
+    if mode == 'vendored':
+        failed = [e for e in events if e.get('action') == 'failed']
+        return {
+            'vendorSummary': {
+                'applied': sum(e.get('action') == 'applied' for e in events),
+                'failed': len(failed),
+            },
+            'vendorErrors': failed,
+        }
+    return {}
+
+
 def variant_status(observations, name, mode):
     """Collapse one fixture/mode's observations into the doc-table verdict.
 
@@ -1115,25 +1150,7 @@ def write_summary():
                         row['installedResponseSha256'] == patched_response
                     )
                 if key.endswith('socket-patch'):
-                    payload = json.loads(row['stdout'])
-                    redirect = payload.get('redirect')
-                    vendor = payload.get('vendor')
-                    if redirect:
-                        item['rewrittenFiles'] = redirect.get('rewrittenFiles', [])
-                        item['redirected'] = redirect.get('redirected', 0)
-                        item['warnings'] = [
-                            warning['code'] for warning in redirect.get('warnings', [])
-                        ]
-                    if vendor:
-                        item['vendorSummary'] = {
-                            key: vendor.get('summary', {}).get(key)
-                            for key in ['applied', 'failed']
-                        }
-                        item['vendorErrors'] = [
-                            event
-                            for event in vendor.get('events', [])
-                            if event.get('action') == 'failed'
-                        ]
+                    item.update(scan_observation(json.loads(row['stdout']), command))
                 elif item['exitCode']:
                     item['diagnostic'] = row['stderr'].replace(str(ROOT), '<output>')[
                         :1000

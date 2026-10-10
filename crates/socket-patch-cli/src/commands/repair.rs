@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
-use crate::json_envelope::{Command, Envelope, GcReport, PatchAction, PatchEvent, Status};
+use crate::json_envelope::{
+    Command, Envelope, EnvelopeError, GcReport, PatchAction, PatchEvent, Status,
+};
 use crate::ui::sweep_failure;
 
 #[derive(Args)]
@@ -229,12 +231,12 @@ pub async fn run(args: RepairArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_repair_failed(&e, &telemetry).await;
+            track_patch_repair_failed(&e.message, &telemetry).await;
             if args.common.json {
-                let env = error_envelope(Command::Repair, args.common.dry_run, "repair_failed", &e);
+                let env = error_envelope(Command::Repair, args.common.dry_run, &e.code, &e.message);
                 println!("{}", env.to_pretty_json());
             } else {
-                eprintln!("Error: {e}");
+                eprintln!("Error: {}", e.message);
             }
             1
         }
@@ -461,12 +463,12 @@ async fn repair_inner(
     client: &mut Option<ApiClient>,
     // `(eco, uuid, rel)` lockfile vendor references, scanned once by `run`.
     vendor_references: Vec<(String, String, String)>,
-) -> Result<(Envelope, RepairCounts), String> {
+) -> Result<(Envelope, RepairCounts), EnvelopeError> {
     // `Ok(None)` = no manifest (vendor-only repair); present-but-invalid
-    // stays a hard error.
+    // stays a hard error, under the shared manifest-load code (#931).
     let manifest = read_manifest(manifest_path)
         .await
-        .map_err(|e| crate::ui::manifest_error_message(manifest_path, &e))?;
+        .map_err(|e| crate::json_envelope::manifest_load_error(manifest_path, &e))?;
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &args.common.cwd);
     let blobs_path = socket_dir.join("blobs");
@@ -562,6 +564,7 @@ async fn repair_inner(
     // ledger entry are reported. Runs under `--download-only` too:
     // restoring artifacts IS repair's download half. The reference scan
     // and ledger load above are handed over, not repeated.
+    let vendored_since = env.events.len();
     let vendor_redownloaded =
         crate::commands::vendored_backend::VendoredBackend::new(&args.common, None)
             .repair(
@@ -574,6 +577,11 @@ async fn repair_inner(
                 &mut env,
             )
             .await;
+    // Vendored-leg events say so (`details.mode`), as in every envelope.
+    crate::commands::vendored_backend::tag_event_mode(
+        &mut env.events[vendored_since..],
+        crate::commands::VENDORED_MODE_LABEL,
+    );
     if !quiet && vendor_redownloaded > 0 {
         stdout_started = true;
         println!(
@@ -681,7 +689,7 @@ async fn repair_inner(
                 "count": count,
                 // Constant since v5 (blobs are the only download); kept so
                 // the event's shape is unchanged.
-                "mode": "file",
+                "downloadMode": "file",
             })),
         );
     }
@@ -823,11 +831,14 @@ mod tests {
     }
 
     /// True when `env` carries the download / would-download artifact event
-    /// (identified by its `details.mode` field, unique to that event).
+    /// (identified by its `details.downloadMode` field, unique to that event).
     fn has_download_event(env: &Envelope) -> bool {
-        env.events
-            .iter()
-            .any(|e| e.details.as_ref().and_then(|d| d.get("mode")).is_some())
+        env.events.iter().any(|e| {
+            e.details
+                .as_ref()
+                .and_then(|d| d.get("downloadMode"))
+                .is_some()
+        })
     }
 
     /// Regression for the offline + dry-run leak: with `--offline` set, the

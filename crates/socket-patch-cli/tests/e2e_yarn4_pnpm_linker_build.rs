@@ -543,13 +543,10 @@ async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes
     });
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert!(
-        env["packagesWithPatches"].as_u64() >= Some(1),
+        env["packages"].as_array().map(Vec::len) >= Some(1),
         "discovery must find the dep through the pnpm-linker layout: {env}"
     );
-    assert_eq!(
-        env["redirect"]["redirected"], 1,
-        "one dep redirected: {env}"
-    );
+    assert_eq!(env["summary"]["applied"], 1, "one dep redirected: {env}");
 
     let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
     assert!(

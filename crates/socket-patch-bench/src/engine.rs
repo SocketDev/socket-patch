@@ -270,6 +270,69 @@ fn warning_codes(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// The base and head binaries may straddle the v5 JSON envelope change
+// (`scan --json`'s legacy counters became events), so every reading below
+// accepts both shapes: the legacy key when present, else the envelope's.
+
+/// How many discovered packages have patches: legacy `packagesWithPatches`,
+/// else the length of the `packages` discovery array.
+fn packages_with_patches(v: &Value) -> Value {
+    match &v["packagesWithPatches"] {
+        Value::Null => v["packages"]
+            .as_array()
+            .map_or(Value::Null, |a| a.len().into()),
+        n => n.clone(),
+    }
+}
+
+/// How many patches discovery found: legacy `totalPatches`, else the sum of
+/// `packages[].patches[]`.
+fn total_patches(v: &Value) -> Value {
+    match &v["totalPatches"] {
+        Value::Null => v["packages"].as_array().map_or(Value::Null, |a| {
+            a.iter()
+                .map(|p| p["patches"].as_array().map_or(0, Vec::len))
+                .sum::<usize>()
+                .into()
+        }),
+        n => n.clone(),
+    }
+}
+
+/// The hosted events (`details.mode: "hosted"`) of a v5 envelope.
+fn hosted_events(v: &Value) -> impl Iterator<Item = &Value> {
+    v["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted")
+}
+
+/// How many packages a hosted run pinned (or would pin, on a dry run):
+/// legacy `redirect.redirected`, else the hosted `applied` / `verified`
+/// events.
+fn hosted_pins(v: &Value) -> Value {
+    match &v["redirect"]["redirected"] {
+        Value::Null if v["events"].is_array() => hosted_events(v)
+            .filter(|e| e["action"] == "applied" || e["action"] == "verified")
+            .count()
+            .into(),
+        n => n.clone(),
+    }
+}
+
+/// The packages a hosted run skipped: legacy `redirect.skipped[]`, else
+/// the hosted `skipped` events.
+fn hosted_skips(v: &Value) -> Vec<Value> {
+    match v["redirect"]["skipped"].as_array() {
+        Some(a) => a.clone(),
+        None => hosted_events(v)
+            .filter(|e| e["action"] == "skipped")
+            .cloned()
+            .collect(),
+    }
+}
+
 /// Check that a run did the work the fixture calls for. Any mismatch makes
 /// the sample meaningless, so it is an error, not a footnote.
 fn validate(
@@ -326,12 +389,12 @@ fn validate(
         ),
         (
             "packagesWithPatches",
-            v["packagesWithPatches"].clone(),
+            packages_with_patches(&v),
             want_patched.len().into(),
         ),
         (
             "totalPatches",
-            v["totalPatches"].clone(),
+            total_patches(&v),
             p.fixture.patches.len().into(),
         ),
     ];
@@ -342,6 +405,7 @@ fn validate(
     }
     let mut codes = warning_codes(&v["warnings"]);
     let redirect = &v["redirect"];
+    // Pre-v5 binaries nest the hosted warnings under `redirect`.
     codes.extend(warning_codes(&redirect["warnings"]));
     let unexpected: Vec<&String> = codes
         .iter()
@@ -354,11 +418,11 @@ fn validate(
                 + &serde_json::to_string(&redirect["warnings"]).unwrap_or_default()
         ));
     }
-    let skipped = redirect["skipped"].as_array().map(Vec::len).unwrap_or(0);
-    if skipped > 0 {
+    let skipped = hosted_skips(&v);
+    if !skipped.is_empty() {
         return Err(format!(
             "redirect skipped packages: {}",
-            redirect["skipped"]
+            Value::Array(skipped)
         ));
     }
     let rewritten: Vec<String> = {
@@ -377,10 +441,11 @@ fn validate(
     want_rewritten.sort();
     match kind {
         Kind::Hosted | Kind::DryRun => {
-            if redirect["redirected"] != e.redirected {
+            let redirected = hosted_pins(&v);
+            if redirected != e.redirected {
                 return Err(format!(
-                    "redirect.redirected: got {}, want {}",
-                    redirect["redirected"], e.redirected
+                    "redirect.redirected: got {redirected}, want {}",
+                    e.redirected
                 ));
             }
             if rewritten != want_rewritten {
