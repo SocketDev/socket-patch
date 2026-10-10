@@ -172,7 +172,10 @@ pub async fn audit_warnings(
 /// that regenerates it: the workspace root's `vendor/` (`go work vendor`)
 /// when a `go.work` is in effect, else the module's own (`go mod vendor`).
 fn modules_txt_location(project_root: &Path) -> (PathBuf, &'static str) {
-    if let Some(work_dir) = workspace_root(project_root) {
+    if let Some(work_dir) = workspace_file(project_root)
+        .as_deref()
+        .and_then(Path::parent)
+    {
         return (
             work_dir.join("vendor").join("modules.txt"),
             "go work vendor",
@@ -184,21 +187,41 @@ fn modules_txt_location(project_root: &Path) -> (PathBuf, &'static str) {
     )
 }
 
-/// The directory of the `go.work` go would use for `project_root`: `GOWORK`
-/// when it names a file (`off` disables workspaces), else the nearest
-/// `go.work` at or above the project.
-fn workspace_root(project_root: &Path) -> Option<PathBuf> {
+/// The `go.work` go would use for `project_root`: `GOWORK` when it names a
+/// file (`off` disables workspaces), else the nearest `go.work` at or above
+/// the project.
+fn workspace_file(project_root: &Path) -> Option<PathBuf> {
     match std::env::var("GOWORK") {
         Ok(v) if v == "off" => return None,
-        Ok(v) if !v.is_empty() => return Path::new(&v).parent().map(Path::to_path_buf),
+        Ok(v) if !v.is_empty() => return Some(PathBuf::from(v)),
         _ => {}
     }
     let base = std::env::current_dir()
         .unwrap_or_default()
         .join(project_root);
     base.ancestors()
-        .find(|dir| dir.join("go.work").is_file())
-        .map(Path::to_path_buf)
+        .map(|dir| dir.join("go.work"))
+        .find(|file| file.is_file())
+}
+
+/// The replaces a workspace `modules.txt` records: `go work vendor` writes
+/// every `use` member's `go.mod` replaces plus the `go.work` ones. Returns
+/// `(go.work replaces, every member's replaces)`.
+async fn workspace_replaces(project_root: &Path) -> (Vec<ReplaceEntry>, Vec<ReplaceEntry>) {
+    let Some(work_file) = workspace_file(project_root) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Ok(text) = read_regular_to_string(&work_file).await else {
+        return (Vec::new(), Vec::new());
+    };
+    let work_dir = work_file.parent().unwrap_or(Path::new(""));
+    let mut members = Vec::new();
+    for dir in go_mod_edit::parse_use_dirs(&text) {
+        if let Ok(go_mod) = read_regular_to_string(&work_dir.join(&dir).join("go.mod")).await {
+            members.extend(go_mod_edit::parse_replace_entries(&go_mod));
+        }
+    }
+    (go_mod_edit::parse_replace_entries(&text), members)
 }
 
 async fn vendor_modules_txt_issues(
@@ -225,11 +248,25 @@ async fn vendor_modules_txt_issues(
         .filter_map(go_mod_edit::parse_replace_body)
         .collect();
 
+    // In a workspace, a `go.work` replace of the same module overrides the
+    // member's, and a recorded replacement may come from any member.
+    let (work_replaces, member_replaces) = if workspace {
+        workspace_replaces(project_root).await
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let overridden_by_work = |entry: &ReplaceEntry| {
+        work_replaces.iter().any(|w| {
+            w.module == entry.module && (w.version.is_none() || w.version == entry.version)
+        })
+    };
+
     let mut issues = Vec::new();
     for entry in replaces.iter().filter(|e| e.socket_owned()) {
-        if !recorded
-            .iter()
-            .any(|r| same_replacement(entry, r, workspace))
+        if !overridden_by_work(entry)
+            && !recorded
+                .iter()
+                .any(|r| same_replacement(entry, r, workspace))
         {
             issues.push(GoSyncIssue::VendorModulesTxt {
                 module: entry.module.clone(),
@@ -240,7 +277,12 @@ async fn vendor_modules_txt_issues(
         }
     }
     for rec in recorded.iter().filter(|r| r.socket_owned()) {
-        if !replaces.iter().any(|e| same_replacement(e, rec, workspace)) {
+        if !replaces
+            .iter()
+            .chain(&member_replaces)
+            .chain(&work_replaces)
+            .any(|e| same_replacement(e, rec, workspace))
+        {
             issues.push(GoSyncIssue::VendorModulesTxt {
                 module: rec.module.clone(),
                 modules_txt: display.clone(),
@@ -433,6 +475,59 @@ mod tests {
             "{issues:?}"
         );
         assert!(issues[0].to_string().contains("no longer has"));
+    }
+
+    /// A workspace `modules.txt` records every `use` member's replaces plus
+    /// `go.work`'s: auditing one member must not call another member's
+    /// socket replace stale, and a member replace that a `go.work` replace
+    /// of the same module overrides is not expected in it.
+    #[tokio::test]
+    async fn workspace_modules_txt_is_checked_against_every_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        consumer(root, REPLACE);
+        write(
+            root,
+            &format!("{COPY}/go.mod"),
+            "module example.com/upstream\n",
+        );
+        write(
+            root,
+            "tools/go.mod",
+            "module example.com/tools\n\ngo 1.21\n\nrequire example.com/other v1.0.0\n\n\
+             replace example.com/other v1.0.0 => ./.socket/go-patches/example.com/other@v1.0.0\n",
+        );
+        write(root, "go.work", "go 1.21\n\nuse (\n\t.\n\t./tools\n)\n");
+        // What `go work vendor` writes: both members' replaces.
+        write(
+            root,
+            "vendor/modules.txt",
+            &format!(
+                "# example.com/upstream v1.0.0 => ./{COPY}\n## explicit; go 1.21\n\
+                 example.com/upstream\n\
+                 # example.com/other v1.0.0 => ./tools/.socket/go-patches/example.com/other@v1.0.0\n\
+                 ## explicit; go 1.21\nexample.com/other\n"
+            ),
+        );
+        let none = HashMap::new();
+        assert_eq!(audit(root, &none).await, vec![]);
+        assert_eq!(audit(&root.join("tools"), &none).await, vec![]);
+
+        // go.work replaces the root's patched module itself: modules.txt
+        // records go.work's replacement, not the member's.
+        write(
+            root,
+            "go.work",
+            "go 1.21\n\nuse (\n\t.\n\t./tools\n)\n\nreplace example.com/upstream => ../fork\n",
+        );
+        write(
+            root,
+            "vendor/modules.txt",
+            "# example.com/upstream v1.0.0 => ../fork\n## explicit; go 1.21\n\
+             example.com/upstream\n\
+             # example.com/other v1.0.0 => ./tools/.socket/go-patches/example.com/other@v1.0.0\n",
+        );
+        assert_eq!(audit(root, &none).await, vec![]);
     }
 
     /// A user-authored replace is never ours to report, and a hosted

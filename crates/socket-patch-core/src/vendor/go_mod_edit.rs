@@ -367,6 +367,19 @@ pub fn parse_replace_entries(content: &str) -> Vec<ReplaceEntry> {
     out
 }
 
+/// Parse a `go.work` file's `use` directives into the member directories
+/// they name (as written, unquoted), single-line and block form alike.
+pub fn parse_use_dirs(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let _ = for_each_directive_body(content, "use", |_, body| {
+        if let Some(tok) = body.split_whitespace().next() {
+            out.push(unquote(tok).to_string());
+        }
+        Ok(())
+    });
+    out
+}
+
 /// Parse `require` directives into `module -> version` (last wins; the module
 /// graph selects one version per module path). Pure — exposed for the hosted
 /// rewriter's stale-pin cross-check (a version-pinned `replace` is silently
