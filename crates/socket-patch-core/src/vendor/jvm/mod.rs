@@ -230,6 +230,17 @@ pub enum Shape {
     Other,
 }
 
+/// The committed vendor trees a plan for `shape` writes into.
+pub(crate) fn shape_trees(shape: Shape) -> &'static [&'static str] {
+    match shape {
+        Shape::MavenReactor | Shape::Sbt => &[layout::MAVEN2_TREE],
+        Shape::Gradle => &[layout::GRADLE_TREE],
+        Shape::Mixed => &[layout::MAVEN2_TREE, layout::GRADLE_TREE],
+        Shape::ScalaCli => &[layout::COURSIER_TREE],
+        Shape::Other => &[],
+    }
+}
+
 /// A planned file: project-relative forward-slash path and its full new
 /// bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -589,6 +600,7 @@ pub(crate) fn eol_blind(rel: &str) -> bool {
         gradle::SCRIPT_REL,
         gradle::INDEX_REL,
         gradle::GITATTRIBUTES_REL,
+        gradle::GITIGNORE_REL,
         gradle::SCRIPT_GITATTRIBUTES_REL,
         gradle::VENDOR_GITATTRIBUTES_REL,
         maven_reactor::GITATTRIBUTES_REL,
