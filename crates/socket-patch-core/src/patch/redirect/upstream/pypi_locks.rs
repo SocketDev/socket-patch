@@ -350,9 +350,10 @@ fn is_pypi_file_url(url: &str) -> bool {
 /// only knows PyPI's. When the project installs from another index — a
 /// `[[tool.pdm.source]]` in its `pyproject.toml` (one named `pypi`
 /// replaces PyPI; any other may have served the package), a project
-/// `pdm.toml` `pypi.url`, or, failing both, the index the lock's other
-/// packages were downloaded from — writing PyPI's URLs would make `pdm
-/// sync` bypass that mirror (or fail where only the mirror is reachable).
+/// `pypi.url` (`.pdm.toml`, then `pdm.toml`), or, failing both, the index
+/// the lock's other packages were downloaded from — writing PyPI's URLs
+/// would make `pdm sync` bypass that mirror (or fail where only the mirror
+/// is reachable).
 /// Like the uv and Pipenv restores, refuse rather than guess.
 async fn pdm_static_index_refusal(
     view: &mut View<'_>,
@@ -384,17 +385,27 @@ async fn pdm_static_index_refusal(
             }
         }
     }
-    let pdm_toml = format!("{dir}pdm.toml");
-    if let Ok(Some(text)) = view.read(&pdm_toml).await {
-        if let Ok(config) = text.parse::<DocumentMut>() {
-            let url = config
-                .get("pypi")
-                .and_then(|p| p.get("url"))
-                .and_then(Item::as_str);
-            if let Some(url) = url.filter(|u| !is_pypi_simple(u)) {
-                foreign.push((url.to_string(), format!("`pypi.url` in {pdm_toml}")));
-            }
+    // PDM overlays the legacy `.pdm.toml` on `pdm.toml`, so the first of
+    // the two that sets `pypi.url` is the project's.
+    for name in [".pdm.toml", "pdm.toml"] {
+        let config_rel = format!("{dir}{name}");
+        let Ok(Some(text)) = view.read(&config_rel).await else {
+            continue;
+        };
+        let Ok(config) = text.parse::<DocumentMut>() else {
+            continue;
+        };
+        let Some(url) = config
+            .get("pypi")
+            .and_then(|p| p.get("url"))
+            .and_then(Item::as_str)
+        else {
+            continue;
+        };
+        if !is_pypi_simple(url) {
+            foreign.push((url.to_string(), format!("`pypi.url` in {config_rel}")));
         }
+        break;
     }
     if foreign.is_empty() {
         let skip: BTreeSet<usize> = hits.iter().map(|h| h.index).collect();

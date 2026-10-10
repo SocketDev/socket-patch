@@ -1574,6 +1574,18 @@ async fn pdm_static_urls_private_index_restore_is_refused() {
                 ("pdm.toml", format!("[pypi]\nurl = \"{MIRROR}/simple\"\n")),
             ]),
         ),
+        // The legacy `.pdm.toml`, which PDM overlays on `pdm.toml`.
+        (
+            ".pdm.toml pypi.url",
+            tree(&[
+                ("pdm.lock", lock.clone()),
+                (".pdm.toml", format!("[pypi]\nurl = \"{MIRROR}/simple\"\n")),
+                (
+                    "pdm.toml",
+                    "[pypi]\nurl = \"https://pypi.org/simple\"\n".to_string(),
+                ),
+            ]),
+        ),
         // No config in the project (a user-global `pdm config`), but the
         // lock's other packages show where PDM downloads from.
         ("sibling package urls", tree(&[("pdm.lock", sibling)])),
