@@ -6,8 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::{is_safe_nuget_coordinate, parse_legacy_dir_name, NuGetCrawler};
+use super::{parse_legacy_dir_name, NuGetCrawler};
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
 use crate::utils::fs::is_dir;
 
 pub(super) struct LegacyNuGetCrawler;
@@ -41,7 +42,7 @@ impl LegacyNuGetCrawler {
                 continue;
             };
             let (name, version) = (name.as_ref(), version.as_ref());
-            if !is_safe_nuget_coordinate(name, version) {
+            if !path_safety::is_safe_name_version(name, version) {
                 continue;
             }
 

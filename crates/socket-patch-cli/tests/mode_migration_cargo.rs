@@ -38,6 +38,10 @@
 //! the fixture build (a failure instead under
 //! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); all assertions after that are hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -68,10 +72,6 @@ const GHSA: &str = "GHSA-migr-cargo-test";
 /// `--cap-lints allow`.
 const PATCH_SUFFIX: &str =
     "\n/// Socket-patch capstone marker (added by the patch).\npub fn socket_patched() -> u32 { 1 }\n";
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
     run_socket_env(cwd, args, cargo_home, &[])
@@ -127,10 +127,6 @@ fn assert_build_ok(tag: &str, out: &Output) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    compute_git_sha256_from_bytes(content)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -624,6 +620,26 @@ fn read(proj: &Path, rel: &str) -> String {
     std::fs::read_to_string(proj.join(rel)).unwrap_or_default()
 }
 
+/// Every project file outside `target/` (relative path → bytes).
+fn project_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if std::fs::symlink_metadata(&p).unwrap().is_dir() {
+                if p != root.join("target") {
+                    walk(root, &p, out);
+                }
+            } else {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
 fn vendor_ledger_claims(proj: &Path, purl: &str) -> bool {
     read(proj, ".socket/vendor/state.json").contains(purl)
 }
@@ -666,25 +682,38 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
     let crate_bytes =
         build_patched_crate(&tmp.path().join("stage"), &crate_dir, &version, &patched);
     mount_hosted_mocks(&server, &purl, &version, &crate_bytes, &orig, &patched).await;
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "scan",
-            "--mode",
-            "hosted",
-            "--json",
-            "--yes",
-            "--cwd",
-            proj.to_str().unwrap(),
-            "--api-url",
-            &server.uri(),
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
-        ],
-        &cargo_home,
+    let uri = server.uri();
+    let hosted_args = [
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    // The dry run stages the same takeover in memory and drops it: every
+    // project byte, `.socket/` and the committed crate copy included, stays.
+    let before = project_snapshot(&proj);
+    let dry: Vec<&str> = hosted_args.iter().copied().chain(["--dry-run"]).collect();
+    let (code, stdout, stderr) = run_socket(&proj, &dry, &cargo_home);
+    assert_eq!(code, 0, "hosted dry run failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("redirect_would_revert_vendored"),
+        "the takeover is previewed: {stdout}"
     );
+    assert!(
+        project_snapshot(&proj) == before,
+        "a dry-run takeover changes nothing: {stdout}"
+    );
+
+    let (code, stdout, stderr) = run_socket(&proj, &hosted_args, &cargo_home);
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
     assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
@@ -1290,4 +1319,135 @@ async fn vendor_over_unrestorable_hosted_pin_is_refused() {
     assert_eq!(read(&proj, "Cargo.toml"), table_toml);
     assert_eq!(read(&proj, "Cargo.lock"), pristine_lock);
     assert!(!vendor_ledger_claims(&proj, &purl));
+}
+
+// ── #1020: a takeover the hosted rewriter refuses keeps the vendored patch ──
+// Vendored mode accepts every Cargo.toml spelling of the dependency (it never
+// edits the dependency line); the hosted cargo rewriter refuses some
+// (`redirect_cargo_toml_dep_unrewritable`). A vendored → hosted takeover over
+// such a spelling must leave the purl VENDORED, byte for byte (wiring, ledger
+// entry and committed copy), and the dry run must preview exactly that, not
+// `redirect_would_revert_vendored` + `redirected: 1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn takeover_over_unrewritable_spelling_keeps_vendored() {
+    for (tag, spelling) in [
+        ("dotted", format!("{DEP}.version = \"1.0\"\n")),
+        ("literal", format!("{DEP} = '1.0'\n")),
+        (
+            "crates-io",
+            format!("{DEP} = {{ version = \"1.0\", registry = \"crates-io\" }}\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path()) else {
+            return;
+        };
+        let toml = read(&proj, "Cargo.toml").replace(&format!("{DEP} = \"1.0\"\n"), &spelling);
+        assert!(toml.contains(&spelling), "{tag}: {toml}");
+        std::fs::write(proj.join("Cargo.toml"), toml).unwrap();
+        std::fs::write(
+            proj.join("src/main.rs"),
+            format!(
+                "fn main() {{ println!(\"M:{{}}\", {}::socket_patched()); }}\n",
+                DEP.replace('-', "_")
+            ),
+        )
+        .unwrap();
+        let purl = format!("pkg:cargo/{DEP}@{version}");
+        let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+        let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+        stage_patch(&proj, &purl, &orig, &patched);
+
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+            &cargo_home,
+        );
+        assert_eq!(code, 0, "{tag}: vendor failed: {stdout}\n{stderr}");
+        assert!(vendor_ledger_claims(&proj, &purl), "{tag}: vendored");
+        assert_build_ok(
+            &format!("{tag}: vendored cargo build --locked --offline"),
+            &cargo(
+                &proj,
+                &["build", "--locked", "--offline", "-q"],
+                &cargo_home,
+            ),
+        );
+
+        let server = MockServer::start().await;
+        let crate_bytes =
+            build_patched_crate(&tmp.path().join("stage"), &crate_dir, &version, &patched);
+        mount_hosted_mocks(&server, &purl, &version, &crate_bytes, &orig, &patched).await;
+        let uri = server.uri();
+        let hosted_args = [
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ];
+        let before = project_snapshot(&proj);
+        let dry: Vec<&str> = hosted_args.iter().copied().chain(["--dry-run"]).collect();
+        let (dry_code, dry_out, stderr) = run_socket(&proj, &dry, &cargo_home);
+        let dry_env: serde_json::Value = serde_json::from_str(&dry_out)
+            .unwrap_or_else(|e| panic!("{tag}: dry-run json ({e}): {dry_out}\n{stderr}"));
+        assert_eq!(dry_env["redirect"]["redirected"], 0, "{tag}: {dry_out}");
+        assert!(
+            !dry_out.contains("redirect_would_revert_vendored"),
+            "{tag}: the dry run must not preview a takeover the wet run refuses: {dry_out}"
+        );
+        assert!(
+            dry_out.contains("redirect_takeover_kept_vendored")
+                && dry_out.contains("redirect_cargo_toml_dep_unrewritable"),
+            "{tag}: the dry run previews the refusal: {dry_out}"
+        );
+        assert!(project_snapshot(&proj) == before, "{tag}: dry run wrote");
+
+        let (code, stdout, stderr) = run_socket(&proj, &hosted_args, &cargo_home);
+        let env: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{tag}: wet json ({e}): {stdout}\n{stderr}"));
+        assert_eq!(code, dry_code, "{tag}: dry run and wet run agree: {stdout}");
+        assert_eq!(env["status"], dry_env["status"], "{tag}: {stdout}");
+        assert_eq!(env["redirect"]["redirected"], 0, "{tag}: {stdout}");
+        assert!(
+            !stdout.contains("redirect_takeover_unpatched")
+                && !stdout.contains("redirect_takeover_reverted_vendored"),
+            "{tag}: the vendored patch must not be reverted: {stdout}"
+        );
+        assert!(
+            stdout.contains("redirect_takeover_kept_vendored")
+                && stdout.contains("redirect_cargo_toml_dep_unrewritable"),
+            "{tag}: the refusal is reported: {stdout}"
+        );
+        let after = project_snapshot(&proj);
+        let changed: Vec<&String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|k| before.get(*k) != after.get(*k))
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "{tag}: a refused takeover leaves the vendored project byte for byte: {changed:?}\n{stdout}"
+        );
+        // A fresh checkout still builds the PATCHED crate.
+        let (fresh, home) = fresh_checkout(&proj, tmp.path(), tag);
+        assert_build_ok(
+            &format!("{tag}: fresh cargo build --locked"),
+            &cargo(&fresh, &["build", "--locked", "-q"], &home),
+        );
+    }
 }

@@ -12,7 +12,7 @@
 //! locks of every Poetry release (`socket-patch-core/tests/fixtures/poetry/
 //! <0.12.17..2.4.3>/`: lock formats "0" / "1.0" / "1.1" / "2.0" / "2.1"), and
 //! the writer-driven cells run the real `scan --mode hosted --vex` / `scan
-//! --vendor --vex` / `apply --vex` / `vendor --vex` binaries against a
+//! --mode vendored --vex` / `apply --vex` / `vendor --vex` binaries against a
 //! wiremock patch API. The package is renamed to a made-up `vexfixture`, so
 //! no interpreter's global site-packages on the test host can hold a copy.
 //!
@@ -442,13 +442,13 @@ fn write_redirect_ledger(p: &Proj, ledger_purl: &str, record: PatchRecord) {
 /// (the shape every current vendor writer persists).
 fn write_vendor_ledger(p: &Proj, sha: &str, record: PatchRecord) {
     let mut state = VendorState::new();
-    state.entries.insert(
-        api_purl(),
-        VendorEntry {
-            ecosystem: "pypi".to_string(),
-            base_purl: purl(),
-            uuid: record.uuid.clone(),
-            artifact: VendorArtifact {
+    let mut entry = VendorEntry {
+        flavor: Some("poetry".to_string()),
+        ..VendorEntry::new(
+            "pypi".to_string(),
+            purl(),
+            record.uuid.clone(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: vendored_rel(&record.uuid),
                 sha256: sha.to_string(),
@@ -456,7 +456,7 @@ fn write_vendor_ledger(p: &Proj, sha: &str, record: PatchRecord) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![WiringRecord {
+            vec![WiringRecord {
                 file: "poetry.lock".to_string(),
                 kind: "poetry_lock_package".to_string(),
                 action: WiringAction::Rewritten,
@@ -464,18 +464,10 @@ fn write_vendor_ledger(p: &Proj, sha: &str, record: PatchRecord) {
                 original: None,
                 new: None,
             }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: Some(record),
-            flavor: Some("poetry".to_string()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
-    );
+        )
+    };
+    entry.record = Some(record);
+    state.entries.insert(api_purl(), entry);
     p.write(
         ".socket/vendor/state.json",
         serde_json::to_string_pretty(&state).unwrap(),
@@ -1014,6 +1006,9 @@ fn every_hosted_pin_spelling_attests_and_a_pinless_entry_needs_an_install() {
         let lock = p.read("poetry.lock");
         let api = api_for(Mode::Hosted);
         let files_line = format!("files = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]");
+        // Lock 2.x keeps Poetry's own one-file-per-line `files` array.
+        let files_block =
+            format!("files = [\n    {{file = \"{WHEEL}\", hash = \"sha256:{sha}\"}},\n]");
         let metadata_entry = format!("{PKG} = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]");
         // A `[metadata.files]` entry that listed files before the rewrite
         // keeps Poetry's one-file-per-line layout (rollback restores the full
@@ -1023,6 +1018,7 @@ fn every_hosted_pin_spelling_attests_and_a_pinless_entry_needs_an_install() {
         let fragment = format!("#sha256={sha}&");
         let spellings: Vec<(&str, &str)> = [
             ("package files", files_line.as_str()),
+            ("package files block", files_block.as_str()),
             ("metadata.files", metadata_entry.as_str()),
             ("metadata.files block", metadata_block.as_str()),
             ("url fragment", fragment.as_str()),
@@ -1240,7 +1236,7 @@ fn strip_pin(lock: &str, pin: &str) -> String {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Writer-driven: the REAL `scan --mode hosted --vex` / `scan --vendor --vex`
+// Writer-driven: the REAL `scan --mode hosted --vex` / `scan --mode vendored --vex`
 // write the wiring and the ledgers; then the manifest (and the ledgers) are
 // deleted and standalone + embedded VEX must still attest — and stop
 // attesting once the real revert unwinds the wiring with the ledger left
@@ -1554,7 +1550,7 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
     }
 }
 
-/// `scan --vendor --vex --vendor-source build` over the installed (pristine)
+/// `scan --mode vendored --vex --vendor-source build` over the installed (pristine)
 /// dist rebuilds the patched wheel into `.socket/vendor/pypi/<uuid>/`, wires
 /// the lock, writes the ledger (never a manifest: vendored mode is
 /// manifest-free) and attests in-run. A legacy manifest seeded beside the
@@ -1568,7 +1564,7 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
 #[test]
 fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
     for release in WRITER_RELEASES {
-        let what = format!("poetry {release} scan --vendor");
+        let what = format!("poetry {release} scan --mode vendored");
         let p = Proj::new();
         p.write_files(&native_files(release));
         p.install(PRISTINE);
@@ -1580,7 +1576,8 @@ fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
         let embedded_doc = p.root.join("embedded.vex.json");
         let args = vec![
             "scan",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--vendor-source",
             "service",
             "--vex",

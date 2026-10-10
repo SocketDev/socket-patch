@@ -22,9 +22,32 @@ name: Composer patch compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Only this ecosystem's own files. A change to shared engine code
+    # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
+    # push to main (when it is in the push filter below) or nightly, or on
+    # demand via workflow_dispatch on the PR branch;
+    # ci.yml's per-ecosystem blocking slice still runs on every PR and in
+    # the merge queue (#1198).
     paths:
       - '.github/workflows/composer-compatibility.yml'
       - 'tests/docker/Dockerfile.composer'
+      - 'crates/*/src/**/*composer*'
+      - 'crates/*/src/**/*composer*/**'
+      - 'crates/socket-patch-core/tests/fixtures/redirect/composer/**'
+      - 'crates/socket-patch-core/tests/fixtures/composer-version-vectors.json'
+      - 'crates/socket-patch-cli/tests/e2e_*composer*.rs'
+      - 'crates/socket-patch-cli/tests/docker_e2e_vendor_composer.rs'
+      - 'crates/socket-patch-cli/tests/composer_e2e_common/**'
+      - 'crates/socket-patch-cli/tests/e2e_vex_lockfile/composer.rs'
+  push:
+    branches: [main]
+    # The ecosystem's pre-#1198 relevance set (the shared engine code its
+    # cells run through), its PR paths and the toolchain files. A main
+    # push outside this set waits for the nightly run below.
+    paths:
+      - '.github/workflows/composer-compatibility.yml'
+      - 'tests/docker/Dockerfile.composer'
+      - 'tests/docker/Dockerfile.base'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'crates/*/Cargo.toml'
@@ -62,8 +85,14 @@ on:
       - 'crates/socket-patch-cli/tests/docker_vendor_common/**'
       - 'crates/socket-patch-cli/tests/e2e_vex_lockfile/composer.rs'
       - 'crates/socket-patch-cli/tests/vex_e2e_common/**'
-  push:
-    branches: [main]
+      - 'crates/*/src/**/*composer*'
+      - 'crates/*/src/**/*composer*/**'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly full matrix, so a main change outside the push filter
+    # still gets a run within a day.
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -101,7 +130,7 @@ jobs:
           - {os: windows-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
           - {os: windows-latest, composer: '2.9.8', php: '8.4', sha256: 59b2c50e10cafa0d8efc19ede9a326d782f096c674a26baf98cf042ce23de890}
           - {os: windows-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     steps: &native-steps
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -110,9 +139,9 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: composer-compat
+          shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: ${{ matrix.php }}
           tools: none
@@ -181,8 +210,13 @@ jobs:
         include:
           - {os: macos-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
           - {os: macos-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
-          - {os: macos-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
-    runs-on: ${{ matrix.os }}
+          # PHP 8.4 on macOS: setup-php 2.37.2 could not install 8.5 from
+          # Homebrew once PHP 8.6 shipped (every run from 2026-10-07 23:51Z
+          # failed in "Setup PHP"), and from 2026-10-09 00:55Z no version at
+          # all (#1210); 2.40.0 resolves the tap's formula aliases first.
+          # Ubuntu and Windows keep the 2.10.3 / 8.5 cell.
+          - {os: macos-latest, composer: '2.10.3', php: '8.4', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     steps: *native-steps
 
@@ -192,7 +226,7 @@ jobs:
     # Composer 1, so 1.10.28 is covered by the native legs only.
     name: docker composer ${{ matrix.composer }}
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 35
     strategy:
       fail-fast: false

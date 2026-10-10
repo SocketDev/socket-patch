@@ -205,7 +205,7 @@ Mill builds get agent mode (the Coursier cache crawl) and hosted guidance
 (`redirect_mill_manual_snippet`). `socket-patch vendor` does not wire a Mill
 build: a root with `build.mill`, `build.mill.yaml` or `build.sc` is never a
 scala-cli build, and with no `pom.xml` or Gradle file it is refused
-`vendor_maven_pom_project_missing`. Automatic vendoring is deferred because the
+`vendor_jvm_shape_unsupported` (reason `no_build_file`). Automatic vendoring is deferred because the
 only committable mechanism the probe found has costs socket-patch should not
 impose silently:
 

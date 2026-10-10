@@ -16,6 +16,9 @@ inputs:
   include-hidden-files:
     description: Include hidden files in the artifact
     default: 'false'
+  compression-level:
+    description: ZIP compression level (0 for files that are already compressed)
+    default: '6'
 outputs:
   artifact-id:
     description: ID of the uploaded artifact
@@ -47,6 +50,7 @@ runs:
         if-no-files-found: ${{ inputs.if-no-files-found }}
         retention-days: ${{ inputs.retention-days }}
         include-hidden-files: ${{ inputs.include-hidden-files }}
+        compression-level: ${{ inputs.compression-level }}
         overwrite: true
 
     - name: Wait before retrying
@@ -65,6 +69,7 @@ runs:
         if-no-files-found: ${{ inputs.if-no-files-found }}
         retention-days: ${{ inputs.retention-days }}
         include-hidden-files: ${{ inputs.include-hidden-files }}
+        compression-level: ${{ inputs.compression-level }}
         overwrite: true
 
     - name: Wait before the final attempt
@@ -84,4 +89,5 @@ runs:
         if-no-files-found: ${{ inputs.if-no-files-found }}
         retention-days: ${{ inputs.retention-days }}
         include-hidden-files: ${{ inputs.include-hidden-files }}
+        compression-level: ${{ inputs.compression-level }}
         overwrite: true

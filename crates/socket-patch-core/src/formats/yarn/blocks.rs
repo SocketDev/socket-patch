@@ -7,7 +7,8 @@
 //! apart on what a block, a key or a field is.
 
 use super::patterns::{berry_npm_alias_target, split_berry_key_patterns, split_pattern};
-use crate::vendor::common::detect_eol;
+use crate::formats::text::split_bom;
+use crate::utils::line_endings::terminator;
 
 /// One key-line block of a yarn lockfile (classic or berry).
 pub(crate) struct LockBlock {
@@ -42,10 +43,9 @@ pub(crate) fn scan_blocks(text: &str) -> Vec<LockBlock> {
         }
         let mut content = content.strip_suffix('\r').unwrap_or(content);
         if start == 0 {
-            if let Some(rest) = content.strip_prefix('\u{feff}') {
-                start = '\u{feff}'.len_utf8();
-                content = rest;
-            }
+            let (bom, rest) = split_bom(content);
+            start = bom.len();
+            content = rest;
         }
         lines.push((start, pos, content, terminated));
     }
@@ -82,16 +82,16 @@ fn is_body_line(s: &str) -> bool {
 }
 
 /// The line terminator `block` is written in: its first line's (`\r\n` or
-/// `\n`), else — a block that is one unterminated last line — the file's
-/// dominant one ([`detect_eol`]). For a uniformly-ended lock this is the
-/// file's own terminator; in a lock whose endings were mixed after the
+/// `\n`), else — a block that is one unterminated last line — the
+/// file's [`terminator`]. For a uniformly-ended lock this is the file's
+/// own terminator; in a lock whose endings were mixed after the
 /// fact it keeps a restored block in the style of the block it replaces.
 pub(crate) fn block_eol(text: &str, block: &LockBlock) -> &'static str {
     let span = &text[block.start..block.end];
     match span.find('\n') {
         Some(i) if span[..i].ends_with('\r') => "\r\n",
         Some(_) => "\n",
-        None => detect_eol(text),
+        None => terminator(text),
     }
 }
 
@@ -269,14 +269,18 @@ pub(crate) fn berry_lock_locks(lock: &str, name: &str, version: &str) -> bool {
     })
 }
 
-/// The entries of the berry lock `lock` that carry a `bin:` map: the only
-/// ones whose pin needs the served tarball's own package.json (#718).
-/// Scanned once per lock, so the per-dep check in
-/// [`berry_pin_needs_manifest`] only walks these (usually none).
+/// The entries of the berry lock `lock` that carry a `bin:` map (#718) or
+/// the npm resolver's implicit `node-gyp` dependency (#737): the only ones
+/// whose pin needs the served tarball's own package.json. Scanned once per
+/// lock, so the per-dep check in [`berry_pin_needs_manifest`] only walks
+/// these (usually none).
 pub(crate) fn berry_bin_entries(lock: &str) -> Vec<LockBlock> {
     scan_blocks(lock)
         .into_iter()
-        .filter(|block| block.lines.iter().skip(1).any(|l| is_body_field(l, "bin")))
+        .filter(|block| {
+            block.lines.iter().skip(1).any(|l| is_body_field(l, "bin"))
+                || super::berry_entry::has_implicit_node_gyp(&block.lines)
+        })
         .collect()
 }
 

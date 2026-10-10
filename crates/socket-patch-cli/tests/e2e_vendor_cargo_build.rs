@@ -79,6 +79,10 @@
 //! the fixture build (a failure instead under
 //! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); all assertions after that are hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256, parse_json_envelope};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -200,10 +204,6 @@ fn metadata_version(dir: &Path, cargo_home: &Path) -> String {
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
 /// Run socket-patch with ambient `SOCKET_*` vars scrubbed and the fixture's
 /// private CARGO_HOME injected (the cargo crawler resolves the registry
 /// source tree through it).
@@ -241,13 +241,6 @@ fn cargo(cwd: &Path, args: &[&str], cargo_home: &Path) -> Output {
         .expect("failed to run cargo")
 }
 
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
-
 fn b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -281,11 +274,6 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
     )
     .unwrap();
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
-}
-
-fn parse_envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("vendor --json output is not JSON: {e}\nstdout:\n{stdout}"))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
@@ -645,7 +633,7 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
     // summary.applied / the event action are pinned by
@@ -878,7 +866,7 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
     assert_eq!(
@@ -938,7 +926,7 @@ fn cargo_vendor_reports_applied_event() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(
         env["summary"]["applied"], 1,
         "a successful first-time vendor must count as applied: {env}"
@@ -952,6 +940,102 @@ fn cargo_vendor_reports_applied_event() {
     assert_eq!(
         event["action"], "applied",
         "vendor success must be an `applied` event, not skipped/`vendored`: {event}"
+    );
+}
+
+/// #336: an agent-mode apply patches the crate in the SHARED registry
+/// cache; a later `vendor` moves the crate onto a committed copy but leaves
+/// that cache edit behind. A bare `rollback` must restore the cache copy
+/// too — not report success, drop the manifest entry and GC the only blobs
+/// that could restore it while every other project on the machine keeps
+/// building the patched crate.
+#[test]
+fn cargo_rollback_after_agent_to_vendored_restores_shared_cache() {
+    agent_to_vendored_rollback_restores_shared_cache(false);
+}
+
+/// #336 behind a `cargo vendor` dir: the project crawl then searches only
+/// `vendor/`, which hides the registry cache. The rollback still drops the
+/// record, so it must still find and restore the patched cache copy.
+#[test]
+fn cargo_rollback_after_agent_to_vendored_restores_cache_behind_cargo_vendor_dir() {
+    agent_to_vendored_rollback_restores_shared_cache(true);
+}
+
+fn agent_to_vendored_rollback_restores_shared_cache(cargo_vendor_dir: bool) {
+    if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (agent-then-vendor)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) =
+        stage_fixture(tmp.path(), "agent-then-vendor")
+    else {
+        return;
+    };
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let lib = crate_dir.join("src/lib.rs");
+    let orig = std::fs::read(&lib).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+    std::fs::write(proj.join(".socket/blobs").join(git_sha256(&orig)), &orig).unwrap();
+    let cwd = proj.to_str().unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["apply", "--json", "--offline", "--cwd", cwd],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&lib).unwrap(),
+        patched,
+        "apply must patch the cache copy"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["vendor", "--json", "--offline", "--cwd", cwd],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    if cargo_vendor_dir {
+        std::fs::create_dir_all(proj.join("vendor")).unwrap();
+    }
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["rollback", "--json", "--offline", "--cwd", cwd],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(
+        std::fs::read(&lib).unwrap(),
+        orig,
+        "rollback must restore the shared registry-cache copy: {env}"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert!(
+        manifest["patches"].get(&purl).is_none(),
+        "a fully rolled-back entry leaves the manifest: {manifest}"
+    );
+    let ledger =
+        std::fs::read_to_string(proj.join(".socket/vendor/state.json")).unwrap_or_default();
+    assert!(
+        !ledger.contains(&purl),
+        "the vendored leg must have reverted the ledger entry: {ledger}"
     );
 }
 
@@ -1048,7 +1132,7 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
         code, 0,
         "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["found"], 1, "envelope: {env}");
     assert_eq!(env["downloaded"], 1, "envelope: {env}");
@@ -1222,7 +1306,7 @@ fn vendor_ok(proj: &Path, cargo_home: &Path, tag: &str) -> serde_json::Value {
         code, 0,
         "{tag}: vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    parse_envelope(&stdout)
+    parse_json_envelope(&stdout)
 }
 
 fn revert_ok(proj: &Path, cargo_home: &Path, tag: &str) {

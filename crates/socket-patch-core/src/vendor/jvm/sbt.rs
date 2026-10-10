@@ -25,10 +25,11 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
+use super::layout::{self, safe_coordinates};
 use super::{
-    adopt, coursier_tree, finish_writes, fragment, maven_reactor, owned_file, safe_coordinates,
-    CommittedTree, Coords, FileWrite, JvmPatch, JvmPlan, JvmRefusal, JvmUnplan, JvmWarning, ReadFn,
-    Shape, WiringAction, WiringRecord, OWNED_FILE_KIND, SBT_FRAGMENT_KIND, TREE_GITATTRIBUTES,
+    adopt, coursier_tree, finish_writes, fragment, maven_reactor, owned_file, CommittedTree,
+    Coords, FileWrite, JvmPatch, JvmPlan, JvmRefusal, JvmUnplan, JvmWarning, ReadFn, Shape,
+    WiringAction, WiringRecord, OWNED_FILE_KIND, SBT_FRAGMENT_KIND, TREE_GITATTRIBUTES,
 };
 use crate::formats::sbt::build::{
     declared_projects, deps_digest, is_sbt_build, is_sbt_build_root, sbt_support, sbt_version,
@@ -38,9 +39,7 @@ use crate::formats::sbt::owned_file::{
     parse, render, OwnedFileError, SbtFileMode, SbtOwnedFile, SbtPin, HOSTED_FILE, VENDORED_FILE,
 };
 // Beside an sbt build, which of these builds a developer runs is unknowable.
-use crate::patch::redirect::{
-    gradle::GRADLE_ROOT_FILES as GRADLE_FILES, scala_guidance::MILL_MARKERS,
-};
+use super::layout::{GRADLE_ROOT_FILES as GRADLE_FILES, MILL_MARKERS};
 
 /// The generated root file.
 pub const BUILD_FILE: &str = VENDORED_FILE;
@@ -61,7 +60,7 @@ fn text<'a>(read: ReadFn<'a>) -> impl Fn(&str) -> Option<String> + 'a {
 }
 
 /// [`Shape::Sbt`] for a directory holding an sbt marker, unless the
-/// project is already vendored through the Maven reactor, the legacy
+/// project is already vendored through the Maven reactor, the pre-v5
 /// single-pom path, the Gradle backend or the scala-cli backend (its wiring
 /// stays on that backend; a new pin there then plans as before).
 pub fn detect(read: ReadFn<'_>) -> Option<Shape> {
@@ -71,7 +70,8 @@ pub fn detect(read: ReadFn<'_>) -> Option<Shape> {
     }
     // Beside a Maven or Gradle build, a stray `project/build.properties`
     // naming no `sbt.version` is not an sbt marker.
-    let other_build = read("pom.xml").is_some() || GRADLE_FILES.iter().any(|f| read(f).is_some());
+    let other_build =
+        read(layout::POM_FILE).is_some() || GRADLE_FILES.iter().any(|f| read(f).is_some());
     if other_build && read(BUILD_SBT).is_none() && !is_sbt_build_root(&read_text) {
         return None;
     }
@@ -89,8 +89,9 @@ fn scala_cli_wired(read: ReadFn<'_>) -> bool {
     read(super::scala_cli::ROOT_FILE).is_some() || read(super::coursier_tree::INDEX_REL).is_some()
 }
 
-/// The legacy single-pom path (`vendor/maven_repo.rs`, `Shape::Other`)
-/// already wired the root pom: its `<repository>` id.
+/// The pre-v5 single-pom backend already wired the root pom: its
+/// `<repository>` id. The root stays off sbt so that `vendor --revert` can
+/// unwind it first (vendoring it is refused as `legacy_maven_root`).
 fn legacy_pom_wired(read: ReadFn<'_>) -> bool {
     read("pom.xml").is_some_and(|b| {
         let pom = String::from_utf8_lossy(&b);
@@ -102,22 +103,22 @@ fn legacy_pom_wired(read: ReadFn<'_>) -> bool {
     })
 }
 
-/// The Maven reactor backend already wired this root: its tagged block or
-/// pin in the root pom, or its repository tail in `.mvn/maven.config`.
+/// The Maven reactor backend already wired this root (a multi-module
+/// reactor or a single pom): its tagged block or pin in the root pom, or
+/// its repository tail in `.mvn/maven.config`.
 fn reactor_wired(read: ReadFn<'_>) -> bool {
-    let Some(pom) = read("pom.xml").map(|b| String::from_utf8_lossy(&b).into_owned()) else {
+    let Some(pom) = read(layout::POM_FILE).map(|b| String::from_utf8_lossy(&b).into_owned()) else {
         return false;
     };
-    maven_reactor::declares_modules(&pom)
-        && (pom.contains("<!-- socket-patch:begin -->")
-            || pom.contains("<!-- socket-patch ")
-            || read(maven_reactor::MAVEN_CONFIG)
-                .is_some_and(|c| String::from_utf8_lossy(&c).contains(".socket/vendor/maven2")))
+    pom.contains(maven_reactor::BEGIN_MARKER)
+        || pom.contains(maven_reactor::PIN_TAG)
+        || read(maven_reactor::MAVEN_CONFIG)
+            .is_some_and(|c| String::from_utf8_lossy(&c).contains(layout::MAVEN2_TREE))
 }
 
 /// The Gradle backend already wired this root (its settings apply line).
 fn gradle_wired(read: ReadFn<'_>) -> bool {
-    ["settings.gradle", "settings.gradle.kts"].iter().any(|f| {
+    layout::GRADLE_SETTINGS_FILES.iter().any(|f| {
         read(f).is_some_and(|b| String::from_utf8_lossy(&b).contains(super::gradle::SCRIPT_REL))
     })
 }
@@ -734,8 +735,9 @@ mod tests {
         let read = |p: &str| scala.get(p).cloned();
         assert_eq!(detect(&read), None);
         assert_eq!(super::super::detect(&read), Shape::ScalaCli);
-        // A single-module pom the legacy path already wired stays legacy
-        // (`Shape::Other`); an unwired one beside sbt routes to sbt.
+        // A single-module pom the pre-v5 path already wired stays off sbt
+        // (a Maven root, refused until reverted); an unwired one beside
+        // sbt routes to sbt.
         let legacy = build(
             "1.9.9",
             &[(
@@ -747,7 +749,7 @@ mod tests {
         );
         let read = |p: &str| legacy.get(p).cloned();
         assert_eq!(detect(&read), None);
-        assert_eq!(super::super::detect(&read), Shape::Other);
+        assert_eq!(super::super::detect(&read), Shape::MavenReactor);
         // A Gradle build with an unrelated `project/build.properties` is
         // not sbt-shaped.
         let stray: BTreeMap<String, Vec<u8>> = [

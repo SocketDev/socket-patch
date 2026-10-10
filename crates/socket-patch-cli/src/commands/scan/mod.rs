@@ -13,11 +13,13 @@ use socket_patch_core::api::client::{
     is_fallback_candidate, ApiClient, ApiError,
 };
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
-use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
+use socket_patch_core::crawlers::ruby_crawler::{
+    config_path_ignored_warning, stale_plugin_registration_warning,
+};
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
-    spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
+    spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry, TelemetryAuth,
 };
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl};
@@ -30,10 +32,16 @@ use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
+use crate::ecosystem_dispatch::{
+    crawl_ecosystems, crawl_ecosystems_with_npm, find_all_packages_for_rollback_reusing,
+    partition_purls,
+};
+use crate::json_envelope::{usage_error, Command as JsonCommand};
 use crate::ui::{self, plural, print_json, StatusLine};
 
-use super::get::{download_and_apply_patches_with, DownloadParams, DownloadRun};
+use crate::commands::agent_download::{
+    download_and_apply_patches_with, DownloadParams, DownloadRun,
+};
 
 use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
 pub use self::socket_yml_args::{SocketYmlArgs, MIN_SEVERITY_ENV};
@@ -64,7 +72,6 @@ pub(crate) use self::discovery::{
 use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
-pub(crate) use self::hosted::{vlt_rollback_heal, vlt_takeover_heal};
 use self::vendor_flow::{
     boxed_vendor_interactive_path, boxed_vendor_json_path, fold_vendored_skips_into_apply,
     partition_skipped_selected,
@@ -97,6 +104,53 @@ const BATCH_BODY_BYTE_CAP: usize = 256 * 1024;
 /// authenticated API and [`DEFAULT_PROXY_BATCH_SIZE`] on the public proxy.
 /// Floored at 1: `--batch-size 0` is otherwise unvalidated and would make
 /// the chunking below panic, so it degrades to one-package batches.
+/// `purls` plus, for each lockfile-only PyPI purl among them, its other
+/// PEP 440 spellings of the same release (#604), deduplicated in order.
+fn with_pypi_equivalents(purls: &[String], lockfile_only: &HashSet<PurlKey>) -> Vec<String> {
+    let mut out = purls.to_vec();
+    let mut seen: HashSet<PurlKey> = purls.iter().map(|p| PurlKey::new(p)).collect();
+    for purl in purls {
+        if !lockfile_only_contains(lockfile_only, purl) {
+            continue;
+        }
+        for spelling in socket_patch_core::utils::purl_key::pypi_equivalent_purls(purl) {
+            if seen.insert(PurlKey::new(&spelling)) {
+                out.push(spelling);
+            }
+        }
+    }
+    out
+}
+
+/// Mark each API purl that names a lockfile-only PyPI pin under another
+/// PEP 440 spelling (`@1.16.0` for a lock's `@1.16`, #604) as lockfile-only
+/// too, so the `notInstalled` flag, the `[NOT INSTALLED]` marker and the
+/// vendored baseline pre-check treat it as the package it is. A spelling an
+/// installed copy already carries is left alone.
+fn adopt_pypi_equivalents(
+    packages: &[BatchPackagePatches],
+    scanned: &[String],
+    lockfile_only: &mut HashSet<PurlKey>,
+) {
+    let scanned_keys: HashSet<PurlKey> = scanned.iter().map(|p| PurlKey::new(p)).collect();
+    let lock_only_pypi: Vec<&String> = scanned
+        .iter()
+        .filter(|p| p.starts_with("pkg:pypi/") && lockfile_only_contains(lockfile_only, p))
+        .collect();
+    for pkg in packages {
+        let key = PurlKey::new(&pkg.purl);
+        if scanned_keys.contains(&key) {
+            continue;
+        }
+        if lock_only_pypi
+            .iter()
+            .any(|lock| socket_patch_core::utils::purl_key::pypi_same_release(lock, &pkg.purl))
+        {
+            lockfile_only.insert(key);
+        }
+    }
+}
+
 fn effective_batch_size(requested: Option<usize>, use_public_proxy: bool) -> usize {
     requested
         .unwrap_or(if use_public_proxy {
@@ -147,8 +201,7 @@ fn batch_chunks(purls: &[String], batch_size: usize, max_body_bytes: usize) -> V
 }
 
 /// The three patch-application modes `scan` can drive, selectable via
-/// `--mode`. Vendored and agent also keep a hidden deprecated boolean
-/// spelling (`--vendor`, `--apply`/`--sync`).
+/// `--mode`. `--sync` is shorthand for `--mode agent --prune`.
 //
 // The `///` docs on the variants are user-facing `--help` text (shared
 // with `get --mode`); keep implementation notes in `//` comments.
@@ -160,12 +213,10 @@ pub enum ScanMode {
     Hosted,
     /// Commit patched artifacts to `.socket/vendor/`: hermetic,
     /// offline-safe installs at the cost of repo size
-    // Equivalent to `--vendor`.
     Vendored,
     /// Record patches in `.socket/manifest.json` plus blobs and re-apply
     /// them in place (e.g. from CI): smallest repo footprint, but every
     /// install environment must run the agent
-    // Equivalent to `--apply`.
     Agent,
 }
 
@@ -181,53 +232,34 @@ impl ScanMode {
     }
 }
 
-/// Fold the boolean spellings (`--vendor` / `--apply` / `--sync`) into
-/// `args.mode`, so `ScanMode` is the single
-/// source of truth everything downstream reads (the booleans are input
-/// spellings only, never consulted after this returns), and enforce the
+/// Resolve `args.mode` from `--mode` and `--sync`, so `ScanMode` is the
+/// single source of truth everything downstream reads, and enforce the
 /// cross-flag rules clap cannot express:
 ///
-/// * `--mode X` combined with a boolean belonging to a DIFFERENT mode is a
-///   contradiction → `Err`. Clap's `conflicts_with` is value-independent —
-///   it could not allow `--mode vendored --vendor` while rejecting
-///   `--mode hosted --vendor` — so the check lives here.
-/// * The same mode spelled both ways (`--mode vendored --vendor`) is
-///   redundant but accepted: both spellings mean one thing.
-/// * `--sync` implies `--apply`, so it counts as an agent-mode spelling;
-///   `--prune` is an orthogonal GC knob and never conflicts. (`--sync`'s
+/// * `--sync` means `--mode agent --prune`, so `--mode X --sync` with any
+///   mode other than agent is a contradiction → `Err`. Clap's
+///   `conflicts_with` is value-independent — it could not allow
+///   `--mode agent --sync` while rejecting `--mode hosted --sync` — so the
+///   check lives here. `--mode agent --sync` is redundant but accepted.
+/// * `--prune` is an orthogonal GC knob and never conflicts. (`--sync`'s
 ///   prune half is orthogonal too, and stays a separate read in `run`.)
 ///   Hosted mode runs no GC, so `--mode hosted --prune` stays accepted but
 ///   emits an explicit `redirect_prune_ignored` warning in `run` rather
 ///   than silently dropping the flag.
 ///
 /// Public (not `pub(crate)`) so the CLI-contract tests can exercise the
-/// fold without driving a full `run()`.
+/// resolution without driving a full `run()`.
 pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
     if let Some(mode) = args.mode {
-        // First boolean that selects a mode OTHER than the requested one.
-        let mut conflicting: Option<&'static str> = None;
-        if args.vendor && mode != ScanMode::Vendored {
-            conflicting = Some("--vendor");
-        }
-        if args.apply && mode != ScanMode::Agent {
-            conflicting = Some("--apply");
-        }
         if args.sync && mode != ScanMode::Agent {
-            conflicting = Some("--sync");
-        }
-        if let Some(flag) = conflicting {
             // "cannot be used with" phrasing matches clap's conflict errors —
             // the scan_vendor_e2e contract test accepts exactly that shape.
             return Err(format!(
-                "--mode {} cannot be used with {flag}: the flags select different \
-                 modes (--vendor means --mode vendored; --apply and --sync mean \
-                 --mode agent)",
+                "--mode {} cannot be used with --sync: --sync means --mode agent --prune",
                 mode.cli_name(),
             ));
         }
-    } else if args.vendor {
-        args.mode = Some(ScanMode::Vendored);
-    } else if args.apply || args.sync {
+    } else if args.sync {
         args.mode = Some(ScanMode::Agent);
     } else if !args.prune && !args.common.is_global() {
         // v5: hosted is the default. A `--prune` or global scan with no mode
@@ -264,11 +296,6 @@ pub struct ScanArgs {
     #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE")]
     pub batch_size: Option<usize>,
 
-    // Hidden, deprecated spelling of `--mode agent`: download the selected
-    // patches and apply them in place.
-    #[arg(long, default_value_t = false, hide = true)]
-    pub apply: bool,
-
     /// Garbage-collect after the scan: prune manifest entries for
     /// packages that are no longer installed, then delete orphan blob,
     /// diff and package-archive files from `.socket/`. Off by default so
@@ -284,19 +311,12 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
-    // Hidden, deprecated spelling of `--mode vendored`: vendor every
-    // patched dependency the scan selects into the committable
-    // `.socket/vendor/` tree instead of applying patches in place.
-    #[arg(long, default_value_t = false, hide = true, conflicts_with_all = ["apply", "sync"])]
-    pub vendor: bool,
-
-    /// How discovered patches are consumed [default: hosted]. A `--prune`
-    /// or `--global` scan with no mode only reports
-    // The hidden `--vendor` and `--apply` are deprecated spellings of
-    // `--mode vendored` and `--mode agent` (`--sync` also selects agent);
-    // hosted has no boolean spelling. Combining `--mode` with a boolean
-    // from a DIFFERENT mode is rejected in `resolve_mode_flags`; the same
-    // mode spelled both ways is accepted.
+    /// How discovered patches are consumed [default: the mode the
+    /// project's patch state already records, else hosted]. Switching an
+    /// existing vendored or agent-mode project to another mode needs this
+    /// flag. A `--prune` or `--global` scan with no mode only reports
+    // `--sync` also selects agent; combining it with a different `--mode`
+    // is rejected in `resolve_mode_flags`.
     #[arg(long = "mode", value_enum)]
     pub mode: Option<ScanMode>,
 
@@ -324,7 +344,7 @@ pub struct ScanArgs {
     /// On a successful scan, also generate an OpenVEX 0.2.0 document.
     /// `--vex <path>` is the trigger; the `--vex-*` knobs mirror the
     /// standalone `vex` command. The document is built from the manifest
-    /// as it stands after the scan (including any `--apply`/`--sync`
+    /// as it stands after the scan (including any `--mode agent`/`--sync`
     /// writes) and verified against on-disk state. A requested-but-failed
     /// VEX makes the command exit non-zero.
     #[command(flatten)]
@@ -349,6 +369,7 @@ pub(crate) use socket_patch_core::policy::package_spec_matches;
 async fn embed_vex_into_json(
     common: &GlobalArgs,
     vex_args: &VexEmbedArgs,
+    api_client: &ApiClient,
     manifest_path: &Path,
     base_code: i32,
     result: &mut serde_json::Value,
@@ -366,7 +387,7 @@ async fn embed_vex_into_json(
         result["vex"] = serde_json::json!({ "skipped": true, "reason": "dry_run" });
         return base_code;
     }
-    let mut params = vex_args.to_build_params();
+    let mut params = vex_args.to_build_params(Some(api_client));
     // A hosted scan that redirected nothing (empty catalog / no grants)
     // still attests older hosted gem pins: check them against the mirror.
     params.hosted_gem_mirror_check = hosted;
@@ -387,11 +408,10 @@ async fn embed_vex_into_json(
             0
         }
         Err(e) => {
-            result["status"] = serde_json::json!("error");
-            result["error"] = serde_json::json!({
-                "code": e.code,
-                "message": e.message,
-            });
+            crate::json_envelope::set_error(
+                result,
+                crate::json_envelope::EnvelopeError::new(e.code.to_string(), e.message.clone()),
+            );
             append_vex_error_warnings(result, &e.embedded_warnings());
             1
         }
@@ -426,6 +446,7 @@ pub(super) fn append_vex_error_warnings(
 async fn embed_vex_human(
     common: &GlobalArgs,
     vex_args: &VexEmbedArgs,
+    api_client: &ApiClient,
     manifest_path: &Path,
     base_code: i32,
     hosted: bool,
@@ -443,7 +464,7 @@ async fn embed_vex_human(
         }
         return base_code;
     }
-    let mut params = vex_args.to_build_params();
+    let mut params = vex_args.to_build_params(Some(api_client));
     // A hosted scan that redirected nothing (empty catalog / no grants)
     // still attests older hosted gem pins: check them against the mirror.
     params.hosted_gem_mirror_check = hosted;
@@ -519,7 +540,6 @@ async fn discover_selected(
     // Some queries failed, some succeeded: a `--json` run has no stderr
     // warning (`warn` is human-only), so each failed package becomes a
     // run-level `warnings[]` entry — never a silent drop from the envelope.
-    let fetched = all_search_results.len();
     let offers = select_accessible(all_search_results, can_access_paid_patches, policy);
     if let Some(result) = json_warnings {
         for (purl, e) in &failures {
@@ -533,18 +553,15 @@ async fn discover_selected(
     }
     Ok(Discovered {
         offers,
-        fetched,
         failed: failures,
     })
 }
 
-/// [`discover_selected`]'s result: the offers, how many records came back
-/// (before the tier filter), and each failed detail query as `(purl,
-/// error)` (a failure for a package with no recorded patch makes a capped
-/// run's data incomplete).
+/// [`discover_selected`]'s result: the offers and each failed detail
+/// query as `(purl, error)` (a failure for a package with no recorded
+/// patch makes a capped run's data incomplete).
 struct Discovered {
     offers: rollout::Offers,
-    fetched: usize,
     failed: Vec<(String, String)>,
 }
 
@@ -702,8 +719,9 @@ fn open_paragraph(opened: &mut bool) {
 /// arm treats an empty merged set as a fetch failure). The two output
 /// knobs are human-only: `show_progress` shows the status-line counter on
 /// stderr, `warn` prints a warning per failed package once the loop is
-/// done — only when some query succeeded (when every one failed, the
-/// caller's error line carries the cause instead, so nothing repeats).
+/// done — only when some query succeeded, even with no records (when
+/// every one failed, the caller's error line carries the cause instead,
+/// so nothing repeats).
 async fn fetch_patch_details(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
@@ -745,7 +763,8 @@ async fn fetch_patch_details(
         }
     }
     status.finish();
-    if warn && !results.is_empty() {
+    // Not when every query failed: the caller's error line names it.
+    if warn && failures.len() < packages.len() {
         for (purl, e) in &failures {
             eprintln!("Warning: could not fetch details for {purl}: {e}");
         }
@@ -757,10 +776,14 @@ async fn fetch_patch_details(
 /// print it. The discovery counts already in `result` stay — they were
 /// computed from the (successful) batch phase — while `status`/`error`
 /// mirror the all-batches-failed envelope so JSON consumers see one
-/// consistent scan-error schema instead of empty stdout.
+/// consistent scan-error schema instead of empty stdout. The code is
+/// [`PATCH_DETAILS_FAILED`]: every patch-detail query failing is the only
+/// way discovery fails.
 fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
-    result["status"] = serde_json::json!("error");
-    result["error"] = serde_json::json!(message);
+    crate::json_envelope::set_error(
+        result,
+        crate::json_envelope::EnvelopeError::new(PATCH_DETAILS_FAILED, message),
+    );
     if let Some(obj) = result.as_object_mut() {
         obj.remove("rollout");
     }
@@ -771,8 +794,8 @@ fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
 /// owned purls leave first (any uuid: the committed artifact IS the patch,
 /// and a manifest moved past the vendored uuid would break VEX verification
 /// until a vendor run refreshes the artifact — a newer patch still surfaces
-/// in `updates[]`, the operator's signal to run `scan --vendor`), then
-/// lockfile-only purls (nothing installed to patch in place; `scan --vendor`
+/// in `updates[]`, the operator's signal to run `scan --mode vendored`), then
+/// lockfile-only purls (nothing installed to patch in place; `scan --mode vendored`
 /// fetches them pristine). Both classes become calm `skipped` records —
 /// never an error.
 struct AgentSelection {
@@ -848,7 +871,6 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         global_prefix: args.common.global_prefix.clone(),
         json,
         silent,
-        download_mode: args.common.download_mode.clone(),
         all_releases: args.all_releases,
         strict: args.common.strict,
         ecosystems: args.common.ecosystems.clone(),
@@ -859,7 +881,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
 
 /// The run-level context the agent engine borrows from scan: the client
 /// `run` already built (proxy fallback included) and the flags the nested
-/// apply inherits — so `scan --apply` honors `--lock-timeout` and never
+/// apply inherits — so `scan --mode agent` honors `--lock-timeout` and never
 /// rebuilds the client.
 fn download_run<'a>(args: &ScanArgs, api_client: &'a ApiClient) -> DownloadRun<'a> {
     DownloadRun {
@@ -905,7 +927,7 @@ pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
      `scan --mode vendored --prune` to garbage-collect";
 
 /// The PURLs claimed by BOTH a hosted pin (`redirect`, the lockfiles'
-/// hosted state — see [`crate::commands::hosted_state_from_lockfiles`]) and
+/// hosted state — see [`crate::commands::hosted_state_from_pins`]) and
 /// the vendored state ledger (`.socket/vendor/state.json`), sorted. A
 /// non-empty result means one of the two is stale for each PURL (a
 /// lockfile entry can point only one way). `None`, an empty vendor ledger,
@@ -951,22 +973,37 @@ pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -
     // A malformed vendor ledger classifies like a missing one (this path
     // only feeds takeover warnings; corruption is a hard error on the
     // write/attest paths).
-    let redirect = crate::commands::hosted_state_from_lockfiles(common, cwd).await;
     let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
-    classify_overlap_takeover_with(common, cwd, Some(&redirect), vendor.as_ref()).await
+    // Nothing vendored, nothing to overlap: skip the lockfile walk (#993).
+    let Some(vendor) = vendor.filter(|v| !v.entries.is_empty()) else {
+        return OverlapTakeover::default();
+    };
+    let discovery = crate::commands::discover_wiring(common, cwd).await;
+    let redirect = crate::commands::hosted_state_from_pins(
+        &socket_patch_core::patch::redirect::upstream::HostedPin::all(&discovery),
+    );
+    classify_overlap_takeover_with(cwd, Some(&redirect), Some(&vendor), &discovery).await
 }
 
 /// [`classify_overlap_takeover`] over already-loaded state (the hosted
-/// engine classifies against its post-takeover vendor ledger); still reads
-/// the LIVE lockfiles in `cwd`. `None` for either yields no overlap.
+/// engine classifies against its post-takeover vendor ledger) and
+/// `discovery`, the lockfile discovery of `cwd` as it is now
+/// ([`crate::commands::discover_wiring`]). `None` for either state, or an
+/// empty vendored ledger, yields no overlap.
+///
+/// Callers hand in a discovery they already hold and should skip
+/// discovering at all when the vendored ledger has no entries: discovery
+/// re-walks every lockfile of the project, which is a real share of a
+/// hosted scan's time (#993), and a project that never vendored (the
+/// hosted common case) has nothing for it to decide.
 pub(super) async fn classify_overlap_takeover_with(
-    common: &GlobalArgs,
     cwd: &Path,
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: Option<&VendorState>,
+    discovery: &socket_patch_core::vex::discover::Discovery,
 ) -> OverlapTakeover {
     let mut out = OverlapTakeover::default();
-    let Some(vendor) = vendor else {
+    let Some(vendor) = vendor.filter(|v| !v.entries.is_empty()) else {
         return out;
     };
     let overlap = overlap_from_states(redirect, vendor);
@@ -994,8 +1031,7 @@ pub(super) async fn classify_overlap_takeover_with(
             .entry(PurlKey::new(key))
             .or_insert(record.uuid.as_str());
     }
-    let discovery = crate::commands::discover_wiring(common, cwd).await;
-    let mut liveness = LedgerLiveness::new(cwd, &discovery, None);
+    let mut liveness = LedgerLiveness::new(cwd, discovery, None);
     for purl in overlap {
         let hosted_live = match redirect_uuid_by_purl.get(&PurlKey::new(&purl)) {
             Some(uuid) => liveness.redirect_record(&purl, uuid).await,
@@ -1228,7 +1264,10 @@ async fn gradle_scan(
         .unwrap_or_default();
     let want_locks = !out.gradle_purls.is_empty();
     let Ok((gate, locked, mismatch, env)) = tokio::task::spawn_blocking(move || {
-        let gradle_build = gradle_cache::has_gradle_marker(&cwd);
+        let gradle_build = socket_patch_core::vendor::jvm::layout::has_build(
+            &cwd,
+            socket_patch_core::vendor::jvm::layout::BuildTool::Gradle,
+        );
         let env = JvmEnv::from_process();
         let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
         // The cwd's build locks annotate Gradle-cached packages in a global
@@ -1320,7 +1359,7 @@ async fn gradle_scan(
 
 /// The scanned purls whose HOSTED redirect wiring is still live: a hosted
 /// pin names the purl (`redirect_state`, the lockfiles' hosted state — see
-/// [`crate::commands::hosted_state_from_lockfiles`]) AND lockfile discovery
+/// [`crate::commands::hosted_state_from_pins`]) AND lockfile discovery
 /// proves the current lockfile still routes it to that hosted patch — core
 /// `Discovery::redirect_record_live`, the same liveness rule `vex` gates
 /// hosted attestations on.
@@ -1474,10 +1513,10 @@ fn push_scan_json_warning(result: &mut serde_json::Value, code: &str, detail: &s
 /// Print the scan error envelope for a refusal before any scanning
 /// (`--offline`): the all-batches-failed shape with every count at
 /// zero, so JSON consumers see one consistent scan-error schema.
-fn print_zero_error_envelope(err: &str, paths: &[String]) {
+fn print_zero_error_envelope(code: &str, err: &str, paths: &[String]) {
     let result = serde_json::json!({
         "status": "error",
-        "error": err,
+        "error": { "code": code, "message": err },
         "scannedPackages": 0,
         "lockfileOnlyPackages": 0,
         "packagesWithPatches": 0,
@@ -1508,15 +1547,23 @@ pub async fn run(args: ScanArgs) -> i32 {
 /// PATH is a directory, or a glob matching directories, relative to
 /// `--cwd`. Sorted and deduplicated; the flag says whether the user named
 /// the directory literally (explicit roots skip the built-in default path
-/// ignores; glob matches are discovered roots).
-fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<(PathBuf, bool)>, String> {
+/// ignores; glob matches are discovered roots). `Err` is a usage error:
+/// `(code, message)`.
+fn project_dirs(
+    cwd: &Path,
+    paths: &[String],
+) -> Result<Vec<(PathBuf, bool)>, (&'static str, String)> {
     let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
     for raw in paths {
         let joined = cwd.join(raw);
         if raw.contains(['*', '?', '[']) {
             let pattern = joined.to_string_lossy().into_owned();
-            let matches =
-                glob::glob(&pattern).map_err(|e| format!("invalid path pattern `{raw}`: {e}"))?;
+            let matches = glob::glob(&pattern).map_err(|e| {
+                (
+                    "path_glob_invalid",
+                    format!("invalid path pattern `{raw}`: {e}"),
+                )
+            })?;
             let before = dirs.len();
             dirs.extend(
                 matches
@@ -1525,12 +1572,15 @@ fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<(PathBuf, bool)>, St
                     .map(|p| (p, false)),
             );
             if dirs.len() == before {
-                return Err(format!("`{raw}` matches no directory"));
+                return Err((
+                    "path_glob_no_match",
+                    format!("`{raw}` matches no directory"),
+                ));
             }
         } else if joined.is_dir() {
             dirs.push((joined, true));
         } else {
-            return Err(format!("`{raw}` is not a directory"));
+            return Err(("path_not_directory", format!("`{raw}` is not a directory")));
         }
     }
     // A directory both named and matched counts as named.
@@ -1543,49 +1593,65 @@ fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<(PathBuf, bool)>, St
 /// name, as if each were `--cwd`. The exit code is the worst of the runs.
 /// `--json` takes one directory, so stdout stays one document. Every
 /// directory must be inside the repository root the policy was read from.
+///
+/// `mode_inferred`: the mode came from `--cwd`'s state rather than
+/// `--mode`, so each directory takes its mode from its own state.
 async fn run_project_dirs(
     args: ScanArgs,
     telemetry: &mut PendingTelemetry,
     invocation: &InvocationPolicy,
+    mode_inferred: bool,
 ) -> i32 {
+    let usage = |code: &str, message: &str| {
+        usage_error(
+            JsonCommand::Scan,
+            args.common.json,
+            args.common.dry_run,
+            code,
+            message,
+        )
+    };
     let dirs = match project_dirs(&args.common.cwd, &args.paths) {
         Ok(dirs) => dirs,
-        Err(message) => {
-            eprintln!("Error: {message}");
-            return 2;
-        }
+        Err((code, message)) => return usage(code, &message),
     };
     if !args.common.is_global() {
         for (dir, _) in &dirs {
             let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
             if !resolved.starts_with(&invocation.repo_root) {
-                eprintln!(
-                    "Error: `{}` is outside {} (the repository root socket.yml is read \
-                     from; without a trusted .git it is --cwd): run one scan per repository, \
-                     or pass --cwd at a common parent",
-                    dir.display(),
-                    invocation.repo_root.display()
+                return usage(
+                    "path_outside_repo",
+                    &format!(
+                        "`{}` is outside {} (the repository root socket.yml is read \
+                         from; without a trusted .git it is --cwd): run one scan per \
+                         repository, or pass --cwd at a common parent",
+                        dir.display(),
+                        invocation.repo_root.display()
+                    ),
                 );
-                return 2;
             }
         }
     }
     if args.common.json && dirs.len() > 1 {
-        eprintln!(
-            "Error: --json takes one project directory ({} given); run one scan per directory",
-            dirs.len()
+        return usage(
+            "invalid_args",
+            &format!(
+                "--json takes one project directory ({} given); run one scan per directory",
+                dirs.len()
+            ),
         );
-        return 2;
     }
     // `--vex <path>` names one document: each directory's run would write
     // (or, on a failed generation, remove) the same file, so the last run
     // would silently clobber the others' attestations.
     if args.vex.vex.is_some() && dirs.len() > 1 {
-        eprintln!(
-            "Error: --vex takes one project directory ({} given); run one scan per directory",
-            dirs.len()
+        return usage(
+            "invalid_args",
+            &format!(
+                "--vex takes one project directory ({} given); run one scan per directory",
+                dirs.len()
+            ),
         );
-        return 2;
     }
     // One budget per invocation (§5.2): the directories spend it in sorted
     // order, and a package admitted in one is admitted free in the next.
@@ -1594,10 +1660,7 @@ async fn run_project_dirs(
         .resolve_from_env(invocation.policy.max_new_patches())
     {
         Ok(max) => max,
-        Err(message) => {
-            eprintln!("Error: {message}");
-            return 2;
-        }
+        Err(message) => return usage("invalid_env", &message),
     };
     let root = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
     let carry = rollout_args::RolloutCarry::new(configured, root);
@@ -1611,9 +1674,24 @@ async fn run_project_dirs(
         child.paths.clear();
         child.common.cwd = dir.clone();
         child.rollout.carry = Some(carry.clone());
+        if mode_inferred {
+            child.mode = None;
+        }
         code = code.max(Box::pin(run_scan(child, telemetry, Some(invocation), *explicit)).await);
     }
     code
+}
+
+/// Report a usage error `scan` enforces itself (exit 2): the coded error
+/// on stdout under `--json`, `Error: ...` on stderr otherwise.
+fn scan_usage_error(args: &ScanArgs, code: &str, message: &str) -> i32 {
+    usage_error(
+        JsonCommand::Scan,
+        args.common.json,
+        args.common.dry_run,
+        code,
+        message,
+    )
 }
 
 /// Print a policy file that cannot be honored (fail closed, exit 1).
@@ -1636,13 +1714,43 @@ async fn run_scan(
 ) -> i32 {
     apply_env_toggles(&args.common);
 
-    // Fold the legacy mode booleans into `args.mode` (see
-    // `resolve_mode_flags`). Cross-mode combinations are usage errors
-    // (exit 2), which print no JSON envelope even under --json, like
-    // clap's own.
+    // Whether the user chose the mode (`--mode`, or `--sync` = agent).
+    // Without it, the mode comes from the project's own state below.
+    let mode_explicit = args.mode.is_some() || args.sync;
+    // Resolve `--mode`/`--sync` into `args.mode` (see
+    // `resolve_mode_flags`). `--sync` with another mode is a usage error
+    // (exit 2); under --json it prints the coded error on stdout.
     if let Err(message) = resolve_mode_flags(&mut args) {
-        eprintln!("Error: {message}");
-        return 2;
+        // The global-install refusal is the one with its own code: it is
+        // exactly `global_mode_conflict`'s message for the folded mode.
+        let global = args
+            .mode
+            .and_then(|mode| crate::commands::global_mode_conflict(&args.common, mode))
+            .is_some_and(|conflict| conflict == message);
+        let code = if global {
+            "global_scope_unsupported"
+        } else {
+            "invalid_args"
+        };
+        return scan_usage_error(&args, code, &message);
+    }
+    // A bare scan keeps the mode the project already has (#1088): only an
+    // explicit `--mode` converts a vendored or agent-mode project. The
+    // hosted default above is the only one this replaces (a `--prune` or
+    // global scan with no mode stays report-only).
+    let mode_inferred = !mode_explicit && args.mode == Some(ScanMode::Hosted);
+    if mode_inferred {
+        match crate::commands::mode_from_project_state(&args.common).await {
+            Ok(mode) => {
+                if !args.common.json && !args.common.silent {
+                    if let Some(note) = crate::commands::kept_mode_note(mode) {
+                        eprintln!("{note}");
+                    }
+                }
+                args.mode = Some(mode);
+            }
+            Err(message) => return scan_usage_error(&args, "mode_ambiguous", &message),
+        }
     }
 
     // The repo's socket.yml policy, read once per invocation before any
@@ -1656,8 +1764,7 @@ async fn run_scan(
                 &loaded
             }
             Err(PolicyLoadError::Usage(message)) => {
-                eprintln!("Error: {message}");
-                return 2;
+                return scan_usage_error(&args, "invalid_env", &message);
             }
             Err(PolicyLoadError::Policy(err)) => return report_policy_error(&err, &args),
         },
@@ -1668,7 +1775,7 @@ async fn run_scan(
     if matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
         && !args.paths.is_empty()
     {
-        return Box::pin(run_project_dirs(args, telemetry, invocation)).await;
+        return Box::pin(run_project_dirs(args, telemetry, invocation, mode_inferred)).await;
     }
 
     let mut policy = Box::new(ScanPolicy::for_root(
@@ -1677,15 +1784,21 @@ async fn run_scan(
         explicit,
         args.common.is_global(),
     ));
+    // Agent and report-only scans patch the crawled copies in place, so a
+    // copy under a nested project's `node_modules` is judged by that
+    // project's root (#554). Hosted and vendored scans only rewire this
+    // root's lockfiles.
+    if !args.common.is_global()
+        && !matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
+    {
+        policy.judge_nested_roots(invocation, &args.common.cwd);
+    }
 
     // Positional PATH globs (see `ScanArgs::paths`). An unparseable glob
     // is a usage error, same exit-2 shape as the mode conflicts.
     let path_scope = match crate::path_scope::PathScope::parse(&args.paths) {
         Ok(s) => s,
-        Err(message) => {
-            eprintln!("Error: {message}");
-            return 2;
-        }
+        Err(message) => return scan_usage_error(&args, "path_glob_invalid", &message),
     };
 
     // The per-run cap on NEW patches (`--max-new-patches` > env > the
@@ -1698,10 +1811,7 @@ async fn run_scan(
             .resolve_from_env(invocation.policy.max_new_patches())
         {
             Ok(max) => max,
-            Err(message) => {
-                eprintln!("Error: {message}");
-                return 2;
-            }
+            Err(message) => return scan_usage_error(&args, "invalid_env", &message),
         },
     };
     let mut stage =
@@ -1716,7 +1826,7 @@ async fn run_scan(
         if args.common.json {
             // Mirror the all-batches-failed error envelope shape so JSON
             // consumers see one consistent scan-error schema.
-            print_zero_error_envelope(err, path_scope.raw());
+            print_zero_error_envelope("offline_unsupported", err, path_scope.raw());
         } else {
             eprintln!("Error: {err}");
         }
@@ -1753,8 +1863,7 @@ async fn run_scan(
     // proxy keeps these chunk boundaries: every chunk is within the proxy's
     // body cap by construction (`BATCH_BODY_BYTE_CAP`).
     let batch_size = effective_batch_size(args.batch_size, use_public_proxy);
-    let telemetry_token = api_client.api_token().cloned();
-    let telemetry_org = api_client.org_slug().cloned();
+    let telemetry_auth = TelemetryAuth::for_client(&api_client);
     // Whether scan downgraded to the public proxy mid-run after a 401/403
     // (reported in the `patch_scanned` telemetry event).
     let mut fallback_to_proxy = false;
@@ -1780,7 +1889,11 @@ async fn run_scan(
     // Crawl packages. Vendored mode keeps the npm half for its engine to
     // reuse; hosted mode keeps it only for an embedded `--vex` (skipped
     // under `--dry-run`). No other run pays for copying the snapshot.
-    let keep_npm = vendor || (hosted && args.vex.vex.is_some() && !args.common.dry_run);
+    // A path-scoped (agent or mode-less) run keeps it to resolve every
+    // installed copy for the scope filter below.
+    let keep_npm = vendor
+        || (hosted && args.vex.vex.is_some() && !args.common.dry_run)
+        || !path_scope.is_empty();
     let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if keep_npm {
         crawl_ecosystems_with_npm(&crawler_options, crawl_scope).await
     } else {
@@ -1792,16 +1905,40 @@ async fn run_scan(
     // that have NO installed copy (fresh clone, partial install). They join
     // discovery and are flagged "not yet installed". Scoped to the crawled
     // ecosystems.
-    let lockfile_only = lockfile_supplement(&ctx, &all_crawled, crawl_scope).await;
+    let mut lockfile_only = lockfile_supplement(&ctx, &all_crawled, crawl_scope).await;
+    // Counted once: #604 adds the API's spellings of lockfile-only PyPI pins
+    // to `lockfile_only.purls` after the batch query.
+    let lockfile_only_count = lockfile_only.purls.len();
     // Unsupported layouts and malformed binary Bun locks, kept on empty
     // scans too: an unreadable graph is not evidence of no dependencies.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
+    // A token whose org could not be resolved put the whole run on the
+    // public proxy (the client already warned on stderr): `--json`
+    // consumers get it on the same run-level `warnings[]` channel.
+    if args.common.json {
+        if let Some(reason) = api_client.org_unresolved() {
+            layout_refusals.push((
+                crate::commands::vex_sources::NOTE_API_AUTH_FALLBACK.to_string(),
+                reason.to_string(),
+            ));
+        }
+    }
     // A committed `.bundle/config` whose BUNDLE_PATH resolves outside the
     // project, refused by the crawler's containment guard: surface it on
     // the same run-level channel as the layout refusals.
     if let Some(value) = skipped_bundle_config_path {
         if args.common.ecosystem_selected(Ecosystem::Gem) {
             let (code, detail) = config_path_ignored_warning(&value);
+            layout_refusals.push((code.to_string(), detail));
+        }
+    }
+    // A Bundler plugin registration v4's `setup` left in this checkout,
+    // pointing at a plugin dir the v5 migration deleted (#1295).
+    if args.common.ecosystem_selected(Ecosystem::Gem)
+        && !args.common.global
+        && args.common.global_prefix.is_none()
+    {
+        if let Some((code, detail)) = stale_plugin_registration_warning(&args.common.cwd).await {
             layout_refusals.push((code.to_string(), detail));
         }
     }
@@ -1824,8 +1961,7 @@ async fn run_scan(
     // supplement falls back to the committed artifacts (fail-closed for the
     // prune), the key set degrades to empty (fail-open).
     let vendor_state = &ctx.loaded().await.vendor;
-    let ledger_supplement =
-        vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
+    let ledger_supplement = vendored_ledger_supplement(&ctx, &all_crawled, vendor_state).await;
     for pkg in &ledger_supplement.packages {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
@@ -1886,13 +2022,52 @@ async fn run_scan(
         } else {
             socket_patch_core::patch::redirect::upstream::HostedPin::all(ctx.discovery().await)
         };
+    // Lockless cargo/nuget pins are never refs, so `HostedPin::all` drops
+    // them; the rollout's recorded view still counts them (otherwise a
+    // re-scan reads the pin it wrote as NEW and spends a cap slot).
+    let hosted_unlocked_pins = if args.common.is_global() {
+        Vec::new()
+    } else {
+        ctx.discovery().await.unlocked_pins.clone()
+    };
+    // The same discovery, handed to the hosted redirect's attribution gate
+    // (nothing below writes before it; see `rollout::Gate::prior`).
+    let prior_discovery = if args.common.is_global() {
+        None
+    } else {
+        let (discovery, read_set) = ctx.recorded_discovery().await;
+        Some(rollout::Prior {
+            discovery,
+            read_set: read_set.as_ref(),
+        })
+    };
     let hosted_state = (!args.common.is_global())
         .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
     let redirect_state = hosted_state.as_ref();
-    let hosted_pins: Vec<(String, String)> = hosted_pin_list
-        .iter()
-        .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
-        .collect();
+    // The recorded view also counts the pins discovery withheld over an
+    // unpatched copy beside them (`HostedPin::recorded`): still this
+    // project's patch, so a capped re-scan reads ALREADY and rewires the
+    // copy instead of deferring it as NEW (#1195).
+    let mut hosted_pins: Vec<(String, String)> = if args.common.is_global() {
+        Vec::new()
+    } else {
+        socket_patch_core::patch::redirect::upstream::HostedPin::recorded(ctx.discovery().await)
+            .into_iter()
+            .map(|pin| (pin.purl, pin.uuid))
+            .collect()
+    };
+    // A gem pinned only in the Gemfile (a CHECKSUMS-less lock the hosted
+    // rewriter leaves for the next unfrozen `bundle install`) has no lock
+    // ref yet; it is recorded all the same, or a capped re-scan reads the
+    // pin it wrote as NEW forever (#1224).
+    if !args.common.is_global() {
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&args.common.cwd);
+        for pin in socket_patch_core::vex::discover::gem_manifest_source_pins(&view).await {
+            if !hosted_pins.contains(&pin) {
+                hosted_pins.push(pin);
+            }
+        }
+    }
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest,
         vendor_state.as_ref().ok().filter(|_| project_state),
@@ -1926,7 +2101,10 @@ async fn run_scan(
 
     // PATH scoping, strictly AFTER the `scanned_purls` capture. A purl is
     // in scope when ANY genuinely-crawled copy of it sits under a matching
-    // path.
+    // path. The crawl keeps one record per purl (for npm, the first copy
+    // the walk meets: a pnpm workspace's root `.pnpm` store entry, not the
+    // member's link to it), so a purl whose record misses is resolved to
+    // every installed copy the way `rollback`'s path targets are.
     let filtered_crawled: Vec<_> = if path_scope.is_empty() {
         filtered_crawled
     } else {
@@ -1953,12 +2131,35 @@ async fn run_scan(
             ));
         }
         let scope = path_scope.bind(&args.common.cwd);
-        let in_scope: HashSet<String> = filtered_crawled
+        let mut in_scope: HashSet<String> = filtered_crawled
             .iter()
             .filter(|pkg| !supplement_purls.contains(&pkg.purl))
             .filter(|pkg| scope.matches(&pkg.path))
             .map(|pkg| pkg.purl.clone())
             .collect();
+        let mut unresolved: Vec<String> = filtered_crawled
+            .iter()
+            .filter(|pkg| !supplement_purls.contains(&pkg.purl) && !in_scope.contains(&pkg.purl))
+            .map(|pkg| pkg.purl.clone())
+            .collect();
+        unresolved.sort();
+        unresolved.dedup();
+        if !unresolved.is_empty() {
+            let partitioned = partition_purls(&unresolved, args.common.ecosystems.as_deref());
+            let copies = find_all_packages_for_rollback_reusing(
+                &partitioned,
+                &crawler_options,
+                true,
+                npm_crawl.as_ref(),
+            )
+            .await;
+            in_scope.extend(
+                copies
+                    .into_iter()
+                    .filter(|(_, paths)| paths.iter().any(|p| scope.matches(p)))
+                    .map(|(purl, _)| purl),
+            );
+        }
         filtered_crawled
             .into_iter()
             .filter(|pkg| in_scope.contains(&pkg.purl))
@@ -1967,10 +2168,16 @@ async fn run_scan(
 
     // The socket.yml root/ecosystem/package filters, after the flags
     // (which only narrow further) and after the prune-universe capture.
-    let filtered_crawled: Vec<_> = filtered_crawled
-        .into_iter()
-        .filter(|pkg| policy.admit_crawled(&pkg.purl))
-        .collect();
+    if policy.judges_nested_roots() && args.common.ecosystem_selected(Ecosystem::Npm) {
+        let nm_roots = socket_patch_core::crawlers::NpmCrawler::new()
+            .get_node_modules_paths(&crawler_options)
+            .await
+            .unwrap_or_default();
+        policy
+            .locate_nested_copies(&nm_roots, &filtered_crawled)
+            .await;
+    }
+    let filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
 
     // Gradle discovery notes (m2 gating, the user home) ride the run-level
     // warnings; the lock set only annotates `packages[]` below.
@@ -2023,8 +2230,7 @@ async fn run_scan(
                 .unwrap_or_default()
                 .as_slice(),
             false,
-            telemetry_token.as_deref(),
-            telemetry_org.as_deref(),
+            &telemetry_auth,
         );
         // The result prints right away: nothing to overlap the send with.
         telemetry.flush().await;
@@ -2088,6 +2294,7 @@ async fn run_scan(
             let code = embed_vex_into_json(
                 &args.common,
                 &args.vex,
+                &api_client,
                 &manifest_path,
                 0,
                 &mut result,
@@ -2110,7 +2317,15 @@ async fn run_scan(
             }
             policy.print_human(args.common.silent, args.common.verbose);
         }
-        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0, hosted).await;
+        return embed_vex_human(
+            &args.common,
+            &args.vex,
+            &api_client,
+            &manifest_path,
+            0,
+            hosted,
+        )
+        .await;
     }
 
     // Build ecosystem summary
@@ -2140,8 +2355,8 @@ async fn run_scan(
         plural(package_count, "package", "packages")
     ));
     if human {
-        if !lockfile_only.purls.is_empty() {
-            eprintln!("{}", render::lockfile_only_note(lockfile_only.purls.len()));
+        if lockfile_only_count > 0 {
+            eprintln!("{}", render::lockfile_only_note(lockfile_only_count));
         }
         print_layout_refusals(&layout_refusals, args.common.silent);
         policy.print_warnings(args.common.silent);
@@ -2150,7 +2365,12 @@ async fn run_scan(
     // Query API in batches
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
     let mut can_access_paid_patches = false;
-    let chunks: Vec<&[String]> = batch_chunks(&all_purls, batch_size, BATCH_BODY_BYTE_CAP);
+    // #604: a lockfile-only PyPI pin is spelled as the user wrote it
+    // (`six==1.16` → `@1.16`) while the API keys the release as the
+    // registry published it (`@1.16.0`); pip treats both as one release
+    // (PEP 440). Ask for its equivalent spellings too.
+    let query_purls = with_pypi_equivalents(&all_purls, &lockfile_only.purls);
+    let chunks: Vec<&[String]> = batch_chunks(&query_purls, batch_size, BATCH_BODY_BYTE_CAP);
     let total_batches = chunks.len();
     let mut batch_error_count = 0usize;
     let mut last_batch_error: Option<String> = None;
@@ -2261,27 +2481,28 @@ async fn run_scan(
     // drives the table, the `--json` `packages` array and the apply order,
     // which operators diff across runs.
     all_packages_with_patches.sort_by(|a, b| a.purl.cmp(&b.purl));
+    // #604: a patch the API returned under an equivalent spelling of a
+    // lockfile-only PyPI pin is that lockfile-only package.
+    adopt_pypi_equivalents(
+        &all_packages_with_patches,
+        &all_purls,
+        &mut lockfile_only.purls,
+    );
 
     // If every batch errored, surface a full scan failure rather than
     // silently reporting zero patches.
     if total_batches > 0 && batch_error_count == total_batches {
         status.finish();
         let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
-        spawn_patch_scan_failed(
-            telemetry,
-            &err,
-            fallback_to_proxy,
-            telemetry_token.as_deref(),
-            telemetry_org.as_deref(),
-        );
+        spawn_patch_scan_failed(telemetry, &err, fallback_to_proxy, &telemetry_auth);
         // The failure prints right away: nothing to overlap the send with.
         telemetry.flush().await;
         if args.common.json {
             let result = serde_json::json!({
                 "status": "error",
-                "error": err,
+                "error": { "code": API_BATCH_FAILED, "message": err },
                 "scannedPackages": package_count,
-                "lockfileOnlyPackages": lockfile_only.purls.len(),
+                "lockfileOnlyPackages": lockfile_only_count,
                 "packagesWithPatches": 0,
                 "totalPatches": 0,
                 "freePatches": 0,
@@ -2342,15 +2563,15 @@ async fn run_scan(
             .unwrap_or_default()
             .as_slice(),
         fallback_to_proxy,
-        telemetry_token.as_deref(),
-        telemetry_org.as_deref(),
+        &telemetry_auth,
     );
 
     let mut updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
     policy.set_update_purls(updates.iter().map(|u| u.purl.as_str()));
     let recorded = rollout::RecordedState {
         manifest: update_manifest.as_deref(),
-        index: rollout::RecordedIndex::new(update_manifest.as_deref(), &hosted_pins),
+        index: rollout::RecordedIndex::new(update_manifest.as_deref(), &hosted_pins)
+            .with_unlocked_pins(hosted_unlocked_pins),
     };
 
     // The hosted-wiring probes below take `all_purls` (POST-filter: only
@@ -2361,7 +2582,7 @@ async fn run_scan(
         let mut result = serde_json::json!({
             "status": "success",
             "scannedPackages": package_count,
-            "lockfileOnlyPackages": lockfile_only.purls.len(),
+            "lockfileOnlyPackages": lockfile_only_count,
             "packagesWithPatches": all_packages_with_patches.len(),
             "totalPatches": total_patches,
             "freePatches": free_patches,
@@ -2423,6 +2644,8 @@ async fn run_scan(
                 &recorded,
                 batch_error_count > 0,
                 &mut stage,
+                prior_discovery,
+                prune,
             )
             .await;
         }
@@ -2517,21 +2740,27 @@ async fn run_scan(
                 let mut patches: Vec<serde_json::Value> = selected
                     .iter()
                     .map(|p| {
-                        match super::get::decide_patch_action(
+                        match crate::commands::agent_download::decide_patch_action(
                             manifest_for_preview,
                             &p.purl,
                             &p.uuid,
                         ) {
-                            super::get::PatchAction::Added => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid, "action": "added",
-                            }),
-                            super::get::PatchAction::Updated { old_uuid } => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid,
-                                "action": "updated", "oldUuid": old_uuid,
-                            }),
-                            super::get::PatchAction::Skipped => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid, "action": "skipped",
-                            }),
+                            crate::commands::agent_download::PatchAction::Added => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid, "action": "added",
+                                })
+                            }
+                            crate::commands::agent_download::PatchAction::Updated { old_uuid } => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid,
+                                    "action": "updated", "oldUuid": old_uuid,
+                                })
+                            }
+                            crate::commands::agent_download::PatchAction::Skipped => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid, "action": "skipped",
+                                })
+                            }
                         }
                     })
                     .collect();
@@ -2595,7 +2824,7 @@ async fn run_scan(
                 }
                 push_scan_json_warning(&mut result, HOSTED_WIRING_RETAINED, &detail);
             }
-        // --- Vendor path (if requested; conflicts with --apply/--sync) ---
+        // --- Vendor path (if requested; --sync selects agent instead) ---
         } else if vendor {
             // Must STAY a boxed fn: this branch's temporaries would otherwise
             // live in the enclosing poll frame in debug builds, which has to
@@ -2616,8 +2845,7 @@ async fn run_scan(
                 &scanned_purls,
                 &vendored_purls,
                 prune,
-                telemetry_token.as_deref(),
-                telemetry_org.as_deref(),
+                &telemetry_auth,
                 telemetry,
                 npm_crawl.as_ref(),
             )
@@ -2625,7 +2853,7 @@ async fn run_scan(
         }
 
         // The GC and the VEX build below can write to stderr; the report-
-        // only arm has not flushed the scan event yet (the `--apply` arm
+        // only arm has not flushed the scan event yet (the agent arm
         // did, in `discover_selected`).
         telemetry.flush().await;
 
@@ -2646,6 +2874,7 @@ async fn run_scan(
         let final_code = embed_vex_into_json(
             &args.common,
             &args.vex,
+            &api_client,
             &manifest_path,
             apply_code,
             &mut result,
@@ -2664,14 +2893,18 @@ async fn run_scan(
     let silent = args.common.silent;
 
     // Every human-path exit that did not fail: the `--prune` GC first
-    // (not vendored, which runs its own, nor hosted, which runs none), then
-    // the embedded VEX. An early "nothing to apply" exit still runs the GC.
+    // (not hosted, which runs none), then the embedded VEX. An early
+    // "nothing to apply" exit still runs the GC, vendored mode included:
+    // its wet vendor step runs its own GC and never reaches this closure,
+    // but the early exits (nothing patched, paid-only, nothing selected,
+    // `--dry-run`) must reconcile the ledger like the JSON arm (#1127).
     let (args_ref, manifest_ref, socket_ref) = (&args, &manifest_path, &socket_dir);
+    let client_ref: &ApiClient = &api_client;
     let (scanned_ref, vendored_ref) = (&scanned_purls, &vendored_purls);
     let policy_ref: &ScanPolicy = &policy;
     let finish_human = move |code: i32| async move {
         policy_ref.print_human(silent, verbose);
-        if prune && !vendor && !hosted && code == 0 {
+        if prune && !hosted && code == 0 {
             gc::run_human_gc(
                 &args_ref.common,
                 manifest_ref,
@@ -2681,7 +2914,15 @@ async fn run_scan(
             )
             .await;
         }
-        embed_vex_human(&args_ref.common, &args_ref.vex, manifest_ref, code, hosted).await
+        embed_vex_human(
+            &args_ref.common,
+            &args_ref.vex,
+            client_ref,
+            manifest_ref,
+            code,
+            hosted,
+        )
+        .await
     };
 
     // Every mode stops on an empty discovery, vendored included (restoring
@@ -2707,10 +2948,11 @@ async fn run_scan(
 
     // The by-package records every arm selects from, fetched before the
     // table so its `[UPDATE]` markers are the same UPGRADE rows the
-    // selection acts on (§5.1). Discovery said these packages HAVE
-    // patches, so an empty merged set is a fetch failure.
-    // A failed discovery still prints the table first; its exit code is
-    // returned below it.
+    // selection acts on (§5.1). Only `discover_selected`'s own `Err`
+    // (every query failed) is a fetch failure: queries that succeed with
+    // no records leave nothing to select, in every arm and in `--json`
+    // alike (#1062). A failed discovery still prints the table first; its
+    // exit code is returned below it.
     let mut discovery_failure: Option<i32> = None;
     let rows: Vec<rollout::Row> = if downloadable_count == 0 {
         Vec::new()
@@ -2728,13 +2970,6 @@ async fn run_scan(
         )
         .await
         {
-            // The agent / vendored / report-only arms need records to show:
-            // an empty merged set is a fetch failure there.
-            Ok(discovered) if !hosted && discovered.fetched == 0 => {
-                eprintln!("{}", render::fetch_details_failed(&discovered.failed));
-                discovery_failure = Some(1);
-                Vec::new()
-            }
             Ok(discovered) => {
                 let rows = classified_rows(
                     &mut stage,
@@ -2904,7 +3139,7 @@ async fn run_scan(
             &pairs,
             None,
             npm_crawl.as_ref(),
-            Some(rollout::Gate::new(&mut stage, rows)),
+            Some(rollout::Gate::new(&mut stage, rows).with_prior(prior_discovery)),
         )
         .await;
     }
@@ -3068,7 +3303,15 @@ async fn run_scan(
                     selected.iter().map(|p| p.purl.as_str()),
                 )
                 .await;
-                Some(preview_vendor_json(&args.common.cwd, &selected, &takeover).await)
+                Some(
+                    preview_vendor_json(
+                        &args.common.cwd,
+                        &selected,
+                        &crate::commands::hosted_unwind::patch_server_origins(&args.common),
+                        &takeover,
+                    )
+                    .await,
+                )
             } else {
                 None
             };
@@ -3104,7 +3347,15 @@ async fn run_scan(
             )
             .await;
         }
-        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0, hosted).await;
+        return embed_vex_human(
+            &args.common,
+            &args.vex,
+            &api_client,
+            &manifest_path,
+            0,
+            hosted,
+        )
+        .await;
     }
 
     // Vendor mode: pre-verify baselines so a content mismatch is reported
@@ -3157,8 +3408,7 @@ async fn run_scan(
             &scanned_purls,
             &vendored_purls,
             prune,
-            telemetry_token.as_deref(),
-            telemetry_org.as_deref(),
+            &telemetry_auth,
             npm_crawl.as_ref(),
         )
         .await
@@ -3207,7 +3457,15 @@ async fn run_scan(
         .await;
     }
 
-    embed_vex_human(&args.common, &args.vex, &manifest_path, code, hosted).await
+    embed_vex_human(
+        &args.common,
+        &args.vex,
+        &api_client,
+        &manifest_path,
+        code,
+        hosted,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -3248,15 +3506,15 @@ mod tests {
                 ("libs/core".to_string(), true)
             ]
         );
-        assert!(project_dirs(tmp.path(), &["apps/README".into()])
-            .unwrap_err()
-            .contains("is not a directory"));
-        assert!(project_dirs(tmp.path(), &["nope/*".into()])
-            .unwrap_err()
-            .contains("matches no directory"));
-        assert!(project_dirs(tmp.path(), &["x[".into()])
-            .unwrap_err()
-            .contains("invalid path pattern"));
+        let err = project_dirs(tmp.path(), &["apps/README".into()]).unwrap_err();
+        assert_eq!(err.0, "path_not_directory");
+        assert!(err.1.contains("is not a directory"));
+        let err = project_dirs(tmp.path(), &["nope/*".into()]).unwrap_err();
+        assert_eq!(err.0, "path_glob_no_match");
+        assert!(err.1.contains("matches no directory"));
+        let err = project_dirs(tmp.path(), &["x[".into()]).unwrap_err();
+        assert_eq!(err.0, "path_glob_invalid");
+        assert!(err.1.contains("invalid path pattern"));
     }
 
     #[test]
@@ -4401,6 +4659,43 @@ mod tests {
             vec!["pkg:npm/minimist@1.2.2".to_string()]
         );
         assert!(takeover.vendored.is_empty(), "{takeover:?}");
+    }
+
+    /// The takeover classifier runs after every hosted rewrite, so it must
+    /// not re-walk the lockfiles when no vendored ledger entry could
+    /// overlap (the hosted common case), and walks them once otherwise
+    /// (#993: it used to discover twice — once for the hosted pins, once
+    /// for liveness — and even with no vendored ledger at all).
+    #[tokio::test]
+    async fn takeover_classifier_discovers_at_most_once() {
+        let discoveries = || crate::commands::DISCOVERIES.with(|n| n.get());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_lock_pointing_at_hosted(root, "minimist", "1.2.2").await;
+
+        // No vendored ledger, then an empty one: nothing to overlap.
+        for write_empty in [false, true] {
+            if write_empty {
+                socket_patch_core::vendor::save_state(root, &VendorState::new())
+                    .await
+                    .unwrap();
+            }
+            let before = discoveries();
+            assert_eq!(
+                classify_overlap_takeover(&common_at(root), root).await,
+                OverlapTakeover::default()
+            );
+            assert_eq!(discoveries(), before, "no vendored entry, no discovery");
+        }
+
+        write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
+        let before = discoveries();
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
+        assert_eq!(discoveries(), before + 1, "one discovery serves both sides");
+        assert_eq!(
+            takeover.redirect,
+            vec!["pkg:npm/minimist@1.2.2".to_string()]
+        );
     }
 
     #[tokio::test]

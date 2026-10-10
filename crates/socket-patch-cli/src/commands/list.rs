@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use clap::Args;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
@@ -229,27 +227,6 @@ fn emit_error(args: &ListArgs, code: &str, message: String, warnings: Vec<RunWar
     }
 }
 
-/// The message for a manifest that exists but could not be read, naming
-/// the file (the bare io/serde text — "Permission denied (os error 13)",
-/// "EOF while parsing ..." — doesn't say which file). Shared with `repair`.
-pub(crate) fn manifest_error_message(path: &Path, e: &std::io::Error) -> String {
-    if e.kind() == std::io::ErrorKind::InvalidData {
-        let detail = e.to_string();
-        let detail = detail
-            .strip_prefix("Failed to parse manifest JSON: ")
-            .map(|d| format!("not valid JSON: {d}"))
-            .or_else(|| {
-                detail
-                    .strip_prefix("Invalid manifest: ")
-                    .map(str::to_string)
-            })
-            .unwrap_or(detail);
-        format!("Invalid manifest at {}: {detail}", path.display())
-    } else {
-        format!("Could not read manifest at {}: {e}", path.display())
-    }
-}
-
 /// Manifest/ledger text is free-form (API-sourced descriptions): drop
 /// control characters that would rewrite the terminal (ESC, a stray
 /// `\r`), keeping newlines and tabs, and normalize `\r\n`.
@@ -381,7 +358,7 @@ pub async fn run(args: ListArgs) -> i32 {
             emit_error(
                 &args,
                 code,
-                manifest_error_message(&manifest_path, e),
+                crate::ui::manifest_error_message(&manifest_path, e),
                 Vec::new(),
             );
             return 1;
@@ -426,10 +403,28 @@ pub async fn run(args: ListArgs) -> i32 {
                 detail: detail.clone(),
             });
         } else if !args.common.silent {
-            eprintln!(
-                "Warning: {}",
-                crate::commands::rollback::capitalize_first(detail)
-            );
+            eprintln!("Warning: {}", crate::ui::sentence_case(detail));
+        }
+    }
+    // A hosted `resolutions` selector no lock installs any more (#1203) is
+    // no patch either: say how to retire it.
+    for pin in &inventory.stale {
+        // Named by file and purl, as the contested refusal names files: a
+        // hosted URL carries its grant token, which output never prints.
+        let detail = format!(
+            "{} keeps a hosted `resolutions` entry for {} that no lockfile installs any \
+             more; `socket-patch remove {}` removes that entry alone",
+            pin.files.join(", "),
+            pin.purl,
+            pin.purl
+        );
+        if args.common.json {
+            warnings.push(RunWarning {
+                code: "hosted_resolution_orphaned".to_string(),
+                detail,
+            });
+        } else if !args.common.silent {
+            eprintln!("Warning: {}", crate::ui::sentence_case(&detail));
         }
     }
     let vendor_state = crate::commands::vendor_state_lenient(&loaded.vendor, args.common.silent);
@@ -454,13 +449,7 @@ pub async fn run(args: ListArgs) -> i32 {
     // to its consumers, so it counts the manifest ONLY (0 on a ledger-only
     // project) rather than the listed entries.
     let manifest_patch_count = manifest.map_or(0, |m| m.patches.len());
-    let (api_token, org_slug) = args.common.telemetry_credentials();
-    track_patch_listed(
-        manifest_patch_count,
-        api_token.as_deref(),
-        org_slug.as_deref(),
-    )
-    .await;
+    track_patch_listed(manifest_patch_count, &args.common.telemetry_auth()).await;
 
     if args.common.json {
         let mut env = build_list_envelope(&entries);
@@ -1102,35 +1091,5 @@ mod tests {
         // Exactly one blank line between entries, none doubled.
         assert_eq!(out.matches("\n\nPackage: ").count(), many.len());
         assert!(!out.contains("\n\n\n"), "{out:?}");
-    }
-
-    #[test]
-    fn manifest_error_message_names_the_file() {
-        let path = Path::new("proj/.socket/manifest.json");
-        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        assert!(manifest_error_message(path, &io)
-            .starts_with("Could not read manifest at proj/.socket/manifest.json: "),);
-        let bad_json = std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Failed to parse manifest JSON: EOF while parsing an object at line 2 column 0",
-        );
-        assert_eq!(
-            manifest_error_message(path, &bad_json),
-            "Invalid manifest at proj/.socket/manifest.json: not valid JSON: EOF while \
-             parsing an object at line 2 column 0"
-        );
-        let schema = std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Invalid manifest: missing field `exportedAt`",
-        );
-        assert_eq!(
-            manifest_error_message(path, &schema),
-            "Invalid manifest at proj/.socket/manifest.json: missing field `exportedAt`"
-        );
-        let other = std::io::Error::new(std::io::ErrorKind::InvalidData, "odd");
-        assert_eq!(
-            manifest_error_message(path, &other),
-            "Invalid manifest at proj/.socket/manifest.json: odd"
-        );
     }
 }

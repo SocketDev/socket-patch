@@ -241,7 +241,7 @@ async fn vlt_pinned_matrix_agent_launcher() {
     let Some(leg) = agent_leg("launcher") else {
         return;
     };
-    if !hermetic_registry(leg.version()) {
+    if !hermetic_registry(leg.version()) || registry_config_ignored(leg.version()) {
         return leg.skip("non-hermetic-registry");
     }
     let (pkgs, host) = launcher_packages();

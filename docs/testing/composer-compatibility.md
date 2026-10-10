@@ -17,7 +17,7 @@ contract.
 | Mode | Lock entry after the rewrite |
 | --- | --- |
 | Vendored (`vendor`, `scan`/`get --mode vendored`) | `dist` → `{"type": "path", "url": ".socket/vendor/composer/<uuid>/<vendor>/<name>@<version>", "reference": "<patch-uuid>"}` in the original slot, `"transport-options": {"symlink": false}` after it, `source` removed. The patched copy is committed under `.socket/vendor/composer/`. |
-| Hosted (`scan --mode hosted`) | `dist.type` → `zip`, `dist.url` → the hosted archive, `dist.shasum` → its sha1 (inserted when the lock had none). The entry's top-level `source` is removed wherever it sits in the entry, and `dist.mirrors` is removed (`redirect_composer_dist_mirrors_removed`). A `source` that is not an object is left and warned about (`redirect_composer_source_kept`). |
+| Hosted (`scan --mode hosted`) | `dist.type` → `zip`, `dist.url` → the hosted archive, `dist.shasum` → its sha1 (inserted when the lock had none). The entry's top-level `source` is removed wherever it sits in the entry, `dist.mirrors` is removed (`redirect_composer_dist_mirrors_removed`), and the entry's `transport-options` are removed (`redirect_composer_transport_options_removed`): Composer copies a repository's `options` (auth headers, client certificates, proxy) into each entry it resolves and applies them to the dist download, so kept on a redirected entry they would go to the hosted host (#399). The ledger's fragment revert restores all three. A `source` that is not an object is left and warned about (`redirect_composer_source_kept`). |
 
 The lock's `version` spelling is never rewritten (`v6.4.1` stays `v6.4.1`).
 Patch coordinates are matched by Composer release identity, so a lock
@@ -43,7 +43,7 @@ vendored (`e2e_vendor_composer_build`) and hosted
 | --- | --- |
 | Ubuntu | 1.10.28 (8.1), 2.0.14 (8.0), 2.1.14 (8.1), 2.2.30 (8.1, 8.3), 2.5.8 (8.2), 2.8.12 (8.4), 2.9.8 (8.4), 2.10.3 (8.5) |
 | Windows | 1.10.28 (8.1), 2.2.30 (8.3), 2.9.8 (8.4), 2.10.3 (8.5) |
-| macOS | 1.10.28 (8.1), 2.2.30 (8.3), 2.10.3 (8.5) |
+| macOS | 1.10.28 (8.1), 2.2.30 (8.3), 2.10.3 (8.4) |
 | Docker (Debian 12, PHP 8.2) | 2.2.30, 2.10.3 (`docker_e2e_vendor_composer`) |
 
 The capstones pin psr/log 3.0.2 (PHP ≥ 8.0) and, for the `v`-tagged cells,
@@ -93,12 +93,15 @@ serves the unpatched archive, so the hosted rewrite removes it.
 | Composer | `composer install` after the lock was rewritten |
 | --- | --- |
 | 2.x | Reinstalls the package (its dist or source reference changed): patched |
-| 1.x | Leaves an installed stable package as it is: **pristine**. Remove `vendor/<vendor>/<name>` first, then run `composer install` |
+| 1.x | Leaves an installed stable package as it is: **pristine**. Remove `<vendor-dir>/<vendor>/<name>` first, then run `composer install` |
 
 A fresh checkout installs the patched bytes on every version. `vendor`,
 `scan --mode vendored` and `get --mode vendored` print both instructions after
 a run that leaves composer packages vendored; `scan --mode hosted` names them in
-its next steps. Nothing else prints a Composer reinstall hint.
+its next steps. Nothing else prints a Composer reinstall hint. The directory
+the hints name is the one Composer installed into: `COMPOSER_VENDOR_DIR`, else
+`config.vendor-dir`, else `vendor` (a project with `"vendor-dir": "lib"` is told
+to remove `lib/<vendor>/<name>`).
 
 ## Vendored copies and Composer's mirror filters
 

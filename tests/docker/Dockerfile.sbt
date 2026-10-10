@@ -41,9 +41,12 @@ ARG SCALA_CLI_VERSION=1.17.1
 ARG SCALA_CLI_SHA256_AMD64=4186bfac6552097fbfd3939bdf2ecdec1cb55baafcbf6259bef5c04e08858eb3
 ARG SCALA_CLI_SHA256_ARM64=a12ed53f4723f3e9312a2383e47664b4beaccf2be366cff40adf6b054426156f
 
+# --retry-all-errors: plain --retry skips most HTTP errors, so one bad
+# response from the GitHub release-asset CDN (curl exit 22) failed the
+# image build and evicted a merge-queue entry (run 37894279963).
 RUN set -eu \
  && cd /tmp \
- && curl -fsSL --retry 3 -o sbt.tgz \
+ && curl -fsSL --retry 3 --retry-all-errors -o sbt.tgz \
       "https://github.com/sbt/sbt/releases/download/v${SBT_LAUNCHER_VERSION}/sbt-${SBT_LAUNCHER_VERSION}.tgz" \
  && echo "${SBT_LAUNCHER_SHA256}  sbt.tgz" | sha256sum -c - \
  && tar -C /opt -xzf sbt.tgz \
@@ -53,15 +56,15 @@ RUN set -eu \
 # One launcher script per Mill line, installed as mill-<version>.
 RUN set -eu \
  && cd /tmp \
- && curl -fsSL --retry 3 -o mill-011 \
+ && curl -fsSL --retry 3 --retry-all-errors -o mill-011 \
       "https://github.com/com-lihaoyi/mill/releases/download/${MILL_011_VERSION}/${MILL_011_VERSION}" \
  && echo "${MILL_011_SHA256}  mill-011" | sha256sum -c - \
  && install -m 0755 mill-011 "/usr/local/bin/mill-${MILL_011_VERSION}" \
- && curl -fsSL --retry 3 -o mill-012 \
+ && curl -fsSL --retry 3 --retry-all-errors -o mill-012 \
       "https://repo1.maven.org/maven2/com/lihaoyi/mill-dist/${MILL_012_VERSION}/mill-dist-${MILL_012_VERSION}-mill.sh" \
  && echo "${MILL_012_SHA256}  mill-012" | sha256sum -c - \
  && install -m 0755 mill-012 "/usr/local/bin/mill-${MILL_012_VERSION}" \
- && curl -fsSL --retry 3 -o mill-1 \
+ && curl -fsSL --retry 3 --retry-all-errors -o mill-1 \
       "https://repo1.maven.org/maven2/com/lihaoyi/mill-dist/${MILL_1_VERSION}/mill-dist-${MILL_1_VERSION}-mill.sh" \
  && echo "${MILL_1_SHA256}  mill-1" | sha256sum -c - \
  && install -m 0755 mill-1 "/usr/local/bin/mill-${MILL_1_VERSION}" \
@@ -74,7 +77,7 @@ RUN set -eu \
       arm64) arch=aarch64; sum="${SCALA_CLI_SHA256_ARM64}";; \
       *) echo "unsupported architecture" >&2; exit 1;; \
     esac \
- && curl -fsSL --retry 3 -o scala-cli.gz \
+ && curl -fsSL --retry 3 --retry-all-errors -o scala-cli.gz \
       "https://github.com/VirtusLab/scala-cli/releases/download/v${SCALA_CLI_VERSION}/scala-cli-${arch}-pc-linux.gz" \
  && echo "${sum}  scala-cli.gz" | sha256sum -c - \
  && gunzip scala-cli.gz \
@@ -95,6 +98,8 @@ RUN set -eu \
 # the image's Central cache from memory, which more lines would bloat past
 # its 2g container.
 ARG SBT_WARM_VERSIONS="0.13.18 1.2.8 1.13.0 2.0.9"
+# CI's blocking slice uses only two sbt lines; nightly/compat keep all tools.
+ARG SBT_WARM_TOOLS=1
 RUN set -eu \
  && for v in ${SBT_WARM_VERSIONS}; do \
       d="/tmp/warm-$v"; mkdir -p "$d/project"; \
@@ -107,7 +112,8 @@ RUN set -eu \
         sbt -batch -no-colors -Dsbt.server.autostart=false $extra update); \
       rm -rf "$d"; \
     done \
- && d=/tmp/warm-mill && mkdir -p "$d/foo/src" && cd "$d" \
+ && if [ "$SBT_WARM_TOOLS" = 1 ]; then \
+      d=/tmp/warm-mill && mkdir -p "$d/foo/src" && cd "$d" \
  && printf '%s\n' '//| mill-version: '"${MILL_1_VERSION}" 'package build' 'import mill.*, scalalib.*' \
       'object foo extends ScalaModule {' '  def scalaVersion = "2.13.16"' \
       '  def mvnDeps = Seq(mvn"org.apache.commons:commons-lang3:3.11")' '}' > build.mill \
@@ -117,4 +123,5 @@ RUN set -eu \
  && printf '%s\n' '//> using scala 3.3.6' '//> using dep org.apache.commons:commons-lang3:3.11' > project.scala \
  && echo '@main def m() = println("warm")' > Main.scala \
  && scala-cli compile . --server=false > /dev/null \
- && cd / && rm -rf "$d"
+ && cd / && rm -rf "$d"; \
+    fi

@@ -32,10 +32,10 @@ use serde::{Deserialize, Serialize};
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes};
-use crate::utils::purl::patch_matches;
 use crate::utils::purl_key::PurlKey;
 use crate::utils::serde::serialize_sorted;
 use crate::utils::socket_dir::{prune_empty_dirs, remove_file_and_prune, write_json_ledger};
+use crate::utils::target::Target;
 
 use super::parse_memo::ParseMemo;
 use super::path::VENDOR_DIR;
@@ -78,6 +78,35 @@ pub struct VendorArtifact {
     /// verification, and `repair` warns about the gap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_inventory: Option<BTreeMap<String, String>>,
+}
+
+impl VendorArtifact {
+    /// The packed npm tarball at `rel_tgz`, pinned by its sha256 and size.
+    /// `yarn_berry10c0` stays `None`: only the yarn-berry flavor records
+    /// the checksum, and only when it is the service's own.
+    pub(crate) fn tarball(rel_tgz: String, packed: &super::npm_pack::PackedTarball) -> Self {
+        Self {
+            yarn_berry10c0: None,
+            path: rel_tgz,
+            sha256: packed.sha256_hex.clone(),
+            size: Some(packed.size),
+            platform_locked: None,
+            file_inventory: None,
+        }
+    }
+
+    /// A vendored package DIRECTORY at `rel_dir` (vlt): no file hash or
+    /// size, its whole-tree `inventory` instead.
+    pub(crate) fn dir(rel_dir: String, inventory: BTreeMap<String, String>) -> Self {
+        Self {
+            yarn_berry10c0: None,
+            path: rel_dir,
+            sha256: String::new(),
+            size: None,
+            platform_locked: None,
+            file_inventory: Some(inventory),
+        }
+    }
 }
 
 /// How a wiring edit changed a file.
@@ -174,6 +203,11 @@ pub struct PnpmMeta {
     /// `pnpm-workspace.yaml`; revert removes just that section once emptied.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub created_workspace_overrides: bool,
+    /// Vendor added the root-only `packages:` scaffold to a pre-existing
+    /// `pnpm-workspace.yaml` that had no keys (#1096); revert removes it
+    /// with the emptied `overrides:` section.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_workspace_packages: bool,
 }
 
 /// pypi/poetry bookkeeping.
@@ -283,6 +317,50 @@ pub struct VendorEntry {
 }
 
 impl VendorEntry {
+    /// Create an entry with no ecosystem-specific metadata or embedded record.
+    pub fn new(
+        ecosystem: String,
+        base_purl: String,
+        uuid: String,
+        artifact: VendorArtifact,
+        wiring: Vec<WiringRecord>,
+    ) -> Self {
+        Self {
+            ecosystem,
+            base_purl,
+            uuid,
+            artifact,
+            wiring,
+            lock: None,
+            took_over_go_patches: false,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+            detached: false,
+            record: None,
+        }
+    }
+
+    /// The ledger entry every npm-family vendor backend records: ecosystem
+    /// `npm`, the wiring flavor (`None` is package-lock's pre-flavor
+    /// spelling) and no other ecosystem's extras. A flavor sets its one
+    /// meta field afterwards (`pnpm`, `artifact.yarn_berry10c0`).
+    pub(crate) fn npm(
+        base_purl: String,
+        uuid: String,
+        artifact: VendorArtifact,
+        wiring: Vec<WiringRecord>,
+        flavor: Option<&str>,
+    ) -> Self {
+        Self {
+            flavor: flavor.map(str::to_string),
+            ..Self::new("npm".to_string(), base_purl, uuid, artifact, wiring)
+        }
+    }
+
     /// Whether this entry's committed artifact is on disk under
     /// `project_root` — for a FILE artifact (wheel, tarball: a recorded
     /// `sha256`), only when its bytes still hash to that pin; a copy dir
@@ -303,12 +381,27 @@ impl VendorEntry {
     }
 
     /// Does this entry, stored under ledger `key`, match a remove/rollback
-    /// identifier? By its ledger key or by its base purl (mirroring the
-    /// manifest matching of [`patch_matches`]; a golang key is case-encoded
-    /// while `base_purl` holds the decoded spelling users type), or by uuid.
-    pub fn matches_identifier(&self, key: &str, identifier: &str) -> bool {
-        patch_matches(key, &self.uuid, identifier)
-            || patch_matches(&self.base_purl, &self.uuid, identifier)
+    /// target? By its ledger key or by its base purl (the manifest rule,
+    /// [`Target::matches_patch`]; a golang key is case-encoded while
+    /// `base_purl` holds the decoded spelling users type), or by uuid.
+    pub fn matches_target(&self, key: &str, target: &Target) -> bool {
+        target.matches_patch(key, &self.uuid) || target.matches_patch(&self.base_purl, &self.uuid)
+    }
+
+    /// The purl that names this entry's package for
+    /// [`Target::ambiguity`]: the decoded `base_purl` when `target`
+    /// reaches the entry through it, otherwise the ledger `key`. A golang
+    /// key is case-encoded (`!core`) and so can miss a last-segment name
+    /// that its `base_purl` (`Core`) matches; feeding the key alone would
+    /// skip the refusal while [`Self::matches_target`] still selects the
+    /// entry. One purl per entry, so an encoded key and its decoded base
+    /// never count as two packages.
+    pub fn ambiguity_purl<'a>(&'a self, key: &'a str, target: &Target) -> &'a str {
+        if target.matches_patch(&self.base_purl, &self.uuid) {
+            &self.base_purl
+        } else {
+            key
+        }
     }
 
     /// Does this entry, stored under ledger `key`, own the manifest purl
@@ -367,6 +460,7 @@ impl VendorState {
                 pnpm.created_pnpm_table |= m.created_pnpm_table;
                 pnpm.created_workspace_file |= m.created_workspace_file;
                 pnpm.created_workspace_overrides |= m.created_workspace_overrides;
+                pnpm.created_workspace_packages |= m.created_workspace_packages;
             }
         }
         (uv, pnpm)
@@ -504,7 +598,9 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
                 .wiring
                 .iter()
                 .filter(|p| wiring_surface_matches(p, rec));
-            if let Some(prev_rec) = candidates.next() {
+            if rec.kind == "bun_lock_package" && !prev.wiring.iter().any(|p| p.kind == rec.kind) {
+                rec.original = migrated_bun_original(prev, rec);
+            } else if let Some(prev_rec) = candidates.next() {
                 // Multiple equal binary resolutions can have different
                 // registry originals. Renumbered IDs cannot disambiguate
                 // them, so do not attach a guessed restore payload.
@@ -528,6 +624,7 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
                 meta.created_pnpm_table |= prev_meta.created_pnpm_table;
                 meta.created_workspace_file |= prev_meta.created_workspace_file;
                 meta.created_workspace_overrides |= prev_meta.created_workspace_overrides;
+                meta.created_workspace_packages |= prev_meta.created_workspace_packages;
             }
             None => entry.pnpm = Some(prev_meta.clone()),
         }
@@ -546,6 +643,23 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
             entry.wiring.push(prev_rec.clone());
         }
     }
+}
+
+/// The pre-vendor original of a `bun.lock` record that re-pinned a tuple
+/// Bun migrated from the binary lock (#784): the previous entry recorded it
+/// as a `bun.lockb` package snapshot, rebuilt here as the registry tuple Bun
+/// writes for it. `None` when the binary records disagree on it.
+fn migrated_bun_original(prev: &VendorEntry, current: &WiringRecord) -> Option<serde_json::Value> {
+    let line = current.new.as_ref()?.as_str()?;
+    let mut lines = prev
+        .wiring
+        .iter()
+        .filter(|p| p.kind == "bun_lockb_package")
+        .filter_map(|p| super::bun_binary::migrated_registry_line(line, p.original.as_ref()?));
+    let first = lines.next()?;
+    lines
+        .all(|other| other == first)
+        .then_some(serde_json::Value::String(first))
 }
 
 /// Binary IDs are offsets into Bun's package array and may change after an
@@ -896,11 +1010,11 @@ mod tests {
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
     fn sample_entry() -> VendorEntry {
-        VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: "pkg:npm/lodash@4.17.21".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "npm".into(),
+            "pkg:npm/lodash@4.17.21".into(),
+            UUID.into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: format!(".socket/vendor/npm/{UUID}/lodash-4.17.21.tgz"),
                 sha256: "ab".repeat(32),
@@ -908,7 +1022,7 @@ mod tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![WiringRecord {
+            vec![WiringRecord {
                 file: "package-lock.json".into(),
                 kind: "npm_lock_entry".into(),
                 action: WiringAction::Rewritten,
@@ -924,17 +1038,7 @@ mod tests {
                     "integrity": "sha512-ours"
                 })),
             }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+        )
     }
 
     /// A cargo entry migrated from the pre-v5 `.cargo/config.toml` wiring to
@@ -953,28 +1057,21 @@ mod tests {
         };
         let uuid = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
         let base = |wiring: Vec<WiringRecord>, lock: Option<CargoLockOriginal>| VendorEntry {
-            ecosystem: "cargo".into(),
-            base_purl: "pkg:cargo/cfg-if@1.0.4".into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring,
             lock,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "cargo".into(),
+                "pkg:cargo/cfg-if@1.0.4".into(),
+                uuid.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
         };
         let orig = CargoLockOriginal {
             source: "registry+https://github.com/rust-lang/crates.io-index".into(),
@@ -1086,20 +1183,49 @@ mod tests {
         entry.ecosystem = "golang".into();
         entry.base_purl = "pkg:golang/github.com/BurntSushi/toml@1.0.0".into();
         let key = "pkg:golang/github.com/!burnt!sushi/toml@1.0.0";
-        assert!(entry.matches_identifier(key, key));
-        assert!(entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@1.0.0"));
-        assert!(entry.matches_identifier(key, UUID));
-        assert!(!entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@2.0.0"));
-        assert!(!entry.matches_identifier(key, "00000000-0000-4000-8000-000000000000"));
+        assert!(entry.matches_target(key, &Target::parse(key)));
+        assert!(entry.matches_target(
+            key,
+            &Target::parse("pkg:golang/github.com/BurntSushi/toml@1.0.0")
+        ));
+        assert!(entry.matches_target(key, &Target::parse(UUID)));
+        assert!(!entry.matches_target(
+            key,
+            &Target::parse("pkg:golang/github.com/BurntSushi/toml@2.0.0")
+        ));
+        assert!(!entry.matches_target(key, &Target::parse("00000000-0000-4000-8000-000000000000")));
+
+        // A last-segment name reaching the entry only through its decoded
+        // base purl is counted under that purl, never under the encoded key.
+        let name = Target::parse("Toml");
+        assert_eq!(entry.ambiguity_purl(key, &name), entry.base_purl);
+        let mut core = sample_entry();
+        core.ecosystem = "golang".into();
+        core.base_purl = "pkg:golang/github.com/x/Core@1.0.0".into();
+        let core_key = "pkg:golang/github.com/x/!core@1.0.0";
+        // Another last-segment-only match: a full-name match such as
+        // `pkg:npm/core` would settle the name on its own.
+        let other = "pkg:npm/@x/core@1.0.0";
+        let core_name = Target::parse("core");
+        assert!(core.matches_target(core_key, &core_name));
+        assert!(core_name
+            .ambiguity([core.ambiguity_purl(core_key, &core_name), other])
+            .is_some());
+        // One entry, encoded key plus decoded base: one package.
+        let sushi = Target::parse("toml");
+        assert_eq!(sushi.ambiguity([entry.ambiguity_purl(key, &sushi)]), None);
 
         // A qualified pypi key: the base identifier covers it, another
         // variant's qualifier does not.
         let mut entry = sample_entry();
         entry.base_purl = "pkg:pypi/requests@2.28.0".into();
         let key = "pkg:pypi/requests@2.28.0?artifact_id=abc";
-        assert!(entry.matches_identifier(key, "pkg:pypi/requests@2.28.0"));
-        assert!(entry.matches_identifier(key, key));
-        assert!(!entry.matches_identifier(key, "pkg:pypi/requests@2.28.0?artifact_id=zzz"));
+        assert!(entry.matches_target(key, &Target::parse("pkg:pypi/requests@2.28.0")));
+        assert!(entry.matches_target(key, &Target::parse(key)));
+        assert!(!entry.matches_target(
+            key,
+            &Target::parse("pkg:pypi/requests@2.28.0?artifact_id=zzz")
+        ));
     }
 
     /// `covers_purl`: the exact key, a qualifier-stripped twin of the key
@@ -1557,6 +1683,7 @@ mod tests {
             created_pnpm_table: true,
             created_workspace_file: true,
             created_workspace_overrides: false,
+            created_workspace_packages: false,
         };
         let mut state = VendorState::new();
         for (key, entry) in [
@@ -1705,6 +1832,7 @@ mod tests {
             created_pnpm_table: true,
             created_workspace_file: true,
             created_workspace_overrides: false,
+            created_workspace_packages: false,
         });
 
         // The re-vendor under a NEW uuid probes the surfaces as pre-existing.
@@ -2136,5 +2264,100 @@ mod tests {
             assert!(!a.join(VENDOR_STATE_REL).exists(), "grouped {grouped}");
             assert!(!b.join(VENDOR_STATE_REL).exists(), "grouped {grouped}");
         }
+    }
+
+    /// #922: the npm-family constructor serializes to exactly the ledger
+    /// JSON the yarn-classic backend's literal entry did.
+    #[test]
+    fn npm_constructor_matches_the_yarn_classic_literal() {
+        let packed = super::super::npm_pack::PackedTarball::from_bytes(b"tarball bytes");
+        let rel = ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+        let wiring = vec![WiringRecord {
+            file: "yarn.lock".to_string(),
+            kind: "yarn_lock_block".to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("left-pad@^1.3.0".to_string()),
+            original: Some(serde_json::json!(["left-pad@^1.3.0:"])),
+            new: Some(serde_json::json!([
+                "left-pad@^1.3.0:",
+                "  version \"1.3.0\""
+            ])),
+        }];
+        let literal = VendorEntry {
+            ecosystem: "npm".to_string(),
+            base_purl: "pkg:npm/left-pad@1.3.0".to_string(),
+            uuid: "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f".to_string(),
+            artifact: VendorArtifact {
+                yarn_berry10c0: None,
+                path: rel.to_string(),
+                sha256: packed.sha256_hex.clone(),
+                size: Some(packed.size),
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: wiring.clone(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: Some("yarn-classic".to_string()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        };
+        let built = VendorEntry::npm(
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f".to_string(),
+            VendorArtifact::tarball(rel.to_string(), &packed),
+            wiring,
+            Some("yarn-classic"),
+        );
+        assert_eq!(built, literal);
+        assert_eq!(
+            serde_json::to_string_pretty(&built).unwrap(),
+            serde_json::to_string_pretty(&literal).unwrap()
+        );
+        // The pinned JSON: no other ecosystem's extras, no
+        // `yarnBerry10c0`, no `fileInventory`.
+        assert_eq!(
+            serde_json::to_value(&built).unwrap(),
+            serde_json::json!({
+                "ecosystem": "npm",
+                "basePurl": "pkg:npm/left-pad@1.3.0",
+                "uuid": "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
+                "artifact": {"path": rel, "sha256": packed.sha256_hex, "size": packed.size},
+                "wiring": [{
+                    "file": "yarn.lock",
+                    "kind": "yarn_lock_block",
+                    "action": "rewritten",
+                    "key": "left-pad@^1.3.0",
+                    "original": ["left-pad@^1.3.0:"],
+                    "new": ["left-pad@^1.3.0:", "  version \"1.3.0\""],
+                }],
+                "flavor": "yarn-classic",
+            })
+        );
+
+        // package-lock keeps the pre-flavor spelling; vlt's dir artifact
+        // carries its inventory and no file hash.
+        assert_eq!(
+            VendorEntry::npm(
+                String::new(),
+                String::new(),
+                built.artifact.clone(),
+                vec![],
+                None
+            )
+            .flavor,
+            None
+        );
+        let inventory = BTreeMap::from([("index.js".to_string(), "ab".repeat(32))]);
+        let dir = VendorArtifact::dir("dir".to_string(), inventory.clone());
+        assert_eq!(
+            serde_json::to_value(&dir).unwrap(),
+            serde_json::json!({"path": "dir", "fileInventory": inventory})
+        );
     }
 }

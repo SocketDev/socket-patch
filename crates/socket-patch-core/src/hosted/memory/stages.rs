@@ -12,6 +12,7 @@ use crate::api::types::PackageVendorResult;
 use crate::hosted::engine::{
     self, Candidate, CandidateFiles, Refusal, RewriteOptions, SkippedPatch,
 };
+use crate::hosted::npm_manifest::HostedClassicArtifact;
 use crate::hosted::vlt::Preflight;
 use crate::patch::redirect::npmrc::OuterAllowRemote;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
@@ -93,19 +94,20 @@ fn refuse_takeovers(
     skipped: &mut Vec<SkippedPatch>,
     pre_warnings: &mut Vec<crate::patch::redirect::RewriteWarning>,
 ) {
-    let takeover_capable = |p: &str| {
-        p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
-    };
-    if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
+    use super::super::takeover;
+    if !takeover::any_takeover_ecosystem(candidates.iter().map(|c| c.purl.as_str())) {
         return;
     }
     let vendored = vendored_entries(project);
     let mut refused: BTreeSet<String> = BTreeSet::new();
-    for candidate in candidates.iter().filter(|c| takeover_capable(&c.purl)) {
-        let has_entry = vendored.as_ref().is_some_and(|s| {
+    for candidate in candidates.iter() {
+        let entry = vendored.as_ref().and_then(|s| {
             crate::vendor::lookup_entry(&s.entries, strip_purl_qualifiers(&candidate.purl))
-                .is_some()
         });
+        if !takeover::in_reach(&candidate.purl, entry) {
+            continue;
+        }
+        let has_entry = entry.is_some();
         let cargo_wired = !has_entry
             && candidate.purl.starts_with("pkg:cargo/")
             && cargo_vendored_wiring(project, &candidate.dep.name, &candidate.dep.version);
@@ -156,6 +158,9 @@ pub(crate) struct Planned {
     /// `(artifact url, sha512)` of every npm tarball whose own
     /// package.json a yarn berry pin needs (#718).
     pub(crate) npm_manifests: Vec<(String, Option<String>)>,
+    /// `(artifact url, sha512)` of every npm tarball a yarn classic pin
+    /// reads (its sha1, #558, and its package.json, #591).
+    pub(crate) npm_classic: Vec<(String, String)>,
     /// The vlt artifact preflight, judged offline (no network here, so
     /// every in-scope dep is withheld instead of pinned: `--offline`
     /// parity).
@@ -209,6 +214,14 @@ pub(crate) async fn plan(
         .into_iter()
         .map(|dep| (dep.artifact_url.clone(), dep.integrity.sha512.clone()))
         .collect();
+    let npm_classic = engine::yarn_classic_artifact_targets(
+        &candidates,
+        &read.files,
+        &OuterYarnMirror::default(),
+    )
+    .into_iter()
+    .filter_map(|dep| Some((dep.artifact_url.clone(), dep.integrity.sha512.clone()?)))
+    .collect();
     Ok(Planned {
         project,
         candidates,
@@ -217,6 +230,7 @@ pub(crate) async fn plan(
         read,
         wheels,
         npm_manifests,
+        npm_classic,
         vlt_preflight,
     })
 }
@@ -240,11 +254,13 @@ pub(crate) struct RewriteRefused {
     pub(crate) skipped: Vec<SkippedPatch>,
 }
 
-/// Wheel metadata and served npm manifests (keyed by artifact URL) → the
-/// engine's rewrite → the guard.
+/// Wheel metadata, served npm manifests and the served npm tarballs a
+/// yarn classic pin reads (each keyed by artifact URL) → the engine's
+/// rewrite → the guard.
 pub(crate) async fn rewrite(
     planned: Planned,
     artifact_metadata: &BTreeMap<String, Result<Option<String>, String>>,
+    artifact_classic: &BTreeMap<String, Result<HostedClassicArtifact, String>>,
     options: StageOptions,
 ) -> Result<Rewritten, RewriteRefused> {
     let Planned {
@@ -255,6 +271,7 @@ pub(crate) async fn rewrite(
         read,
         wheels,
         npm_manifests,
+        npm_classic,
         vlt_preflight,
     } = planned;
     let skipped_before = skipped.clone();
@@ -303,6 +320,30 @@ pub(crate) async fn rewrite(
             }
         }
     }
+    for (url, _) in &npm_classic {
+        match artifact_classic.get(url) {
+            Some(Ok(artifact)) => engine::record_classic_artifact(
+                &mut candidates,
+                &mut python_metadata,
+                url,
+                artifact,
+            ),
+            Some(Err(detail)) => {
+                if unavailable.insert(url.clone()) {
+                    for dep in candidates
+                        .iter()
+                        .map(|c| &c.dep)
+                        .filter(|d| &d.artifact_url == url)
+                    {
+                        skipped.push(engine::npm_tarball_unavailable(dep, detail));
+                    }
+                }
+            }
+            None => {
+                unavailable.insert(url.clone());
+            }
+        }
+    }
     candidates.retain(|c| !unavailable.contains(&c.dep.artifact_url));
 
     let view = ProjectView::Memory(&project);
@@ -316,7 +357,6 @@ pub(crate) async fn rewrite(
         &candidates,
         python_metadata,
         &vlt_preflight.withheld_from_vlt,
-        &[],
         RewriteOptions {
             dry_run: options.dry_run,
             targets_pipenv_lock,
@@ -335,6 +375,9 @@ pub(crate) async fn rewrite(
             npm_outer: &npm_outer,
             yarn_classic_outer: &yarn_classic_outer,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         },
     )
     .await;
@@ -344,6 +387,7 @@ pub(crate) async fn rewrite(
             skipped: skipped_before,
         });
     }
+    skipped.extend(done.unattributed.iter().cloned());
     let unconfirmed = engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped);
     Ok(Rewritten {
         project,

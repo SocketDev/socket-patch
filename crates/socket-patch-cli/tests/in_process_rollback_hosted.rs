@@ -83,10 +83,8 @@ fn hosted_scan_args(cwd: &Path, api_url: String) -> ScanArgs {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: Some(ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
@@ -179,6 +177,15 @@ fn scrubbed_cli() -> std::process::Command {
         .env_remove("SOCKET_ECOSYSTEMS")
         .env_remove("SOCKET_MANIFEST_PATH")
         .env_remove("SOCKET_PRESERVE_STATE");
+    // A registry exported by npm (`npm_config_registry`) or Bun would
+    // steer the Bun restores off the fixtures' registry.
+    for key in [
+        "BUN_CONFIG_REGISTRY",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+    ] {
+        cmd.env_remove(key);
+    }
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
@@ -757,6 +764,45 @@ async fn npm_hosted_round_trip_envelope() {
 #[tokio::test]
 #[serial]
 async fn pypi_requirements_hosted_round_trip() {
+    pypi_requirements_round_trip("flask==2.0.1\nrequests==2.31.0\n", &[]).await;
+}
+
+/// REGRESSION (#1212): the same round trip when the file opens with a
+/// PEP 263 coding line naming a codec beyond UTF-8 / ASCII / Latin-1 /
+/// cp1252 (a header copied from a template; the bytes are plain ASCII).
+/// pip decodes it with that codec, so `get --mode hosted` must wire it,
+/// `vex` attest it and `rollback` restore it (they read it as absent:
+/// nothing wired, then exit 2 and `manifest_not_found`).
+#[tokio::test]
+#[serial]
+async fn pypi_requirements_hosted_round_trip_with_an_unmodelled_coding_line() {
+    pypi_requirements_round_trip(
+        "# -*- coding: iso-8859-15 -*-\nflask==2.0.1\nrequests==2.31.0\n",
+        &[],
+    )
+    .await;
+    pypi_requirements_round_trip(
+        "# deps\n# vim: set fileencoding=cp1250 :\nflask==2.0.1\nrequests==2.31.0\n",
+        &[],
+    )
+    .await;
+}
+
+/// REGRESSION (#1086): the same round trip when an in-root `-r` include
+/// pins the same `requests==2.31.0` (split base/dev files), with the `-r`
+/// line before and after the root pin. pip reads the root and its includes
+/// as one requirement set, where the hosted direct reference wins, so the
+/// include's compatible pin is not a competing lock: `vex` attests the
+/// patch and `rollback` restores the root line (it used to exit 2 and 1).
+#[tokio::test]
+#[serial]
+async fn pypi_requirements_hosted_round_trip_with_a_duplicate_include_pin() {
+    let dev = [("dev.txt", "requests==2.31.0\n")];
+    pypi_requirements_round_trip("-r dev.txt\nflask==2.0.1\nrequests==2.31.0\n", &dev).await;
+    pypi_requirements_round_trip("flask==2.0.1\nrequests==2.31.0\n-r dev.txt\n", &dev).await;
+}
+
+async fn pypi_requirements_round_trip(pristine: &'static str, includes: &[(&str, &str)]) {
     const PY_UUID: &str = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
     const PY_PURL: &str = "pkg:pypi/requests@2.31.0";
     const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -811,8 +857,10 @@ async fn pypi_requirements_hosted_round_trip() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let pristine = "flask==2.0.1\nrequests==2.31.0\n";
     std::fs::write(tmp.path().join("requirements.txt"), pristine).unwrap();
+    for (file, text) in includes {
+        std::fs::write(tmp.path().join(file), text).unwrap();
+    }
 
     let get_args = socket_patch_cli::commands::get::GetArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -889,6 +937,10 @@ async fn pypi_requirements_hosted_round_trip() {
         !tmp.path().join(".socket").exists(),
         "a fully unwound hosted project keeps no .socket/ residue"
     );
+    for (file, text) in includes {
+        let after = std::fs::read_to_string(tmp.path().join(file)).unwrap();
+        assert_eq!(&after, text, "hosted mode never edits the include {file}");
+    }
 
     // After the rollback nothing references the patch any more: VEX finds
     // nothing to attest (online, the API would still vouch for the uuid).
@@ -1062,7 +1114,12 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
     let wired = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
     let (code, envelope) = run_rollback_subprocess(tmp.path(), &[]);
     assert_eq!(code, 1, "{envelope}");
-    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    // Both pins refused, nothing restored: a total failure whose
+    // counters span the hosted leg (#1066).
+    assert_eq!(envelope["status"], "error", "{envelope}");
+    assert_eq!(envelope["error"]["code"], "rollback_failed", "{envelope}");
+    assert_eq!(envelope["failed"], 2, "{envelope}");
+    assert_eq!(envelope["rolledBack"], 0, "{envelope}");
     assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([]));
     let failed: Vec<&str> = envelope["hosted"]["failed"]
         .as_array()
@@ -1090,6 +1147,9 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(code, 1, "{envelope}");
     assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    // The top-level counters span the hosted leg (#1066): they were 0/0.
+    assert_eq!(envelope["rolledBack"], 1, "{envelope}");
+    assert_eq!(envelope["failed"], 1, "{envelope}");
     assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([IO_PURL]));
     assert_eq!(
         envelope["hosted"]["failed"][0]["purl"], LP_PURL,
@@ -1254,7 +1314,7 @@ async fn hosted_only_project_without_manifest() {
     );
     assert_eq!(envelope["status"], "error", "{envelope}");
     assert!(
-        envelope["error"]
+        envelope["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("Manifest not found"),
@@ -1415,6 +1475,42 @@ async fn npm_hosted_round_trip_manifest_less_vex() {
             .join()
             .expect("manifest-less VEX cells panicked");
     });
+}
+
+/// REGRESSION (#828, yarn classic twin): a hosted registry block beside a
+/// git-sourced block of the same `name@version` (the hosted rewriter skips
+/// the git block, `redirect_yarn_classic_git_skipped`). Discovery withholds
+/// the pin from VEX, but rollback must still restore its upstream entry —
+/// it refused it as `hosted_wiring_contested` / `patched_ref_unattributable`
+/// with a remedy (re-run the hosted scan) that only rewrote the same state.
+/// The git block is left exactly as it was.
+#[tokio::test]
+#[serial]
+async fn yarn_classic_hosted_pin_beside_a_git_copy_rolls_back() {
+    let server = MockServer::start().await;
+    mock_yarn_registry(&server, "left-pad", "1.2.3").await;
+    let git_block = "\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.2.3\":\n  \
+                     version \"1.2.3\"\n  \
+                     resolved \"git+https://github.com/stevemao/left-pad.git#5e5f1a6e23f6fa2bd1e4a3d0c2bb1c0e1bb0f00a\"";
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("yarn.lock"),
+        yarn_lock_content(&format!("{git_block}\n\n{}", yarn_redirected_block())),
+    )
+    .unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "rollback must restore the pin: {envelope}");
+    assert_eq!(
+        envelope["hosted"]["reverted"],
+        serde_json::json!([LP_PURL]),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&format!("{git_block}\n\n{}", yarn_original_block())),
+        "only the hosted block is restored"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,6 +1709,157 @@ async fn remove_unhosts_a_package_whose_agent_record_is_superseded() {
     );
 }
 
+/// Re-shape the superseded fixture as Bun's isolated linker leaves it
+/// after `bun install` of the hosted pin (#1084): `node_modules/<name>`
+/// links to the new store entry holding B's bytes, and the old
+/// `node_modules/.bun/<name>@<version>` entry Bun never prunes still holds
+/// agent record A's patched bytes. Returns the orphan's `index.js`.
+#[cfg(unix)]
+fn orphan_bun_store_copy(root: &Path) -> std::path::PathBuf {
+    let nm = root.join("node_modules");
+    let top = nm.join(NAME);
+    let store = nm.join(".bun");
+    let live = store
+        .join(format!("{NAME}@http+++patch.test+bbbbbbbb"))
+        .join("node_modules")
+        .join(NAME);
+    let orphan = store
+        .join(format!("{NAME}@{VERSION}"))
+        .join("node_modules")
+        .join(NAME);
+    for (dir, index) in [(&live, B_PATCHED_INDEX), (&orphan, A_PATCHED_INDEX)] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::copy(top.join("package.json"), dir.join("package.json")).unwrap();
+        std::fs::write(dir.join("index.js"), index).unwrap();
+    }
+    std::fs::remove_dir_all(&top).unwrap();
+    std::os::unix::fs::symlink(&live, &top).unwrap();
+    orphan.join("index.js")
+}
+
+/// #1084: the live copy holds B's bytes, but an orphaned Bun store copy
+/// still holds A's. Rollback restores that copy before dropping record A,
+/// so the next `bun install` cannot relink agent patch A unrecorded.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn rollback_restores_an_orphaned_store_copy_of_a_superseded_record() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let orphan = orphan_bun_store_copy(tmp.path());
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_eq!(
+        std::fs::read(&orphan).unwrap(),
+        ORIGINAL_INDEX,
+        "the orphaned store copy at A's patched bytes is restored:\n{envelope:#}"
+    );
+    let live = tmp.path().join("node_modules").join(NAME).join("index.js");
+    assert_eq!(
+        std::fs::read(live).unwrap(),
+        B_PATCHED_INDEX,
+        "B's live copy is still the reinstall's to replace"
+    );
+    assert!(
+        warning_codes(&envelope).contains(&"rollback_record_superseded".to_string()),
+        "{envelope:#}"
+    );
+    let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(restored, pristine);
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
+}
+
+/// #1084: `remove <purl>` restores the orphaned copy the same way.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn remove_restores_an_orphaned_store_copy_of_a_superseded_record() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let orphan = orphan_bun_store_copy(tmp.path());
+
+    let (code, envelope) = run_remove_subprocess_online(tmp.path(), &server, PURL);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_eq!(
+        std::fs::read(&orphan).unwrap(),
+        ORIGINAL_INDEX,
+        "the orphaned store copy at A's patched bytes is restored:\n{envelope:#}"
+    );
+    let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(restored, pristine);
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
+}
+
+/// #1084: a store copy that holds A's bytes but cannot be restored (its
+/// before-blob is gone) fails the run and keeps record A, instead of
+/// dropping the only data that could restore it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn an_unrestorable_orphaned_store_copy_keeps_the_superseded_record() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    orphan_bun_store_copy(tmp.path());
+    let before = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(ORIGINAL_INDEX);
+    std::fs::remove_file(tmp.path().join(".socket/blobs").join(before)).unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(
+        code, 1,
+        "a copy still holding A's bytes that cannot be restored fails:\n{envelope:#}"
+    );
+    assert_eq!(
+        manifest_patch_keys(tmp.path()),
+        vec![PURL.to_string()],
+        "record A stays for a later rollback"
+    );
+}
+
+/// #1084 review: a store copy of the superseding patch B that shares a
+/// file with record A (B's `lib.js` is A's patched `lib.js`, its
+/// `index.js` is B's own) is not A's copy. It is left, as the primary is,
+/// and the run drops record A as before instead of failing on it forever.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_superseding_store_copy_sharing_a_file_with_the_record_is_left() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let copy = orphan_bun_store_copy(tmp.path());
+    // Record A patched lib.js too; B carries the same patched lib.js.
+    let before = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(ORIGINAL_INDEX);
+    let after = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(A_PATCHED_INDEX);
+    let manifest_path = tmp.path().join(".socket/manifest.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][PURL]["files"]["package/lib.js"] =
+        serde_json::json!({ "beforeHash": before, "afterHash": after });
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    std::fs::write(&copy, B_PATCHED_INDEX).unwrap();
+    std::fs::write(copy.with_file_name("lib.js"), A_PATCHED_INDEX).unwrap();
+    let live = tmp.path().join("node_modules").join(NAME).join("lib.js");
+    std::fs::write(live, A_PATCHED_INDEX).unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert!(
+        warning_codes(&envelope).contains(&"rollback_record_superseded".to_string()),
+        "{envelope:#}"
+    );
+    assert_eq!(std::fs::read(&copy).unwrap(), B_PATCHED_INDEX);
+    assert_eq!(
+        std::fs::read(copy.with_file_name("lib.js")).unwrap(),
+        A_PATCHED_INDEX,
+        "B's copy is the reinstall's to replace"
+    );
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
+}
+
 /// B07: a remove/rollback identifier that names the superseded record's
 /// uuid (A) selects the whole owned pin, so the hosted pin of the same
 /// release under the superseding uuid (B) is unwound too, instead of being
@@ -1639,6 +1886,127 @@ async fn remove_and_rollback_by_superseded_record_uuid_unhost_the_release() {
         assert!(
             manifest_patch_keys(tmp.path()).is_empty(),
             "{command}:\n{envelope:#}"
+        );
+    }
+}
+
+// ── #1203: a berry `resolutions` pin `yarn remove` left behind ──────────────
+// `yarn remove left-pad` deletes the hosted lock entry but never edits
+// `resolutions`, so the Socket selector routes nothing. It used to read as
+// contested wiring: `list`, `rollback` and `remove` failed forever with
+// `hosted_wiring_contested`, and the printed remedy (re-scan) changed
+// nothing. It is Socket's own leftover pin: listed around and retired.
+
+/// A yarn berry project whose hosted left-pad pin was `yarn remove`d: the
+/// lock holds only the workspace, `package.json` still the selector.
+fn write_berry_selector_left_by_yarn_remove(root: &Path) -> String {
+    let pkg = format!(
+        "{{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \
+         \"resolutions\": {{\n    \"left-pad@npm:1.2.3\": \"{LP_HOSTED_URL}\"\n  }}\n}}\n"
+    );
+    std::fs::write(root.join("package.json"), &pkg).unwrap();
+    std::fs::write(
+        root.join("yarn.lock"),
+        "# This file is generated by running \"yarn install\" inside your project.\n\
+         # Manual changes might be lost - proceed with caution!\n\n\
+         __metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+         \"app@workspace:.\":\n  version: 0.0.0-use.local\n  resolution: \"app@workspace:.\"\n  \
+         languageName: unknown\n  linkType: soft\n",
+    )
+    .unwrap();
+    std::fs::write(root.join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
+    pkg
+}
+
+fn run_cli_json(cwd: &Path, args: &[&str]) -> (i32, Value) {
+    let out = scrubbed_cli()
+        .args(args)
+        .args([
+            "--json",
+            "--offline",
+            "--patch-server-url",
+            "http://patch.test",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run socket-patch");
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{args:?} --json stdout must be a JSON envelope: {e}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code().unwrap_or(-1), envelope)
+}
+
+/// The `package.json` once the leftover selector is retired.
+const BERRY_PKG_RETIRED: &str =
+    "{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"private\": true\n}\n";
+
+#[test]
+#[serial]
+fn berry_selector_left_by_yarn_remove_is_listed_around() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = write_berry_selector_left_by_yarn_remove(tmp.path());
+    let (code, envelope) = run_cli_json(tmp.path(), &["list"]);
+    assert_eq!(code, 0, "list must succeed: {envelope}");
+    assert!(
+        warning_codes(&envelope).contains(&"hosted_resolution_orphaned".to_string()),
+        "{envelope}"
+    );
+    assert!(
+        !warning_codes(&envelope).contains(&"hosted_wiring_contested".to_string()),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+        pkg,
+        "list writes nothing"
+    );
+}
+
+#[test]
+#[serial]
+fn rollback_retires_a_berry_selector_left_by_yarn_remove() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_selector_left_by_yarn_remove(tmp.path());
+    let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
+    let (code, envelope) = run_rollback_subprocess(tmp.path(), &[]);
+    assert_eq!(code, 0, "rollback must succeed: {envelope}");
+    assert_eq!(envelope["status"], "success", "{envelope}");
+    assert!(
+        warning_codes(&envelope).contains(&"hosted_resolution_orphaned".to_string()),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+        BERRY_PKG_RETIRED
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        lock,
+        "the lock is not touched"
+    );
+    // Nothing hosted is left: list is clean.
+    let (code, envelope) = run_cli_json(tmp.path(), &["list"]);
+    assert_eq!(code, 0, "{envelope}");
+    assert!(warning_codes(&envelope).is_empty(), "{envelope}");
+}
+
+#[test]
+#[serial]
+fn remove_retires_a_berry_selector_left_by_yarn_remove() {
+    for target in [LP_UUID, LP_PURL] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_berry_selector_left_by_yarn_remove(tmp.path());
+        let (code, envelope) = run_cli_json(tmp.path(), &["remove", target, "--yes"]);
+        assert_eq!(code, 0, "remove {target} must succeed: {envelope}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+            BERRY_PKG_RETIRED,
+            "remove {target}"
         );
     }
 }

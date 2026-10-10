@@ -514,7 +514,7 @@ fn corrupt_manifest_json_errors_in_both_modes() {
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
     assert!(
-        v["error"]
+        v["error"]["message"]
             .as_str()
             .is_some_and(|e| e.contains("Failed to parse manifest JSON")),
         "the error must name the parse failure; stdout=\n{stdout}"
@@ -572,7 +572,9 @@ fn blobs_path_as_file_yields_legacy_error_envelope() {
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
     assert!(
-        v["error"].as_str().is_some_and(|e| !e.is_empty()),
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()),
         "the envelope carries the io error; stdout=\n{stdout}"
     );
     assert_eq!(v["rolledBack"], 0, "stdout=\n{stdout}");
@@ -705,7 +707,7 @@ fn ledgerless_wired_lock_errors_with_state_json_guidance() {
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
     assert!(
-        v["error"].as_str().is_some_and(|e| {
+        v["error"]["message"].as_str().is_some_and(|e| {
             e.contains("lockfiles still reference .socket/vendor/ artifacts")
                 && e.contains("restore .socket/vendor/state.json")
         }),
@@ -760,7 +762,7 @@ fn lock_contention_exits_with_lock_held_envelope() {
     assert_eq!(
         envelope_error_code(&v),
         Some("lock_held"),
-        "expected errorCode=lock_held; stdout=\n{stdout}"
+        "expected error.code=lock_held; stdout=\n{stdout}"
     );
     assert_eq!(
         json_string(&v, "status"),
@@ -929,7 +931,11 @@ fn vendored_unknown_ecosystem_fails_leg_in_both_modes() {
         "an unknown-backend entry must fail the run; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    // The vendored failure is the run's only outcome: a total failure
+    // (#1066), counted in the top-level `failed`.
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
+    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
     let failed = v["vendoredFailed"]
         .as_array()
         .expect("vendoredFailed array");
@@ -1299,7 +1305,11 @@ fn vendored_ledger_save_failure_fails_closed() {
         "a ledger save failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    // The vendored failure is the run's only outcome: a total failure
+    // (#1066), counted in the top-level `failed`.
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
+    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
     let failed = v["vendoredFailed"]
         .as_array()
         .expect("vendoredFailed array");
@@ -1795,7 +1805,11 @@ fn legacy_ledger_beside_a_live_pin_is_never_the_revert_source() {
     );
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    // Nothing was rolled back: a total failure (#1066), and the refused
+    // hosted pin counts in the top-level `failed`.
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
+    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
     assert_eq!(
         v["hosted"]["failed"][0]["purl"], LP_PURL,
         "stdout=\n{stdout}"
@@ -2086,6 +2100,103 @@ fn bun_lock_pin_restores_to_the_registry_tuple() {
         "the bun.lock entry must be the registry tuple again"
     );
     assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
+}
+
+/// #764: Bun's hoisted linker keeps an installed copy whose lock entry
+/// returns to the registry record (a plain `bun install` reports "no
+/// changes"), so a rollback over a hoisted `node_modules/left-pad` warns
+/// `redirect_bun_reinstall_required` and names `bun install --force`, in
+/// the JSON `warnings[]` and on stderr. An isolated install (the copy a
+/// link into `node_modules/.bun/`) relinks, so it stays silent.
+#[test]
+fn bun_lock_rollback_warns_that_a_hoisted_copy_is_kept() {
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
+    let project = |installed: bool| {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("bun.lock"),
+            bun_lock(&bun_redirected_line()),
+        )
+        .unwrap();
+        if installed {
+            let pkg = tmp.path().join("node_modules/left-pad");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(pkg.join("index.js"), "// PATCHED\n").unwrap();
+        }
+        tmp
+    };
+    let has_code = |v: &serde_json::Value| {
+        v["warnings"].as_array().is_some_and(|ws| {
+            ws.iter().any(|w| {
+                w["code"] == "redirect_bun_reinstall_required"
+                    && w["detail"].as_str().is_some_and(|d| {
+                        d.contains("left-pad@1.2.3") && d.contains("`bun install --force`")
+                    })
+            })
+        })
+    };
+
+    let hoisted = project(true);
+    let (code, stdout, stderr) = run_hosted(
+        hoisted.path(),
+        &["rollback", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        has_code(&parse_envelope(&stdout, &stderr)),
+        "stdout=\n{stdout}"
+    );
+
+    let hoisted = project(true);
+    let (code, stdout, stderr) =
+        run_hosted(hoisted.path(), &["rollback", "--yes"], Some(&registry));
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("`bun install --force`"),
+        "the human run names the forcing install; stderr=\n{stderr}"
+    );
+
+    // The preview warns the same way: its run-level `reinstall_required`
+    // note would otherwise promise that the next plain install refreshes
+    // the tree, which is the #764 failure.
+    let hoisted = project(true);
+    let (code, stdout, stderr) = run_hosted(
+        hoisted.path(),
+        &["rollback", "--dry-run", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let env = parse_envelope(&stdout, &stderr);
+    assert!(has_code(&env), "stdout=\n{stdout}");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| {
+                w["code"] == "reinstall_required"
+                    && w["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("`bun install --force`"))
+            })),
+        "the preview's reinstall note names the forcing install; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hoisted.path().join("bun.lock")).unwrap(),
+        bun_lock(&bun_redirected_line()),
+        "a dry run writes nothing"
+    );
+
+    let fresh = project(false);
+    let (code, stdout, stderr) = run_hosted(
+        fresh.path(),
+        &["rollback", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        !has_code(&parse_envelope(&stdout, &stderr)),
+        "nothing installed, nothing kept; stdout=\n{stdout}"
+    );
 }
 
 /// Dry-run twin of `bun_lock_pin_restores_to_the_registry_tuple`: "Would
@@ -2499,7 +2610,7 @@ fn manifest_deleted_under_held_lock_fails_with_invalid_manifest() {
         );
         let v = parse_envelope(&stdout, &stderr);
         assert_eq!(v["status"], "error", "stdout=\n{stdout}");
-        match v["error"].as_str() {
+        match v["error"]["message"].as_str() {
             Some("Invalid manifest") => return, // target interleaving reached
             Some("Manifest not found") => continue, // probed after the delete — retry
             other => panic!(
@@ -3086,7 +3197,9 @@ fn pypi_variant_group_with_no_installed_match_attempts_every_variant() {
         "a drifted install cannot roll back; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], json!("partial_failure"), "stdout=\n{stdout}");
+    // Both variants failed and nothing was rolled back: a total failure.
+    assert_eq!(v["status"], json!("error"), "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
     assert_eq!(v["failed"], json!(2), "stdout=\n{stdout}");
     let results = v["results"].as_array().expect("results array");
     let mut result_purls: Vec<&str> = results
@@ -3403,4 +3516,77 @@ fn vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals() {
     );
     assert!(!store.exists());
     assert!(!root.join("node_modules/.vlt-lock.json").exists());
+}
+
+/// #599: Bun never prunes `node_modules/.bun`. A patched `is-number@6.0.0`
+/// entry the project has since moved off (an in-place `bun install` of
+/// 7.0.0 re-linked the importer and hoist dir to the new entry) is an
+/// orphan nothing loads now, but a later install that resolves back to
+/// 6.0.0 re-links it as it is ("no changes"). Rollback must still restore
+/// it, or the rolled-back patch silently returns: the orphan filter that
+/// keeps `vex` from judging the install by such an entry is for checks of
+/// the live install only.
+#[cfg(unix)]
+#[test]
+fn bun_orphaned_store_entry_is_still_rolled_back() {
+    let before: &[u8] = b"module.exports = 'original'\n";
+    let after: &[u8] = b"module.exports = 'original' // PATCHED-599\n";
+    let (before_hash, after_hash) = (git_sha256(before), git_sha256(after));
+    let purl = "pkg:npm/is-number@6.0.0";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "app", "version": "0.0.0", "dependencies": { "is-number": "7.0.0" } }"#,
+    )
+    .expect("write root package.json");
+    let orphan = install_npm_pkg(
+        root,
+        "node_modules/.bun/is-number@6.0.0/node_modules",
+        "is-number",
+        "6.0.0",
+        after,
+    );
+    install_npm_pkg(
+        root,
+        "node_modules/.bun/is-number@7.0.0/node_modules",
+        "is-number",
+        "7.0.0",
+        b"module.exports = 7\n",
+    );
+    std::fs::create_dir_all(root.join("node_modules/.bun/node_modules")).expect("hoist dir");
+    std::os::unix::fs::symlink(
+        "../is-number@7.0.0/node_modules/is-number",
+        root.join("node_modules/.bun/node_modules/is-number"),
+    )
+    .expect("hoist link");
+    std::os::unix::fs::symlink(
+        ".bun/is-number@7.0.0/node_modules/is-number",
+        root.join("node_modules/is-number"),
+    )
+    .expect("importer link");
+    let socket = write_socket_manifest(
+        root,
+        &[manifest_entry(
+            purl,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            &before_hash,
+            &after_hash,
+        )],
+    );
+    stage_blob(&socket, &before_hash, before);
+    stage_blob(&socket, &after_hash, after);
+
+    let (code, stdout, stderr) = run(root, &["rollback", "--offline", "--yes"]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        !stderr.contains("no matching installed package"),
+        "the orphaned entry must be found; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(orphan.join("index.js")).expect("read orphan index.js"),
+        before,
+        "the orphaned entry keeps its patched bytes; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
 }

@@ -21,14 +21,11 @@
 //! that crashes, swallows the PURL, or silently reports success no
 //! longer slips through.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use crate::cache_env;
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+use crate::common::binary;
 
 /// Build a `socket-patch` `Command` with the ambient `SOCKET_*` env
 /// surface scrubbed (mirrors `common::run_with_env`). The binary binds
@@ -439,6 +436,57 @@ fn rollback_global_with_empty_path_handles_missing_npm() {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert_eq!(code, 0, "missing npm rollback → exit 0; stdout={stdout}");
     assert_rollback_noop(&stdout);
+}
+
+/// #443: when Bun is in use but its global dir can't be told (here
+/// `BUN_INSTALL_GLOBAL_DIR` is relative, so it names a dir relative to
+/// wherever `bun add -g` ran), a global run says so on stderr instead of
+/// silently leaving Bun's globals out. `--json` keeps the warning (stdout
+/// stays the envelope); `--silent` mutes it.
+#[test]
+fn apply_global_warns_when_bun_global_dir_is_undeterminable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    write_manifest(tmp.path(), "pkg:npm/__bun_undetermined__@1.0.0");
+
+    let run = |extra: &[&str]| {
+        let mut args = vec!["apply", "--global", "--offline", "--json"];
+        args.extend_from_slice(extra);
+        let out = cli(tmp.path())
+            .args(&args)
+            .env("PATH", "/nonexistent-dir-for-test")
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("BUN_INSTALL_GLOBAL_DIR", "relative/bun-global")
+            .output()
+            .expect("run socket-patch");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "stdout={stdout}\nstderr={stderr}"
+        );
+        assert_apply_not_installed(&stdout, "pkg:npm/__bun_undetermined__@1.0.0");
+        stderr
+    };
+
+    let stderr = run(&[]);
+    assert!(
+        stderr.contains(
+            "Warning: could not determine Bun's global package directory \
+             (BUN_INSTALL_GLOBAL_DIR is \"relative/bun-global\", not an absolute path)"
+        ),
+        "stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.matches("could not determine Bun's global").count(),
+        1,
+        "said once per run; stderr={stderr}"
+    );
+    let stderr = run(&["--silent"]);
+    assert!(!stderr.contains("Bun's global"), "stderr={stderr}");
 }
 
 // ---------------------------------------------------------------------------

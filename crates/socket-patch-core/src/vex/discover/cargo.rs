@@ -88,8 +88,9 @@
 //! `[patch] crates-io = { … }` forms). The path must be root-anchored
 //! ([`vendor_ref`]: a `../` or absolute spelling consumes some OTHER
 //! checkout's copy), the leaf a single `<name>-<version>` directory for the
-//! entry's crate. Same liveness truth source as
-//! `vendor::cargo::vendored_entry_in_use`: when a `Cargo.lock` parses, it
+//! entry's crate. The lock is the liveness truth source (the prune GC's
+//! in-use verdict, `Discovery::vendor_entry_in_use`, reads it from these
+//! refs): when a `Cargo.lock` parses, it
 //! must hold a SOURCELESS `[[package]]` for that name + version — an entry
 //! with a registry source (re-resolved, or a hosted takeover) or none at
 //! all means the copy is not what builds, and so does a
@@ -97,7 +98,7 @@
 //! a `[patch]` left out of the graph — e.g. by the user's path dependency,
 //! whose lock entry is sourceless too), so no ref ([`DIAG_REF_INVALID`]).
 //! No lock (first build pending) or an unparseable one (cargo refuses to
-//! build) keeps the ref, like `vendored_entry_in_use`. A manifest entry
+//! build) keeps the ref. A manifest entry
 //! cargo ignores is no ref ([`DIAG_REF_INVALID`]) either: cargo lets a
 //! project-config `[patch]` item with the same key replace it (unless that
 //! item wires the same path — the half-migrated shape, attested through the
@@ -118,11 +119,11 @@ use super::{
     Discovery, PatchedRef, TomlDiag, UnlockedPin, VendorRef, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::formats::cargo::{CargoLock, CopyClaim, LockedPackage};
+use crate::formats::cargo::{is_registry_source, CargoLock, CopyClaim, LockedPackage};
 use crate::patch::redirect::generation::{hosted_pin_name, PIN_NAME_PREFIX};
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
-    effective_config_rel, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
+    effective_config_rel_in, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
     CONFIG_TOML,
 };
 use crate::vendor::cargo_manifest::{crates_io_url_alias_tables, is_crates_io_source};
@@ -178,6 +179,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         .unwrap_or_default();
 
     hosted_from_lock(ctx, &lock, decls.as_ref(), &definitions, out);
+    unpatched_twins(ctx, &lock, out);
     if let (Some(decls), Some(doc)) = (&decls, &manifest) {
         unresolved_manifest_pins(ctx, &lock, decls, doc, &definitions, out);
     }
@@ -313,7 +315,7 @@ fn parse_toml(file: &str, text: &str, out: &mut Discovery) -> Option<DocumentMut
     toml_or_diag(file, text, TomlDiag::TrimEnd, out)
 }
 
-/// The config file cargo actually reads ([`effective_config_rel`]), parsed,
+/// The config file cargo actually reads ([`effective_config_rel_in`]), parsed,
 /// with its root-relative name. When `.cargo/config` exists cargo ignores
 /// `.cargo/config.toml` entirely (and warns); Socket-shaped wiring left in
 /// the ignored file is diagnosed so a "why is my patch not attested" has an
@@ -322,7 +324,7 @@ async fn read_config(
     ctx: &DiscoverCtx<'_>,
     out: &mut Discovery,
 ) -> Option<(&'static str, DocumentMut)> {
-    if effective_config_rel(ctx.root).await == CONFIG_TOML {
+    if effective_config_rel_in(ctx.view).await == CONFIG_TOML {
         return read_toml(ctx, CONFIG_TOML, out)
             .await
             .map(|doc| (CONFIG_TOML, doc));
@@ -426,11 +428,10 @@ fn dependency_entries(doc: &DocumentMut) -> Vec<DepEntry> {
 /// The patch uuid a Cargo.lock `source` routes to, when it is a registry
 /// source on a Socket patch server.
 fn source_uuid(ctx: &DiscoverCtx<'_>, source: &str) -> Option<String> {
-    let s = source.trim();
-    if !(s.starts_with("sparse+") || s.starts_with("registry+")) {
+    if !is_registry_source(source) {
         return None; // git / path / local-registry sources are never ours
     }
-    ctx.hosted_uuid(s)
+    ctx.hosted_uuid(source.trim())
 }
 
 fn hosted_from_lock(
@@ -532,6 +533,56 @@ fn hosted_from_lock(
     }
 }
 
+/// Record every lock block that resolves a Socket-hosted crate's
+/// `name@version` from another source ([`Discovery::unpatched_copy`]).
+/// Cargo never unifies packages of different sources, so a dependency that
+/// locks its own crates.io (or git) copy beside the hosted pin, typically
+/// one added after the scan (#679), compiles that copy unpatched. The hosted
+/// ref is then withheld from attestation, though rollback / remove still
+/// unwind it. A re-scan cannot rewire the other copy (the rewriter refuses
+/// a crate a transitive dependent resolves from crates.io,
+/// `redirect_cargo_transitive_dependents`), so it is a shadow, not a
+/// rewirable ref.
+fn unpatched_twins(ctx: &DiscoverCtx<'_>, lock: &Lock, out: &mut Discovery) {
+    let packages = lock.packages();
+    let hosted: Vec<&LockedPackage> = packages
+        .iter()
+        .filter(|p| {
+            p.source
+                .as_deref()
+                .is_some_and(|s| source_uuid(ctx, s).is_some())
+        })
+        .collect();
+    if hosted.is_empty() {
+        return;
+    }
+    for pkg in packages {
+        let Some(source) = pkg.source.as_deref() else {
+            // A sourceless block is a workspace member, a path dependency or
+            // a vendored copy (tagged, so another version): not this crate.
+            continue;
+        };
+        if source_uuid(ctx, source).is_some()
+            || !hosted
+                .iter()
+                .any(|h| h.name == pkg.name && h.version == pkg.version)
+        {
+            continue;
+        }
+        out.unpatched_copy(
+            CARGO_LOCK,
+            simple_purl("cargo", &pkg.name, &pkg.version),
+            &format!("{} {} ({source})", pkg.name, pkg.version),
+            &format!(
+                "resolves the same crate version from another source, which cargo builds \
+                 beside the Socket copy for the dependents that lock it (`cargo tree -i \
+                 {}@{}` lists them)",
+                pkg.name, pkg.version
+            ),
+        );
+    }
+}
+
 /// Diagnose `Cargo.toml` Socket-registry pins no lock entry turns into a ref
 /// (no exact version to attest), and malformed `socket-patch-*` names.
 ///
@@ -600,6 +651,7 @@ fn unresolved_manifest_pins(
                             uuid: uuid.clone(),
                             file: CARGO_TOML.into(),
                             version_reqs,
+                            index_url: definitions.get(reg.as_str()).cloned(),
                         });
                     }
                     format!("there is no {CARGO_LOCK} to fix its version")
@@ -667,7 +719,7 @@ async fn vendored_from_patches(
     file: &str,
     doc: &DocumentMut,
     lock: &Lock,
-    shadowed: &dyn Fn(&CargoPatchEntry<'_>) -> Option<String>,
+    shadowed: &(dyn Fn(&CargoPatchEntry<'_>) -> Option<String> + Sync),
     out: &mut Discovery,
 ) {
     for entry in patch_entries(doc) {
@@ -739,7 +791,10 @@ async fn vendored_from_patches(
         }
         let copy_tagged = matches!(tag, CopyTag::Tagged(_) | CopyTag::Unreadable);
         if let Lock::Parsed(lock) = lock {
-            let why = match lock.vendored_in_use(name, version, &vref.uuid, copy_tagged) {
+            let claim = lock.vendored_in_use(name, version, &vref.uuid, copy_tagged);
+            let relock_pending =
+                matches!(claim, CopyClaim::OtherTag(_) | CopyClaim::UntaggedOverride);
+            let why = match claim {
                 CopyClaim::Consumed => None,
                 CopyClaim::OtherTag(other) => Some(format!(
                     "{CARGO_LOCK} builds the copy tagged for patch {other} ({name} {})",
@@ -756,6 +811,16 @@ async fn vendored_from_patches(
                 )),
             };
             if let Some(why) = why {
+                // The manifest still routes the crate to this copy and the
+                // lock entry is detached: only the lock's generation lags,
+                // and the next unlocked build consumes the copy.
+                if relock_pending {
+                    out.withheld.push(super::Recognized {
+                        uuid: vref.uuid.clone(),
+                        mode: super::WiringMode::Vendored,
+                        file: std::path::PathBuf::from(file),
+                    });
+                }
                 out.diag(
                     DIAG_REF_INVALID,
                     file,
@@ -925,6 +990,66 @@ mod tests {
     }
 
     // ── hosted: shapes ───────────────────────────────────────────────
+
+    /// #679: a dependency added after the hosted pin resolves its own
+    /// crates.io copy of the same cfg-if 1.0.4 (cargo cannot unify the two
+    /// sources), so the build compiles the unpatched copy too. The ref is
+    /// withheld from attestation, diagnosed, and kept as `shadowed` so
+    /// rollback / remove still unwind the pin.
+    #[tokio::test]
+    async fn crates_io_twin_of_the_hosted_crate_withholds_the_ref() {
+        for other in [
+            CRATES_IO.to_string(),
+            "git+https://github.com/rust-lang/cfg-if?rev=1#abc".to_string(),
+        ] {
+            let p = Project::new();
+            p.write("Cargo.toml", manifest(&pinned("cfg-if", "1.0.4", UUID_A)));
+            p.write(
+                "Cargo.lock",
+                lock(&[
+                    ("cfg-if", "1.0.4", Some(&other), Some(CKSUM)),
+                    ("cfg-if", "1.0.4", Some(&index(UUID_A)), Some(CKSUM)),
+                    ("crc32fast", "1.5.0", Some(CRATES_IO), Some(CKSUM)),
+                ]),
+            );
+            p.write(".cargo/config.toml", registry_block(UUID_A));
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert_eq!(
+                out.shadowed
+                    .iter()
+                    .map(|r| (r.purl.as_str(), r.uuid.as_str()))
+                    .collect::<Vec<_>>(),
+                [("pkg:cargo/cfg-if@1.0.4", UUID_A)],
+                "{other}"
+            );
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("cfg-if")
+                        && d.detail.contains("UNPATCHED")),
+                "{other}: {:#?}",
+                out.diagnostics
+            );
+        }
+        // Another VERSION from crates.io is a different package: no effect.
+        let p = Project::new();
+        p.write("Cargo.toml", manifest(&pinned("cfg-if", "1.0.4", UUID_A)));
+        p.write(
+            "Cargo.lock",
+            lock(&[
+                ("cfg-if", "0.1.10", Some(CRATES_IO), Some(CKSUM)),
+                ("cfg-if", "1.0.4", Some(&index(UUID_A)), Some(CKSUM)),
+            ]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(out.shadowed.is_empty());
+    }
 
     #[tokio::test]
     async fn workspace_and_target_tables_carry_the_pin() {

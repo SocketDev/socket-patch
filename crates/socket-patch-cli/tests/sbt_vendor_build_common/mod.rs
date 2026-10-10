@@ -258,6 +258,51 @@ pub fn dump(out: &Output) -> String {
     )
 }
 
+/// How an sbt run reports a failed fetch from Maven Central: Coursier
+/// (`Error downloading g:a:v` / `not found: https://…`), Ivy on 0.13 /
+/// 1.0–1.2 (`Server access error`, `unresolved dependency`) and the
+/// launcher booting a line (`Error retrieving required libraries`).
+const FETCH_ERRORS: &[&str] = &[
+    "Error downloading",
+    "download error",
+    "Server access error",
+    "unresolved dependency",
+    "Error retrieving required libraries",
+];
+
+/// The warm-up `sbt sbtVersion update` in `proj`, the one run that
+/// fetches from Maven Central (the fixture's GAs are not in the image's
+/// warm seed). On a CI runner Central blips: a CDN 404 or reset for an
+/// artifact it serves, which failed every test of a leg at once
+/// (`Error downloading org.apache.commons:commons-text:1.10.0 / Not
+/// found`). A run that failed with a fetch error is retried from a fresh
+/// home (Coursier and Ivy can remember a miss) and no build outputs, after
+/// a backoff; any other failure returns at once.
+pub fn warm_up(sbt: &Sbt, proj: &Path, home: &mut SbtHome) -> Output {
+    const ATTEMPTS: u64 = 3;
+    let mut attempt = 1;
+    loop {
+        let out = sbt.run(proj, home, &[], &["sbtVersion", "update"]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if ok(&out) || attempt == ATTEMPTS || !FETCH_ERRORS.iter().any(|e| text.contains(e)) {
+            return out;
+        }
+        eprintln!("warm-up `sbt update` attempt {attempt} failed fetching; retrying");
+        std::thread::sleep(Duration::from_secs(10 * attempt));
+        let dir = home.root.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&home.root).unwrap();
+        for rel in BUILD_OUTPUT_DIRS.iter().chain(&["project/target"]) {
+            let _ = std::fs::remove_dir_all(proj.join(rel));
+        }
+        *home = SbtHome::new(&dir);
+        attempt += 1;
+    }
+}
+
 /// Directories sbt writes that a checkout never carries.
 pub const BUILD_OUTPUT_DIRS: &[&str] = &["target", ".bsp", ".bloop", ".metals", "project/project"];
 

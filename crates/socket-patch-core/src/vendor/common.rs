@@ -9,6 +9,7 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::formats::text::{split_bom, strip_bom, strip_bom_bytes};
 use crate::manifest::schema::PatchFileInfo;
 use crate::patch::apply::{
     is_safe_relative_subpath, normalize_file_path, ApplyResult, VerifyResult, VerifyStatus,
@@ -104,19 +105,11 @@ pub(crate) fn done(
     }
 }
 
-/// Shared helper the vendor backends delegate to: the fail-closed refusals
-/// for a `--vendor-source=service` run that cannot reach the service —
-/// combined with `--offline`, or with no API client configured — checked
-/// before any service consultation. Every backend's service helper treats
-/// `!service_enabled()` as "build locally", so this is the one gate that
-/// keeps `service` mode from silently building.
+/// Refuse network acquisition when offline or without an API client.
 pub(crate) fn service_offline_conflict(
     service: Option<&VendorServiceConfig>,
 ) -> Option<VendorOutcome> {
     let cfg = service?;
-    if !cfg.source.requires_service() {
-        return None;
-    }
     if cfg.offline {
         return Some(refused(
             "vendor_service_offline_conflict",
@@ -152,16 +145,6 @@ pub(crate) fn detect_indent(text: &str) -> String {
     "  ".to_string()
 }
 
-/// The file's dominant line terminator (new lines we write use it; bytes
-/// outside edited spans keep whatever they had).
-pub(crate) fn detect_eol(text: &str) -> &'static str {
-    if text.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
-
 /// Pretty-print JSON with `indent` + a trailing newline (the shape npm and
 /// composer themselves emit), so untouched keys stay byte-identical and a
 /// later `npm install` / `composer update` produces no format-only churn.
@@ -179,12 +162,12 @@ pub(crate) fn serialize_json(value: &Value, indent: &str) -> std::io::Result<Vec
 /// Node and yarn berry (`Manifest.loadFromText`'s `stripBOM`) all do —
 /// serde_json rejects one.
 pub(crate) fn parse_json_manifest(bytes: &[u8]) -> serde_json::Result<Value> {
-    serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes))
+    serde_json::from_slice(strip_bom_bytes(bytes))
 }
 
 /// [`parse_json_manifest`] for text already decoded as UTF-8.
 pub(crate) fn parse_json_text(text: &str) -> serde_json::Result<Value> {
-    serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
+    serde_json::from_str(strip_bom(text))
 }
 
 /// The byte layout a re-serialized JSON manifest keeps from the text it
@@ -200,7 +183,7 @@ pub(crate) fn parse_json_text(text: &str) -> serde_json::Result<Value> {
 /// with ([`majority_terminator`]; the forward vendor paths refuse such a
 /// file before this runs, so only a revert reaches that arm).
 pub(crate) struct JsonLayout {
-    bom: bool,
+    bom: &'static str,
     indent: String,
     eol: &'static str,
     trailer: String,
@@ -210,10 +193,7 @@ impl JsonLayout {
     /// The layout of `text` (a manifest's current contents).
     pub(crate) fn of(text: &str) -> Self {
         use crate::utils::line_endings::{majority_terminator, LineEndings};
-        let (bom, body) = match text.strip_prefix('\u{feff}') {
-            Some(rest) => (true, rest),
-            None => (false, text),
-        };
+        let (bom, body) = split_bom(text);
         let content = body.trim_end_matches([' ', '\t', '\r', '\n']);
         let eol = match LineEndings::of(body) {
             LineEndings::Crlf => "\r\n",
@@ -235,9 +215,7 @@ impl JsonLayout {
         pretty.pop();
         let pretty = String::from_utf8(pretty).map_err(std::io::Error::other)?;
         let mut out = String::with_capacity(pretty.len() + self.trailer.len() + 3);
-        if self.bom {
-            out.push('\u{feff}');
-        }
+        out.push_str(self.bom);
         // serde_json escapes every newline INSIDE a string value, so each
         // `\n` it emits is a line break of the layout.
         if self.eol == "\n" {
@@ -366,6 +344,16 @@ pub(crate) fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
     swap_sibling_for(copy_dir, ".socket-old")
 }
 
+/// Remove a failed stage, optionally unwind a fresh UUID directory, and prune
+/// empty parents. Existing wired copies must survive failed rebuilds.
+pub(crate) async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
+    let _ = remove_tree(stage).await;
+    if unwind_uuid_dir {
+        let _ = remove_tree(uuid_dir).await;
+    }
+    prune_empty_vendor_levels(uuid_dir).await;
+}
+
 /// Swap a fully-built stage into place without a destructive window: park the
 /// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
 /// stage over the now-vacant copy path, and only then delete the backup. Every
@@ -450,31 +438,53 @@ pub(crate) async fn any_live_file_references(
     false
 }
 
+/// The repair remedy for wiring an earlier socket-patch vendoring left in a
+/// stale or foreign shape. `vendor --revert` takes no package argument, so
+/// the remedy names its whole-project reach instead of implying a
+/// per-package form that does not exist (B80).
+///
+/// `socket-patch rollback <purl>` reverts one entry through the same
+/// per-entry revert, but it is not a drop-in "then vendor again": without
+/// `--preserve-state` it also deletes the artifact, the ledger record and
+/// the purl's manifest entry, so the following `vendor` has nothing left to
+/// vendor (the user would have to `get` the patch again); with
+/// `--preserve-state` it keeps a ledger entry whose wiring records are spent,
+/// and re-vendoring over that from a stale-shape lock (gem CHECKSUMS,
+/// Poetry/PDM/Pipenv sources) is not covered by any test. Until that path is
+/// proven, the remedy stays the whole-project revert, which keeps the
+/// manifest and re-vendors every package from it.
+pub(crate) const REVERT_ALL_AND_REVENDOR: &str = "run `socket-patch vendor --revert` (it reverts \
+     EVERY vendored package in the project, not just this one), then vendor again";
+
 // ── pre-write guards shared by the pypi lock flavors ────────────────────────
 
-/// Refuse (with the flavor's stable `code`) when any of `files` (root-relative)
-/// is itself a symbolic link. Every lock writer stages a replacement next to
-/// the path and renames over it, which REPLACES the link with a detached
-/// regular file: the shared target the link points at stays unpatched (git
-/// shows a 120000→100644 typechange), and `revert` restores bytes but never
-/// the link. Both wire and revert check before any write — the package
-/// managers themselves write THROUGH a linked lock.
+/// Refuse when any of `files` (root-relative) is itself a symbolic link,
+/// with the one symlink refusal every mode uses
+/// ([`crate::hosted::engine::symlink_refusal`]: hosted rewrites, the
+/// vendored group commit, and each backend's own pre-write check). Every
+/// lock writer stages a replacement next to the path and renames over it,
+/// which REPLACES the link with a detached regular file: the shared target
+/// the link points at stays unpatched (git shows a 120000→100644
+/// typechange), and `revert` restores bytes but never the link. Both wire
+/// and revert check before any write — the package managers themselves
+/// write THROUGH a linked lock.
 pub(crate) async fn refuse_symlinked(
     root: &Path,
     files: &[&str],
-    code: &'static str,
 ) -> Result<(), (&'static str, String)> {
     match first_symlink(root, files.iter().copied()).await {
-        Some(file) => Err((
-            code,
-            format!(
-                "{file} is a symbolic link; the atomic rewrite would replace the link with \
-                 a regular file and leave its target stale — vendor the real file's directory \
-                 instead"
-            ),
-        )),
+        Some(file) => Err(symlink_refusal(file)),
         None => Ok(()),
     }
+}
+
+/// [`crate::hosted::engine::symlink_refusal`] as a vendored backend's
+/// `(code, detail)` failure.
+pub(crate) fn symlink_refusal(file: &str) -> (&'static str, String) {
+    (
+        crate::hosted::engine::SYMLINK_REFUSAL,
+        crate::hosted::engine::symlink_refusal(file).message,
+    )
 }
 
 /// Refuse (with the flavor's stable `code`) when `file` (root-relative) no
@@ -599,15 +609,25 @@ pub(crate) fn pep508_name(spec: &str) -> &str {
     &s[..end]
 }
 
-/// Whether a `[[package]]` unit (as its lines) names `canon` — PEP 503
-/// canonical comparison, the form the pypi lock generators record.
-pub(crate) fn unit_has_canon_name(lines: &[&str], canon: &str) -> bool {
-    lines
-        .iter()
-        .find_map(|l| l.strip_prefix("name = "))
-        .map(|r| canonicalize_pypi_name(r.trim().trim_matches('"')))
-        .as_deref()
-        == Some(canon)
+/// Whether a dependency spec is a PEP 508 direct reference
+/// (`name[extras] @ <url>`: an `https://` / `file://` archive, a
+/// `git+…` checkout, …) rather than a registry requirement. Such a
+/// declaration is the user's own source choice, which neither writer may
+/// overwrite (#767).
+pub(crate) fn is_pep508_direct_reference(spec: &str) -> bool {
+    let spec = spec.trim_start();
+    let name = pep508_name(spec);
+    if name.is_empty() {
+        return false;
+    }
+    let mut rest = spec[name.len()..].trim_start();
+    if rest.starts_with('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        rest = rest[end + 1..].trim_start();
+    }
+    rest.starts_with('@')
 }
 
 /// The lock's `[[package]]` tables whose `name` canonicalizes (PEP 503) to

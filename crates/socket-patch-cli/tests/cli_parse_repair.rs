@@ -1,11 +1,8 @@
-//! CLI contract tests for the `repair` subcommand (and its `gc` visible alias).
+//! CLI contract tests for the `repair` subcommand.
 //!
-//! These tests pin the public clap parser surface for `RepairArgs`. In v3.0
-//! `repair`'s `--download-mode` aligns with every other command (default
-//! `"diff"`); the legacy `"file"` default was retired so the surface stays
-//! uniform. Users that need legacy per-file blob downloads opt in with
-//! `--download-mode file`. The `gc` visible alias is also exercised so a
-//! refactor that drops it is caught immediately.
+//! These tests pin the public clap parser surface for `RepairArgs`. v5.0
+//! removed `--download-mode` (repair always fetches per-file blobs) and the
+//! `gc` alias; both must stay parse errors.
 //!
 //! See `crates/socket-patch-cli/CLI_CONTRACT.md` for the full repair table.
 //!
@@ -17,8 +14,8 @@
 //! satisfy these assertions even if the corresponding CLI default
 //! (`default_value`/`default_value_t`) regressed or a flag's action broke —
 //! the env value would mask the bug and the test would pass for the wrong
-//! reason (e.g. an exported `SOCKET_DOWNLOAD_MODE=diff` keeps the default
-//! assertion green even if the clap `default_value` were changed to `"file"`).
+//! reason (e.g. an exported `SOCKET_DOWNLOAD_ONLY=true` keeps a flag
+//! assertion green even if the flag's action broke).
 //! To make the assertions test *argv parsing* rather than the ambient
 //! environment, every parse runs with the full set of `SOCKET_*` vars scrubbed
 //! (see [`EnvScrub`]). Because the environment is process-global, every test is
@@ -30,7 +27,6 @@ use std::path::PathBuf;
 use clap::Parser;
 use socket_patch_cli::commands::repair::RepairArgs;
 use socket_patch_cli::{Cli, Commands};
-use socket_patch_core::api::blob_fetcher::DownloadMode;
 
 /// Every `SOCKET_*` env var that clap consults while parsing `repair` (its own
 /// `--download-only` flag plus the flattened `GlobalArgs`). If any leaks in
@@ -45,7 +41,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_ORG_SLUG",
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
     "SOCKET_VENDOR_SOURCE",
     "SOCKET_VENDOR_URL",
     "SOCKET_PATCH_SERVER_URL",
@@ -111,17 +106,6 @@ fn parse_repair(extra: &[&str]) -> RepairArgs {
     }
 }
 
-fn parse_gc(extra: &[&str]) -> RepairArgs {
-    let _scrub = EnvScrub::new();
-    let mut argv = vec!["socket-patch", "gc"];
-    argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
-    match cli.command {
-        Commands::Repair(a) => a,
-        _ => panic!("expected Repair via gc alias"),
-    }
-}
-
 /// Owned, comparable snapshot of *every* parsed field in `RepairArgs` — its own
 /// `download_only` flag plus every field of the flattened `GlobalArgs`.
 /// `RepairArgs`/`GlobalArgs` are production types we may not touch and don't
@@ -143,7 +127,6 @@ struct Snap {
     org: Option<String>,
     proxy_url: Option<String>,
     ecosystems: Option<Vec<String>>,
-    download_mode: String,
     vendor_source: String,
     vendor_url: Option<String>,
     patch_server_url: Option<String>,
@@ -171,7 +154,6 @@ fn snapshot(a: &RepairArgs) -> Snap {
         org: a.common.org.clone(),
         proxy_url: a.common.proxy_url.clone(),
         ecosystems: a.common.ecosystems.clone(),
-        download_mode: a.common.download_mode.clone(),
         vendor_source: a.common.vendor_source.clone(),
         vendor_url: a.common.vendor_url.clone(),
         patch_server_url: a.common.patch_server_url.clone(),
@@ -206,7 +188,6 @@ fn expected_defaults() -> Snap {
         org: None,
         proxy_url: None, // no clap default — resolved in core
         ecosystems: None,
-        download_mode: "diff".to_string(),
         vendor_source: "service".to_string(),
         vendor_url: None,
         patch_server_url: None,
@@ -232,26 +213,12 @@ fn repair_defaults_match_contract() {
     let args = parse_repair(&[]);
 
     // Pin the *entire* default surface in one shot against the independent
-    // oracle. The previous version only checked download_mode, cwd,
+    // oracle. The previous version only checked cwd,
     // manifest_path, dry_run, offline, download_only and json — leaving
     // api_url, proxy_url, verbose, silent, yes, lock_timeout,
     // debug, no_telemetry, global, global_prefix, ecosystems, api_token and
     // org free to regress unnoticed.
     assert_eq!(snapshot(&args), expected_defaults());
-
-    // v3.0: repair's --download-mode default aligns with every other
-    // command (was "file" in v2.x). Users that need the legacy per-file
-    // blob behavior opt in with `--download-mode file`.
-    assert_eq!(args.common.download_mode, "diff");
-    // The clap layer stores a raw String with no value_parser, so the
-    // assertion above only proves the literal echoes. Bind it to the real
-    // runtime validator so a regression that changes what `"diff"` *means*
-    // (or stops recognizing it) fails here too.
-    assert_eq!(
-        DownloadMode::parse(&args.common.download_mode),
-        Ok(DownloadMode::Diff),
-        "default download_mode must be the real Diff variant"
-    );
 }
 
 #[test]
@@ -310,91 +277,14 @@ fn repair_json_flag() {
     assert_eq!(snapshot(&args), expected);
 }
 
+/// v5.0 removed `--download-mode`: repair always fetches per-file blobs.
 #[test]
 #[serial_test::serial]
-fn repair_download_mode_file() {
-    let args = parse_repair(&["--download-mode", "file"]);
-    let mut expected = expected_defaults();
-    expected.download_mode = "file".to_string();
-    assert_eq!(snapshot(&args), expected);
-    // The legacy per-file blob opt-in this test exists to protect: assert
-    // `"file"` is a mode the engine actually recognizes, not just an echoed
-    // string. If `File` support is dropped, this fails loudly.
-    assert_eq!(
-        DownloadMode::parse(&args.common.download_mode),
-        Ok(DownloadMode::File)
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn repair_download_mode_diff() {
-    let args = parse_repair(&["--download-mode", "diff"]);
-    let mut expected = expected_defaults();
-    expected.download_mode = "diff".to_string();
-    assert_eq!(snapshot(&args), expected);
-    assert_eq!(
-        DownloadMode::parse(&args.common.download_mode),
-        Ok(DownloadMode::Diff)
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn repair_download_mode_package_removed() {
-    // `package` still parses at the clap layer (any string does) but the
-    // runtime validator rejects it with a removal message, not a generic
-    // unknown-mode error.
-    let args = parse_repair(&["--download-mode", "package"]);
-    let mut expected = expected_defaults();
-    expected.download_mode = "package".to_string();
-    assert_eq!(snapshot(&args), expected);
-    assert!(DownloadMode::parse(&args.common.download_mode)
-        .unwrap_err()
-        .contains("removed"));
-}
-
-#[test]
-#[serial_test::serial]
-fn repair_download_mode_rejects_unknown_at_runtime() {
-    // The clap surface accepts ANY string for --download-mode (no
-    // value_parser); validation is deferred to `DownloadMode::parse` in the
-    // run path. Pin that two-layer contract: a bogus mode parses at the clap
-    // layer but is rejected by the validator. Without this, a test asserting
-    // only the clap echo would pass even if every mode were silently valid.
-    let args = parse_repair(&["--download-mode", "bogus"]);
-    assert_eq!(args.common.download_mode, "bogus");
-    assert!(
-        DownloadMode::parse(&args.common.download_mode).is_err(),
-        "unknown download mode must be rejected by the runtime validator"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn repair_gc_alias_defaults_match_repair() {
-    let via_gc = parse_gc(&[]);
-    let via_repair = parse_repair(&[]);
-
-    // The whole point of the alias: identical parsing. Compare the *entire*
-    // parsed surface, and independently anchor both to the contract defaults
-    // so the test isn't merely "the parser agrees with itself".
-    assert_eq!(snapshot(&via_gc), expected_defaults());
-    assert_eq!(snapshot(&via_repair), expected_defaults());
-    assert_eq!(snapshot(&via_gc), snapshot(&via_repair));
-    assert_eq!(
-        DownloadMode::parse(&via_gc.common.download_mode),
-        Ok(DownloadMode::Diff)
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn repair_gc_alias_accepts_flags() {
-    let args = parse_gc(&["--dry-run"]);
-    let mut expected = expected_defaults();
-    expected.dry_run = true;
-    assert_eq!(snapshot(&args), expected);
+fn repair_download_mode_flag_is_removed() {
+    match Cli::try_parse_from(["socket-patch", "repair", "--download-mode", "file"]) {
+        Ok(_) => panic!("--download-mode must be rejected"),
+        Err(err) => assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument),
+    }
 }
 
 /// Regression: an exported-but-empty `SOCKET_DOWNLOAD_ONLY=` — the shell/CI
@@ -492,15 +382,11 @@ fn repair_unknown_flag_is_unknown_argument_error() {
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
-// --- `gc` is a first-class visible alias for `repair` ---------------------
+// --- `repair` in help; the removed `gc` alias -------------------------------
 //
 // `scan --mode agent --prune` (or `--sync`) combines apply and GC in one
-// pass, but `gc`/`repair` remain documented commands for users who want to
-// clean up without an
-// apply pass. These tests guard the `visible_alias = "gc"` attribute on
-// `Commands::Repair` — if a future refactor demotes the alias (to
-// `alias = "gc"` or removes it entirely), the help output check below
-// will fail.
+// pass, but `repair` remains a documented command for users who want to
+// clean up without an apply pass. v5 removed its `gc` alias.
 
 fn top_level_help() -> String {
     let _scrub = EnvScrub::new();
@@ -524,29 +410,13 @@ fn repair_appears_in_top_level_help() {
 
 #[test]
 #[serial_test::serial]
-fn gc_alias_is_visible_in_top_level_help() {
+fn removed_gc_alias_is_a_usage_error() {
     let help = top_level_help();
-    // clap renders a *visible* alias inline on the subcommand's help row as
-    // `[aliases: gc]`. A hidden `alias = "gc"` produces no such marker at all,
-    // so this fails loudly if the alias is demoted or dropped. Require the
-    // exact visible-alias marker — accepting a bare `gc` substring would match
-    // unrelated help text (e.g. the prose explaining the alias).
-    assert!(
-        help.contains("[aliases: gc]"),
-        "`gc` visible alias must be listed in --help output:\n{help}"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn gc_alias_parses_as_repair() {
+    assert!(!help.contains("[aliases: gc]"), "{help}");
     let _scrub = EnvScrub::new();
     match Cli::try_parse_from(["socket-patch", "gc"]) {
-        Ok(cli) => assert!(
-            matches!(cli.command, Commands::Repair(_)),
-            "gc should resolve to Repair"
-        ),
-        Err(e) => panic!("gc alias should parse: {e}"),
+        Ok(_) => panic!("`gc` should no longer parse"),
+        Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::InvalidSubcommand),
     }
 }
 

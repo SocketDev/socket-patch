@@ -11,8 +11,11 @@
 //! the built binary with a scrubbed child environment (`run_cli` /
 //! `vendor_cli`). No test mutates this process's environment.
 
+#[path = "common/envelope.rs"]
+mod envelope;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
+use envelope::{events, find_event};
 
 async fn vendor_run(mut args: VendorArgs) -> i32 {
     let server = prebuilt_common::Server::project(&args.common.cwd);
@@ -243,19 +246,6 @@ fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
     (code, env)
 }
 
-fn events(envelope: &Value) -> &Vec<Value> {
-    envelope["events"].as_array().expect("events array")
-}
-
-fn find_event<'a>(envelope: &'a Value, action: &str, error_code: Option<&str>) -> &'a Value {
-    events(envelope)
-        .iter()
-        .find(|e| e["action"] == action && error_code.is_none_or(|c| e["errorCode"] == c))
-        .unwrap_or_else(|| {
-            panic!("expected a `{action}` event (errorCode={error_code:?}) in:\n{envelope:#}")
-        })
-}
-
 /// A synthetic ledger with one entry of `eco` for [`PURL`], written via the
 /// real `save_state` serializer (what a tampered-but-parseable state.json
 /// deserializes into).
@@ -263,11 +253,11 @@ async fn write_ledger_entry(root: &Path, eco: &str) {
     let mut state = VendorState::default();
     state.entries.insert(
         PURL.to_string(),
-        VendorEntry {
-            ecosystem: eco.into(),
-            base_purl: PURL.into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            eco.into(),
+            PURL.into(),
+            UUID.into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: format!(".socket/vendor/{eco}/{UUID}/left-pad-1.3.0.tgz"),
                 sha256: String::new(),
@@ -275,18 +265,8 @@ async fn write_ledger_entry(root: &Path, eco: &str) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
+            Vec::new(),
+        ),
     );
     save_state(root, &state).await.unwrap();
 }
@@ -1163,11 +1143,12 @@ async fn reconcile_state_write_failure_reports_failed_after_removal() {
 /// writes) after the backend already wrote the artifact: the run's ONE
 /// commit of the lock rewire and the ledger fails as a whole, so neither is
 /// written — the lock keeps its pre-run bytes, no ledger appears — and the
-/// run exits 1 with the top-level `vendor_commit_failed` error. The
-/// package's `Applied` event still reports what the backend did; the
-/// artifact is an orphan the next run re-vendors over. (Before the group
-/// commit this was a per-package `vendor_state_write_failed` next to an
-/// already-rewired lock.)
+/// run exits 1 with the top-level `vendor_commit_failed` error. Like the
+/// symlink refusal (#898), nothing of the package stands: it is a `failed`
+/// event with that code, not `applied`, the artifact the backend wrote is
+/// removed, and the human run claims no vendored package. (Before the
+/// group commit this was a per-package `vendor_state_write_failed` next to
+/// an already-rewired lock.)
 #[cfg(unix)]
 #[tokio::test]
 async fn vendor_state_write_failure_reports_failed_event() {
@@ -1180,12 +1161,19 @@ async fn vendor_state_write_failure_reports_failed_event() {
 
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_eq!(code, 1, "{env:#}");
-    let applied = find_event(&env, "applied", None);
-    assert_eq!(applied["purl"], PURL, "the backend vendored: {env:#}");
     assert_eq!(env["error"]["code"], "vendor_commit_failed", "{env:#}");
+    assert_eq!(env["summary"]["applied"], 0, "{env:#}");
+    let failed = find_event(&env, "failed", Some("vendor_commit_failed"));
+    assert_eq!(failed["purl"], PURL, "{env:#}");
     assert!(
-        fx.tgz_path().is_file(),
-        "the artifact the backend wrote is on disk"
+        !events(&env)
+            .iter()
+            .any(|e| e["action"] == "applied" || e["errorCode"] == "vendor_prebuilt_downloaded"),
+        "nothing reports the uncommitted vendoring as done: {env:#}"
+    );
+    assert!(
+        !fx.tgz_path().exists(),
+        "the uncommitted run leaves no orphan artifact"
     );
     assert!(!fx.state_path().exists(), "the ledger write failed");
     assert_eq!(
@@ -1193,6 +1181,63 @@ async fn vendor_state_write_failure_reports_failed_event() {
         fx.original_lock,
         "the lock rewire is committed with the ledger or not at all"
     );
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["vendor", "--cwd", fx.root().to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("Vendored 1 package") && !stdout.contains("Next steps"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+/// #691: yarn 1 resolves the vendored `file:./.socket/vendor/…` tarball
+/// against the directory it runs in, so in a workspaces project every
+/// cold-cache install run from a member directory fails once vendoring
+/// wires one. The vendor run must say so (and say nothing for a project
+/// without workspaces).
+#[test]
+fn yarn_classic_workspaces_vendor_warns_about_member_dir_installs() {
+    const CODE: &str = "yarn_classic_workspace_member_install_risk";
+    let yarn_lock = format!(
+        "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
+         # yarn lockfile v1\n\n\n\
+         left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"{REG_RESOLVED}\"\n  \
+         integrity {REG_INTEGRITY}\n"
+    );
+    for workspaces in [true, false] {
+        let fx = npm_fixture();
+        std::fs::remove_file(fx.lock_path()).unwrap();
+        let manifest = if workspaces {
+            std::fs::create_dir_all(fx.root().join("a")).unwrap();
+            std::fs::write(
+                fx.root().join("a/package.json"),
+                br#"{"name":"a","version":"1.0.0","dependencies":{"left-pad":"^1.3.0"}}"#,
+            )
+            .unwrap();
+            r#"{"name":"fixture","version":"1.0.0","private":true,"workspaces":["a"]}"#
+        } else {
+            r#"{"name":"fixture","version":"1.0.0","private":true,"dependencies":{"left-pad":"^1.3.0"}}"#
+        };
+        std::fs::write(fx.root().join("package.json"), manifest).unwrap();
+        std::fs::write(fx.root().join("yarn.lock"), &yarn_lock).unwrap();
+
+        let (code, env) = vendor_cli(fx.root(), &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert!(
+            std::fs::read_to_string(fx.root().join("yarn.lock"))
+                .unwrap()
+                .contains("resolved \"file:./.socket/vendor/"),
+            "{env:#}"
+        );
+        let warned = env["warnings"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| w["code"] == CODE));
+        assert_eq!(warned, workspaces, "workspaces={workspaces}: {env:#}");
+    }
 }
 
 /// #627: a symlinked lockfile (a lock shared with another checkout) is
@@ -1264,7 +1309,68 @@ async fn vendor_refuses_a_symlinked_lock_instead_of_replacing_it() {
             !fx.state_path().exists(),
             "{linked}: no ledger entry was committed"
         );
+        // #898: "nothing was written" holds — the artifact the loop
+        // downloaded before the commit was refused is removed — and the
+        // package is reported refused, not applied.
+        assert!(
+            !fx.tgz_path().exists(),
+            "{linked}: the refused run leaves no orphan artifact"
+        );
+        assert_eq!(env["summary"]["applied"], 0, "{linked}: {env:#}");
+        let refused = find_event(&env, "failed", Some("redirect_symlinked_file_unsupported"));
+        assert_eq!(refused["purl"], PURL, "{linked}: {env:#}");
+
+        // The human run neither claims a vendored package nor advises
+        // committing `.socket/vendor/`.
+        let (code, stdout, stderr) = run_cli(
+            fx.root(),
+            &["vendor", "--cwd", fx.root().to_str().unwrap()],
+            &[],
+        );
+        assert_eq!(code, 1, "{linked}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains(&format!("{linked} is a symbolic link")),
+            "{linked}: {stdout}\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("Vendored 1 package") && !stdout.contains("Next steps"),
+            "{linked}: {stdout}\n{stderr}"
+        );
+        assert!(!fx.tgz_path().exists(), "{linked}");
     }
+}
+
+/// #898: a refused commit removes only the artifact dirs the run ADDED.
+/// An artifact the pre-run ledger already names, deleted and redownloaded
+/// in place by this run, is referenced without any commit, so the refusal
+/// keeps it (the ledger still points there).
+#[cfg(unix)]
+#[tokio::test]
+async fn refused_commit_keeps_an_artifact_the_ledger_already_names() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
+    let state_before = std::fs::read(fx.state_path()).unwrap();
+    // The artifact is lost and the lock re-resolved from the registry
+    // (e.g. a fresh `npm install`), and the lock is now a shared symlink.
+    std::fs::remove_dir_all(fx.tgz_path().parent().unwrap()).unwrap();
+    let shared = tempfile::tempdir().unwrap();
+    let target = shared.path().join("package-lock.json");
+    std::fs::write(&target, &fx.original_lock).unwrap();
+    std::fs::remove_file(fx.lock_path()).unwrap();
+    std::os::unix::fs::symlink(&target, fx.lock_path()).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 1, "{env:#}");
+    assert_eq!(
+        env["error"]["code"], "redirect_symlinked_file_unsupported",
+        "{env:#}"
+    );
+    assert!(
+        fx.tgz_path().is_file(),
+        "the artifact the pre-run ledger names is kept: {env:#}"
+    );
+    assert_eq!(std::fs::read(fx.state_path()).unwrap(), state_before);
+    assert_eq!(std::fs::read(&target).unwrap(), fx.original_lock);
 }
 
 /// #627 follow-up: an already-vendored package whose lock is LATER made a

@@ -23,8 +23,7 @@
 
 use regex::Regex;
 
-use super::npm::{by_uuid, read_or_refuse, refuse_all_in};
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::patch::redirect::{
     generation, maven_repositories_with_id, maven_tag_inner_range, maven_tag_text_in,
     remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS, MVN_CONFIG, MVN_CONFIG_ARGS,
@@ -283,8 +282,8 @@ pub(crate) async fn restore(
                 Ok(next) => {
                     text = next;
                     checksum_dirs.push(format!(
-                        "{}/{artifact}/{suffixed}/",
-                        group.replace('.', "/")
+                        "{}/",
+                        crate::vendor::jvm::layout::version_dir(group, artifact, &suffixed)
                     ));
                     restored.push(&pin.uuid);
                 }

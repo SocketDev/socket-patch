@@ -275,14 +275,7 @@ pub(super) fn dry_run_line(plan: Plan, refused: usize) -> String {
 /// without it, running the hint verbatim patches the cwd project and
 /// leaves the global copy unpatched (#464).
 pub(super) fn report_only_hint(common: &GlobalArgs) -> [String; 3] {
-    let scope = match &common.global_prefix {
-        Some(prefix) => Some(format!(
-            "--global-prefix {}",
-            shell_word(&prefix.to_string_lossy())
-        )),
-        None if common.global => Some("-g".to_string()),
-        None => None,
-    };
+    let scope = ui::global_scope_arg(common);
     let (scan, get) = match &scope {
         Some(scope) => (
             format!("  socket-patch scan --mode agent {scope}"),
@@ -298,28 +291,6 @@ pub(super) fn report_only_hint(common: &GlobalArgs) -> [String; 3] {
         scan,
         get,
     ]
-}
-
-/// `word` as one argument a user can paste into their shell: bare when it
-/// holds only characters no shell treats specially, otherwise quoted (POSIX
-/// single quotes; double quotes on Windows, which cmd and PowerShell both
-/// read as one argument). A trailing run of backslashes is doubled inside
-/// the Windows quotes: the argv parser would otherwise read the last one as
-/// escaping the closing quote.
-fn shell_word(word: &str) -> String {
-    let plain = |c: char| {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '/' | '.' | '_' | '-' | ':' | '+' | '=' | ',' | '@')
-            || (cfg!(windows) && c == '\\')
-    };
-    if !word.is_empty() && word.chars().all(plain) {
-        word.to_string()
-    } else if cfg!(windows) {
-        let trailing = word.len() - word.trim_end_matches('\\').len();
-        format!("\"{word}{}\"", "\\".repeat(trailing))
-    } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
-    }
 }
 
 /// Printed (vendored mode, before vendoring) for a selected package whose
@@ -350,7 +321,7 @@ pub(super) fn already_recorded_line(purl: &str, uuid: &str, reapply: bool) -> St
     let tag = if reapply { "re-apply" } else { "skip" };
     format!(
         "  [{tag}] {purl} (already recorded: {})",
-        super::super::get::short_uuid(uuid)
+        crate::ui::short_uuid(uuid)
     )
 }
 
@@ -470,7 +441,7 @@ pub(super) fn patch_block(b: &PatchBlock) -> Vec<String> {
     let replaces = b
         .replaces
         .as_ref()
-        .map(|r| format!(" (replaces {})", super::super::get::short_uuid(r.uuid)))
+        .map(|r| format!(" (replaces {})", crate::ui::short_uuid(r.uuid)))
         .unwrap_or_default();
     lines.push(format!(
         "  {} [{}] {}{replaces}",

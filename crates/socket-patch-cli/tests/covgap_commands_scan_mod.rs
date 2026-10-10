@@ -21,7 +21,7 @@
 //!   `hosted_wiring_retained` stderr warning after an in-place apply;
 //! * human runs: a bare scan runs hosted mode; a mode-less `--prune`/global
 //!   scan is report-only (no download, no `.socket/`, prints the
-//!   `scan --mode agent` hint), while `--mode agent` / `--apply` apply
+//!   `scan --mode agent` hint), while `--mode agent` / `--sync` apply
 //!   without prompting;
 //! * the hosted human arm's results table and `[UPDATE]` detection (parity
 //!   with the agent/vendored arms);
@@ -32,36 +32,27 @@
 //! `cli_scan_silent.rs` pattern) so ambient developer/CI configuration
 //! cannot reroute the branch under test. Network tests use wiremock.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "common/pty_io.rs"]
 mod pty_io;
 #[path = "vlt_hosted_common/mod.rs"]
 mod vlt_hosted_common;
 #[path = "vlt_hosted_common/vendored.rs"]
 mod vlt_vendored;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const OLD_UUID: &str = "99999999-9999-4999-8999-999999999999";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn write_root_package_json(root: &Path) {
     std::fs::write(
@@ -316,13 +307,11 @@ fn seed_manifest(root: &Path, entries: &[(&str, &str)]) {
 }
 
 // ---------------------------------------------------------------------------
-// resolve_mode_flags — the remaining cross-mode conflict arms
+// resolve_mode_flags — the `--sync` cross-mode conflict
 // ---------------------------------------------------------------------------
-// Only the `--mode hosted --vendor` arm is pinned in cli_parse_scan.rs;
-// these cover the --apply / --sync / --vendor booleans against a
-// different --mode, plus ScanMode::Agent.cli_name() rendering into the
-// message. Clap parses each combination fine (no value-dependent conflict
-// is expressible); the fold is what rejects them.
+// `--sync` means `--mode agent --prune`, so it contradicts any other
+// `--mode`. Clap parses each combination fine (no value-dependent conflict
+// is expressible); the fold is what rejects them, naming the mode.
 
 mod mode_fold {
     use clap::Parser;
@@ -369,18 +358,8 @@ mod mode_fold {
 
     #[test]
     #[serial_test::serial]
-    fn mode_vendored_with_apply_boolean_errors() {
-        let err = fold_err(&["--mode", "vendored", "--apply"]);
-        assert!(
-            err.contains("--mode vendored cannot be used with --apply"),
-            "the --apply arm must name the conflicting boolean: {err}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn mode_hosted_with_sync_boolean_errors() {
-        // --sync counts as an agent-mode spelling, so it contradicts hosted.
+        // --sync means agent mode, so it contradicts hosted.
         let err = fold_err(&["--mode", "hosted", "--sync"]);
         assert!(
             err.contains("--mode hosted cannot be used with --sync"),
@@ -390,13 +369,11 @@ mod mode_fold {
 
     #[test]
     #[serial_test::serial]
-    fn mode_agent_with_vendor_boolean_errors_naming_agent() {
-        // Pins ScanMode::Agent.cli_name(): "agent" must render into the
-        // message (the only user-visible spelling of the variant).
-        let err = fold_err(&["--mode", "agent", "--vendor"]);
+    fn mode_vendored_with_sync_boolean_errors() {
+        let err = fold_err(&["--mode", "vendored", "--sync"]);
         assert!(
-            err.contains("--mode agent cannot be used with --vendor"),
-            "the agent arm must render cli_name() and the boolean: {err}"
+            err.contains("--mode vendored cannot be used with --sync"),
+            "the vendored arm must render cli_name(): {err}"
         );
     }
 }
@@ -1348,10 +1325,10 @@ async fn scan_global_report_only_hint_keeps_the_global_scope() {
     );
 }
 
-/// Each spelling that folds to `--mode agent` applies without prompting.
+/// Each spelling that selects `--mode agent` applies without prompting.
 #[tokio::test]
 async fn scan_human_agent_mode_applies_without_prompting() {
-    for flags in [&["--mode", "agent"][..], &["--apply"][..]] {
+    for flags in [&["--mode", "agent"][..], &["--sync"][..]] {
         let mock = MockServer::start().await;
         let purl = "pkg:npm/silent-target@1.0.0";
         let before = b"before\n";
@@ -2287,10 +2264,17 @@ fn scan_hosted_rejects_global() {
         "{stderr:?}"
     );
     assert!(stdout.is_empty());
-    // Like every usage error (and clap's own), no JSON envelope under --json.
+    // Under --json a self-enforced usage error prints the coded error on
+    // stdout (v5.0; clap's own parse errors still print nothing there).
     let (code, stdout, _) = run_scan(tmp.path(), &["--mode", "hosted", "--global", "--json"]);
     assert_eq!(code, 2);
-    assert!(stdout.trim().is_empty(), "{stdout:?}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("JSON on stdout");
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], "global_scope_unsupported", "{v}");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("--global cannot be used with --mode hosted"));
     let prefix = tempfile::tempdir().unwrap();
     let (code, _, stderr) = run_scan(
         tmp.path(),
@@ -2313,10 +2297,10 @@ fn scan_hosted_rejects_global() {
 #[test]
 fn scan_mode_conflict_error_is_capitalized_and_names_no_hidden_flag() {
     let tmp = tempfile::tempdir().unwrap();
-    let (code, _, stderr) = run_scan(tmp.path(), &["--mode", "hosted", "--vendor"]);
+    let (code, _, stderr) = run_scan(tmp.path(), &["--mode", "hosted", "--sync"]);
     assert_eq!(code, 2);
     assert!(
-        stderr.starts_with("Error: --mode hosted cannot be used with --vendor"),
+        stderr.starts_with("Error: --mode hosted cannot be used with --sync"),
         "{stderr:?}"
     );
     assert!(!stderr.contains("--redirect"), "{stderr:?}");
@@ -2582,7 +2566,7 @@ async fn scan_human_table_shows_full_purl_with_version() {
 // ---------------------------------------------------------------------------
 
 /// `scan --mode vendored --prune`: the lock-driven GC keeps the vlt entry
-/// `vlt-lock.json` still resolves to its dir (`vendored_entry_in_use` is
+/// `vlt-lock.json` still resolves to its dir (the in-use verdict is
 /// structural: a `file` node under the uuid) and reclaims one it does not.
 #[tokio::test]
 async fn scan_prune_keeps_a_wired_vlt_uuid_and_sweeps_an_unwired_one() {
@@ -2750,4 +2734,239 @@ async fn scan_agent_json_nested_apply_failure_reaches_the_apply_block() {
         "the apply error text must reach the envelope: {v}"
     );
     assert_eq!(std::fs::read(member.join("index.js")).unwrap(), b"before\n",);
+}
+
+/// `scan --mode agent --json` over an installed file a local edit changed
+/// (neither beforeHash nor afterHash): the default policy overwrites it,
+/// and the `apply` block's `warnings[]` must report that overwrite — the
+/// same `content_mismatch_overwritten` warning `apply --json` and the human
+/// scan print — instead of dropping it (#1004).
+#[tokio::test]
+async fn scan_agent_json_mismatch_overwrite_reaches_the_apply_block() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/locally-edited@1.0.0";
+    mount_one_patch_api(&mock, purl, b"before\n").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(
+        tmp.path(),
+        "locally-edited",
+        "1.0.0",
+        b"before\n// local edit\n",
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON envelope");
+    let apply = &v["apply"];
+    assert_eq!(apply["applied"], 1, "{v}");
+    let warned = apply["warnings"].as_array().is_some_and(|ws| {
+        ws.iter().filter_map(|w| w.as_str()).any(|w| {
+            w.starts_with("(content_mismatch_overwritten) ")
+                && w.contains(purl)
+                && w.contains("package/index.js")
+        })
+    });
+    assert!(warned, "the overwrite must be reported: {v}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/locally-edited/index.js")).unwrap(),
+        b"after\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1062: human / JSON parity when every detail query succeeds but is empty
+// ---------------------------------------------------------------------------
+
+/// Mount a by-package response that succeeds with NO patch records (the
+/// batch said the package has one; the detail query found none to offer).
+async fn mount_by_package_empty(mock: &MockServer, purl: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{}",
+            encode_purl(purl)
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// #1062: when every detail query succeeds but returns no records, scan
+/// has nothing to select. That is a successful run with no applicable
+/// patches in every mode, so the human arm must exit like the `--json`
+/// arm (0), not report a fetch failure and exit 1.
+#[tokio::test]
+async fn scan_empty_detail_results_exit_alike_in_human_and_json() {
+    let purl = "pkg:npm/minimist@1.2.2";
+    // `--prune` alone is report-only (no mode); `--dry-run` keeps every
+    // mode read-only.
+    let modes: [&[&str]; 4] = [
+        &["--mode", "agent"],
+        &["--mode", "vendored"],
+        &["--mode", "hosted"],
+        &["--prune"],
+    ];
+    for mode in modes {
+        for dry in [false, true] {
+            let mock = MockServer::start().await;
+            mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+            mount_by_package_empty(&mock, purl).await;
+
+            let mut codes = Vec::new();
+            for json in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                write_root_package_json(tmp.path());
+                write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+                let mut extra: Vec<&str> = mode.to_vec();
+                if dry {
+                    extra.push("--dry-run");
+                }
+                if json {
+                    extra.push("--json");
+                }
+                let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &extra);
+                assert!(
+                    !stderr.contains("could not fetch patch details"),
+                    "{extra:?}: no query failed, so no fetch failure; stderr={stderr}"
+                );
+                if json {
+                    let v: serde_json::Value =
+                        serde_json::from_str(stdout.trim()).expect("valid JSON");
+                    assert_ne!(v["status"], "error", "{extra:?}: {v}");
+                }
+                codes.push((code, stdout, stderr));
+            }
+            let (human, json) = (&codes[0], &codes[1]);
+            assert_eq!(
+                human.0, json.0,
+                "{mode:?} dry={dry}: human and --json exit alike\n\
+                 human stdout={}\nhuman stderr={}\njson stdout={}\njson stderr={}",
+                human.1, human.2, json.1, json.2
+            );
+            assert_eq!(human.0, 0, "{mode:?} dry={dry}: nothing to do is a success");
+        }
+    }
+}
+
+/// #1062: a human `--dry-run --prune` previews the GC (once) where the
+/// `--json` arm previews it (`gc` block).
+#[tokio::test]
+async fn scan_dry_run_prune_previews_gc_in_human_and_json() {
+    let purl = "pkg:npm/minimist@1.2.2";
+    let stale = "pkg:npm/left-pad@1.3.0";
+    // Agent and report-only (no mode; `--prune` below). Vendored mode's
+    // human GC on early exits is #1127.
+    for mode in [&["--mode", "agent"][..], &[][..]] {
+        let mock = MockServer::start().await;
+        mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+        mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+        for json in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_root_package_json(tmp.path());
+            write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+            // A recorded patch for a package that is not installed: the
+            // GC would prune its entry.
+            seed_manifest(tmp.path(), &[(stale, OLD_UUID)]);
+            let manifest = tmp.path().join(".socket/manifest.json");
+            let before = std::fs::read(&manifest).unwrap();
+            let mut extra: Vec<&str> = mode.to_vec();
+            extra.extend(["--prune", "--dry-run", "--yes"]);
+            if json {
+                extra.push("--json");
+            }
+            let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &extra);
+            assert_eq!(code, 0, "{extra:?}: stdout={stdout}; stderr={stderr}");
+            if json {
+                let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+                assert!(
+                    v["gc"]["prunedManifestEntries"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|p| p == stale)),
+                    "{extra:?}: {v}"
+                );
+            } else {
+                assert_eq!(
+                    stdout
+                        .matches("[dry-run] GC would prune 1 manifest entry")
+                        .count(),
+                    1,
+                    "{extra:?}: the human dry run previews the GC once; stdout={stdout}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(&manifest).unwrap(),
+                before,
+                "{extra:?}: a dry run writes nothing"
+            );
+        }
+    }
+}
+
+/// #1062: when some detail queries fail and the rest succeed with no
+/// records, the human run still warns per failed package (the `--json`
+/// arm adds a `patch_details_failed` warning each) and exits like it.
+#[tokio::test]
+async fn scan_partial_failure_with_empty_results_still_warns() {
+    let empty = "pkg:npm/minimist@1.2.2";
+    let bad = "pkg:npm/lodash@4.17.20";
+    let mock = MockServer::start().await;
+    let patch = |purl: &str| {
+        serde_json::json!({
+            "uuid": UUID, "purl": purl, "tier": "free", "cveIds": [],
+            "ghsaIds": [], "severity": "high", "title": "t"
+        })
+    };
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [
+                {"purl": empty, "patches": [patch(empty)]},
+                {"purl": bad, "patches": [patch(bad)]},
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    mount_by_package_empty(&mock, empty).await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{}",
+            encode_purl(bad)
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+
+    let mut codes = Vec::new();
+    for json in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+        write_npm_package(tmp.path(), "lodash", "4.17.20", b"x\n");
+        let mut extra = vec!["--mode", "agent", "--dry-run"];
+        if json {
+            extra.push("--json");
+        }
+        let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &extra);
+        if json {
+            let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+            assert!(
+                v["warnings"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|w| w["code"] == "patch_details_failed")),
+                "{v}"
+            );
+        } else {
+            assert!(
+                stderr.contains(&format!("Warning: could not fetch details for {bad}")),
+                "the failed package is named; stderr={stderr}"
+            );
+        }
+        codes.push(code);
+    }
+    assert_eq!(codes[0], codes[1], "human and --json exit alike");
 }

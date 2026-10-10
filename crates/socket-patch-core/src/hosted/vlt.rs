@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::constants::npm_family::{BUN_LOCKB, VLT_HIDDEN_LOCK_REL, VLT_LOCK, VLT_STORE_DIR};
 use crate::formats::governing_locks::{npm_locks_outside, NpmLockFamily};
 use crate::patch::redirect::vlt_preflight::{self, ArtifactProbe, OFFLINE_REASON};
-use crate::patch::redirect::{redact_grant_token, vlt, DepOverride};
+use crate::patch::redirect::{vlt, DepOverride};
 use crate::vendor::lock_inventory::{MemoryEntry, ProjectView};
 
 /// The warning code (and skip reason) of a dep whose artifact vlt would
@@ -24,10 +24,8 @@ pub const WITHHELD_REASON: &str = ARTIFACT_UNVERIFIABLE;
 /// megabytes and is never read into the rewriter's input.
 pub fn install_state_present(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
             let is = |rel: &str, dir: bool| {
                 std::fs::symlink_metadata(cwd.join(rel)).is_ok_and(|m| {
                     if dir {
@@ -51,10 +49,10 @@ pub fn install_state_present(view: &ProjectView<'_>) -> bool {
 /// Whether `bun.lockb` is present (disk: `exists`, which follows links).
 pub(crate) fn bun_lockb_present(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join(BUN_LOCKB).exists(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join(BUN_LOCKB).exists()
+        }
         ProjectView::Memory(project) => project.contains(BUN_LOCKB),
     }
 }
@@ -180,7 +178,11 @@ pub fn judge(
         );
         out.warnings.push(crate::hosted::engine::warning(
             ARTIFACT_UNVERIFIABLE,
-            redact_grant_token(&detail, &dep.artifact_url, &dep.patch_uuid),
+            crate::hosted::engine::redact_artifact_text(
+                &detail,
+                &dep.artifact_url,
+                &dep.patch_uuid,
+            ),
         ));
         if everywhere {
             out.withheld_everywhere

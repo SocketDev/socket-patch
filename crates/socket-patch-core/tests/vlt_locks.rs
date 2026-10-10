@@ -547,7 +547,6 @@ fn stage(case: &Case, crlf: bool) -> Staged {
 async fn vendor(case: &Case, staged: &Staged) -> VendorOutcome {
     let sources = PatchSources {
         blobs_path: &staged.blobs,
-        diffs_path: None,
         mem_blobs: None,
     };
     use base64::Engine as _;
@@ -603,8 +602,7 @@ async fn vendor(case: &Case, staged: &Staged) -> VendorOutcome {
         client: Some(ApiClient::new(ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
-            org_slug: None,
-            use_public_proxy: true,
+            route: socket_patch_core::api::client::ApiRoute::Proxy,
         })),
         use_public_proxy: true,
         vendor_url: None,

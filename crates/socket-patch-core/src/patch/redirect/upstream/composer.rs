@@ -32,6 +32,7 @@ use crate::crawlers::composer_crawler::normalize_version;
 use crate::formats::composer::hosted::{
     find_composer_entry, find_composer_member, json_string_field, ComposerEntry,
 };
+use crate::utils::redact::url_hostname;
 
 const COMPOSER_LOCK: &str = "composer.lock";
 /// The `notification-url` composer records for packagist packages.
@@ -127,6 +128,35 @@ fn declares_custom_repositories(composer_json: Option<&str>) -> Result<bool, Str
     })
 }
 
+/// Whether `composer.json` redeclares packagist with `options` (an
+/// `http.proxy`, `ssl` settings). Composer copies a repository's options
+/// into the `transport-options` of the lock entries it resolves from that
+/// repository only, and this restore only restores packagist-origin
+/// entries, so these are the only options a restored entry can have lost
+/// (the hosted rewrite drops them; packagist's metadata cannot give them
+/// back). Options on another repository belong to that repository's
+/// entries, which the restore refuses.
+fn packagist_declares_options(composer_json: Option<&str>) -> bool {
+    let Some(doc) = composer_json.and_then(|t| serde_json::from_str::<Value>(t).ok()) else {
+        return false;
+    };
+    let packagist_with_options = |r: &Value| {
+        r.get("options").is_some_and(|o| !o.is_null())
+            && r.get("url")
+                .and_then(Value::as_str)
+                .and_then(url_hostname)
+                .is_some_and(|host| {
+                    let host = host.to_ascii_lowercase();
+                    host == "packagist.org" || host.ends_with(".packagist.org")
+                })
+    };
+    match doc.get("repositories") {
+        Some(Value::Array(a)) => a.iter().any(packagist_with_options),
+        Some(Value::Object(o)) => o.values().any(packagist_with_options),
+        _ => false,
+    }
+}
+
 /// The packagist version entry that locked `locked` (exact pretty version
 /// first, then composer's leading-`v` normalization).
 fn pick_version<'v>(versions: &'v [Value], locked: &str) -> Result<&'v Value, String> {
@@ -176,6 +206,7 @@ pub(crate) async fn restore(
     };
     let composer_json = view.read("composer.json").await.ok().flatten();
     let custom_repos = declares_custom_repositories(composer_json.as_deref());
+    let repo_options = packagist_declares_options(composer_json.as_deref());
 
     let mut hits: Vec<Hit> = Vec::new();
     for pin in pins {
@@ -256,11 +287,7 @@ pub(crate) async fn restore(
             .collect();
 
     let escaped = content.contains("\\/");
-    let eol = if content.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
+    let eol = crate::utils::line_endings::terminator(&content);
     let mut content = content;
     let mut changed = false;
     for hit in &hits {
@@ -362,6 +389,18 @@ pub(crate) async fn restore(
         content.replace_range(d_start..=d_end, &format!("{source_text}{dist_text}"));
         changed = true;
         result.handled.insert(hit.uuid.clone());
+        if repo_options {
+            result.warnings.push((
+                "upstream_composer_transport_options_not_restored",
+                format!(
+                    "{label}: composer.json gives packagist repository options, but the \
+                     transport-options the hosted rewrite removed from this lock entry \
+                     cannot be restored; re-lock {} at {} to record them again (a plain \
+                     `composer update` may also move it and its dependents to newer versions)",
+                    hit.name, hit.locked_version
+                ),
+            ));
+        }
     }
     if changed {
         view.write(COMPOSER_LOCK, content);
@@ -456,6 +495,33 @@ mod tests {
             Ok(true)
         );
         assert!(declares_custom_repositories(Some("{")).is_err());
+    }
+
+    #[test]
+    fn packagist_options_gate() {
+        assert!(!packagist_declares_options(None));
+        assert!(!packagist_declares_options(Some("{")));
+        assert!(!packagist_declares_options(Some(
+            r#"{"repositories": [{"type": "composer", "url": "https://repo.packagist.org"}]}"#
+        )));
+        assert!(packagist_declares_options(Some(
+            r#"{"repositories": [{"type": "composer", "url": "https://repo.packagist.org",
+                "options": {"http": {"proxy": "http://proxy:3128"}}}]}"#
+        )));
+        // Options on a private repository belong to its own entries, which
+        // the restore refuses: no warning for packagist-origin restores.
+        assert!(!packagist_declares_options(Some(
+            r#"{"repositories": {"private": {"type": "composer", "url": "https://r.example",
+                "options": {"http": {"header": ["X-Token: t"]}}}}}"#
+        )));
+        assert!(packagist_declares_options(Some(
+            r#"{"repositories": [{"type": "composer", "url": "https://u:p@repo.packagist.org",
+                "options": {"ssl": {"verify_peer": false}}}]}"#
+        )));
+        assert!(!packagist_declares_options(Some(
+            r#"{"repositories": [{"type": "composer", "url": "https://packagist.org.evil.example",
+                "options": {"http": {"header": ["X-Token: t"]}}}]}"#
+        )));
     }
 
     #[test]

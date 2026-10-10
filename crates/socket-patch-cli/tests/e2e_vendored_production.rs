@@ -49,7 +49,7 @@
 //!
 //! | Ecosystem | PURL | Patch UUID | Marker in the patched bytes |
 //! |-----------|------|------------|-----------------------------|
-//! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
+//! | npm    | `pkg:npm/minimist@1.2.2`        | `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb` | `Socket Community Patch` header |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | `Socket Community Patch` header |
 //! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_PATCHES`]               | `Socket Community Patch` header |
 //!
@@ -100,6 +100,10 @@
 //!   cargo test -p socket-patch-cli --test e2e_vendored_production -- --ignored --test-threads=1
 //! ```
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -133,7 +137,7 @@ const PROXY: &str = "https://patches-api.socket.dev";
 const NPM_PURL: &str = "pkg:npm/minimist@1.2.2";
 const NPM_NAME: &str = "minimist";
 const NPM_VERSION: &str = "1.2.2";
-const NPM_UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+const NPM_UUID: &str = "642d7f02-ebc1-4ab0-99e2-07f5dd8463cb";
 
 const PYPI_PURL: &str = "pkg:pypi/urllib3@1.26.18";
 const PYPI_NAME: &str = "urllib3";
@@ -283,10 +287,6 @@ macro_rules! soft_skip {
 // ---------------------------------------------------------------------------
 // CLI invocation
 // ---------------------------------------------------------------------------
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 fn has_command(cmd: &str) -> bool {
     // `go` has no `--version` flag — it takes `go version` as a subcommand.
@@ -1493,8 +1493,9 @@ fn berry_skip_code(env: &serde_json::Value) -> String {
 
 /// Manifest-less VEX against PRODUCTION for the berry vendored leg, on the
 /// fresh checkout the real yarn just installed from the committed artifact:
-/// with the manifest deleted (ledger online + `--offline`), with the
-/// ledger deleted too (lockfile + artifact, record from the public proxy),
+/// with no manifest (v5 vendored mode writes none; ledger online +
+/// `--offline`), with the ledger deleted too (lockfile + artifact, record
+/// from the public proxy),
 /// `--offline` with nothing local (`record_unavailable`), and a copy whose
 /// lock + package.json are reverted to the registry while the ledger and
 /// artifact stay (`vendor_unwired`, even with `--no-verify`).
@@ -1508,7 +1509,12 @@ fn yarn_berry_vendored_manifestless_vex(
     let manifest = fresh.join(".socket/manifest.json");
     let ledger_path = fresh.join(".socket/vendor/state.json");
     let ledger = std::fs::read(&ledger_path).expect("vendor ledger");
-    std::fs::remove_file(&manifest).expect("scan --mode vendored writes a manifest");
+    // v5.0 vendored mode is manifest-free: the ledger embeds each entry's
+    // record, so the checkout is already manifest-less.
+    assert!(
+        !manifest.exists(),
+        "{LEG}: scan --mode vendored writes no .socket/manifest.json"
+    );
 
     let (code, env, doc) = yarn_berry_vex(fresh, &[]);
     assert_berry_vendored_attestation(code, &env, doc, &format!("{LEG}: ledger, online"));

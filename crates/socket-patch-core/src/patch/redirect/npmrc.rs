@@ -33,6 +33,8 @@
 //! and — when the project file is silent — the user / global / builtin
 //! config files ([`resolve_outer_allow_remote`]).
 
+use crate::formats::text::{split_bom, BOM};
+
 /// Repo-relative path of the project `.npmrc` the auto-config edits.
 pub const NPMRC_REL: &str = ".npmrc";
 
@@ -51,12 +53,11 @@ pub const NPMRC_ALLOW_REMOTE_LINE: &str = "allow-remote=all";
 /// The exact `.npmrc` the auto-config CREATES when none existed.
 pub const NPMRC_CREATED: &str = "allow-remote=all\n";
 
-const BOM: char = '\u{feff}';
-
 /// ECMAScript whitespace — what npm's `ini` means by `\s` and by
 /// `String.prototype.trim` (WhiteSpace + LineTerminator). Rust's
 /// `char::is_whitespace` differs only by U+0085 (NEL: not JS whitespace)
-/// and U+FEFF (the BOM: JS whitespace).
+/// and U+FEFF (the BOM: JS whitespace, so npm trims it off any key or
+/// value, not only at the start of the file).
 fn is_js_ws(c: char) -> bool {
     c == BOM || (c.is_whitespace() && c != '\u{85}')
 }
@@ -83,7 +84,7 @@ fn has_lone_cr(text: &str) -> bool {
 }
 
 /// npm `ini`'s section header — `^\[([^\]]*)\]\s*$` matched against the
-/// UNTRIMMED line: an indented `  [sec]` or a BOM-prefixed `\u{feff}[sec]`
+/// UNTRIMMED line: an indented `  [sec]` or a BOM-prefixed `[sec]`
 /// is NOT a header to npm (it parses as a top-level key), so it must not
 /// end the top-level scope here either.
 fn is_section_header(line: &str) -> bool {
@@ -98,7 +99,7 @@ fn is_section_header(line: &str) -> bool {
 /// with lone `\r`s, several npm lines) hold a real section header? `line0`
 /// is true for the file's first line, which carries the BOM `bom` the
 /// callers strip off before splitting (npm does NOT strip it, so a
-/// `\u{feff}[sec]` first line is no header).
+/// BOM-prefixed `[sec]` first line is no header).
 fn holds_section_header(bom: &str, line: &str, line0: bool) -> bool {
     let owned;
     let line = if line0 && !bom.is_empty() {
@@ -277,6 +278,20 @@ pub struct OuterAllowRemote {
     /// The highest-precedence explicit value among the user, global and
     /// builtin config files (all below the project `.npmrc`).
     pub file: Option<OuterFileValue>,
+    /// `replace-registry-host` in the same outer layers (see
+    /// [`effective_replace_registry_host`]).
+    pub replace_registry_host: OuterSetting,
+}
+
+/// One npm config key as the layers OUTSIDE the project `.npmrc` set it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct OuterSetting {
+    /// `(variable, value)` of an `npm_config_*` env var (beats every
+    /// `.npmrc`).
+    pub env: Option<(String, String)>,
+    /// The highest-precedence value among the user, global and builtin
+    /// config files.
+    pub file: Option<OuterFileValue>,
 }
 
 /// One explicit `allow-remote` assignment in a non-project npm config file.
@@ -430,9 +445,9 @@ impl NpmConfigEnv {
     /// An `npm_config_*` variable, matched the way npm's `loadEnv` does:
     /// prefix case-insensitive, then non-leading `_` → `-` and lowercased.
     /// Empty values are ignored (npm skips them). When several spellings
-    /// are set a non-`all` one wins (process env order is unspecified, so
-    /// the conservative reading is reported).
-    fn npm_config(&self, key: &str) -> Option<(String, String)> {
+    /// are set a non-`benign` one wins (process env order is unspecified,
+    /// so the conservative reading is reported).
+    fn npm_config(&self, key: &str, benign: &str) -> Option<(String, String)> {
         let mut found: Option<(String, String)> = None;
         for (k, v) in &self.vars {
             let Some(rest) = k
@@ -453,7 +468,7 @@ impl NpmConfigEnv {
                     c.to_ascii_lowercase()
                 });
             }
-            if norm == key && found.as_ref().is_none_or(|(_, prev)| prev == "all") {
+            if norm == key && found.as_ref().is_none_or(|(_, prev)| prev == benign) {
                 found = Some((k.clone(), v.clone()));
             }
         }
@@ -492,6 +507,43 @@ pub fn resolve_outer_allow_remote(
     env: &NpmConfigEnv,
     read: impl Fn(&std::path::Path) -> Option<String>,
 ) -> OuterAllowRemote {
+    let layers = outer_config_layers(env, read);
+    OuterAllowRemote {
+        env: env.npm_config("allow-remote", "all"),
+        file: outer_file_value(&layers, "allow-remote"),
+        replace_registry_host: OuterSetting {
+            env: env.npm_config(REPLACE_REGISTRY_HOST, "npmjs"),
+            file: outer_file_value(&layers, REPLACE_REGISTRY_HOST),
+        },
+    }
+}
+
+/// [`resolve_outer_allow_remote`] for any npm config `key` (e.g. the
+/// vendored flow's `allow-file`): the same layers, located the same way.
+/// `benign` is the key's permissive value, used to pick among several env
+/// spellings (a non-`benign` one wins).
+pub fn resolve_outer_npm_setting(
+    env: &NpmConfigEnv,
+    read: impl Fn(&std::path::Path) -> Option<String>,
+    key: &str,
+    benign: &str,
+) -> OuterSetting {
+    let layers = outer_config_layers(env, read);
+    OuterSetting {
+        env: env.npm_config(key, benign),
+        file: outer_file_value(&layers, key),
+    }
+}
+
+/// One non-project npm config file: `(layer, path, text)`.
+type OuterLayer = (&'static str, Option<std::path::PathBuf>, Option<String>);
+
+/// The user, global and builtin config files (highest precedence first),
+/// located as [`resolve_outer_allow_remote`] documents.
+fn outer_config_layers(
+    env: &NpmConfigEnv,
+    read: impl Fn(&std::path::Path) -> Option<String>,
+) -> [OuterLayer; 3] {
     use std::path::{Path, PathBuf};
     let home = env.home.as_deref();
     // The directory holding node (Windows) / its `bin` parent (Unix).
@@ -517,7 +569,7 @@ pub fn resolve_outer_allow_remote(
         }
     });
     let builtin_text = builtin_path.as_deref().and_then(&read);
-    let env_path = |key: &str| env.npm_config(key).map(|(_, v)| env.config_path(&v));
+    let env_path = |key: &str| env.npm_config(key, "all").map(|(_, v)| env.config_path(&v));
     let file_value = |text: &Option<String>, key: &str| {
         text.as_deref()
             .and_then(|t| npmrc_top_level_value(t, key))
@@ -538,24 +590,100 @@ pub fn resolve_outer_allow_remote(
                 .map(|prefix| prefix.join("etc").join("npmrc"))
         });
     let global_text = global_path.as_deref().and_then(&read);
-    let file = [
+    [
         ("user", user_path, user_text),
         ("global", global_path, global_text),
         ("builtin", builtin_path, builtin_text),
     ]
-    .into_iter()
-    .find_map(|(layer, path, text)| {
-        let value = npmrc_allow_remote(text.as_deref()?)?;
+}
+
+/// The highest-precedence top-level `key` assignment among `layers`.
+fn outer_file_value(layers: &[OuterLayer], key: &str) -> Option<OuterFileValue> {
+    layers.iter().find_map(|(layer, path, text)| {
+        let value = npmrc_top_level_value(text.as_deref()?, key)?;
         Some(OuterFileValue {
             layer,
-            path: path?,
+            path: path.clone()?,
             value,
         })
-    });
-    OuterAllowRemote {
-        env: env.npm_config("allow-remote"),
-        file,
+    })
+}
+
+/// npm's (>= 8) `replace-registry-host` config key. npm rewrites the origin
+/// of a lock's `resolved` URL to the configured registry when the URL's
+/// hostname equals this value (`npmjs`, the default, means
+/// `registry.npmjs.org`; `never` matches nothing) — or for EVERY origin
+/// under `always` (`@npmcli/arborist` `#registryResolved`). A hosted pin
+/// rewritten that way is fetched from the registry, which 404s.
+pub const REPLACE_REGISTRY_HOST: &str = "replace-registry-host";
+
+/// Where the effective `replace-registry-host` value comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingSource {
+    /// An `npm_config_*` environment variable (named).
+    Env(String),
+    /// The project `.npmrc`.
+    Project,
+    /// A user / global / builtin config file.
+    File {
+        layer: &'static str,
+        path: std::path::PathBuf,
+    },
+}
+
+/// The `replace-registry-host` value npm would use, following its layer
+/// order (env > project > user > global > builtin), or `None` when no
+/// layer sets it (npm's default `npmjs`).
+pub fn effective_replace_registry_host(
+    project: Option<&str>,
+    outer: &OuterAllowRemote,
+) -> Option<(String, SettingSource)> {
+    let outer = &outer.replace_registry_host;
+    if let Some((var, value)) = &outer.env {
+        return Some((value.clone(), SettingSource::Env(var.clone())));
     }
+    if let Some(value) = project.and_then(|t| npmrc_top_level_value(t, REPLACE_REGISTRY_HOST)) {
+        return Some((value, SettingSource::Project));
+    }
+    outer.file.as_ref().map(|f| {
+        (
+            f.value.clone(),
+            SettingSource::File {
+                layer: f.layer,
+                path: f.path.clone(),
+            },
+        )
+    })
+}
+
+/// Whether npm's `replace-registry-host=<value>` rewrites a `resolved` URL
+/// whose authority is `host` (`host[:port]`, as [`url_host`] returns it):
+/// `always`, or the URL's hostname (port dropped) equal to the value
+/// (`npmjs` standing for `registry.npmjs.org`). npm compares the raw value
+/// against the URL's lowercased hostname, so an uppercase value matches
+/// nothing.
+///
+/// [`url_host`]: crate::hosted::guidance::url_host
+pub fn replace_registry_host_rewrites(value: &str, host: &str) -> bool {
+    let value = value.trim_matches(is_js_ws);
+    if value == "always" {
+        return true;
+    }
+    // Drop a `:port` suffix (never inside an `[ipv6]` literal).
+    let hostname = match host.rfind(':') {
+        Some(i)
+            if !host[i..].contains(']') && host[i + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            &host[..i]
+        }
+        _ => host,
+    };
+    let target = if value == "npmjs" {
+        "registry.npmjs.org"
+    } else {
+        value
+    };
+    hostname.to_ascii_lowercase() == target
 }
 
 /// Decide how to ensure `allow-remote=all` in the project `.npmrc`,
@@ -605,11 +733,8 @@ pub fn plan_npmrc_allow_remote_with(existing: Option<&str>, outer: &OuterAllowRe
                 .into(),
         );
     }
-    let (bom, body) = match text.strip_prefix(BOM) {
-        Some(rest) => (&text[..BOM.len_utf8()], rest),
-        None => ("", text),
-    };
-    let crlf = body.contains("\r\n");
+    let (bom, body) = split_bom(text);
+    let crlf = crate::utils::line_endings::terminator(body) == "\r\n";
     let line = if crlf {
         format!("{NPMRC_ALLOW_REMOTE_LINE}\r")
     } else {
@@ -774,6 +899,43 @@ mod tests {
             panic!("append expected");
         };
         assert_eq!(text, "\u{feff}[x]\nallow-remote=all\n[sec]\ny=1\n");
+    }
+
+    /// One leading BOM is split off and put back byte-exact
+    /// (`formats::text::split_bom`); a second one stays in the body, where
+    /// npm's JS trim drops it from the key.
+    #[test]
+    fn npmrc_splice_keeps_one_bom_and_reads_a_second_as_whitespace() {
+        for bom in ["", "\u{feff}"] {
+            assert_eq!(
+                plan_npmrc_allow_remote(Some(&format!("{bom}a=1\n"))),
+                NpmrcPlan::Append(format!("{bom}a=1\nallow-remote=all\n"))
+            );
+        }
+        assert_eq!(
+            plan_npmrc_allow_remote(Some("\u{feff}\u{feff}allow-remote=none\n")),
+            NpmrcPlan::UserSet("none".into())
+        );
+    }
+
+    /// The spliced line takes `line_endings::terminator`'s style: the
+    /// majority of a mixed file's breaks, LF on a tie.
+    #[test]
+    fn spliced_line_takes_the_majority_terminator_of_a_mixed_npmrc() {
+        for (existing, want) in [
+            ("a=1\r\nb=2\n", "a=1\r\nb=2\nallow-remote=all\n"),
+            ("a=1\r\nb=2\nc=3\n", "a=1\r\nb=2\nc=3\nallow-remote=all\n"),
+            (
+                "a=1\r\nb=2\r\nc=3\n",
+                "a=1\r\nb=2\r\nc=3\nallow-remote=all\r\n",
+            ),
+            ("a=1\r\nb=2\r\n", "a=1\r\nb=2\r\nallow-remote=all\r\n"),
+        ] {
+            let NpmrcPlan::Append(text) = plan_npmrc_allow_remote(Some(existing)) else {
+                panic!("append expected for {existing:?}");
+            };
+            assert_eq!(text, want, "{existing:?}");
+        }
     }
 
     fn cfg_env(vars: &[(&str, &str)]) -> NpmConfigEnv {
@@ -1134,5 +1296,79 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// #812: `replace-registry-host` is read from every npm config layer in
+    /// npm's order (env > project > user > global > builtin), and matched
+    /// against a pinned origin the way `@npmcli/arborist` does.
+    #[test]
+    fn replace_registry_host_layers_and_matching() {
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+        let files: HashMap<PathBuf, &str> = HashMap::from([
+            (
+                PathBuf::from("/home/u/.npmrc"),
+                "replace-registry-host=always\n",
+            ),
+            (
+                PathBuf::from("/opt/node/etc/npmrc"),
+                "replace-registry-host=never\n",
+            ),
+        ]);
+        let read = |p: &Path| files.get(p).map(|s| s.to_string());
+
+        // Nothing set anywhere: npm's default (`npmjs`) applies.
+        let outer = resolve_outer_allow_remote(&cfg_env(&[]), |_| None);
+        assert_eq!(effective_replace_registry_host(None, &outer), None);
+
+        // The user file beats the global one.
+        let outer = resolve_outer_allow_remote(&cfg_env(&[]), read);
+        assert_eq!(
+            effective_replace_registry_host(Some("fund=false\n"), &outer),
+            Some((
+                "always".into(),
+                SettingSource::File {
+                    layer: "user",
+                    path: "/home/u/.npmrc".into()
+                }
+            ))
+        );
+        // ...the project file beats both...
+        assert_eq!(
+            effective_replace_registry_host(Some("replace-registry-host=npmjs\n"), &outer),
+            Some(("npmjs".into(), SettingSource::Project))
+        );
+        // ...and the env beats every file, in any spelling npm normalizes.
+        for var in [
+            "npm_config_replace_registry_host",
+            "NPM_CONFIG_REPLACE_REGISTRY_HOST",
+        ] {
+            let outer = resolve_outer_allow_remote(&cfg_env(&[(var, "always")]), read);
+            assert_eq!(
+                effective_replace_registry_host(Some("replace-registry-host=never\n"), &outer),
+                Some(("always".into(), SettingSource::Env(var.into())))
+            );
+        }
+        // allow-remote resolution is unaffected by the new key.
+        assert_eq!((outer.env, outer.file), (None, None));
+
+        let host = "patch.socket.dev";
+        assert!(replace_registry_host_rewrites("always", host));
+        assert!(replace_registry_host_rewrites(host, host));
+        assert!(replace_registry_host_rewrites(
+            "127.0.0.1",
+            "127.0.0.1:8765"
+        ));
+        assert!(replace_registry_host_rewrites(
+            "npmjs",
+            "registry.npmjs.org"
+        ));
+        assert!(!replace_registry_host_rewrites("npmjs", host));
+        assert!(!replace_registry_host_rewrites("never", host));
+        assert!(!replace_registry_host_rewrites("registry.example", host));
+        assert!(!replace_registry_host_rewrites("Always", host));
+        assert!(!replace_registry_host_rewrites("PATCH.SOCKET.DEV", host));
+        assert!(replace_registry_host_rewrites("[::1]", "[::1]:80"));
+        assert!(replace_registry_host_rewrites("[::1]", "[::1]"));
     }
 }

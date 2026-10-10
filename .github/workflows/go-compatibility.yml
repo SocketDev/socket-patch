@@ -8,6 +8,28 @@ name: Go patch compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Only this ecosystem's own files. A change to shared engine code
+    # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
+    # push to main (when it is in the push filter below) or nightly, or on
+    # demand via workflow_dispatch on the PR branch;
+    # ci.yml's per-ecosystem blocking slice still runs on every PR and in
+    # the merge queue (#1198).
+    paths:
+      - '.github/workflows/go-compatibility.yml'
+      - 'crates/*/src/**/*golang*'
+      - 'crates/*/src/**/*golang*/**'
+      - 'crates/socket-patch-core/src/vendor/go*.rs'
+      - 'crates/socket-patch-core/src/crawlers/go_crawler.rs'
+      - 'crates/socket-patch-core/src/crawlers/go_crawler/**'
+      - 'crates/socket-patch-cli/tests/e2e_golang_*build.rs'
+      - 'crates/socket-patch-cli/tests/e2e_vendor_golang_build.rs'
+      - 'crates/socket-patch-cli/tests/golang_e2e_matrix/**'
+      - 'crates/socket-patch-cli/tests/e2e_vex_lockfile/golang.rs'
+  push:
+    branches: [main]
+    # The ecosystem's pre-#1198 relevance set (the shared engine code its
+    # cells run through), its PR paths and the toolchain files. A main
+    # push outside this set waits for the nightly run below.
     paths:
       - '.github/workflows/go-compatibility.yml'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
@@ -22,8 +44,18 @@ on:
       - 'crates/socket-patch-cli/tests/golang_e2e_matrix/**'
       - 'crates/socket-patch-cli/tests/e2e_vex_lockfile/golang.rs'
       - 'crates/socket-patch-cli/tests/vex_e2e_common/**'
-  push:
-    branches: [main]
+      - 'crates/*/src/**/*golang*'
+      - 'crates/*/src/**/*golang*/**'
+      - 'crates/socket-patch-core/src/crawlers/go_crawler/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly full matrix, so a main change outside the push filter
+    # still gets a run within a day.
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -46,7 +78,7 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         go: ['1.18.10', '1.21.13', '1.24.13', '1.26.3']
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     steps: &go-steps
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -55,7 +87,7 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: go-compat
+          shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
@@ -86,6 +118,6 @@ jobs:
         # macOS-latest dyld refuses binaries without LC_UUID (Go < 1.24
         # linkers; see ci.yml's vexctl step).
         go: ['1.24.13', '1.26.3']
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     steps: *go-steps

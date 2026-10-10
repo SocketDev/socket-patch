@@ -19,6 +19,9 @@
 //! | d | the generated file edited | `sbt_owned_file_modified` |
 //! | e | no ledger | nothing attested; the tree check still runs |
 
+use crate::common::envelope::all_codes;
+use crate::common::git_sha256;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -58,10 +61,6 @@ fn jar(notice: &[u8]) -> Vec<u8> {
         zw.write_all(bytes).unwrap();
     }
     zw.finish().unwrap().into_inner()
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
 /// `root/proj`: the sbt 1.13.0 probe build (gson 2.8.9 resolved in `b`),
@@ -186,29 +185,6 @@ impl Fx {
     }
 }
 
-/// Every `code` / `errorCode` in an envelope.
-fn codes(env: &Value) -> Vec<String> {
-    fn walk(v: &Value, out: &mut Vec<String>) {
-        match v {
-            Value::Object(m) => {
-                for (k, v) in m {
-                    if k == "code" || k == "errorCode" {
-                        if let Some(s) = v.as_str() {
-                            out.push(s.to_string());
-                        }
-                    }
-                    walk(v, out);
-                }
-            }
-            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(env, &mut out);
-    out
-}
-
 /// Whether `doc` attests gson `not_affected` under [`VULN`].
 fn attested(doc: Option<&Value>) -> bool {
     doc.and_then(|d| d["statements"].as_array())
@@ -234,7 +210,7 @@ fn sbt_vendored_vex_attests_after_sbt_update() {
     let (code, env, doc) = fx.vex();
     assert_eq!(code, Some(0), "{env}");
     assert!(attested(doc.as_ref()), "{env}\n{doc:?}");
-    let got = codes(&env);
+    let got = all_codes(&env);
     assert!(
         !SBT_DIAGS.iter().any(|d| got.iter().any(|c| c == d)),
         "{env}"
@@ -246,7 +222,7 @@ fn sbt_vendored_vex_before_sbt_update_is_unverified() {
     let fx = Fx::vendored();
     let (_, env, _) = fx.vex();
     assert!(
-        codes(&env).contains(&"sbt_resolution_unverified".to_string()),
+        all_codes(&env).contains(&"sbt_resolution_unverified".to_string()),
         "{env}"
     );
 }
@@ -258,7 +234,7 @@ fn sbt_vendored_vex_flags_a_tampered_tree() {
     std::fs::write(tree_jar(&fx.proj), jar(b"EVIL\n")).unwrap();
     let (_, env, doc) = fx.vex();
     assert!(
-        codes(&env).contains(&"vendored_tree_missing".to_string()),
+        all_codes(&env).contains(&"vendored_tree_missing".to_string()),
         "{env}"
     );
     assert!(
@@ -276,7 +252,7 @@ fn sbt_vendored_vex_flags_an_edited_generated_file() {
     std::fs::write(&path, text.replace("// socket-patch ", "// mine ")).unwrap();
     let (_, env, _) = fx.vex();
     assert!(
-        codes(&env).contains(&"sbt_owned_file_modified".to_string()),
+        all_codes(&env).contains(&"sbt_owned_file_modified".to_string()),
         "{env}"
     );
 }
@@ -293,7 +269,7 @@ fn sbt_vendored_vex_without_a_ledger_attests_nothing() {
     std::fs::write(tree_jar(&fx.proj), jar(b"EVIL\n")).unwrap();
     let (_, env, _) = fx.vex();
     assert!(
-        codes(&env).contains(&"vendored_tree_missing".to_string()),
+        all_codes(&env).contains(&"vendored_tree_missing".to_string()),
         "{env}"
     );
 }

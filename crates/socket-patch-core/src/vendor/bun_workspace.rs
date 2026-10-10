@@ -1,7 +1,7 @@
 //! Integrity and repair for Bun's member-relative binary-lock tarballs.
 use std::path::{Path, PathBuf};
 
-use super::bun_binary::{prune_mirror_parents, undo_mirrors, validate_mirror_path};
+use super::bun_binary::{undo_mirrors, validate_mirror_path};
 use super::bun_lockb::BunLockb;
 use super::path::parse_vendor_path;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -15,7 +15,9 @@ fn required_mirrors(
 ) -> Result<Vec<(String, String, PathBuf)>, String> {
     if entry.ecosystem != "npm"
         || entry.flavor.as_deref() != Some("bun")
-        || root.join("bun.lock").exists()
+        || super::lock_inventory::bun_text_lock_drives(&super::lock_inventory::ProjectView::Disk(
+            root,
+        ))
     {
         return Ok(Vec::new());
     }
@@ -173,10 +175,9 @@ pub(super) async fn cleanup(root: &Path, entry: &VendorEntry, dry_run: bool) -> 
     }
     if !dry_run {
         for path in paths {
-            tokio::fs::remove_file(&path)
+            super::bun_binary::remove_mirror(&path)
                 .await
                 .map_err(|e| format!("cannot remove workspace tarball: {e}"))?;
-            prune_mirror_parents(&path).await;
         }
     }
     Ok(())

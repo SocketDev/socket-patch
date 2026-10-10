@@ -13,7 +13,7 @@
 //!
 //! Pure text in, answers out; the editors own the reads and writes.
 
-use crate::formats::text::strip_bom;
+use crate::formats::text::{split_bom, strip_bom};
 
 /// The parsed key (quotes removed) and its inline value (comment and
 /// surrounding blanks stripped; `""` for a block-valued key) when `line` is
@@ -54,6 +54,17 @@ pub(crate) fn top_level_key(line: &str) -> Option<(String, &str)> {
         return None;
     }
     Some((key, strip_comment(rest).trim()))
+}
+
+/// The value of the last top-level `key` in a YAML settings file
+/// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed. [`top_level_key`]
+/// skips the first line's BOM.
+pub(crate) fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .filter_map(top_level_key)
+        .rfind(|(k, _)| k == key)
+        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// The line index a new top-level key is inserted at: after the document's
@@ -105,8 +116,69 @@ pub(crate) fn block_insert_point(lines: &[String]) -> Result<usize, String> {
     Ok(match (last, end_marker) {
         (Some(i), _) => i + 1,
         (None, Some(end)) => end,
-        (None, None) => lines.len(),
+        // Blank lines only: the new key opens the file, so its trailing
+        // newlines stay where they are — after a BOM line, though, which
+        // must stay the stream's first bytes.
+        (None, None) => usize::from(lines.first().is_some_and(|l| !split_bom(l).0.is_empty())),
     })
+}
+
+/// The root-only `packages:` list a splice writes into a workspace file
+/// that has none (pnpm 8.x–10.4 refuse a workspace file holding any key but
+/// no `packages`), in the vendor and hosted scaffold spelling.
+pub(crate) const PACKAGES_SCAFFOLD: [&str; 2] = ["packages:", "  - '.'"];
+
+/// Whether a pnpm-workspace.yaml holds no key at all: every line is blank,
+/// a comment, a `%` directive or a bare `---` / `...` marker. pnpm parses
+/// such a file to an empty document and installs as if it did not exist,
+/// but pnpm 8.x–10.4 refuse every command once it holds a key without a
+/// `packages` field ("packages field missing or empty", #1096), so a splice
+/// that gives it its first key must give it [`PACKAGES_SCAFFOLD`] too.
+pub(crate) fn is_keyless(text: &str) -> bool {
+    strip_bom(text).split('\n').all(|raw| {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let trimmed = line.trim();
+        trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || line.starts_with('%')
+            || ((is_marker(line, "---") || is_marker(line, "..."))
+                && strip_comment(&line[3..]).trim().is_empty())
+    })
+}
+
+/// Whether a pnpm lock's project document (`lines`) lists an importer
+/// besides the root `.`. A pnpm-workspace.yaml with no keys reads as every
+/// nested package on pnpm 8–10.4 (`packages` defaults to `['.', '**']`) but
+/// as the root alone on pnpm >= 10.5, so a lock made from one with member
+/// importers comes from pnpm <= 10.4, and the root-only
+/// [`PACKAGES_SCAFFOLD`] would drop those members.
+pub(crate) fn lock_has_member_importers(lines: &[String]) -> bool {
+    // CRLF-blind: a Windows checkout's lock reads like its LF twin.
+    let mut in_importers = false;
+    for line in lines {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !line.is_empty() && !line.starts_with(' ') {
+            in_importers = line == "importers:";
+        } else if in_importers
+            && super::lines::parse_key_line(line, 2).is_some_and(|(key, _, _)| key != ".")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `text` with the contiguous run of lines `block` removed, when that
+/// leaves a [`is_keyless`] document: the inverse of a splice that gave a
+/// keyless file its first keys. `None` when the run is absent or the rest
+/// of the file holds keys (the lines are then not provably the splice).
+pub(crate) fn strip_keyless_splice(text: &str, block: &[&str]) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let at = lines.windows(block.len()).position(|w| w == block)?;
+    let mut rest = lines;
+    rest.drain(at..at + block.len());
+    let rest = rest.join("\n");
+    is_keyless(&rest).then_some(rest)
 }
 
 /// The top-level `name:` section holding a block mapping: `(header, end)`,
@@ -131,6 +203,102 @@ pub(crate) fn block_section_bounds(lines: &[String], name: &str) -> Option<(usiz
     Some((start, end))
 }
 
+/// The `packages:` globs of a pnpm-workspace.yaml, quotes removed (a
+/// negation keeps its leading `!`), from a block sequence (items indented
+/// or at column 0) or a one-line flow sequence. `Ok(None)` when the file
+/// has no top-level `packages:` key (pnpm <= 8 then finds projects in
+/// every directory) or a null one (`packages:` spelled `~` or `null`,
+/// which pnpm reads as an absent key); `Err` names a value this reader
+/// cannot follow (a scalar, a multi-line flow, an anchor or alias, a
+/// nested node), which a caller must not take for "no members". Callers
+/// read through [`read_package_globs`], which falls back to a full YAML
+/// parse for those.
+pub(crate) fn package_globs(text: &str) -> Result<Option<Vec<String>>, String> {
+    let text = strip_bom(text);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let Some(start) = lines
+        .iter()
+        .rposition(|l| top_level_key(l).is_some_and(|(key, _)| key == "packages"))
+    else {
+        return Ok(None);
+    };
+    let inline = top_level_key(lines[start]).map_or("", |(_, value)| value);
+    if matches!(inline, "~" | "null" | "Null" | "NULL") {
+        return Ok(None);
+    }
+    if !inline.is_empty() {
+        let inner = inline
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .ok_or_else(|| format!("`packages: {inline}` is not a one-line list"))?;
+        return inner
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(glob_scalar)
+            .collect::<Result<_, _>>()
+            .map(Some);
+    }
+    let mut out = Vec::new();
+    for line in &lines[start + 1..] {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let item = trimmed
+            .strip_prefix('-')
+            .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']));
+        match item {
+            Some(item) => out.push(glob_scalar(strip_comment(item).trim())?),
+            None if line.starts_with([' ', '\t']) => {
+                return Err(format!("`packages:` holds a non-list line {trimmed:?}"));
+            }
+            // The next top-level key (or a document marker) ends the list.
+            None => break,
+        }
+    }
+    Ok(Some(out))
+}
+
+/// The `packages:` globs as [`package_globs`] reads them, falling back to a
+/// full YAML parse of the file when the line reader cannot follow the
+/// value (a flow list spread over several lines, an anchor and its alias).
+/// `Err` (the line reader's reason) only when neither reader can: a value
+/// that is not a list of strings, or a file that does not parse.
+pub(crate) fn read_package_globs(text: &str) -> Result<Option<Vec<String>>, String> {
+    #[derive(serde::Deserialize)]
+    struct Workspace {
+        packages: Option<Vec<String>>,
+    }
+    package_globs(text).or_else(|why| {
+        serde_saphyr::from_str::<Option<Workspace>>(strip_bom(text))
+            .map(|workspace| workspace.and_then(|w| w.packages))
+            .map_err(|_| why)
+    })
+}
+
+/// One `packages:` item: a plain or quoted scalar, quotes removed.
+fn glob_scalar(raw: &str) -> Result<String, String> {
+    let quoted = match raw.as_bytes().first() {
+        Some(b'"') => double_quoted(raw),
+        Some(b'\'') => single_quoted(raw),
+        // An anchor, alias, block scalar, nested node, or tag (YAML reads an
+        // unquoted `!x` as a tag, so a negation must be quoted).
+        Some(b'&' | b'*' | b'|' | b'>' | b'{' | b'[' | b'?' | b'!' | b'%' | b'@' | b'`') => {
+            return Err(format!("`packages:` item {raw:?} is not a plain glob"));
+        }
+        Some(_) => return Ok(raw.to_string()),
+        None => return Err("`packages:` holds an empty item".to_string()),
+    };
+    match quoted {
+        Some((value, len)) if len == raw.len() && !value.is_empty() => Ok(value),
+        _ => Err(format!("`packages:` item {raw:?} is not a plain glob")),
+    }
+}
+
 /// Whether `line` is the document marker `marker` (`---` / `...`), alone or
 /// followed by a blank.
 fn is_marker(line: &str, marker: &str) -> bool {
@@ -139,7 +307,7 @@ fn is_marker(line: &str, marker: &str) -> bool {
 }
 
 /// `text` up to a ` #` comment that sits outside quotes.
-fn strip_comment(text: &str) -> &str {
+pub(crate) fn strip_comment(text: &str) -> &str {
     let bytes = text.as_bytes();
     let mut quote = None;
     for (i, &b) in bytes.iter().enumerate() {
@@ -254,6 +422,131 @@ mod tests {
     }
 
     #[test]
+    fn package_globs_read_block_flow_quoted_and_negated_items() {
+        let globs = |text: &str| package_globs(text).map(Option::unwrap_or_default);
+        assert_eq!(
+            globs("packages:\n  - packages/*\n  - 'apps/**' # web\n  - \"!**/fixtures/**\"\nsharedWorkspaceLockfile: false\n"),
+            Ok(vec![
+                "packages/*".to_string(),
+                "apps/**".to_string(),
+                "!**/fixtures/**".to_string()
+            ])
+        );
+        // Items at column 0, CRLF, a BOM, comments between items.
+        assert_eq!(
+            globs("\u{feff}packages:\r\n# members\r\n- a\r\n\r\n- b\r\ncatalog: {}\r\n"),
+            Ok(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            globs("packages: ['packages/*', \"!packages/x\"]\n"),
+            Ok(vec!["packages/*".to_string(), "!packages/x".to_string()])
+        );
+        assert_eq!(globs("packages: []\n"), Ok(Vec::new()));
+        // An absent key is not an empty list.
+        assert_eq!(package_globs("packages: []\n"), Ok(Some(Vec::new())));
+        assert_eq!(package_globs("trustLockfile: true\n"), Ok(None));
+        // A null value is an absent key, in every spelling (#1006).
+        for null in ["~", "null", "Null", "NULL", "~ # root only"] {
+            let text = format!("packages: {null}\ntrustLockfile: true\n");
+            assert_eq!(package_globs(&text), Ok(None), "{text:?}");
+            assert_eq!(read_package_globs(&text), Ok(None), "{text:?}");
+        }
+        // Shapes this reader cannot follow are errors, never "no members".
+        for text in [
+            "packages: *members\n",
+            "packages: packages/*\n",
+            "packages: [a,\n  b]\n",
+            "packages:\n  - !packages/x\n",
+            "packages:\n  - *alias\n",
+            "packages:\n  key: value\n",
+            "packages:\n  - 'unterminated\n",
+        ] {
+            assert!(globs(text).is_err(), "{text:?}");
+        }
+        // The full parse reads what the line reader cannot follow...
+        assert_eq!(
+            read_package_globs("packages: [\n  'a',\n  \"!b\"\n]\nx: 1\n"),
+            Ok(Some(vec!["a".to_string(), "!b".to_string()]))
+        );
+        assert_eq!(
+            read_package_globs("packages: [a,\n  b]\n"),
+            Ok(Some(vec!["a".to_string(), "b".to_string()]))
+        );
+        // ...and the line reader's reason stands when it cannot either.
+        for text in [
+            "packages: packages/*\n",
+            "packages:\n  key: value\n",
+            "packages:\n  - 'unterminated\n",
+        ] {
+            assert!(read_package_globs(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn member_importers_mark_a_pre_10_5_workspace() {
+        let lock = |importers: &str| {
+            lines(&format!(
+                "lockfileVersion: '9.0'\n\nimporters:\n\n{importers}\npackages: {{}}\n"
+            ))
+        };
+        assert!(!lock_has_member_importers(&lock(
+            "  .:\n    dependencies: {}\n"
+        )));
+        assert!(lock_has_member_importers(&lock(
+            "  .:\n    dependencies: {}\n\n  sub:\n    dependencies: {}\n"
+        )));
+        assert!(!lock_has_member_importers(&lines(
+            "lockfileVersion: '9.0'\n"
+        )));
+        let crlf: Vec<String> =
+            lock("  .:\n    dependencies: {}\n\n  sub:\n    dependencies: {}\n")
+                .into_iter()
+                .map(|l| format!("{l}\r"))
+                .collect();
+        assert!(lock_has_member_importers(&crlf));
+    }
+
+    #[test]
+    fn keyless_documents_and_their_splices() {
+        for text in [
+            "",
+            "\n",
+            "# c\n\n  # indented\n",
+            "---\n",
+            "--- # start\n",
+            "%YAML 1.2\n---\n",
+            "---\n...\n",
+            "\u{feff}# bom\r\n",
+        ] {
+            assert!(is_keyless(text), "{text:?}");
+        }
+        for text in ["a: 1\n", "# c\npackages: []\n", "--- {}\n", "- a\n", "~\n"] {
+            assert!(!is_keyless(text), "{text:?}");
+        }
+        let block = ["packages:", "  - '.'", "trustLockfile: true"];
+        assert_eq!(
+            strip_keyless_splice("# c\npackages:\n  - '.'\ntrustLockfile: true\n", &block),
+            Some("# c\n".to_string())
+        );
+        assert_eq!(
+            strip_keyless_splice(
+                "---\npackages:\n  - '.'\ntrustLockfile: true\n...\n",
+                &block
+            ),
+            Some("---\n...\n".to_string())
+        );
+        assert_eq!(
+            strip_keyless_splice(
+                "packages:\n  - '.'\ntrustLockfile: true\ncatalog: {}\n",
+                &block
+            ),
+            None,
+            "other keys: not provably the splice"
+        );
+        assert_eq!(strip_keyless_splice("# c\n", &block), None);
+    }
+
+    #[test]
     fn block_insert_point_follows_the_document() {
         assert_eq!(block_insert_point(&lines("a: 1\nb:\n  - c\n")), Ok(3));
         assert_eq!(block_insert_point(&lines("a: 1\n\n# tail\n\n")), Ok(3));
@@ -261,7 +554,10 @@ mod tests {
         assert_eq!(block_insert_point(&lines("a: 1\n\n...\n# done\n")), Ok(1));
         assert_eq!(block_insert_point(&lines("%YAML 1.2\n---\na: 1\n")), Ok(3));
         assert_eq!(block_insert_point(&lines("# only a comment\n")), Ok(1));
-        assert_eq!(block_insert_point(&lines("")), Ok(1));
+        assert_eq!(block_insert_point(&lines("")), Ok(0));
+        assert_eq!(block_insert_point(&lines("\n\n")), Ok(0));
+        assert_eq!(block_insert_point(&lines("\u{feff}\n")), Ok(1));
+        assert_eq!(block_insert_point(&lines("\u{feff}")), Ok(1));
         for text in [
             "{a: 1}\n",
             "[a]\n",

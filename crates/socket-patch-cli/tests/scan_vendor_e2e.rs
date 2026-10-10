@@ -1,4 +1,4 @@
-//! End-to-end tests for `scan --vendor` — the bot workflow that discovers
+//! End-to-end tests for `scan --mode vendored` — the bot workflow that discovers
 //! patches, fetches their records in memory, and vendors each patched
 //! package into the committable `.socket/vendor/` tree instead of
 //! applying in place. Vendored mode is manifest-free: the ledger's
@@ -203,7 +203,8 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, String,
     let mut argv = vec![
         "scan",
         "--json",
-        "--vendor",
+        "--mode",
+        "vendored",
         "--yes",
         "--api-url",
         mock_uri,
@@ -233,7 +234,7 @@ fn assert_socket_dir_lean(root: &Path) {
 
 #[tokio::test]
 async fn scan_vendor_end_to_end_is_manifest_free() {
-    // scan --vendor: discover → fetch records in memory → vendor. The
+    // scan --mode vendored: discover → fetch records in memory → vendor. The
     // ledger (with embedded records) is the only state written.
     let mock = MockServer::start().await;
     mount_patch_api(&mock, UUID).await;
@@ -342,7 +343,7 @@ async fn mount_empty_discovery(mock: &MockServer) {
 }
 
 /// Seed a committed `.socket/manifest.json` plus its afterHash blob — the
-/// state a repo has after `scan --vendor` was run and `.socket/vendor/`
+/// state a repo has after `scan --mode vendored` was run and `.socket/vendor/`
 /// was later wiped (or never committed). The blob lets the vendor engine
 /// stage sources with no download phase and no network.
 fn seed_committed_manifest(root: &Path) {
@@ -376,7 +377,7 @@ fn seed_committed_manifest(root: &Path) {
 
 /// Vendored mode takes its work from DISCOVERY, never from a committed
 /// manifest: with nothing discovered there is nothing to vendor, so
-/// `scan --vendor` is a clean no-op that creates nothing — no
+/// `scan --mode vendored` is a clean no-op that creates nothing — no
 /// `.socket/vendor/`, no `apply.lock` — and a legacy manifest is left
 /// byte-identical. Both arms agree (the interactive arm exits before the
 /// vendor dispatch; the JSON arm's vendor step skips itself before taking
@@ -396,7 +397,8 @@ async fn scan_vendor_with_empty_discovery_is_a_no_op() {
         let manifest_before = std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap();
         let mut argv = vec![
             "scan",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--yes",
             "--api-url",
             &uri,
@@ -523,7 +525,7 @@ async fn scan_vendor_migrates_legacy_manifest_mode_project() {
 
 #[tokio::test]
 async fn scan_vendor_writes_no_manifest() {
-    // scan --vendor: the manifest-free flow, embedded-record ledger and all.
+    // scan --mode vendored: the manifest-free flow, embedded-record ledger and all.
     let mock = MockServer::start().await;
     mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -661,7 +663,7 @@ async fn scan_vendor_dry_run_previews_without_touching_disk() {
     );
 }
 
-/// Interactive (non-JSON) `scan --vendor` with a failing patch
+/// Interactive (non-JSON) `scan --mode vendored` with a failing patch
 /// view fetch must SAY what failed: exit 1 with a `[fail]` line naming the
 /// purl on stderr. Regression guard: `download_patch_records`' failure arms
 /// recorded the error only in their JSON report, so the human path exited
@@ -721,7 +723,8 @@ async fn scan_vendor_fetch_failure_reports_error() {
     let out = Command::new(binary())
         .args([
             "scan",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--yes",
             "--api-url",
             &mock.uri(),
@@ -762,11 +765,11 @@ async fn scan_vendor_fetch_failure_reports_error() {
 }
 
 #[tokio::test]
-async fn scan_vendor_flag_conflicts_are_clap_errors() {
-    // --vendor conflicts with --apply/--sync.
+async fn scan_mode_sync_conflicts_are_usage_errors() {
+    // --sync means --mode agent --prune, so it conflicts with any other mode.
     for argv in [
-        &["scan", "--vendor", "--apply"][..],
-        &["scan", "--vendor", "--sync"][..],
+        &["scan", "--mode", "vendored", "--sync"][..],
+        &["scan", "--mode", "hosted", "--sync"][..],
     ] {
         let out = Command::new(binary())
             .args(argv)
@@ -775,10 +778,7 @@ async fn scan_vendor_flag_conflicts_are_clap_errors() {
             .expect("run");
         let code = out.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(
-            code, 2,
-            "argv={argv:?} must be a clap usage error: {stderr}"
-        );
+        assert_eq!(code, 2, "argv={argv:?} must be a usage error: {stderr}");
         assert!(
             stderr.contains("cannot be used with"),
             "argv={argv:?}: {stderr}"
@@ -819,7 +819,8 @@ async fn scan_vendor_emits_no_telemetry_even_with_endpoint_env() {
         &[
             "scan",
             "--json",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--yes",
             "--api-url",
             &mock_uri,
@@ -1024,7 +1025,7 @@ async fn scan_vendor_resolves_percent_encoded_scoped_purl() {
 // ───────────────────── prune reconciles vendored state ─────────────────────
 
 /// After a dependency is removed and re-locked, `scan --prune` (without
-/// `--vendor`) reclaims its vendored entry in one run (#665):
+/// `--mode vendored`) reclaims its vendored entry in one run (#665):
 ///
 /// 1. The wired lock entry VANISHED (`npm uninstall`). That is not drift:
 ///    nothing in the lock resolves through the artifact any more, so the
@@ -1078,7 +1079,7 @@ async fn scan_prune_reverts_unused_vendored_entry() {
     std::fs::write(tmp.path().join("package-lock.json"), &lock_bytes).unwrap();
     std::fs::remove_dir_all(tmp.path().join("node_modules/left-pad")).unwrap();
 
-    // Plain prune scan (read-only discovery + GC; no --vendor, no --apply).
+    // Plain prune scan (read-only discovery + GC; no --mode vendored, no --mode agent).
     let run_prune = || {
         let out = Command::new(binary())
             .args([
@@ -1113,6 +1114,13 @@ async fn scan_prune_reverts_unused_vendored_entry() {
         v["gc"]["keptVendoredEntries"],
         serde_json::json!([]),
         "nothing resolves through the artifact, so nothing is kept: {v}"
+    );
+    // The revert warns `vendor_lock_entry_removed` (nothing to restore):
+    // routine for a prune of an uninstalled dependency, so it is not a
+    // gc warning.
+    assert!(
+        v["gc"].get("warnings").is_none(),
+        "a routine prune adds no gc warning: {v}"
     );
 
     // Ledger empty (an emptied state file is removed outright), artifact
@@ -1150,6 +1158,97 @@ async fn scan_prune_reverts_unused_vendored_entry() {
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock_bytes
+    );
+}
+
+/// #1155: `npm install left-pad@1.3.1` after vendoring 1.3.0 keeps the
+/// `node_modules/left-pad` key but locks the new version from the
+/// registry. The vendored version left the lock graph just as after
+/// `npm uninstall`, so `scan --prune` must revert the entry in one run.
+/// It used to call the moved entry drift and keep it forever, so the
+/// prune remedy `vendor --check` names never converged.
+#[tokio::test]
+async fn scan_prune_reverts_vendored_entry_after_version_upgrade() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}"))
+        .exists());
+
+    // What `npm install left-pad@1.3.1` leaves behind.
+    let lock = serde_json::json!({
+        "name": "scan-vendor-test",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "scan-vendor-test",
+                "version": "0.0.0",
+                "dependencies": { "left-pad": "^1.3.1" }
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded==",
+                "license": "WTFPL"
+            }
+        }
+    });
+    let mut lock_bytes = serde_json::to_vec_pretty(&lock).unwrap();
+    lock_bytes.push(b'\n');
+    std::fs::write(tmp.path().join("package-lock.json"), &lock_bytes).unwrap();
+    std::fs::write(
+        tmp.path().join("node_modules/left-pad/package.json"),
+        br#"{"name":"left-pad","version":"1.3.1"}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(binary())
+        .args([
+            "scan",
+            "--json",
+            "--prune",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        v["gc"]["revertedVendoredEntries"],
+        serde_json::json!([PURL]),
+        "gc must revert the upgraded-away entry: {v}"
+    );
+    assert_eq!(
+        v["gc"]["keptVendoredEntries"],
+        serde_json::json!([]),
+        "nothing resolves through the artifact, so nothing is kept: {v}"
+    );
+    assert!(
+        !tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
+        "artifact dir removed"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_bytes,
+        "the user's upgraded lock is left exactly as they wrote it"
     );
 }
 
@@ -1306,10 +1405,10 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
     assert_eq!(unwired(&v), 0, "envelope={v}");
 }
 
-/// Interactive (non-JSON) `scan --vendor` pre-verifies patch baselines:
+/// Interactive (non-JSON) `scan --mode vendored` pre-verifies patch baselines:
 /// installed content matching NEITHER hash is annotated before vendoring
-/// starts, and the run still vendors (auto-force) with the
-/// `vendor_content_mismatch_overwritten` warning on stderr.
+/// starts, and the run still vendors the server's verified artifact (no
+/// mismatch warning: vendoring never reads the installed bytes).
 #[tokio::test]
 async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
     let mock = MockServer::start().await;
@@ -1326,7 +1425,8 @@ async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
     let out = Command::new(binary())
         .args([
             "scan",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--yes",
             "--api-url",
             &mock.uri(),
@@ -1755,7 +1855,7 @@ async fn vendor_verifies_server_artifact_without_old_lock_integrity() {
 }
 
 /// The headline flow: a COMPLETELY fresh clone (lockfile, no node_modules,
-/// no .socket) discovers from the lockfile and `scan --vendor` vendors
+/// no .socket) discovers from the lockfile and `scan --mode vendored` vendors
 /// end-to-end via the registry fetch.
 #[tokio::test]
 async fn scan_vendor_works_on_a_completely_fresh_clone() {
@@ -1996,7 +2096,7 @@ async fn scan_flags_scoped_lockfile_only_package_despite_api_purl_encoding() {
     );
 }
 
-/// `scan --apply` skips lockfile-only patches calmly: exit 0, a skipped
+/// `scan --mode agent` skips lockfile-only patches calmly: exit 0, a skipped
 /// record with package_not_installed, and NO manifest entry written.
 #[tokio::test]
 async fn scan_apply_skips_lockfile_only_without_error() {
@@ -2013,7 +2113,8 @@ async fn scan_apply_skips_lockfile_only_without_error() {
         .args([
             "scan",
             "--json",
-            "--apply",
+            "--mode",
+            "agent",
             "--yes",
             "--api-url",
             &mock.uri(),
@@ -2090,7 +2191,7 @@ async fn scan_vendored_bun_v1_workspace_refuses_in_download_phase() {
     write_bun_v1_workspace_fixture(tmp.path());
     let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
 
-    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--mode", "vendored"]);
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "partial_failure", "envelope={v}");
@@ -2224,7 +2325,7 @@ async fn scan_vendored_vlt_transitive_refuses_in_download_phase() {
     let tmp = tempfile::tempdir().unwrap();
     write_vlt_fixture(tmp.path(), true);
     let lock_before = std::fs::read(tmp.path().join("vlt-lock.json")).unwrap();
-    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--mode", "vendored"]);
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let dl = &v["download"];
@@ -2244,11 +2345,7 @@ async fn scan_vendored_vlt_transitive_refuses_in_download_phase() {
     );
     assert!(!tmp.path().join(".socket").exists());
 
-    let (code, stdout, stderr) = run_scan_vendor(
-        tmp.path(),
-        &mock.uri(),
-        &["--mode", "vendored", "--dry-run"],
-    );
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let text = v.to_string();
@@ -2265,7 +2362,7 @@ async fn scan_vendored_vlt_direct_dependency_vendors() {
     mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
     write_vlt_fixture(tmp.path(), false);
-    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--mode", "vendored"]);
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
     assert_eq!(
@@ -2282,13 +2379,13 @@ async fn scan_vendored_vlt_direct_dependency_vendors() {
     assert_socket_dir_lean(tmp.path());
 }
 
-/// Manifest-less VEX over the committed state `scan --vendor` leaves
+/// Manifest-less VEX over the committed state `scan --mode vendored` leaves
 /// (manifest-free since 5.0 — the ledger's `detached` entries embed the
 /// records, so there is one shape to cover): the checkout attests `(vendored)` from the ledger's
 /// embedded record, then from lockfile discovery + the patch API once the
 /// ledgers are gone too, never `--offline` (`record_unavailable`, zero
 /// requests), and not once the lock is reverted (`vendor_unwired`,
-/// `--no-verify` too). The embedded `scan --vendor --vex` of the producing
+/// `--no-verify` too). The embedded `scan --mode vendored --vex` of the producing
 /// run attests as well. The manifest-driven standalone `vendor` shape (a
 /// NON-detached entry with a fallback record) is
 /// `standalone_vendor_state_attests_from_the_embedded_record`.
@@ -2305,7 +2402,7 @@ async fn scan_vendor_state_attests_manifest_less() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
         v["vex"]["statements"], 1,
-        "embedded scan --vendor --vex: {v}"
+        "embedded scan --mode vendored --vex: {v}"
     );
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
@@ -2314,7 +2411,7 @@ async fn scan_vendor_state_attests_manifest_less() {
 
     let checkout = tmp.path().join("checkout");
     npm_e2e_common::fresh_checkout(tmp.path(), &checkout, &["package-lock.json"]);
-    run_manifestless_tail("scan --vendor", &checkout, pristine);
+    run_manifestless_tail("scan --mode vendored", &checkout, pristine);
 }
 
 /// The committed state of the manifest-driven standalone `vendor` — the
@@ -3315,5 +3412,128 @@ snapshots:
             "the installed crate's view is never fetched"
         );
         assert_no_registry_request(&mock).await;
+    }
+
+    /// #1197: pnpm 7–11 keep a removed package's `.pnpm/<name>@<version>`
+    /// entry for up to 7 days (pnpm 12 an upgraded-away one until `pnpm
+    /// prune`). Nothing links to it and neither lock has it, so the
+    /// vendored scan skips it instead of failing it
+    /// `vendor_lock_entry_not_found` on every run: the current lockfile
+    /// pnpm writes beside the entries (`.pnpm/lock.yaml`) is the record of
+    /// what is installed.
+    #[tokio::test]
+    async fn vendored_scan_skips_a_pnpm_store_entry_the_install_dropped() {
+        let mock = MockServer::start().await;
+        let scope = [PNPM_SCOPE[0], PNPM_SCOPE[2]];
+        mount_patch_api(&mock, &scope, "package/index.js").await;
+        // The real batch endpoint answers only for the purls it is asked
+        // about: a scan that reports the orphan gets its patch.
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                let packages: Vec<serde_json::Value> = scope
+                    .iter()
+                    .filter(|(purl, _)| body.contains(purl))
+                    .map(|(purl, uuid)| {
+                        serde_json::json!({
+                            "purl": purl,
+                            "patches": [{
+                                "uuid": uuid, "purl": purl, "tier": "free",
+                                "cveIds": ["CVE-2026-0001"], "ghsaIds": [],
+                                "severity": "high", "title": "plan target"
+                            }]
+                        })
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "packages": packages,
+                    "canAccessPaidPatches": false,
+                }))
+            })
+            .with_priority(1)
+            .mount(&mock)
+            .await;
+        let registry = format!("{}/registry", mock.uri());
+        let uri = mock.uri();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "scope-test", "version": "0.0.0", "dependencies": { "pkg-a": "1.0.0" } }"#,
+        )
+        .unwrap();
+        let lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      pkg-a:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  pkg-a@1.0.0:
+    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}
+
+snapshots:
+
+  pkg-a@1.0.0: {}
+";
+        std::fs::write(root.join("pnpm-lock.yaml"), lock).unwrap();
+        let store = root.join("node_modules/.pnpm");
+        for name in ["pkg-a", "pkg-y"] {
+            let pkg = store.join(format!("{name}@1.0.0/node_modules/{name}"));
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            ".pnpm/pkg-a@1.0.0/node_modules/pkg-a",
+            root.join("node_modules/pkg-a"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        {
+            let pkg = root.join("node_modules/pkg-a");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                r#"{"name":"pkg-a","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+        }
+        std::fs::write(store.join("lock.yaml"), lock).unwrap();
+
+        let (code, stdout, stderr) = run_cli_env(
+            root,
+            &api_argv(&uri, &["scan", "--mode", "vendored"]),
+            &[("SOCKET_NPM_REGISTRY", registry.as_str())],
+        );
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("valid JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
+        assert_eq!(code, 0, "{v}");
+        assert_eq!(v["status"], "success", "{v}");
+        assert!(
+            !stdout.contains("vendor_lock_entry_not_found") && !stdout.contains("pkg-y"),
+            "the orphaned entry is not scanned: {v}"
+        );
+        assert_eq!(
+            events_for(&v, "pkg:npm/pkg-a@1.0.0").first(),
+            Some(&("applied", "")),
+            "{v}"
+        );
     }
 }

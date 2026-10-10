@@ -19,21 +19,12 @@
 //! Hermetic: every registry base and the patch API point at a
 //! guaranteed-dead local endpoint, and patch staging reads `.socket/blobs`.
 
-use std::path::{Path, PathBuf};
+use crate::common::{binary, git_sha256};
+
+use std::path::Path;
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
 /// release it, so every request fails fast with connection-refused.

@@ -5,7 +5,7 @@ projects using text `bun.lock` or native binary `bun.lockb`. Real-Bun evidence b
 
 - **The native matrix** — `scripts/backtest-bun.py` runs real Bun releases
   against the public free Socket patch for `minimist@1.2.2`
-  (`80630680-4da6-45f9-bba8-b888e0ffd58c`) with the production CLI and patch
+  (`642d7f02-ebc1-4ab0-99e2-07f5dd8463cb`) with the production CLI and patch
   service, without a token or substitute service, and checks the INSTALLED
   bytes, lock stability, digest rejection and rollback on Linux, macOS and
   Windows ([workflow](../../.github/workflows/bun-compatibility.yml)).
@@ -44,6 +44,7 @@ other npm lockfile flavors.
 | Version-2 lock (Bun 1.4+) with `workspace:` packages, nested versions included | Rewritten (golden `lock-v2-workspace-nested` — provenance: its nested same-version `consumer/left-pad` entry is a synthetic, grammar-valid extension of the 1.4.2 capture; bun hoists identical resolutions and never writes that entry itself, but bun 1.4.2 installs the fixture unchanged, and it is the only case pinning the rewrite of every matching tuple in one lock). | Vendored (matrix 1.4.0 / 1.4.2 `workspace`, `workspace-nested`, `already-vendored-workspace`). | Works. |
 | Binary `bun.lockb` (binary format revisions 1, 2 and 3) | Package resolution and integrity records are rewritten in place. The CLI does not spawn Bun or produce a text lock. `rollback` / `remove` cannot restore a hosted `bun.lockb` entry to its upstream registry entry (v5.0 keeps no ledger to replay, and the binary lock is not re-derived), so they refuse it with the `git checkout -- bun.lockb` remedy. | Native local-tarball wiring, committed artifact, repair and vendored → hosted takeover. Hosted → vendored rebuilds a hosted `bun.lockb` pin's npm registry record from the registry (byte-exact for a lock socket-patch wired hosted), then vendors; `vendor --revert` returns the pre-hosted lock. Offline it refuses (`redirect_revert_failed`), leaving it hosted. | Registry package records are inventoried directly, including lockfile-only projects without `node_modules`. |
 | A package the project patches itself with `bun patch` (a `patchedDependencies` key for its `name@version`, or its bare name, in the root `package.json` or mirrored in `bun.lock`) (#367) | Left on its registry tuple (text and binary lock): Bun applies the user's patch only to the registry `name@version`, so a hosted URL would drop it from every install with exit 0. Warns `redirect_bun_patched_dependency_skipped` naming the key, and the in-run VEX never assumes the patch applied; other packages in the lock are still rewired. | Refused `vendor_lock_entry_unsupported` before any write or download (text and binary lock), naming the key. | The installed tree is patched in place, as for any package. |
+| A package on Bun's default trusted list (better-sqlite3, esbuild, sharp, …) in a project that declares no `trustedDependencies` (root `package.json`, or mirrored in `bun.lock`) (#371) | Rewired (text and binary lock), with warning `redirect_bun_default_trust_lost`: Bun 1.3.5+ apply the default list only to npm-registry resolutions, so a hosted URL makes `bun install` skip the package's install scripts with exit 0 (measured: 1.3.4 runs them, 1.3.5–1.4.2 do not). The remedy is adding the package to `trustedDependencies`, which replaces the default list. | Same, `vendor_bun_default_trust_lost`, for the local tarball tuple (text and binary lock). | Not affected: the installed tree keeps its registry resolution. |
 | Truncated, corrupt or unrecognized binary `bun.lockb` | Refused with `redirect_bun_lockb_invalid`, preserving the lock. | Refused with `vendor_bun_lockb_invalid` before downloads or artifact creation. | The inventory reports the malformed lock. |
 | `bun.lock` with a `lockfileVersion` ≥ 3, no integer version, or a `packages` section outside bun's single-line grammar | Refused `redirect_bun_lock_unsupported`. | Refused `vendor_lockfile_version_unsupported` (preflight and engine). | The inventory skips the lock. |
 
@@ -92,7 +93,8 @@ Binary locks are parsed and patched directly. The codec understands the original
 version-1 representation, the version-2 URL representation, the later scripts
 package field, and version 3's wider semantic-version representation. It keeps
 package IDs, dependency edges, hoisting data, package metadata and optional
-extensions intact. Historical workspace dependency flags and literals are
+extensions intact, except where a vendored re-run folds a duplicate record of
+the patched package into its tarball record (#861, below). Historical workspace dependency flags and literals are
 normalized to the equivalent representation accepted by old and new readers;
 the original encoding is retained for rollback. Unknown versions and invalid
 offsets fail closed.
@@ -234,6 +236,44 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   writes the bare path itself, are left alone. Covered by
   `e2e_bun_lockb::workspace_text_migration_heals_on_rerun`
   on the 1.4.2 leg.
+- **Binary → text migration of a vendored lock.** The migration deletes
+  `bun.lockb` and carries the vendored tuples into `bun.lock`, while the
+  vendor state still records `bun.lockb` package snapshots. `vendor
+  --revert`, `rollback` and the hosted takeover then restore each recorded
+  registry package as the tuple Bun writes for it (an empty registry slot
+  under `https://registry.npmjs.org`, the tarball URL otherwise), and a
+  superseding re-vendor carries that tuple over as its pre-vendor original
+  (#784). Covered by `e2e_bun_lockb::vendored_text_migration_reverts_to_registry`
+  (skipped below Bun 1.2) on the 1.4.2 leg.
+- **Late dependents of a vendored package (#861).** After a workspace
+  `bun.lockb` is vendored, a new dependent of the patched `name@version` (a
+  member added later, or `bun add` in a member) makes Bun write a second,
+  nested registry record of it, since the hoisted record is now a local
+  tarball. Rewiring that record to the same tarball leaves two records with
+  one resolution, which Bun's own writer never produces: on the isolated
+  linker both map to one `node_modules/.bun/` store directory and cold
+  frozen installs fail intermittently with `EEXIST` (measured on 1.3.9 and
+  1.4.2; 1.2.23, the hoisted linker and text `bun.lock` were unaffected).
+  The vendored re-run instead folds the duplicate into the tarball record:
+  its dependents resolve to that record, the record and its own dependency
+  edges are dropped and later package IDs and dependency slices renumbered,
+  and the hoisting trees are re-derived with Bun's hoister (1.3.x refuses a
+  frozen binary lock whose re-hoisted trees differ). The fold needs the
+  duplicate's dependencies to resolve to the same packages as the tarball
+  record's (so nothing is orphaned), and the codec's hoister to reproduce
+  the lock's own trees and need no rule it does not model (a peer meeting
+  another version, a cyclic folder); otherwise every record is rewired as
+  before, with `vendor_bun_lockb_duplicate_records`. A patched package with
+  dependencies of its own (mkdirp@0.5.6) folds the same way, and an
+  unfrozen install by 1.3.9 and 1.4.2 leaves the folded lock byte-identical.
+  An optional peer nothing installs (ws@8's `bufferutil` and
+  `utf-8-validate`, common in real locks) is an unresolved edge: the hoister
+  skips it from the written trees as Bun does, so it does not block the
+  fold; the e2e `-adder` and `-deps` shapes depend on ws@8.18.0 for this.
+  Covered by `e2e_bun_lockb::workspace_late_dependent_rerun_shares_the_tarball_record`
+  and `workspace_late_dependent_with_dependencies_rerun_shares_the_tarball_record`
+  on the 1.3.14 and 1.4.2 legs, and hermetically by the
+  `bun-lockb/late-dependent/` fixtures.
 - **Workspace-member local tarballs.** Bun 1.2.x–1.3.x resolve a
   local-tarball dependency declared by a workspace member relative to the
   member (`.socket/vendor/…` → ENOENT on `bun install`); 1.4.x resolve it
@@ -346,7 +386,8 @@ workspace` (vendor a plain project, add a workspace member, `bun install`,
 re-run — must be `already_vendored`; then `repair` rebuilds a deleted
 tarball), `crlf` (CRLF manifest), `crlf-lock` (CRLF `bun.lock`),
 `space-unicode` (a path with spaces and Unicode), `custom-registry` (a
-non-empty registry slot the rewrite must drop), `text` (`--save-text-lockfile`
+non-empty registry slot the rewrite must drop; the project configures no
+registry, so a hosted rollback restores Bun's `""` npmjs slot, #992), `text` (`--save-text-lockfile`
 opt-in, Bun ≥ 1.1.39 only — asserts `bun.lock` exists after the baseline),
 `isolated` / `hoisted` linkers, `lockfile-only` (no `node_modules`),
 `production`, `get-uuid`, `get-search`, `legacy-lockb` (the baseline is
@@ -360,7 +401,12 @@ boundaries above — not the CLI's own output — and every cell asserts
 `supported` against it and the refusal codes EXACTLY, after removing an
 explicit informational allowlist (`vendor_prebuilt_downloaded`,
 `vendor_fetched_missing`, `reinstall_required`,
-…); substring matching is never used. A configuration expected to be
+`vendor_bun_reinstall_required` / `redirect_bun_reinstall_required`,
+…); substring matching is never used. `*_bun_default_trust_lost`,
+`*_non_registry_entry_skipped` and `vendor_bun_lockb_duplicate_records` are
+deliberately not on it: no fixture rewires a default-trusted package, holds a
+non-registry copy or a duplicate `bun.lockb` record, so each would be a
+misclassification. A configuration expected to be
 supported FAILS on unexpected warnings, `redirect_bun_entry_not_found`
 or `redirect_revert_failed`. Exit codes are recorded for every invocation and
 asserted: supported → 0; hosted refusals → 0 with `redirect.redirected == 0`
@@ -388,11 +434,24 @@ asserted: supported → 0; hosted refusals → 0 with `redirect.redirected == 0`
 - `rejectCorruptDigest`: a tampered sha512 on the PATCHED tuple is rejected on
   Bun ≥ 1.3.10; below that the observation is RECORDED
   (`legacyDigestBehavior`) rather than asserted;
-- rollback restores the original manifest / lock bytes, removes the
-  `.socket/vendor` state, and a clean install reproduces the record's
-  `beforeHash` bytes; text projects retain `bun.lock`, and binary projects
-  retain `bun.lockb` without creating a text lock. The original lock presence
-  and SHA-256 are both checked.
+- rollback (run over a patched install) restores the original manifest /
+  lock bytes, removes the `.socket/vendor` state, and the reinstall reproduces
+  the record's `beforeHash` bytes; text projects retain `bun.lock`, and binary
+  projects retain `bun.lockb` without creating a text lock. The original lock
+  presence and SHA-256 are both checked. The reinstall is a plain
+  `bun install` over the kept `node_modules`; Bun's hoisted linker keeps the
+  patched copy there (#764), so when it does the rollback must have emitted
+  `vendor_bun_reinstall_required` / `redirect_bun_reinstall_required`
+  (`rollbackReinstallAdvised`; for the refused hosted `bun.lockb`, the
+  refusal's checkout remedy names it) and the cell follows that advice with
+  `bun install --force`. The isolated linker links the registry entry and
+  leaves the superseded patched store entry under `node_modules/.bun`
+  unlinked; the byte oracle counts only store entries something links to.
+  Bun 1.3.0 (only; 1.3.1 fixed it, measured 1.3.0–1.3.14) also leaves its
+  hidden hoist link `node_modules/.bun/node_modules/minimist` on that
+  superseded entry, even under `--force`; when that link is the only patched
+  copy left, the cell records it under `upstreamLimitations` instead of
+  failing.
 
 The runner captures the exact project manifests, lockfiles, the ledgers (and a
 `.socket/manifest.json` only where the `preexisting-manifest` shape seeded one),

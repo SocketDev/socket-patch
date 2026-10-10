@@ -11,6 +11,11 @@
 //!
 //! Designated #551 regression test: [`m2_only_gradle_project_refuses`].
 
+#[path = "common/mod.rs"]
+mod common;
+use common::envelope::codes_in;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
@@ -31,10 +36,6 @@ const JAR: &str = "victim-1.0.jar";
 const POM: &str = "victim-1.0.pom";
 const NOTICE: &str = "META-INF/NOTICE.txt";
 const GAV: &str = "com.example:victim:1.0";
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
 
 fn sha1_hex(bytes: &[u8]) -> String {
     hex::encode(sha1::Sha1::digest(bytes))
@@ -348,20 +349,10 @@ struct Out {
 
 impl Out {
     fn warning_codes(&self) -> Vec<String> {
-        let mut codes: Vec<String> = self.json["warnings"]
-            .as_array()
+        [&self.json["warnings"], &self.json["vex"]["warnings"]]
             .into_iter()
-            .flatten()
-            .filter_map(|w| w["code"].as_str().map(str::to_string))
-            .collect();
-        codes.extend(
-            self.json["vex"]["warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|w| w["code"].as_str().map(str::to_string)),
-        );
-        codes
+            .flat_map(codes_in)
+            .collect()
     }
 
     fn ok(&self) -> &Self {

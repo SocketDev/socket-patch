@@ -21,8 +21,7 @@
 use regex::Regex;
 use serde_json::Value;
 
-use super::npm::{by_uuid, read_or_refuse, refuse_all_in};
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::formats::nuget::{parse_config, NugetConfig};
 use crate::vendor::nuget_feed::normalize_nuget_version;
 
@@ -212,9 +211,9 @@ pub(crate) async fn restore(
             Some((d, l)) => (format!("{d}/"), l),
             None => (String::new(), rel.as_str()),
         };
-        if leaf == PACKAGES_LOCK {
-            // Restored together with the config that wires it; a pin no
-            // config claims is refused by the driver.
+        if !crate::patch::redirect::NUGET_CONFIG_FILE_NAMES.contains(&leaf) {
+            // A lock is restored together with the config that wires it; a
+            // pin no config claims is refused by the driver.
             continue;
         }
         let Some(original) = read_or_refuse(view, rel, &pins, &mut result).await else {
@@ -254,50 +253,74 @@ pub(crate) async fn restore(
             continue;
         };
 
-        let lock_rel = format!("{dir}{PACKAGES_LOCK}");
-        let lock_text = match view.read(&lock_rel).await {
-            Ok(t) => t,
-            Err(e) => {
-                refuse_all_in(&pins, rel, &mut result, e);
-                continue;
+        // The locks the config governs: at the root, every lock a project
+        // under it restores into (#353, #514); a nested config, its own
+        // directory's default lock.
+        let lock_rels: Vec<String> = if dir.is_empty() {
+            match crate::vendor::nuget_config::governed_locks_on_disk(view.root()) {
+                Ok(governed) => {
+                    if let Some((project, detail)) = governed.unresolved.first() {
+                        refuse_all_in(
+                            &pins,
+                            rel,
+                            &mut result,
+                            format!("{project}: {detail}; its lock cannot be restored"),
+                        );
+                        continue;
+                    }
+                    governed.locks
+                }
+                Err(why) => {
+                    refuse_all_in(&pins, rel, &mut result, why);
+                    continue;
+                }
             }
+        } else {
+            vec![format!("{dir}{PACKAGES_LOCK}")]
         };
-        let mut lock: Option<Value> = match lock_text.as_deref().map(serde_json::from_str) {
-            None => None,
-            Some(Ok(v)) => Some(v),
-            Some(Err(_)) => {
-                refuse_all_in(
-                    &pins,
-                    rel,
-                    &mut result,
-                    format!("{lock_rel} is not valid JSON"),
-                );
-                continue;
+        let mut locks: Vec<(String, String, Value)> = Vec::new();
+        let mut unreadable = false;
+        for lock_rel in lock_rels {
+            match view.read(&lock_rel).await {
+                Ok(None) => {}
+                Ok(Some(text)) => match crate::formats::nuget::lock::parse_lock(&text) {
+                    Ok(value) => locks.push((lock_rel, text, value)),
+                    Err(_) => {
+                        refuse_all_in(
+                            &pins,
+                            rel,
+                            &mut result,
+                            format!("{lock_rel} is not valid JSON"),
+                        );
+                        unreadable = true;
+                        break;
+                    }
+                },
+                Err(e) => {
+                    refuse_all_in(&pins, rel, &mut result, e);
+                    unreadable = true;
+                    break;
+                }
             }
-        };
+        }
+        if unreadable {
+            continue;
+        }
         for (pin, id, version) in &restored {
-            let Some(lock) = lock.as_mut() else {
-                continue;
-            };
-            let entries: Vec<&mut serde_json::Map<String, Value>> = lock
-                .get_mut("dependencies")
-                .and_then(Value::as_object_mut)
-                .into_iter()
-                .flat_map(|fws| fws.values_mut())
-                .filter_map(Value::as_object_mut)
-                .flat_map(|fw| fw.iter_mut())
-                .filter(|(k, _)| k.eq_ignore_ascii_case(id))
-                .filter_map(|(_, e)| e.as_object_mut())
-                .filter(|e| e.contains_key("contentHash"))
-                .collect();
-            if entries.is_empty() {
+            // Only the entries at the pinned version: another version of
+            // the id was never re-pinned (#593).
+            let norm = normalize_nuget_version(version);
+            let pinned = locks.iter().any(|(_, _, lock)| {
+                crate::formats::nuget::lock::locked_at(lock, id, &norm)
+                    .any(|e| e.content_hash.is_some())
+            });
+            if !pinned {
                 continue;
             }
             if let Err(why) = check_upstream_feed(&cfg, id, rel) {
                 result.refuse(&pin.uuid, why);
                 continue;
             }
-            let norm = normalize_nuget_version(version);
             let hash = match ctx.client.nuget_content_hash(id, &norm).await {
                 Ok(h) => h,
                 Err(why) => {
@@ -305,15 +328,12 @@ pub(crate) async fn restore(
                     continue;
                 }
             };
-            for entry in entries {
-                let keeps_resolved = entry
-                    .get("resolved")
-                    .and_then(Value::as_str)
-                    .is_some_and(|r| normalize_nuget_version(r).eq_ignore_ascii_case(&norm));
-                if !keeps_resolved {
-                    entry.insert("resolved".into(), Value::String(norm.clone()));
+            for (_, _, lock) in locks.iter_mut() {
+                for (_, entry) in crate::formats::nuget::lock::locked_at_mut(lock, id, &norm) {
+                    if entry.contains_key("contentHash") {
+                        entry.insert("contentHash".into(), Value::String(hash.clone()));
+                    }
                 }
-                entry.insert("contentHash".into(), Value::String(hash.clone()));
             }
         }
         // A refusal in this file reruns the pass without that pin; write
@@ -334,10 +354,14 @@ pub(crate) async fn restore(
             ));
         }
         view.write(rel, text);
-        if let (Some(lock), Some(before)) = (lock, lock_text) {
-            let after = super::super::serialize_json(&lock);
-            if serde_json::from_str::<Value>(&before).ok().as_ref() != Some(&lock) {
-                view.write(&lock_rel, after);
+        for (lock_rel, before, lock) in locks {
+            // In the lock's own layout (BOM, indent, line endings).
+            if crate::formats::nuget::lock::parse_lock(&before)
+                .ok()
+                .as_ref()
+                != Some(&lock)
+            {
+                view.write(&lock_rel, super::super::serialize_json_like(&lock, &before));
             }
         }
         result
@@ -517,6 +541,42 @@ mod tests {
         assert_eq!(config, USER_MAPPING);
         assert_eq!(lock_after, lock(UPSTREAM));
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    }
+
+    /// #353: the root config governs a member project's lock, so the
+    /// unwind restores it with the config.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_member_project_lock_is_restored_with_the_root_config() {
+        let server = nuget_org().await;
+        std::env::set_var("SOCKET_NUGET_URL", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("src/App");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(tmp.path().join("nuget.config"), hosted_config(USER_MAPPING)).unwrap();
+        std::fs::write(app.join("App.csproj"), "<Project />").unwrap();
+        std::fs::write(app.join(PACKAGES_LOCK), lock(PATCHED)).unwrap();
+        let pins = [HostedPin {
+            purl: "pkg:nuget/Newtonsoft.Json@13.0.3".into(),
+            uuid: UUID.into(),
+            files: vec!["nuget.config".into()],
+        }];
+        let outcome = restore_upstream(tmp.path(), &pins, &RestoreOptions::default()).await;
+        std::env::remove_var("SOCKET_NUGET_URL");
+        assert_eq!(
+            outcome.pins[0].status,
+            PinStatus::Restored,
+            "{:?}",
+            outcome.pins
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("nuget.config")).unwrap(),
+            USER_MAPPING
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.join(PACKAGES_LOCK)).unwrap(),
+            lock(UPSTREAM)
+        );
     }
 
     #[tokio::test]

@@ -8,11 +8,17 @@
 //! * #412: pins reached through in-root `-r` includes;
 //! * #721: a UTF-16 file with a BOM (Windows PowerShell 5.1's
 //!   `pip freeze >` output), which pip decodes.
+//! * #1119: a file pip decodes through a PEP 263 coding line
+//!   (`# -*- coding: latin-1 -*-`), as the root file or an include.
+//! * #1212: a plain-ASCII file whose coding line names any other
+//!   ASCII-compatible codec (`iso-8859-15`, `cp1250`, `mac-roman`, `gbk`).
 //! * #994: include targets pip unquotes (`-r "dev reqs.txt"`,
 //!   `--requirement="dev.txt"`, `-r dev\ reqs.txt`) or expands
 //!   (`-r ${REQDIR}/dev.txt`);
 //! * #1028: a `-r` that follows other options on the line
 //!   (`--pre -r dev.txt`, `-i URL -r dev.txt`).
+//! * #1249: a last line ending in a dangling `\` continuation
+//!   (`six==1.16.0 \` at EOF), which pip joins and installs.
 //!
 //! Driven through the built binary against a mock patch API; the
 //! assertion is what discovery sends to the batch endpoint and the
@@ -121,7 +127,7 @@ async fn assert_lock_only_discovers_bytes_with_env(
     envs: &[(&str, &str)],
     expected: &[&str],
 ) {
-    for mode in [&[][..], &["--vendor"][..]] {
+    for mode in [&[][..], &["--mode", "vendored"][..]] {
         let mock = MockServer::start().await;
         mount_empty_batch(&mock).await;
         let tmp = tempfile::tempdir().unwrap();
@@ -209,6 +215,66 @@ async fn lock_only_scan_discovers_utf16_pins() {
     }
 }
 
+/// #1119: with no BOM, pip decodes a requirements file through a PEP 263
+/// coding line, so a Latin-1 file with a non-ASCII comment is discovered,
+/// as the root file and as a `-r` include, instead of reading as
+/// "No packages found".
+#[tokio::test]
+async fn lock_only_scan_discovers_pep_263_pins() {
+    let latin1 =
+        b"# -*- coding: latin-1 -*-\n# Maintainer: Jos\xe9\nsp-fixture-six==1.16.0\n".to_vec();
+    assert_lock_only_discovers_bytes(
+        &[("requirements.txt", &latin1[..])],
+        &["pkg:pypi/sp-fixture-six@1.16.0"],
+    )
+    .await;
+    assert_lock_only_discovers_bytes(
+        &[
+            (
+                "requirements.txt",
+                &b"-r dev.txt\nsp-fixture-idna==3.7\n"[..],
+            ),
+            ("dev.txt", &latin1[..]),
+        ],
+        &[
+            "pkg:pypi/sp-fixture-idna@3.7",
+            "pkg:pypi/sp-fixture-six@1.16.0",
+        ],
+    )
+    .await;
+}
+
+/// #1212: a coding line naming a codec the decoder has no table for
+/// (copied from a template; the file itself is plain ASCII) decodes like
+/// ASCII under every ASCII-compatible codec, as it does for pip, so the
+/// pins are discovered instead of reading as "No packages found".
+#[tokio::test]
+async fn lock_only_scan_discovers_ascii_pins_under_any_ascii_coding_line() {
+    for coding in ["iso-8859-15", "latin9", "cp1250", "mac-roman", "gbk"] {
+        let root = format!("# -*- coding: {coding} -*-\nsp-fixture-six==1.16.0\n");
+        assert_lock_only_discovers_bytes(
+            &[("requirements.txt", root.as_bytes())],
+            &["pkg:pypi/sp-fixture-six@1.16.0"],
+        )
+        .await;
+        let dev = format!("# coding={coding}\nsp-fixture-six==1.16.0\n");
+        assert_lock_only_discovers_bytes(
+            &[
+                (
+                    "requirements.txt",
+                    &b"-r dev.txt\nsp-fixture-idna==3.7\n"[..],
+                ),
+                ("dev.txt", dev.as_bytes()),
+            ],
+            &[
+                "pkg:pypi/sp-fixture-idna@3.7",
+                "pkg:pypi/sp-fixture-six@1.16.0",
+            ],
+        )
+        .await;
+    }
+}
+
 /// #994: pip `shlex`-splits an include line's options, so a quoted or
 /// backslash-escaped target names the file without its quotes, and a
 /// target with a space is one path, not two words.
@@ -275,5 +341,75 @@ async fn lock_only_scan_discovers_include_after_other_options() {
             &["pkg:pypi/sp-fixture-optfirst@1.0.0"],
         )
         .await;
+    }
+}
+
+/// #1249: pip's `join_lines` strips the backslash of a continued last
+/// line and yields it at EOF, so `name==X \` with nothing after it is
+/// the pin `name==X`, in the root file or a `-r` include, LF or CRLF.
+#[tokio::test]
+async fn lock_only_scan_discovers_pin_with_dangling_eof_continuation() {
+    for root in [
+        "sp-fixture-dangle==1.16.0 \\",
+        "sp-fixture-dangle==1.16.0 \\\n",
+        "sp-fixture-dangle==1.16.0 \\\r\n",
+    ] {
+        eprintln!("case {root:?}");
+        assert_lock_only_discovers(
+            &[("requirements.txt", root)],
+            &["pkg:pypi/sp-fixture-dangle@1.16.0"],
+        )
+        .await;
+    }
+    assert_lock_only_discovers(
+        &[
+            ("requirements.txt", "-r dev.txt\n"),
+            (
+                "dev.txt",
+                "sp-fixture-idna==3.4\nsp-fixture-dangle==1.16.0 \\\n",
+            ),
+        ],
+        &[
+            "pkg:pypi/sp-fixture-idna@3.4",
+            "pkg:pypi/sp-fixture-dangle@1.16.0",
+        ],
+    )
+    .await;
+}
+
+/// #604: pip resolves `six==1.16`, `six==1.16.0.0` and `six==01.16.0` to
+/// the registry release `1.16.0` (PEP 440), but lock-only discovery queried
+/// only the spelled version, so the patch keyed `@1.16.0` was never found.
+/// Each spelling must also ask for the release's other spellings.
+#[tokio::test]
+async fn lock_only_scan_queries_pep440_equivalent_spellings() {
+    for (pin, spelled) in [
+        ("1.16", "1.16"),
+        ("1.16.0.0", "1.16.0.0"),
+        ("01.16.0", "01.16.0"),
+    ] {
+        for mode in [&[][..], &["--mode", "vendored"][..]] {
+            let mock = MockServer::start().await;
+            mount_empty_batch(&mock).await;
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("requirements.txt"),
+                format!("sp-fixture-six=={pin}\n"),
+            )
+            .unwrap();
+            let (code, v) = run_scan(tmp.path(), &mock.uri(), mode, &[]);
+            assert_eq!(code, 0, "{pin} {mode:?}: {v}");
+            assert_eq!(v["lockfileOnlyPackages"].as_u64(), Some(1), "{v}");
+            let purls = batch_purls(&mock).await;
+            for want in [
+                format!("pkg:pypi/sp-fixture-six@{spelled}"),
+                "pkg:pypi/sp-fixture-six@1.16.0".to_string(),
+            ] {
+                assert!(
+                    purls.contains(&want),
+                    "{pin} {mode:?}: {want} must reach the patch API; sent {purls:?}"
+                );
+            }
+        }
     }
 }

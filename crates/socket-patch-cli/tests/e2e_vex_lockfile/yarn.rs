@@ -43,6 +43,8 @@
 //!
 //! Runs on every OS; no toolchain, no network.
 
+use crate::common::binary;
+
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -458,7 +460,7 @@ fn write_redirect_ledger(cwd: &Path, flavor: Flavor, rec: PatchRecord) {
     );
 }
 
-/// The vendor ledger `scan --vendor` persists for a yarn project: embedded
+/// The vendor ledger `scan --mode vendored` persists for a yarn project: embedded
 /// record (D9) and the backend's own wiring records.
 fn write_vendor_ledger(cwd: &Path, flavor: Flavor, rel: &str, rec: PatchRecord) {
     let wiring_record = |file: &str, kind: &str| WiringRecord {
@@ -478,13 +480,13 @@ fn write_vendor_ledger(cwd: &Path, flavor: Flavor, rel: &str, rec: PatchRecord) 
         vec![wiring_record("yarn.lock", "yarn_lock_block")]
     };
     let mut state = VendorState::new();
-    state.entries.insert(
-        PURL.to_string(),
-        VendorEntry {
-            ecosystem: "npm".to_string(),
-            base_purl: PURL.to_string(),
-            uuid: rec.uuid.clone(),
-            artifact: VendorArtifact {
+    let mut entry = VendorEntry {
+        flavor: Some(flavor.ledger_flavor().to_string()),
+        ..VendorEntry::new(
+            "npm".to_string(),
+            PURL.to_string(),
+            rec.uuid.clone(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel.to_string(),
                 sha256: String::new(),
@@ -493,18 +495,10 @@ fn write_vendor_ledger(cwd: &Path, flavor: Flavor, rel: &str, rec: PatchRecord) 
                 file_inventory: None,
             },
             wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: Some(rec),
-            flavor: Some(flavor.ledger_flavor().to_string()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
-    );
+        )
+    };
+    entry.record = Some(rec);
+    state.entries.insert(PURL.to_string(), entry);
     put(
         cwd,
         ".socket/vendor/state.json",
@@ -513,10 +507,6 @@ fn write_vendor_ledger(cwd: &Path, flavor: Flavor, rel: &str, rec: PatchRecord) 
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// The CLI with the ambient `SOCKET_*` environment scrubbed (explicit flags
 /// are the sole source of truth), no token, no socket-cli config, telemetry
@@ -1322,7 +1312,7 @@ fn pnp_loader_naming_hosted_and_registry_copies_is_not_attested() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// EMBEDDED — scan --vex / scan --mode hosted --vex / scan --vendor --vex /
+// EMBEDDED — scan --vex / scan --mode hosted --vex / scan --mode vendored --vex /
 // apply --vex, manifest-less
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1368,7 +1358,7 @@ fn assert_embedded_attested(doc: Option<Value>, env: &Value, marker: &str, cell:
 }
 
 /// The in-run VEX of `scan` (a bare scan, which runs hosted mode; the legacy
-/// `--mode hosted`; `--vendor`) on an
+/// `--mode hosted`; `--mode vendored`) on an
 /// already-wired, manifest-less checkout attests the lock's patch like the
 /// standalone command, never rewrites the wiring, never writes a manifest,
 /// and still refuses a tampered installed tree.
@@ -1376,7 +1366,7 @@ fn assert_embedded_attested(doc: Option<Value>, env: &Value, marker: &str, cell:
 fn embedded_scan_vex_attests_manifest_less_wiring() {
     for flavor in [Flavor::Classic, Flavor::Berry4] {
         for mode in ["hosted", "vendored"] {
-            for scan_mode in [None, Some("--mode=hosted"), Some("--vendor")] {
+            for scan_mode in [None, Some("--mode=hosted"), Some("--mode=vendored")] {
                 let tmp = tempfile::tempdir().unwrap();
                 let cwd = tmp.path();
                 if mode == "hosted" {

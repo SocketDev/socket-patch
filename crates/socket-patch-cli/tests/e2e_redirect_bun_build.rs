@@ -90,6 +90,10 @@
 //! equal `bun --version`, so a CI leg cannot pass by running the wrong bun
 //! or no bun at all.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -149,10 +153,6 @@ const LOCK_V1_FROM: BunVersion = (1, 2, 0);
 const LOCK_V2_FROM: BunVersion = (1, 4, 0);
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// The REQUIRED gate: set AND non-empty. CI's e2e matrix passes
 /// `SOCKET_PATCH_BUN_E2E_REQUIRED: ${{ matrix.bun != '' && '1' || '' }}`,
@@ -284,11 +284,19 @@ fn bun_toolchain(tag: &str) -> Option<(String, BunVersion)> {
 /// pre-rewrite assertions). Scrub BEFORE seeding: `Command`'s last env call
 /// for a name wins, and the scrub removes `BUN_INSTALL_CACHE_DIR`.
 fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
+    bun_env(cwd, args, cache_dir, &[])
+}
+
+/// [`bun`] with extra env applied last (a fixture's user-level config).
+fn bun_env(cwd: &Path, args: &[&str], cache_dir: &Path, env: &[(String, String)]) -> Output {
     let mut cmd = Command::new("bun");
     cmd.args(args).current_dir(cwd);
     cache_env::scrub_ambient_bun_env(&mut cmd);
     cache_env::isolate(&mut cmd);
     cmd.env("BUN_INSTALL_CACHE_DIR", cache_dir);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     cmd.output().expect("failed to run bun")
 }
 
@@ -460,6 +468,16 @@ async fn mount_scoped_registry(server: &MockServer, tgz: Vec<u8>) {
         })))
         .mount(server)
         .await;
+    // The version document a hosted unwind's restore reads.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/@scope(%2[fF]|/)pkg/1\.0\.0$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": SCOPED_NAME,
+            "version": SCOPED_VERSION,
+            "dist": { "tarball": tarball_url, "integrity": sri(&tgz) }
+        })))
+        .mount(server)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("/@scope/pkg/-/pkg-{SCOPED_VERSION}.tgz")))
         .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
@@ -546,7 +564,21 @@ struct BunRedirectFixture {
     /// `bun --version`, verbatim, for messages.
     bun_raw: String,
     bun_version: BunVersion,
+    /// Env every bun and socket-patch run of this fixture gets: the
+    /// `XDG_CONFIG_HOME` holding a [`ScopeConfig::UserNpmrc`] scope.
+    user_env: Vec<(String, String)>,
     _server: MockServer,
+}
+
+/// Where the scoped target's registry is configured.
+#[derive(Clone, Copy, PartialEq)]
+enum ScopeConfig {
+    /// The project's committed `bunfig.toml` `[install.scopes]`.
+    ProjectBunfig,
+    /// Only the user's `$XDG_CONFIG_HOME/.npmrc` `@scope:registry`, where
+    /// private scopes and their tokens usually live (#1276): no
+    /// committable file names the registry.
+    UserNpmrc,
 }
 
 /// Which socket-patch invocation drives the hosted rewrite (step 3). Both
@@ -599,6 +631,27 @@ async fn bun_hosted_project(
     shape: LockShape,
     target: Target,
 ) -> Option<BunRedirectFixture> {
+    bun_hosted_project_with(
+        tag,
+        tamper_served_tarball,
+        driver,
+        shape,
+        target,
+        ScopeConfig::ProjectBunfig,
+    )
+    .await
+}
+
+/// [`bun_hosted_project`] with the scoped target's registry configured
+/// where `scope_config` says.
+async fn bun_hosted_project_with(
+    tag: &str,
+    tamper_served_tarball: bool,
+    driver: HostedDriver,
+    shape: LockShape,
+    target: Target,
+    scope_config: ScopeConfig,
+) -> Option<BunRedirectFixture> {
     let (bun_raw, bun_version) = bun_toolchain(tag)?;
     if shape == LockShape::V1OnNewerBun && bun_version < LOCK_V2_FROM {
         println!(
@@ -619,19 +672,35 @@ async fn bun_hosted_project(
     // before the fixture install), the patch API, and the hosted tarball.
     let server = MockServer::start().await;
     let mut registry_field = String::new();
+    let mut user_env = Vec::new();
     if target == Target::ScopedWithDeps {
         let registry_tgz = scoped_registry_tgz();
         mount_scoped_registry(&server, registry_tgz).await;
-        // bun's scoped-registry config — a committable file, so it travels
-        // with every fresh checkout below.
-        std::fs::write(
-            proj.join("bunfig.toml"),
-            format!(
-                "[install.scopes]\n\"@scope\" = {{ url = \"{}/\" }}\n",
-                server.uri()
-            ),
-        )
-        .unwrap();
+        match scope_config {
+            // bun's scoped-registry config — a committable file, so it
+            // travels with every fresh checkout below.
+            ScopeConfig::ProjectBunfig => std::fs::write(
+                proj.join("bunfig.toml"),
+                format!(
+                    "[install.scopes]\n\"@scope\" = {{ url = \"{}/\" }}\n",
+                    server.uri()
+                ),
+            )
+            .unwrap(),
+            ScopeConfig::UserNpmrc => {
+                let xdg = tmp.path().join("xdg-config");
+                std::fs::create_dir_all(&xdg).unwrap();
+                std::fs::write(
+                    xdg.join(".npmrc"),
+                    format!("@scope:registry={}/\n", server.uri()),
+                )
+                .unwrap();
+                user_env.push((
+                    "XDG_CONFIG_HOME".to_string(),
+                    xdg.to_str().unwrap().to_string(),
+                ));
+            }
+        }
         // For a non-default registry bun records the TARBALL URL as the
         // 4-tuple's registry field.
         registry_field = format!("{}/@scope/pkg/-/pkg-{SCOPED_VERSION}.tgz", server.uri());
@@ -639,7 +708,7 @@ async fn bun_hosted_project(
 
     // 1. REAL fixture: bun install (network here, private cache). Text lockfile.
     let cache = tmp.path().join("bun-cache");
-    let install = bun(&proj, &fixture_install_args(bun_version), &cache);
+    let install = bun_env(&proj, &fixture_install_args(bun_version), &cache, &user_env);
     if !install.status.success() {
         assert!(
             !bun_required(),
@@ -881,7 +950,7 @@ async fn bun_hosted_project(
             "fake",
         ],
     };
-    let (code, stdout, stderr) = run_socket(&proj, &argv);
+    let (code, stdout, stderr) = run_socket_env(&proj, &argv, &user_env);
     assert_eq!(
         code, 0,
         "{} --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
@@ -1016,6 +1085,7 @@ async fn bun_hosted_project(
         lock_version,
         bun_raw,
         bun_version,
+        user_env,
         _server: server,
     })
 }
@@ -1084,10 +1154,11 @@ fn fresh_checkout(fx: &BunRedirectFixture, name: &str) -> PathBuf {
 fn fresh_frozen_install(fx: &BunRedirectFixture, name: &str) -> (PathBuf, Output) {
     let fresh = fresh_checkout(fx, name);
     let fresh_cache = fx.tmp.path().join(format!("{name}-bun-cache"));
-    let ci = bun(
+    let ci = bun_env(
         &fresh,
         &["install", "--frozen-lockfile", "--ignore-scripts"],
         &fresh_cache,
+        &fx.user_env,
     );
     (fresh, ci)
 }
@@ -1157,7 +1228,12 @@ fn assert_patched_fresh_install(fx: &BunRedirectFixture) {
     let wired_lock = std::fs::read(fx.proj.join("bun.lock")).unwrap();
     std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
     let plain_cache = fx.tmp.path().join("fresh-plain-bun-cache");
-    let plain = bun(&fresh, &["install", "--ignore-scripts"], &plain_cache);
+    let plain = bun_env(
+        &fresh,
+        &["install", "--ignore-scripts"],
+        &plain_cache,
+        &fx.user_env,
+    );
     assert!(
         plain.status.success(),
         "plain `bun install` on the redirected lock must succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -1495,6 +1571,83 @@ async fn bun_redirect_rollback_restores_lock_and_original_install() {
         !installed.starts_with(MARKER.as_bytes()),
         "after rollback bun must install the ORIGINAL bytes, not the patch"
     );
+    assert_eq!(
+        installed, fx.orig,
+        "after rollback the fresh install must be byte-identical to the pristine package"
+    );
+}
+
+/// #1276: the scoped target's registry is set only in the user's
+/// `$XDG_CONFIG_HOME/.npmrc`, as a private scope usually is. `rollback`
+/// must read that registry (not the default one, which does not know the
+/// package) and give back the tarball URL bun recorded, byte for byte, so
+/// a fresh frozen install with the same user config lands the original
+/// bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn bun_redirect_rollback_reads_a_scope_set_only_in_the_user_npmrc() {
+    let Some(fx) = bun_hosted_project_with(
+        "user-npmrc-scope",
+        false,
+        HostedDriver::ScanVex,
+        LockShape::Native,
+        Target::ScopedWithDeps,
+        ScopeConfig::UserNpmrc,
+    )
+    .await
+    else {
+        return;
+    };
+    assert!(
+        !fx.proj.join("bunfig.toml").exists() && !fx.proj.join(".npmrc").exists(),
+        "no project file names the scope's registry"
+    );
+    assert_patched_fresh_install(&fx);
+
+    let proj = &fx.proj;
+    let mut env = unwind_env(&fx).await;
+    env.extend(fx.user_env.iter().cloned());
+    let (code, stdout, stderr) = run_socket_env(
+        proj,
+        &[
+            "rollback",
+            "--yes",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &env,
+    );
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("rollback --json output is not JSON: {e}\nstdout:\n{stdout}"));
+    assert_eq!(
+        envelope["status"], "success",
+        "rollback envelope: {envelope}"
+    );
+    assert!(
+        !stdout.contains("upstream_registry_fallback"),
+        "the user's scope registry was read: {envelope}"
+    );
+    assert_eq!(
+        String::from_utf8(std::fs::read(proj.join("bun.lock")).unwrap()).unwrap(),
+        String::from_utf8(fx.lock_before.clone()).unwrap(),
+        "rollback must restore bun.lock byte-identical to the pre-redirect snapshot, \
+         the scope registry's tarball URL in the slot"
+    );
+
+    let (fresh, ci) = fresh_frozen_install(&fx, "fresh-rolled-back");
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `bun install --frozen-lockfile` of the restored lock must \
+         succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fx.target.installed_dir(&fresh).join("index.js")).unwrap();
     assert_eq!(
         installed, fx.orig,
         "after rollback the fresh install must be byte-identical to the pristine package"

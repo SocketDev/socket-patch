@@ -18,8 +18,11 @@
 //! case is DSL-specific; toolchain selection is `gradle_build_common`'s
 //! `SOCKET_PATCH_GRADLE_E2E_*` knobs.
 
-#[path = "common/hermetic.rs"]
-mod hermetic;
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
+use common::hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -84,10 +87,6 @@ fn coordinate() -> String {
 
 fn purl() -> String {
     jvm_fixture_repo::victim_purl(VICTIM_VERSION)
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
 fn central_file(path: &str) -> Vec<u8> {
@@ -2172,8 +2171,10 @@ fn gradle_hosted_vendored_takeover_and_eject() {
 }
 
 /// A vendored Gradle build the hosted planner would refuse (a custom
-/// `lockFile`): `scan --mode hosted` refuses the takeover BEFORE reverting
-/// anything, so the vendored patch keeps working.
+/// `lockFile`): `scan --mode hosted` stages the vendored revert in memory,
+/// the planner refuses the pin, and the takeover is retracted before
+/// anything reaches the disk (the tree's jars included), so the vendored
+/// patch keeps working.
 #[test]
 #[ignore = "real Gradle; run with --ignored"]
 fn gradle_hosted_takeover_refusal_keeps_vendored() {

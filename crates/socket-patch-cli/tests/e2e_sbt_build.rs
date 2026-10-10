@@ -24,6 +24,7 @@ mod sbt_build_common;
 
 use std::path::{Path, PathBuf};
 
+use common::envelope::all_codes;
 use sbt_build_common::*;
 use socket_patch_core::formats::sbt::owned_file::{HOSTED_FILE, HOSTED_REPO_REL};
 use wiremock::matchers::{method, path};
@@ -186,28 +187,6 @@ fn get_hosted(ws: &Workspace, server: &Server, uuid: &str) -> serde_json::Value 
     );
     assert_eq!(code, 0, "get --mode hosted:\n{out}");
     json
-}
-
-fn codes(json: &serde_json::Value) -> Vec<String> {
-    let mut out = Vec::new();
-    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
-        match v {
-            serde_json::Value::Object(map) => {
-                for (k, v) in map {
-                    if k == "code" || k == "errorCode" {
-                        if let Some(s) = v.as_str() {
-                            out.push(s.to_string());
-                        }
-                    }
-                    walk(v, out);
-                }
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
-            _ => {}
-        }
-    }
-    walk(json, &mut out);
-    out
 }
 
 /// The standard fixture: `top` → `lib`, the root on `top`, `a` on `lib`,
@@ -403,7 +382,7 @@ fn sbt_hosted_no_evidence_noop() {
     server.grant(&sbt, UUID, "lib", BASE, &patched(), &patched());
     let json = get_hosted(&ws, &server, UUID);
     assert!(
-        codes(&json).contains(&"redirect_sbt_no_resolution_evidence".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_no_resolution_evidence".to_string()),
         "{json}"
     );
     assert!(!ws.project.join(HOSTED_FILE).exists());
@@ -420,7 +399,7 @@ fn sbt_hosted_version_conflict_refused() {
     server.grant(&sbt, UUID, "lib", BASE, &patched(), &patched());
     let json = get_hosted(&ws, &server, UUID);
     assert!(
-        codes(&json).contains(&"redirect_sbt_version_conflict".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_version_conflict".to_string()),
         "{json}"
     );
     assert!(!ws.project.join(HOSTED_FILE).exists());
@@ -444,7 +423,7 @@ fn sbt_hosted_zz_override_assignment_refused() {
     server.grant(&sbt, UUID, "lib", BASE, &patched(), &patched());
     let json = get_hosted(&ws, &server, UUID);
     assert!(
-        codes(&json).contains(&"redirect_sbt_overrides_assignment".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_overrides_assignment".to_string()),
         "{json}"
     );
     assert!(!ws.project.join(HOSTED_FILE).exists());
@@ -504,13 +483,13 @@ fn sbt_hosted_vex_attests_after_update() {
     // Before the post-wiring update: the pin is not verified.
     let (_, json, _) = vex("before update");
     assert!(
-        codes(&json).contains(&"sbt_resolution_unverified".to_string()),
+        all_codes(&json).contains(&"sbt_resolution_unverified".to_string()),
         "{json}"
     );
     sbt.run(&ws, &["update"]).expect_ok("post-wiring update");
     let (code, json, out) = vex("after update");
     assert!(
-        !codes(&json).contains(&"sbt_resolution_unverified".to_string()),
+        !all_codes(&json).contains(&"sbt_resolution_unverified".to_string()),
         "{out}"
     );
     assert_eq!(code, 0, "{out}");
@@ -547,14 +526,14 @@ fn sbt_hosted_dep_edit_rechecks_after_update() {
     // Edited, not resolved yet.
     let json = get_hosted(&ws, &server, UUID);
     assert!(
-        codes(&json).contains(&"redirect_sbt_pin_unverifiable".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_pin_unverifiable".to_string()),
         "{json}"
     );
     assert_eq!(std::fs::read(ws.project.join(HOSTED_FILE)).unwrap(), before);
     sbt.run(&ws, &["update"]).expect_ok("update after the edit");
     let json = get_hosted(&ws, &server, UUID);
     assert!(
-        !codes(&json).contains(&"redirect_sbt_pin_unverifiable".to_string()),
+        !all_codes(&json).contains(&"redirect_sbt_pin_unverifiable".to_string()),
         "{json}"
     );
     assert_eq!(json["redirect"]["redirected"], 1, "{json}");
@@ -563,7 +542,7 @@ fn sbt_hosted_dep_edit_rechecks_after_update() {
     // ...and the next run is quiet.
     let json = get_hosted(&ws, &server, UUID);
     assert!(
-        !codes(&json).contains(&"redirect_sbt_pin_unverifiable".to_string()),
+        !all_codes(&json).contains(&"redirect_sbt_pin_unverifiable".to_string()),
         "{json}"
     );
     assert_eq!(std::fs::read(ws.project.join(HOSTED_FILE)).unwrap(), after);
@@ -592,7 +571,7 @@ fn sbt_hosted_declared_bump_fails_closed() {
         .expect_failure("declared bump", "declares dev.socket.fixture:lib:1.1.0");
     let json = get_hosted(&ws, &server, UUID);
     assert!(
-        codes(&json).contains(&"redirect_sbt_pin_declared_newer".to_string()),
+        all_codes(&json).contains(&"redirect_sbt_pin_declared_newer".to_string()),
         "{json}"
     );
     assert_eq!(json["redirect"]["redirected"], 0, "{json}");

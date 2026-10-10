@@ -1,13 +1,18 @@
-# Vendored Maven reactors and Gradle in v5
+# Vendored Maven and Gradle in v5
 
 The JVM backend in `crates/socket-patch-core/src/vendor/jvm/` is enabled by
-build shape. No experimental environment variable is required. Maven reactors
+build shape. No experimental environment variable is required. Maven roots
 use suffixed coordinates; Gradle keeps the original coordinates. Both commit a
 local repository so another checkout can build without socket-patch or the
 Socket service.
 
-The existing single-POM backend remains supported. This change adds reactor and
-Gradle support without automatically migrating existing single-POM repositories.
+Every Maven root goes through the reactor planner. A root `pom.xml` with no
+`<modules>` is planned as a reactor of one: the same pin, `.mvn/maven.config`,
+fallback repository and `.socket/vendor/maven2` tree a multi-module reactor
+gets. The pre-v5 single-POM backend (a same-GAV `<repository>` serving
+`.socket/vendor/maven/<uuid>/`) is retired. Its ledger entries can still be
+reverted byte for byte, but vendoring a root whose ledger holds one is
+refused (see `legacy_maven_root` below).
 Hosted Gradle wiring is a separate backend; see
 [ecosystem support](../ecosystems.md#gradle).
 
@@ -49,8 +54,9 @@ against registry checksums.
 ## Maven
 
 Supported reactors have an explicit root `pom.xml` and `<modules>` or
-`<subprojects>` declarations, including declarations in profiles. Run vendoring
-from the reactor root. A discovered ancestor reactor produces `not_build_root`
+`<subprojects>` declarations, including declarations in profiles. A root
+`pom.xml` without them is a reactor of one (#973). Run vendoring from the
+reactor root. A discovered ancestor reactor produces `not_build_root`
 instead of allowing a partial submodule edit.
 
 The patched version is `<base>-socket.<first-eight-uuid-hex>`, matching the patch
@@ -74,6 +80,20 @@ produce specific warnings; the backend does not silently claim those
 unsupported declarations are patched. An enforcer repository ban omits the
 fallback repository and warns that the tail requires Maven 3.9.2 or newer.
 
+A local root's pin beats every management from outside the checkout, so it is
+weighed against that management first: the parents a local root resolves from
+a repository (`<relativePath/>`, a corporate or Spring Boot parent) and every
+`<scope>import</scope>` BOM of the reactor and of those parents, read from the
+local caches or the registry like other upstream metadata. Properties follow
+Maven's order (the reactor's own values override an external parent's). When
+that management, or a literal an external parent declares, sets the artifact to
+another version than the patch's base, the root is not pinned
+(`conflicting_managed_version`); when a needed POM is in no cache and cannot be
+fetched, the root is not pinned either (`management_unresolved`, resolve the
+project once and vendor again). A re-run after a BOM bump drops the pin the
+same way. `vendor --check` reads that metadata from the local repository only
+and accepts either decision when some of it is missing.
+
 Maven 3.9.2+ can read the repository tail without copying jars into `~/.m2` and
 without routing through mirrors. Older Maven versions use the fallback file
 repository, which copies the suffixed artifact into the local cache. A
@@ -86,7 +106,10 @@ first vendoring run. That option uses the fallback file repository only, is
 recorded in the ledger, and remains in effect on later runs and repair. Revert
 existing auto-config wiring before changing to `none`. Combining `none` with a
 repository ban is refused. Version detection reads wrapper properties only;
-it never executes Maven.
+it never executes Maven. Without a wrapper (most single-module projects) the
+version is unknown, so both `maven_f_outside_root` and `maven_mirror_of_all`
+are reported as `vendor_jvm_degraded` warnings; a Maven Wrapper at 3.9.9 or
+later clears both.
 
 ## Gradle
 
@@ -103,10 +126,14 @@ written, and `repair` refuses there too. A root holding both a `pom.xml` and a
 Gradle build vendors both, in one ledger entry: the Maven half as a one-POM
 reactor (suffixed tree, pin, `maven.config`), the Gradle half as below. A
 refusal of either half writes nothing, and `--check`, `vex`, revert and repair
-always handle both. A single-POM root whose ledger already holds a single-POM
-(`<repository>`) entry stays on the single-POM backend, with a
-`legacy_maven_root` degraded warning that the Gradle build stays unpatched:
-nothing migrates that wiring, so revert and vendor again to wire both builds.
+always handle both.
+
+A root whose ledger still holds a pre-v5 single-POM (`maven_pom_repository`)
+entry is refused whole, alone or beside a Gradle build:
+`vendor_jvm_shape_unsupported` with reason `legacy_maven_root`, and nothing is
+written. That entry's revert restores a whole-file `pom.xml` snapshot, so
+planner edits on the same pom would make it unsafe, and nothing migrates it.
+Run `socket-patch vendor --revert`, then vendor again.
 
 The original GAV is retained under
 `.socket/vendor/gradle/<group-path>/<artifact>/<version>/`, with the jar, the
@@ -227,7 +254,7 @@ tier pins Maven 3.6.3, 3.8.9, 3.9.2, 3.9.16 and 4.0.0-rc-6 (macOS and Windows on
 8.14.3 row; `gradle-compatibility.yml` runs every Gradle version on Linux,
 macOS and Windows nightly.
 
-Automatic single-POM migration, Maven 4 implicit subproject discovery,
-build-time Maven strict pins, creating Gradle verification policy, and online
+Pre-v5 single-POM entries are not migrated: revert them and vendor again.
+Maven 4 implicit subproject discovery, build-time Maven strict pins, creating Gradle verification policy, and online
 dependency-graph resolution checks remain separate work. They are not enabled
 by this release.

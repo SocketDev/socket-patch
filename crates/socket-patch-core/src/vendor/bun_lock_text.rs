@@ -33,12 +33,7 @@ const SUPPORTED_LOCK_VERSIONS: [u64; 3] = [0, 1, 2];
 /// plainly.
 pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>) -> Vec<String> {
     let mut keys: Vec<String> = manifest
-        .map(crate::formats::text::strip_bom)
-        .and_then(|text| {
-            serde_json::from_str::<serde_json::Value>(text)
-                .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
-                .ok()
-        })
+        .and_then(parse_manifest)
         .and_then(|value| match value.get("patchedDependencies") {
             Some(serde_json::Value::Object(map)) => Some(map.keys().cloned().collect()),
             _ => None,
@@ -59,10 +54,74 @@ pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>
     keys
 }
 
+/// A root `package.json` parsed as Bun reads it: a leading BOM, comments
+/// and trailing commas allowed. `None` when Bun could not parse it either.
+fn parse_manifest(text: &str) -> Option<serde_json::Value> {
+    let text = crate::formats::text::strip_bom(text);
+    serde_json::from_str(text)
+        .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
+        .ok()
+}
+
+/// Bun's built-in default-trusted package names, the union of every release
+/// up to 1.4.2 (`src/install/default-trusted-dependencies.txt` upstream).
+const DEFAULT_TRUSTED: &str = include_str!("bun_default_trusted.txt");
+
+/// Whether Bun runs `name`'s lifecycle scripts only through its built-in
+/// default trust, which a hosted or vendored rewire takes away (#371).
+///
+/// Bun trusts a package when the project's `trustedDependencies` lists it,
+/// or, when the project declares no `trustedDependencies` at all, when its
+/// name is on Bun's default list. From Bun 1.3.5 on that default applies
+/// only to packages resolved from the npm registry, so a package on a hosted
+/// URL or a local tarball loses it: `bun install` skips its `install` /
+/// `postinstall` script without failing, and a native addon is left
+/// unbuilt. An explicit list (in the root manifest, or the copy Bun mirrors
+/// at the top of a text `bun.lock`) already decides trust by name alone,
+/// so the rewire changes nothing there.
+pub(crate) fn loses_default_trust(manifest: Option<&str>, lock: Option<&str>, name: &str) -> bool {
+    // The list lookup is cheap and almost always false, so it runs first:
+    // the hosted rewriter calls this per wired dep, and the manifest parse
+    // plus whole-lock scan must not land in its per-dep loop (#578).
+    static TRUSTED: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    if !TRUSTED
+        .get_or_init(|| DEFAULT_TRUSTED.lines().collect())
+        .contains(name)
+    {
+        return false;
+    }
+    let declared = manifest.and_then(parse_manifest).is_some_and(|value| {
+        value
+            .get("trustedDependencies")
+            .is_some_and(|v| v.is_array())
+    }) || lock.is_some_and(|lock| {
+        lock.split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l))
+            .any(|l| l.starts_with("  \"trustedDependencies\": ["))
+    });
+    !declared
+}
+
+/// The user-facing warning for a rewired package that loses Bun's default
+/// trust ([`loses_default_trust`]), shared by the hosted and vendored paths.
+/// `target` names what the package now resolves to.
+pub(crate) fn default_trust_detail(name: &str, version: &str, target: &str) -> String {
+    format!(
+        "{name}@{version} is on Bun's default trusted list, which Bun 1.3.5 and later apply \
+         only to packages installed from the npm registry; now that it resolves to {target}, \
+         `bun install` skips its install scripts without failing (`bun pm untrusted` lists \
+         it), which can leave native bindings unbuilt. Add \"{name}\" to \
+         \"trustedDependencies\" in package.json and run `bun install`. Declaring \
+         trustedDependencies replaces Bun's default list, so also list any other \
+         default-trusted dependency whose scripts you rely on"
+    )
+}
+
 /// `text` with the JSONC Bun accepts in a `package.json` removed: `//` and
 /// `/* */` comments and a comma before a closing `}` or `]`, all outside
 /// strings. Everything else, strings included, is kept byte for byte.
-fn strip_jsonc(text: &str) -> String {
+pub(crate) fn strip_jsonc(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     let mut in_string = false;
@@ -170,6 +229,56 @@ pub(crate) fn split_name_spec(s: &str) -> Option<(&str, &str)> {
     Some((&s[..at], &s[at + 1..]))
 }
 
+/// The version a user tarball dependency of `name` installs (#497). Bun
+/// records a remote-URL or `file:` tarball dependency as `name@<url|path>`
+/// (text) or as a tarball resolution (binary) with no version of its own,
+/// and installs it from that spec, never from the registry, so no rewire
+/// of a registry `name@version` reaches it. The version is read from the
+/// artifact leaf, `<bare>-<version>.tgz` (or `.tar.gz`) with a semver
+/// `<version>` (`<bare>` = the name without its `@scope/`): the leaf every
+/// registry tarball and `npm pack` output carries. A leaf naming no version
+/// yields `None`, and so does our own vendored path.
+pub(crate) fn user_tarball_version<'t>(name: &str, target: &'t str) -> Option<&'t str> {
+    // The leaf checks are cheap and reject a registry spec (`name@1.2.3`)
+    // at once; the vendor-path parse runs only for a tarball leaf (#578).
+    let path = target.split(['?', '#']).next().unwrap_or(target);
+    let leaf = path.rsplit(['/', '\\']).next()?;
+    let bare = name.rsplit('/').next().unwrap_or(name);
+    let version = leaf.strip_prefix(bare)?.strip_prefix('-')?;
+    let version = version
+        .strip_suffix(".tgz")
+        .or_else(|| version.strip_suffix(".tar.gz"))?;
+    if crate::vendor::path::parse_vendor_path(target).is_some() {
+        return None;
+    }
+    semver::Version::parse(version).is_ok().then_some(version)
+}
+
+/// [`user_tarball_version`] for a text `packages` entry: true when the
+/// entry's spec is `name@<tarball>` and the tarball's leaf names `version`.
+pub(crate) fn is_user_tarball_entry(entry: &BunEntry, name: &str, version: &str) -> bool {
+    entry
+        .elems
+        .first()
+        .and_then(|raw| decode_json_string(raw))
+        .is_some_and(|spec| is_user_tarball_spec(&spec, name, version))
+}
+
+/// [`is_user_tarball_entry`] on an already-decoded `name@<target>` spec,
+/// for hot loops that decoded it once already. The name is matched by a
+/// prefix strip, so an entry of another package costs one compare.
+#[inline]
+pub(crate) fn is_user_tarball_spec(spec: &str, name: &str, version: &str) -> bool {
+    // Length and separator first: the hosted rewriter asks this of every
+    // lock entry per patch, nearly all of another package (#578).
+    if spec.as_bytes().get(name.len()) != Some(&b'@') {
+        return false;
+    }
+    spec.strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('@'))
+        .is_some_and(|target| user_tarball_version(name, target) == Some(version))
+}
+
 /// `"lockfileVersion": <n>` head check — only the fixture-pinned text
 /// lockfile versions are spliced (fail-closed on anything newer/older).
 ///
@@ -217,6 +326,14 @@ pub(crate) fn has_workspace_packages(entries: &[BunEntry]) -> bool {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`is_bundled_entry`] calls this thread made. Each one JSON-parses the
+    /// entry's meta, so a rewrite loop over N deps × M entries must check the
+    /// cheap spec match first and pay it only for matching entries (#578).
+    pub(crate) static BUNDLED_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// True when `entry` is a `bundleDependencies` copy: bun records it as its
 /// own `parent/child` entry whose `{meta}` object carries `"bundled": true`,
 /// and unpacks it from the PARENT's tarball without ever reading the
@@ -226,9 +343,17 @@ pub(crate) fn has_workspace_packages(entries: &[BunEntry]) -> bool {
 /// tarball tuple). A meta that does not parse as JSON but mentions
 /// `"bundled"` counts as bundled: fail closed, never rewire or attest it.
 pub(crate) fn is_bundled_entry(entry: &BunEntry) -> bool {
+    #[cfg(test)]
+    BUNDLED_CHECKS.with(|checks| checks.set(checks.get() + 1));
     let Some(meta) = entry.elems.iter().skip(1).find(|e| e.starts_with('{')) else {
         return false;
     };
+    // Fast path (#580): a meta that never spells `bundled` cannot carry the
+    // key. A backslash could hide it behind a JSON escape, so only a meta
+    // with neither skips the parse.
+    if !meta.contains("bundled") && !meta.contains('\\') {
+        return false;
+    }
     match serde_json::from_str::<serde_json::Value>(meta) {
         Ok(value) => value.get("bundled").and_then(serde_json::Value::as_bool) == Some(true),
         Err(_) => meta.contains("\"bundled\""),
@@ -648,6 +773,71 @@ pub(crate) fn heal_workspace_literals(
 mod tests {
     use super::*;
 
+    /// #497: a user tarball's version is its `<bare>-<semver>.tgz` leaf,
+    /// for remote URLs and local paths alike; a registry version, a leaf
+    /// naming no version or another package, and our own vendored path are
+    /// not user tarballs.
+    #[test]
+    fn user_tarball_version_reads_the_leaf() {
+        for (name, target, want) in [
+            (
+                "is-number",
+                "https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz",
+                Some("6.0.0"),
+            ),
+            ("is-number", "./is-number-6.0.0.tgz", Some("6.0.0")),
+            ("is-number", "file:./is-number-6.0.0.tgz", Some("6.0.0")),
+            ("is-number", "vendor\\is-number-6.0.0.tar.gz", Some("6.0.0")),
+            (
+                "@s/p",
+                "https://h.test/@s/p/-/p-1.0.0-2.tgz?t=1",
+                Some("1.0.0-2"),
+            ),
+            ("is-number", "6.0.0", None),
+            ("is-number", "./is-number.tgz", None),
+            ("is-number", "./is-number-latest.tgz", None),
+            ("is-number", "./is-odd-6.0.0.tgz", None),
+            ("is-number", "github:jonschlinkert/is-number#6.0.0", None),
+            (
+                "is-number",
+                ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/is-number-6.0.0.tgz",
+                None,
+            ),
+        ] {
+            assert_eq!(user_tarball_version(name, target), want, "{name} {target}");
+        }
+    }
+
+    #[test]
+    fn is_user_tarball_spec_checks_the_name_first() {
+        assert!(is_user_tarball_spec(
+            "left-pad@./left-pad-1.3.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(is_user_tarball_spec(
+            "@s/p@file:./p-1.0.0.tgz",
+            "@s/p",
+            "1.0.0"
+        ));
+        assert!(!is_user_tarball_spec(
+            "left-pad@./left-pad-1.2.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(!is_user_tarball_spec("left-pad@1.3.0", "left-pad", "1.3.0"));
+        assert!(!is_user_tarball_spec(
+            "left-pad-x@./left-pad-1.3.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(!is_user_tarball_spec(
+            "is-odd@./left-pad-1.3.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+    }
+
     /// #367: the keys come from the manifest and from the lock's mirror,
     /// and match the exact `name@version` (scoped too) or a bare name.
     #[test]
@@ -714,6 +904,26 @@ mod tests {
         ));
         assert!(!bundled(
             r#"    "q": ["q@1.0.0", "", { "bundled": false }, "sha512-X=="],"#
+        ));
+    }
+
+    /// The substring fast path (#580) never changes the answer: a meta that
+    /// never spells `bundled` is not bundled, a malformed meta that does
+    /// still fails closed, and a JSON-escaped key still takes the parse.
+    #[test]
+    fn bundled_fast_path_matches_the_full_parse() {
+        let bundled = |line: &str| is_bundled_entry(&parse_entry_line(line).unwrap());
+        assert!(!bundled(
+            r#"    "q": ["q@1.0.0", "", { "dependencies": { "a": "1" } }, "sha512-X=="],"#
+        ));
+        assert!(!bundled(
+            r#"    "q": ["q@1.0.0", "", { "x": , }, "sha512-X=="],"#
+        ));
+        assert!(bundled(
+            r#"    "q": ["q@1.0.0", "", { "bundled": true, "x": , }, "sha512-X=="],"#
+        ));
+        assert!(bundled(
+            r#"    "q": ["q@1.0.0", "", { "bundl\u0065d": true }, "sha512-X=="],"#
         ));
     }
 

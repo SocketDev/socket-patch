@@ -18,15 +18,10 @@ use serde_json::{json, Value};
 use toml_edit::{DocumentMut, Item};
 
 use super::client::PypiFile;
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::preserve_line_endings;
 use crate::vendor::common::pep508_name;
-
-/// The pins by uuid.
-pub(super) fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
-    pins.iter().map(|p| (p.uuid.as_str(), *p)).collect()
-}
 
 /// The in-scope pin a hosted `location` names.
 pub(super) fn pin_of<'p>(
@@ -45,40 +40,6 @@ pub(super) fn pin_coords(pin: &HostedPin, result: &mut FormatResult) -> Option<(
         None => {
             result.refuse(&pin.uuid, format!("{} is not a pypi purl", pin.purl));
             None
-        }
-    }
-}
-
-/// Read `rel` through the view; a missing or unreadable file refuses every
-/// pin discovery found in it.
-pub(super) async fn read_or_refuse(
-    view: &mut View<'_>,
-    rel: &str,
-    pins: &BTreeMap<&str, &HostedPin>,
-    result: &mut FormatResult,
-) -> Option<String> {
-    match view.read(rel).await {
-        Ok(Some(text)) => Some(text),
-        Ok(None) => {
-            refuse_all_in(pins, rel, result, format!("{rel} no longer exists"));
-            None
-        }
-        Err(e) => {
-            refuse_all_in(pins, rel, result, e);
-            None
-        }
-    }
-}
-
-pub(super) fn refuse_all_in(
-    pins: &BTreeMap<&str, &HostedPin>,
-    rel: &str,
-    result: &mut FormatResult,
-    why: String,
-) {
-    for pin in pins.values() {
-        if pin.files.iter().any(|f| f == rel) {
-            result.refuse(&pin.uuid, why.clone());
         }
     }
 }
@@ -270,7 +231,7 @@ fn pipfile_explicit_index(pipfile: &str, name: &str) -> Option<String> {
 
 /// One hosted `Pipfile.lock` entry.
 struct PipenvHit {
-    /// Index into the lock's `pipenv::entries`.
+    /// Index into the lock's `formats::pipenv::entries`.
     entry: usize,
     uuid: String,
     name: String,
@@ -290,7 +251,7 @@ pub(crate) async fn restore_pipfile_lock(
             continue;
         };
         let (entries, doc) = match (
-            super::super::pipenv::entries(&text),
+            crate::formats::pipenv::entries(&text),
             crate::vendor::lock_inventory::pypi::parse_pipfile_lock(&text),
         ) {
             (Ok(entries), Ok(doc)) => (entries, doc),
@@ -405,7 +366,7 @@ pub(crate) async fn restore_pipfile_lock(
             object.insert("hashes".into(), json!(hashes));
             let mut value = Value::Object(object);
             value.sort_all_objects();
-            match super::super::pipenv::format_entry(&value, &text, entry.range.start) {
+            match crate::formats::pipenv::format_entry(&value, &text, entry.range.start) {
                 Ok(rendered) => splices.push((entry.range.clone(), rendered, hit.uuid.clone())),
                 Err(e) => result.refuse(&hit.uuid, format!("{rel}: {e}")),
             }
@@ -649,7 +610,7 @@ pub(crate) async fn restore_requirements(
         } else {
             BTreeMap::new()
         };
-        let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let eol = crate::utils::line_endings::terminator(&text);
         let mut rewritten: Vec<(usize, String, String)> = Vec::new();
         for (i, line) in &hits {
             if result.refused.contains_key(&line.uuid) {
@@ -1020,6 +981,29 @@ mod tests {
     // ── requirements.txt: pip's hash-checking mode (#410) ──────────────────
 
     use super::super::{restore_upstream, HostedPin, PinStatus, RestoreOptions, RestoreOutcome};
+
+    /// #815: a restored hashed line's continuation takes the file's majority
+    /// line ending; one stray CRLF comment no longer turns it CRLF.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restored_hash_continuation_takes_the_majority_line_ending() {
+        let other = format!("idna==3.4 \\\n    --hash=sha256:{}\n", "c".repeat(64));
+        for (head, eol) in [
+            ("# pinned\r\n", "\n"),
+            ("# pinned\r\n# by pip-compile\r\n# x\r\n# y\r\n", "\r\n"),
+        ] {
+            let (outcome, after) = restore_six(&format!("{head}{other}{}\n", hashed_line())).await;
+            assert_restored(&outcome);
+            assert!(
+                after.contains(&format!("six==1.16.0 \\{eol}    --hash=sha256:")),
+                "{after:?}"
+            );
+            assert_eq!(
+                after.matches("\\\r\n").count(),
+                if eol == "\r\n" { 2 } else { 0 }
+            );
+        }
+    }
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

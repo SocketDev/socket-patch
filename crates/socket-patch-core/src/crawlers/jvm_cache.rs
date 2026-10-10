@@ -2,8 +2,8 @@
 //! caches (Maven's `~/.m2/repository`, Gradle's `modules-2`, Coursier,
 //! Ivy). Every Maven-PURL discovery path goes through here:
 //!
-//! - [`JVM_PROJECT_MARKERS`]: the files that make a directory a JVM
-//!   project root (each build tool contributes its own).
+//! - [`is_jvm_project`]: whether a directory is a JVM project root, by
+//!   the build markers of [`layout::BuildTool`].
 //! - [`JvmCacheLayout`] / [`JvmCacheRoot`]: an installed-artifact cache
 //!   and how its directories spell coordinates. [`MavenCrawler`] crawls
 //!   and resolves PURLs per root, dispatching on the layout.
@@ -22,34 +22,16 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Files whose presence makes a directory a JVM project root.
-pub const JVM_PROJECT_MARKERS: &[&str] = &[
-    // Maven
-    "pom.xml",
-    // Gradle
-    "build.gradle",
-    "build.gradle.kts",
-    "settings.gradle",
-    "settings.gradle.kts",
-    // sbt (`project/build.properties` is no marker: every marker list
-    // matches a basename, and `build.properties` alone is too generic)
-    "build.sbt",
-    // Mill
-    "build.mill",
-    "build.mill.yaml",
-    "build.sc",
-    // scala-cli
-    "project.scala",
-];
+use crate::vendor::jvm::layout;
 
-/// Whether `dir` holds any [`JVM_PROJECT_MARKERS`] file.
+/// Whether `dir` is a JVM build root: any [`layout::BuildTool`] marker,
+/// root-relative ones (`project/build.properties`, `.scala-build`)
+/// included ([`layout::is_jvm_build`]).
 pub async fn is_jvm_project(dir: &Path) -> bool {
-    for marker in JVM_PROJECT_MARKERS {
-        if tokio::fs::metadata(dir.join(marker)).await.is_ok() {
-            return true;
-        }
-    }
-    false
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || layout::is_jvm_build(&dir))
+        .await
+        .unwrap_or(false)
 }
 
 /// How a cache root's directories spell an artifact's coordinates.
@@ -156,9 +138,7 @@ pub fn push_classified(roots: &mut Vec<JvmCacheRoot>, root: JvmCacheRoot) -> boo
 
 /// A `SOCKET_DEBUG` line from the JVM cache discovery.
 pub(crate) fn debug_log(message: &str) {
-    if crate::utils::env_compat::is_debug_enabled() {
-        eprintln!("[socket-patch debug] {message}");
-    }
+    crate::utils::env_compat::debug_log("debug", message);
 }
 
 /// One installed-artifact cache to crawl.
@@ -224,7 +204,7 @@ pub fn all_local_roots_with(cwd: &Path, env: &super::maven_crawler::JvmEnv) -> V
         .as_ref()
         .filter(|repo| repo.is_dir())
         .map(|repo| JvmCacheRoot::new(repo.clone(), JvmCacheLayout::Maven2));
-    if super::gradle_cache::has_gradle_marker(cwd) {
+    if layout::has_build(cwd, layout::BuildTool::Gradle) {
         gradle.extend(m2);
         gradle
     } else {
@@ -248,24 +228,13 @@ pub fn locate_artifact(
     let (group, artifact, version) = gav;
     let classifier_ok = classifier.is_none_or(crate::patch::path_safety::is_safe_single_segment);
     let ext_ok = crate::patch::path_safety::is_safe_single_segment(ext);
-    if !super::maven_crawler::is_safe_maven_coordinate(group, artifact, version)
-        || !classifier_ok
-        || !ext_ok
-    {
+    if !layout::is_path_safe(group, artifact, version) || !classifier_ok || !ext_ok {
         return Vec::new();
     }
-    let leaf = match classifier {
-        Some(c) => format!("{artifact}-{version}-{c}.{ext}"),
-        None => format!("{artifact}-{version}.{ext}"),
-    };
+    let leaf = layout::file_name(artifact, version, classifier, ext);
     match root.layout {
         JvmCacheLayout::Maven2 => {
-            let path = root
-                .path
-                .join(group.replace('.', "/"))
-                .join(artifact)
-                .join(version)
-                .join(&leaf);
+            let path = layout::version_dir_path(&root.path, group, artifact, version).join(&leaf);
             if path.is_file() {
                 vec![path]
             } else {
@@ -299,12 +268,7 @@ pub fn locate_artifact(
             };
             repos
                 .into_iter()
-                .map(|repo| {
-                    repo.join(group.replace('.', "/"))
-                        .join(artifact)
-                        .join(version)
-                        .join(&leaf)
-                })
+                .map(|repo| layout::version_dir_path(&repo, group, artifact, version).join(&leaf))
                 .filter(|p| p.is_file())
                 .collect()
         }
@@ -427,31 +391,23 @@ mod tests {
     }
 
     #[test]
-    fn scala_build_files_are_markers_but_build_properties_is_not() {
-        for marker in [
-            "build.sbt",
-            "build.mill",
-            "build.mill.yaml",
-            "build.sc",
-            "project.scala",
-        ] {
-            assert!(JVM_PROJECT_MARKERS.contains(&marker), "{marker}");
-        }
-        assert!(JVM_PROJECT_MARKERS.iter().all(|m| !m.contains('/')));
-    }
-
-    #[test]
     fn no_provider_means_whole_cache_fallback() {
         assert_eq!(project_dependency_set(Path::new("/nonexistent")), None);
     }
 
+    /// Every build-tool marker, root-relative ones included, makes a JVM
+    /// project: an sbt build may have only `project/build.properties`.
     #[tokio::test]
     async fn every_marker_makes_a_jvm_project() {
-        for marker in JVM_PROJECT_MARKERS {
-            let dir = tempfile::tempdir().unwrap();
-            assert!(!is_jvm_project(dir.path()).await);
-            std::fs::write(dir.path().join(marker), "").unwrap();
-            assert!(is_jvm_project(dir.path()).await, "{marker}");
+        for tool in layout::BuildTool::ALL {
+            for marker in tool.markers() {
+                let dir = tempfile::tempdir().unwrap();
+                assert!(!is_jvm_project(dir.path()).await);
+                let path = dir.path().join(marker);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "").unwrap();
+                assert!(is_jvm_project(dir.path()).await, "{marker}");
+            }
         }
     }
 }

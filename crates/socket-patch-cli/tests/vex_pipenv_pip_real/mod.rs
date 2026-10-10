@@ -95,7 +95,7 @@ impl Mode {
     pub fn scan_flags(self) -> &'static [&'static str] {
         match self {
             Mode::Hosted => &["--mode=hosted"],
-            Mode::Vendored => &["--vendor", "--vendor-source", "service"],
+            Mode::Vendored => &["--mode", "vendored", "--vendor-source", "service"],
         }
     }
 }
@@ -268,7 +268,9 @@ pub fn make_venv(uv: &Path, python: &str, venv: &Path, pins: &[&str]) -> Result<
 }
 
 /// `<tools_root>/<name>` made by [`make_venv`] unless `probe` already runs
-/// there (bootstraps are reused across runs).
+/// there (bootstraps are reused across runs). Serialized: tests in one
+/// binary run in parallel, and two of them bootstrapping the same venv
+/// race `uv venv` into "a virtual environment already exists".
 pub fn bootstrap_tool(
     uv: &Path,
     name: &str,
@@ -276,6 +278,8 @@ pub fn bootstrap_tool(
     pins: &[&str],
     probe: &str,
 ) -> Result<PathBuf, String> {
+    static BOOTSTRAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = BOOTSTRAP.lock().unwrap_or_else(|e| e.into_inner());
     let venv = tools_root().join(name);
     let exe = venv_bin(&venv, probe);
     let healthy = |exe: &Path| {

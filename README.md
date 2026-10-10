@@ -6,8 +6,8 @@ vulnerabilities without waiting for an upstream release or upgrading the depende
 
 The default workflow is **scan → install → vex**:
 
-- `socket-patch scan` finds available patches and updates your dependency files to
-  use Socket-hosted patched packages.
+- `socket-patch scan` finds available patches from project dependency files and
+  updates them to use Socket-hosted patched packages.
 - Your package manager installs those packages using the updated references and
   integrity pins. Commit the files that `scan` reports.
 - `socket-patch vex` produces an OpenVEX document describing the vulnerabilities
@@ -53,12 +53,17 @@ installs, use that package manager's update command. The
 
 ## Quick start
 
-From the root of a project with dependency files:
+From the root of a project with a supported lockfile, including a fresh checkout
+before dependencies are installed:
 
 ```sh
 socket-patch scan --dry-run       # preview available patches and edits
 socket-patch scan                 # apply hosted references; never prompts
 ```
+
+Agent mode needs installed packages. Some ecosystems need build-tool resolution
+records first, such as sbt and scala-cli; see the
+[ecosystem notes](docs/ecosystems.md).
 
 Without an API token, the CLI uses Socket's public proxy for free patches.
 To use your organization's patch tier, set `SOCKET_API_TOKEN`, or sign in with the
@@ -90,13 +95,15 @@ VEX-aware vulnerability scanner.
 
 | Mode | Command | What to commit | What installs need |
 | --- | --- | --- | --- |
-| Hosted (default) | `socket-patch scan` | Changed lockfiles, manifests, and registry configuration | Access to Socket's patch server |
+| Hosted (default for a new project) | `socket-patch scan` | Changed lockfiles, manifests, and registry configuration | Access to Socket's patch server |
 | Vendored | `socket-patch scan --mode vendored` | Changed dependency files and `.socket/vendor/` (artifacts and ledger) | The committed patched packages |
 | Agent | `socket-patch scan --mode agent` | `.socket/manifest.json` and patch data; Go also uses a committed patched tree | `socket-patch apply` after dependency installs |
 
 Vendored mode stores **patched dependencies**, not the entire dependency graph.
 Other dependencies still need their normal registry, mirror, or offline cache.
 Hosted and vendored installs do not need an install hook or the Socket Patch CLI.
+Once a project holds vendored or agent-mode patches, a bare `scan` or `get` keeps
+that mode; pass `--mode` to switch.
 
 The CLI supports npm, PyPI, Cargo, Go, RubyGems, Maven (including sbt, Mill and
 scala-cli builds), Composer, NuGet, and Deno.
@@ -117,10 +124,12 @@ socket-patch scan --max-new-patches 5        # introduce at most five new patche
 socket-patch scan 'apps/*'                  # scan project directories in a monorepo
 socket-patch get CVE-2024-12345              # target an advisory; hosted by default
 socket-patch vendor                        # eject an existing hosted patch set
+socket-patch repair                        # restore agent or vendored patch artifacts
 socket-patch rollback                      # restore upstream dependencies
 ```
 
-`get` also accepts a GHSA, patch UUID, PURL, or package name. `scan` selects from
+`get` also accepts a GHSA, patch UUID, PURL, or exact package name (every installed
+version of that name is searched; near names are only suggested). `scan` selects from
 patches your account can download, preferring the highest severity, then the most
 advisories fixed, then the newest publication date. Existing patches are upgraded
 only by a better-ranked patch.

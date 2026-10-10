@@ -15,11 +15,9 @@
 //! - [`locks`]: dependency-lock files: where they are, what they hold and a
 //!   one-entry rewrite.
 //! - [`home`]: the Gradle user home and the caches inside it.
-//! - [`eol`]: line-ending sniffing and line-ending-blind comparison.
 //! - [`selector`]: Gradle version ordering and version selectors.
 
 pub mod dsl;
-pub mod eol;
 pub mod graph;
 pub mod home;
 pub mod locks;
@@ -203,7 +201,6 @@ mod tests {
         let sources = [
             ("mod.rs", include_str!("mod.rs")),
             ("dsl.rs", include_str!("dsl.rs")),
-            ("eol.rs", include_str!("eol.rs")),
             ("graph.rs", include_str!("graph.rs")),
             ("home.rs", include_str!("home.rs")),
             ("locks.rs", include_str!("locks.rs")),

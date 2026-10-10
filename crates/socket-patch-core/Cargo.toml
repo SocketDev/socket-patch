@@ -26,6 +26,9 @@ sha2 = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 tokio = { workspace = true }
 # CancellationToken for the in-memory hosted engine (`hosted::memory`).
 tokio-util = { workspace = true }
@@ -37,7 +40,6 @@ regex = { workspace = true }
 aho-corasick = { workspace = true }
 toml_edit = { workspace = true }
 once_cell = { workspace = true }
-qbsdiff = { workspace = true }
 rayon = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
@@ -58,6 +60,10 @@ libc = { workspace = true }
 # do ourselves (mode-preserving, setuid-refusing — see update/swap.rs).
 [target.'cfg(windows)'.dependencies]
 self-replace = { workspace = true }
+# apply_lock's interrupt cleanup unlinks the held lock file with POSIX
+# semantics so the emptied `.socket/` can be removed before exit. Same
+# windows-sys the CLI already builds, so no new crate.
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 # sha2 0.10 compiles its aarch64 SHA-256 hardware path only under the `asm`
 # feature (x86/x86_64 already select SHA-NI at runtime without it); the
@@ -80,3 +86,4 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 serial_test = { workspace = true }
 wiremock = { workspace = true }
+tokio-rustls = { workspace = true }

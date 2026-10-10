@@ -393,10 +393,10 @@ async fn wheel_metadata_failures_fold_in_dep_order() {
     for s in doc["redirect"]["skipped"].as_array().unwrap() {
         if s["reason"] == "python_metadata_unavailable" {
             let detail = s["detail"].as_str().unwrap();
-            assert!(
-                !detail.contains(&server.uri()),
-                "the hosted URL is redacted from the detail: {detail}"
-            );
+            // The detail quotes the URL through the shared redactor (this
+            // fixture's `/wheels/` URL carries no grant token; core's
+            // `hosted_skip_details_never_carry_the_grant_token` pins it).
+            assert!(!detail.is_empty(), "the detail names the failure: {doc:#}");
         }
     }
     // The two good wheels still redirect; the refused two stay upstream.

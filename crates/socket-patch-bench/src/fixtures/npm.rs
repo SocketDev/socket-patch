@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use serde_json::{json, Value};
 
 use super::gen::{self, Rng, Tree};
-use super::{Expect, Fixture, Size, PATCH_HOST};
+use super::{fixture, Fixture, Size, PATCH_HOST};
 use crate::mock::PatchSpec;
 
 /// One installed npm package.
@@ -318,30 +318,6 @@ pub fn view_json(uuid: &str, purl: &str, file: &str) -> Value {
     })
 }
 
-fn fixture(
-    g: &Graph,
-    patches: Vec<PatchSpec>,
-    rewritten: &[&str],
-    warnings: &[&'static str],
-) -> Fixture {
-    Fixture {
-        project: "project",
-        expect: Expect {
-            scanned: g.pkgs.len(),
-            lockfile_only: 0,
-            redirected: patches.len(),
-            rewritten: rewritten.iter().map(|s| s.to_string()).collect(),
-            allowed_warnings: warnings.to_vec(),
-            rescan_lockfile_only: 0,
-            rescan_extra_scanned: 0,
-        },
-        patches,
-        files: Vec::new(),
-        env_paths: Vec::new(),
-        env: Vec::new(),
-    }
-}
-
 // ── npm ────────────────────────────────────────────────────────────────
 
 /// `package-lock.json` (lockfileVersion 3).
@@ -389,7 +365,7 @@ pub fn build_npm(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
     g.install_hoisted(t, "project/")?;
     t.mkdir("home")?;
     Ok(fixture(
-        &g,
+        g.pkgs.len(),
         g.patches(false),
         &["package-lock.json", ".npmrc"],
         &["redirect_npm_allow_remote"],
@@ -478,14 +454,16 @@ pub fn build_pnpm(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
             &format!("project/node_modules/{}", p.name),
         )?;
     }
+    // pnpm >= 11, so the scan still writes the `trustLockfile` scaffold (a
+    // pnpm 9.0-10.4 install record skips it, #734).
     t.write(
         "project/node_modules/.modules.yaml",
-        "layoutVersion: 5\nnodeLinker: isolated\npackageManager: pnpm@9.15.0\n",
+        "layoutVersion: 5\nnodeLinker: isolated\npackageManager: pnpm@11.0.0\n",
     )?;
     t.write("project/node_modules/.pnpm/lock.yaml", pnpm_lock(&g))?;
     t.mkdir("home")?;
     Ok(fixture(
-        &g,
+        g.pkgs.len(),
         g.patches(false),
         &["pnpm-lock.yaml", "pnpm-workspace.yaml"],
         &["redirect_pnpm_trust_lockfile"],
@@ -555,7 +533,7 @@ pub fn build_yarn_classic(t: &mut Tree, size: Size) -> std::io::Result<Fixture> 
     )?;
     g.install_hoisted(t, "project/")?;
     t.mkdir("home")?;
-    Ok(fixture(&g, g.patches(false), &["yarn.lock"], &[]))
+    Ok(fixture(g.pkgs.len(), g.patches(false), &["yarn.lock"], &[]))
 }
 
 // ── yarn berry ─────────────────────────────────────────────────────────
@@ -635,7 +613,7 @@ pub fn build_yarn_berry(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
     t.mkdir("home")?;
     // Hosted Berry pins both descriptor resolutions and their lock entries.
     Ok(fixture(
-        &g,
+        g.pkgs.len(),
         g.patches(true),
         &["package.json", "yarn.lock"],
         &[],
@@ -696,7 +674,7 @@ pub fn build_bun(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
     t.write("project/bun.lock", bun_lock(&g))?;
     g.install_hoisted(t, "project/")?;
     t.mkdir("home")?;
-    Ok(fixture(&g, g.patches(false), &["bun.lock"], &[]))
+    Ok(fixture(g.pkgs.len(), g.patches(false), &["bun.lock"], &[]))
 }
 
 /// Bun's isolated linker (the default since Bun 1.3.2): the same text
@@ -737,7 +715,7 @@ pub fn build_bun_isolated(t: &mut Tree, size: Size) -> std::io::Result<Fixture> 
         )?;
     }
     t.mkdir("home")?;
-    Ok(fixture(&g, g.patches(false), &["bun.lock"], &[]))
+    Ok(fixture(g.pkgs.len(), g.patches(false), &["bun.lock"], &[]))
 }
 
 // ── vlt ────────────────────────────────────────────────────────────────
@@ -827,7 +805,7 @@ pub fn build_vlt(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
     t.mkdir("home")?;
     let patches = g.patches(false);
     let mut f = fixture(
-        &g,
+        g.pkgs.len(),
         patches,
         &["vlt-lock.json"],
         &["redirect_vlt_reinstall_required"],

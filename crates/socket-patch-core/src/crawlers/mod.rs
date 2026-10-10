@@ -17,6 +17,7 @@ pub mod nuget_crawler;
 #[cfg(test)]
 pub(crate) mod oracle_support;
 pub mod pkg_managers;
+pub(crate) mod pnpm_layout;
 pub mod python_crawler;
 pub mod ruby_crawler;
 pub mod sbt_evidence;
@@ -29,7 +30,7 @@ pub use composer_crawler::ComposerCrawler;
 pub use deno_crawler::DenoCrawler;
 pub use go_crawler::GoCrawler;
 pub use maven_crawler::MavenCrawler;
-pub use npm_crawler::NpmCrawler;
+pub use npm_crawler::{bun_uses_global_store, NpmCrawler};
 pub use nuget_crawler::NuGetCrawler;
 pub use pkg_managers::{detect_npm_pkg_manager, NpmPkgManager, YarnPnpLoader};
 pub use python_crawler::PythonCrawler;

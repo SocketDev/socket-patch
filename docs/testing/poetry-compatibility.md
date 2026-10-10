@@ -112,13 +112,14 @@ Other measured details:
   Poetry's `EnvManager.get()`: `VIRTUAL_ENV` (or a non-`base` conda
   `CONDA_PREFIX`), unless `poetry env use` recorded an env for the project in
   `<virtualenvs.path>/envs.toml`, which Poetry prefers over an activated
-  venv; then, for a Poetry project whose `./.venv` Poetry would not use (an
-  explicit `virtualenvs.in-project = false`, or no `./.venv` at all, even
-  with `in-project = true`), the virtualenv Poetry placed under its
-  `virtualenvs.path`: the `envs.toml` env (`<name>-<hash>-py<minor>`) when
-  there is one, else every `<name>-<hash>-py<X.Y>` env; then `./.venv`,
-  `./venv`; else, for a project
-  directory, the global interpreter's site-packages. Poetry's placement is
+  venv (a record in any of the roots a `{data-dir}` path can expand to
+  counts); then an existing `./.venv` unless `virtualenvs.in-project = false`;
+  then the virtualenv Poetry placed under its `virtualenvs.path`: the
+  `envs.toml` env (`<name>-<hash>-py<minor>`) when there is one, else every
+  `<name>-<hash>-py<X.Y>` env. That answer is final. Poetry never uses
+  `./venv`, so a stray one is never patched, and a fresh checkout with no
+  env yet patches nothing (its packages come from `poetry.lock`) instead of
+  falling back to the OS Python. Poetry's placement is
   reproduced without running Poetry, from `POETRY_*`, the project's
   `poetry.toml`, the user `config.toml` and the platform default cache dir.
   The env name follows poetry-core's precedence: `[project] name` (2.x), then
@@ -128,8 +129,9 @@ Other measured details:
   `rollback` in a default-configured Poetry checkout works; `poetry run
   socket-patch …`, `VIRTUAL_ENV=$(poetry env info -p)` and
   `--global-prefix <site-packages>` keep working. `virtualenvs.create = false`
-  (containers) means Poetry installed into the system interpreter, which the
-  project-marker global fallback covers. Patched bytes survive
+  (containers) means Poetry installed into the system interpreter (unless an
+  active venv or a usable `./.venv` came first), which the project-marker
+  global fallback covers. Patched bytes survive
   `poetry install`, `poetry sync` and `poetry install --sync` on every release
   (same version → no reinstall).
 - **Vendored mode works lock-only** for locks that list a pure-Python

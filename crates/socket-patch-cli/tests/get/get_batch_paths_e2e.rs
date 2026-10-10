@@ -9,15 +9,13 @@
 //! with `.expect(1)` so a wrong URL (which would otherwise 404 → look
 //! like an empty result) is caught instead of silently passing.
 
+use crate::common::binary;
+
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG_SLUG: &str = "test-org";
 const UUID_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -156,7 +154,7 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
     // happens by re-running with the chosen UUID as the positional
     // identifier; a "Specify --id <UUID>" instruction would send users
     // straight into a clap usage error.
-    let err = v["error"].as_str().unwrap_or("");
+    let err = v["error"]["message"].as_str().unwrap_or("");
     assert!(
         !err.contains("--id <"),
         "error must not instruct the value-taking `--id <UUID>` form the CLI rejects; got {err:?}"
@@ -268,7 +266,7 @@ async fn get_uuid_returning_500_emits_error() {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("valid JSON error envelope");
     assert_eq!(v["status"], "error", "5xx must surface as error");
-    let err = v["error"]
+    let err = v["error"]["message"]
         .as_str()
         .expect("error envelope must carry an error string");
     assert!(
@@ -296,7 +294,7 @@ async fn get_uuid_returning_malformed_json_emits_error() {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("valid JSON error envelope");
     assert_eq!(v["status"], "error", "parse failure must surface as error");
-    let err = v["error"]
+    let err = v["error"]["message"]
         .as_str()
         .expect("error envelope must carry an error string");
     assert!(

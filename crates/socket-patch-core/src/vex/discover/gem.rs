@@ -136,9 +136,11 @@ use super::{
 };
 use crate::crawlers::ruby_crawler::bundler_loaded_lock_in;
 use crate::formats::gem::{
-    bundler_manifest_for, same_remote, GemfileLock, Section, SpecLine, BUNDLER_LOCKS,
+    bundler_manifest_for, gemfile, same_remote, GemfileLock, Section, SpecLine, BUNDLER_LOCKS,
 };
+use crate::patch::path_safety::is_canonical_uuid;
 use crate::vendor::gem::{gem_declaration_any, quoted_literal};
+use crate::vendor::lock_inventory::ProjectView;
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let loaded = bundler_loaded_lock_in(&ctx.view).await;
@@ -155,7 +157,10 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         extract_file(ctx, file, &mut ignored).await;
         let why = match loaded {
             Some(lock) => format!("bundler loads {lock}, not {file}"),
-            None => "BUNDLE_GEMFILE points bundler at another manifest".to_string(),
+            None => "socket-patch cannot tell which lock bundler loads here (BUNDLE_GEMFILE or \
+                     BUNDLE_LOCKFILE names another file, or a Gemfile + gems.rb twin leaves it \
+                     to the bundler major that runs)"
+                .to_string(),
         };
         for r in ignored.refs {
             out.diag(
@@ -211,6 +216,22 @@ async fn source_block_gems(
 /// `=begin` … `=end` block comments) is ignored — this only ever ADDS a
 /// cross-check to lock evidence, never creates a ref on its own.
 fn parse_source_blocks(gemfile: &str) -> Vec<(String, String)> {
+    parse_source_block_decls(gemfile)
+        .into_iter()
+        .map(|d| (d.url, d.name))
+        .collect()
+}
+
+/// One `gem` declaration inside a `source "<url>" do … end` block.
+struct BlockDecl {
+    url: String,
+    name: String,
+    /// The declaration's argument tail (after the name's closing quote).
+    tail: String,
+}
+
+/// [`parse_source_blocks`] keeping each declaration's argument tail.
+fn parse_source_block_decls(gemfile: &str) -> Vec<BlockDecl> {
     let mut out = Vec::new();
     let mut open: Option<String> = None;
     let mut block_comment = false;
@@ -266,7 +287,11 @@ fn parse_source_blocks(gemfile: &str) -> Vec<(String, String)> {
                     continue;
                 }
                 if let Some(decl) = gem_declaration_any(line) {
-                    out.push((url.clone(), decl.name.to_string()));
+                    out.push(BlockDecl {
+                        url: url.clone(),
+                        name: decl.name.to_string(),
+                        tail: decl.rest.to_string(),
+                    });
                 }
             }
         }
@@ -291,20 +316,68 @@ pub(crate) fn gemfile_source_block_pins(gemfile: &str, uuid: &str, gem_name: Opt
 /// `…/patch-registry/gem/<token>/<uuid>[/]`, `uuid` the LAST path level,
 /// no query or fragment.
 fn is_patch_registry_index(remote: &str, uuid: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(remote) else {
-        return false;
-    };
+    patch_registry_uuid(remote).is_some_and(|u| u == uuid)
+}
+
+/// The patch uuid of a compact-index root
+/// `…/patch-registry/gem/<token>/<uuid>[/]` (no query or fragment): its
+/// last path level.
+fn patch_registry_uuid(remote: &str) -> Option<String> {
+    let url = reqwest::Url::parse(remote).ok()?;
     if url.query().is_some() || url.fragment().is_some() {
-        return false;
+        return None;
     }
-    let Some(segments) = url.path_segments() else {
-        return false;
+    let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        [.., "patch-registry", "gem", token, last] if !token.is_empty() => Some(last.to_string()),
+        _ => None,
+    }
+}
+
+/// The gems the manifest of the lock bundler loads (`Gemfile` for
+/// `Gemfile.lock`, `gems.rb` for `gems.locked`) pins to a Socket patch with
+/// a `source "<…/patch-registry/gem/<token>/<uuid>/>" do` block, as
+/// `(pkg:gem/<name>@<version>, uuid)`.
+///
+/// This is the hosted rewriter's Gemfile-only wiring: on a lock with no
+/// `CHECKSUMS` section it rewrites the manifest and leaves the lock for the
+/// next unfrozen `bundle install` (`redirect_gem_no_checksums_section`), so
+/// lockfile discovery has no ref for the pin yet. Discovery stays
+/// lock-only (the pin is not installed until the lock converges, so it is
+/// never VEX evidence); this is for the gradual rollout's recorded view,
+/// which must count the pin the run already wrote as recorded or every
+/// capped re-scan spends a NEW slot on it again (#1224).
+///
+/// Only the shape the rewriter writes counts, read with discovery's
+/// Gemfile grammar: one exact version (`gem "x", "1.0.0"`), no
+/// source-selecting option, a canonical uuid, and no block for another
+/// source declaring the same gem.
+pub async fn manifest_source_pins(view: &ProjectView<'_>) -> Vec<(String, String)> {
+    let Some(lock) = bundler_loaded_lock_in(view).await else {
+        return Vec::new();
     };
-    let segments: Vec<&str> = segments.filter(|s| !s.is_empty()).collect();
-    matches!(
-        segments.as_slice(),
-        [.., "patch-registry", "gem", token, last] if *last == uuid && !token.is_empty()
-    )
+    let Ok(text) = view.read_text(bundler_manifest_for(lock)).await else {
+        return Vec::new();
+    };
+    let decls = parse_source_block_decls(&text);
+    let mut pins = BTreeSet::new();
+    for d in &decls {
+        let Some(uuid) = patch_registry_uuid(&d.url).filter(|u| is_canonical_uuid(u)) else {
+            continue;
+        };
+        if decls
+            .iter()
+            .any(|o| o.name == d.name && !same_remote(&o.url, &d.url))
+            || gemfile::source_option(&d.tail).is_some()
+        {
+            continue;
+        }
+        let Some(version) = gemfile::exact_version(&d.tail) else {
+            continue;
+        };
+        pins.insert((format!("pkg:gem/{}@{version}", d.name), uuid));
+    }
+    pins.into_iter().collect()
 }
 
 /// One lock file: every Socket-wired `GEM` (hosted) and `PATH` (vendored)
@@ -574,7 +647,7 @@ fn spec_ref(
                 file,
                 Some(*remote),
                 lock.integrity(spec.name, spec.version),
-                lock.checksums.is_some(),
+                lock.has_checksums(),
             ));
         }
         Wiring::Vendored(vref) => {
@@ -629,6 +702,100 @@ mod tests {
         assert_eq!(
             crate::patch::redirect::grant_token_path_segment(&url, UUID_A),
             None
+        );
+    }
+
+    async fn manifest_pins(files: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut project = crate::vendor::lock_inventory::MemoryProject::new();
+        for (rel, text) in files {
+            project.insert_text(*rel, *text);
+        }
+        super::manifest_source_pins(&super::ProjectView::Memory(&project)).await
+    }
+
+    /// The pre-2.6 mixed pair: the rewriter pinned the Gemfile only and left
+    /// the CHECKSUMS-less lock on rubygems. Discovery has no ref for it, but
+    /// the rollout's recorded view must see the pin (#1224).
+    const MIXED_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    \
+                              rails (7.0.0)\n    tiny (1.0.0)\n\nPLATFORMS\n  ruby\n\n\
+                              DEPENDENCIES\n  rails (= 7.0.0)\n  tiny\n";
+
+    #[tokio::test]
+    async fn gemfile_only_pin_is_a_manifest_source_pin() {
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\n\nsource \"{}\" do\n  gem \"rails\", \"7.0.0\", \
+             require: false\nend\n\nsource \"{}\" do\n  gem 'tiny', '= 1.0.0'\nend\n",
+            index(UUID_A),
+            index(UUID_B)
+        );
+        let pins = manifest_pins(&[("Gemfile", &gemfile), ("Gemfile.lock", MIXED_LOCK)]).await;
+        assert_eq!(
+            pins,
+            [
+                ("pkg:gem/rails@7.0.0".to_string(), UUID_A.to_string()),
+                ("pkg:gem/tiny@1.0.0".to_string(), UUID_B.to_string()),
+            ]
+        );
+        // Lockfile discovery itself stays lock-only: no ref, no lockless pin.
+        let p = Project::new();
+        p.write("Gemfile", &gemfile);
+        p.write("Gemfile.lock", MIXED_LOCK);
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert!(out.unlocked_pins.is_empty(), "{:#?}", out.unlocked_pins);
+    }
+
+    /// Only the shape the rewriter writes, in the manifest bundler loads.
+    #[tokio::test]
+    async fn manifest_source_pins_fail_closed() {
+        let block =
+            |uuid: &str, decl: &str| format!("source \"{}\" do\n  {decl}\nend\n", index(uuid));
+        for (case, gemfile) in [
+            // A range, no version, a source-selecting option.
+            block(UUID_A, "gem \"rails\", \"~> 7.0\""),
+            block(UUID_A, "gem \"rails\""),
+            block(UUID_A, "gem \"rails\", \"7.0.0\", path: \"../rails\""),
+            // Commented out, in either comment style.
+            format!("# {}", block(UUID_A, "gem \"rails\", \"7.0.0\"")),
+            format!(
+                "=begin\n{}=end\n",
+                block(UUID_A, "gem \"rails\", \"7.0.0\"")
+            ),
+            // Not a patch-registry root, or not a canonical uuid.
+            "source \"https://gems.example.com/\" do\n  gem \"rails\", \"7.0.0\"\nend\n".into(),
+            block("not-a-uuid", "gem \"rails\", \"7.0.0\""),
+            // The same gem in a block for another source too.
+            format!(
+                "{}source \"https://gems.example.com/\" do\n  gem \"rails\", \"7.0.0\"\nend\n",
+                block(UUID_A, "gem \"rails\", \"7.0.0\"")
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let pins =
+                manifest_pins(&[("Gemfile", gemfile.as_str()), ("Gemfile.lock", MIXED_LOCK)]).await;
+            assert!(pins.is_empty(), "case {case} must yield no pin");
+        }
+        // bundler loads gems.rb + gems.locked: a leftover Gemfile is not read.
+        let gemfile = block(UUID_A, "gem \"rails\", \"7.0.0\"");
+        let pins = manifest_pins(&[
+            ("Gemfile", &gemfile),
+            (
+                "gems.rb",
+                "source \"https://rubygems.org\"\ngem \"rails\"\n",
+            ),
+            ("gems.locked", MIXED_LOCK),
+        ])
+        .await;
+        assert!(
+            pins.is_empty(),
+            "a Gemfile bundler does not load must yield no pin"
+        );
+        let pins = manifest_pins(&[("gems.rb", &gemfile), ("gems.locked", MIXED_LOCK)]).await;
+        assert_eq!(
+            pins,
+            [("pkg:gem/rails@7.0.0".to_string(), UUID_A.to_string())]
         );
     }
 

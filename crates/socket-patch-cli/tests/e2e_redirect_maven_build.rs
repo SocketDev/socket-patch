@@ -156,12 +156,19 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
     (out.status.code(), env, stderr)
 }
 
-/// Purge every copy of the fixture GAV (base + suffixed) from `m2` so the
-/// next resolve must fetch it.
+/// Purge every suffixed copy of the fixture from `m2` so the next resolve
+/// must fetch it. The base version stays: the project only asks for the
+/// suffixed one, and `maven-dependency-plugin` itself depends on
+/// commons-text 1.10.0, so purging it sends every later resolve back to
+/// Central (CI run 37909555148).
 fn purge(m2: &Path) {
-    let dir = m2.join(GROUP_PATH).join(ARTIFACT);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).unwrap();
+    let Ok(versions) = std::fs::read_dir(m2.join(GROUP_PATH).join(ARTIFACT)) else {
+        return;
+    };
+    for entry in versions.flatten() {
+        if entry.file_name() != VERSION && entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path()).unwrap();
+        }
     }
 }
 

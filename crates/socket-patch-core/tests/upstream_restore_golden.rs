@@ -993,6 +993,50 @@ async fn composer_edge_shapes_round_trip() {
     }
 }
 
+/// #815: a mixed-ending lock (LF majority, CRLF `_readme` lines) gets
+/// its restored dist block in the majority style, so the unwind is byte
+/// exact. The old "any `\r\n` → CRLF" rule spelled the block in CRLF.
+#[tokio::test]
+#[serial]
+async fn composer_mixed_line_endings_restore_in_the_majority_style() {
+    let mixed = COMPOSER_LOCK.replacen("\n", "\r\n", 3);
+    assert!(mixed.matches("\r\n").count() < mixed.matches('\n').count() / 2);
+    let case = synthetic(
+        "mixed-lf-majority",
+        &[("composer.lock", &mixed)],
+        composer_override("psr/log", "1.1.4"),
+    );
+    let (after, statuses) = composer_run(&case, |_| {}).await;
+    assert_round_trip(&case, &after, &statuses);
+}
+
+/// #815: the hosted gem lock converge inserts its DEPENDENCIES pin in the
+/// lock's majority style; one stray CRLF line no longer turns it CRLF.
+#[test]
+fn gem_lock_pin_on_a_mixed_lock_takes_the_majority_terminator() {
+    let lf_majority = transitive_lock()
+        .replace("  rails (= 7.0.0)\n", "")
+        .replace("BUNDLED WITH\n", "BUNDLED WITH\r\n");
+    let crlf_majority = lf_majority.replace('\n', "\r\n").replace("\r\r\n", "\n");
+    for (lock, eol) in [(lf_majority, "\n"), (crlf_majority, "\r\n")] {
+        let input = BTreeMap::from([
+            (
+                "Gemfile".to_string(),
+                "source \"https://rubygems.org\"\n\ngem \"puma\"\n\n".to_string(),
+            ),
+            ("Gemfile.lock".to_string(), lock.clone()),
+        ]);
+        let deps: Vec<socket_patch_core::patch::redirect::DepOverride> =
+            serde_json::from_value(gem_override("zeitwerk", "2.6.0")).unwrap();
+        let rewrite = socket_patch_core::patch::redirect::rewrite_registry_redirect(&input, &deps);
+        let out = &rewrite.files["Gemfile.lock"];
+        assert!(
+            out.contains(&format!("\n  zeitwerk (= 2.6.0)!{eol}")),
+            "{lock:?} -> {out:?}"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn composer_refusals_leave_everything_hosted() {
@@ -1448,6 +1492,138 @@ async fn pdm_static_urls_round_trip() {
     );
     let input = tree(&[("pdm.lock", lock)]);
     assert_pypi_round_trip("pdm static_urls", &input, &[urllib3_dep()], None).await;
+}
+
+/// The 2.29.2 fixture as a `static_urls` lock whose files come from
+/// `host` (PDM orders them by URL).
+fn pdm_static_urls_lock(url_of: impl Fn(&str) -> String) -> String {
+    let lock = fixture("pdm-native/2.29.2.lock").replace(
+        "strategy = [\"inherit_metadata\"]",
+        "strategy = [\"inherit_metadata\", \"static_urls\"]",
+    );
+    let mut files = [URLLIB3_WHEEL, URLLIB3_SDIST].map(|f| {
+        let sha = if f == URLLIB3_WHEEL {
+            URLLIB3_WHEEL_SHA
+        } else {
+            URLLIB3_SDIST_SHA
+        };
+        format!(
+            "    {{url = \"{}\", hash = \"sha256:{sha}\"}},\n",
+            url_of(f)
+        )
+    });
+    files.sort();
+    let start = lock.find("files = [\n").unwrap() + "files = [\n".len();
+    let end = start + lock[start..].find("]\n").unwrap();
+    format!("{}{}{}", &lock[..start], files.concat(), &lock[end..])
+}
+
+/// #413: a `static_urls` lock records where every file was downloaded
+/// from. When the project installs from a private index or mirror, the
+/// restore cannot know that index's URLs, and writing PyPI's would make
+/// `pdm sync` bypass the mirror (or fail behind a firewall). Refuse, like
+/// the uv and Pipenv restores refuse a non-PyPI registry, and leave the
+/// hosted lock as it is.
+#[tokio::test]
+#[serial]
+async fn pdm_static_urls_private_index_restore_is_refused() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    const MIRROR: &str = "http://127.0.0.1:18780";
+    let mirror_url = |f: &str| format!("{MIRROR}/files/{f}");
+    let lock = pdm_static_urls_lock(mirror_url);
+    let pyproject = |sources: &str| {
+        format!(
+            "[project]\nname = \"proj\"\nversion = \"0.1.0\"\nrequires-python = \">=3.8\"\n\
+             dependencies = [\"urllib3==1.26.18\"]\n\n[tool.pdm]\ndistribution = false\n{sources}"
+        )
+    };
+    let replaced = pyproject(&format!(
+        "\n[[tool.pdm.source]]\nname = \"pypi\"\nurl = \"{MIRROR}/simple\"\nverify_ssl = false\n"
+    ));
+    let extra = pyproject(&format!(
+        "\n[[tool.pdm.source]]\nname = \"private\"\nurl = \"{MIRROR}/simple\"\n"
+    ));
+    let sibling = lock.replace(
+        "\n[[package]]\nname = \"urllib3\"",
+        &format!(
+            "\n[[package]]\nname = \"idna\"\nversion = \"3.4\"\nsummary = \"x\"\n\
+             groups = [\"default\"]\nfiles = [\n    {{url = \"{MIRROR}/files/idna-3.4-py3-none-any.whl\", \
+             hash = \"sha256:{}\"}},\n]\n\n[[package]]\nname = \"urllib3\"",
+            "a".repeat(64)
+        ),
+    );
+    let cases = [
+        // The issue's shape: `[[tool.pdm.source]] name = "pypi"` replaces PyPI.
+        (
+            "replaced pypi",
+            tree(&[
+                ("pdm.lock", lock.clone()),
+                ("pyproject.toml", replaced.clone()),
+            ]),
+        ),
+        // A supplementary index may have served the package.
+        (
+            "extra index",
+            tree(&[("pdm.lock", lock.clone()), ("pyproject.toml", extra)]),
+        ),
+        // Project-level `pdm config pypi.url` (pdm.toml).
+        (
+            "pdm.toml pypi.url",
+            tree(&[
+                ("pdm.lock", lock.clone()),
+                ("pdm.toml", format!("[pypi]\nurl = \"{MIRROR}/simple\"\n")),
+            ]),
+        ),
+        // The legacy `.pdm.toml`, which PDM overlays on `pdm.toml`.
+        (
+            ".pdm.toml pypi.url",
+            tree(&[
+                ("pdm.lock", lock.clone()),
+                (".pdm.toml", format!("[pypi]\nurl = \"{MIRROR}/simple\"\n")),
+                (
+                    "pdm.toml",
+                    "[pypi]\nurl = \"https://pypi.org/simple\"\n".to_string(),
+                ),
+            ]),
+        ),
+        // No config in the project (a user-global `pdm config`), but the
+        // lock's other packages show where PDM downloads from.
+        ("sibling package urls", tree(&[("pdm.lock", sibling)])),
+    ];
+    for (label, input) in cases {
+        let (why, rewritten, after) =
+            pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(
+            why.contains("static_urls") && why.contains(MIRROR),
+            "{label}: {why}"
+        );
+        assert!(why.contains("pdm.lock"), "{label}: {why}");
+        assert_eq!(
+            after, rewritten,
+            "{label}: the hosted lock is left as it is"
+        );
+    }
+
+    // Controls. A PyPI-hosted static_urls lock beside a source that names
+    // PyPI itself still round-trips.
+    let pypi_lock = pdm_static_urls_lock(pypi_file_url);
+    let pypi_source =
+        pyproject("\n[[tool.pdm.source]]\nname = \"pypi\"\nurl = \"https://pypi.org/simple\"\n");
+    let input = tree(&[("pdm.lock", pypi_lock), ("pyproject.toml", pypi_source)]);
+    assert_pypi_round_trip(
+        "pdm static_urls, PyPI source",
+        &input,
+        &[urllib3_dep()],
+        None,
+    )
+    .await;
+    // A lock without static_urls records file names and hashes only, which
+    // a mirror of PyPI serves unchanged.
+    let input = tree(&[
+        ("pdm.lock", fixture("pdm-native/2.29.2.lock")),
+        ("pyproject.toml", replaced),
+    ]);
+    assert_pypi_round_trip("pdm mirror, file names", &input, &[urllib3_dep()], None).await;
 }
 
 #[tokio::test]

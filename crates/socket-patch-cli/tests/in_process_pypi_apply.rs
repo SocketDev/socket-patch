@@ -261,15 +261,12 @@ async fn pypi_install_scan_sync_patches_real_file() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: true,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
@@ -338,15 +335,12 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: true,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
@@ -383,7 +377,6 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
             ecosystems: Some(vec!["pypi".to_string()]),
             json: true,
             verbose: false,
-            download_mode: "diff".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         force: true,
@@ -448,16 +441,13 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: true,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: true,
         prune: false,
         sync: false,
-        vendor: false,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
         all_releases: false,
         vex: Default::default(),
         rollout: Default::default(),
@@ -468,7 +458,7 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
     let dry_code = scan_run(scan_args).await;
     assert_eq!(
         dry_code, 0,
-        "scan --apply --dry-run should succeed (exit 0)"
+        "scan --mode agent --dry-run should succeed (exit 0)"
     );
 
     let after = std::fs::read(&six_path).expect("read after dry-run");
@@ -510,7 +500,7 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
     // per-package fetch (`discover_selected`, which runs before the dry-run
     // gate) proves a real patch was selected before dry-run declined to
     // write. Hosted mode's `run_redirect` also calls `discover_selected`, so
-    // this does NOT tell a broken `--apply` → agent fold (which would fall
+    // this does NOT tell a broken `--mode agent` → agent fold (which would fall
     // into the hosted default) apart from a working one.
     assert!(
         requests.iter().any(|r| r
@@ -578,15 +568,12 @@ async fn pypi_crawler_finds_real_installed_six() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
@@ -678,14 +665,11 @@ async fn pypi_scan_sync_patches_egg_info_install() {
                 api_url: Some(server.uri()),
                 api_token: Some("fake".to_string()),
                 ecosystems: Some(vec!["pypi".to_string()]),
-                download_mode: "diff".to_string(),
                 ..socket_patch_cli::args::GlobalArgs::default()
             },
             batch_size: Some(100),
-            apply: false,
             prune: false,
             sync: true,
-            vendor: false,
             mode: None,
             all_releases: false,
             vex: Default::default(),

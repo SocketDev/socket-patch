@@ -40,7 +40,11 @@
 //! A pin counts only where Maven resolves it: a direct `<dependency>`
 //! literal version wins over `<dependencyManagement>`, so a managed Socket
 //! pin shadowed by a direct plain version (or a GA declared with several
-//! different effective versions) is diagnosed, not a ref. A `${property}`
+//! different effective versions) is diagnosed, not a ref.
+//! A hosted pin in a reactor root (`<modules>` / `<subprojects>`) stays
+//! a ref (rollback / remove find it) but marked unattested: a module's
+//! own literal `<version>` overrides it, and only the root pom is read here
+//! (the rewriter refuses such roots, #261). A `${property}`
 //! version is resolved one level from the root `<properties>`.
 //!
 //! Integrity: when the pom sha256 was known the rewriter also writes Maven
@@ -54,9 +58,15 @@
 //! fail-closed pin (no other repository serves it; the Socket repository is
 //! `checksumPolicy=fail`).
 //!
-//! ## Vendored (`vendor::maven_repo`)
+//! ## Vendored, pre-v5 (the retired single-pom backend)
 //!
-//! `vendor_maven` inserts `<id>socket-patch-vendor-<uuid></id>` +
+//! Ledgers written before v5 still carry this wiring until `vendor
+//! --revert` (vendoring such a root is refused as `legacy_maven_root`); v5
+//! vendors every pom root through the JVM planner instead, whose suffixed
+//! pins are attributed through its ledger only (a suffixed pin whose tree
+//! is committed under `.socket/vendor/maven2` is no ref here). The retired
+//! backend inserted
+//! `<id>socket-patch-vendor-<uuid></id>` +
 //! `<url>file://${project.basedir}/.socket/vendor/maven/<uuid></url>` and
 //! leaves the dependency at its ORIGINAL version, so the GAV lives only in
 //! the committed maven2 tree: `.socket/vendor/maven/<uuid>/<g-path>/<a>/<v>/
@@ -85,17 +95,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     maven_purl, names_vendor_dir, socket_patch_name_uuid, vendor_ref, vendor_uuid_dir, DiscoverCtx,
-    Discovery, PatchedRef, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
+    Discovery, PatchedRef, UnattestedKind, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::maven::{
     is_maven_coordinate, is_maven_version_text, parse_pom, split_socket_version, Pom, PomDep,
     PomRepo,
 };
-use crate::patch::redirect::{
-    local_repo_artifact_path, MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON,
-};
+use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
 use crate::utils::digest::sha256_hex;
+use crate::vendor::jvm::layout;
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::maven_repo::{sha1_sidecar_matches, VENDOR_REPO_URL_PREFIX};
 use crate::vendor::path::{sweep_vendor_dirs, VENDOR_DIR};
@@ -141,7 +150,8 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
 
     let gas = group_by_ga(&pom.deps);
-    extract_hosted(ctx, &pom, &gas, &hosted, out).await;
+    let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw);
+    extract_hosted(ctx, &pom, &gas, &hosted, reactor, out).await;
     if !vendored.is_empty() {
         extract_vendored(ctx, &gas, &vendored, out).await;
     }
@@ -154,6 +164,7 @@ async fn extract_hosted(
     pom: &Pom,
     gas: &BTreeMap<(String, String), GaVersions>,
     hosted: &BTreeMap<String, String>,
+    reactor: bool,
     out: &mut Discovery,
 ) {
     // uuid -> the (purl, g, a, suffixed version) pins that tie to it.
@@ -249,13 +260,29 @@ async fn extract_hosted(
         let jvm_tree = candidates.is_empty()
             && ctx
                 .exists(&format!(
-                    "{}/{}/{artifact}/{pinned}/{artifact}-{pinned}.jar",
-                    crate::vendor::jvm::maven_reactor::TREE_ROOT,
-                    group.replace('.', "/")
+                    "{}/{}",
+                    layout::MAVEN2_TREE,
+                    layout::artifact_path(group, artifact, &pinned, None, "jar")
                 ))
                 .await;
         match candidates.as_slice() {
             [uuid] => {
+                // A reactor root's pin stays a ref (rollback, remove and
+                // list must still find it) but is never attested: a
+                // module's own <version>, unread here, overrides it (#261).
+                if reactor {
+                    out.unattested(
+                        &purl,
+                        uuid,
+                        POM,
+                        format!(
+                            "{POM} declares <modules>/<subprojects>, and a module's own \
+                             <version> of {ga} overrides this root pin; hosted mode reads only \
+                             the root pom (re-patch the reactor with `scan --mode vendored`)"
+                        ),
+                        UnattestedKind::MavenReactorRoot,
+                    );
+                }
                 ties.entry(*uuid).or_default().insert((
                     purl,
                     group.clone(),
@@ -315,7 +342,7 @@ async fn extract_hosted(
         if checksums.is_none() {
             checksums = Some(trusted_checksums(ctx, out).await);
         }
-        let jar = local_repo_artifact_path(group, artifact, pinned, "jar");
+        let jar = layout::artifact_path(group, artifact, pinned, None, "jar");
         let integrity = checksums
             .as_ref()
             .and_then(|c| c.get(&jar))
@@ -369,7 +396,11 @@ async fn extract_vendored(
     vendored: &BTreeSet<String>,
     out: &mut Discovery,
 ) {
-    let swept: BTreeMap<String, Vec<String>> = sweep_vendor_dirs(ctx.root)
+    // The vendored repository is a tree of jars: only a disk has one.
+    let Some(root) = ctx.disk_root() else {
+        return;
+    };
+    let swept: BTreeMap<String, Vec<String>> = sweep_vendor_dirs(root)
         .await
         .into_iter()
         .filter(|d| d.eco == "maven")
@@ -397,9 +428,9 @@ async fn extract_vendored(
         let (group, artifact, version) = (group.as_ref(), artifact.as_ref(), version.as_ref());
         let rel = format!(
             "{dir}/{}",
-            local_repo_artifact_path(group, artifact, version, "jar")
+            layout::artifact_path(group, artifact, version, None, "jar")
         );
-        let jar_ok = tokio::fs::symlink_metadata(ctx.root.join(&rel))
+        let jar_ok = tokio::fs::symlink_metadata(root.join(&rel))
             .await
             .is_ok_and(|m| m.is_file());
         let (Some(vref), Some(purl), true) = (
@@ -756,6 +787,45 @@ mod tests {
         p.write("pom.xml", text);
         let out = run(&p).await;
         assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+    }
+
+    /// A hosted pin in a reactor root is not attested (#261): a module that
+    /// declares the GA with its own literal `<version>` overrides the root's
+    /// managed pin, and discovery reads only the root pom. It stays a ref,
+    /// so rollback / remove / list still find a pin an older release wrote,
+    /// but is marked unattested so `vex` never says not_affected for a
+    /// module that still resolves the upstream jar.
+    #[tokio::test]
+    async fn hosted_pin_in_a_reactor_root_is_not_attested() {
+        for reactor in [
+            "<modules>\n<module>child</module>\n</modules>\n",
+            "<subprojects>\n<subproject>child</subproject>\n</subprojects>\n",
+            "<profiles>\n<profile>\n<id>all</id>\n<modules>\n<module>child</module>\n</modules>\n</profile>\n</profiles>\n",
+        ] {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<packaging>pom</packaging>\n{reactor}<dependencyManagement>\n<dependencies>\n{}</dependencies>\n</dependencyManagement>\n<repositories>\n{}</repositories>\n",
+                    dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                    hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A)),
+                )),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.unattested.len(), 1, "{reactor}: {:?}", out.unattested);
+            let u = &out.unattested[0];
+            assert_eq!(u.kind, UnattestedKind::MavenReactorRoot, "{reactor}");
+            assert_eq!((u.purl.as_str(), u.uuid.as_str()), (FX_PURL, UUID_A), "{reactor}");
+            assert!(u.detail.contains("org.slf4j:slf4j-api"), "{}", u.detail);
+        }
+
+        // The single-module control stays attested.
+        let p = Project::new();
+        p.write("pom.xml", hosted_pom(UUID_A));
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
     }
 
     #[tokio::test]
@@ -1185,16 +1255,22 @@ mod tests {
         hex::encode(Sha1::digest(V_JAR))
     }
 
-    /// A project wired exactly as `vendor_maven` wires it (its own
-    /// `build_repo_edit`), with the committed maven2 tree.
+    /// A project wired exactly as the pre-v5 single-pom backend left it (a
+    /// `<repositories>` section before `</project>`), with the committed
+    /// maven2 tree: VEX still reads such a legacy ledger.
     fn vendored_project(uuid: &str) -> Project {
         let p = Project::new();
-        let wired = crate::vendor::maven_repo::build_repo_edit(
-            &project_pom("1.10.0"),
-            &format!("socket-patch-vendor-{uuid}"),
-            &format!(".socket/vendor/maven/{uuid}"),
-        )
-        .expect("vendor wiring edit");
+        let pom = project_pom("1.10.0");
+        let at = pom.rfind("</project>").expect("project close");
+        let wired = format!(
+            "{}  <repositories>\n    <repository>\n      <id>socket-patch-vendor-{uuid}</id>\n      \
+             <url>file://${{project.basedir}}/.socket/vendor/maven/{uuid}</url>\n      \
+             <releases>\n        <enabled>true</enabled>\n        \
+             <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        \
+             <enabled>false</enabled>\n      </snapshots>\n    </repository>\n  </repositories>\n{}",
+            &pom[..at],
+            &pom[at..]
+        );
         p.write("pom.xml", wired);
         let jar = v_jar_rel(uuid);
         p.write(&jar, V_JAR);

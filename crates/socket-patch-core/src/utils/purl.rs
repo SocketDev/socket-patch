@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
+use crate::patch::path_safety::{
+    is_safe_multi_segment, is_safe_name_version, is_safe_single_segment,
+};
 use crate::utils::purl_key::PurlKey;
 
 /// Strip the trailing `?qualifiers` and `#subpath` components from a PURL,
@@ -393,19 +395,6 @@ pub fn purl_matches_identifier(manifest_key: &str, identifier: &str) -> bool {
     }
 }
 
-/// Does a patch (its manifest/ledger `purl` key and `uuid`) match a
-/// user-supplied remove/rollback identifier? A `pkg:` identifier matches
-/// by PURL with [`purl_matches_identifier`]'s variant rules (a base PURL
-/// covers every release variant of that `package@version`; a qualified one
-/// targets a single patch); anything else is compared to the patch uuid.
-pub fn patch_matches(purl: &str, uuid: &str, identifier: &str) -> bool {
-    if is_purl(identifier) {
-        purl_matches_identifier(purl, identifier)
-    } else {
-        uuid == identifier
-    }
-}
-
 // ── validating builders ─────────────────────────────────────────────────
 // The purl builders lockfile discovery (`vex::discover`, which re-exports
 // them under the same names) and the lock inventory's registry views share:
@@ -426,17 +415,14 @@ pub fn npm_purl(name: &str, version: &str) -> Option<String> {
 /// `pkg:pypi/<canonical name>@<version>`.
 pub fn pypi_purl(name: &str, version: &str) -> Option<String> {
     let name = canonicalize_pypi_name(name);
-    (is_safe_single_segment(&name) && is_safe_single_segment(version))
-        .then(|| format!("pkg:pypi/{name}@{version}"))
+    is_safe_name_version(&name, version).then(|| format!("pkg:pypi/{name}@{version}"))
 }
 
 /// `pkg:<ty>/<name>@<version>` for the single-segment-name ecosystems
 /// (`cargo`, `gem`, `nuget`).
 pub fn simple_purl(ty: &str, name: &str, version: &str) -> Option<String> {
-    (matches!(ty, "cargo" | "gem" | "nuget")
-        && is_safe_single_segment(name)
-        && is_safe_single_segment(version))
-    .then(|| format!("pkg:{ty}/{name}@{version}"))
+    (matches!(ty, "cargo" | "gem" | "nuget") && is_safe_name_version(name, version))
+        .then(|| format!("pkg:{ty}/{name}@{version}"))
 }
 
 /// `pkg:golang/<module>@<version>` (module path multi-segment, version one
@@ -462,7 +448,7 @@ pub fn composer_purl(name: &str, version: &str) -> Option<String> {
 /// artifact and the version each a safe single segment — an empty group
 /// fails as one empty segment).
 pub fn maven_purl(group: &str, artifact: &str, version: &str) -> Option<String> {
-    crate::crawlers::maven_crawler::is_safe_maven_coordinate(group, artifact, version)
+    crate::vendor::jvm::layout::is_path_safe(group, artifact, version)
         .then(|| build_maven_purl(group, artifact, version))
 }
 
@@ -521,34 +507,6 @@ mod builder_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `pkg:` identifiers match by PURL (base covers every variant, a
-    /// qualified one only its exact key); anything else is a uuid match.
-    #[test]
-    fn test_patch_matches_routes_purl_vs_uuid() {
-        const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
-        let key = "pkg:pypi/requests@2.28.0?artifact_id=abc";
-        assert!(patch_matches(key, UUID, "pkg:pypi/requests@2.28.0"));
-        assert!(patch_matches(key, UUID, key));
-        assert!(!patch_matches(
-            key,
-            UUID,
-            "pkg:pypi/requests@2.28.0?artifact_id=zzz"
-        ));
-        assert!(!patch_matches(key, UUID, "pkg:pypi/requests@2.29.0"));
-        assert!(patch_matches(key, UUID, UUID));
-        assert!(!patch_matches(key, UUID, "not-the-uuid"));
-        // A uuid identifier never matches by PURL text, and a PURL
-        // identifier is only ever compared against the purl field — a
-        // uuid field that happens to equal the identifier does not match.
-        assert!(!patch_matches(
-            "pkg:npm/other@1.0.0",
-            "pkg:pypi/requests@2.28.0",
-            "pkg:pypi/requests@2.28.0"
-        ));
-        assert!(!patch_matches(UUID, "other-uuid", UUID));
-        assert!(!patch_matches("pkg:npm/a@1", UUID, "pkg:npm/b@1"));
-    }
 
     #[test]
     fn test_strip_qualifiers() {
@@ -1290,9 +1248,8 @@ mod tests {
     /// PEP 503 spelling or a NuGet case variant names the recorded patch.
     #[test]
     fn test_purl_matches_identifier_folds_pep503_and_nuget_case() {
-        assert!(patch_matches(
+        assert!(purl_matches_identifier(
             "pkg:pypi/typing-extensions@4.12.2",
-            "uuid",
             "pkg:pypi/typing_extensions@4.12.2"
         ));
         assert!(purl_matches_identifier(
@@ -1365,7 +1322,10 @@ mod tests {
                 purl_matches_identifier(qualified, &format!("{spelling}?artifact_id=abc")),
                 "{spelling}"
             );
-            assert!(patch_matches(key, "u", spelling), "{spelling}");
+            assert!(
+                crate::utils::target::Target::parse(spelling).matches_patch(key, "u"),
+                "{spelling}"
+            );
         }
         assert!(purl_matches_identifier(
             "pkg:pypi/jinja2@3.1.2",

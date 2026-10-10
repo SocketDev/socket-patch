@@ -56,12 +56,57 @@ class BunTransportRetryTests(unittest.TestCase):
             self.assertEqual((evidence / 'cli.log').read_text(), 'failed request evidence')
             self.assertFalse((evidence / 'cache').exists())
 
+    def test_a_harness_fetch_reset_is_a_transport_failure(self):
+        self.assertTrue(bun.has_transport_failure(
+            {'error': '<urlopen error [Errno 104] Connection reset by peer>'}))
+        self.assertTrue(bun.has_transport_failure({'error': '[Errno 54] Connection reset by peer'}))
+        self.assertFalse(bun.has_transport_failure({'error': 'KeyError: bun.lock'}))
+
     def test_a_patch_api_5xx_is_a_transport_failure(self):
         self.assertTrue(bun.has_transport_failure({'repeat': {'error': (
             'failed to resolve patch references: API request failed with status 503: upstream '
             'connect error or disconnect/reset before headers')}}))
         self.assertTrue(bun.has_transport_failure(['API request failed with status 504: error code: 504']))
         self.assertFalse(bun.has_transport_failure({'error': 'API request failed with status 404: not found'}))
+
+    def test_a_harness_fetch_5xx_is_a_transport_failure(self):
+        # run 37852649519: hosted_lockb_digest's urlopen of patch.socket.dev
+        # raised this on all four bun.lockb legs and none of them retried.
+        self.assertTrue(bun.has_transport_failure({'error': 'HTTP Error 503: Service Unavailable'}))
+        self.assertTrue(bun.has_transport_failure({'error': 'HTTP Error 429: Too Many Requests'}))
+        self.assertTrue(bun.has_transport_failure(
+            {'error': '<urlopen error [Errno 104] Connection reset by peer>'}))
+        self.assertFalse(bun.has_transport_failure({'error': 'HTTP Error 404: Not Found'}))
+
+    def test_a_failed_install_fetch_is_a_transport_failure(self):
+        output = 'bun install v1.0.0\nerror: GET https://patch.socket.dev/x.tgz - 503\n'
+        row = dict(passed=False, checks={'frozenPatchedBytes': False},
+                   frozenInstallTransport=bun.bun_transport_failures(output))
+        self.assertTrue(bun.has_transport_failure(row))
+        row['frozenInstallTransport'] = bun.bun_transport_failures('bun install v1.0.0\n')
+        self.assertFalse(bun.has_transport_failure(row))
+
+    def test_a_harness_fetch_5xx_cell_retries_fresh(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            job = ('0.8.1', 'vendored-then-hosted', 'vendored')
+            case = root / 'captures' / '-'.join(job)
+            calls = []
+
+            def run_case(_job):
+                case.mkdir(parents=True)
+                calls.append(True)
+                row = dict(passed=len(calls) > 1, checks={'frozenPatchedBytes': len(calls) > 1})
+                if len(calls) == 1:
+                    row['error'] = 'HTTP Error 503: Service Unavailable'
+                bun.save(case / 'result.json', row)
+                return row
+
+            with patch.object(bun.time, 'sleep'):
+                row = bun.retry_network_cell(run_case, job, root)
+            self.assertTrue(row['passed'])
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(row['networkRetryAttempts'][0]['failedChecks'], ['frozenPatchedBytes'])
 
     def test_functional_failure_is_never_retried(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -91,6 +136,82 @@ class BunTransportRetryTests(unittest.TestCase):
             self.assertFalse(row['passed'])
             self.assertEqual(len(calls), 3)
             self.assertEqual(len(row['networkRetryAttempts']), 2)
+
+
+class BunInformationalCodeTests(unittest.TestCase):
+    def test_reinstall_advisories_are_informational(self):
+        # #764: rollback / vendor --revert name `bun install --force`; the
+        # advisory is not a refusal, and rerun_clean must accept it too.
+        for code in ('vendor_bun_reinstall_required', 'redirect_bun_reinstall_required'):
+            self.assertIn(code, bun.INFORMATIONAL)
+            self.assertIn(code, bun.BUN_REINSTALL_ADVISORIES)
+        envelope = {'status': 'success', 'redirect': {'redirected': 1, 'warnings': [
+            {'code': 'redirect_bun_reinstall_required'}]}}
+        self.assertTrue(bun.rerun_clean(0, envelope, 'hosted'))
+
+    def test_misclassification_codes_stay_refusals(self):
+        # No fixture rewires a default-trusted package (#371), holds a
+        # non-registry copy (#497) or a duplicate bun.lockb record (#861).
+        for code in ('redirect_bun_default_trust_lost', 'vendor_bun_default_trust_lost',
+                     'redirect_bun_non_registry_entry_skipped', 'vendor_non_registry_entry_skipped',
+                     'vendor_bun_lockb_duplicate_records'):
+            self.assertNotIn(code, bun.INFORMATIONAL)
+
+
+class BunInstalledTargetsTests(unittest.TestCase):
+    def test_unlinked_isolated_store_entry_is_not_installed(self):
+        # After a rollback Bun's isolated linker links the registry entry and
+        # leaves the patched one on disk, unlinked: only the linked copy counts.
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            store = project / 'node_modules/.bun'
+            for key in ('minimist@1.2.2', 'minimist@https+++patch.socket.dev+x'):
+                pkg = store / key / 'node_modules/minimist'
+                pkg.mkdir(parents=True)
+                (pkg / 'package.json').write_text('{"name": "minimist", "version": "1.2.2"}')
+            (store / 'node_modules').mkdir()
+            try:
+                (store / 'node_modules/minimist').symlink_to('../minimist@1.2.2/node_modules/minimist')
+                (project / 'node_modules/minimist').symlink_to('.bun/minimist@1.2.2/node_modules/minimist')
+            except OSError:
+                self.skipTest('symlinks unavailable')
+            self.assertEqual(bun.installed_targets(project),
+                             [store / 'minimist@1.2.2/node_modules/minimist'])
+            self.assertIsNone(bun.store_entry(store / 'node_modules/minimist'))
+
+    def test_stale_hidden_hoist_link_is_skipped_only_on_request(self):
+        # Bun 1.3.0 leaves `.bun/node_modules/minimist` on the superseded
+        # patched entry while the member links the registry one.
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            store = project / 'node_modules/.bun'
+            for key in ('minimist@1.2.2', 'minimist@https+++patch.socket.dev+x'):
+                pkg = store / key / 'node_modules/minimist'
+                pkg.mkdir(parents=True)
+                (pkg / 'package.json').write_text('{"name": "minimist", "version": "1.2.2"}')
+            (store / 'node_modules').mkdir()
+            member = project / 'packages/consumer/node_modules'
+            member.mkdir(parents=True)
+            try:
+                (store / 'node_modules/minimist').symlink_to(
+                    '../minimist@https+++patch.socket.dev+x/node_modules/minimist')
+                (member / 'minimist').symlink_to(
+                    '../../../node_modules/.bun/minimist@1.2.2/node_modules/minimist')
+            except OSError:
+                self.skipTest('symlinks unavailable')
+            registry = store / 'minimist@1.2.2/node_modules/minimist'
+            patched = store / 'minimist@https+++patch.socket.dev+x/node_modules/minimist'
+            self.assertEqual(sorted(bun.installed_targets(project)), sorted([registry, patched]))
+            self.assertEqual(bun.installed_targets(project, skip_hidden_hoist=True), [registry])
+            self.assertEqual(bun.STALE_HIDDEN_HOIST, ('1.3.0',))
+
+    def test_hoisted_copies_are_always_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            pkg = project / 'node_modules/minimist'
+            pkg.mkdir(parents=True)
+            (pkg / 'package.json').write_text('{"name": "minimist", "version": "1.2.2"}')
+            self.assertEqual(bun.installed_targets(project), [pkg])
 
 
 class BunManifestlessVexHelperTests(unittest.TestCase):
@@ -693,6 +814,39 @@ class VltOracleTests(unittest.TestCase):
         self.assertLessEqual(set(vlt.SHAPES), capture_names)
 
 
+class VltInstalledBytesTests(unittest.TestCase):
+    def test_holds_checks_root_and_nested_files_with_optional_package_prefix(self):
+        contents = {
+            'index.js': {'before': b'original entrypoint', 'after': b'patched entrypoint'},
+            'test/proto.js': {'before': b'original test', 'after': b'patched test'},
+        }
+        for prefix in ('', 'package/'):
+            for side in ('before', 'after'):
+                with self.subTest(prefix=prefix, side=side), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    package = root / 'node_modules' / 'minimist'
+                    record = {'files': {
+                        prefix + name: {s + 'Hash': vlt.git_hash(data) for s, data in sides.items()}
+                        for name, sides in contents.items()
+                    }}
+                    cell = vlt.Cell({'out': root, 'record': record}, '1.2.0', 'vendored', 'direct')
+                    expected = {}
+                    for name, sides in contents.items():
+                        path = package / name
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(sides[side])
+                        expected[str(path.relative_to(root))] = vlt.git_hash(sides[side])
+                    self.assertEqual(cell.holds(root, '{}', side), (True, expected))
+                    other_side = 'after' if side == 'before' else 'before'
+                    self.assertFalse(cell.holds(root, '{}', other_side)[0])
+
+                    nested = package / 'test' / 'proto.js'
+                    nested.write_bytes(b'corrupted')
+                    self.assertFalse(cell.holds(root, '{}', side)[0])
+                    nested.unlink()
+                    self.assertFalse(cell.holds(root, '{}', side)[0])
+
+
 class VltConfigTests(unittest.TestCase):
     """write_vlt_json follows the DESIGN §8.3 per-era registry table."""
 
@@ -753,9 +907,9 @@ class VltReleaseTests(unittest.TestCase):
         for version in vlt.VERSIONS:
             self.assertEqual(vlt.release_status(version, self.supported, self.excluded),
                              'supported')
-        self.assertEqual(vlt.release_status('1.3.0', self.supported, self.excluded), 'unlisted')
-        self.assertEqual(vlt.unlisted_releases(['1.2.0', '0.0.0-22', '1.3.0', '0.0.0-0.17'],
-                                               self.supported, self.excluded), ['1.3.0'])
+        self.assertEqual(vlt.release_status('9.9.9', self.supported, self.excluded), 'unlisted')
+        self.assertEqual(vlt.unlisted_releases(['1.3.7', '0.0.0-22', '9.9.9', '0.0.0-0.17'],
+                                               self.supported, self.excluded), ['9.9.9'])
 
     def test_main_refuses_an_excluded_release(self):
         with self.assertRaises(SystemExit), patch('sys.stderr'):
@@ -770,9 +924,10 @@ class VltReleaseTests(unittest.TestCase):
                                    '1.2.0'])
         eras = {v: vlt.era_of(v) for v in ('0.0.0-18', '0.0.0-19', '1.0.0-rc.8', '1.0.0-rc.9',
                                            '1.0.0-rc.14', '1.0.0-rc.15', '1.0.0-rc.32',
-                                           '1.0.0-rc.33', '1.0.7', '1.0.8', '1.1.1', '1.2.0')}
+                                           '1.0.0-rc.33', '1.0.7', '1.0.8', '1.1.1', '1.2.0',
+                                           '1.3.7')}
         self.assertEqual(list(eras.values()),
-                         ['A0', 'A', 'A', 'B', 'B', 'C', 'C', 'D', 'D', 'E', 'E', 'F'])
+                         ['A0', 'A', 'A', 'B', 'B', 'C', 'C', 'D', 'D', 'E', 'E', 'F', 'F'])
 
     def test_pinned_integrity_covers_every_supported_release(self):
         pinned = json.loads(vlt.HISTORICAL_INTEGRITY.read_text())
@@ -912,6 +1067,50 @@ class VltRetryTests(unittest.TestCase):
         self.assertFalse(vlt.transient({'cliStderrTail': 'API request failed with status 404: not found'}))
         self.assertFalse(vlt.transient({'serveProbe': {'curlExit': 0, 'status': 200},
                                         'failingChecks': ['freshCi']}))
+
+    def test_a_preflight_transport_failure_retries(self):
+        def refusal(reason):
+            return {'serveProbe': {'curlExit': 0, 'status': 200}, 'safeRefusal': True,
+                    'preflightFailures': [f'vlt would fail to verify https://h/<redacted>/u/a.tgz: '
+                                          f'{reason}; nothing was written for pkg:npm/a@1']}
+        for reason in ('http 502', 'http 504', 'fetch error error sending request',
+                       'fetch error no response within 60s', 'fetch error no response',
+                       'fetch error hosted artifact body not received within 300s'):
+            with self.subTest(reason=reason):
+                self.assertTrue(vlt.transient(refusal(reason)))
+        for reason in ('http 404', 'http 403', 'content-encoding gzip', 'sha512 mismatch',
+                       'offline', 'fetch error refusing a non-http(s) artifact URL',
+                       'fetch error hosted artifact too large (5 bytes > 4)'):
+            with self.subTest(reason=reason):
+                self.assertFalse(vlt.transient(refusal(reason)))
+
+    def test_a_vlt_network_drop_retries(self):
+        for err in ("vlt install exited 1: Timeout { code: 'ETIMEDOUT', syscall: 'connect' }",
+                    'vlt install exited 1: read ECONNRESET', 'getaddrinfo EAI_AGAIN registry',
+                    'vlt install exited 1: socket hang up'):
+            with self.subTest(err=err):
+                self.assertTrue(vlt.transient({'error': f'RuntimeError: {err}'}))
+        for err in ('getaddrinfo ENOTFOUND h', 'connect ECONNREFUSED 127.0.0.1:1', 'EINTEGRITY'):
+            with self.subTest(err=err):
+                self.assertFalse(vlt.transient({'error': f'RuntimeError: {err}'}))
+
+    def test_a_successful_runs_preflight_reasons_reach_the_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cell = vlt.Cell({'out': Path(temp), 'record': {}, 'cli': 'socket-patch',
+                             'cli_env': {}}, '1.2.0', 'hosted', 'direct')
+            cell.project.mkdir(parents=True)
+            row = dict(cell=cell.name, expectedVerdict='patched', passed=False, checks={},
+                       safeRefusal=True)
+            detail = 'vlt would fail to verify https://h/a.tgz: http 503; nothing was written for x'
+            envelope = {'status': 'success', 'redirect': {'warnings': [
+                {'code': 'redirect_vlt_artifact_unverifiable', 'detail': detail}]}}
+            with patch.object(vlt, 'run', return_value=(0, json.dumps(envelope), '')):
+                cell.patch_run('hosted')
+            with patch('sys.stdout'):
+                cell.finish(row, row['checks'], vlt.time.time())
+            captured = json.loads((cell.case / 'result.json').read_text())
+            self.assertEqual(captured['preflightFailures'], [detail])
+            self.assertTrue(vlt.transient(captured))
 
     def test_a_transport_failure_reruns_from_scratch(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -50,6 +50,10 @@
 //! unavailable or the fixture install cannot reach the registry — unless
 //! `SOCKET_PATCH_YARN_E2E_REQUIRED=1`; every assertion after is hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -91,10 +95,6 @@ macro_rules! skip {
 }
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 fn scrub_socket_env(cmd: &mut Command) {
     for (k, _) in std::env::vars_os() {
@@ -251,6 +251,17 @@ enum HostedDriver {
     GetUuid,
 }
 
+/// The project the fixture installs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Layout {
+    /// One manifest depending on `left-pad@1.3.0`.
+    Single,
+    /// #1271: a yarn workspace whose member `a` declares `"left-pad": ""`
+    /// (an empty range, the same as `*`) and member `b` `"^1.3.0"`, so yarn
+    /// locks both under one `left-pad@, left-pad@^1.3.0:` block.
+    EmptyRangeWorkspace,
+}
+
 /// Where the fixture configures `yarn-offline-mirror`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mirror {
@@ -278,6 +289,7 @@ async fn classic_hosted_project(
     tamper_served_tarball: bool,
     mirror: Mirror,
     driver: HostedDriver,
+    layout: Layout,
 ) -> Option<ClassicRedirectFixture> {
     let offline_mirror = mirror != Mirror::None;
     if !require_yarn_classic(&format!("e2e_redirect_yarn_classic_build ({tag})"), |c| {
@@ -288,13 +300,32 @@ async fn classic_hosted_project(
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("package.json"),
-        format!(
-            r#"{{"name":"redirect-classic-capstone","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
-        ),
-    )
-    .unwrap();
+    match layout {
+        Layout::Single => std::fs::write(
+            proj.join("package.json"),
+            format!(
+                r#"{{"name":"redirect-classic-capstone","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+            ),
+        )
+        .unwrap(),
+        Layout::EmptyRangeWorkspace => {
+            std::fs::write(
+                proj.join("package.json"),
+                r#"{"name":"redirect-classic-capstone","version":"0.0.0","private":true,"workspaces":["a","b"]}"#,
+            )
+            .unwrap();
+            for (member, range) in [("a", ""), ("b", "^1.3.0")] {
+                std::fs::create_dir_all(proj.join(member)).unwrap();
+                std::fs::write(
+                    proj.join(member).join("package.json"),
+                    format!(
+                        r#"{{"name":"{member}","version":"1.0.0","dependencies":{{"{DEP}":"{range}"}}}}"#
+                    ),
+                )
+                .unwrap();
+            }
+        }
+    }
     let mirror_dir = proj.join("mirror");
     let mirror_dir = mirror_dir.to_str().unwrap();
     // Where yarn reads the mirror from; the env leg sets it for yarn AND
@@ -356,6 +387,12 @@ async fn classic_hosted_project(
         lock_pristine.contains("# yarn lockfile v1"),
         "fixture must be a yarn classic v1 lock:\n{lock_pristine}"
     );
+    if layout == Layout::EmptyRangeWorkspace {
+        assert!(
+            lock_pristine.contains(&format!("\n{DEP}@, {DEP}@^1.3.0:\n")),
+            "yarn must merge the empty range into one block:\n{lock_pristine}"
+        );
+    }
 
     // 2. Patched tarball + the exact hashes classic will verify at install.
     let tgz_path = tmp.path().join(format!("{DEP}-{DEP_VERSION}.tgz"));
@@ -452,6 +489,25 @@ async fn classic_hosted_project(
         })))
         .mount(&server)
         .await;
+    if tamper_served_tarball {
+        // The scan reads the served tarball once (it checks the dependency
+        // graph against the lock, #591) and verifies it against the grant,
+        // so it would refuse tampered bytes up front. Serve the real bytes
+        // to that read and the tampered ones from then on: the tarball is
+        // swapped after the pin was written, which only yarn's own check of
+        // the pinned hashes can catch.
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(tgz.clone(), "application/octet-stream"),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+    }
     Mock::given(method("GET"))
         .and(path(format!(
             "/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz"
@@ -591,6 +647,14 @@ fn fresh_checkout_yarn_install(fx: &ClassicRedirectFixture) -> (PathBuf, Output)
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(fx.proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
+    // Workspace members' manifests (Layout::EmptyRangeWorkspace).
+    for member in ["a", "b"] {
+        let manifest = fx.proj.join(member).join("package.json");
+        if manifest.is_file() {
+            std::fs::create_dir_all(fresh.join(member)).unwrap();
+            std::fs::copy(manifest, fresh.join(member).join("package.json")).unwrap();
+        }
+    }
     // v5 hosted mode writes nothing under `.socket/`; carry it when present.
     if fx.proj.join(".socket").is_dir() {
         copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
@@ -773,7 +837,14 @@ fn hosted_dev_resave_vex(fx: &ClassicRedirectFixture) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
-    let Some(fx) = classic_hosted_project("main", false, Mirror::None, HostedDriver::Scan).await
+    let Some(fx) = classic_hosted_project(
+        "main",
+        false,
+        Mirror::None,
+        HostedDriver::Scan,
+        Layout::Single,
+    )
+    .await
     else {
         return;
     };
@@ -802,6 +873,41 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
     tokio::task::block_in_place(|| hosted_dev_resave_vex(&fx));
 }
 
+/// #1271: yarn 1 locks a member's `"left-pad": ""` (an empty range) under
+/// one `left-pad@, left-pad@^1.3.0:` block with the other member's range.
+/// That block is the installed registry copy: the hosted scan pins it (the
+/// fixture asserts one redirect and the lock pin), and a fresh checkout
+/// installs the patched bytes for both members.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_empty_range_workspace_key_is_pinned() {
+    let Some(fx) = classic_hosted_project(
+        "empty-range",
+        false,
+        Mirror::None,
+        HostedDriver::Scan,
+        Layout::EmptyRangeWorkspace,
+    )
+    .await
+    else {
+        return;
+    };
+    let lock = std::fs::read_to_string(fx.proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("\n{DEP}@, {DEP}@^1.3.0:\n")),
+        "the pin keeps the key line:\n{lock}"
+    );
+    let (fresh, ci) = fresh_checkout_yarn_install(&fx);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout install must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert_eq!(installed, fx.patched, "both members load the patched bytes");
+}
+
 /// get-driven hosted twin (v4.0): `get <uuid> --mode hosted --json --yes`
 /// routes through the SAME hosted engine as `scan --mode hosted`, so the
 /// classic chain must hold unchanged — the fixture's lock pin (hosted URL +
@@ -813,8 +919,14 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_get_uuid_hosted_fresh_checkout_installs() {
-    let Some(fx) =
-        classic_hosted_project("get-uuid", false, Mirror::None, HostedDriver::GetUuid).await
+    let Some(fx) = classic_hosted_project(
+        "get-uuid",
+        false,
+        Mirror::None,
+        HostedDriver::GetUuid,
+        Layout::Single,
+    )
+    .await
     else {
         return;
     };
@@ -847,7 +959,14 @@ async fn classic_get_uuid_hosted_fresh_checkout_installs() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_tampered_hosted_tarball_fails_integrity() {
-    let Some(fx) = classic_hosted_project("tampered", true, Mirror::None, HostedDriver::Scan).await
+    let Some(fx) = classic_hosted_project(
+        "tampered",
+        true,
+        Mirror::None,
+        HostedDriver::Scan,
+        Layout::Single,
+    )
+    .await
     else {
         return;
     };
@@ -894,13 +1013,17 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
         false,
         Mirror::ProjectRc,
         HostedDriver::Scan,
+        Layout::Single,
     )
     .await
     else {
         return;
     };
     assert!(
-        fx.proj.join("mirror").join(format!("{DEP}-{DEP_VERSION}.tgz")).is_file(),
+        fx.proj
+            .join("mirror")
+            .join(format!("{DEP}-{DEP_VERSION}.tgz"))
+            .is_file(),
         "the fixture install must populate the offline mirror"
     );
     let fresh = fx.tmp.path().join("fresh");
@@ -926,7 +1049,11 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
             String::from_utf8_lossy(&ci.stderr)
         );
         assert!(
-            !fresh.join("node_modules").join(DEP).join("index.js").exists(),
+            !fresh
+                .join("node_modules")
+                .join(DEP)
+                .join("index.js")
+                .exists(),
             "yarn < 1.7 is expected to install nothing from the mirror"
         );
         return;
@@ -948,7 +1075,10 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
         );
         let installed =
             std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
-        assert_eq!(installed, fx.orig, "the untouched lock installs the upstream bytes");
+        assert_eq!(
+            installed, fx.orig,
+            "the untouched lock installs the upstream bytes"
+        );
         std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
     }
 }
@@ -965,7 +1095,9 @@ async fn classic_offline_mirror_outside_project_rc_refuses_hosted() {
         ("offline-mirror-parent", Mirror::ParentRc),
         ("offline-mirror-env", Mirror::Env),
     ] {
-        let Some(fx) = classic_hosted_project(tag, false, mirror, HostedDriver::Scan).await else {
+        let Some(fx) =
+            classic_hosted_project(tag, false, mirror, HostedDriver::Scan, Layout::Single).await
+        else {
             continue;
         };
         assert!(
@@ -1237,6 +1369,134 @@ async fn classic_file_directory_dependency_is_named_and_not_attested() {
     );
 }
 
+/// #1236: the same `file:` directory declared under ANOTHER dependency
+/// name (`"lp2": "file:./lpdir"`, lpdir being left-pad@1.3.0) locks as
+/// `"lp2@file:./lpdir"`, beside the registry left-pad. yarn 1 copies it
+/// into `node_modules/lp2`, so it stays unpatched whatever the pin does.
+/// `scan --mode hosted` must still pin the registry block, name the copy
+/// (`redirect_yarn_classic_directory_skipped`), and neither its in-run VEX
+/// nor a lock-only `vex` may attest left-pad not_affected.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_file_directory_copy_under_another_name_is_named_and_not_attested() {
+    if !require_yarn_classic("e2e_redirect_yarn_classic_build (other-name file:)", |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let copy = proj.join("lpdir");
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(
+        copy.join("package.json"),
+        format!(r#"{{"name":"{DEP}","version":"{DEP_VERSION}","main":"index.js"}}"#),
+    )
+    .unwrap();
+    let orig: &[u8] = b"module.exports = function leftPad(s) { return s; };\n";
+    std::fs::write(copy.join("index.js"), orig).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"other-name-classic","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}","lp2":"file:./lpdir"}}}}"#
+        ),
+    )
+    .unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "(other-name file:): fixture `yarn install` failed:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    let lock_pristine = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock_pristine.contains("lp2@file:./lpdir"),
+        "fixture must lock the copy under its dependency name:\n{lock_pristine}"
+    );
+
+    let installed_dir = proj.join("node_modules").join(DEP);
+    let installed_orig = std::fs::read(installed_dir.join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), &installed_orig].concat();
+    let tgz_path = tmp.path().join("patched.tgz");
+    build_patched_tgz(&installed_dir, &patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let server = mock_hosted_grant(&tgz, &installed_orig, &patched, "other-name fixture").await;
+
+    let api_url = server.uri();
+    let api = [
+        "--api-url",
+        api_url.as_str(),
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    let mut args = vec![
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--vex",
+        "out.vex.json",
+        "--vex-product",
+        PRODUCT,
+    ];
+    args.extend(api);
+    let (code, stdout, stderr) = run_socket(&proj, &args);
+    println!("scan exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan --json output is not JSON: {e}\n{stdout}\n{stderr}"));
+    let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("{UUID}/{DEP}-{DEP_VERSION}.tgz")),
+        "the registry left-pad block must still be pinned:\n{lock}"
+    );
+    assert!(
+        env.to_string()
+            .contains("redirect_yarn_classic_directory_skipped"),
+        "the other-name copy must be named: {env}"
+    );
+    assert!(env.to_string().contains("lp2@file:./lpdir"), "{env}");
+    let vex = std::fs::read_to_string(proj.join("out.vex.json")).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "the in-run VEX must not attest left-pad:\n{vex}\n{env}"
+    );
+
+    // Lock-only: with node_modules gone, `vex` reads only the lock.
+    std::fs::remove_dir_all(proj.join("node_modules")).unwrap();
+    let mut args = vec![
+        "vex",
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--output",
+        "lock-only.vex.json",
+        "--product",
+        PRODUCT,
+        "--patch-server-url",
+        api_url.as_str(),
+    ];
+    args.extend(api);
+    let (code, stdout, stderr) = run_socket(&proj, &args);
+    println!("vex exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let vex = std::fs::read_to_string(proj.join("lock-only.vex.json")).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "lock-only vex must not attest left-pad:\n{vex}\n{stdout}\n{stderr}"
+    );
+}
+
 /// A mock patch API granting one hosted patch of `DEP@DEP_VERSION` whose
 /// tarball is `tgz` (`index.js` from `orig` to `patched`).
 async fn mock_hosted_grant(tgz: &[u8], orig: &[u8], patched: &[u8], title: &str) -> MockServer {
@@ -1295,6 +1555,16 @@ async fn mock_hosted_grant(tgz: &[u8], orig: &[u8], patched: &[u8], title: &str)
             } },
             "description": "x", "license": "MIT", "tier": "free"
         })))
+        .mount(&server)
+        .await;
+    // The hosted tarball itself: the scan reads it before pinning (#591).
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(tgz.to_vec(), "application/octet-stream"),
+        )
         .mount(&server)
         .await;
 

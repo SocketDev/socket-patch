@@ -26,7 +26,9 @@
 //! from the rubygems.org compact index (`info/<name>`, what bundler itself
 //! records; other upstream remotes are refused: their index may need
 //! credentials and is not the default registry), and the `DEPENDENCIES`
-//! source pin (`name (= v)!`) loses its `!`.
+//! source pin (`name (= v)!`) loses its `!` — unless the declaration comes
+//! back inside the user's own `source … do` block, where bundler writes the
+//! `!` itself ([`in_source_block`], #1056).
 //!
 //! What the rewrite discards is NOT derivable, so the restore picks the
 //! installable reading and documents it:
@@ -277,13 +279,25 @@ struct Gem<'p> {
     version: String,
 }
 
-/// Restore `gem` in the LF lock text (module docs). `transitive`: drop the
-/// `DEPENDENCIES` entry instead of unpinning it.
+/// What the restore does to the gem's `DEPENDENCIES` entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DepEntry {
+    /// Drop the `!` source pin the rewriter added (module docs).
+    Unpin,
+    /// Keep the entry as is: the restored declaration sits in a user
+    /// `source … do` block, which bundler records with a `!` (#1056).
+    Keep,
+    /// Drop the entry: the rewriter added it for a transitive gem.
+    Drop,
+}
+
+/// Restore `gem` in the LF lock text (module docs); `dep` says what becomes
+/// of its `DEPENDENCIES` entry.
 fn lock_edit(
     lock: &str,
     gem: &Gem<'_>,
     globals: &[String],
-    transitive: bool,
+    dep: DepEntry,
     sha: Option<&str>,
     ctx: &Ctx<'_>,
 ) -> Result<LockEdit, String> {
@@ -346,10 +360,16 @@ fn lock_edit(
     };
     if wiring.is_some() {
         if let Some((k, entry)) = dependency_line(&lines, &gem.name) {
-            if transitive {
-                drop.insert(k);
-            } else if let Some(unpinned) = entry.strip_suffix('!') {
-                replace.insert(k, format!("  {unpinned}"));
+            match dep {
+                DepEntry::Drop => {
+                    drop.insert(k);
+                }
+                DepEntry::Unpin => {
+                    if let Some(unpinned) = entry.strip_suffix('!') {
+                        replace.insert(k, format!("  {unpinned}"));
+                    }
+                }
+                DepEntry::Keep => {}
             }
         }
     }
@@ -494,7 +514,7 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let code = trimmed.split('#').next().unwrap_or_default().trim_end();
+    let code = ruby_code(trimmed).trim_end();
     if code == "do" || code.ends_with(" do") || (code.ends_with('|') && code.contains(" do |")) {
         return format!("{}  ", indent_of(prev));
     }
@@ -508,6 +528,70 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
         ""
     };
     format!("{eol}{indent}")
+}
+
+/// Whether byte `at` of the manifest sits inside a `source "<url>" do`
+/// block (at any depth: a `group … do` nested in it keeps the source).
+/// Bundler records a dependency declared there with a `!` source pin in the
+/// lock's `DEPENDENCIES`, whichever URL the block names (#1056). A line-level
+/// `do` / `end` count, like [`declaration_prefix`]'s: a block opened and
+/// closed on one line nets out. Keyword constructs (`if`, `case`, `def`, …)
+/// that start a line are counted too, so their `end` does not close an
+/// enclosing `source … do` block.
+fn in_source_block(text: &str, at: usize) -> bool {
+    let mut open: Vec<bool> = Vec::new();
+    for line in text[..at].lines() {
+        let code = ruby_code(line).trim();
+        let opens = code == "do"
+            || code.ends_with(" do")
+            || code.ends_with(")do")
+            || (code.ends_with('|') && code.contains(" do |"));
+        if opens {
+            let source = code
+                .strip_prefix("source")
+                .is_some_and(|rest| rest.starts_with([' ', '\t', '(']));
+            open.push(source);
+        } else if opens_keyword_block(code) {
+            open.push(false);
+        } else if code == "end" || code.starts_with("end ") || code.starts_with("end.") {
+            open.pop();
+        }
+    }
+    open.contains(&true)
+}
+
+/// `line` without its trailing `#` comment. A `#` inside a quoted string
+/// (`"https://#{host}/"` interpolation, a URL fragment) is code, not a
+/// comment.
+fn ruby_code(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => return &line[..i],
+            None => {}
+        }
+    }
+    line
+}
+
+/// Whether the (comment-stripped, trimmed) line opens a keyword construct
+/// that Ruby closes with `end`: one that starts the line, not a modifier
+/// (`gem "x" if cond`), and not closed on the same line.
+fn opens_keyword_block(code: &str) -> bool {
+    let first = code
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .next()
+        .unwrap_or_default();
+    matches!(
+        first,
+        "if" | "unless" | "while" | "until" | "case" | "begin" | "def" | "class" | "module"
+    ) && !(code.ends_with(" end") || code.ends_with(";end"))
 }
 
 /// How the gem comes back into the manifest.
@@ -619,6 +703,7 @@ pub(crate) async fn restore(
         let mut lock: Option<String> = lock_raw.as_deref().map(|t| to_lf(t).into_owned());
         let mut manifest = manifest_raw.clone();
         let globals = manifest.as_deref().map(global_sources).unwrap_or_default();
+        let handled_before = result.handled.clone();
         for pin in pins {
             if result.refused.contains_key(&pin.uuid) {
                 continue;
@@ -658,6 +743,20 @@ pub(crate) async fn restore(
                 Err(why) => result.refuse(&pin.uuid, why),
             }
         }
+        // The pins this pair restored, each judged once against its own
+        // restored lock.
+        for pin in pins {
+            if !result.handled.contains(&pin.uuid)
+                || handled_before.contains(&pin.uuid)
+                || result.refused.contains_key(&pin.uuid)
+            {
+                continue;
+            }
+            if let Some(warning) = stale_cache_warning(view.root(), pin, lock.as_deref(), ctx).await
+            {
+                result.warnings.push(warning);
+            }
+        }
         if let (Some(next), Some(endings)) = (lock, endings) {
             let next = endings.restore(&next).into_owned();
             if lock_raw.as_deref() != Some(next.as_str()) {
@@ -671,6 +770,82 @@ pub(crate) async fn restore(
         }
     }
     result
+}
+
+/// The warning code for a patched archive left in Bundler's cache dir by
+/// an unwind (the restore-side counterpart of scan's
+/// `redirect_gem_stale_install`).
+pub(crate) const STALE_CACHE: &str = "upstream_gem_stale_cache";
+
+/// The `CHECKSUMS` sha256 the lock pins for `name (version)`, if any.
+fn lock_checksum(lock: &str, name: &str, version: &str) -> Option<String> {
+    let lines: Vec<&str> = lock.split('\n').collect();
+    let (s, e) = named_section(&lines, "CHECKSUMS")?;
+    lines[s..e].iter().find_map(|line| {
+        let entry = indented(line, 2)?.trim_end();
+        let (n, token, tail) = split_checksum_entry(entry)?;
+        if n != name || token != version {
+            return None;
+        }
+        tail.split_whitespace()
+            .find_map(|tok| tok.strip_prefix("sha256="))
+            .map(str::to_ascii_lowercase)
+    })
+}
+
+/// A restored gem whose `<name>-<version>.gem` still sits in Bundler's
+/// cache dir (`cache_path`, default `vendor/cache`) and is not proven to
+/// be the upstream archive: bundler installs from that dir before
+/// fetching, so the archive a `bundle cache` took while the hosted pin was
+/// live keeps installing the patched bytes (bundler < 2.6, frozen) or
+/// fails every install against the restored upstream checksum (#1260).
+/// The upstream sha is the restored lock's `CHECKSUMS` entry, else the
+/// rubygems.org compact index (already fetched when the restore re-pinned
+/// `CHECKSUMS`). Read-only, like scan's guard: the file is named, never
+/// deleted.
+async fn stale_cache_warning(
+    root: &std::path::Path,
+    pin: &HostedPin,
+    lock: Option<&str>,
+    ctx: &Ctx<'_>,
+) -> Option<(&'static str, String)> {
+    let (name, version) = pin.name_version()?;
+    let cache_dir = crate::crawlers::ruby_crawler::bundler_app_cache_dir(root).await;
+    let archive = cache_dir.join(format!("{name}-{version}.gem"));
+    if !archive.is_file() {
+        return None;
+    }
+    let got = crate::vendor::file_sha256_hex(&archive).await;
+    let upstream = match lock.and_then(|l| lock_checksum(l, &name, &version)) {
+        Some(sha) => Ok(sha),
+        None => ctx.client.rubygems_sha256(&name, &version).await,
+    };
+    let fix = "delete it, then run `bundle cache` to cache the upstream gem in its place \
+               (or `bundle install` if the project does not commit its cache)";
+    let detail = match (got, upstream) {
+        (Some(got), Ok(want)) if got.eq_ignore_ascii_case(&want) => return None,
+        (Some(_), Ok(_)) => format!(
+            "{purl} is back on its upstream registry entry, but Bundler's cache dir still \
+             holds a non-upstream (patched) archive at {path}; bundler installs from that \
+             dir first, so installs fail on the upstream checksum or keep the patched \
+             bytes: {fix}",
+            purl = pin.purl,
+            path = archive.display(),
+        ),
+        (_, why) => format!(
+            "{purl} is back on its upstream registry entry, but Bundler's cache dir holds \
+             {path}, which could not be checked against the upstream sha256{why}; if it \
+             was cached while the hosted patch was live, bundler keeps installing it: \
+             {fix}",
+            purl = pin.purl,
+            path = archive.display(),
+            why = match why {
+                Err(e) => format!(" ({e})"),
+                Ok(_) => " (the archive is unreadable)".to_string(),
+            },
+        ),
+    };
+    Some((STALE_CACHE, detail))
 }
 
 /// Restore one gem in a lock + manifest pair: `Ok(None)` when neither wires
@@ -716,32 +891,36 @@ async fn restore_one(
     } else {
         Decl::Direct(format!(", \"{}\"", gem.version))
     };
-    let transitive = matches!(decl, Decl::Transitive);
+    // The restored declaration goes back where the block is: a user
+    // `source … do` block around it keeps the `!` bundler wrote for it.
+    let dep = match (&decl, &block, manifest) {
+        (Decl::Transitive, _, _) => DepEntry::Drop,
+        (Decl::Direct(_), Some(b), Some(text)) if in_source_block(text, b.start) => DepEntry::Keep,
+        (Decl::Direct(_), _, _) => DepEntry::Unpin,
+    };
     let next_lock = match lock {
         None => None,
-        Some(text) => Some(
-            match lock_edit(text, gem, globals, transitive, None, ctx)? {
-                LockEdit::Done(next) => next,
-                LockEdit::NeedsSha { remote } => {
-                    let remote = remote.ok_or("its upstream GEM remote is ambiguous")?;
-                    if !same_remote(&remote, RUBYGEMS_REMOTE) {
-                        return Err(format!(
+        Some(text) => Some(match lock_edit(text, gem, globals, dep, None, ctx)? {
+            LockEdit::Done(next) => next,
+            LockEdit::NeedsSha { remote } => {
+                let remote = remote.ok_or("its upstream GEM remote is ambiguous")?;
+                if !same_remote(&remote, RUBYGEMS_REMOTE) {
+                    return Err(format!(
                         "its upstream GEM remote {remote} is not rubygems.org, so its CHECKSUMS \
                          sha256 cannot be re-derived"
                     ));
-                    }
-                    let sha = ctx
-                        .client
-                        .rubygems_sha256(&gem.name, &gem.version)
-                        .await
-                        .map_err(|why| format!("{} {}: {why}", gem.name, gem.version))?;
-                    match lock_edit(text, gem, globals, transitive, Some(&sha), ctx)? {
-                        LockEdit::Done(next) => next,
-                        LockEdit::NeedsSha { .. } => unreachable!("a sha was supplied"),
-                    }
                 }
-            },
-        ),
+                let sha = ctx
+                    .client
+                    .rubygems_sha256(&gem.name, &gem.version)
+                    .await
+                    .map_err(|why| format!("{} {}: {why}", gem.name, gem.version))?;
+                match lock_edit(text, gem, globals, dep, Some(&sha), ctx)? {
+                    LockEdit::Done(next) => next,
+                    LockEdit::NeedsSha { .. } => unreachable!("a sha was supplied"),
+                }
+            }
+        }),
     };
     let next_manifest = match (manifest, &block) {
         (Some(text), Some(b)) => Some(restore_manifest(text, b, gem, &decl)),
@@ -795,11 +974,11 @@ mod tests {
                     ruby\n\nDEPENDENCIES\n  puma\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.4.0\n";
         // No CHECKSUMS (bundler 2.2–2.5): no registry lookup, offline works.
         assert_eq!(
-            done(lock_edit(&hosted, &gem(), &[], false, None, &ctx).unwrap()),
+            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap()),
             want
         );
         // Transitive: the DEPENDENCIES entry the rewriter added goes.
-        let out = done(lock_edit(&hosted, &gem(), &[], true, None, &ctx).unwrap());
+        let out = done(lock_edit(&hosted, &gem(), &[], DepEntry::Drop, None, &ctx).unwrap());
         assert!(out.contains("DEPENDENCIES\n  puma\n\n"), "{out}");
     }
 
@@ -813,7 +992,7 @@ mod tests {
              sha256={}\n",
             "d".repeat(64)
         );
-        match lock_edit(&hosted, &gem(), &[], false, None, &ctx).unwrap() {
+        match lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap() {
             LockEdit::NeedsSha { remote } => {
                 assert_eq!(remote.as_deref(), Some("https://rubygems.org/"))
             }
@@ -821,7 +1000,7 @@ mod tests {
         }
         let sha = "2".repeat(64);
         assert_eq!(
-            done(lock_edit(&hosted, &gem(), &[], false, Some(&sha), &ctx).unwrap()),
+            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, Some(&sha), &ctx).unwrap()),
             format!(
                 "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  \
                  rails (= 7.0.0)\n\nCHECKSUMS\n  rails (7.0.0) sha256={sha}\n"
@@ -830,7 +1009,7 @@ mod tests {
         // The rewriter's ADDED entry next to bundler's bare one is dropped.
         let added = hosted.replace("CHECKSUMS\n", "CHECKSUMS\n  rails (7.0.0)\n");
         assert!(
-            done(lock_edit(&added, &gem(), &[], false, None, &ctx).unwrap())
+            done(lock_edit(&added, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap())
                 .ends_with("CHECKSUMS\n  rails (7.0.0)\n")
         );
     }
@@ -844,7 +1023,7 @@ mod tests {
              rails (7.0.0)\n\nDEPENDENCIES\n  puma\n  rails (= 7.0.0)!\n\nBUNDLED WITH\n   2.1.4\n"
         );
         assert_eq!(
-            done(lock_edit(&hosted, &gem(), &[], false, None, &ctx).unwrap()),
+            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap()),
             "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    rails (7.0.0)\n\n\
              DEPENDENCIES\n  puma\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.1.4\n"
         );
@@ -858,10 +1037,20 @@ mod tests {
             "GEM\n  remote: https://gems.example/\n  specs:\n\nGEM\n  remote: https://mirror.example/\n  \
              specs:\n\nGEM\n  remote: {IDX}\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n"
         );
-        assert!(lock_edit(&two_upstreams, &gem(), &[], false, None, &ctx).is_err());
+        assert!(lock_edit(&two_upstreams, &gem(), &[], DepEntry::Unpin, None, &ctx).is_err());
         // The manifest's global source singles one out.
         let globals = vec!["https://mirror.example".to_string()];
-        let out = done(lock_edit(&two_upstreams, &gem(), &globals, false, None, &ctx).unwrap());
+        let out = done(
+            lock_edit(
+                &two_upstreams,
+                &gem(),
+                &globals,
+                DepEntry::Unpin,
+                None,
+                &ctx,
+            )
+            .unwrap(),
+        );
         assert!(
             out.contains("remote: https://mirror.example/\n  specs:\n    rails (7.0.0)\n"),
             "{out}"
@@ -871,11 +1060,11 @@ mod tests {
             "GEM\n  remote: https://rubygems.org/\n  specs:\n\nGEM\n  remote: {IDX}\n  specs:\n    \
              rack (3.0.0)\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n"
         );
-        assert!(lock_edit(&extra, &gem(), &[], false, None, &ctx).is_err());
+        assert!(lock_edit(&extra, &gem(), &[], DepEntry::Unpin, None, &ctx).is_err());
         let none = format!(
             "GEM\n  remote: {IDX}\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails!\n"
         );
-        assert!(lock_edit(&none, &gem(), &[], false, None, &ctx).is_err());
+        assert!(lock_edit(&none, &gem(), &[], DepEntry::Unpin, None, &ctx).is_err());
     }
 
     #[test]
@@ -1056,7 +1245,18 @@ mod tests {
             }),
             ..ov.clone()
         };
-        let files = BTreeMap::from([("Gemfile".to_string(), lf.to_string())]);
+        // A CHECKSUMS-less lock resolving both (hosted mode pins only a
+        // version a lock resolves, #1125) and left untouched by the rewrite.
+        let files = BTreeMap::from([
+            ("Gemfile".to_string(), lf.to_string()),
+            (
+                "Gemfile.lock".to_string(),
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n      \
+                 rack (>= 3)\n      rails (>= 7)\n    rack (3.0.0)\n    rails (7.0.0)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n\nBUNDLED WITH\n   2.5.23\n"
+                    .to_string(),
+            ),
+        ]);
         let gemfile =
             rewrite_registry_redirect(&files, &[ov.clone(), rack_ov]).files["Gemfile"].clone();
         let rack = || Gem {
@@ -1140,6 +1340,393 @@ mod tests {
         .expect("the redirect is found");
         assert_eq!(next_manifest.as_deref(), Some(manifest));
         assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
+    }
+
+    /// #1056: a gem the user declared inside a `source "…" do` block is
+    /// locked with a `!` source pin in `DEPENDENCIES` (bundler writes it
+    /// for any dependency with an explicit source, rubygems.org included).
+    /// The unwind puts the declaration back inside that block, so the `!`
+    /// must stay or every frozen install refuses the restored pair.
+    #[tokio::test]
+    async fn source_block_declaration_keeps_its_bang_through_restore() {
+        let client = super::super::UpstreamClient::new(true);
+        let upstream_sha = "2".repeat(64);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let ctx = ctx_with(&client);
+        for manifest in [
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource \"https://rubygems.org\" do\n  \
+             gem \"rails\", \"7.0.0\"\nend\n",
+            // Nested in a group inside the source block, parenthesized opener.
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource(\"https://rubygems.org\") do\n  \
+             group :web do\n    gem \"rails\", \"7.0.0\"\n  end\nend\n",
+        ] {
+            let lock = format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    \
+                 rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n  \
+                 rails (= 7.0.0)!\n\nCHECKSUMS\n  puma (6.0.0) sha256={}\n  rails (7.0.0) \
+                 sha256={upstream_sha}\n\nBUNDLED WITH\n   4.0.22\n",
+                "a".repeat(64)
+            );
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), manifest.to_string()),
+                ("Gemfile.lock".to_string(), lock.clone()),
+            ]);
+            let r = crate::patch::redirect::rewrite_registry_redirect(
+                &files,
+                &[crate::patch::redirect::DepOverride {
+                    ecosystem: "gem".into(),
+                    name: "rails".into(),
+                    namespace: None,
+                    version: "7.0.0".into(),
+                    token: "tok".into(),
+                    patch_uuid: UUID.into(),
+                    artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                    registry_override: Some(crate::patch::redirect::RegistryOverride {
+                        kind: "rubygems-compact-index".into(),
+                        index_url: IDX.into(),
+                        identifiers: crate::patch::redirect::RegistryOverrideIdentifiers {
+                            name: "rails".into(),
+                            version: "7.0.0".into(),
+                            gem_checksum_sha256: Some("f".repeat(64)),
+                            ..Default::default()
+                        },
+                    }),
+                    integrity: Default::default(),
+                }],
+            );
+            let (hosted_manifest, hosted_lock) = (&r.files["Gemfile"], &r.files["Gemfile.lock"]);
+            assert!(hosted_lock.contains(IDX), "{hosted_lock}");
+            let (next_lock, next_manifest) = restore_one(
+                &gem(),
+                Some(hosted_lock),
+                Some(hosted_manifest),
+                "Gemfile",
+                &global_sources(hosted_manifest),
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .expect("the redirect is found");
+            assert_eq!(next_manifest.as_deref(), Some(manifest));
+            assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
+        }
+    }
+
+    #[test]
+    fn source_block_detection() {
+        let at = |text: &str| in_source_block(text, text.find("gem \"rails\"").unwrap());
+        assert!(!at("source \"https://rubygems.org\"\ngem \"rails\"\n"));
+        assert!(!at("group :test do\n  gem \"rails\"\nend\n"));
+        assert!(at(
+            "source \"https://x\" do # comment\n  gem \"rails\"\nend\n"
+        ));
+        // A closed source block before the declaration does not count.
+        assert!(!at(
+            "source \"https://x\" do\n  gem \"a\"\nend\ngroup :t do |g|\n  gem \"rails\"\nend\n"
+        ));
+        // A one-line block opens and closes on its line.
+        assert!(!at(
+            "source \"https://x\" do gem \"a\" end\ngem \"rails\"\n"
+        ));
+        // The `end` of an `if`/`case`/`def` inside the source block does
+        // not close it.
+        assert!(at(
+            "source \"https://x\" do\n  if ENV[\"A\"]\n    gem \"a\"\n  end\n  gem \"rails\"\nend\n"
+        ));
+        assert!(at(
+            "source \"https://x\" do\n  case RUBY_ENGINE\n  when \"jruby\" then gem \"a\"\n  end\n  def x; end\n  gem \"rails\"\nend\n"
+        ));
+        // A modifier `if` opens nothing.
+        assert!(!at(
+            "source \"https://x\" do\n  gem \"a\" if true\nend\ngem \"rails\"\n"
+        ));
+        assert!(!at("if true\n  gem \"a\"\nend\ngem \"rails\"\n"));
+        // A `#` inside a string (`#{}` interpolation) is no comment: the
+        // trailing `do` still opens the source block.
+        assert!(at(
+            "source \"https://#{ENV[\"HOST\"]}/gems\" do\n  gem \"rails\"\nend\n"
+        ));
+        assert!(at(
+            "source 'https://x/#frag' do # comment\n  gem \"rails\"\nend\n"
+        ));
+    }
+
+    /// A hosted Gemfile + lock pair for `rails 7.0.0` (a direct gem), from
+    /// the real forward rewrite: `checksums` picks a converged
+    /// (bundler 2.6+) or a pre-CHECKSUMS (2.5) lock.
+    fn hosted_pair(checksums: bool, upstream_sha: &str) -> BTreeMap<String, String> {
+        let manifest = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nPLATFORMS\n  \
+             ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nCHECKSUMS\n  rails (7.0.0) \
+             sha256={upstream_sha}\n\nBUNDLED WITH\n   2.6.9\n"
+        );
+        let files = BTreeMap::from([
+            ("Gemfile".to_string(), manifest.to_string()),
+            ("Gemfile.lock".to_string(), lock),
+        ]);
+        let r = crate::patch::redirect::rewrite_registry_redirect(
+            &files,
+            &[crate::patch::redirect::DepOverride {
+                ecosystem: "gem".into(),
+                name: "rails".into(),
+                namespace: None,
+                version: "7.0.0".into(),
+                token: "tok".into(),
+                patch_uuid: UUID.into(),
+                artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                registry_override: Some(crate::patch::redirect::RegistryOverride {
+                    kind: "rubygems-compact-index".into(),
+                    index_url: IDX.into(),
+                    identifiers: crate::patch::redirect::RegistryOverrideIdentifiers {
+                        name: "rails".into(),
+                        version: "7.0.0".into(),
+                        gem_checksum_sha256: Some("f".repeat(64)),
+                        ..Default::default()
+                    },
+                }),
+                integrity: Default::default(),
+            }],
+        );
+        let mut out = r.files;
+        let lock = out.get_mut("Gemfile.lock").expect("the lock is redirected");
+        assert!(lock.contains(IDX), "{lock}");
+        if !checksums {
+            // Bundler 2.5 converges the same hosted lock with no CHECKSUMS.
+            let start = lock.find("CHECKSUMS\n").expect("a converged lock");
+            let end = start + lock[start..].find("\n\n").expect("a section end") + 2;
+            lock.replace_range(start..end, "");
+            assert!(!lock.contains("sha256="), "{lock}");
+        }
+        out
+    }
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// Restore the hosted pair from `hosted_pair` in a temp project whose
+    /// `cache_rel` dir holds `rails-7.0.0.gem` (unless `archive` is None),
+    /// returning the restore's warnings.
+    async fn restore_with_cache(
+        checksums: bool,
+        client: &super::super::UpstreamClient,
+        upstream_sha: &str,
+        bundle_config: Option<&str>,
+        cache_rel: &str,
+        archive: Option<&[u8]>,
+    ) -> (tempfile::TempDir, Vec<(&'static str, String)>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (rel, text) in hosted_pair(checksums, upstream_sha) {
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        if let Some(config) = bundle_config {
+            std::fs::create_dir_all(root.join(".bundle")).unwrap();
+            std::fs::write(root.join(".bundle/config"), config).unwrap();
+        }
+        if let Some(bytes) = archive {
+            std::fs::create_dir_all(root.join(cache_rel)).unwrap();
+            std::fs::write(root.join(cache_rel).join("rails-7.0.0.gem"), bytes).unwrap();
+        }
+        let pin = HostedPin {
+            purl: "pkg:gem/rails@7.0.0".into(),
+            uuid: UUID.into(),
+            files: vec!["Gemfile".into(), "Gemfile.lock".into()],
+        };
+        let ctx = ctx_with(client);
+        let mut view = View::new(root);
+        let r = restore(&mut view, &[&pin], &pin.files, &ctx).await;
+        assert!(r.refused.is_empty(), "{:?}", r.refused);
+        assert!(r.handled.contains(UUID));
+        (tmp, r.warnings)
+    }
+
+    fn stale_cache<'w>(warnings: &'w [(&'static str, String)]) -> Vec<&'w str> {
+        warnings
+            .iter()
+            .filter(|(code, _)| *code == STALE_CACHE)
+            .map(|(_, d)| d.as_str())
+            .collect()
+    }
+
+    /// #1260: `bundle cache` while the hosted pin was live left the
+    /// PATCHED archive in vendor/cache. The restored CHECKSUMS pins the
+    /// upstream sha, so every later install fails (exit 37) until that
+    /// file goes: the unwind must name it.
+    #[tokio::test]
+    async fn restore_warns_about_a_patched_archive_in_vendor_cache() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let (tmp, warnings) = restore_with_cache(
+            true,
+            &client,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"patched gem"),
+        )
+        .await;
+        let hits = stale_cache(&warnings);
+        assert_eq!(hits.len(), 1, "{warnings:?}");
+        let path = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join("rails-7.0.0.gem");
+        assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
+        assert!(hits[0].contains("pkg:gem/rails@7.0.0"), "{}", hits[0]);
+        assert!(hits[0].contains("non-upstream"), "{}", hits[0]);
+    }
+
+    /// #1260: an upstream archive in the cache (cached before the hosted
+    /// scan, or re-cached after) is healthy: no warning.
+    #[tokio::test]
+    async fn restore_keeps_quiet_about_an_upstream_archive_in_vendor_cache() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let (_tmp, warnings) = restore_with_cache(
+            true,
+            &client,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"upstream gem"),
+        )
+        .await;
+        assert!(stale_cache(&warnings).is_empty(), "{warnings:?}");
+        // No archive at all: nothing to say either.
+        let (_tmp, warnings) =
+            restore_with_cache(true, &client, &upstream_sha, None, "vendor/cache", None).await;
+        assert!(stale_cache(&warnings).is_empty(), "{warnings:?}");
+    }
+
+    /// #1260, `cache_path gems/cache`: the dir bundler reads is the
+    /// configured one, so that's the archive the warning names.
+    #[tokio::test]
+    async fn restore_follows_the_configured_bundle_cache_path() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let (tmp, warnings) = restore_with_cache(
+            true,
+            &client,
+            &upstream_sha,
+            Some("---\nBUNDLE_CACHE_PATH: \"gems/cache\"\n"),
+            "gems/cache",
+            Some(b"patched gem"),
+        )
+        .await;
+        let hits = stale_cache(&warnings);
+        assert_eq!(hits.len(), 1, "{warnings:?}");
+        let path = tmp
+            .path()
+            .join("gems")
+            .join("cache")
+            .join("rails-7.0.0.gem");
+        assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
+    }
+
+    /// #1260 on bundler 2.5 (no CHECKSUMS): a frozen install takes the
+    /// cached patched archive without complaint, so the rollback silently
+    /// doesn't take effect. The upstream sha comes from rubygems.org; when
+    /// it can't be fetched (`--offline`) the warning still names the file.
+    #[tokio::test]
+    async fn restore_warns_about_a_cached_archive_without_checksums() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let (_tmp, warnings) = restore_with_cache(
+            false,
+            &client,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"patched gem"),
+        )
+        .await;
+        let hits = stale_cache(&warnings);
+        assert_eq!(hits.len(), 1, "{warnings:?}");
+        assert!(hits[0].contains("non-upstream"), "{}", hits[0]);
+
+        let (_tmp, warnings) = restore_with_cache(
+            false,
+            &client,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"upstream gem"),
+        )
+        .await;
+        assert!(stale_cache(&warnings).is_empty(), "{warnings:?}");
+
+        let offline = super::super::UpstreamClient::new(true);
+        let (tmp, warnings) = restore_with_cache(
+            false,
+            &offline,
+            &upstream_sha,
+            None,
+            "vendor/cache",
+            Some(b"patched gem"),
+        )
+        .await;
+        let hits = stale_cache(&warnings);
+        assert_eq!(hits.len(), 1, "{warnings:?}");
+        let path = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join("rails-7.0.0.gem");
+        assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
+        assert!(hits[0].contains("could not be checked"), "{}", hits[0]);
+    }
+
+    /// A gem restored in both a `Gemfile` and a `gems.rb` pair shares one
+    /// cache dir: one warning, not one per pair.
+    #[tokio::test]
+    async fn restore_warns_once_for_both_lock_spellings() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pair = hosted_pair(true, &upstream_sha);
+        std::fs::write(root.join("Gemfile"), &pair["Gemfile"]).unwrap();
+        std::fs::write(root.join("Gemfile.lock"), &pair["Gemfile.lock"]).unwrap();
+        std::fs::write(root.join("gems.rb"), &pair["Gemfile"]).unwrap();
+        std::fs::write(root.join("gems.locked"), &pair["Gemfile.lock"]).unwrap();
+        std::fs::create_dir_all(root.join("vendor/cache")).unwrap();
+        std::fs::write(root.join("vendor/cache/rails-7.0.0.gem"), b"patched gem").unwrap();
+        let pin = HostedPin {
+            purl: "pkg:gem/rails@7.0.0".into(),
+            uuid: UUID.into(),
+            files: vec![
+                "Gemfile".into(),
+                "Gemfile.lock".into(),
+                "gems.locked".into(),
+                "gems.rb".into(),
+            ],
+        };
+        let ctx = ctx_with(&client);
+        let mut view = View::new(root);
+        let r = restore(&mut view, &[&pin], &pin.files, &ctx).await;
+        assert!(r.refused.is_empty(), "{:?}", r.refused);
+        assert_eq!(stale_cache(&r.warnings).len(), 1, "{:?}", r.warnings);
     }
 
     #[test]

@@ -8,9 +8,8 @@ use crate::utils::purl::{
 };
 
 use super::common::{copy_matches_after_hashes, swap_stage_into_place};
-use super::service_fetch::{
-    fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal, VerifiedArchive,
-};
+use super::jvm::layout;
+use super::service_fetch::{fetch_verified_archive, ServicePolicy, VerifiedArchive};
 use super::state::VendorEntry;
 use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -23,28 +22,19 @@ fn detail(outcome: VendorOutcome) -> String {
     }
 }
 
-fn used<T>(attempt: ServiceAttempt<T>) -> Result<T, String> {
-    match attempt {
-        ServiceAttempt::Used(value) => Ok(value),
-        ServiceAttempt::HardFail(outcome) => Err(detail(*outcome)),
-    }
-}
-
 async fn download_archive(
     service: &VendorServiceConfig,
     record: &PatchRecord,
     noun: &str,
     subject: &str,
-    warnings: &mut Vec<VendorWarning>,
 ) -> Result<VerifiedArchive, String> {
-    ServicePolicy::new(service, ServiceTerminal::Refused)
+    ServicePolicy::Refused
         .settle(
             fetch_verified_archive(service, &record.uuid).await,
             noun,
             subject,
-            warnings,
         )
-        .or_else(used)
+        .map_err(|outcome| detail(*outcome))
 }
 
 // Without the ledger's fingerprint no download can be proven to be the
@@ -52,9 +42,12 @@ async fn download_archive(
 // verified download by re-running the vendoring command; a file artifact
 // with no SHA-256 needs a revert first (it reverts every vendored package),
 // so the next vendoring run downloads afresh and records a new fingerprint.
-const NO_ARCHIVE_SHA256: &str = "the ledger has no archive SHA-256; restore it from version \
-     control, or run `socket-patch vendor --revert` (it reverts every vendored package) and \
-     vendor again";
+fn no_archive_sha256() -> String {
+    format!(
+        "the ledger has no archive SHA-256; restore it from version control, or {}",
+        super::common::REVERT_ALL_AND_REVENDOR
+    )
+}
 const NO_FILE_INVENTORY: &str = "the ledger has no complete file inventory; restore it from \
      version control, or re-run the vendoring command (`socket-patch vendor`, or `scan --mode \
      vendored`) to rebuild it from a verified download";
@@ -67,9 +60,7 @@ pub async fn restore(
     service: &VendorServiceConfig,
 ) -> Result<Vec<VendorWarning>, String> {
     let ecosystem = super::ecosystem_dir_for_purl(&entry.base_purl);
-    if ecosystem != Some(entry.ecosystem.as_str())
-        && !(ecosystem == Some("maven") && entry.ecosystem == "jvm")
-    {
+    if ecosystem != Some(layout::ledger_ecosystem(&entry.ecosystem)) {
         return Err("ledger package identity does not match its artifact ecosystem".into());
     }
     // The download would land in (and repair would vouch for) a store this
@@ -85,7 +76,7 @@ pub async fn restore(
     }
     // A JVM tree belongs to its build root: repairing from a subproject
     // would restore it where the real build never looks (#428).
-    if entry.ecosystem == "jvm" {
+    if entry.ecosystem == layout::LEDGER_ECOSYSTEM {
         if let Some(detail) = super::maven_repo::not_build_root(root) {
             return Err(format!("vendor_jvm_shape_unsupported: {detail}"));
         }
@@ -93,7 +84,7 @@ pub async fn restore(
     let artifact = match super::verify::checked_artifact_path(root, entry, record) {
         Ok(path) => path,
         Err(reason)
-            if entry.ecosystem == "jvm"
+            if entry.ecosystem == layout::LEDGER_ECOSYSTEM
                 && matches!(
                     reason.as_str(),
                     "vendor_artifact_missing" | "vendor_artifact_unreadable"
@@ -113,7 +104,7 @@ pub async fn restore(
     let file_shaped = !super::verify::is_vlt_dir_entry(entry)
         && super::verify::artifact_is_file_shaped(&entry.artifact.path);
     if file_shaped && entry.artifact.sha256.is_empty() {
-        return Err(NO_ARCHIVE_SHA256.into());
+        return Err(no_archive_sha256());
     }
     if !file_shaped && entry.artifact.file_inventory.is_none() {
         return Err(NO_FILE_INVENTORY.into());
@@ -137,7 +128,6 @@ pub async fn restore(
             record,
             "archive",
             &format!("archive for {}", entry.base_purl),
-            &mut warnings,
         )
         .await?;
         if entry.artifact.sha256.is_empty()
@@ -173,7 +163,7 @@ pub async fn restore(
         crate::utils::fs::atomic_write_artifact(&stage, &archive.bytes)
             .await
             .map_err(|e| e.to_string())?;
-        if entry.ecosystem == "maven" || entry.ecosystem == "jvm" {
+        if layout::ledger_ecosystem(&entry.ecosystem) == "maven" {
             jvm_trees = restore_maven_metadata(
                 root,
                 temporary.path(),
@@ -189,34 +179,32 @@ pub async fn restore(
             "cargo" => {
                 let (name, version) =
                     parse_cargo_purl(&entry.base_purl).ok_or("invalid cargo coordinates")?;
-                used(
-                    super::cargo::cargo_service_copy(
-                        Some(service),
-                        record,
-                        &name,
-                        &version,
-                        &stage,
-                        uuid_dir,
-                        &mut warnings,
-                    )
-                    .await,
-                )?;
+                super::cargo::cargo_service_copy(
+                    Some(service),
+                    record,
+                    &name,
+                    &version,
+                    &stage,
+                    uuid_dir,
+                    &mut warnings,
+                )
+                .await
+                .map_err(|outcome| detail(*outcome))?;
             }
             "composer" => {
                 let ((namespace, name), _) =
                     parse_composer_purl(&entry.base_purl).ok_or("invalid composer coordinates")?;
                 let package = format!("{namespace}/{name}");
-                used(
-                    super::composer_lock::composer_service_copy(
-                        Some(service),
-                        record,
-                        &package,
-                        &stage,
-                        uuid_dir,
-                        &mut warnings,
-                    )
-                    .await,
-                )?;
+                super::composer_lock::composer_service_copy(
+                    Some(service),
+                    record,
+                    &package,
+                    &stage,
+                    uuid_dir,
+                    &mut warnings,
+                )
+                .await
+                .map_err(|outcome| detail(*outcome))?;
                 super::composer_lock::mirror_filters::neutralize_or_conflict(
                     &stage,
                     record,
@@ -228,7 +216,7 @@ pub async fn restore(
             "gem" => {
                 let (name, _) =
                     parse_gem_purl(&entry.base_purl).ok_or("invalid gem coordinates")?;
-                match super::gem::gem_service_copy(
+                super::gem::gem_service_copy(
                     Some(service),
                     record,
                     &name,
@@ -238,26 +226,22 @@ pub async fn restore(
                     &mut warnings,
                 )
                 .await
-                {
-                    super::gem::GemServiceCopy::Used => {}
-                    super::gem::GemServiceCopy::HardFail(outcome) => return Err(detail(*outcome)),
-                }
+                .map_err(|outcome| detail(*outcome))?;
             }
             "npm" => {
                 let (name, version) = super::npm_common::parse_npm_purl(&entry.base_purl)
                     .ok_or("invalid npm coordinates")?;
-                used(
-                    super::npm_dir::try_service_dir(
-                        &entry.base_purl,
-                        record,
-                        service,
-                        &stage,
-                        &name,
-                        &version,
-                        &mut warnings,
-                    )
-                    .await,
-                )?;
+                super::npm_dir::try_service_dir(
+                    &entry.base_purl,
+                    record,
+                    service,
+                    &stage,
+                    &name,
+                    &version,
+                    &mut warnings,
+                )
+                .await
+                .map_err(|outcome| detail(*outcome))?;
                 super::npm_dir::apply_transforms(&stage, &name, &version)
                     .await
                     .map_err(|outcome| detail(*outcome))?;
@@ -270,7 +254,6 @@ pub async fn restore(
                     record,
                     "module zip",
                     &format!("module zip for {module}"),
-                    &mut warnings,
                 )
                 .await?;
                 let prefix = format!("{module}@{version}/");
@@ -309,7 +292,7 @@ pub async fn restore(
             super::verify::verify_dir_inventory(&stage, inventory, uuid).await?;
         }
     }
-    if entry.ecosystem == "maven" || entry.ecosystem == "jvm" {
+    if layout::ledger_ecosystem(&entry.ecosystem) == "maven" {
         let target = artifact.parent().ok_or("artifact has no parent")?;
         tokio::fs::create_dir_all(target.parent().ok_or("artifact tree has no parent")?)
             .await
@@ -335,7 +318,7 @@ pub async fn restore(
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        if entry.ecosystem == "jvm" {
+        if entry.ecosystem == layout::LEDGER_ECOSYSTEM {
             restore_jvm_owned_files(root, entry).await?;
         }
     } else {
@@ -436,7 +419,7 @@ async fn restore_maven_metadata(
     // The classifier artifacts the tree recorded (#533), downloaded again
     // and checked against their upstream checksums.
     let mut extras = Vec::new();
-    let gradle_tree = format!("{}/", super::jvm::gradle::TREE_ROOT);
+    let gradle_tree = format!("{}/", super::jvm::layout::GRADLE_TREE);
     for w in entry
         .wiring
         .iter()
@@ -542,7 +525,8 @@ async fn restore_maven_metadata(
 
 /// The owned files a Gradle tree needs beside its directory: the derived
 /// `maven-metadata.xml` (recomputed from the committed index) and the
-/// `.gitattributes` the entry created, rewritten when missing. Needs no
+/// `.gitattributes` / tree-root `.gitignore` the entry created, rewritten
+/// when missing. Needs no
 /// download, so `repair` also runs it for a healthy entry.
 pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result<(), String> {
     use super::jvm::gradle;
@@ -573,6 +557,17 @@ pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result
             wanted.push((rel.to_string(), "* -text\n".to_string()));
         }
     }
+    for rel in [
+        gradle::GITIGNORE_REL,
+        super::jvm::maven_reactor::GITIGNORE_REL,
+    ] {
+        if created(rel) {
+            wanted.push((
+                rel.to_string(),
+                super::jvm::coursier_tree::GITIGNORE.to_string(),
+            ));
+        }
+    }
     if created(gradle::VENDOR_GITATTRIBUTES_REL) {
         wanted.push((
             gradle::VENDOR_GITATTRIBUTES_REL.to_string(),
@@ -583,7 +578,7 @@ pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result
         let current = read(&rel);
         if current
             .as_deref()
-            .is_some_and(|c| crate::gradle::eol::eol_eq(c, text.as_bytes()))
+            .is_some_and(|c| crate::utils::line_endings::eol_eq(c, text.as_bytes()))
         {
             continue;
         }
@@ -639,28 +634,23 @@ mod tests {
 
     fn entry(bytes: &[u8]) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: "pkg:npm/example@1.0.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                path: format!(".socket/vendor/npm/{UUID}/example-1.0.0.tgz"),
-                sha256: hex::encode(Sha256::digest(bytes)),
-                size: Some(bytes.len() as u64),
-                platform_locked: None,
-                file_inventory: None,
-                yarn_berry10c0: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             detached: true,
             record: Some(record()),
             flavor: Some("npm".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                "pkg:npm/example@1.0.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    path: format!(".socket/vendor/npm/{UUID}/example-1.0.0.tgz"),
+                    sha256: hex::encode(Sha256::digest(bytes)),
+                    size: Some(bytes.len() as u64),
+                    platform_locked: None,
+                    file_inventory: None,
+                    yarn_berry10c0: None,
+                },
+                Vec::new(),
+            )
         }
     }
 
@@ -752,7 +742,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("no archive SHA-256"), "{error}");
         assert!(
-            error.contains("`socket-patch vendor --revert` (it reverts every vendored package) and vendor again"),
+            error.contains(super::super::common::REVERT_ALL_AND_REVENDOR),
             "the refusal names the remedy that records a new fingerprint: {error}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());

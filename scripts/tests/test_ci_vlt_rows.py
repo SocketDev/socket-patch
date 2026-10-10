@@ -4,6 +4,7 @@ vlt-compatibility.yml. Parses the workflows with a small reader of the YAML
 subset they use (no PyYAML on the runners)."""
 
 import importlib.util
+import json
 import re
 import unittest
 from pathlib import Path
@@ -102,6 +103,11 @@ def jobs(text):
 def matrix_include(job_lines):
     """The `strategy.matrix.include` rows of a job (flow or block style)."""
     lines = [strip_comment(l) for l in job_lines]
+    scoped = next((l for l in job_lines if l.strip().startswith("include: ${{ fromJSON(")), None)
+    if scoped is not None:
+        # CI_SCOPE-switched rows: the first JSON literal is the full table.
+        literal = re.search(r"&& '(\[.*?\])'", scoped).group(1)
+        return [{k: str(v) for k, v in row.items()} for row in json.loads(literal)]
     at = next(i for i, l in enumerate(lines) if l.strip() == "include:")
     base = indent(lines[at])
     rows, current, item_indent = [], None, None
@@ -126,12 +132,16 @@ def matrix_include(job_lines):
     return rows
 
 
-def job_rows(jobs_by_id, job):
-    """`matrix_include` of a job plus its `<job>-macos` sibling, which holds
-    the macOS rows that run off the pull_request path."""
+def job_rows(jobs_by_id, job, extended=True):
+    """All rows of a job family, including its independent OS siblings.
+
+    `extended=False` leaves out the `-extended` sibling, whose rows run only
+    with CI_SCOPE=full or nightly, not on every pull request."""
     rows = matrix_include(jobs_by_id[job])
-    if f"{job}-macos" in jobs_by_id:
-        rows += matrix_include(jobs_by_id[f"{job}-macos"])
+    for os_name in ("windows", "macos") + (("extended",) if extended else ()):
+        sibling = f"{job}-{os_name}"
+        if sibling in jobs_by_id:
+            rows += matrix_include(jobs_by_id[sibling])
     return rows
 
 
@@ -302,9 +312,13 @@ class CompatibilityWorkflow(unittest.TestCase):
         self.assertIn("schedule:", text)
         self.assertIn("workflow_dispatch:", text)
         for path in ("'scripts/backtest-vlt.py'", "'scripts/check-vlt-legs.py'",
-                     "'crates/socket-patch-core/src/vendor/**'", "'Cargo.lock'",
-                     "'rust-toolchain.toml'", "'.github/workflows/vlt-compatibility.yml'"):
+                     "'.github/workflows/vlt-compatibility.yml'"):
             self.assertEqual(text.count(path), 2, f"{path} in both pull_request and push filters")
+        # Shared engine code runs the matrix on push to main (and nightly),
+        # not on every PR (#1198).
+        for path in ("'crates/socket-patch-core/src/vendor/**'", "'Cargo.lock'",
+                     "'rust-toolchain.toml'"):
+            self.assertEqual(text.count(path), 1, f"{path} only in the push filter")
         self.assertIn("continue-on-error: true", "\n".join(self.compat["downgrade"]))
         self.assertIn("--canary-checks", "\n".join(self.compat["canary"]))
         self.assertIn("--diff-locks", "\n".join(self.compat["lock-diff"]))

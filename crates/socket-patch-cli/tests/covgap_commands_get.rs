@@ -97,7 +97,6 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
             global: false,
             global_prefix: None,
             json: true,
-            download_mode: "diff".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         identifier: identifier.to_string(),
@@ -294,7 +293,6 @@ fn engine_params(root: &Path) -> DownloadParams {
         global_prefix: None,
         json: true,
         silent: true,
-        download_mode: "diff".to_string(),
         strict: false,
         ecosystems: None,
         persist_blobs: true,
@@ -525,7 +523,7 @@ async fn get_uuid_view_without_after_hashes_fails_no_applicable_files() {
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "error", "stdout={stdout}");
     assert!(
-        v["error"]
+        v["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("no applicable files"),
@@ -557,7 +555,10 @@ async fn get_uuid_traversal_after_hash_fails_blob_write_both_modes() {
         assert_eq!(code, 1, "blob failure must exit 1; stdout={stdout}");
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "error", "stdout={stdout}");
-        assert_eq!(v["error"], "Blob decode or write failed", "stdout={stdout}");
+        assert_eq!(
+            v["error"]["message"], "Blob decode or write failed",
+            "stdout={stdout}"
+        );
         assert_eq!(v["patches"][0]["action"], "failed", "stdout={stdout}");
         assert_no_manifest(tmp.path());
         assert!(
@@ -764,10 +765,10 @@ async fn human_global_package_search_empty_prefix_prints_no_global_packages() {
     );
 }
 
-/// Installed packages that fuzzy-match NOTHING: the `no_match` terminal —
+/// Installed packages that match NOTHING (exactly or nearly): the `no_match` terminal —
 /// json envelope + human message — exits 0 with zero API calls.
 #[tokio::test]
-async fn package_search_without_fuzzy_match_is_no_match_in_both_modes() {
+async fn package_search_without_a_match_is_no_match_in_both_modes() {
     // json flavor.
     {
         let server = MockServer::start().await;
@@ -813,7 +814,7 @@ async fn package_search_without_fuzzy_match_is_no_match_in_both_modes() {
     }
 }
 
-/// The package path's search-API error arm: a fuzzy-matched package whose
+/// The package path's search-API error arm: a matched package whose
 /// by-package search 500s must exit 1 via `report_fetch_failure`, after
 /// printing the "checking for available patches" progress line.
 #[tokio::test]
@@ -839,8 +840,8 @@ async fn human_package_search_api_error_reports_fetch_failure() {
         "a 500 from the package search must exit 1; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
-        stderr.contains(&format!("Best match: pkg:npm/{NAME}@1.0.0\n")),
-        "the best-match line must print first; stderr={stderr}"
+        stderr.contains(&format!("Matched: pkg:npm/{NAME}@1.0.0\n")),
+        "the matched-packages line must print first; stderr={stderr}"
     );
     assert!(
         stderr.contains("Error:"),
@@ -976,9 +977,9 @@ async fn engine_socket_path_occupied_fails_before_any_fetch() {
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "error", "json={json}");
-    assert_eq!(json["errorCode"], "lock_io", "json={json}");
+    assert_eq!(json["error"]["code"], "lock_io", "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains(".socket"),
@@ -1029,9 +1030,9 @@ async fn engine_readonly_socket_fails_closed_before_any_fetch() {
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "error", "json={json}");
-    assert_eq!(json["errorCode"], "lock_io", "json={json}");
+    assert_eq!(json["error"]["code"], "lock_io", "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains(".socket"),
@@ -1076,7 +1077,7 @@ async fn engine_readonly_socket_fails_manifest_write() {
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "error", "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("Failed to write manifest"),
@@ -1124,7 +1125,7 @@ async fn engine_manifest_write_failure_unwinds_the_blobs_it_wrote() {
 
     assert_eq!(code, 1, "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("Failed to write manifest"),
@@ -2089,7 +2090,7 @@ async fn engine_human_readonly_socket_manifest_write_failure_still_errors() {
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "error", "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("Failed to write manifest"),
@@ -2426,9 +2427,9 @@ async fn mount_granted_reference(server: &MockServer, uuid: &str, purl: &str, ur
 /// Hosted twin of `vendored_lock_held_vendor_step_errors_without_vendor_envelope`
 /// (and of `covgap_commands_scan_hosted::hosted_lock_held_refuses_before_any_write`):
 /// `get <uuid> --mode hosted` folds its result into the HOSTED error
-/// envelope, so a held apply lock surfaces as the top-level `errorCode`
-/// with a string `error` — NOT the vendored `error: {code, message}`
-/// object — exit 1, `redirect.mode` retained, nothing written; the human
+/// envelope, so a held apply lock surfaces as the top-level
+/// `error: {code: "lock_held", message}` object (v5.0: no top-level
+/// `errorCode`) — exit 1, `redirect.mode` retained, nothing written; the human
 /// arm prints the shared `Error: Another socket-patch process …` line plus
 /// the `--lock-timeout` hint. A
 /// `--dry-run` never contends: it previews the redirect under the held
@@ -2459,14 +2460,14 @@ async fn hosted_lock_held_get_errors_with_top_level_error_code() {
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "error", "stdout={stdout}");
-    assert_eq!(v["errorCode"], "lock_held", "stdout={stdout}");
+    assert_eq!(v["error"]["code"], "lock_held", "stdout={stdout}");
     assert_eq!(
-        v["error"], HELD,
-        "the hosted envelope carries a string `error`, not the vendored object; stdout={stdout}"
+        v["error"]["message"], HELD,
+        "the hosted envelope carries the `{{code, message}}` error object; stdout={stdout}"
     );
     assert!(
-        v["error"].get("code").is_none(),
-        "no nested `error.code` on the hosted shape; stdout={stdout}"
+        v.get("errorCode").is_none(),
+        "no top-level `errorCode` (v5.0); stdout={stdout}"
     );
     assert_eq!(
         v["redirect"]["mode"], "hosted",
@@ -2833,14 +2834,17 @@ async fn forced_identifier_type_is_validated_locally() {
         let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag]);
         assert_eq!(code, 2, "{flag}: stdout={stdout}\nstderr={stderr}");
         assert!(
-            stderr.contains(&format!("Error: \"lodash\" {what} (expected ")),
+            stderr.contains(&format!("Error: The identifier {what} (expected ")),
             "{flag}: stderr={stderr}"
         );
         let (code, stdout, _) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag, "--json"]);
         assert_eq!(code, 2);
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "error", "{v}");
-        assert!(v["error"].as_str().unwrap().contains(what), "{v}");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains(what),
+            "{v}"
+        );
     }
     assert!(
         received_paths(&server).await.is_empty(),
@@ -3271,4 +3275,96 @@ async fn get_uuid_json_nested_apply_failure_names_the_patch() {
         rec["error"].as_str().is_some_and(|e| !e.is_empty()),
         "json={json}"
     );
+}
+
+// ===========================================================================
+// Nested apply mismatch-overwrite warnings in the JSON envelope (#1004)
+// ===========================================================================
+
+/// Locally edited bytes: neither the patch's beforeHash nor its afterHash.
+const LOCAL_EDIT_BYTES: &[u8] = b"vulnerable\n// local edit\n";
+
+/// Whether `json["warnings"]` carries a `content_mismatch_overwritten`
+/// entry naming `purl` and the overwritten file.
+fn has_mismatch_warning(json: &serde_json::Value, purl: &str) -> bool {
+    json["warnings"].as_array().is_some_and(|ws| {
+        ws.iter().filter_map(|w| w.as_str()).any(|w| {
+            w.starts_with("(content_mismatch_overwritten) ")
+                && w.contains(purl)
+                && w.contains("package/index.js")
+        })
+    })
+}
+
+/// The agent engine (`scan --mode agent --json`'s path) over an installed
+/// file a local edit changed: the default policy overwrites it, and the
+/// envelope must say so — the warning `apply --json` reports as a
+/// `content_mismatch_overwritten` event — while the patch still counts as
+/// applied.
+#[tokio::test]
+#[serial]
+async fn engine_nested_apply_mismatch_overwrite_reaches_the_json_envelope() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let installed = tmp.path().join("node_modules").join(NAME).join("index.js");
+    std::fs::write(&installed, LOCAL_EDIT_BYTES).unwrap();
+    let mut params = engine_params(tmp.path());
+    params.save_only = false;
+    let selected = vec![search_result(UUID, PURL)];
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+
+    assert_eq!(code, 0, "json={json}");
+    assert_eq!(json["status"], "success", "json={json}");
+    assert_eq!(json["applied"], 1, "json={json}");
+    assert_eq!(json["patches"][0]["action"], "added", "json={json}");
+    assert!(
+        has_mismatch_warning(&json, PURL),
+        "the overwrite must be reported: {json}"
+    );
+    assert_eq!(std::fs::read(&installed).unwrap(), AFTER_BYTES);
+}
+
+/// A clean apply carries no mismatch warning.
+#[tokio::test]
+#[serial]
+async fn engine_nested_apply_clean_has_no_mismatch_warning() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let mut params = engine_params(tmp.path());
+    params.save_only = false;
+    let selected = vec![search_result(UUID, PURL)];
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+    assert_eq!(code, 0, "json={json}");
+    assert!(json.get("warnings").is_none(), "json={json}");
+}
+
+/// `get <uuid> --json` over a locally edited installed file: one JSON
+/// document whose `warnings[]` names the overwrite, and nothing on stderr
+/// (the envelope is the JSON caller's channel).
+#[tokio::test]
+async fn get_uuid_json_mismatch_overwrite_is_reported() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let installed = tmp.path().join("node_modules").join(NAME).join("index.js");
+    std::fs::write(&installed, LOCAL_EDIT_BYTES).unwrap();
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let json = parse_single_json_doc(&stdout);
+    assert_eq!(json["status"], "success", "json={json}");
+    assert_eq!(json["applied"], 1, "json={json}");
+    assert!(
+        has_mismatch_warning(&json, PURL),
+        "the overwrite must be reported: {json}"
+    );
+    assert!(!stderr.contains("did not match"), "stderr={stderr}");
+    assert_eq!(std::fs::read(&installed).unwrap(), AFTER_BYTES);
 }

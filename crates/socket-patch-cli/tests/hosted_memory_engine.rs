@@ -591,6 +591,52 @@ async fn vendored_takeover_is_refused() {
     assert!(output.changed_files.is_empty());
 }
 
+/// The in-memory engine refuses exactly the takeovers the disk flow
+/// performs (one shared predicate): a vendored PyPI package is one, so it
+/// is refused as a takeover rather than handed to the Python rewriters,
+/// which would refuse socket-patch's own vendored source as user-authored.
+#[tokio::test]
+async fn vendored_pypi_takeover_is_refused_like_the_disk_flow() {
+    const PYPI_FIXTURE: &str = "redirect/pypi/requirements/basic";
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(
+        &fixtures_root().join(PYPI_FIXTURE).join("overrides.json"),
+        None,
+    );
+    mount_api(&server, &patches).await;
+    let mut files = fixture_files(&fixtures_root().join(PYPI_FIXTURE).join("input"));
+    let uuid = "33333333-3333-3333-3333-333333333333";
+    files.insert(
+        ".socket/vendor/state.json".into(),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "entries": {
+                "pkg:pypi/requests@2.28.1": {
+                    "ecosystem": "pypi",
+                    "basePurl": "pkg:pypi/requests@2.28.1",
+                    "uuid": uuid,
+                    "flavor": "requirements",
+                    "artifact": {"path": format!(".socket/vendor/pypi/{uuid}/requests-2.28.1-py3-none-any.whl")},
+                    "wiring": []
+                }
+            }
+        }))
+        .unwrap(),
+    );
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(
+        project
+            .skipped
+            .iter()
+            .any(|s| s.reason == "vendored_takeover_unsupported_in_memory"),
+        "{:?}",
+        project.skipped
+    );
+    assert!(project.redirected.is_empty());
+    assert!(output.changed_files.is_empty());
+}
+
 /// A pre-v5 redirect ledger (`.socket/vendor/redirect-state.json`) is
 /// never read by the v5 engine: a torn one neither fails its project nor
 /// changes its plan, and the engine never emits (or rewrites) the file.
@@ -991,6 +1037,150 @@ async fn a_vlt_project_is_withheld_as_offline() {
     assert!(output.changed_files.is_empty());
 }
 
+const GEM_BASIC_FIXTURE: &str = "redirect/gem/bundler/basic";
+
+/// The gem fixture's API mocks and input files.
+async fn gem_server_and_input() -> (MockServer, BTreeMap<String, Vec<u8>>) {
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(
+        &fixtures_root()
+            .join(GEM_BASIC_FIXTURE)
+            .join("overrides.json"),
+        None,
+    );
+    mount_api(&server, &patches).await;
+    let input = fixture_files(&fixtures_root().join(GEM_BASIC_FIXTURE).join("input"));
+    (server, input)
+}
+
+fn warning_codes(redirect: &Value) -> Vec<String> {
+    redirect["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn changed_paths(output: &HostedScanOutput) -> Vec<&str> {
+    output
+        .changed_files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect()
+}
+
+/// #749: bundler 4 reads the lock `bundle config set lockfile custom.lock`
+/// names, which the rewriter never pins. With a leftover `Gemfile.lock`
+/// beside it, the run used to rewrite that ignored lock, report success,
+/// and break every frozen install; the project is refused with nothing
+/// written instead. A memory tree only finds gem candidates through the
+/// lock bundler loads (#736), and that lock is none of the default ones
+/// here, so the project yields no gem candidate; the run reports
+/// `gem_lock_unsupported` instead (the per-candidate
+/// `redirect_gem_bundle_lockfile_unsupported` refusal is covered by the
+/// engine unit tests).
+#[tokio::test]
+async fn a_bundler4_custom_lockfile_is_refused() {
+    let (server, input) = gem_server_and_input().await;
+    let mut files = input.clone();
+    files.insert("custom.lock".to_string(), input["Gemfile.lock"].clone());
+    files.insert(
+        ".bundle/config".to_string(),
+        b"---\nBUNDLE_LOCKFILE: \"custom.lock\"\n".to_vec(),
+    );
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(project.error.is_none(), "{:?}", project.error);
+    assert!(project.redirected.is_empty(), "{:?}", project.redirected);
+    assert!(
+        changed_paths(&output).is_empty(),
+        "{:?}",
+        changed_paths(&output)
+    );
+    assert_gem_lock_unsupported(&output);
+}
+
+/// The run says the project's gems were not scanned, rather than finding
+/// none: the lock inventory's `gem_lock_unsupported` diagnosis.
+fn assert_gem_lock_unsupported(output: &HostedScanOutput) {
+    let codes: Vec<&str> = output.warnings.iter().map(|w| w.code.as_str()).collect();
+    assert!(codes.contains(&"gem_lock_unsupported"), "{codes:?}");
+}
+
+/// #749: a configured lockfile naming the pair's own default lock is the
+/// lock the rewriter pins anyway, so the project is wired as usual.
+#[tokio::test]
+async fn a_lockfile_setting_naming_the_default_lock_is_wired() {
+    let (server, input) = gem_server_and_input().await;
+    let mut files = input.clone();
+    files.insert(
+        ".bundle/config".to_string(),
+        b"---\nBUNDLE_LOCKFILE: \"Gemfile.lock\"\n".to_vec(),
+    );
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert_eq!(
+        project.redirected.len(),
+        1,
+        "{:?}",
+        warning_codes(&project.redirect)
+    );
+    assert_eq!(changed_paths(&output), vec!["Gemfile", "Gemfile.lock"]);
+}
+
+/// The fixture lock re-stamped `BUNDLED WITH <version>`.
+fn bundled_with(lock: &[u8], version: &str) -> Vec<u8> {
+    let text = String::from_utf8(lock.to_vec()).unwrap();
+    let (head, _) = text.split_once("BUNDLED WITH").unwrap();
+    format!("{head}BUNDLED WITH\n   {version}\n").into_bytes()
+}
+
+/// A `Gemfile` + `gems.rb` twin with each lock bundled by `versions`.
+fn gem_twin(
+    input: &BTreeMap<String, Vec<u8>>,
+    versions: (&str, &str),
+) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    files.insert("Gemfile".to_string(), input["Gemfile"].clone());
+    files.insert("gems.rb".to_string(), input["Gemfile"].clone());
+    files.insert(
+        "Gemfile.lock".to_string(),
+        bundled_with(&input["Gemfile.lock"], versions.0),
+    );
+    files.insert(
+        "gems.locked".to_string(),
+        bundled_with(&input["Gemfile.lock"], versions.1),
+    );
+    files
+}
+
+/// #751: bundler 1.x loads a twin's `Gemfile` and bundler >= 2 its
+/// `gems.rb`, and a lock's `BUNDLED WITH` records who wrote it, not who
+/// installs it, so no twin is wired whatever its locks say: refused,
+/// nothing written. No lock is the one bundler loads (#736), so the
+/// memory tree yields no gem candidate and the run reports
+/// `gem_lock_unsupported`; the per-candidate
+/// `redirect_gem_twin_manifest_ambiguous` refusal is covered by the engine
+/// unit tests.
+#[tokio::test]
+async fn a_gemfile_gems_rb_twin_is_refused() {
+    let (server, input) = gem_server_and_input().await;
+    for versions in [
+        ("1.17.3", "1.17.3"),
+        ("2.6.2", "2.6.2"),
+        ("1.17.3", "2.6.2"),
+        ("2.6.2", "1.17.3"),
+    ] {
+        let files = gem_twin(&input, versions);
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.redirected.is_empty(), "{versions:?}");
+        assert!(changed_paths(&output).is_empty(), "{versions:?}");
+        assert_gem_lock_unsupported(&output);
+    }
+}
+
 /// #736: the engine's purl set comes from the lock bundler loads. A
 /// `gems.rb` project's gems live in `gems.locked`; reading only
 /// `Gemfile.lock` found nothing to redirect, and a leftover `Gemfile.lock`
@@ -1143,5 +1333,301 @@ async fn yarn_berry_pin_takes_bin_from_the_served_tarball() {
             );
             assert!(!changed.contains_key("yarn.lock"), "{changed:?}");
         }
+    }
+}
+
+/// #558 in the in-memory engine: a yarn classic pin whose grant carries
+/// only a sha512 takes its `#<sha1>` fragment from the served tarball
+/// (fetched through the provider and checked against that sha512); a
+/// tarball it cannot fetch drops the patch instead of pinning a
+/// fragmentless URL yarn 1 would serve stale cached bytes for.
+#[tokio::test]
+async fn issue_558_yarn_classic_pin_takes_sha1_from_the_served_tarball() {
+    use base64::Engine as _;
+    use sha1::Digest as _;
+
+    const UUID: &str = "55858558-5585-4558-8558-558558558558";
+    let tarball = {
+        let manifest = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/package.json", &manifest[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+    let sha512 = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&tarball))
+    );
+    let sha1 = hex::encode(sha1::Sha1::digest(&tarball));
+    let mut files = BTreeMap::new();
+    files.insert(
+        "package.json".to_string(),
+        b"{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"packageManager\": \"yarn@1.22.22\",\n  \"dependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n".to_vec(),
+    );
+    files.insert(
+        "yarn.lock".to_string(),
+        b"# yarn lockfile v1\n\n\nleft-pad@1.3.0:\n  version \"1.3.0\"\n  \
+          resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz\"\n  \
+          integrity sha512-UP==\n"
+            .to_vec(),
+    );
+
+    for served in [true, false] {
+        let server = MockServer::start().await;
+        let artifact = format!("/patch/npm/left-pad/1.3.0/tok/{UUID}/left-pad-1.3.0.tgz");
+        let url = format!("{}{artifact}", server.uri());
+        let patch = common::Patch {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            uuid: UUID.into(),
+            reference: serde_json::json!({
+                "status": "granted",
+                "url": url,
+                "purl": null,
+                "artifacts": [
+                    { "kind": "tarball", "url": url, "integrity": { "sha512": sha512 } }
+                ],
+                "registryOverride": null,
+            }),
+        };
+        mount_api(&server, &[patch]).await;
+        Mock::given(method("GET"))
+            .and(path(artifact))
+            .respond_with(if served {
+                ResponseTemplate::new(200).set_body_bytes(tarball.clone())
+            } else {
+                ResponseTemplate::new(404)
+            })
+            .mount(&server)
+            .await;
+
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        let changed = engine_changed(&output);
+        if served {
+            assert_eq!(project.redirected.len(), 1, "{:?}", project.skipped);
+            let lock = String::from_utf8(changed["yarn.lock"].clone()).unwrap();
+            assert!(
+                lock.contains(&format!(
+                    "  resolved \"{url}#{sha1}\"\n  integrity {sha512}\n"
+                )),
+                "{lock}"
+            );
+        } else {
+            assert!(project.redirected.is_empty(), "{:?}", project.redirected);
+            assert!(
+                project
+                    .skipped
+                    .iter()
+                    .any(|s| s.reason == "npm_tarball_unavailable"),
+                "{:?}",
+                project.skipped
+            );
+            assert!(!changed.contains_key("yarn.lock"), "{changed:?}");
+        }
+    }
+}
+
+/// #734 in memory: with no node_modules in the view, package.json's
+/// `packageManager` is the only pin. pnpm 9.15.9 gets its lock pinned and
+/// no root-only pnpm-workspace.yaml; pnpm 11 still gets the trust scaffold.
+#[tokio::test]
+async fn pnpm_9_pin_gets_no_root_only_workspace_in_memory() {
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    mount_api(
+        &server,
+        &patches_from_overrides(&dir.join("overrides.json"), None),
+    )
+    .await;
+    for (pin, scaffold) in [("9.15.9", false), ("11.0.0", true)] {
+        let mut files = fixture_files(&dir.join("input"));
+        files.insert(
+            "package.json".into(),
+            format!(r#"{{"name":"app","packageManager":"pnpm@{pin}"}}"#).into_bytes(),
+        );
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        let paths: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(paths.contains(&"pnpm-lock.yaml"), "{paths:?}");
+        assert_eq!(
+            paths.contains(&"pnpm-workspace.yaml"),
+            scaffold,
+            "{pin}: {paths:?}"
+        );
+        let warnings = project.redirect["warnings"].to_string();
+        assert_eq!(
+            warnings.contains("ERR_PNPM_ADDING_TO_ROOT"),
+            !scaffold,
+            "{warnings}"
+        );
+    }
+}
+
+/// #492 in memory: the lock of a `sharedWorkspaceLockfile: false` pnpm
+/// workspace member is demoted into the workspace root, which pins it and
+/// trusts it in its own pnpm-workspace.yaml (the only one pnpm reads),
+/// never in a nested scaffold. A project the root file does not list
+/// stays a standalone root. A member named alone as a project root is not
+/// pinned on its own; a warning names the workspace root to scan.
+#[tokio::test]
+async fn a_pnpm_workspace_member_lock_is_demoted_into_the_workspace_root_in_memory() {
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    mount_api(
+        &server,
+        &patches_from_overrides(&dir.join("overrides.json"), None),
+    )
+    .await;
+    let mut member = prefixed("packages/a", &fixture_files(&dir.join("input")));
+    member.insert("packages/a/package.json".into(), b"{}".to_vec());
+    for (globs, listed) in [("packages/*", true), ("tools/*", false)] {
+        let mut files = member.clone();
+        files.insert(
+            "pnpm-workspace.yaml".into(),
+            format!("packages:\n  - {globs}\nsharedWorkspaceLockfile: false\n").into_bytes(),
+        );
+        files.insert(
+            "pnpm-lock.yaml".into(),
+            b"lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n".to_vec(),
+        );
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let roots: Vec<&str> = output.projects.iter().map(|p| p.root.as_str()).collect();
+        let paths: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(
+            output.projects.iter().all(|p| p.error.is_none()),
+            "{:?}",
+            output.projects
+        );
+        assert!(paths.contains(&"packages/a/pnpm-lock.yaml"), "{paths:?}");
+        if listed {
+            assert_eq!(roots, [""]);
+            assert!(paths.contains(&"pnpm-workspace.yaml"), "{paths:?}");
+            assert!(
+                !paths.contains(&"packages/a/pnpm-workspace.yaml"),
+                "{paths:?}"
+            );
+        } else {
+            assert_eq!(roots, ["", "packages/a"]);
+            assert!(
+                paths.contains(&"packages/a/pnpm-workspace.yaml"),
+                "a standalone project gets its own file: {paths:?}"
+            );
+        }
+        // The trust auto-config off pins the lock without any scaffold.
+        let mut opts = options(false);
+        opts.trust_lockfile_config = Some(false);
+        let output = run_engine(&server, build_input(&files, &[], opts)).await;
+        let paths: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(paths, ["packages/a/pnpm-lock.yaml"]);
+
+        // The member named alone: its lock is the workspace root's.
+        let mut opts = options(false);
+        opts.project_roots = Some(vec!["packages/a".into()]);
+        let output = run_engine(&server, build_input(&files, &[], opts)).await;
+        let ignored = output
+            .warnings
+            .iter()
+            .any(|w| w.code == "pnpm_member_lock_ignored");
+        assert_eq!(ignored, listed, "{:?}", output.warnings);
+        assert_eq!(output.changed_files.is_empty(), listed);
+    }
+}
+
+/// Path selection fetches the nearest ancestor pnpm-workspace.yaml of a
+/// pnpm root that has none of its own, so the session can tell a member
+/// from a standalone project.
+#[test]
+fn selection_fetches_the_governing_pnpm_workspace_file() {
+    let blob = |path: &str| TreeEntryInput {
+        path: path.into(),
+        mode: "100644".into(),
+        kind: "blob".into(),
+        size: Some(10),
+    };
+    let entries = vec![
+        blob("pnpm-workspace.yaml"),
+        blob("packages/pnpm-workspace.yaml"),
+        blob("packages/a/pnpm-lock.yaml"),
+        blob("packages/a/package.json"),
+        blob("tools/b/pnpm-lock.yaml"),
+    ];
+    let s = select_paths(&entries, &SelectOptions::default());
+    assert!(
+        s.fetch_text
+            .iter()
+            .any(|p| p == "packages/pnpm-workspace.yaml"),
+        "{:?}",
+        s.fetch_text
+    );
+    assert!(
+        s.fetch_text.iter().any(|p| p == "pnpm-workspace.yaml"),
+        "{:?}",
+        s.fetch_text
+    );
+}
+
+/// #734 re-scan: a project pinned to pnpm 9.0–10.4 that still carries the
+/// root-only scaffold an earlier run created is told to delete it; a
+/// workspace file the user wrote (or one in a pnpm 11 project) is not.
+#[tokio::test]
+async fn a_leftover_root_only_scaffold_on_pnpm_9_is_flagged() {
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    mount_api(
+        &server,
+        &patches_from_overrides(&dir.join("overrides.json"), None),
+    )
+    .await;
+    let scaffold = "packages:\n  - '.'\ntrustLockfile: true\n";
+    let user = "packages:\n  - '.'\ncatalog: {}\ntrustLockfile: true\n";
+    for (pin, workspace, flagged) in [
+        ("9.15.9", scaffold, true),
+        ("9.15.9", user, false),
+        ("11.0.0", scaffold, false),
+    ] {
+        let mut files = fixture_files(&dir.join("input"));
+        files.insert(
+            "package.json".into(),
+            format!(r#"{{"name":"app","packageManager":"pnpm@{pin}"}}"#).into_bytes(),
+        );
+        files.insert("pnpm-workspace.yaml".into(), workspace.as_bytes().to_vec());
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        let warnings = project.redirect["warnings"].to_string();
+        assert_eq!(
+            warnings.contains("ERR_PNPM_ADDING_TO_ROOT"),
+            flagged,
+            "{pin} {workspace:?}: {warnings}"
+        );
+        assert!(
+            !output
+                .changed_files
+                .iter()
+                .any(|f| f.path == "pnpm-workspace.yaml"),
+            "the file is never rewritten or removed"
+        );
     }
 }

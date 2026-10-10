@@ -38,34 +38,18 @@ impl Ecosystem {
 
     /// Match a PURL string to its ecosystem.
     pub fn from_purl(purl: &str) -> Option<Self> {
-        if purl.starts_with("pkg:cargo/") {
-            return Some(Ecosystem::Cargo);
-        }
-        if purl.starts_with("pkg:gem/") {
-            return Some(Ecosystem::Gem);
-        }
-        if purl.starts_with("pkg:golang/") {
-            return Some(Ecosystem::Golang);
-        }
-        if purl.starts_with("pkg:maven/") {
-            return Some(Ecosystem::Maven);
-        }
-        if purl.starts_with("pkg:composer/") {
-            return Some(Ecosystem::Composer);
-        }
-        if purl.starts_with("pkg:nuget/") {
-            return Some(Ecosystem::Nuget);
-        }
-        if purl.starts_with("pkg:jsr/") {
-            return Some(Ecosystem::Deno);
-        }
-        if purl.starts_with("pkg:npm/") {
-            Some(Ecosystem::Npm)
-        } else if purl.starts_with("pkg:pypi/") {
-            Some(Ecosystem::Pypi)
-        } else {
-            None
-        }
+        Some(match purl.strip_prefix("pkg:")?.split_once('/')?.0 {
+            "npm" => Self::Npm,
+            "pypi" => Self::Pypi,
+            "cargo" => Self::Cargo,
+            "gem" => Self::Gem,
+            "golang" => Self::Golang,
+            "maven" => Self::Maven,
+            "composer" => Self::Composer,
+            "nuget" => Self::Nuget,
+            "jsr" => Self::Deno,
+            _ => return None,
+        })
     }
 
     /// Name used in the `--ecosystems` CLI flag (e.g. `"npm"`, `"pypi"`, `"cargo"`).
@@ -105,15 +89,11 @@ impl Ecosystem {
     /// Human-readable name for user-facing messages.
     pub fn display_name(&self) -> &'static str {
         match self {
-            Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "python",
-            Ecosystem::Cargo => "cargo",
             Ecosystem::Gem => "ruby",
             Ecosystem::Golang => "go",
-            Ecosystem::Maven => "maven",
             Ecosystem::Composer => "php",
-            Ecosystem::Nuget => "nuget",
-            Ecosystem::Deno => "deno",
+            _ => self.cli_name(),
         }
     }
 }

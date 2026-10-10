@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::lock_cli::lock_failure;
-use crate::commands::rollback::sweep_failure;
 use crate::commands::vendor::{run_vendor_gc, VendorGcSummary};
+use crate::json_envelope::GcReport;
+use crate::ui::sweep_failure;
 
 /// Aggregated outcome of a GC pass (or preview). Serialized into the
 /// `scan --json` output's `gc` sub-object. See CLI_CONTRACT.md for the
@@ -53,8 +54,10 @@ pub(super) struct GcSummary {
     /// finish (`cleanup_failed`: the pass aborted, or left orphans it could
     /// not unlink — the removed counts above are what it did reclaim). The
     /// mutations already happened on disk, so the stale record is reported,
-    /// not the pass failed. Serialized as additive `warnings[]` on the
-    /// apply shape only.
+    /// not the pass failed. Also the vendored reverts' reinstall advisories
+    /// (`vendor_bun_reinstall_required`, `vendor_vlt_reinstall_required`)
+    /// and no other revert warning. Serialized as additive
+    /// `warnings[]` on the apply shape only.
     warnings: Vec<(&'static str, String)>,
 }
 
@@ -87,24 +90,28 @@ impl GcSummary {
         self.vendored_failed = v.failed;
         self.vendored_failed.sort();
         self.warnings.extend(v.write_failures);
+        self.warnings.extend(v.advisories);
         self.vendor_orphan_dirs = v.orphan_dirs;
     }
 
-    /// Serialize for a *mutating* GC pass (post-apply). `skipped` and
-    /// `warnings` are additive: present only when the lock could not be
-    /// taken / a post-revert rewrite failed.
-    fn to_apply_json(&self) -> serde_json::Value {
-        let mut json = serde_json::json!({
-            "prunedManifestEntries": self.pruned,
-            "removedBlobs": self.blobs.blobs_removed,
-            "removedDiffArchives": self.diffs.blobs_removed,
-            "removedPackageArchives": self.packages.blobs_removed,
-            "revertedVendoredEntries": self.vendored_reverted,
-            "keptVendoredEntries": self.vendored_kept,
-            "failedVendoredEntries": self.vendored_failed,
-            "removedVendorOrphanDirs": self.vendor_orphan_dirs,
-            "bytesFreed": self.total_bytes(),
-        });
+    /// The `gc` sub-object. One shape for both passes: the artifact half is
+    /// the `gc` object every GC-running command prints (`GcReport`), the
+    /// manifest and vendored halves are scan's. On a `--dry-run` preview the
+    /// counts are what the pass would remove, and the keys only a real pass
+    /// can fill (`keptVendoredEntries`, `failedVendoredEntries`, `skipped`,
+    /// `warnings`) are left out rather than reported as an empty check.
+    pub(super) fn to_json(&self, preview: bool) -> serde_json::Value {
+        let mut json =
+            GcReport::from_passes(Some(&self.blobs), Some(&self.diffs), Some(&self.packages))
+                .to_value();
+        json["prunedManifestEntries"] = serde_json::json!(self.pruned);
+        json["revertedVendoredEntries"] = serde_json::json!(self.vendored_reverted);
+        json["removedVendorOrphanDirs"] = serde_json::json!(self.vendor_orphan_dirs);
+        if preview {
+            return json;
+        }
+        json["keptVendoredEntries"] = serde_json::json!(self.vendored_kept);
+        json["failedVendoredEntries"] = serde_json::json!(self.vendored_failed);
         if let Some((code, message)) = &self.skipped {
             json["skipped"] = serde_json::json!({ "code": code, "message": message });
         }
@@ -116,29 +123,6 @@ impl GcSummary {
                 .collect();
         }
         json
-    }
-
-    /// The `gc` sub-object: [`Self::to_preview_json`] for a `--dry-run`
-    /// pass, [`Self::to_apply_json`] otherwise.
-    pub(super) fn to_json(&self, preview: bool) -> serde_json::Value {
-        if preview {
-            self.to_preview_json()
-        } else {
-            self.to_apply_json()
-        }
-    }
-
-    /// Serialize for a *non-mutating* GC pass (read-only preview).
-    fn to_preview_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "prunableManifestEntries": self.pruned,
-            "orphanBlobs": self.blobs.blobs_removed,
-            "orphanDiffArchives": self.diffs.blobs_removed,
-            "orphanPackageArchives": self.packages.blobs_removed,
-            "revertableVendoredEntries": self.vendored_reverted,
-            "vendorOrphanDirs": self.vendor_orphan_dirs,
-            "bytesReclaimable": self.total_bytes(),
-        })
     }
 }
 
@@ -155,7 +139,7 @@ async fn run_gc(
     socket_dir: &Path,
     dry_run: bool,
 ) -> GcSummary {
-    let sweep = ArtifactReferences::for_apply(manifest)
+    let sweep = ArtifactReferences::active(manifest)
         .sweep(socket_dir, dry_run)
         .await;
     let mut warnings = Vec::new();
@@ -232,7 +216,8 @@ pub(super) async fn run_apply_gc(
         Ok(Some(m)) => m,
         _ => return GcSummary::vendor_only(vendor_gc),
     };
-    let prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    let kept = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
@@ -255,8 +240,48 @@ pub(super) async fn run_apply_gc(
     }
     let mut gc = run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ false).await;
     gc.absorb_vendor_gc(vendor_gc);
+    gc.warnings.extend(kept);
     gc.warnings.extend(write_failure);
     gc
+}
+
+/// Drop from `prunable` every Cargo entry whose agent-mode patch is still
+/// on disk in a copy the crawl no longer reports (#1278): the project
+/// crawl is scoped to the crates `Cargo.lock` resolves, but a crate bumped
+/// or dropped from the lock keeps its patched copy in the machine-wide
+/// `$CARGO_HOME/registry/src` cache, which nothing deletes. Its manifest
+/// record holds the only before-blobs that can restore that copy, so it is
+/// kept, with one `cargo_cache_patch_kept` warning per entry naming the
+/// `rollback` that restores the copy and then drops the record.
+async fn keep_patched_cargo_copies(
+    common: &GlobalArgs,
+    manifest: &PatchManifest,
+    socket_dir: &Path,
+    prunable: &mut Vec<String>,
+) -> Vec<(&'static str, String)> {
+    let kept = crate::ecosystem_dispatch::cargo_copies_still_patched(
+        manifest,
+        prunable.iter(),
+        &common.crawler_options(),
+        &socket_dir.join("blobs"),
+        true,
+    )
+    .await;
+    prunable.retain(|p| !kept.contains(p));
+    kept.into_iter()
+        .map(|purl| {
+            (
+                "cargo_cache_patch_kept",
+                format!(
+                    "kept {purl}: the project no longer resolves it, but its copy in the \
+                     shared Cargo registry cache is still patched (or could not be \
+                     read to tell); run `socket-patch rollback {purl}` (with `--global` \
+                     when a `cargo vendor` dir hides the registry cache) to restore \
+                     that copy and drop the entry"
+                ),
+            )
+        })
+        .collect()
 }
 
 /// The vendored-state half of the GC alone, for a `--prune` whose crawl
@@ -294,9 +319,8 @@ pub(super) async fn run_vendor_only_gc(
     GcSummary::vendor_only(run_vendor_gc(common, manifest_path, false).await)
 }
 
-/// Dry-run preview of the apply-mode GC pass. Same shape as
-/// [`run_apply_gc`] but emits `prunable*`/`orphan*` field names and
-/// performs no mutation.
+/// Dry-run preview of the apply-mode GC pass. Same summary as
+/// [`run_apply_gc`] (what the pass would remove), with no mutation.
 async fn preview_apply_gc(
     common: &GlobalArgs,
     manifest_path: &Path,
@@ -331,7 +355,10 @@ async fn preview_apply_gc(
             }
         }
     }
-    let prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    // The wet pass keeps a Cargo entry whose shared-cache copy is still
+    // patched; so does the preview.
+    let _ = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
     // Likewise drop the prunable entries in memory before the sweep: the
     // cleanup helpers derive the referenced set from this manifest.
     for purl in &prunable {
@@ -343,8 +370,7 @@ async fn preview_apply_gc(
 }
 
 /// The `gc` sub-object for the JSON paths: a read-only preview under
-/// `--dry-run`, the mutating pass otherwise, serialized with the matching
-/// (`prunable*`/`orphan*` vs `pruned*`/`removed*`) field names.
+/// `--dry-run`, the mutating pass otherwise, both in the one `gc` shape.
 pub(super) async fn gc_json(
     common: &GlobalArgs,
     manifest_path: &Path,
@@ -356,11 +382,11 @@ pub(super) async fn gc_json(
     if dry_run {
         preview_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored)
             .await
-            .to_preview_json()
+            .to_json(true)
     } else {
         run_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored)
             .await
-            .to_apply_json()
+            .to_json(false)
     }
 }
 
@@ -833,7 +859,7 @@ mod tests {
         let blobs_dir = socket_dir.join("blobs");
         std::fs::create_dir_all(&blobs_dir).unwrap();
         let blob_path = blobs_dir.join(after_hash);
-        // Non-trivial size so `bytesReclaimable`/`bytesFreed` is observably > 0.
+        // Non-trivial size so `bytesFreed` is observably > 0.
         std::fs::write(&blob_path, vec![0u8; 64]).unwrap();
 
         let manifest_path = socket_dir.join("manifest.json");
@@ -895,7 +921,7 @@ mod tests {
         );
         assert!(
             preview.total_bytes() > 0,
-            "bytesReclaimable must be > 0 when an orphan blob would be freed"
+            "bytesFreed must be > 0 when an orphan blob would be freed"
         );
         // Preview is non-mutating: blob and manifest untouched.
         assert!(
@@ -960,7 +986,7 @@ mod tests {
             )),
             "a lock-contended pass must say why it pruned nothing"
         );
-        let json = gc.to_apply_json();
+        let json = gc.to_json(false);
         assert_eq!(json["skipped"]["code"], "lock_held", "{json}");
         assert_eq!(
             json["prunedManifestEntries"],
@@ -1041,7 +1067,7 @@ mod tests {
         assert!(blob_path.exists(), "nothing may be swept on a lock fault");
         let m = read_manifest(&manifest_path).await.unwrap().unwrap();
         assert!(m.patches.contains_key("pkg:npm/gone@1.0.0"));
-        assert_eq!(gc.to_apply_json()["skipped"]["code"], "lock_io");
+        assert_eq!(gc.to_json(false)["skipped"]["code"], "lock_io");
     }
 
     #[tokio::test]
@@ -1249,10 +1275,10 @@ mod tests {
             "preview must not create a manifest file"
         );
         // The serialized degenerate preview is the normal all-zero shape.
-        let json = gc.to_preview_json();
-        assert_eq!(json["prunableManifestEntries"], serde_json::json!([]));
-        assert_eq!(json["orphanBlobs"], serde_json::json!(0));
-        assert_eq!(json["bytesReclaimable"], serde_json::json!(0));
+        let json = gc.to_json(true);
+        assert_eq!(json["prunedManifestEntries"], serde_json::json!([]));
+        assert_eq!(json["removedBlobs"], serde_json::json!(0));
+        assert_eq!(json["bytesFreed"], serde_json::json!(0));
 
         // Corrupt manifest, fresh tempdir.
         let tmp = tempfile::tempdir().unwrap();
@@ -1307,28 +1333,21 @@ mod tests {
         state.entries.insert(
             PURL.to_string(),
             socket_patch_core::vendor::VendorEntry {
-                ecosystem: "npm".into(),
-                base_purl: PURL.into(),
-                uuid: UUID.into(),
-                artifact: socket_patch_core::vendor::state::VendorArtifact {
-                    yarn_berry10c0: None,
-                    path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
-                    sha256: String::new(),
-                    size: None,
-                    platform_locked: None,
-                    file_inventory: None,
-                },
-                wiring: Vec::new(),
-                lock: None,
-                took_over_go_patches: false,
-                detached: false,
-                record: None,
                 flavor: Some("package-lock".into()),
-                uv: None,
-                pnpm: None,
-                poetry: None,
-                pdm: None,
-                pipenv: None,
+                ..socket_patch_core::vendor::VendorEntry::new(
+                    "npm".into(),
+                    PURL.into(),
+                    UUID.into(),
+                    socket_patch_core::vendor::state::VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
+                        sha256: String::new(),
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    Vec::new(),
+                )
             },
         );
         socket_patch_core::vendor::save_state(tmp.path(), &state)
@@ -1365,7 +1384,7 @@ mod tests {
         );
         assert!(
             gc.total_bytes() > 0,
-            "bytesReclaimable must include the unused entry's blob"
+            "bytesFreed must include the unused entry's blob"
         );
         assert_eq!(gc.vendor_orphan_dirs, 0, "no orphan uuid dirs on disk");
         // Preview is non-mutating: blob, manifest entry, and ledger intact.
@@ -1428,42 +1447,35 @@ mod tests {
         state.entries.insert(
             PURL.to_string(),
             socket_patch_core::vendor::VendorEntry {
-                ecosystem: "npm".into(),
-                base_purl: PURL.into(),
-                uuid: UUID.into(),
-                artifact: socket_patch_core::vendor::state::VendorArtifact {
-                    yarn_berry10c0: None,
-                    path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
-                    sha256: String::new(),
-                    size: None,
-                    platform_locked: None,
-                    file_inventory: None,
-                },
-                wiring: vec![WiringRecord {
-                    file: "package-lock.json".into(),
-                    kind: "npm_lock_entry".into(),
-                    action: WiringAction::Rewritten,
-                    key: Some("node_modules/gone".into()),
-                    original: Some(serde_json::json!({
-                        "version": "1.0.0",
-                        "resolved": "https://registry.npmjs.org/gone/-/gone-1.0.0.tgz",
-                    })),
-                    new: Some(serde_json::json!({
-                        "version": "1.0.0",
-                        "resolved":
-                            format!("file:.socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
-                    })),
-                }],
-                lock: None,
-                took_over_go_patches: false,
-                detached: false,
-                record: None,
                 flavor: Some("package-lock".into()),
-                uv: None,
-                pnpm: None,
-                poetry: None,
-                pdm: None,
-                pipenv: None,
+                ..socket_patch_core::vendor::VendorEntry::new(
+                    "npm".into(),
+                    PURL.into(),
+                    UUID.into(),
+                    socket_patch_core::vendor::state::VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
+                        sha256: String::new(),
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    vec![WiringRecord {
+                        file: "package-lock.json".into(),
+                        kind: "npm_lock_entry".into(),
+                        action: WiringAction::Rewritten,
+                        key: Some("node_modules/gone".into()),
+                        original: Some(serde_json::json!({
+                            "version": "1.0.0",
+                            "resolved": "https://registry.npmjs.org/gone/-/gone-1.0.0.tgz",
+                        })),
+                        new: Some(serde_json::json!({
+                            "version": "1.0.0",
+                            "resolved":
+                                format!("file:.socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
+                        })),
+                    }],
+                )
             },
         );
         socket_patch_core::vendor::save_state(tmp.path(), &state)
@@ -1492,9 +1504,17 @@ mod tests {
              preview listed as revertable was deliberately not reclaimed"
         );
         assert_eq!(
-            gc.to_apply_json()["keptVendoredEntries"],
+            gc.to_json(false)["keptVendoredEntries"],
             serde_json::json!([PURL]),
             "scan --prune --json must carry the keep"
+        );
+        // The revert's own drift warnings (`vendor_lock_entry_drifted`,
+        // `vendor_artifact_kept`) are already said by the keep above; they
+        // must not also land in `gc.warnings[]`.
+        assert!(
+            gc.to_json(false).get("warnings").is_none(),
+            "a drift keep adds no gc warning: {}",
+            gc.to_json(false)
         );
         // Nothing reclaimed: manifest record, blob, ledger entry, and
         // artifacts all survive (the drift-keep contract).
@@ -1556,7 +1576,7 @@ mod tests {
             Some(("lock_held", LOCK_MARKER.to_string())),
             "absorbing the vendored half leaves this pass's own skip reason alone"
         );
-        let apply = gc.to_apply_json();
+        let apply = gc.to_json(false);
         assert_eq!(
             apply["keptVendoredEntries"],
             serde_json::json!(["pkg:npm/a@1.0.0", "pkg:npm/b@1.0.0"])
@@ -1576,7 +1596,7 @@ mod tests {
             }]),
             "{apply}"
         );
-        let preview = gc.to_preview_json();
+        let preview = gc.to_json(true);
         for key in [
             "keptVendoredEntries",
             "failedVendoredEntries",
@@ -1594,7 +1614,7 @@ mod tests {
         // absent, not null).
         let clean = GcSummary::vendor_only(VendorGcSummary::default());
         assert!(clean.skipped.is_none());
-        let clean_json = clean.to_apply_json();
+        let clean_json = clean.to_json(false);
         assert!(clean_json.get("skipped").is_none(), "{clean_json}");
         assert!(clean_json.get("warnings").is_none(), "{clean_json}");
         // A failed rewrite in the vendored half is a warning, never a skip
@@ -1606,7 +1626,7 @@ mod tests {
         });
         assert!(io.skipped.is_none(), "the vendored half never sets skipped");
         assert_eq!(
-            io.to_apply_json()["warnings"][0]["code"],
+            io.to_json(false)["warnings"][0]["code"],
             "manifest_write_failed"
         );
         assert!(io.vendored_failed.is_empty());

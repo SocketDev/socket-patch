@@ -397,13 +397,16 @@ fn preserve_conflicts_with_skip_rollback() {
         code, 2,
         "the conflict is a usage error; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    // Under --json the coded usage error is the envelope on stdout (#704).
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be one JSON envelope ({e}): {stdout:?}"));
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], "invalid_args", "{v}");
     assert!(
-        stderr.contains("no-op"),
-        "the error must explain the no-op quadrant; got {stderr:?}"
-    );
-    assert!(
-        stdout.trim().is_empty(),
-        "usage errors print to stderr, not a JSON envelope; got {stdout:?}"
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no-op")),
+        "the error must explain the no-op quadrant; got {v}"
     );
     // The conflict fires before any store is read or created.
     assert!(
@@ -414,7 +417,7 @@ fn preserve_conflicts_with_skip_rollback() {
     // Env-sourced: SOCKET_PRESERVE_STATE=true + --skip-rollback conflicts
     // exactly the same way (the contract row says flag- or env-sourced alike).
     let tmp2 = tempfile::tempdir().expect("tempdir");
-    let (code2, _stdout2, stderr2) = run_remove(
+    let (code2, stdout2, stderr2) = run_remove(
         tmp2.path(),
         &["pkg:npm/x@1.0.0", "--json", "--yes", "--skip-rollback"],
         &[("SOCKET_PRESERVE_STATE", "true")],
@@ -424,8 +427,8 @@ fn preserve_conflicts_with_skip_rollback() {
         "env-sourced preserve-state must conflict too; stderr=\n{stderr2}"
     );
     assert!(
-        stderr2.contains("no-op"),
-        "same self-enforced usage error text; got {stderr2:?}"
+        stdout2.contains("no-op"),
+        "same self-enforced usage error text; got {stdout2:?}"
     );
     assert!(!tmp2.path().join(".socket").exists());
 }
@@ -469,12 +472,10 @@ fn make_two_entry_socket_dir(root: &Path) -> PathBuf {
     socket
 }
 
-/// The default cleanup now covers `.socket/diffs` (`<uuid>.tar.gz`, kept iff
-/// the uuid is still referenced by the post-removal manifest) and the legacy
-/// `.socket/packages` (swept whole: v5.0 reads no package archives) in
-/// addition to blobs. Removing A must sweep A's diff archive while B's —
-/// still referenced by the second manifest entry — survives, and both
-/// package archives go; the artifact carrier reports the count.
+/// The default cleanup covers the obsolete `.socket/diffs` and
+/// `.socket/packages` (both swept whole: v5.0 reads neither) in addition to
+/// blobs. Removing A sweeps every archive, B's included even though B stays
+/// in the manifest; the artifact carrier reports the count.
 #[test]
 fn default_remove_sweeps_archives_too() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -506,41 +507,25 @@ fn default_remove_sweeps_archives_too() {
         "exactly A's manifest entry is removed"
     );
 
-    // A's archives are gone from BOTH archive dirs; B's diff archive
-    // survives, its legacy package archive does not.
+    // Every archive is gone from BOTH archive dirs, the kept entry's too.
     for dir in ["diffs", "packages"] {
-        assert!(
-            !socket
-                .join(dir)
-                .join(format!("{ARCH_UUID_A}.tar.gz"))
-                .exists(),
-            "the removed entry's {dir} archive must be swept"
-        );
+        for (label, uuid) in [("A", ARCH_UUID_A), ("B", ARCH_UUID_B)] {
+            assert!(
+                !socket.join(dir).join(format!("{uuid}.tar.gz")).exists(),
+                "entry {label}'s {dir} archive must be swept"
+            );
+        }
     }
-    assert!(
-        socket
-            .join("diffs")
-            .join(format!("{ARCH_UUID_B}.tar.gz"))
-            .exists(),
-        "the kept entry's diff archive must survive"
-    );
-    assert!(
-        !socket
-            .join("packages")
-            .join(format!("{ARCH_UUID_B}.tar.gz"))
-            .exists(),
-        "a legacy package archive is swept even for a kept entry"
-    );
 
-    // The purl-less artifact carrier reports the three swept archives.
+    // The purl-less artifact carrier reports the four swept archives.
     let events = v["events"].as_array().expect("events array");
     let carrier = events
         .iter()
         .find(|e| e["action"] == "removed" && e["purl"].is_null())
         .unwrap_or_else(|| panic!("expected the artifact carrier event: {events:?}"));
     assert_eq!(
-        carrier["details"]["archivesRemoved"], 3,
-        "one diff + two package archives swept; carrier={carrier}"
+        carrier["details"]["archivesRemoved"], 4,
+        "two diff + two package archives swept; carrier={carrier}"
     );
 
     // The keep-rule really is manifest-anchored: B's entry survives.

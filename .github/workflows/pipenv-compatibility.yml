@@ -10,6 +10,26 @@ name: Pipenv compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Only this ecosystem's own files. A change to shared engine code
+    # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
+    # push to main (when it is in the push filter below) or nightly, or on
+    # demand via workflow_dispatch on the PR branch;
+    # ci.yml's per-ecosystem blocking slice still runs on every PR and in
+    # the merge queue (#1198).
+    paths:
+      - '.github/actions/upload-artifact/**'
+      - '.github/workflows/pipenv-compatibility.yml'
+      - 'crates/*/src/**/*pipenv*'
+      - 'crates/*/src/**/*pipenv*/**'
+      - 'crates/socket-patch-core/src/vendor/pypi.rs'
+      - 'crates/socket-patch-core/src/crawlers/python_crawler.rs'
+      - 'scripts/backtest-pipenv.py'
+      - 'scripts/tests/test_backtest_harnesses.py'
+  push:
+    branches: [main]
+    # The ecosystem's pre-#1198 relevance set (the shared engine code its
+    # cells run through), its PR paths and the toolchain files. A main
+    # push outside this set waits for the nightly run below.
     paths:
       - '.github/actions/upload-artifact/**'
       - 'crates/socket-patch-core/src/patch/redirect/pipenv.rs'
@@ -28,8 +48,17 @@ on:
       - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/src/commands/vex_sources.rs'
       - '.github/workflows/pipenv-compatibility.yml'
-  push:
-    branches: [main]
+      - 'crates/*/src/**/*pipenv*'
+      - 'crates/*/src/**/*pipenv*/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly full matrix, so a main change outside the push filter
+    # still gets a run within a day.
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -57,7 +86,7 @@ jobs:
           - os: ubuntu-latest
             versions: 2022.12.19 2026.8.0
             shapes: crlf marker-excluded extras category
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     steps: &matrix-steps
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -68,7 +97,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: pipenv-compat
+          shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install uv
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
@@ -124,6 +153,6 @@ jobs:
           - os: macos-latest
             versions: 2018.11.26 2022.12.19 2023.12.1 2026.8.0
             shapes: direct
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     steps: *matrix-steps

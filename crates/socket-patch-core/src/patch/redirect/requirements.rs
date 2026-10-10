@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::formats::text::{split_bom, strip_bom};
 use crate::utils::purl::percent_decode_purl_component;
 use crate::vendor::state::{VendorEntry, WiringAction};
 
@@ -32,11 +33,7 @@ pub(super) fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
             } else {
                 (physical_line, "")
             };
-            let parsed_body = if index == 0 {
-                body.strip_prefix('\u{feff}').unwrap_or(body)
-            } else {
-                body
-            };
+            let parsed_body = if index == 0 { strip_bom(body) } else { body };
             let continued =
                 !parsed_body.trim_start().starts_with('#') && body.trim_end().ends_with('\\');
             if continued && index + 1 < physical.len() {
@@ -48,7 +45,7 @@ pub(super) fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
             original.push_str(body);
             text.push_str(body);
             if start == 0 {
-                text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
+                text = strip_bom(&text).to_owned();
             }
             requirements.push(LogicalRequirement {
                 original,
@@ -131,8 +128,17 @@ fn without_hashes(text: &str) -> String {
 }
 
 enum RequirementVersion {
-    /// `==X` (PEP 440 equality), or a direct reference whose archive names X.
+    /// `==X` (PEP 440 equality), or socket-patch's own hosted direct
+    /// reference whose archive names X (a re-scan).
     Exact(String),
+    /// A direct reference to an archive naming release X that is NOT
+    /// socket-patch's hosted artifact: a public-index file, a private
+    /// mirror, an internal fork build, a `file://` path. That is the user's
+    /// own source choice, never rewritten (#542).
+    UserReference {
+        location: String,
+        version: String,
+    },
     /// `===X`: arbitrary equality, a plain string comparison.
     Arbitrary(String),
     Unpinned,
@@ -167,8 +173,17 @@ fn requirement_version(specifier: &str, name_re: &Regex, name: &str) -> Requirem
         return RequirementVersion::Unpinned;
     }
     if let Some(location) = tail.strip_prefix('@') {
-        return archive_version(location.trim(), name)
-            .map_or(RequirementVersion::Ambiguous, RequirementVersion::Exact);
+        let location = location.trim();
+        let Some(version) = archive_version(location, name) else {
+            return RequirementVersion::Ambiguous;
+        };
+        if crate::vendor::lock_inventory::pypi::socket_reference_coords(location).is_none() {
+            return RequirementVersion::UserReference {
+                location: location.to_string(),
+                version,
+            };
+        }
+        return RequirementVersion::Exact(version);
     }
     let (arbitrary, version) = match tail.strip_prefix("===") {
         Some(version) => (true, Some(version)),
@@ -267,6 +282,23 @@ pub(super) fn rewrite(
                     continue
                 }
                 RequirementVersion::Arbitrary(version) if version != dep.version => continue,
+                RequirementVersion::UserReference { version, .. }
+                    if !crate::utils::pep440::versions_equal(&version, &dep.version) =>
+                {
+                    continue
+                }
+                RequirementVersion::UserReference { location, .. } => {
+                    matched = true;
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_requirements_direct_reference".into(),
+                        detail: format!(
+                            "requirements.txt installs {}@{} from the direct reference {location}; \
+                             refusing to overwrite a user-authored source (not rewritten)",
+                            dep.name, dep.version
+                        ),
+                    });
+                    continue;
+                }
                 RequirementVersion::Exact(_) | RequirementVersion::Arbitrary(_) => {}
                 RequirementVersion::Unpinned
                     if row_counts.get(&target) == Some(&1)
@@ -297,17 +329,9 @@ pub(super) fn rewrite(
             let extras = captures
                 .get(2)
                 .map_or("", |capture| capture.as_str().trim());
-            let prefix_body = requirement
-                .original
-                .strip_prefix('\u{feff}')
-                .unwrap_or(&requirement.original);
+            let (bom, prefix_body) = split_bom(&requirement.original);
             let indent = &prefix_body
                 [..prefix_body.len() - prefix_body.trim_start_matches([' ', '\t']).len()];
-            let bom = if requirement.original.starts_with('\u{feff}') {
-                "\u{feff}"
-            } else {
-                ""
-            };
             // Unhashed file: the url's `#sha256=` fragment, which pip
             // verifies without turning hash-checking mode on.
             let location = if hashed {
@@ -343,10 +367,7 @@ pub(super) fn rewrite(
                     original: Some(Value::String(requirement.original.clone())),
                     new: Some(Value::String(rewritten.clone())),
                 });
-                requirement.text = rewritten
-                    .strip_prefix('\u{feff}')
-                    .unwrap_or(&rewritten)
-                    .to_owned();
+                requirement.text = strip_bom(&rewritten).to_owned();
                 requirement.original = rewritten;
                 changed = true;
             }
@@ -439,10 +460,8 @@ mod takeover_reach_tests {
 
     fn entry(flavor: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6c".into(),
-            artifact: VendorArtifact {
+flavor: Some(flavor.into()),
+..VendorEntry::new("pypi".into(), "pkg:pypi/six@1.16.0".into(), "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6c".into(), VendorArtifact {
                 yarn_berry10c0: None,
                 path: ".socket/vendor/pypi/5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6c/six-1.16.0-py3-none-any.whl"
                     .into(),
@@ -450,19 +469,8 @@ mod takeover_reach_tests {
                 size: None,
                 platform_locked: None,
                 file_inventory: None,
-            },
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: Some(flavor.into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+            }, wiring)
+}
     }
 
     #[test]
@@ -769,17 +777,53 @@ mod tests {
             )
         );
         assert_eq!(result.edits.len(), 1);
-        for source in [
-            "requests @ https://files.pythonhosted.org/requests-2.28.1.tar.gz#sha256=old",
-            "requests ( == 2.28.1 )",
-            "requests===2.28.1",
-        ] {
+        for source in ["requests ( == 2.28.1 )", "requests===2.28.1"] {
             let result = rewrite_registry_redirect(&input(source), &[patch()]);
             assert_eq!(
                 result.files["requirements.txt"],
                 format!("requests @ {URL}#sha256={HASH}")
             );
         }
+    }
+
+    /// #542: a direct reference the user wrote — a public-index file, a
+    /// private mirror, an internal fork, a `file://` path — is their own
+    /// source choice: refused with a warning and left byte-for-byte, never
+    /// swapped for the hosted build (whose rollback would then write a
+    /// plain index pin, losing the original source).
+    #[test]
+    fn user_direct_references_are_refused_not_rewritten() {
+        for location in [
+            "https://files.pythonhosted.org/requests-2.28.1.tar.gz#sha256=old",
+            "http://127.0.0.1:18766/requests-2.28.1-py3-none-any.whl",
+            "file:///abs/private/requests-2.28.1-py3-none-any.whl",
+            "https://mirror.internal/requests-2.28.01-py3-none-any.whl",
+        ] {
+            let source = format!("idna==3.7\nrequests @ {location} ; python_version >= '3.7'\n");
+            let result = rewrite_registry_redirect(&input(&source), &[patch()]);
+            assert!(
+                result.files.is_empty() && result.edits.is_empty(),
+                "{location}"
+            );
+            let codes: Vec<_> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                ["redirect_requirements_direct_reference"],
+                "{location}"
+            );
+            assert!(result.warnings[0].detail.contains(location));
+            assert!(result.confirmed_requirements_uuids.is_empty());
+        }
+        // A user reference to another release is not this patch's entry.
+        let result = rewrite_registry_redirect(
+            &input("requests @ https://mirror.internal/requests-2.32.0-py3-none-any.whl\n"),
+            &[patch()],
+        );
+        assert!(result.files.is_empty());
+        assert_eq!(
+            result.warnings[0].code,
+            "redirect_requirements_entry_not_found"
+        );
     }
 
     /// #376: an unhashed requirements file must stay unhashed. pip turns

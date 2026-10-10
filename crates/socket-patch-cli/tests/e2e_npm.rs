@@ -1,7 +1,7 @@
 //! End-to-end tests for the npm patch lifecycle.
 //!
 //! These tests exercise the full CLI against the real Socket API, using the
-//! **minimist@1.2.2** patch (UUID `80630680-4da6-45f9-bba8-b888e0ffd58c`),
+//! **minimist@1.2.2** patch (UUID `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb`),
 //! which fixes CVE-2021-44906 (Prototype Pollution).
 //!
 //! # Prerequisites
@@ -13,34 +13,31 @@
 //! cargo test -p socket-patch-cli --test e2e_npm -- --ignored
 //! ```
 
-use std::path::{Path, PathBuf};
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
+use std::path::Path;
 use std::process::{Command, Output};
 
-use sha2::{Digest, Sha256};
-
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const NPM_UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+const NPM_UUID: &str = "642d7f02-ebc1-4ab0-99e2-07f5dd8463cb";
 const NPM_PURL: &str = "pkg:npm/minimist@1.2.2";
 
 /// Git SHA-256 of the *unpatched* `index.js` shipped with minimist 1.2.2.
 const BEFORE_HASH: &str = "311f1e893e6eac502693fad8617dcf5353a043ccc0f7b4ba9fe385e838b67a10";
 
 /// Git SHA-256 of the *patched* `index.js` after the security fix.
-const AFTER_HASH: &str = "043f04d19e884aa5f8371428718d2a3f27a0d231afe77a2620ac6312f80aaa28";
+const AFTER_HASH: &str = "ec956dcafb886f14315570bf3981d44aa12c561716abb46eed8b067aaa1f6bdf";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 fn has_command(cmd: &str) -> bool {
     let mut probe = Command::new(cmd);
@@ -51,15 +48,6 @@ fn has_command(cmd: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok()
-}
-
-/// Compute Git SHA-256: `SHA256("blob <len>\0" ++ content)`.
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn git_sha256_file(path: &Path) -> String {
@@ -288,15 +276,15 @@ fn test_npm_dry_run() {
     // Download the patch *without* applying.
     assert_run_ok(
         cwd,
-        &["get", NPM_UUID, "--mode", "agent", "--no-apply"],
-        "get --no-apply",
+        &["get", NPM_UUID, "--mode", "agent", "--save-only"],
+        "get --save-only",
     );
 
     // File should still be original.
     assert_eq!(
         git_sha256_file(&index_js),
         BEFORE_HASH,
-        "file should not change after get --no-apply"
+        "file should not change after get --save-only"
     );
 
     // Dry-run should report that the patch *would* apply, but leave the
@@ -470,15 +458,32 @@ fn test_npm_global_lifecycle() {
     assert_eq!(patches[0]["purl"].as_str().unwrap(), NPM_PURL);
 
     // -- ROLLBACK: restore original file globally ----------------------------
+    // v5.0 rollback is full-state: by default it also drops the rolled-back
+    // manifest records, leaving `apply` nothing to re-apply. This lifecycle
+    // re-applies next, so it rolls back with `--preserve-state`, which
+    // restores the file and keeps the record.
     assert_run_ok(
         cwd,
-        &["rollback", "-g", "--global-prefix", nm_str],
-        "rollback -g",
+        &[
+            "rollback",
+            "-g",
+            "--global-prefix",
+            nm_str,
+            "--preserve-state",
+        ],
+        "rollback -g --preserve-state",
     );
     assert_eq!(
         git_sha256_file(&index_js),
         BEFORE_HASH,
         "index.js should match beforeHash after global rollback"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert_eq!(
+        manifest["patches"][NPM_PURL]["uuid"].as_str(),
+        Some(NPM_UUID),
+        "rollback --preserve-state keeps the manifest record"
     );
 
     // -- APPLY: re-apply from manifest globally ------------------------------
@@ -527,7 +532,7 @@ fn test_npm_save_only() {
     let index_js = cwd.join("node_modules/minimist/index.js");
     assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
 
-    // Download with --save-only (new name for --no-apply).
+    // Download with --save-only.
     assert_run_ok(cwd, &["get", NPM_UUID, "--save-only"], "get --save-only");
 
     // File should still be original.
@@ -702,7 +707,11 @@ fn test_npm_macos_global_auto_discovery() {
     );
 }
 
-/// UUID shortcut: `socket-patch <UUID>` should behave like `socket-patch get <UUID>`.
+/// UUID shortcut: `socket-patch <UUID>` behaves like `socket-patch get
+/// <UUID>`. In v5.0 a bare `get` in a lockfile project runs hosted mode: the
+/// lockfile is redirected to the Socket-hosted patched tarball and the
+/// installed tree is left for the next install; `--mode agent` passes
+/// through the shortcut and patches in place, recording the manifest.
 #[test]
 #[ignore]
 fn test_npm_uuid_shortcut() {
@@ -720,28 +729,53 @@ fn test_npm_uuid_shortcut() {
     let index_js = cwd.join("node_modules/minimist/index.js");
     assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
 
-    // Run with bare UUID (no "get" subcommand).
-    assert_run_ok(cwd, &[NPM_UUID], "uuid shortcut");
+    // Bare UUID (no "get" subcommand): hosted mode, like a bare `get`.
+    let (stdout, _) = assert_run_ok(cwd, &[NPM_UUID, "--json"], "uuid shortcut");
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("uuid shortcut --json is not JSON ({e}): {stdout}"));
+    assert_eq!(env["status"], "success", "{env:#}");
+    let lock = std::fs::read_to_string(cwd.join("package-lock.json")).unwrap();
+    let lock: serde_json::Value = serde_json::from_str(&lock).unwrap();
+    let resolved = lock["packages"]["node_modules/minimist"]["resolved"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        resolved.starts_with("https://patch.socket.dev/") && resolved.contains(NPM_UUID),
+        "the shortcut's hosted get pins minimist to the hosted patch, got {resolved:?}"
+    );
+    assert_eq!(
+        git_sha256_file(&index_js),
+        BEFORE_HASH,
+        "hosted mode rewires the lockfile, not the installed tree"
+    );
+    assert!(
+        !cwd.join(".socket/manifest.json").exists(),
+        "hosted mode keeps no manifest"
+    );
 
+    // `--mode agent` passes through the shortcut: in place, with a manifest.
+    let agent = tempfile::tempdir().unwrap();
+    let cwd = agent.path();
+    write_package_json(cwd);
+    npm_run(cwd, &["install", "minimist@1.2.2"]);
+    let index_js = cwd.join("node_modules/minimist/index.js");
+    assert_run_ok(
+        cwd,
+        &[NPM_UUID, "--mode", "agent"],
+        "uuid shortcut --mode agent",
+    );
     assert_eq!(
         git_sha256_file(&index_js),
         AFTER_HASH,
-        "index.js should match afterHash after UUID shortcut"
+        "index.js should match afterHash after `<UUID> --mode agent`"
     );
-
-    // The shortcut must behave like `get`: the manifest must actually record
-    // our patch, not merely exist as an empty stub.
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(
-        manifest_path.exists(),
-        "manifest should exist after UUID shortcut"
-    );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
     let patch = &manifest["patches"][NPM_PURL];
     assert!(
         patch.is_object(),
-        "manifest should contain {NPM_PURL} after UUID shortcut"
+        "manifest should contain {NPM_PURL} after the agent-mode shortcut"
     );
     assert_eq!(patch["uuid"].as_str().unwrap(), NPM_UUID);
 }

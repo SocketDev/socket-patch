@@ -62,25 +62,27 @@
 //! wiring reverted with ledger + tarball kept (`vendor_unwired`,
 //! `--no-verify` too), and a lock-only revert that pnpm itself re-wires.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
-#[path = "common/hermetic.rs"]
-mod hermetic;
+use common::cache_env;
+use common::hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
-    assert_absent, assert_attested, assert_not_attested, patch_view, run_vex, strip_ledgers,
-    strip_manifest, Marker, PatchApi, VexRun, VexVia,
+    assert_absent, assert_attested, assert_not_attested, installed_pnpm_pre_10_5, patch_view,
+    run_vex, strip_ledgers, strip_manifest, Marker, PatchApi, VexRun, VexVia,
 };
 
 const ORG: &str = "test-org";
@@ -99,7 +101,7 @@ const PNPM_TERTIARY: &str = "pnpm@11";
 
 /// The binary under test; the pinned-matrix workflow runs a prebuilt copy
 /// (`SOCKET_PATCH_PNPM_E2E_SOCKET_BIN`, shared with the hosted suite).
-fn binary() -> PathBuf {
+fn socket_bin() -> PathBuf {
     std::env::var_os("SOCKET_PATCH_PNPM_E2E_SOCKET_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_socket-patch")))
@@ -214,7 +216,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = hermetic::command(&binary());
+    let mut cmd = hermetic::command(&socket_bin());
     cmd.current_dir(cwd);
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pnpm]);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
@@ -224,13 +226,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[u8]) {
@@ -660,17 +655,28 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
     // refuses a workspace file whose `packages` field is missing/empty, and
     // `.` cannot glob a stray subtree into the workspace the way `packages/*`
     // could. That makes the committable set install on pnpm 9/10/11 alike.
+    // pnpm 9.0–10.4 (as the install recorded it) are the exception: they
+    // read package.json, and a root-only workspace breaks their `pnpm add`,
+    // so no file is created (#734).
     let ws_path = proj.join("pnpm-workspace.yaml");
-    let ws_after =
-        std::fs::read_to_string(&ws_path).expect("vendoring must create pnpm-workspace.yaml");
-    assert!(
-        ws_after.contains(&format!("{DEP}@{DEP_VERSION}: file:{tgz_rel}")),
-        "pnpm-workspace.yaml `overrides:` must point at the vendored tarball; got:\n{ws_after}"
-    );
-    assert!(
-        ws_after.contains("packages:") && ws_after.contains("- '.'"),
-        "created pnpm-workspace.yaml must carry a root-only packages list; got:\n{ws_after}"
-    );
+    let ws_created = !installed_pnpm_pre_10_5(&proj);
+    if ws_created {
+        let ws_after =
+            std::fs::read_to_string(&ws_path).expect("vendoring must create pnpm-workspace.yaml");
+        assert!(
+            ws_after.contains(&format!("{DEP}@{DEP_VERSION}: file:{tgz_rel}")),
+            "pnpm-workspace.yaml `overrides:` must point at the vendored tarball; got:\n{ws_after}"
+        );
+        assert!(
+            ws_after.contains("packages:") && ws_after.contains("- '.'"),
+            "created pnpm-workspace.yaml must carry a root-only packages list; got:\n{ws_after}"
+        );
+    } else {
+        assert!(
+            !ws_path.exists(),
+            "{pm}: no root-only pnpm-workspace.yaml on pnpm 9.0–10.4"
+        );
+    }
     eprintln!("VENDOR OK ({pm}, {driver:?})");
 
     // 4. FRESH-CHECKOUT PROOF: committable files only, EMPTY store,
@@ -679,7 +685,9 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&pkg_path, fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("pnpm-lock.yaml")).unwrap();
-    std::fs::copy(&ws_path, fresh.join("pnpm-workspace.yaml")).unwrap();
+    if ws_created {
+        std::fs::copy(&ws_path, fresh.join("pnpm-workspace.yaml")).unwrap();
+    }
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_store = tmp.path().join("fresh-pnpm-store");
@@ -738,7 +746,8 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
 
     // Manifest-less VEX over the real fresh install (kept ledger, deleted
     // ledgers, offline, embedded vendor/apply --vex, reverted lock).
-    // The fixture had no pnpm-workspace.yaml: vendoring created it.
+    // The fixture had no pnpm-workspace.yaml: vendoring created it (or, on
+    // pnpm 9.0–10.4, did not).
     assert_manifestless_vendored_vex(
         &fresh,
         pm,
@@ -762,7 +771,7 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
     // 5. Idempotency: a re-run exits 0 and leaves ALL THREE files byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();
     let pkg_wired = std::fs::read(&pkg_path).unwrap();
-    let ws_wired = std::fs::read(&ws_path).unwrap();
+    let ws_wired = std::fs::read(&ws_path).ok();
     let (code, stdout, stderr) = run_socket(
         &proj,
         &[
@@ -790,7 +799,7 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
         "re-vendor must leave package.json byte-identical"
     );
     assert_eq!(
-        std::fs::read(&ws_path).unwrap(),
+        std::fs::read(&ws_path).ok(),
         ws_wired,
         "re-vendor must leave pnpm-workspace.yaml byte-identical"
     );
@@ -886,7 +895,7 @@ fn assert_manifestless_vendored_vex(
     tag: &str,
 ) {
     off_runtime(|| {
-        let bin = binary();
+        let bin = socket_bin();
         let api = PatchApi::start(vec![(
             UUID.to_string(),
             patch_view(
@@ -1183,10 +1192,14 @@ fn run_unsupported_lock_refusal(pm: &str) {
 
     let api = PatchApi::empty();
     strip_manifest(&proj);
-    let out = run_vex(&binary(), &proj, &VexRun::online(&api));
+    let out = run_vex(&socket_bin(), &proj, &VexRun::online(&api));
     assert_ne!(out.code, Some(0), "{pm}: nothing is wired: {out}");
     assert_absent(out.doc.as_ref(), &purl);
-    let out = run_vex(&binary(), &proj, &VexRun::online(&api).via(VexVia::Vendor));
+    let out = run_vex(
+        &socket_bin(),
+        &proj,
+        &VexRun::online(&api).via(VexVia::Vendor),
+    );
     assert_absent(out.doc.as_ref(), &purl);
     api.assert_no_requests();
     eprintln!("VEX-CELL vendored [{pm}] refused: not attested");
@@ -1620,6 +1633,183 @@ fn run_legacy_hermetic(lock_text: &str, after_template: &str, version: &str) {
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
     );
+}
+
+// ── gated real-pnpm two-document lock legs (#466) ─────────────────────
+
+/// pnpm 12 with `packageManager` set: `pnpm-lock.yaml` is two documents
+/// (pnpm's `packageManagerDependencies` env document, then the project
+/// lock). Vendoring used to refuse `vendor_lock_entry_not_found` here.
+#[test]
+fn pnpm12_package_manager_two_document_lock_vendors_and_reverts() {
+    run_two_document_capstone("pnpm@12.8.1", DEP, DEP_VERSION, true, false);
+}
+
+/// pnpm 11 config dependency sharing the vendored package's key: the env
+/// document carries its own `is-number@7.0.0`. Vendoring used to report
+/// success after rewriting the env document, and a fresh frozen install
+/// then failed.
+#[test]
+fn pnpm11_config_dependency_two_document_lock_vendors_the_project_copy() {
+    run_two_document_capstone("pnpm@11.27.0", "is-number", "7.0.0", false, true);
+}
+
+/// pnpm 12 with both: `packageManager` set and a config dependency sharing
+/// the vendored package's key.
+#[test]
+fn pnpm12_config_dependency_and_package_manager_two_document_lock() {
+    run_two_document_capstone("pnpm@12.8.1", "is-number", "7.0.0", true, true);
+}
+
+/// Vendor `dep` into a real two-document lock, prove a fresh checkout's
+/// frozen install lands the patched bytes in the project copy (the env
+/// document byte-untouched; a config dependency's own copy stays the
+/// registry's, with a `vendor_config_dependency_unpatched` warning), and
+/// revert byte-for-byte.
+fn run_two_document_capstone(
+    pm: &str,
+    dep: &str,
+    version: &str,
+    package_manager: bool,
+    config_dep: bool,
+) {
+    if !has_corepack_pm(pm) {
+        println!("SKIP: `corepack {pm}` unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut pkg_doc = serde_json::json!({
+        "name": "pnpm-two-doc",
+        "version": "0.0.0",
+        "private": true,
+        "dependencies": { dep: version },
+    });
+    if package_manager {
+        pkg_doc["packageManager"] = serde_json::json!(pm);
+    }
+    std::fs::write(
+        proj.join("package.json"),
+        format!("{}\n", serde_json::to_string_pretty(&pkg_doc).unwrap()),
+    )
+    .unwrap();
+    let store = tmp.path().join("pnpm-store");
+    let store = store.to_str().unwrap();
+    let config = format!("{dep}@{version}");
+    let mut steps: Vec<Vec<&str>> = Vec::new();
+    if config_dep {
+        steps.push(vec!["add", "--config", &config, "--store-dir", store]);
+    }
+    steps.push(vec!["install", "--store-dir", store]);
+    for args in steps {
+        let out = corepack(&proj, pm, &args);
+        if !out.status.success() {
+            assert!(!pnpm_required(), "required {pm} fixture failed: {out:?}");
+            println!("SKIP ({pm}): fixture `pnpm {args:?}` failed: {out:?}");
+            return;
+        }
+    }
+
+    let lock_path = proj.join("pnpm-lock.yaml");
+    let ws_path = proj.join("pnpm-workspace.yaml");
+    let pkg_path = proj.join("package.json");
+    let lock_before = std::fs::read_to_string(&lock_path).unwrap();
+    let ws_before = std::fs::read(&ws_path).ok();
+    let pkg_before = std::fs::read(&pkg_path).unwrap();
+    let env_doc = |lock: &str| {
+        let docs: Vec<&str> = lock.split("\n---\n").collect();
+        assert!(
+            lock.starts_with("---\n") && docs.len() == 2,
+            "{pm} must write a two-document lock:\n{lock}"
+        );
+        (docs[0].to_string(), docs[1].to_string())
+    };
+    let (env_before, _) = env_doc(&lock_before);
+
+    let installed_index = proj.join("node_modules").join(dep).join("index.js");
+    let orig = std::fs::read(&installed_index).expect("installed index.js");
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{dep}@{version}");
+    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "vendor failed ({pm}):\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    assert_eq!(
+        stdout.contains("vendor_config_dependency_unpatched"),
+        config_dep,
+        "{env}"
+    );
+    let lock_after = std::fs::read_to_string(&lock_path).unwrap();
+    let (env_after, project_after) = env_doc(&lock_after);
+    assert_eq!(env_after, env_before, "the env document is never edited");
+    assert!(
+        project_after.contains(&format!("{dep}@file:.socket/vendor/npm/{UUID}/")),
+        "the project document is wired:\n{lock_after}"
+    );
+
+    // Fresh checkout: committable files only, empty store, frozen.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+    }
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    let fresh_store = tmp.path().join("fresh-store");
+    let ci = corepack(
+        &fresh,
+        pm,
+        &[
+            "install",
+            "--frozen-lockfile",
+            "--store-dir",
+            fresh_store.to_str().unwrap(),
+        ],
+    );
+    assert!(ci.status.success(), "fresh frozen install ({pm}): {ci:?}");
+    let landed = std::fs::read(fresh.join("node_modules").join(dep).join("index.js")).unwrap();
+    assert!(
+        landed.starts_with(MARKER.as_bytes()),
+        "the project copy installs the vendored bytes ({pm})"
+    );
+    if config_dep {
+        let config_copy = fresh
+            .join("node_modules/.pnpm-config")
+            .join(dep)
+            .join("index.js");
+        let config_bytes = std::fs::read(&config_copy).expect("config dependency installed");
+        assert!(
+            !config_bytes.starts_with(MARKER.as_bytes()),
+            "the config dependency's copy is the registry's, as the warning says"
+        );
+    }
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "revert failed ({pm}):\n{stdout}\n{stderr}");
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_before);
+    assert_eq!(std::fs::read(&pkg_path).unwrap(), pkg_before);
+    assert_eq!(std::fs::read(&ws_path).ok(), ws_before);
+    assert!(!proj.join(".socket/vendor").exists());
 }
 
 // ── gated real-pnpm legacy lifecycle legs ─────────────────────────────

@@ -21,16 +21,17 @@
 //! newline style is preserved.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::terminator;
 use crate::utils::requirements::{
     expand_env_vars, hash_options, logical_lines, requires_hashes, shlex_split, split_comment,
     strip_comment, vendor_tag,
 };
 
-use super::common::{detect_eol, refuse_symlinked};
+use super::common::refuse_symlinked;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
@@ -195,9 +196,9 @@ pub(super) async fn preflight_requirements(
                     "pypi_requirements_already_vendored",
                     format!(
                         "{}: already routes {canon_name} to the socket-patch vendored wheel for \
-                         patch {found}{why}; run `socket-patch vendor --revert` before \
-                         re-vendoring",
-                        file.rel
+                         patch {found}{why}; {remedy}",
+                        file.rel,
+                        remedy = super::common::REVERT_ALL_AND_REVENDOR,
                     ),
                 )
             };
@@ -309,9 +310,9 @@ pub(super) async fn rewire_requirements(
         (
             "pypi_requirements_already_vendored",
             format!(
-                "cannot re-wire {canon_name} from patch {}: {why}; run `socket-patch vendor \
-                     --revert` before re-vendoring",
-                prev.uuid
+                "cannot re-wire {canon_name} from patch {}: {why}; {remedy}",
+                prev.uuid,
+                remedy = super::common::REVERT_ALL_AND_REVENDOR,
             ),
         )
     })?;
@@ -327,7 +328,7 @@ async fn write_plan(
     // Before ANY write: a symlinked requirements file (root or `-r` include)
     // would be replaced by the rename-over.
     let planned: Vec<&str> = plan.iter().map(|f| f.rel.as_str()).collect();
-    refuse_symlinked(root, &planned, "pypi_requirements_symlink_unsupported").await?;
+    refuse_symlinked(root, &planned).await?;
     let mut wiring = Vec::new();
     let mut written: Vec<&PlannedFile> = Vec::new();
     for file in plan {
@@ -406,9 +407,7 @@ pub(super) async fn revert_requirements(
     // its target stale and never restoring the link. Keep the artifact (the
     // wiring still routes through the linked file) and fail.
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
-    if let Err((code, detail)) =
-        refuse_symlinked(root, &file_refs, "pypi_requirements_symlink_unsupported").await
-    {
+    if let Err((code, detail)) = refuse_symlinked(root, &file_refs).await {
         return RevertOutcome {
             kept_artifact: true,
             success: false,
@@ -426,7 +425,7 @@ pub(super) async fn revert_requirements(
                 return RevertOutcome::failed(format!("cannot read {file}: {e}"));
             }
         };
-        let nl = detect_eol(&content);
+        let nl = terminator(&content);
         let had_trailing_newline = content.ends_with('\n');
         let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
 
@@ -597,7 +596,7 @@ async fn plan_requirements(
         if spans.is_empty() {
             continue;
         }
-        let nl = detect_eol(&file.content);
+        let nl = terminator(&file.content);
         let original_lines: Vec<String> = file.content.lines().map(str::to_string).collect();
         let mut lines = original_lines.clone();
         let mut records = Vec::new();
@@ -655,7 +654,7 @@ async fn plan_requirements(
             &None,
             true,
         );
-        let nl = detect_eol(&root_file.content);
+        let nl = terminator(&root_file.content);
         let mut new_content = root_file.content.clone();
         if !new_content.is_empty() && !new_content.ends_with('\n') {
             new_content.push_str(nl);
@@ -750,7 +749,7 @@ fn plan_rewire(
         if !file.editable {
             return Err(format!("{rel} is outside the project root"));
         }
-        let nl = detect_eol(&file.content);
+        let nl = terminator(&file.content);
         let mut lines: Vec<String> = file.content.lines().map(str::to_string).collect();
         let mut taken: HashSet<usize> = HashSet::new();
         let mut records = Vec::new();
@@ -844,7 +843,14 @@ pub(in crate::vendor) fn vendor_line(
 /// must never edit them. The root file is always element 0.
 async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'static str, String)> {
     let mut out: Vec<ReqFile> = Vec::new();
-    walk_requirements_tree(root, |rel, path, read| match read {
+    // Strict UTF-8: the planner rewrites these files byte-exact, so a file
+    // in another encoding is refused below rather than re-encoded.
+    let utf8 = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    };
+    let view = crate::vendor::lock_inventory::ProjectView::Disk(root);
+    walk_requirements_tree(view, utf8, |rel, read| match read {
         Ok(content) => {
             // Out-of-root (`../`) and absolute includes resolve outside any
             // committable root — readable so a pin inside can refuse, never
@@ -865,12 +871,12 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
             format!(
                 "{} is not UTF-8 text (for example UTF-16, which Windows PowerShell 5.1 \
                  writes for `pip freeze > requirements.txt`); re-save it as UTF-8 and re-run",
-                path.display()
+                root.join(rel).display()
             ),
         )),
         Err(_) if out.is_empty() => Err((
             "pypi_no_requirements",
-            format!("cannot read {}", path.display()),
+            format!("cannot read {}", root.join(rel).display()),
         )),
         // A broken include is pip's error to report; vendor just can't see
         // inside it. Skip.
@@ -896,8 +902,18 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
 /// and absolute includes are never editable, so they are neither named nor
 /// followed.
 pub async fn requirements_include_names(root: &Path) -> std::io::Result<Vec<String>> {
+    requirements_include_names_in(crate::vendor::lock_inventory::ProjectView::Disk(root)).await
+}
+
+/// [`requirements_include_names`] over any project view (the disk, a
+/// snapshot of it, or an in-memory project).
+pub(crate) async fn requirements_include_names_in(
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+) -> std::io::Result<Vec<String>> {
     let mut names: Vec<String> = Vec::new();
-    walk_requirements_tree(root, |rel, _path, read| {
+    // Decoded as pip decodes it (#1120): a UTF-16 or PEP 263 file is read
+    // and descended into, not taken for an unreadable one.
+    walk_requirements_tree(view, decode_requirements, |rel, read| {
         if !is_in_root_rel(rel) {
             return Ok(false);
         }
@@ -913,74 +929,53 @@ pub async fn requirements_include_names(root: &Path) -> std::io::Result<Vec<Stri
     Ok(names)
 }
 
-/// The prune/discovery in-use probe for a `requirements`-flavored entry:
-/// does pip still install the wheel under `.socket/vendor/pypi/<uuid>/`?
-/// The requirements tree IS this flavor's lock, so the answer is whether
-/// any requirement line (its code, not its comment) reached from the root
-/// `requirements.txt` through in-root `-r` includes still names the uuid
-/// dir. `Some(false)` when the tree was read and none does — the user
-/// removed the pin, or bumped it to another release; `None` when no file
-/// of the tree could be read, or a reached include exists but cannot be
-/// read (cannot prove the absence of a reference: callers keep the entry).
-pub(super) async fn requirements_entry_in_use(root: &Path, uuid: &str) -> Option<bool> {
-    let needle = format!(".socket/vendor/pypi/{uuid}/");
-    let names = requirements_include_names(root).await.ok()?;
-    let mut any_readable = false;
-    for name in &names {
-        match read_regular_to_string(&root.join(name)).await {
-            Ok(content) => {
-                any_readable = true;
-                if logical_lines(&content)
-                    .iter()
-                    .any(|ll| split_comment(&ll.text).0.contains(&needle))
-                {
-                    return Some(true);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
-        }
-    }
-    any_readable.then_some(false)
-}
-
 /// A root-relative requirements path that stays inside the project root
 /// (not `../…`, not absolute) — the only files the planner may edit.
 pub(crate) fn is_in_root_rel(rel: &str) -> bool {
     !rel.starts_with("../") && !Path::new(rel).is_absolute()
 }
 
+/// A requirements file's bytes decoded as pip decodes them
+/// ([`crate::utils::requirements::decode`]); `InvalidData` when pip's
+/// rules give no text this reader can model.
+pub(crate) fn decode_requirements(bytes: Vec<u8>) -> std::io::Result<String> {
+    crate::utils::requirements::decode(&bytes).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not text pip's decoding rules can read (a byte-order mark, a PEP 263 \
+             coding line, or UTF-8)",
+        )
+    })
+}
+
 /// The shared include walk behind [`collect_requirements_files`] and
 /// [`requirements_include_names`]: depth-first from the root
 /// `requirements.txt`, each `-r`/`--requirement` target resolved against the
 /// INCLUDING file's directory and lexically normalized, visited-set cycle
-/// guard, FIFO-safe reads. `visit` sees every reached file with its read
-/// result and answers whether to descend into its includes (`Ok(true)`), or
-/// aborts the walk with its own error.
+/// guard, FIFO-safe reads, each file's bytes turned into text by `decode`.
+/// `visit` sees every reached file with its read result and answers whether
+/// to descend into its includes (`Ok(true)`), or aborts the walk with its
+/// own error.
 async fn walk_requirements_tree<E>(
-    root: &Path,
-    mut visit: impl FnMut(&str, &Path, std::io::Result<String>) -> Result<bool, E>,
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+    decode: impl Fn(Vec<u8>) -> std::io::Result<String>,
+    mut visit: impl FnMut(&str, std::io::Result<String>) -> Result<bool, E>,
 ) -> Result<(), E> {
     let mut visited: HashSet<String> = HashSet::new();
-    let mut stack: Vec<(String, PathBuf)> = vec![(
-        "requirements.txt".to_string(),
-        root.join("requirements.txt"),
-    )];
-    while let Some((rel, path)) = stack.pop() {
+    let mut stack: Vec<String> = vec!["requirements.txt".to_string()];
+    while let Some(rel) = stack.pop() {
         if !visited.insert(rel.clone()) {
             continue;
         }
-        let read = read_regular_to_string(&path).await;
+        let read = view.read_bytes(&rel).await.and_then(&decode);
         // Parse the includes BEFORE handing the content over (the visitor
         // takes it by value); nothing is pushed unless it asks to descend.
         let includes: Vec<String> = match &read {
             Ok(content) => requirements_includes(&rel, content),
             Err(_) => Vec::new(),
         };
-        if visit(&rel, &path, read)? {
-            for normalized in includes {
-                stack.push((normalized.clone(), root.join(&normalized)));
-            }
+        if visit(&rel, read)? {
+            stack.extend(includes);
         }
     }
     Ok(())
@@ -1200,6 +1195,46 @@ mod tests {
     use super::*;
     use crate::vendor::state::VendorArtifact;
 
+    /// #1120: [`requirements_include_names`] decodes each file as pip does,
+    /// so the includes of a UTF-16 root file (a Windows PowerShell 5.1
+    /// export) and of a PEP 263 include are named, not an `Err` that reads
+    /// as an unknowable tree.
+    #[tokio::test]
+    async fn requirements_include_names_decodes_as_pip_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let root_bytes: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(
+                "-r base.txt\r\nsix==1.16.0\r\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        tokio::fs::write(root.join("requirements.txt"), root_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("base.txt"),
+            b"# -*- coding: latin-1 -*-\n# Jos\xe9\n-r dev.txt\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root.join("dev.txt"), "pytest\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            requirements_include_names(root).await.unwrap(),
+            vec!["requirements.txt", "base.txt", "dev.txt"]
+        );
+        // The vendored planner, which rewrites byte-exact, still refuses
+        // a file that is not UTF-8.
+        let Err(err) = collect_requirements_files(root).await else {
+            panic!("a UTF-16 root file must be refused by the planner");
+        };
+        assert!(err.1.contains("is not UTF-8 text"), "{}", err.1);
+    }
+
     /// [`requirements_include_names`] names every file the planner may
     /// have pinned into — root first, nested includes resolved against the
     /// including file, a missing include still named but not descended —
@@ -1336,28 +1371,21 @@ mod tests {
 
     fn entry_for(wiring: Vec<WiringRecord>) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: REL_WHEEL.into(),
-                sha256: SHA.into(),
-                size: Some(11053),
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("requirements".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "pypi".into(),
+                "pkg:pypi/six@1.16.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: REL_WHEEL.into(),
+                    sha256: SHA.into(),
+                    size: Some(11053),
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
         }
     }
 
@@ -2792,7 +2820,7 @@ mod tests {
         let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
             .await
             .unwrap_err();
-        assert_eq!(err.0, "pypi_requirements_symlink_unsupported");
+        assert_eq!(err.0, crate::hosted::engine::SYMLINK_REFUSAL);
         assert!(std::fs::symlink_metadata(root.join("requirements.txt"))
             .unwrap()
             .file_type()
@@ -2818,7 +2846,7 @@ mod tests {
             outcome
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("pypi_requirements_symlink_unsupported")),
+                .is_some_and(|e| e.contains(crate::hosted::engine::SYMLINK_REFUSAL)),
             "{:?}",
             outcome.error
         );
@@ -2838,6 +2866,28 @@ mod tests {
     // ── in-use probe (#786) ───────────────────────────────────────────────
 
     const PROBE_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    /// The prune GC's in-use verdict for the requirements-flavored entry
+    /// of [`probe_vendor_line`]'s wheel
+    /// ([`crate::vex::discover::Discovery::vendor_entry_in_use`]).
+    async fn in_use(root: &Path) -> Option<bool> {
+        let entry: crate::vendor::state::VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/six@1.16.0",
+            "uuid": PROBE_UUID,
+            "artifact": {
+                "path": format!(".socket/vendor/pypi/{PROBE_UUID}/six-1.16.0-py2.py3-none-any.whl"),
+                "sha256": "",
+            },
+            "wiring": [],
+            "flavor": "requirements",
+        }))
+        .expect("a minimal vendor entry");
+        crate::vex::discover::discover_patched_refs(root)
+            .await
+            .vendor_entry_in_use(root, &entry)
+            .await
+    }
 
     fn probe_vendor_line(transitive: bool) -> String {
         vendor_line(
@@ -2877,7 +2927,7 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(
-                requirements_entry_in_use(root, PROBE_UUID).await,
+                in_use(root).await,
                 Some(true),
                 "root={root_txt:?} include={include:?}"
             );
@@ -2899,11 +2949,7 @@ mod tests {
             tokio::fs::write(tmp.path().join("requirements.txt"), &root_txt)
                 .await
                 .unwrap();
-            assert_eq!(
-                requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
-                Some(false),
-                "{root_txt:?}"
-            );
+            assert_eq!(in_use(tmp.path()).await, Some(false), "{root_txt:?}");
         }
         // A line for ANOTHER uuid (a superseding patch) does not keep this
         // one in use either.
@@ -2914,10 +2960,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
-            Some(false)
-        );
+        assert_eq!(in_use(tmp.path()).await, Some(false));
     }
 
     /// Nothing proves the entry unused when the tree cannot be read: no
@@ -2927,19 +2970,13 @@ mod tests {
     #[tokio::test]
     async fn in_use_probe_is_undeterminable_without_a_readable_tree() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(
-            requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
-            None
-        );
+        assert_eq!(in_use(tmp.path()).await, None);
 
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(tmp.path().join("requirements.txt"), "-r base.txt\n")
             .await
             .unwrap();
         mkfifo(&tmp.path().join("base.txt"));
-        assert_eq!(
-            requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
-            None
-        );
+        assert_eq!(in_use(tmp.path()).await, None);
     }
 }

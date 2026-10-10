@@ -27,6 +27,11 @@
 
 #![cfg_attr(windows, allow(dead_code, unused_imports))]
 
+#[path = "common/mod.rs"]
+mod common;
+use common::envelope::all_codes;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic_spawn;
 #[path = "prebuilt_common/mod.rs"]
@@ -53,10 +58,6 @@ const ROOT_BYTES: &str =
     "// managed by socket-patch\n//> using file .socket/vendor/coursier/socket-patch.scala\n";
 const GUARD_BYTES: &str = "// managed by socket-patch\n//> using repository file://${.}\n";
 const INDEX: &str = ".socket/vendor/coursier-index.tsv";
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
 
 fn purl(name: &str) -> String {
     format!("pkg:maven/org.example/{name}@1.0")
@@ -300,29 +301,6 @@ fn ok(root: &Path, home: &SbtHome, args: &[&str]) -> serde_json::Value {
     env
 }
 
-/// Every `code` / `errorCode` string anywhere in the envelope.
-fn codes(env: &serde_json::Value) -> Vec<String> {
-    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
-        match v {
-            serde_json::Value::Object(m) => {
-                for (k, v) in m {
-                    if k == "code" || k == "errorCode" {
-                        if let Some(s) = v.as_str() {
-                            out.push(s.to_string());
-                        }
-                    }
-                    walk(v, out);
-                }
-            }
-            serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(env, &mut out);
-    out
-}
-
 /// Every file under `proj`, minus the manifest, blobs and `.scala-build`
 /// (the inputs the tests stage).
 fn snapshot(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
@@ -371,7 +349,7 @@ mod hermetic {
         let env = ok(root, &home, &["vendor"]);
         assert_eq!(env["summary"]["applied"], 1, "{env}");
         assert!(
-            codes(&env).contains(&"vendor_scala_cli_directives_split".to_string()),
+            all_codes(&env).contains(&"vendor_scala_cli_directives_split".to_string()),
             "{env}"
         );
         let proj = root.join("proj");
@@ -489,7 +467,7 @@ mod hermetic {
             } else {
                 "vendor_scala_cli_resolution_missing"
             };
-            assert!(codes(&env).contains(&want.to_string()), "{case}: {env}");
+            assert!(all_codes(&env).contains(&want.to_string()), "{case}: {env}");
             assert_eq!(
                 env["summary"]["applied"], 0,
                 "{case}: a skip is not applied: {env}"
@@ -523,7 +501,10 @@ mod hermetic {
                 "vendor_scala_cli_resolution_missing",
                 "vendor_scala_cli_resolution_stale",
             ] {
-                assert!(!codes(&env).contains(&code.to_string()), "{case}: {env}");
+                assert!(
+                    !all_codes(&env).contains(&code.to_string()),
+                    "{case}: {env}"
+                );
             }
             ok(root, &home, &["vendor", "--check"]);
         }
@@ -555,7 +536,7 @@ mod hermetic {
                 "directive" => "vendor_scala_cli_repository_shadowed",
                 _ => "vendor_scala_cli_owned_file_modified",
             };
-            assert!(codes(&env).contains(&want.to_string()), "{case}: {env}");
+            assert!(all_codes(&env).contains(&want.to_string()), "{case}: {env}");
             assert_eq!(snapshot(root), before, "{case}: nothing is written");
         }
     }
@@ -605,7 +586,7 @@ fn windows_is_refused() {
     let (code, env) = socket(root, &home, &["vendor"]);
     assert_eq!(code, Some(1), "{env}");
     assert!(
-        codes(&env).contains(&"vendor_scala_cli_windows_unsupported".to_string()),
+        all_codes(&env).contains(&"vendor_scala_cli_windows_unsupported".to_string()),
         "{env}"
     );
     assert_eq!(snapshot(root), before);
@@ -800,13 +781,16 @@ mod real_tool {
         // The vendored GAV keeps being served: re-planned in sync, no
         // "not vendored" skip.
         let env = ok(&root, &home, &["vendor", "--offline"]);
-        assert!(!codes(&env).contains(&stale), "edited, not compiled: {env}");
+        assert!(
+            !all_codes(&env).contains(&stale),
+            "edited, not compiled: {env}"
+        );
         assert_eq!(env["summary"]["applied"], 0, "{env}");
         let (built, out) = run(&bin, &proj, &["compile", "--test", "."]);
         assert!(built, "{out}");
         let env = ok(&root, &home, &["vendor", "--offline"]);
         assert!(
-            !codes(&env).contains(&stale),
+            !all_codes(&env).contains(&stale),
             "edited, then compiled: {env}"
         );
         assert_eq!(env["summary"]["applied"], 0, "{env}");

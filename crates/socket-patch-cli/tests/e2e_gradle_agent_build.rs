@@ -12,6 +12,11 @@
 //! classifier jars, build logic, the build cache, the read-only cache) in a
 //! JSON probe report per cell.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::envelope::codes_in;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
@@ -51,10 +56,6 @@ fn jar_leaf() -> String {
 
 fn coordinate() -> String {
     format!("{GROUP}:{VICTIM}:{VICTIM_VERSION}")
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -378,18 +379,8 @@ impl Cell {
     }
 }
 
-/// The warning codes of an envelope.
-fn codes(json: &serde_json::Value) -> Vec<String> {
-    json["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|w| w["code"].as_str().map(str::to_string))
-        .collect()
-}
-
 fn has(json: &serde_json::Value, code: &str) -> bool {
-    codes(json).iter().any(|c| c == code)
+    codes_in(&json["warnings"]).iter().any(|c| c == code)
 }
 
 /// Every file under `dir` with its sha1 (the cache trees a rollback must
@@ -940,7 +931,7 @@ fn gradle_agent_cache_semantics_canaries() {
     let stale = has(&json, "gradle_transform_copy_stale");
     report.insert("f_applyReportsStaleTransforms".into(), stale.into());
     report.insert("applyExit".into(), code.into());
-    report.insert("applyWarnings".into(), codes(&json).into());
+    report.insert("applyWarnings".into(), codes_in(&json["warnings"]).into());
     assert!(
         code == Some(0) || stale,
         "apply may only fail over derived copies it names: {json}"
@@ -1046,7 +1037,10 @@ fn gradle_agent_cache_semantics_canaries() {
     // instruments the patched jar anew.
     let (statements, vex_json) = c.vex(&[]);
     report.insert("f_vexStatementsBeforeClear".into(), statements.into());
-    report.insert("f_vexWarningsBeforeClear".into(), codes(&vex_json).into());
+    report.insert(
+        "f_vexWarningsBeforeClear".into(),
+        codes_in(&vex_json["warnings"]).into(),
+    );
     let caches = c.home.join("caches");
     for entry in std::fs::read_dir(&caches).unwrap().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1066,7 +1060,10 @@ fn gradle_agent_cache_semantics_canaries() {
     );
     let (statements, vex_json) = c.vex(&[]);
     report.insert("f_vexStatementsAfterClear".into(), statements.into());
-    report.insert("f_vexWarningsAfterClear".into(), codes(&vex_json).into());
+    report.insert(
+        "f_vexWarningsAfterClear".into(),
+        codes_in(&vex_json["warnings"]).into(),
+    );
     assert!(
         statements > 0 && !has(&vex_json, "vex_gradle_unpatched_copy"),
         "(f) VEX must attest every record once the derived caches are rebuilt from the patched \

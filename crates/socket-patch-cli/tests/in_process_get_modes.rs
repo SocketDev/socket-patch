@@ -59,7 +59,6 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
             api_token: Some("fake-token-for-tests".to_string()),
             api_url: Some(api_url),
             json: true,
-            download_mode: "diff".to_string(),
             vendor_source: "service".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
@@ -739,7 +738,7 @@ async fn get_ghsa_hosted_counts_lockfile_resolved_as_present() {
 }
 
 /// The SAME fresh clone in AGENT mode skips the lockfile-only version
-/// (scan parity: `--apply` partitions lockfile-only purls out as
+/// (scan parity: `--mode agent` partitions lockfile-only purls out as
 /// `package_not_installed`) — nothing recorded, nothing fetched.
 #[tokio::test]
 #[serial]

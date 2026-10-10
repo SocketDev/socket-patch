@@ -19,7 +19,7 @@
 //! | composer | package dir         | composer.lock `dist` → `{type: path}`          |
 //! | gem      | gem dir (+gemspec)  | Gemfile `path:` + Gemfile.lock PATH pair       |
 //! | pypi     | rebuilt wheel       | per manifest flavor: uv, poetry, pdm, pipenv, requirements ([`pypi`] routes) |
-//! | maven    | rebuilt jar         | committed `file://` maven2 repo + pom `<repository>` ([`maven_repo`]) |
+//! | maven    | patched jar         | suffixed `<version>-socket.<hex8>` tree under `.socket/vendor/maven2` + pom pin, `.mvn/maven.config` (or Gradle / sbt / scala-cli wiring) ([`maven_repo`] routes to [`jvm`]) |
 //! | nuget    | rebuilt nupkg       | folder feed + `nuget.config` + `packages.lock.json` pin ([`nuget_feed`]) |
 //!
 //! npm requests route through [`npm_flavor`], which content-sniffs the
@@ -95,6 +95,7 @@ mod pypi_wheel;
 pub mod redownload;
 pub mod registry_fetch;
 pub(crate) mod reuse;
+pub(crate) mod revert;
 pub(crate) mod service_fetch;
 pub mod source;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -129,8 +130,8 @@ pub use verify::{
 };
 // The hosted→vendored takeover refuses a berry project the backend would
 // refuse BEFORE it reverts the hosted redirect.
-pub use npm_lock::npm_lock_vendor_preflight;
 pub use npm_common::npm_tarball_gitignore_preflight;
+pub use npm_lock::npm_lock_vendor_preflight;
 pub use yarn_berry_lock::{yarn_berry_vendor_preflight, yarn_berry_vendor_target_preflight};
 
 use std::collections::{HashMap, HashSet};
@@ -149,11 +150,18 @@ pub struct VendorWarning {
 }
 
 impl VendorWarning {
+    /// Every URL quoted in `detail` is redacted
+    /// ([`crate::utils::redact::redact_urls_in`]): a vendor warning lands in
+    /// `--json` events and CI logs, and the URLs it quotes (service grant
+    /// URLs, GOPROXY / `.npmrc` / private-index registries) carry
+    /// credentials.
     pub fn new(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            code,
-            detail: detail.into(),
-        }
+        let detail = detail.into();
+        let detail = match crate::utils::redact::redact_urls_in(&detail) {
+            std::borrow::Cow::Borrowed(_) => detail,
+            std::borrow::Cow::Owned(redacted) => redacted,
+        };
+        Self { code, detail }
     }
 }
 
@@ -196,6 +204,50 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
     ))
 }
 
+/// Advisory probe (#691): does this yarn classic workspaces project carry
+/// vendored wiring that installs from a workspace member directory cannot
+/// fetch?
+///
+/// Vendored mode wires `resolved "file:./.socket/vendor/…"`, relative to
+/// the workspace root that holds `yarn.lock`. Yarn 1 resolves a relative
+/// `file:` tarball against the directory it runs in, so on a cold cache
+/// every `yarn install` / `yarn add` run from a member directory (and
+/// `yarn workspace <name> …`, which runs there) fails with "Tarball is not
+/// in network and can not be located in cache", whether or not the member
+/// depends on the patched package. No relative spelling works from both
+/// (measured on yarn 1.7.0, 1.10.1 and 1.22.22). Returns the warning when
+/// `yarn.lock` is classic with such a `file:./` resolution and the root
+/// `package.json` declares workspaces. State-based, like
+/// [`yarn_classic_berry_migration_risk`].
+pub fn yarn_classic_workspace_member_risk(project_root: &Path) -> Option<VendorWarning> {
+    let lock = read_regular_to_string_sync(&project_root.join("yarn.lock")).ok()?;
+    if !lock.contains("# yarn lockfile v1") || !lock.contains("\"file:./.socket/vendor/") {
+        return None;
+    }
+    let manifest = read_regular_to_string_sync(&project_root.join("package.json")).ok()?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(crate::formats::text::strip_bom(&manifest)).ok()?;
+    let workspaces = manifest.get("workspaces")?;
+    let globs = workspaces.as_array().or_else(|| {
+        workspaces
+            .get("packages")
+            .and_then(serde_json::Value::as_array)
+    })?;
+    if globs.is_empty() {
+        return None;
+    }
+    Some(VendorWarning::new(
+        "yarn_classic_workspace_member_install_risk",
+        "yarn.lock is yarn-classic (v1) in a workspaces project and its vendored entries \
+         resolve `file:./.socket/vendor/…` tarballs, which yarn 1 looks up relative to the \
+         directory it runs in: on a cold yarn cache, `yarn install`, `yarn add` or `yarn \
+         workspace <name> …` run from a workspace member directory fails (\"Tarball is not \
+         in network\"). Run `yarn install` from the workspace root (which also warms the \
+         cache for later member-directory commands), or patch this project with `--mode \
+         hosted`.",
+    ))
+}
+
 /// Whether a root `package.json` text pins yarn classic through corepack's
 /// `packageManager: yarn@1…`, which makes a stray yarn 2+ (berry) install
 /// refuse instead of migrating a classic `yarn.lock` and dropping its
@@ -212,7 +264,7 @@ pub(crate) fn manifest_pins_yarn_classic(manifest: Option<&str>) -> bool {
     else {
         return false;
     };
-    let major = pm.trim().strip_prefix("yarn@").map(|rest| {
+    let major = crate::utils::package_manager::pinned_version(&pm, "yarn").map(|rest| {
         rest.chars()
             .take_while(char::is_ascii_digit)
             .collect::<String>()
@@ -284,9 +336,9 @@ const ARCHIVE_PREFETCH_BYTES: usize = 128 * 1024 * 1024;
 
 impl VendorServiceConfig {
     /// Whether this run may actually attempt a service download right now:
-    /// the mode permits it, we're online, and a client is configured.
+    /// we're online and a client is configured.
     pub fn service_enabled(&self) -> bool {
-        self.source.may_use_service() && !self.offline && self.client.is_some()
+        !self.offline && self.client.is_some()
     }
 
     /// Whether a run through this config would prefetch service downloads
@@ -622,6 +674,18 @@ fn harvest_zip_blobs(path: &Path, wanted: &[(String, String)]) -> HashMap<String
     out
 }
 
+/// Warning code on a failed npm-family [`VendorOutcome::Done`]: the patch
+/// service is still building the patch's prebuilt artifact. With
+/// [`VENDOR_PREBUILT_UNAVAILABLE`], it tells the vendor loop the patch is not
+/// served (yet), not broken: a package already vendored at an older patch
+/// keeps it and is reported as skipped (#954), the way hosted mode keeps
+/// its pin.
+pub const VENDOR_PREBUILT_PENDING: &str = "vendor_prebuilt_pending";
+/// Warning code on a failed npm-family [`VendorOutcome::Done`]: the patch
+/// service has no artifact for the patch (`build_failed`, `not_found`,
+/// `withdrawn`, …). See [`VENDOR_PREBUILT_PENDING`].
+pub const VENDOR_PREBUILT_UNAVAILABLE: &str = "vendor_prebuilt_unavailable";
+
 /// The result of one backend `vendor_*` call.
 //
 // `large_enum_variant`: `Done` is much bigger than `Refused` because it carries
@@ -673,6 +737,12 @@ impl RevertOpts {
 /// Warning code for a recorded lock entry that no longer exists at revert
 /// time (the dependency was removed). See [`RevertOutcome::lock_entry_removed`].
 pub const LOCK_ENTRY_REMOVED_CODE: &str = "vendor_lock_entry_removed";
+
+/// A PyPI revert restored the wiring it recorded, but another project file
+/// (a `pipenv requirements` / `uv export` / `poetry export` requirements
+/// file, a moved vendor line) still installs from the vendored wheel, so
+/// the artifact and ledger entry are kept until nothing references them.
+pub const RESIDUAL_REFERENCE_CODE: &str = "vendor_revert_residual_reference";
 
 /// The result of one backend `revert_*` call.
 #[derive(Debug)]
@@ -747,6 +817,36 @@ impl RevertOutcome {
         self.warnings
             .iter()
             .any(|w| w.code == LOCK_ENTRY_REMOVED_CODE)
+    }
+
+    /// True when the artifact was kept ONLY because another project file
+    /// still references it ([`RESIDUAL_REFERENCE_CODE`]): the recorded
+    /// wiring was restored and nothing drifted, so the way out is to point
+    /// that file back at the registry release, not to undo a drift (#1184).
+    pub fn kept_for_residual_reference(&self) -> bool {
+        self.kept_artifact
+            && !self.drift_skipped()
+            && self
+                .warnings
+                .iter()
+                .any(|w| w.code == RESIDUAL_REFERENCE_CODE)
+    }
+
+    /// [`Self::keep_artifact`] for a residual-reference keep: the wiring
+    /// was restored, but a project file the revert does not own still
+    /// installs from `uuid_dir_rel` (named by the
+    /// [`RESIDUAL_REFERENCE_CODE`] warning).
+    pub fn keep_artifact_for_reference(&mut self, uuid_dir_rel: &str) {
+        self.kept_artifact = true;
+        self.warnings.push(VendorWarning::new(
+            "vendor_artifact_kept",
+            format!(
+                "kept {uuid_dir_rel}: the recorded wiring was restored, but a project file \
+                 still installs from it (see the vendor_revert_residual_reference warning); \
+                 point that file back at the registry release (or re-export it from the \
+                 restored lock) and re-run the revert to finish cleaning up"
+            ),
+        ));
     }
 
     /// Mark the artifact dir as deliberately kept after a drift-skip and
@@ -859,6 +959,42 @@ pub async fn lock_text_refusals(
         }
     }
     refusals
+}
+
+/// [`lock_text_refusals`] for npm `candidates` a HOSTED pin wires, in a
+/// pnpm (lockfileVersion 9) project only — the refusals a hosted → vendored
+/// takeover of them meets after it restores the registry entry (#853), so
+/// a dry-run preview can name them without staging the restore (which
+/// needs the registry). Empty for every other flavor.
+///
+/// Evaluating the gates on the still-hosted lock is exact for pnpm: the
+/// hosted restore only splices each entry's `resolution:` value, which no
+/// pnpm gate reads (coordinates, CRLF, catalogs, overrides, entry presence
+/// and ref rewritability all key on other text). The one difference is a
+/// `pnpm-workspace.yaml` scaffold hosted mode created, which the restore
+/// deletes; a gate that depended on it would make this under-predict, and
+/// the wet run still refuses. Yarn's restores rewrite key and checksum
+/// text, and legacy pnpm 7/8 locks (5.4 / 6.0) are not lock-text gated at
+/// all, so neither is predicted here: a CRLF legacy lock, an override
+/// conflict or an unsupported legacy entry previews `would_vendor` while
+/// the wet takeover refuses it (keeping the hosted pin, #963) — a known
+/// preview gap the contract names.
+pub async fn pnpm_takeover_lock_text_refusals(
+    project_root: &Path,
+    candidates: &[(&str, &str)],
+) -> HashMap<String, (&'static str, String)> {
+    if !matches!(
+        npm_flavor::detect_npm_lock_flavor(project_root).await,
+        Ok((npm_flavor::NpmLockFlavor::Pnpm, _))
+    ) {
+        return HashMap::new();
+    }
+    let npm: Vec<(&str, &str)> = candidates
+        .iter()
+        .filter(|(purl, _)| ecosystem_dir_for_purl(purl) == Some("npm"))
+        .copied()
+        .collect();
+    lock_text_refusals(project_root, &npm).await
 }
 
 /// [`VendorState::purl_keys`] over the ledger in `project_root`, loaded
@@ -1867,6 +2003,28 @@ mod harvest_tests {
 }
 
 #[cfg(test)]
+mod vendor_warning_redaction_tests {
+    use super::*;
+
+    /// A vendor warning lands in `--json` events and CI logs: every URL its
+    /// detail quotes is redacted at construction, whoever builds it.
+    #[test]
+    fn a_vendor_warning_never_carries_a_credential() {
+        let w = VendorWarning::new(
+            "vendor_registry_fetch_failed",
+            "GET https://u:p@h.example/patch/npm/a/1.0.0/TOK/7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d/a.tgz: \
+             HTTP 404 (GOPROXY=https://proxy.golang.org,https://bot:ghp_X@goproxy.corp,direct)",
+        );
+        for needle in ["TOK", "u:p", "bot:ghp_X"] {
+            assert!(!w.detail.contains(needle), "{needle}: {}", w.detail);
+        }
+        assert!(w.detail.contains("HTTP 404"), "{}", w.detail);
+        let plain = VendorWarning::new("c", "no url here");
+        assert_eq!(plain.detail, "no url here");
+    }
+}
+
+#[cfg(test)]
 mod berry_migration_risk_tests {
     use super::*;
 
@@ -1983,6 +2141,46 @@ mod berry_migration_risk_tests {
         assert!(probe_with_timeout(tmp.path(), &fifo).is_some());
     }
 
+    /// #691: yarn 1 resolves a relative `file:` tarball in `resolved`
+    /// against the directory it runs in, not the one holding yarn.lock, so
+    /// in a workspaces project every cold-cache install run from a member
+    /// directory fails once vendoring wires one. Measured on yarn 1.7.0,
+    /// 1.10.1 and 1.22.22; no relative spelling installs from both.
+    #[test]
+    fn issue_691_wired_classic_workspaces_warn_about_member_dir_installs() {
+        for workspaces in [r#"["a","b"]"#, r#"{"packages":["packages/*"]}"#] {
+            let pkg = format!(r#"{{"name":"root","private":true,"workspaces":{workspaces}}}"#);
+            let tmp = project(Some(WIRED_V1), Some(&pkg));
+            let w = yarn_classic_workspace_member_risk(tmp.path()).expect("must warn");
+            assert_eq!(w.code, "yarn_classic_workspace_member_install_risk");
+            assert!(
+                w.detail.contains("member directory") && w.detail.contains("workspace root"),
+                "detail names the trap and the remedy: {}",
+                w.detail
+            );
+        }
+        // No workspaces, empty workspaces, an unwired or berry lock, or
+        // no manifest: nothing installs from a member directory through
+        // our wiring.
+        for (lock, pkg) in [
+            (Some(WIRED_V1), Some(r#"{"name":"x"}"#)),
+            (Some(WIRED_V1), Some(r#"{"name":"x","workspaces":[]}"#)),
+            (
+                Some(WIRED_V1),
+                Some(r#"{"name":"x","workspaces":{"packages":[]}}"#),
+            ),
+            (Some(WIRED_V1), None),
+            (Some(UNWIRED_V1), Some(r#"{"name":"x","workspaces":["a"]}"#)),
+            (None, Some(r#"{"name":"x","workspaces":["a"]}"#)),
+        ] {
+            let tmp = project(lock, pkg);
+            assert!(
+                yarn_classic_workspace_member_risk(tmp.path()).is_none(),
+                "{lock:?} {pkg:?}"
+            );
+        }
+    }
+
     #[test]
     fn malformed_or_missing_package_json_still_warns() {
         // Fail toward warning: an unreadable pin must not silently vouch
@@ -1991,5 +2189,73 @@ mod berry_migration_risk_tests {
         assert!(yarn_classic_berry_migration_risk(tmp.path()).is_some());
         let tmp = project(Some(WIRED_V1), None);
         assert!(yarn_classic_berry_migration_risk(tmp.path()).is_some());
+    }
+}
+
+#[cfg(test)]
+mod pnpm_takeover_lock_text_refusal_tests {
+    use super::pnpm_takeover_lock_text_refusals;
+
+    const PURL: &str = "pkg:npm/left-pad@1.3.0";
+    const UUID: &str = "11111111-2222-4333-8444-555555555555";
+    /// A hosted pin: the entry's tarball is the patch server's.
+    const HOSTED_V9: &str = "lockfileVersion: '9.0'\n\n\
+        importers:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\n\
+        packages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-x==, tarball: https://patch.socket.dev/patch/npm/left-pad/1.3.0/a/11111111-2222-4333-8444-555555555555/left-pad-1.3.0.tgz}\n\n\
+        snapshots:\n\n  left-pad@1.3.0: {}\n";
+
+    fn project(lock_name: &str, lock: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"c","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(lock_name), lock).unwrap();
+        tmp
+    }
+
+    #[tokio::test]
+    async fn crlf_hosted_pnpm_lock_is_refused() {
+        let tmp = project("pnpm-lock.yaml", &HOSTED_V9.replace('\n', "\r\n"));
+        let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
+        assert_eq!(
+            refused.get(PURL).map(|(code, _)| *code),
+            Some("vendor_lockfile_crlf_unsupported"),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_hosted_pnpm_pin_is_not_refused() {
+        let tmp = project("pnpm-lock.yaml", HOSTED_V9);
+        let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
+        assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    /// Only pnpm is predicted: a CRLF yarn classic lock over the same purl
+    /// yields nothing here (its restore rewrites the text the gates read).
+    #[tokio::test]
+    async fn yarn_classic_project_is_out_of_scope() {
+        let lock = "# yarn lockfile v1\r\n\r\n\r\nleft-pad@1.3.0:\r\n  version \"1.3.0\"\r\n  \
+            resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#abc\"\r\n";
+        let tmp = project("yarn.lock", lock);
+        let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
+        assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    /// A known preview gap (CLI_CONTRACT, #853): a legacy pnpm 7/8 lock
+    /// (5.4 / 6.0) is not lock-text gated, so even a CRLF one the wet
+    /// takeover refuses (`vendor_lockfile_crlf_unsupported`) previews
+    /// `would_vendor`. The wet run's refusal keeps the hosted pin (#963).
+    #[tokio::test]
+    async fn legacy_pnpm_project_is_out_of_scope() {
+        let lock = "lockfileVersion: '6.0'\r\n\r\ndependencies:\r\n  left-pad:\r\n    \
+            specifier: 1.3.0\r\n    version: 1.3.0\r\n\r\npackages:\r\n\r\n  \
+            /left-pad@1.3.0:\r\n    resolution: {integrity: sha512-x==, tarball: \
+            https://patch.socket.dev/patch/npm/left-pad/1.3.0/a/{UUID}/left-pad-1.3.0.tgz}\r\n";
+        let tmp = project("pnpm-lock.yaml", &lock.replace("{UUID}", UUID));
+        let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
+        assert!(refused.is_empty(), "{refused:?}");
     }
 }

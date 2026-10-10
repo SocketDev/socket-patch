@@ -38,6 +38,12 @@ pub mod hermetic;
 
 pub use hermetic::command as hermetic_command;
 
+/// Readers for the `--json` envelope (parse, `events[]`, error and warning
+/// codes).
+pub mod envelope;
+
+pub use envelope::{envelope_error_code, envelope_error_message, json_string, parse_json_envelope};
+
 // ── Binary discovery + invocation ─────────────────────────────────────
 
 /// Absolute path to the built `socket-patch` binary that cargo
@@ -393,36 +399,6 @@ pub fn write_blob(socket_dir: &Path, hash: &str, content: &[u8]) {
     std::fs::write(blobs.join(hash), content).expect("write blob");
 }
 
-/// Parse `--json` apply output, returning the top-level JSON object
-/// or panicking with the raw text on parse failure. Most safety tests
-/// want to assert on specific fields (`errorCode`, `status`, etc.).
-pub fn parse_json_envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("failed to parse JSON envelope: {e}\nstdout:\n{stdout}"))
-}
-
-/// Extract a stringified field from a parsed JSON envelope, or None
-/// if the field is missing / not a string. Convenience for the
-/// `status` checks the safety tests do repeatedly.
-pub fn json_string<'a>(env: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    env.get(key).and_then(|v| v.as_str())
-}
-
-/// Extract `env.error.code` from a parsed envelope. The v3.0
-/// envelope shape nests the error under a top-level `error` object
-/// (`{"error": {"code": "lock_held", "message": "..."}}`), not at
-/// the top level. This helper centralises that lookup so individual
-/// tests can stay terse.
-pub fn envelope_error_code(env: &serde_json::Value) -> Option<&str> {
-    env.get("error")?.get("code")?.as_str()
-}
-
-/// Extract `env.error.message` from a parsed envelope. Companion to
-/// [`envelope_error_code`].
-pub fn envelope_error_message(env: &serde_json::Value) -> Option<&str> {
-    env.get("error")?.get("message")?.as_str()
-}
-
 /// Map a slice of `(env-var-name, env-var-value)` tuples into a
 /// HashMap for callers that want a stable container.
 pub fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -575,10 +551,9 @@ mod oracle_selftests {
         // back and confirm it equals hashing the same bytes in memory,
         // and that distinct contents produce distinct hashes (i.e. it
         // isn't returning a constant or hashing the path).
-        let dir = std::env::temp_dir();
-        let unique = format!("socket-patch-oracle-{}", std::process::id());
-        let p1 = dir.join(format!("{unique}-a.bin"));
-        let p2 = dir.join(format!("{unique}-b.bin"));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p1 = dir.path().join("a.bin");
+        let p2 = dir.path().join("b.bin");
         let content_a = b"alpha-content\n";
         let content_b = b"beta-content\n";
         std::fs::write(&p1, content_a).expect("write temp a");
@@ -591,21 +566,6 @@ mod oracle_selftests {
             git_sha256_file(&p2),
             "git_sha256_file must reflect file contents"
         );
-
-        let _ = std::fs::remove_file(&p1);
-        let _ = std::fs::remove_file(&p2);
-    }
-
-    // Unique temp dir per (pid, callsite) so the fixture-builder self-tests
-    // never collide with each other or across parallel test binaries.
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "socket-patch-oracle-{}-{}",
-            std::process::id(),
-            tag
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        d
     }
 
     #[test]
@@ -616,8 +576,8 @@ mod oracle_selftests {
         // the suites would pass while exercising nothing. Pin the exact shape
         // apply consumes: `patches.<purl>.{uuid,files.<file>.{beforeHash,
         // afterHash}}`, all camelCase.
-        let root = scratch_dir("manifest");
-        let socket_dir = root.join(".socket");
+        let root = tempfile::tempdir().expect("temp dir");
+        let socket_dir = root.path().join(".socket");
         let purl = "pkg:npm/dummy@1.0.0";
         let uuid = "11111111-1111-4111-8111-111111111111";
         let path = write_minimal_manifest(
@@ -669,8 +629,6 @@ mod oracle_selftests {
             !socket_dir.join("blobs").join("afterhash111").exists(),
             "write_minimal_manifest must not stage after_hash blobs"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -679,8 +637,8 @@ mod oracle_selftests {
         // `<socket_dir>/blobs/<hash>` and verifies their bytes. If write_blob
         // wrote the wrong path or mangled the bytes, "offline apply succeeds"
         // tests would silently fall back to a network path or fail to match.
-        let root = scratch_dir("blob");
-        let socket_dir = root.join(".socket");
+        let root = tempfile::tempdir().expect("temp dir");
+        let socket_dir = root.path().join(".socket");
         let hash = "deadbeefcafef00d";
         let payload = &[0u8, 1, 2, 255, b'p', b'a', b't', b'c', b'h', 0, 42];
         write_blob(&socket_dir, hash, payload);
@@ -696,8 +654,6 @@ mod oracle_selftests {
             payload,
             "write_blob must stage the exact bytes, byte-for-byte"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

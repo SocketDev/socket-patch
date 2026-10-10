@@ -11,16 +11,22 @@
 
 #![cfg(feature = "docker-e2e")]
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 use std::process::Command;
 
 use base64::Engine;
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:maven/org.apache.commons/commons-lang3@3.12.0";
 const UUID: &str = "16161616-1616-4161-8161-161616161616";
+/// Google's official Maven Central mirror, the in-container download's
+/// retry target (Central's CDN answers shared runner IPs with 429s).
+const CENTRAL_FALLBACK: &str = "https://maven-central.storage-download.googleapis.com/maven2";
 /// The vulnerability the staged manifest carries so the agent-mode VEX leg
 /// has something to attest (plain agent provenance — no vendored/redirected
 /// marker — is what the host oracle asserts).
@@ -53,14 +59,6 @@ fn cov_docker_args() -> Vec<String> {
         "-e".into(),
         "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
     ]
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 async fn make_mock_server(after_hash: &str) -> MockServer {
@@ -169,11 +167,38 @@ cat > pom.xml <<'EOF'
 </project>
 EOF
 
-# Download the real artifact into ~/.m2/repository.
-mvn -q dependency:get \
-  -Dartifact=org.apache.commons:commons-lang3:3.12.0 \
-  -DremoteRepositories=https://repo.maven.apache.org/maven2 \
-  > /tmp/install.log 2>&1 || {{ cat /tmp/install.log >&2; exit 1; }}
+# Download the real artifact into ~/.m2/repository. Central's CDN
+# rate-limits shared runner IPs with 429s, which Maven reports as an
+# absent artifact, so retries go through Google's official Central
+# mirror (a separate CDN, as in maven_build_common's warm-up).
+# The mirror keeps the id `central`, and -U drops the cached misses.
+cat > /tmp/mirror-settings.xml <<'EOF'
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+  <mirrors>
+    <mirror>
+      <id>central</id>
+      <mirrorOf>central</mirrorOf>
+      <url>{CENTRAL_FALLBACK}</url>
+    </mirror>
+  </mirrors>
+</settings>
+EOF
+for attempt in 1 2 3; do
+  if [ "$attempt" = 1 ]; then
+    mvn -q dependency:get \
+      -Dartifact=org.apache.commons:commons-lang3:3.12.0 \
+      -DremoteRepositories=https://repo.maven.apache.org/maven2 \
+      > /tmp/install.log 2>&1 && break
+  else
+    mvn -q -U -s /tmp/mirror-settings.xml dependency:get \
+      -Dartifact=org.apache.commons:commons-lang3:3.12.0 \
+      -DremoteRepositories={CENTRAL_FALLBACK} \
+      > /tmp/install.log 2>&1 && break
+  fi
+  if [ "$attempt" = 3 ]; then cat /tmp/install.log >&2; exit 1; fi
+  echo "mvn dependency:get attempt $attempt failed; retrying via the Central mirror" >&2
+  sleep $((attempt * 5))
+done
 
 POM_FILE="$HOME/.m2/repository/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom"
 [ -f "$POM_FILE" ] || {{ echo "FAIL: $POM_FILE missing" >&2; exit 1; }}

@@ -10,6 +10,10 @@
 //! self-contained tempdir project driven through the built binary with a
 //! scrubbed child environment. No test mutates this process's environment.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -32,10 +36,6 @@ const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 /// its deletion guard on). Mirrors the stale-doc fixture in
 /// `e2e_vex_vendor.rs`.
 const STALE_OPENVEX_DOC: &str = r#"{"@context":"https://openvex.dev/ns/v0.2.0","@id":"urn:uuid:stale","author":"Socket","timestamp":"2020-01-01T00:00:00Z","version":1,"statements":[]}"#;
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// CLI invocation with the ambient `SOCKET_*` environment scrubbed (same
 /// rationale as `e2e_vex.rs`: explicit flags must be the sole source of
@@ -748,11 +748,11 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
     let mut state = VendorState::new();
     state.entries.insert(
         purl.to_string(),
-        VendorEntry {
-            ecosystem: "golang".to_string(),
-            base_purl: purl.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "golang".to_string(),
+            purl.to_string(),
+            UUID.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
@@ -760,7 +760,7 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![WiringRecord {
+            vec![WiringRecord {
                 file: "go.mod".to_string(),
                 kind: "go_replace".to_string(),
                 action: WiringAction::Added,
@@ -768,17 +768,7 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 original: None,
                 new: None,
             }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
+        ),
     );
     let dir = cwd.join(".socket/vendor");
     std::fs::create_dir_all(&dir).unwrap();

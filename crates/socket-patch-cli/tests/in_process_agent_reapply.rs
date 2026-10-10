@@ -40,7 +40,6 @@ fn common(cwd: &Path, server: &MockServer) -> socket_patch_cli::args::GlobalArgs
         yes: true,
         api_token: Some("fake".to_string()),
         api_url: Some(server.uri()),
-        download_mode: "diff".to_string(),
         ..socket_patch_cli::args::GlobalArgs::default()
     }
 }
@@ -52,10 +51,8 @@ fn scan_args(cwd: &Path, server: &MockServer) -> ScanArgs {
         packages: Vec::new(),
         common: common(cwd, server),
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),

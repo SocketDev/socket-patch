@@ -3,8 +3,8 @@
 //! Calls `socket_patch_cli::commands::scan::run` directly so coverage
 //! is fully instrumented. Mocks the API via wiremock. Hits every flag
 //! combination that the subprocess-based tests don't explicitly
-//! exercise (non-JSON paths, --apply without --prune, --prune without
-//! --apply, --batch-size variations).
+//! exercise (non-JSON paths, --mode agent without --prune, --prune without
+//! --mode agent, --batch-size variations).
 
 use std::path::Path;
 
@@ -74,15 +74,12 @@ fn default_args(cwd: &Path) -> ScanArgs {
             global_prefix: None,
             api_token: Some("fake".to_string()),
             ecosystems: None,
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
@@ -292,7 +289,7 @@ async fn scan_installed_package_discovers_patch() {
 }
 
 // ---------------------------------------------------------------------------
-// --apply (without --prune)
+// --mode agent (without --prune)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -307,7 +304,7 @@ async fn scan_apply_dry_run_does_not_write() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
     args.common.dry_run = true;
 
     assert_eq!(run_scrubbed(args).await, 0);
@@ -320,12 +317,12 @@ async fn scan_apply_dry_run_does_not_write() {
         "dry-run must not download/write any blobs"
     );
     // Prove the apply path was actually entered (not short-circuited before
-    // --apply did anything): a dry-run --apply still fetches patch details
+    // --mode agent did anything): a dry-run --mode agent still fetches patch details
     // via the by-package endpoint to synthesize the preview.
     let reqs = recorded(&server).await;
     assert!(
         batch_posts(&reqs).len() == 1 && by_package_gets(&reqs) >= 1,
-        "dry-run --apply must query batch + patch details; \
+        "dry-run --mode agent must query batch + patch details; \
          batch={}, by_package={}",
         batch_posts(&reqs).len(),
         by_package_gets(&reqs),
@@ -345,7 +342,7 @@ async fn scan_apply_wet_writes_manifest_and_blob() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
 
     let code = run_scrubbed(args).await;
     // Apply over our handcrafted node_modules deterministically reports
@@ -484,7 +481,7 @@ async fn scan_apply_picks_critical_over_more_recent_low_for_paid_user() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
 
     run_scrubbed(args).await;
 
@@ -524,7 +521,7 @@ async fn scan_apply_picks_critical_for_free_user_via_ranked_prompt_order() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
 
     run_scrubbed(args).await;
 
@@ -632,7 +629,7 @@ async fn scan_apply_picks_the_more_recently_published_patch_when_severity_ties()
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
 
     run_scrubbed(args).await;
 
@@ -668,7 +665,7 @@ async fn scan_apply_picks_the_more_recently_published_patch_when_severity_ties()
 // `scan_invariants::scan_update_candidate_is_the_highest_ranked_patch`.
 
 // ---------------------------------------------------------------------------
-// --prune (without --apply)
+// --prune (without --mode agent)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -778,7 +775,7 @@ async fn scan_prune_only_wet_removes_orphans() {
 }
 
 // ---------------------------------------------------------------------------
-// --sync (== --apply --prune)
+// --sync (== --mode agent --prune)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -797,7 +794,7 @@ async fn scan_sync_full_cycle_against_clean_project() {
     args.sync = true;
 
     let code = run_scrubbed(args).await;
-    // --sync == --apply --prune; apply over the hash-mismatched fixture file
+    // --sync == --mode agent --prune; apply over the hash-mismatched fixture file
     // deterministically partial-fails (exit 1) just like the apply-wet case.
     assert_eq!(
         code, 1,
@@ -932,10 +929,13 @@ async fn scan_non_json_with_patches_prints_table() {
 
     let code = run_scrubbed(args).await;
     // Non-JSON path: discovery → batch query → render table → fetch
-    // per-package details. We only mount the batch mock, so detail-fetch
-    // 404s and scan exits 1 ("Error: could not fetch patch details"). That exit is
-    // deterministic given these mocks.
-    assert_eq!(code, 1, "missing detail mock → detail fetch fails → exit 1");
+    // per-package details. We only mount the batch mock, so the detail
+    // query 404s, which the client reads as "no records": nothing to
+    // select, a clean exit 0, exactly like the `--json` arm (#1062).
+    assert_eq!(
+        code, 0,
+        "an empty detail result is no patch to apply, not a failure"
+    );
     // Prove the table-rendering path actually ran against real discovered
     // data: the batch endpoint was queried with the package, and the path
     // proceeded to the per-package detail fetch (i.e. it had a row to print).
@@ -1071,7 +1071,7 @@ async fn scan_apply_all_detail_queries_failed_is_an_error() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
 
     let code = run_scrubbed(args).await;
 
@@ -1081,7 +1081,7 @@ async fn scan_apply_all_detail_queries_failed_is_an_error() {
     );
     assert_ne!(
         code, 0,
-        "scan --json --apply must report failure when EVERY patch-detail \
+        "scan --json --mode agent must report failure when EVERY patch-detail \
          query errors; exit 0 masks a total API outage as 'no patches'"
     );
 }
@@ -1477,7 +1477,7 @@ async fn scan_discovers_maven_and_nuget_in_every_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// Regression: `scan --vendor --dry-run --vex` must skip the embedded VEX.
+// Regression: `scan --mode vendored --dry-run --vex` must skip the embedded VEX.
 //
 // The vendor JSON dry-run arm handed base_code 0 straight to
 // `embed_vex_into_json`, which generated the document for real: on a
@@ -1501,7 +1501,7 @@ async fn scan_vendor_dry_run_with_vex_does_not_fail_on_not_yet_vendored() {
     let vex_path = tmp.path().join("vendor-dry.vex.json");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.vendor = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Vendored);
     args.common.dry_run = true;
     args.vex.vex = Some(vex_path.clone());
 
@@ -1563,7 +1563,7 @@ async fn scan_vendor_dry_run_with_vex_does_not_write_attestation_file() {
     let vex_path = tmp.path().join("vendor-dry.vex.json");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.vendor = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Vendored);
     args.common.dry_run = true;
     args.vex.vex = Some(vex_path.clone());
     args.vex.vex_no_verify = true;
@@ -1582,7 +1582,7 @@ async fn scan_vendor_dry_run_with_vex_does_not_write_attestation_file() {
     );
 }
 
-/// The INTERACTIVE arm's twin: `scan --vendor --dry-run --vex` without
+/// The INTERACTIVE arm's twin: `scan --mode vendored --dry-run --vex` without
 /// `--json` returns through `embed_vex_human`, which generated (and wrote)
 /// the document for real — exit 1 on a not-yet-vendored project, an
 /// attestation file on disk otherwise. The dry-run guard lives in the embed
@@ -1602,7 +1602,7 @@ async fn scan_vendor_dry_run_with_vex_interactive_does_not_fail_or_write() {
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
     args.common.json = false;
-    args.vendor = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Vendored);
     args.common.dry_run = true;
     args.vex.vex = Some(vex_path.clone());
 
@@ -1617,7 +1617,7 @@ async fn scan_vendor_dry_run_with_vex_interactive_does_not_fail_or_write() {
     );
 }
 
-/// `scan --apply --json --dry-run --vex`: the JSON apply arm synthesizes its
+/// `scan --mode agent --json --dry-run --vex`: the JSON apply arm synthesizes its
 /// preview and falls through to `embed_vex_into_json` with apply_code 0, so
 /// without the guard the dry run generated and wrote the attestation.
 #[tokio::test]
@@ -1655,7 +1655,7 @@ async fn scan_apply_json_dry_run_with_vex_does_not_write_attestation() {
     let vex_path = tmp.path().join("apply-dry.vex.json");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
     args.common.dry_run = true;
     args.vex.vex = Some(vex_path.clone());
     args.vex.vex_no_verify = true;

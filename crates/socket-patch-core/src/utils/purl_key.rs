@@ -29,6 +29,7 @@ use std::fmt;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::composer_version::composer_version_key;
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::vendor::nuget_feed::normalize_nuget_version;
 
 /// The canonical spelling of a purl's package release: surrounding
 /// whitespace trimmed, qualifiers and subpath stripped, components
@@ -44,8 +45,9 @@ use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 /// Every other ecosystem keeps its spelling: npm forbids uppercase, and
 /// Maven groups and Go module paths are case-sensitive.
 ///
-/// Composer release spellings (`3.0.2` vs `3.0.2.0`) still differ here;
-/// compare with [`PurlKey`], which folds them.
+/// Composer (`3.0.2` vs `3.0.2.0`) and NuGet (`13.0.3` vs `13.0.3.0`)
+/// release spellings still differ here; compare with [`PurlKey`], which
+/// folds them.
 pub fn canonical_base_purl(purl: &str) -> String {
     let base = normalize_purl(strip_purl_qualifiers(purl.trim())).into_owned();
     let Some(rest) = base.strip_prefix("pkg:") else {
@@ -74,10 +76,18 @@ pub fn canonical_base_purl(purl: &str) -> String {
 /// The identity of a purl's package release; equal for exactly the
 /// spellings that name the same release. See the [module docs](self).
 ///
-/// The string form is [`canonical_base_purl`], with a composer
-/// `pkg:composer/<vendor>/<name>@<version>` version replaced by its release
-/// identity ([`composer_version_key`]: `v3.0.2` → `3.0.2.0`). It contains no
-/// internal sentinels, so rollout and policy reports may show it.
+/// The string form is [`canonical_base_purl`], with the version replaced by
+/// its release identity where the ecosystem defines one:
+///
+/// - a composer `pkg:composer/<vendor>/<name>@<version>`:
+///   [`composer_version_key`] (`v3.0.2` → `3.0.2.0`);
+/// - a NuGet `pkg:nuget/<id>@<version>`: [`normalize_nuget_version`], the
+///   `NuGetVersion.ToNormalizedString()` form the vendored backend, upstream
+///   restore and the lock's `resolved` field use (`13.0.3.0` → `13.0.3`,
+///   build metadata dropped).
+///
+/// It contains no internal sentinels, so rollout and policy reports may show
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PurlKey(String);
 
@@ -86,7 +96,7 @@ impl PurlKey {
     /// ignored, so every release variant of one `name@version` shares it.
     pub fn new(purl: &str) -> Self {
         let canonical = canonical_base_purl(purl);
-        PurlKey(composer_identity(&canonical).unwrap_or(canonical))
+        PurlKey(release_identity(&canonical).unwrap_or(canonical))
     }
 
     /// [`PurlKey::new`] followed by `purl`'s verbatim `?qualifiers` /
@@ -127,6 +137,26 @@ impl AsRef<str> for PurlKey {
     }
 }
 
+/// The canonical base with its version replaced by the ecosystem's release
+/// identity; `None` where the spelling already is the identity.
+fn release_identity(canonical: &str) -> Option<String> {
+    composer_identity(canonical).or_else(|| nuget_identity(canonical))
+}
+
+/// `pkg:nuget/<id>@<normalized version>` for a canonical NuGet base with an
+/// id and a version; `None` for anything else.
+fn nuget_identity(canonical: &str) -> Option<String> {
+    let rest = canonical.strip_prefix("pkg:nuget/")?;
+    let (id, version) = rest.rsplit_once('@')?;
+    if id.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "pkg:nuget/{id}@{}",
+        normalize_nuget_version(version)
+    ))
+}
+
 /// `pkg:composer/<vendor>/<name>@<release identity>` for a canonical
 /// composer base with a `vendor/name` coordinate and a version; `None` for
 /// anything else (which then keys as its canonical spelling).
@@ -142,6 +172,47 @@ fn composer_identity(canonical: &str) -> Option<String> {
         composer_version_key(version)
     ))
 }
+
+/// `pkg:pypi/<name>@<v>` purls for every other spelling of `purl`'s pure
+/// release (`@1.16` → `@1.16.0`, see
+/// [`crate::utils::pep440::equivalent_release_spellings`]): the lockfile
+/// spells a pin as the user wrote it (`six==1.16`), while the patch API
+/// keys the release as the registry published it (#604). Empty for any
+/// other purl.
+pub fn pypi_equivalent_purls(purl: &str) -> Vec<String> {
+    let canonical = canonical_base_purl(purl);
+    let Some((name, version)) = canonical
+        .strip_prefix("pkg:pypi/")
+        .and_then(|rest| rest.rsplit_once('@'))
+    else {
+        return Vec::new();
+    };
+    crate::utils::pep440::equivalent_release_spellings(version)
+        .into_iter()
+        .map(|spelling| format!("pkg:pypi/{name}@{spelling}"))
+        .collect()
+}
+
+/// Whether two PyPI purls name the same release under PEP 440 equality
+/// (`@1.16` and `@1.16.0`), the way pip resolves an `==` pin. `false` for
+/// anything that is not two PyPI purls of one (PEP 503) name.
+pub fn pypi_same_release(a: &str, b: &str) -> bool {
+    let (a, b) = (canonical_base_purl(a), canonical_base_purl(b));
+    let split = |purl: &str| -> Option<(String, String)> {
+        let (name, version) = purl.strip_prefix("pkg:pypi/")?.rsplit_once('@')?;
+        Some((name.to_string(), version.to_string()))
+    };
+    match (split(&a), split(&b)) {
+        (Some((name_a, version_a)), Some((name_b, version_b))) => {
+            name_a == name_b && crate::utils::pep440::versions_equal(&version_a, &version_b)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+#[path = "purl_key_nuget_vendor_tests.rs"]
+mod nuget_vendor_tests;
 
 #[cfg(test)]
 mod tests {
@@ -228,7 +299,8 @@ mod tests {
         assert!(!PurlKey::new("pkg:composer/psr/log@not-a-version")
             .as_str()
             .contains('\u{1}'));
-        // Only composer gets release identity; other types stay version-exact.
+        // Only composer and NuGet get release identity; other types stay
+        // version-exact.
         assert!(!PurlKey::same("pkg:npm/x@1.0", "pkg:npm/x@1.0.0.0"));
         // Malformed composer coordinates key as their canonical spelling.
         assert_eq!(
@@ -239,6 +311,91 @@ mod tests {
             PurlKey::new("pkg:composer/a/b/c@1.0.0").as_str(),
             "pkg:composer/a/b/c@1.0.0"
         );
+    }
+
+    /// #1202: NuGet's package identity is the normalized version, the one
+    /// the vendored backend wires (`locked_at`, the feed leaf) and the lock
+    /// records as `resolved`. A 4-part `packages.config` spelling, a padded
+    /// or zero-led segment, a pre-release case variant and build metadata
+    /// all name the same release.
+    #[test]
+    fn nuget_version_spellings_share_the_normalized_key() {
+        for (a, b) in [
+            ("pkg:nuget/A@1.0.0.0", "pkg:nuget/a@1.0.0"),
+            (
+                "pkg:nuget/Newtonsoft.Json@13.0.3.0",
+                "pkg:nuget/newtonsoft.json@13.0.3",
+            ),
+            ("pkg:nuget/A@1.0", "pkg:nuget/A@1.0.0"),
+            ("pkg:nuget/A@1.02.3", "pkg:nuget/A@1.2.3"),
+            ("pkg:nuget/A@1.0.0-RC1", "pkg:nuget/a@1.0.0-rc1"),
+            ("pkg:nuget/A@1.0.0+build.5", "pkg:nuget/A@1.0.0"),
+            ("pkg:nuget/A@1.0.0%2Bbuild.5", "pkg:nuget/A@1.0.0"),
+            ("pkg:nuget/A@1.0.0.0?repository_url=x", "pkg:nuget/A@1.0.0"),
+        ] {
+            assert!(PurlKey::same(a, b), "{a} vs {b}");
+        }
+        assert_eq!(
+            PurlKey::new("pkg:nuget/Microsoft.Web.Infrastructure@1.0.0.0").as_str(),
+            "pkg:nuget/microsoft.web.infrastructure@1.0.0"
+        );
+        // A non-zero revision is part of the identity.
+        assert!(!PurlKey::same("pkg:nuget/A@1.0.0.1", "pkg:nuget/A@1.0.0"));
+        assert!(!PurlKey::same("pkg:nuget/A@1.0.0-rc1", "pkg:nuget/A@1.0.0"));
+        // The canonical spelling keeps the as-written version.
+        assert_eq!(
+            canonical_base_purl("pkg:nuget/A@1.0.0.0"),
+            "pkg:nuget/a@1.0.0.0"
+        );
+        // An id or version that is missing keys as its canonical spelling.
+        assert_eq!(PurlKey::new("pkg:nuget/A").as_str(), "pkg:nuget/a");
+        assert_eq!(PurlKey::new("pkg:nuget/A@").as_str(), "pkg:nuget/a@");
+        // The qualified key still tells release variants apart.
+        assert_eq!(
+            PurlKey::qualified("pkg:nuget/A@1.0.0.0?x=1").as_str(),
+            "pkg:nuget/a@1.0.0?x=1"
+        );
+    }
+
+    /// One identity rule: two NuGet purls share a [`PurlKey`] exactly when
+    /// the vendored backend's version match (`normalize_nuget_version`, as
+    /// `locked_at` and upstream restore compare) and NuGet's
+    /// case-insensitive id match both say they are the same release.
+    #[test]
+    fn nuget_key_agrees_with_the_vendored_version_match() {
+        let ids = ["Newtonsoft.Json", "newtonsoft.json", "Other"];
+        let versions = [
+            "13.0.3",
+            "13.0.3.0",
+            "13.00.3",
+            "13.0.3.1",
+            "13.0",
+            "13.0.0",
+            "13.0.3-Beta",
+            "13.0.3-beta",
+            "13.0.3+meta",
+            "13.0.4",
+        ];
+        for (ia, va) in ids
+            .iter()
+            .flat_map(|i| versions.iter().map(move |v| (i, v)))
+        {
+            for (ib, vb) in ids
+                .iter()
+                .flat_map(|i| versions.iter().map(move |v| (i, v)))
+            {
+                let vendored = ia.eq_ignore_ascii_case(ib)
+                    && normalize_nuget_version(va) == normalize_nuget_version(vb);
+                assert_eq!(
+                    PurlKey::same(
+                        &format!("pkg:nuget/{ia}@{va}"),
+                        &format!("pkg:nuget/{ib}@{vb}")
+                    ),
+                    vendored,
+                    "{ia}@{va} vs {ib}@{vb}"
+                );
+            }
+        }
     }
 
     /// B20 / #553: the NuGet global-cache crawl spells the purl lowercase,

@@ -93,10 +93,8 @@ fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: Some(ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
@@ -408,6 +406,127 @@ async fn hosted_trust_edit_reads_the_workspace_yaml_shape() {
     }
 }
 
+/// #1096: a pnpm-workspace.yaml with no keys at all (empty, comments only,
+/// bare document markers) is a "no workspace" file to pnpm, but pnpm
+/// 8.x–10.4 refuse every command once it holds a key without `packages`
+/// ("packages field missing or empty"). The trust edit therefore splices in
+/// the root-only `packages` scaffold with the trust key, and `rollback`
+/// takes both back out, restoring the user's file byte for byte. A project
+/// pinned to pnpm 9.0–10.4 gets no edit at all, as with no file (#734).
+#[tokio::test]
+#[serial]
+async fn hosted_trust_edit_scaffolds_packages_in_a_keyless_workspace_yaml() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    const ADDED: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+    for (user_ws, want) in [
+        (
+            "# pnpm settings go here\n",
+            format!("# pnpm settings go here\n{ADDED}"),
+        ),
+        ("\n", format!("{ADDED}\n")),
+        ("---\n", format!("---\n{ADDED}")),
+        ("%YAML 1.2\n---\n", format!("%YAML 1.2\n---\n{ADDED}")),
+        ("---\n...\n", format!("---\n{ADDED}...\n")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        let ws_path = tmp.path().join("pnpm-workspace.yaml");
+        std::fs::write(&ws_path, user_ws).unwrap();
+
+        let code = run(hosted_args(tmp.path(), server.uri())).await;
+        assert_eq!(code, 0, "scan --mode hosted should succeed for {user_ws:?}");
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            want,
+            "a keyless workspace file gains the packages scaffold too ({user_ws:?})"
+        );
+
+        let code = rollback_hosted(tmp.path(), &server).await;
+        assert_eq!(
+            code, 0,
+            "rollback must restore the pnpm pin for {user_ws:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            user_ws,
+            "rollback restores the keyless workspace file byte for byte"
+        );
+    }
+
+    // An empty file reads as the created scaffold, which rollback deletes
+    // (pnpm reads an empty file and no file alike).
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(&ws_path, "").unwrap();
+    assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(std::fs::read_to_string(&ws_path).unwrap(), ADDED);
+    assert_eq!(rollback_hosted(tmp.path(), &server).await, 0);
+    assert!(
+        !ws_path.exists(),
+        "the scaffold-only file goes with the pin"
+    );
+
+    // A BOM-only file keeps its BOM first; several (empty) documents are
+    // not spliced into at all.
+    for (user_ws, want) in [
+        ("\u{feff}\n", format!("\u{feff}\n{ADDED}")),
+        ("---\n---\n", "---\n---\n".to_string()),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        let ws_path = tmp.path().join("pnpm-workspace.yaml");
+        std::fs::write(&ws_path, user_ws).unwrap();
+        assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            want,
+            "{user_ws:?}"
+        );
+    }
+
+    // A lock installed from the keyless file as a multi-package workspace
+    // (pnpm <= 10.4 reads one as every nested package): a root-only
+    // scaffold would drop the members, so the file stays untouched.
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lock_path = tmp.path().join("pnpm-lock.yaml");
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    let with_member = lock.replacen("\npackages:", "\n  sub: {}\n\npackages:", 1);
+    assert_ne!(with_member, lock);
+    std::fs::write(&lock_path, with_member).unwrap();
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(&ws_path, "# pnpm settings go here\n").unwrap();
+    assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).unwrap(),
+        "# pnpm settings go here\n",
+        "a keyless multi-package workspace is left alone"
+    );
+
+    // Pinned to pnpm 9.15.9: the keyless file stays untouched (#734).
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@9.15.9", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(&ws_path, "# pnpm settings go here\n").unwrap();
+    assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).unwrap(),
+        "# pnpm settings go here\n",
+        "a pnpm 9 project's keyless workspace file is left alone"
+    );
+}
+
 /// #903 / #904: a `pnpm-lock.yaml` and `pnpm-workspace.yaml` saved with a
 /// UTF-8 BOM read like their plain twins. The BOM lock gets the
 /// `trustLockfile: true` auto-config (it used to read as unversioned and
@@ -434,7 +553,10 @@ async fn hosted_bom_lock_and_workspace_read_like_their_plain_twins() {
     assert_eq!(code, 0, "scan --mode hosted should succeed on a BOM lock");
     let lock = std::fs::read_to_string(&lock_path).unwrap();
     assert!(lock.starts_with("\u{feff}lockfileVersion:"), "{lock}");
-    assert!(lock.contains(HOSTED_URL), "the BOM lock is redirected: {lock}");
+    assert!(
+        lock.contains(HOSTED_URL),
+        "the BOM lock is redirected: {lock}"
+    );
     let ws_path = tmp.path().join("pnpm-workspace.yaml");
     assert_eq!(
         std::fs::read_to_string(&ws_path).ok().as_deref(),
@@ -449,7 +571,10 @@ async fn hosted_bom_lock_and_workspace_read_like_their_plain_twins() {
         pristine,
         "rollback restores the BOM lock byte for byte"
     );
-    assert!(!ws_path.exists(), "the auto-created workspace file goes too");
+    assert!(
+        !ws_path.exists(),
+        "the auto-created workspace file goes too"
+    );
 
     // A BOM workspace file whose first key is the user's opt-out: left
     // byte-identical (no duplicate `trustLockfile`), lock still redirected.
@@ -475,7 +600,11 @@ async fn hosted_bom_lock_and_workspace_read_like_their_plain_twins() {
             "the lock is still redirected for {user_ws:?}"
         );
         let ws = std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap();
-        assert_eq!(ws, want.unwrap_or(user_ws), "workspace file for {user_ws:?}");
+        assert_eq!(
+            ws,
+            want.unwrap_or(user_ws),
+            "workspace file for {user_ws:?}"
+        );
         assert_eq!(ws.matches("trustLockfile").count(), 1, "{ws:?}");
     }
 }
@@ -1248,10 +1377,10 @@ fn assert_refused_lock_elsewhere(
     );
     assert_eq!(doc["status"], "error", "{doc}");
     assert_eq!(
-        doc["errorCode"], "redirect_pnpm_lockfile_elsewhere",
+        doc["error"]["code"], "redirect_pnpm_lockfile_elsewhere",
         "{doc}"
     );
-    let message = doc["error"].as_str().unwrap_or_default();
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("pnpm-lock.yaml") && message.contains("nothing was written"),
         "the error names the governing lock: {message}"
@@ -1471,10 +1600,10 @@ async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
     assert_eq!(code, Some(1), "{doc}");
     assert_eq!(doc["status"], "error", "{doc}");
     assert_eq!(
-        doc["errorCode"], "redirect_pnpm_settings_elsewhere",
+        doc["error"]["code"], "redirect_pnpm_settings_elsewhere",
         "{doc}"
     );
-    let message = doc["error"].as_str().unwrap_or_default();
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains(&root_ws.display().to_string())
             && message.contains("trustLockfile: true")
@@ -1503,6 +1632,43 @@ async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
         warnings.contains(&root_ws.display().to_string()) && warnings.contains("already carries"),
         "the trust warning names the root file: {warnings}"
     );
+}
+
+/// #1006: a project below a `pnpm-workspace.yaml` whose `packages:` globs
+/// do not list it (an `examples/` app) is no workspace member. pnpm
+/// 11.28+/12 install it standalone, with its own lock, and read
+/// `trustLockfile` only from its own settings file, so hosted mode pins the
+/// lock and creates that file as for any single project; the unrelated
+/// root file is left byte-identical.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_project_outside_workspace_globs_pins_and_nests_trust() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = member_root(&tmp);
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true }"#,
+    )
+    .unwrap();
+    let root_ws = root.join("pnpm-workspace.yaml");
+    let ws_before = "packages:\n  - 'packages/*'\n";
+    std::fs::write(&root_ws, ws_before).unwrap();
+    let demo = root.join("examples/demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    write_pnpm_project(&demo);
+
+    let (code, doc) = run_hosted_json(&demo, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    let lock = std::fs::read_to_string(demo.join("pnpm-lock.yaml")).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    let nested = std::fs::read_to_string(demo.join("pnpm-workspace.yaml")).unwrap();
+    assert!(nested.contains("trustLockfile: true"), "{nested}");
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_before);
 }
 
 /// #880: an explicit `trustLockfile: false` in the root file is the user's
@@ -1738,7 +1904,7 @@ async fn hosted_scan_from_vlt_workspace_member_refuses() {
         let (code, doc) = run_hosted_json(&member, &server.uri());
         assert_refused_workspace_lock_elsewhere(workspaces, code, &doc, &lock, &before, &member);
         assert!(
-            doc["error"]
+            doc["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("vlt.json"),
@@ -1762,10 +1928,10 @@ fn assert_refused_workspace_lock_elsewhere(
     );
     assert_eq!(doc["status"], "error", "{case}: {doc}");
     assert_eq!(
-        doc["errorCode"], "redirect_workspace_lockfile_elsewhere",
+        doc["error"]["code"], "redirect_workspace_lockfile_elsewhere",
         "{case}: {doc}"
     );
-    let message = doc["error"].as_str().unwrap_or_default();
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
     let lock_name = lock.file_name().unwrap().to_str().unwrap();
     assert!(
         message.contains(lock_name) && message.contains("nothing was written"),
@@ -1780,4 +1946,679 @@ fn assert_refused_workspace_lock_elsewhere(
         !cwd.join(".socket").exists(),
         "{case}: nothing written in the member"
     );
+}
+
+/// Pin the project's pnpm: package.json `packageManager` and/or the
+/// installed `node_modules/.modules.yaml` record (pnpm 9's YAML spelling).
+fn pin_pnpm(root: &Path, package_json: Option<&str>, modules_yaml: Option<&str>) {
+    if let Some(version) = package_json {
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@{version}", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+            ),
+        )
+        .unwrap();
+    }
+    if let Some(version) = modules_yaml {
+        std::fs::write(
+            root.join("node_modules/.modules.yaml"),
+            format!("hoistPattern:\n  - '*'\nlayoutVersion: 5\npackageManager: pnpm@{version}\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// #734: on pnpm 9.0–10.4 a created `packages: ['.']` file makes a
+/// single-package project a root-only workspace where `pnpm add <pkg>`
+/// fails with ERR_PNPM_ADDING_TO_ROOT, and those releases never read
+/// `trustLockfile`. A project pinned there (installed record or
+/// package.json) gets its lock pinned and no pnpm-workspace.yaml; the
+/// warning says why and how to add trust on pnpm >= 11. After the upgrade a
+/// re-run creates the file, and rollback removes it with the pin.
+#[tokio::test]
+#[serial]
+async fn hosted_pnpm_9_through_10_4_project_gets_no_root_only_workspace() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    for (package_json, modules_yaml, named) in [
+        (
+            None,
+            Some("9.15.9"),
+            "pnpm@9.15.9 (node_modules/.modules.yaml)",
+        ),
+        (
+            Some("10.4.1"),
+            None,
+            "pnpm@10.4.1 (package.json packageManager)",
+        ),
+        (
+            Some("9.15.9"),
+            Some("9.15.9"),
+            "pnpm@9.15.9 (package.json packageManager)",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        pin_pnpm(tmp.path(), package_json, modules_yaml);
+
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        let lock = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+        assert!(lock.contains(HOSTED_URL), "{lock}");
+        assert!(
+            !tmp.path().join("pnpm-workspace.yaml").exists(),
+            "no root-only workspace for {package_json:?} / {modules_yaml:?}"
+        );
+        let warnings = warning_texts(&doc);
+        assert!(
+            warnings.contains("ERR_PNPM_ADDING_TO_ROOT")
+                && warnings.contains(named)
+                && warnings.contains("re-run `socket-patch scan --mode hosted`"),
+            "{warnings}"
+        );
+    }
+
+    // The upgrade: package.json now pins pnpm 11, which needs the setting;
+    // the heal-on-rerun path creates the scaffold.
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    pin_pnpm(tmp.path(), Some("9.15.9"), None);
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    assert!(!ws_path.exists());
+    pin_pnpm(tmp.path(), Some("11.0.0"), None);
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).unwrap(),
+        "packages:\n  - '.'\ntrustLockfile: true\n"
+    );
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must restore the pnpm pin");
+    assert!(!ws_path.exists(), "rollback removes the created scaffold");
+}
+
+/// The #734 gate keeps the scaffold whenever the project's pnpm may read
+/// it: no pin, pnpm >= 10.5, or pins that disagree (a stale install record
+/// beside a pnpm 11 pin). The detail names the `-w` caveat.
+#[tokio::test]
+#[serial]
+async fn hosted_unknown_or_later_pnpm_still_gets_the_trust_scaffold() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    for (package_json, modules_yaml) in [
+        (None, None),
+        (None, Some("10.5.0")),
+        (Some("11.0.0"), None),
+        (Some("11.1.0"), Some("9.15.9")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        pin_pnpm(tmp.path(), package_json, modules_yaml);
+
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap(),
+            "packages:\n  - '.'\ntrustLockfile: true\n",
+            "{package_json:?} / {modules_yaml:?}"
+        );
+        let warnings = warning_texts(&doc);
+        assert!(warnings.contains("`pnpm add -w <pkg>`"), "{warnings}");
+        // ... and the pin that avoids the file on pnpm 9.0–10.4.
+        assert!(
+            warnings.contains("pin that pnpm in package.json `packageManager`"),
+            "{warnings}"
+        );
+    }
+}
+
+/// A pnpm workspace that keeps one lock per member
+/// (`sharedWorkspaceLockfile: false`): `packages/a` depends on the patched
+/// package directly, `packages/b` through `dep-b`, each through its own
+/// lock and installed tree. `lock` renders a member's lock from its
+/// importer block and the extra packages entries.
+fn write_member_lock_workspace(
+    root: &Path,
+    workspace: &str,
+    npmrc: &str,
+    root_lock: Option<&str>,
+    lock: impl Fn(&str, &str) -> String,
+) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("pnpm-workspace.yaml"), workspace).unwrap();
+    std::fs::write(root.join(".npmrc"), npmrc).unwrap();
+    if let Some(text) = root_lock {
+        std::fs::write(root.join("pnpm-lock.yaml"), text).unwrap();
+    }
+    for (member, dep) in [("a", NAME), ("b", "dep-b")] {
+        let dir = root.join("packages").join(member);
+        let pkg = dir.join("node_modules").join(NAME);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(
+                r#"{{ "name": "{member}", "version": "1.0.0", "dependencies": {{ "{dep}": "1.0.0" }} }}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+        )
+        .unwrap();
+        let version = if dep == NAME { VERSION } else { "1.0.0" };
+        std::fs::write(dir.join("pnpm-lock.yaml"), lock(dep, version)).unwrap();
+    }
+}
+
+/// A member's lockfileVersion 9.0 lock: `dep@version` is its importer's
+/// direct dependency; the patched package is always resolved.
+fn v9_member_lock(dep: &str, version: &str) -> String {
+    let extra = if dep == NAME {
+        String::new()
+    } else {
+        format!("  {dep}@{version}:\n    resolution: {{integrity: sha512-DEPb==}}\n\n")
+    };
+    format!(
+        "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      {dep}:
+        specifier: {version}
+        version: {version}
+
+packages:
+
+{extra}  {NAME}@{VERSION}:
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+
+snapshots:
+
+  {NAME}@{VERSION}: {{}}
+"
+    )
+}
+
+/// #492: a hosted scan from the root of a `sharedWorkspaceLockfile: false`
+/// workspace read only the root lock (`importers: .: {}`), redirected
+/// nothing and reported success. Every member lock is now pinned, the trust
+/// key goes to the root workspace file (the one pnpm reads), discovery sees
+/// the member pins, and `rollback` restores every member lock byte for byte.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_pins_every_member_lock_with_shared_workspace_lockfile_false() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+    write_member_lock_workspace(
+        root,
+        ws,
+        "shared-workspace-lockfile=false\n",
+        Some("lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n"),
+        v9_member_lock,
+    );
+    let locks = [
+        root.join("packages/a/pnpm-lock.yaml"),
+        root.join("packages/b/pnpm-lock.yaml"),
+    ];
+    let pristine: Vec<String> = locks
+        .iter()
+        .map(|l| std::fs::read_to_string(l).unwrap())
+        .collect();
+    let root_lock_before = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["status"], "success", "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    for lock in &locks {
+        let text = std::fs::read_to_string(lock).unwrap();
+        assert!(
+            text.contains(&format!("tarball: {HOSTED_URL}")) && text.contains(PATCHED_SHA512),
+            "{} must be pinned:\n{text}",
+            lock.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+        root_lock_before,
+        "the root lock holds no instance and is left alone"
+    );
+    let warnings = warning_texts(&doc);
+    assert!(
+        !warnings.contains("no resolution for"),
+        "no entry_not_found: {warnings}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+        format!("{ws}trustLockfile: true\n"),
+        "the trust key goes to the root file"
+    );
+    for member in ["a", "b"] {
+        assert!(!root
+            .join(format!("packages/{member}/pnpm-workspace.yaml"))
+            .exists());
+    }
+    assert_no_ledger(root);
+
+    // Discovery reads the member pins: rollback restores both locks.
+    let code = rollback_hosted(root, &server).await;
+    assert_eq!(code, 0, "rollback must restore the member pins");
+    for (lock, before) in locks.iter().zip(&pristine) {
+        assert_eq!(
+            &std::fs::read_to_string(lock).unwrap(),
+            before,
+            "rollback restores {} byte for byte",
+            lock.display()
+        );
+    }
+}
+
+/// Bugbot on #1007: pnpm reads `lockfileIncludeTarballUrl` (and the
+/// registry) for a member lock (`sharedWorkspaceLockfile: false`) from the
+/// workspace root's pnpm-workspace.yaml and `.npmrc`, never from the
+/// member's directory. Rollback used to look beside the member lock, found
+/// no settings there, and restored the entry without the `tarball:` pnpm
+/// wrote.
+#[tokio::test]
+#[serial]
+async fn rollback_reads_member_lock_settings_from_the_workspace_root() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let registry = format!("{}/npm-registry", server.uri());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_member_lock_workspace(
+        root,
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n\
+         lockfileIncludeTarballUrl: true\n",
+        "shared-workspace-lockfile=false\nlockfile-include-tarball-url=true\n",
+        Some("lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n"),
+        |dep, version| {
+            v9_member_lock(dep, version)
+                .replace(
+                    &format!("integrity: {UPSTREAM_SHA512}}}"),
+                    &format!(
+                        "integrity: {UPSTREAM_SHA512}, \
+                         tarball: {registry}/{NAME}/-/{NAME}-{VERSION}.tgz}}"
+                    ),
+                )
+                .replace(
+                    "integrity: sha512-DEPb==}",
+                    &format!(
+                        "integrity: sha512-DEPb==, tarball: {registry}/dep-b/-/dep-b-1.0.0.tgz}}"
+                    ),
+                )
+        },
+    );
+    let lock = root.join("packages/a/pnpm-lock.yaml");
+    let pristine = std::fs::read_to_string(&lock).unwrap();
+    assert!(pristine.contains("tarball: "), "{pristine}");
+
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert!(
+        std::fs::read_to_string(&lock)
+            .unwrap()
+            .contains(&format!("tarball: {HOSTED_URL}")),
+        "{doc}"
+    );
+    let code = rollback_hosted(root, &server).await;
+    assert_eq!(code, 0, "rollback must restore the member pins");
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), pristine);
+}
+
+/// #492 on pnpm 7: `shared-workspace-lockfile=false` in `.npmrc` writes no
+/// root lock at all, only lockfile 5.4 member locks. The run used to warn
+/// `redirect_pnpm_no_lockfile` ("run `pnpm install`", which never writes a
+/// root lock here) and succeed with nothing pinned.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_pins_pnpm7_member_locks_without_a_root_lock() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let v5 = |dep: &str, version: &str| {
+        let extra = if dep == NAME {
+            String::new()
+        } else {
+            format!("  /{dep}/{version}:\n    resolution: {{integrity: sha512-DEPb==}}\n    dev: false\n\n")
+        };
+        format!(
+            "lockfileVersion: 5.4\n\nspecifiers:\n  {dep}: {version}\n\ndependencies:\n  \
+             {dep}: {version}\n\npackages:\n\n{extra}  /{NAME}/{VERSION}:\n    \
+             resolution: {{integrity: {UPSTREAM_SHA512}}}\n    dev: false\n"
+        )
+    };
+    write_member_lock_workspace(
+        root,
+        "packages:\n  - packages/*\n",
+        "shared-workspace-lockfile=false\n",
+        None,
+        v5,
+    );
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    for member in ["a", "b"] {
+        let text = std::fs::read_to_string(root.join(format!("packages/{member}/pnpm-lock.yaml")))
+            .unwrap();
+        assert!(text.contains(HOSTED_URL), "{member}:\n{text}");
+    }
+    let codes: Vec<&str> = doc["redirect"]["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(
+        !codes.contains(&"redirect_pnpm_no_lockfile")
+            && !codes.contains(&"redirect_npm_no_lockfile")
+            && !codes.contains(&"redirect_pnpm_entry_not_found"),
+        "{codes:?}"
+    );
+    assert!(!root.join("pnpm-lock.yaml").exists());
+}
+
+/// #556: with `gitBranchLockfile` on, pnpm installs a branch from its own
+/// `pnpm-lock.<branch>.yaml` whenever one exists. Hosted mode pinned the
+/// stale `pnpm-lock.yaml` beside it and reported success while every fresh
+/// install on the branch stayed upstream; with only the branch lock it said
+/// "run `pnpm install`", which just rewrites the branch lock. Both now
+/// refuse with `redirect_pnpm_git_branch_lockfile`, confirm nothing and
+/// write nothing (a rewriter-level refusal: the run itself still exits 0,
+/// like `redirect_pnpm_member_locks_unresolved`).
+#[tokio::test]
+#[serial]
+async fn hosted_scan_refuses_a_git_branch_lockfile_project() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    for (case, root_lock, workspace, npmrc) in [
+        (
+            "both locks",
+            true,
+            "packages:\n  - '.'\ngitBranchLockfile: true\n",
+            None,
+        ),
+        (
+            "branch lock only",
+            false,
+            "packages:\n  - '.'\ngitBranchLockfile: true\n",
+            None,
+        ),
+        (
+            "pnpm 10 .npmrc",
+            true,
+            "packages:\n  - '.'\n",
+            Some("git-branch-lockfile=true\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pnpm_project(root);
+        let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        std::fs::write(root.join("pnpm-lock.feature.yaml"), &lock).unwrap();
+        if !root_lock {
+            std::fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+        }
+        std::fs::write(root.join("pnpm-workspace.yaml"), workspace).unwrap();
+        if let Some(npmrc) = npmrc {
+            std::fs::write(root.join(".npmrc"), npmrc).unwrap();
+        }
+        let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
+
+        let (code, doc) = run_hosted_json(root, &server.uri());
+        assert_eq!(code, Some(0), "{case}: {doc}");
+        assert_eq!(doc["redirect"]["redirected"], 0, "{case}: {doc}");
+        assert_eq!(
+            doc["redirect"]["rewrittenFiles"],
+            serde_json::json!([]),
+            "{case}"
+        );
+        let codes: Vec<&str> = doc["redirect"]["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|w| w["code"].as_str())
+            .collect();
+        assert!(
+            codes.contains(&"redirect_pnpm_git_branch_lockfile")
+                && !codes.contains(&"redirect_pnpm_no_lockfile"),
+            "{case}: {codes:?}"
+        );
+        assert!(
+            warning_texts(&doc).contains("pnpm-lock.feature.yaml"),
+            "{case}: {doc}"
+        );
+        if root_lock {
+            assert_eq!(
+                std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+                lock,
+                "{case}: the stale root lock is left alone"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("pnpm-lock.feature.yaml")).unwrap(),
+            lock,
+            "{case}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+            workspace,
+            "{case}: no trust key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json")).unwrap(),
+            pkg,
+            "{case}"
+        );
+        assert_no_ledger(root);
+    }
+}
+
+/// #1094: an npm workspace member holding a stray `package-lock.json` /
+/// `npm-shrinkwrap.json` of its own (one npm never reads; members install
+/// from the root lock) used to skip the #884 refusal. `scan` and `get`
+/// pinned the ignored member lock and exited 0. They now refuse, name the
+/// root lock and the ignored member lock, and leave both untouched.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_npm_member_with_stray_lock_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    for (root_lock, member_lock) in [
+        ("package-lock.json", "package-lock.json"),
+        ("package-lock.json", "npm-shrinkwrap.json"),
+        ("npm-shrinkwrap.json", "package-lock.json"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_package_json_workspace(tmp.path(), root_lock, false);
+        let stray = member.join(member_lock);
+        let stray_text = serde_json::json!({
+            "name": "a", "version": "1.0.0", "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "a", "version": "1.0.0", "dependencies": { NAME: VERSION } },
+                format!("node_modules/{NAME}"): {
+                    "version": VERSION,
+                    "resolved": format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"),
+                    "integrity": "sha512-orig=="
+                }
+            }
+        })
+        .to_string();
+        std::fs::write(&stray, &stray_text).unwrap();
+        let lock = tmp.path().join(root_lock);
+        let before = std::fs::read_to_string(&lock).unwrap();
+        let case = format!("root {root_lock}, member {member_lock}");
+
+        for args in [
+            vec!["scan", "--mode", "hosted"],
+            vec!["get", UUID, "--mode", "hosted"],
+        ] {
+            let out = scrubbed_cli()
+                .args(&args)
+                .args([
+                    "--json",
+                    "--yes",
+                    "--cwd",
+                    member.to_str().unwrap(),
+                    "--api-url",
+                    &server.uri(),
+                    "--org",
+                    ORG,
+                    "--api-token",
+                    "fake",
+                ])
+                .output()
+                .expect("run socket-patch");
+            let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "{case} {args:?}: output is not JSON ({e}):\n{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+            let case = format!("{case} {args:?}");
+            assert_refused_workspace_lock_elsewhere(
+                &case,
+                out.status.code(),
+                &doc,
+                &lock,
+                &before,
+                &member,
+            );
+            let message = doc["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains(member_lock), "{case}: {message}");
+            assert_eq!(
+                std::fs::read_to_string(&stray).unwrap(),
+                stray_text,
+                "{case}: the stray member lock is untouched"
+            );
+            assert!(!member.join(".npmrc").exists(), "{case}");
+        }
+    }
+}
+
+/// #1101 (Bun), #1134 (vlt): a workspace member holding a stray
+/// `bun.lock` / `bun.lockb` / `vlt-lock.json` of its own (one its manager
+/// never reads; members install from the root lock) used to skip the
+/// #884 / #942 refusal. `scan` and `get` pinned the ignored member lock
+/// and exited 0. They now refuse, name the root lock and the ignored
+/// member lock, and leave both untouched.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_bun_or_vlt_member_with_stray_lock_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let bun_text = format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{ \"\": {{ \"name\": \"a\", \
+         \"dependencies\": {{ \"{NAME}\": \"{VERSION}\" }} }} }},\n  \"packages\": {{\n    \
+         \"{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{}}, \"{UPSTREAM_SHA512}\"],\n  }}\n}}\n"
+    );
+    let vlt_text = format!(
+        "{{\"lockfileVersion\":1,\"options\":{{}},\"nodes\":{{\"~npm~{NAME}@{VERSION}\":\
+         [0,\"{NAME}\",\"{UPSTREAM_SHA512}\"]}},\"edges\":{{\"file~_d {NAME}\":\"prod {VERSION} \
+         ~npm~{NAME}@{VERSION}\"}}}}"
+    );
+    for (root_lock, vlt_json, member_lock, member_text) in [
+        ("bun.lock", None, "bun.lock", bun_text.as_str()),
+        ("bun.lock", None, "bun.lockb", "binary"),
+        ("bun.lockb", None, "bun.lock", bun_text.as_str()),
+        ("vlt-lock.json", None, "vlt-lock.json", vlt_text.as_str()),
+        (
+            "vlt-lock.json",
+            Some(r#"{"workspaces":"packages/*"}"#),
+            "vlt-lock.json",
+            vlt_text.as_str(),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_package_json_workspace(tmp.path(), root_lock, false);
+        if let Some(text) = vlt_json {
+            std::fs::write(tmp.path().join("vlt.json"), text).unwrap();
+        }
+        let stray = member.join(member_lock);
+        std::fs::write(&stray, member_text).unwrap();
+        let lock = tmp.path().join(root_lock);
+        let before = std::fs::read_to_string(&lock).unwrap();
+        let case = format!("root {root_lock} (vlt.json {vlt_json:?}), member {member_lock}");
+
+        for args in [
+            vec!["scan", "--mode", "hosted"],
+            vec!["get", UUID, "--mode", "hosted"],
+        ] {
+            let out = scrubbed_cli()
+                .args(&args)
+                .args([
+                    "--json",
+                    "--yes",
+                    "--cwd",
+                    member.to_str().unwrap(),
+                    "--api-url",
+                    &server.uri(),
+                    "--org",
+                    ORG,
+                    "--api-token",
+                    "fake",
+                ])
+                .output()
+                .expect("run socket-patch");
+            let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "{case} {args:?}: output is not JSON ({e}):\n{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+            let case = format!("{case} {args:?}");
+            assert_refused_workspace_lock_elsewhere(
+                &case,
+                out.status.code(),
+                &doc,
+                &lock,
+                &before,
+                &member,
+            );
+            let message = doc["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(member_lock) && message.contains("ignores"),
+                "{case}: {message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&stray).unwrap(),
+                member_text,
+                "{case}: the stray member lock is untouched"
+            );
+        }
+    }
 }

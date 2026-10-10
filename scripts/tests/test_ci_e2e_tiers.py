@@ -122,8 +122,17 @@ class Tiers(unittest.TestCase):
 
 GRADLE_COMPAT = ROOT / ".github" / "workflows" / "gradle-compatibility.yml"
 GRADLE_LINES = {"6.9.4": "11", "7.6.6": "17", "8.14.3": "21", "9.8.0": "21"}
-AGENT_HOSTED = ("e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build",
-                "--ignored gradle_agent_ gradle_hosted_")
+# The hosted suite is sharded over three legs per line (test_ci_gradle_prefixes
+# HostedShards checks every hosted test runs in exactly one of them).
+HOSTED_SHARD_1 = ["gradle_hosted_3", "gradle_hosted_4", "gradle_hosted_5"]
+HOSTED_SHARD_2 = ["gradle_hosted_" + c for c in "bcdeflmnop"]
+AGENT_HOSTED = (
+    ("e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build",
+     " ".join(["--ignored", "gradle_agent_", *HOSTED_SHARD_1])),
+    ("e2e_redirect_gradle_build", " ".join(["--ignored", *HOSTED_SHARD_2])),
+    ("e2e_redirect_gradle_build",
+     " ".join(["--ignored", "gradle_hosted_"] + [w for p in HOSTED_SHARD_1 + HOSTED_SHARD_2 for w in ("--skip", p)])),
+)
 VENDOR = ("e2e_vendor_gradle_build e2e_vendor_jvm_build", "--ignored gradle_vendor_ gradle_multi_project")
 
 
@@ -160,7 +169,7 @@ class GradleRows(unittest.TestCase):
         gradle = [r for r in rows("e2e") if r.get("jvm_tool") == "gradle"]
         want = []
         for line, java in GRADLE_LINES.items():
-            for suite, test_filter in (AGENT_HOSTED, VENDOR):
+            for suite, test_filter in (*AGENT_HOSTED, VENDOR):
                 row = {"os": "ubuntu-latest", "suite": suite, "jvm_tool": "gradle", "gradle": line,
                        "java": java, "test_filter": test_filter}
                 # The allowance lasts only while a suite of the row is unlanded.
@@ -169,7 +178,7 @@ class GradleRows(unittest.TestCase):
                 want.append(row)
         want.append({"os": "windows-latest", "suite": "e2e_vendor_jvm_build", "jvm_tool": "gradle",
                      "gradle": "8.14.3", "java": "17", "test_filter": "--ignored gradle_multi_project"})
-        self.assertEqual(len(gradle), 9)
+        self.assertEqual(len(gradle), 17)
         self.assertEqual(sorted(map(str, gradle)), sorted(map(str, want)))
         self.assertFalse([r for r in rows("e2e-full") if "gradle" in r or "jvm_tool" in r])
 
@@ -320,7 +329,12 @@ class VltProofDedupe(unittest.TestCase):
 
     def test_lv0_mode_migration_without_ci_upgrade_stays(self):
         self.assertIn("mode_migration_vlt", proof.remaining(self.suites, "windows-latest", "1.0.0-rc.14", text=TEXT))
-        self.assertNotIn("mode_migration_vlt", proof.remaining(self.suites, "ubuntu-latest", "1.0.0-rc.14", text=TEXT))
+        # Lean scope: the rc.14 Linux row is in e2e-extended, which pull
+        # requests skip, so the proof keeps it. Only rows of the lean `e2e`
+        # job (here: redirect on vlt 1.2.0) are left out.
+        self.assertIn("mode_migration_vlt", proof.remaining(self.suites, "ubuntu-latest", "1.0.0-rc.14", text=TEXT))
+        self.assertNotIn("e2e_redirect_vlt_build",
+                         proof.remaining(self.suites, "ubuntu-latest", "1.2.0", text=TEXT))
 
 
 if __name__ == "__main__":

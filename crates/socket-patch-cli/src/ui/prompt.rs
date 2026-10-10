@@ -219,7 +219,9 @@ fn fit_menu(prompt: &str, options: &[String], width: usize) -> (String, Vec<Stri
 /// don't show it again, and Ctrl-C (which console turns into a real
 /// SIGINT) kills the process mid-menu. This guard shows the cursor on
 /// drop and, for its lifetime, on SIGINT before handing the signal to
-/// whatever disposition was there before.
+/// whatever disposition was there before. In the CLI that is the
+/// `interrupt` handler, so a Ctrl-C at a menu restores the cursor first
+/// and then removes a held `.socket/apply.lock` before the process dies.
 struct CursorGuard {
     /// The SIGINT disposition to put back on drop; `None` when the guard
     /// left SIGINT alone (it was ignored).

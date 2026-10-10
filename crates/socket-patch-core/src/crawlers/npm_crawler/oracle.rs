@@ -230,11 +230,19 @@ impl LegacyNpmCrawler {
             // Alias installs (`"lp": "npm:left-pad@1.3.0"`): a real
             // importer-tree package dir whose own package.json names a
             // pending target under a different dir name is a copy too.
+            // A dir named after its package only up to case is an alias
+            // too (#856), unless it IS the dir this visit's probe just
+            // recorded (a case-folding file system resolving the probe's
+            // spelling onto it), so one physical dir is recorded once.
             if !store_entry {
-                for (index, pkg_path) in Self::alias_copies(&nm_path, &pending).await {
+                for (index, pkg_path, case_only) in Self::alias_copies(&nm_path, &pending).await {
                     let target = &pending[index];
                     let copies = result.entry(target.purl.clone()).or_default();
-                    if !copies.iter().any(|c| c.path == pkg_path) {
+                    let probe_path = nm_path.join(&target.dir_key);
+                    let already_probed = case_only
+                        && copies.iter().any(|c| c.path == probe_path)
+                        && same_file::is_same_file(&probe_path, &pkg_path).unwrap_or(false);
+                    if !already_probed && !copies.iter().any(|c| c.path == pkg_path) {
                         copies.push(CrawledPackage {
                             name: target.name.clone(),
                             version: target.version.clone(),
@@ -268,8 +276,9 @@ impl LegacyNpmCrawler {
     /// The alias installs directly below `nm_path` that are copies of a
     /// pending target, as `(target index, path)` in listing order: real
     /// package dirs (scoped ones one level down) whose package.json
-    /// `name@version` is a target's while the dir is named otherwise.
-    async fn alias_copies(nm_path: &Path, pending: &[Target]) -> Vec<(usize, PathBuf)> {
+    /// `name@version` is a target's while the dir is named otherwise, each
+    /// flagged when the names differ only by case.
+    async fn alias_copies(nm_path: &Path, pending: &[Target]) -> Vec<(usize, PathBuf, bool)> {
         async fn package_dirs(dir: &Path) -> Vec<(String, PathBuf)> {
             let mut out = Vec::new();
             for entry in crate::utils::fs::list_dir_entries(dir).await {
@@ -303,12 +312,13 @@ impl LegacyNpmCrawler {
                 else {
                     continue;
                 };
-                if name.eq_ignore_ascii_case(&dir_key) {
+                if name == dir_key {
                     continue;
                 }
+                let case_only = name.eq_ignore_ascii_case(&dir_key);
                 for (index, target) in pending.iter().enumerate() {
                     if target.dir_key == name && target.version == version {
-                        found.push((index, pkg_path.clone()));
+                        found.push((index, pkg_path.clone(), case_only));
                     }
                 }
             }
@@ -1811,7 +1821,9 @@ mod tests {
         );
         // A dir whose spelling differs from its package's name only by case
         // (resolves under the lowercase name on case-insensitive volumes),
-        // and a scope spelled likewise.
+        // and a scope spelled likewise. On a case-sensitive file system
+        // both are alias copies of `casedir` / `@cs/x` (#856); where the
+        // file system folds case each is reported once, via the probe.
         write(&nm.join("CaseDir"), "casedir", "1.0.0");
         write(&nm.join("@Cs").join("x"), "@cs/x", "1.0.0");
         // Broken / BOM'd package.json.

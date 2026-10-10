@@ -1,4 +1,4 @@
-//! The vendored-mode (`--mode vendored` / `--vendor`) flow driven by
+//! The vendored-mode (`--mode vendored`) flow driven by
 //! `scan`: the shared download → vendor-engine → GC step, its JSON and
 //! interactive arms, the pre-download skip partitions, and the `boxed_*`
 //! transient-frame constructors that keep the never-taken vendor branches
@@ -20,7 +20,7 @@ use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchRecord;
-use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
+use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry, TelemetryAuth};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
@@ -28,8 +28,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
+use crate::commands::agent_download::{
+    download_patch_records_reusing, DetachedDownload, DownloadParams,
+};
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
-use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, symlinked_wiring_warnings, track_outcomes_for_vendor,
@@ -64,7 +66,7 @@ type VendorStepError = (&'static str, String, Option<Box<Envelope>>);
 /// [`VendorStepError`].
 type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 
-/// Dry-run preview for `scan --vendor` (and `get … --mode vendored
+/// Dry-run preview for `scan --mode vendored` (and `get … --mode vendored
 /// --dry-run`): classify each selected patch against the vendor ledger
 /// without writing anything or touching the network beyond discovery.
 /// Action values are part of the CLI contract: `would_vendor` (no ledger
@@ -74,7 +76,9 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 /// package-lock preflight
 /// ([`crate::commands::bun_preflight::BunVendorRefusal`],
 /// [`crate::commands::vlt_preflight`], [`npm_lock_refusal`]) would refuse
-/// before any download.
+/// before any download, or whose hosted pnpm pin the takeover would fail
+/// to replace ([`hosted_pnpm_refusals`]: the pnpm backend's lock-text
+/// refusal, #853). `origins` are the run's `--patch-server-url` origins.
 /// The preview stays a ledger classification otherwise (engine refusals
 /// outside the preflights are not predicted), and `would_refuse` never
 /// flips the run's status or exit code. The preflights (the only disk
@@ -86,6 +90,7 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 pub(crate) async fn preview_vendor_json(
     cwd: &Path,
     selected: &[PatchSearchResult],
+    origins: &[String],
     takeover_refusals: &HashMap<String, (&'static str, String)>,
 ) -> serde_json::Value {
     // The ledger load outcome reaches the preflight AS a result, so an
@@ -98,6 +103,7 @@ pub(crate) async fn preview_vendor_json(
         vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
     let state = state.unwrap_or_default();
+    let pnpm_refusals = hosted_pnpm_refusals(cwd, selected, origins, &state).await;
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
         .map(|p| match lookup_entry(&state.entries, &p.purl) {
@@ -117,8 +123,8 @@ pub(crate) async fn preview_vendor_json(
                     "errorCode": r.code, "error": r.detail,
                 })
             }
-            _ if takeover_refusals.contains_key(&p.purl) => {
-                let (code, detail) = &takeover_refusals[&p.purl];
+            _ if pnpm_refusals.contains_key(&p.purl) => {
+                let (code, detail) = &pnpm_refusals[&p.purl];
                 serde_json::json!({
                     "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
                     "errorCode": code, "error": detail,
@@ -126,6 +132,13 @@ pub(crate) async fn preview_vendor_json(
             }
             _ if p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some() => {
                 let (code, detail) = npm_lock_refusal.as_ref().expect("checked by the guard");
+                serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
+                    "errorCode": code, "error": detail,
+                })
+            }
+            _ if takeover_refusals.contains_key(&p.purl) => {
+                let (code, detail) = &takeover_refusals[&p.purl];
                 serde_json::json!({
                     "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
                     "errorCode": code, "error": detail,
@@ -170,9 +183,10 @@ fn with_symlink_warnings(cwd: &Path, purl: &str, mut row: serde_json::Value) -> 
 }
 
 /// The purls of `selected` the wet run's Bun, vlt or npm package-lock
-/// preflight, or the gem hosted→vendored takeover gate, would refuse before
-/// any download (the `would_refuse` rows of [`preview_vendor_json`]): the
-/// vendored planning pass, so a refused NEW patch holds no rollout slot.
+/// preflight, the hosted pnpm takeover's lock-text gates, or the gem
+/// hosted→vendored takeover gate, would refuse before any download (the
+/// `would_refuse` rows of [`preview_vendor_json`]): the vendored planning
+/// pass, so a refused NEW patch holds no rollout slot.
 pub(super) async fn preflight_refused_purls(
     common: &GlobalArgs,
     selected: &[PatchSearchResult],
@@ -184,6 +198,9 @@ pub(super) async fn preflight_refused_purls(
     let vlt_refusals =
         vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
+    let origins = crate::commands::hosted_unwind::patch_server_origins(common);
+    let pnpm_refusals =
+        hosted_pnpm_refusals(cwd, selected, &origins, &state.unwrap_or_default()).await;
     let gem_refusals = crate::commands::vendor::gem_takeover_preview_refusals(
         common,
         selected.iter().map(|p| p.purl.as_str()),
@@ -195,6 +212,7 @@ pub(super) async fn preflight_refused_purls(
             refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl))
                 || vlt_refusal_for(&vlt_refusals, &p.purl).is_some()
                 || (p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some())
+                || pnpm_refusals.contains_key(&p.purl)
                 || gem_refusals.contains_key(&p.purl)
         })
         .map(|p| p.purl.clone())
@@ -213,6 +231,44 @@ async fn npm_lock_refusal(
         return None;
     }
     socket_patch_core::vendor::npm_lock_vendor_preflight(cwd).await
+}
+
+/// The lock-text refusals a hosted → vendored takeover of `selected` meets
+/// in a pnpm project (#853), keyed by the selected purl: each npm purl the
+/// lockfiles pin hosted (see [`crate::commands::agent_download::hosted_claimed_purls`])
+/// and the ledger does not already hold at this uuid, refused by the pnpm
+/// backend on the project's lock and manifest text
+/// ([`socket_patch_core::vendor::pnpm_takeover_lock_text_refusals`]). The
+/// wet takeover reaches the same refusal after its restore and rolls the
+/// restore back, so the hosted pin stays. Discovery runs only when the
+/// selection holds an npm purl and the project has a pnpm lock.
+async fn hosted_pnpm_refusals(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+    origins: &[String],
+    state: &VendorState,
+) -> HashMap<String, (&'static str, String)> {
+    let npm = |p: &&PatchSearchResult| p.purl.starts_with("pkg:npm/");
+    if !selected.iter().any(|p| npm(&p))
+        || tokio::fs::metadata(cwd.join("pnpm-lock.yaml"))
+            .await
+            .is_err()
+    {
+        return HashMap::new();
+    }
+    let claimed =
+        crate::commands::agent_download::hosted_claimed_purls(cwd, origins.to_vec()).await;
+    let candidates: Vec<(&str, &str)> = selected
+        .iter()
+        .filter(npm)
+        .filter(|p| claimed.contains(&PurlKey::new(&p.purl)))
+        .filter(|p| lookup_entry(&state.entries, &p.purl).is_none_or(|e| e.uuid != p.uuid))
+        .map(|p| (p.purl.as_str(), p.uuid.as_str()))
+        .collect();
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+    socket_patch_core::vendor::pnpm_takeover_lock_text_refusals(cwd, &candidates).await
 }
 
 /// Human rendering of the vendored dry-run preview's `would_refuse` records
@@ -265,8 +321,7 @@ pub(crate) struct VendorStep<'a> {
     /// The download phase failed or refused some patch: the run exits 1
     /// and its telemetry must not report a clean vendoring.
     pub(crate) download_errors: bool,
-    pub(crate) telemetry_token: Option<&'a str>,
-    pub(crate) telemetry_org: Option<&'a str>,
+    pub(crate) telemetry_auth: &'a TelemetryAuth,
 }
 
 /// The one vendored-apply entry of `scan --mode vendored` (JSON and
@@ -295,8 +350,7 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
         report_empty,
         prior,
         download_errors,
-        telemetry_token,
-        telemetry_org,
+        telemetry_auth,
     } = step;
     let outcome = vendor_under_lock(
         common,
@@ -316,13 +370,12 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
                 download_errors || *vendor_errors,
                 venv,
                 common.dry_run,
-                telemetry_token,
-                telemetry_org,
+                telemetry_auth,
             )
             .await
         }
         Err((_, message, _)) => {
-            track_patch_vendor_failed(message, common.dry_run, telemetry_token, telemetry_org).await
+            track_patch_vendor_failed(message, common.dry_run, telemetry_auth).await
         }
     }
     outcome.map(|(vendor_errors, venv)| (download_errors || vendor_errors, venv))
@@ -376,7 +429,7 @@ async fn vendor_under_lock(
                 detached: true,
                 force: false,
                 prior,
-                committed: None,
+                eject: None,
             },
             &mut env,
         )
@@ -521,7 +574,7 @@ async fn migrate_legacy_manifest_records(
     }
 }
 
-/// The `scan --vendor` JSON path: discovery → (dry-run preview | download
+/// The `scan --mode vendored` JSON path: discovery → (dry-run preview | download
 /// → vendor engine → GC → embedded VEX) → print `result` → exit code.
 /// The dry-run arm skips the VEX embed (emitting a `vex.skipped` marker
 /// instead): a dry run vendors nothing, so there is no state to attest.
@@ -546,15 +599,14 @@ async fn run_vendor_json_path(
     scanned_purls: &HashSet<String>,
     vendored_purls: &HashSet<PurlKey>,
     prune: bool,
-    telemetry_token: Option<&str>,
-    telemetry_org: Option<&str>,
+    telemetry_auth: &TelemetryAuth,
     // Scan's pending telemetry, flushed by `discover_selected` before
     // anything below writes to stdout.
     telemetry: &mut PendingTelemetry,
     // The npm half of scan's crawl, for the vendor engine to reuse.
     prior: Option<&NpmCrawlSnapshot>,
 ) -> i32 {
-    // Same discovery as `--apply`. Vendored purls are NOT filtered here —
+    // Same discovery as agent mode. Vendored purls are NOT filtered here —
     // re-vendoring a stale uuid is the point of the flag (same-uuid re-runs
     // land on the backend's `already_vendored` skip).
     let discovered = match discover_selected(
@@ -587,6 +639,7 @@ async fn run_vendor_json_path(
     // The planning pass: a patch the preflight refuses holds no slot (it
     // still reaches the engine, which reports the refusal).
     let writers = writers_of(&rows);
+    let origins = crate::commands::hosted_unwind::patch_server_origins(&args.common);
     let refused = preflight_refused_purls(&args.common, &writers).await;
     stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
     let deferred = stage.deferred_keys();
@@ -598,13 +651,14 @@ async fn run_vendor_json_path(
 
     if args.common.dry_run {
         // No downloads, no backends: classify against the ledger
-        // and preview the GC, exactly like `--apply`'s dry run.
+        // and preview the GC, exactly like agent mode's dry run.
         let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
             &args.common,
             selected.iter().map(|p| p.purl.as_str()),
         )
         .await;
-        result["vendor"] = preview_vendor_json(&args.common.cwd, &selected, &takeover).await;
+        result["vendor"] =
+            preview_vendor_json(&args.common.cwd, &selected, &origins, &takeover).await;
         if prune {
             result["gc"] = gc_json(
                 &args.common,
@@ -645,8 +699,7 @@ async fn run_vendor_json_path(
         report_empty: true,
         prior,
         download_errors: dl_code != 0,
-        telemetry_token,
-        telemetry_org,
+        telemetry_auth,
     })
     .await
     {
@@ -663,11 +716,10 @@ async fn run_vendor_json_path(
                 result["vendor"] =
                     serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
             }
-            result["status"] = serde_json::json!("error");
-            result["error"] = serde_json::json!({
-                "code": code,
-                "message": message,
-            });
+            crate::json_envelope::set_error(
+                result,
+                crate::json_envelope::EnvelopeError::new(code, message),
+            );
             if let Some(obj) = result.as_object_mut() {
                 obj.remove("rollout");
             }
@@ -698,6 +750,7 @@ async fn run_vendor_json_path(
     let final_code = embed_vex_into_json(
         &args.common,
         &args.vex,
+        api_client,
         manifest_path,
         vendor_code,
         result,
@@ -708,7 +761,7 @@ async fn run_vendor_json_path(
     final_code
 }
 
-/// The `scan --vendor` interactive arm: download → vendor engine → GC,
+/// The `scan --mode vendored` interactive arm: download → vendor engine → GC,
 /// with human-readable output. `prefetched` holds the views the pre-download
 /// baseline check already fetched (uuid-keyed), so the download phase
 /// serves those records from memory. Extracted + boxed for the same
@@ -726,8 +779,7 @@ async fn run_vendor_interactive_path(
     scanned_purls: &HashSet<String>,
     vendored_purls: &HashSet<PurlKey>,
     prune: bool,
-    telemetry_token: Option<&str>,
-    telemetry_org: Option<&str>,
+    telemetry_auth: &TelemetryAuth,
     // The npm half of scan's crawl, for the vendor engine to reuse.
     prior: Option<&NpmCrawlSnapshot>,
 ) -> i32 {
@@ -754,8 +806,7 @@ async fn run_vendor_interactive_path(
         report_empty: false,
         prior,
         download_errors: dl_code != 0,
-        telemetry_token,
-        telemetry_org,
+        telemetry_auth,
     })
     .await
     {
@@ -812,11 +863,7 @@ fn format_nothing_vendored(download_failed: u64) -> String {
 /// step: `Error (<code>): <Message>.`. The code and message are the ones
 /// the JSON envelope carries.
 pub(crate) fn format_vendor_step_error(code: &str, message: &str) -> String {
-    let mut chars = message.trim_end_matches('.').chars();
-    let message: String = match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    };
+    let message = crate::ui::sentence_case(message.trim_end_matches('.'));
     let mut out = if message.is_empty() {
         format!("Error ({code}).")
     } else {
@@ -911,8 +958,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
     scanned_purls: &'a HashSet<String>,
     vendored_purls: &'a HashSet<PurlKey>,
     prune: bool,
-    telemetry_token: Option<&'a str>,
-    telemetry_org: Option<&'a str>,
+    telemetry_auth: &'a TelemetryAuth,
     telemetry: &'a mut PendingTelemetry,
     prior: Option<&'a NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
@@ -932,8 +978,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
         scanned_purls,
         vendored_purls,
         prune,
-        telemetry_token,
-        telemetry_org,
+        telemetry_auth,
         telemetry,
         prior,
     ))
@@ -954,8 +999,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
     scanned_purls: &'a HashSet<String>,
     vendored_purls: &'a HashSet<PurlKey>,
     prune: bool,
-    telemetry_token: Option<&'a str>,
-    telemetry_org: Option<&'a str>,
+    telemetry_auth: &'a TelemetryAuth,
     prior: Option<&'a NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_vendor_interactive_path(
@@ -970,8 +1014,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
         scanned_purls,
         vendored_purls,
         prune,
-        telemetry_token,
-        telemetry_org,
+        telemetry_auth,
         prior,
     ))
 }
@@ -1036,28 +1079,23 @@ mod migration_tests {
 
     fn entry(uuid: &str, detached: bool, record: Option<PatchRecord>) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: PURL.into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             detached,
             record,
             flavor: Some("package-lock".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                PURL.into(),
+                uuid.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 
@@ -1333,7 +1371,8 @@ mod preview_tests {
     #[tokio::test]
     async fn preview_without_bun_lock_is_plain_would_vendor() {
         let tmp = tempfile::tempdir().unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
         assert_eq!(
             preview,
             serde_json::json!({
@@ -1361,6 +1400,7 @@ mod preview_tests {
         let preview = preview_vendor_json(
             tmp.path(),
             &[sel(UUID, NPM), sel(UUID, PYPI)],
+            &[],
             &HashMap::new(),
         )
         .await;
@@ -1391,6 +1431,7 @@ mod preview_tests {
         let preview = preview_vendor_json(
             tmp.path(),
             &[sel(UUID, NPM), sel(UUID, PYPI)],
+            &[],
             &HashMap::new(),
         )
         .await;
@@ -1425,7 +1466,8 @@ mod preview_tests {
         std::fs::write(tmp.path().join("bun.lock"), V1_WORKSPACE_LOCK).unwrap();
 
         seed_entry(tmp.path(), NPM, UUID);
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
         assert_eq!(
             action_of(&preview, NPM)["action"],
             "would_refuse",
@@ -1433,7 +1475,8 @@ mod preview_tests {
         );
 
         seed_entry(tmp.path(), NPM, OLD_UUID);
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
         let rec = action_of(&preview, NPM);
         assert_eq!(rec["action"], "would_refuse", "{preview}");
         assert!(
@@ -1447,7 +1490,8 @@ mod preview_tests {
         );
         std::fs::write(tmp.path().join("bun.lock"), wired).unwrap();
         seed_entry(tmp.path(), NPM, UUID);
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
         assert_eq!(
             action_of(&preview, NPM)["action"],
             "already_vendored",
@@ -1464,8 +1508,13 @@ mod preview_tests {
             GEM.to_string(),
             ("gemfile_declaration_not_editable", "indented".to_string()),
         )]);
-        let preview =
-            preview_vendor_json(tmp.path(), &[sel(UUID, GEM), sel(UUID, NPM)], &refusals).await;
+        let preview = preview_vendor_json(
+            tmp.path(),
+            &[sel(UUID, GEM), sel(UUID, NPM)],
+            &[],
+            &refusals,
+        )
+        .await;
         let gem = action_of(&preview, GEM);
         assert_eq!(gem["action"], "would_refuse", "{preview}");
         assert_eq!(gem["errorCode"], "gemfile_declaration_not_editable");
@@ -1477,10 +1526,105 @@ mod preview_tests {
     async fn preview_marks_malformed_lockb_would_refuse() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
         assert_eq!(
             action_of(&preview, NPM)["errorCode"],
             "vendor_bun_lockb_invalid",
+            "{preview}"
+        );
+    }
+
+    const PNPM: &str = "pkg:npm/left-pad@1.3.0";
+
+    /// A pnpm v9 project with `left-pad@1.3.0` resolved from `tarball`,
+    /// declared through the default catalog when `catalog` is set.
+    fn pnpm_project(root: &Path, tarball: &str, catalog: bool) {
+        let spec = if catalog { "catalog:" } else { "1.3.0" };
+        std::fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"c","version":"1.0.0","dependencies":{{"left-pad":"{spec}"}}}}"#),
+        )
+        .unwrap();
+        let mut lock = String::from("lockfileVersion: '9.0'\n\n");
+        if catalog {
+            std::fs::write(
+                root.join("pnpm-workspace.yaml"),
+                "packages:\n  - .\ncatalog:\n  left-pad: 1.3.0\n",
+            )
+            .unwrap();
+            lock.push_str(
+                "catalogs:\n  default:\n    left-pad:\n      specifier: 1.3.0\n      version: 1.3.0\n\n",
+            );
+        }
+        let specifier = if catalog { "'catalog:'" } else { "1.3.0" };
+        lock.push_str(&format!(
+            "importers:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: {specifier}\n        version: 1.3.0\n\n\
+             packages:\n\n  left-pad@1.3.0:\n    resolution: {{integrity: sha512-x==, tarball: {tarball}}}\n\n\
+             snapshots:\n\n  left-pad@1.3.0: {{}}\n"
+        ));
+        std::fs::write(root.join("pnpm-lock.yaml"), lock).unwrap();
+    }
+
+    fn hosted_tarball(origin: &str) -> String {
+        format!("{origin}/patch/npm/left-pad/1.3.0/55555555-5555-4555-8555-555555555555/{UUID}/left-pad-1.3.0.tgz")
+    }
+
+    /// #853: a hosted pnpm pin the vendored backend refuses on lock text
+    /// (here a `catalog:` dependency) previews `would_refuse` with the wet
+    /// takeover's code, not `would_vendor`.
+    #[tokio::test]
+    async fn preview_refuses_hosted_pnpm_catalog_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_project(
+            tmp.path(),
+            &hosted_tarball("https://patch.socket.dev"),
+            true,
+        );
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, PNPM)], &[], &HashMap::new()).await;
+        let row = action_of(&preview, PNPM);
+        assert_eq!(row["action"], "would_refuse", "{preview}");
+        assert_eq!(
+            row["errorCode"], "vendor_lock_entry_unsupported",
+            "{preview}"
+        );
+    }
+
+    /// A pin served from the operator's `--patch-server-url` is hosted too.
+    #[tokio::test]
+    async fn preview_refuses_hosted_pnpm_pin_from_custom_patch_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = "https://patches.example.com";
+        pnpm_project(tmp.path(), &hosted_tarball(origin), true);
+        let preview = preview_vendor_json(
+            tmp.path(),
+            &[sel(UUID, PNPM)],
+            &[origin.to_string()],
+            &HashMap::new(),
+        )
+        .await;
+        assert_eq!(
+            action_of(&preview, PNPM)["action"],
+            "would_refuse",
+            "{preview}"
+        );
+    }
+
+    /// A plain hosted pnpm pin the takeover replaces is not over-refused.
+    #[tokio::test]
+    async fn preview_plain_hosted_pnpm_pin_is_would_vendor() {
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_project(
+            tmp.path(),
+            &hosted_tarball("https://patch.socket.dev"),
+            false,
+        );
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, PNPM)], &[], &HashMap::new()).await;
+        assert_eq!(
+            action_of(&preview, PNPM)["action"],
+            "would_vendor",
             "{preview}"
         );
     }

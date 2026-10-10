@@ -412,8 +412,7 @@ pub fn module_path(text: &str) -> Option<String> {
 /// Anything else is left verbatim (and so never parses as ours). Writers
 /// edit the raw text instead.
 pub(crate) fn normalize_for_read(text: &str) -> String {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    unquote_tokens(text)
+    unquote_tokens(crate::formats::text::strip_bom(text))
 }
 
 fn unquote_tokens(text: &str) -> String {
@@ -623,12 +622,18 @@ fn apply_socket_replace(
     // itself produces — anything else makes the first day-2 tidy churn the
     // committed go.mod). New lines use the file's own terminator so a CRLF
     // go.mod round-trips byte-identical through ensure→drop.
-    let eol = super::common::detect_eol(content);
+    let eol = crate::utils::line_endings::terminator(content);
     let body = content;
     if !body.is_empty() && !body.ends_with('\n') {
         body.push_str(eol);
     }
-    if !body.is_empty() && !body.ends_with(&format!("{eol}{eol}")) {
+    // A trailing blank line counts whichever break spells it: on a mixed
+    // file the blank may be `\r\n` while `eol` is the majority `\n`.
+    let ends_blank = body
+        .strip_suffix('\n')
+        .map(|rest| rest.strip_suffix('\r').unwrap_or(rest))
+        .is_some_and(|rest| rest.ends_with('\n'));
+    if !body.is_empty() && !ends_blank {
         body.push_str(eol);
     }
     body.push_str(&want_line);
@@ -877,7 +882,7 @@ pub fn remove_replace_entry(
 /// `\r`, so joining with bare `\n` would LF-normalize every untouched line of
 /// a CRLF go.mod), restoring a trailing newline iff the original had one.
 fn join_preserving_trailing_newline(lines: &[String], original: &str) -> String {
-    let eol = super::common::detect_eol(original);
+    let eol = crate::utils::line_endings::terminator(original);
     let mut out = lines.join(eol);
     if original.ends_with('\n') {
         out.push_str(eol);
@@ -889,6 +894,21 @@ fn join_preserving_trailing_newline(lines: &[String], original: &str) -> String 
 mod tests {
     use super::*;
     use tokio::fs;
+
+    /// The read-only go.mod parsers drop exactly one leading BOM
+    /// (`formats::text::strip_bom`); a second one stays content.
+    #[test]
+    fn normalize_for_read_drops_one_leading_bom_only() {
+        assert_eq!(normalize_for_read("module \"a/b\"\n"), "module a/b\n");
+        assert_eq!(
+            normalize_for_read("\u{feff}module \"a/b\"\n"),
+            "module a/b\n"
+        );
+        assert_eq!(
+            normalize_for_read("\u{feff}\u{feff}module a/b\n"),
+            "\u{feff}module a/b\n"
+        );
+    }
 
     // ── path ownership ───────────────────────────────────────────────
     #[test]
@@ -1877,7 +1897,41 @@ replace (
     /// output, and joining with bare `\n` LF-normalizes EVERY line — churning
     /// the user's whole file and breaking the byte-identical ensure→drop
     /// round-trip pinned above. Same contract as `setup/pypi/edit.rs`'s
-    /// CRLF preservation (shared `detect_eol`).
+    /// CRLF preservation (shared `line_endings::terminator`).
+    /// #815: on a mixed go.mod the appended directive takes the file's
+    /// majority line ending, not CRLF because one line has it.
+    #[test]
+    fn mixed_go_mod_append_takes_the_majority_line_ending() {
+        for (original, eol) in [
+            (
+                "module m\r\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n",
+                "\n",
+            ),
+            (
+                "module m\r\n\r\ngo 1.21\n\r\nrequire github.com/foo/bar v1.4.2\r\n",
+                "\r\n",
+            ),
+        ] {
+            let upserted =
+                upsert_replace_entry(original, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
+                    .unwrap()
+                    .unwrap();
+            let appended = upserted.strip_prefix(original).expect("an append");
+            assert!(appended.starts_with(eol), "{appended:?}");
+            assert!(appended.ends_with(&format!("@v1.4.2{eol}")), "{appended:?}");
+            assert_eq!(appended.matches('\n').count(), 2, "{appended:?}");
+        }
+        // An existing trailing blank line is reused even when its break is
+        // the minority style: no second blank before the directive.
+        let crlf_blank = "module m\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\r\n\r\n";
+        let upserted =
+            upsert_replace_entry(crlf_blank, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
+                .unwrap()
+                .unwrap();
+        let appended = upserted.strip_prefix(crlf_blank).expect("an append");
+        assert!(appended.starts_with("replace "), "{appended:?}");
+    }
+
     #[test]
     fn test_crlf_go_mod_preserves_line_endings() {
         let original = "module m\r\n\r\ngo 1.21\r\n\r\nrequire github.com/foo/bar v1.4.2\r\n";

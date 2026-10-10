@@ -20,6 +20,7 @@ use socket_patch_core::api::client::{
 };
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::Ecosystem;
+use socket_patch_core::telemetry::TelemetryAuth;
 use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 
 /// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
@@ -28,7 +29,7 @@ use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 /// loudly instead of silently matching nothing.
 ///
 /// Without this, an unsupported name parsed fine and was then silently
-/// dropped by `partition_purls`/`crawl_all_ecosystems`, so the user got a
+/// dropped by `partition_purls`/`crawl_ecosystems`, so the user got a
 /// "0 patches" result with no hint that the ecosystem name was the cause.
 fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
     if Ecosystem::all().iter().any(|e| e.cli_name() == s) {
@@ -56,8 +57,8 @@ fn unsupported_ecosystem_message(token: &str, supported: &str) -> String {
 
 /// clap value-parser for `--vendor-source` / `SOCKET_VENDOR_SOURCE`.
 ///
-/// Validates the token against [`VendorSource`] (`auto` | `service` | `build`,
-/// case-insensitive) at parse time so a typo fails the command immediately
+/// Validates the token against [`VendorSource`] (`service` or its `auto` alias,
+/// case-insensitive; `build` is rejected) at parse time so a typo fails immediately
 /// rather than at vendor time, and normalizes it to the canonical lowercase
 /// tag. Mirrors [`parse_supported_ecosystem`]'s fail-loud-on-typo posture.
 fn parse_vendor_source(s: &str) -> Result<String, String> {
@@ -153,17 +154,6 @@ pub struct GlobalArgs {
         value_parser = parse_supported_ecosystem,
     )]
     pub ecosystems: Option<Vec<String>>,
-
-    /// Which kind of patch artifact to download when local files are missing.
-    /// `diff` (default) fetches the smallest delta archive; `file` falls back
-    /// to legacy per-file blobs.
-    #[arg(
-        help_heading = GLOBAL_OPTIONS,
-        long = "download-mode",
-        env = "SOCKET_DOWNLOAD_MODE",
-        default_value = "diff"
-    )]
-    pub download_mode: String,
 
     /// Download installable patched artifacts from the patch service.
     /// `service` is the default; `auto` is a compatibility alias. Local
@@ -530,8 +520,9 @@ impl GlobalArgs {
         }
     }
 
-    /// The directory the manifest lives in — where `apply.lock`, `blobs/`,
-    /// `diffs/` and `packages/` sit (`<cwd>/.socket` by default). The one
+    /// The directory the manifest lives in — where `apply.lock` and `blobs/`
+    /// sit, and the obsolete `diffs/` and `packages/` the cleanup sweeps
+    /// remove (`<cwd>/.socket` by default). The one
     /// derivation every lock acquire and artifact probe uses; see
     /// [`socket_dir_of`] for callers holding a raw manifest path.
     pub(crate) fn socket_dir(&self) -> PathBuf {
@@ -567,6 +558,15 @@ impl GlobalArgs {
     pub(crate) fn telemetry_credentials(&self) -> (Option<String>, Option<String>) {
         let overrides = self.api_client_overrides();
         resolve_ambient_credentials(overrides.api_token, overrides.org_slug)
+    }
+
+    /// Telemetry's route for a run that built no API client:
+    /// [`Self::telemetry_credentials`] as a [`TelemetryAuth`] (the org
+    /// endpoint only for a token + slug; never a network call). A run that
+    /// has a client uses [`TelemetryAuth::for_client`] instead.
+    pub(crate) fn telemetry_auth(&self) -> TelemetryAuth {
+        let (api_token, org_slug) = self.telemetry_credentials();
+        TelemetryAuth::from_credentials(api_token.as_deref(), org_slug.as_deref())
     }
 
     /// The vendoring-service config every vendor entry point (`vendor`,
@@ -659,7 +659,6 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_ORG_SLUG",
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
     "SOCKET_VENDOR_SOURCE",
     "SOCKET_VENDOR_URL",
     "SOCKET_PATCH_SERVER_URL",
@@ -687,7 +686,6 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
 /// missing here escapes the empty-var scrub — the invariant tests below
 /// parse every entry against its owning subcommand to keep this honest.
 pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
-    "SOCKET_FORCE",
     "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
     "SOCKET_ALL_RELEASES",
@@ -714,7 +712,7 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
 /// ("a value is required"), `SOCKET_LOCK_TIMEOUT` / `SOCKET_BATCH_SIZE`
 /// ("cannot parse integer from empty string") and `SOCKET_ECOSYSTEMS` (the
 /// per-token validator) outright — a single stray blank var crashed every
-/// subcommand — and an empty `SOCKET_DOWNLOAD_MODE` / `SOCKET_MANIFEST_PATH`
+/// subcommand — and an empty `SOCKET_MANIFEST_PATH`
 /// (or `SOCKET_VEX_OUTPUT`, which would silently target `""`) leaked `""`
 /// past the documented defaults. Called from `main` after peer-alias
 /// promotion and before clap runs. Only exactly-empty values are scrubbed;
@@ -751,7 +749,6 @@ impl Default for GlobalArgs {
             org: None,
             proxy_url: None,
             ecosystems: None,
-            download_mode: "diff".to_string(),
             vendor_source: "service".to_string(),
             maven_config: None,
             vendor_url: None,
@@ -773,6 +770,13 @@ impl Default for GlobalArgs {
             no_vlt_install_cleanup: false,
         }
     }
+}
+
+/// True for a golang PURL in local mode (no `--global` / `--global-prefix`):
+/// `apply` redirects it to a project-local patched copy via a `go.mod`
+/// `replace`, and `rollback` drops the same redirect.
+pub(crate) fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
+    !common.is_global() && Ecosystem::from_purl(purl) == Some(Ecosystem::Golang)
 }
 
 #[cfg(test)]
@@ -971,7 +975,6 @@ mod tests {
             std::env::set_var("SOCKET_LOCK_TIMEOUT", "");
             std::env::set_var("SOCKET_GLOBAL_PREFIX", "");
             std::env::set_var("SOCKET_ECOSYSTEMS", "");
-            std::env::set_var("SOCKET_DOWNLOAD_MODE", "");
             std::env::set_var("SOCKET_VENDOR_SOURCE", "");
             std::env::set_var("SOCKET_BATCH_SIZE", "");
             std::env::set_var("SOCKET_VEX_OUTPUT", "");
@@ -1007,7 +1010,6 @@ mod tests {
             assert_eq!(cli.common.lock_timeout, None);
             assert!(cli.common.global_prefix.is_none());
             assert!(cli.common.ecosystems.is_none());
-            assert_eq!(cli.common.download_mode, "diff");
             assert_eq!(
                 cli.common.vendor_source, "service",
                 "empty SOCKET_VENDOR_SOURCE must fall back to the `auto` default"
@@ -1544,7 +1546,6 @@ mod tests {
 
             let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
             assert_eq!(cli.common.manifest_path, DEFAULT_PATCH_MANIFEST_PATH);
-            assert_eq!(cli.common.download_mode, "diff");
             assert_eq!(cli.common.cwd, PathBuf::from("."));
         });
     }
@@ -1634,9 +1635,6 @@ mod tests {
         // (env var, argv of a subcommand that binds it) — every bool entry
         // of `LOCAL_ARG_ENV_VARS`, on each subcommand that binds it.
         const BOOL_BINDINGS: &[(&str, &[&str])] = &[
-            ("SOCKET_FORCE", &["socket-patch", "apply"]),
-            ("SOCKET_FORCE", &["socket-patch", "vendor"]),
-            ("SOCKET_FORCE", &["socket-patch", "self-update"]),
             ("SOCKET_SAVE_ONLY", &["socket-patch", "get", "x"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "get", "x"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "scan"]),
@@ -1671,6 +1669,48 @@ mod tests {
                     std::env::remove_var(var);
                 }
             }
+        });
+    }
+
+    /// v5 retired `SOCKET_FORCE` (#615): `--force` is flag-only on `apply`,
+    /// `vendor` and `--update`. A stale export must be ignored, so it can
+    /// never quietly skip the beforeHash check or the managed-install
+    /// refusal; the flag itself still works.
+    #[test]
+    #[serial_test::serial]
+    fn socket_force_env_is_ignored_and_force_flag_still_works() {
+        fn force_of(argv: &[&str]) -> bool {
+            let argv = argv.iter().map(|s| s.to_string()).collect();
+            match crate::parse_argv_with_shortcuts(argv)
+                .unwrap_or_else(|e| panic!("parse failed: {e}"))
+                .command
+            {
+                crate::Commands::Apply(a) => a.force,
+                crate::Commands::Vendor(a) => a.force,
+                crate::Commands::SelfUpdate(a) => a.force,
+                _ => panic!("unexpected subcommand"),
+            }
+        }
+
+        const ARGVS: &[&[&str]] = &[
+            &["socket-patch", "apply"],
+            &["socket-patch", "vendor"],
+            &["socket-patch", "self-update"],
+            &["socket-patch", "--update"],
+        ];
+
+        with_clean_socket_env(|| {
+            with_env_cleared(&["SOCKET_FORCE"], || {
+                for val in ["1", "true", "yes"] {
+                    std::env::set_var("SOCKET_FORCE", val);
+                    for &argv in ARGVS {
+                        assert!(!force_of(argv), "SOCKET_FORCE={val} set force on {argv:?}");
+                        let mut with_flag = argv.to_vec();
+                        with_flag.push("--force");
+                        assert!(force_of(&with_flag), "--force ignored on {argv:?}");
+                    }
+                }
+            });
         });
     }
 

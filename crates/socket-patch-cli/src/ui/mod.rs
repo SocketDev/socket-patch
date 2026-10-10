@@ -3,7 +3,7 @@
 //! - [`StatusLine`]: the one self-rewriting progress line.
 //! - [`confirm`], [`select_one`]: prompts.
 //! - [`print_json`]: the one `--json` document writer.
-//! - [`plural`], [`truncate`]: text shaping.
+//! - [`plural`], [`truncate`], [`sentence_case`]: text shaping.
 //! - [`next_steps`]: the one "Next steps:" block (hosted and vendored).
 //! - [`color_enabled`], [`paint`], [`severity`], [`pad`]: color policy and
 //!   ANSI-aware column alignment.
@@ -24,7 +24,64 @@ use crate::args::GlobalArgs;
 pub(crate) use prompt::confirm;
 pub use prompt::{select_one, SelectError};
 pub(crate) use status::StatusLine;
-pub(crate) use text::{next_steps, plural, truncate};
+pub(crate) use text::{
+    manifest_error_message, next_steps, plural, sentence_case, shell_word, short_uuid,
+    sweep_failure, truncate,
+};
+
+/// A global run's scope as one pasteable argument: `--global-prefix <dir>`
+/// (shell-quoted when needed) or `-g`; `None` for a project run.
+pub(crate) fn global_scope_arg(common: &GlobalArgs) -> Option<String> {
+    match &common.global_prefix {
+        Some(prefix) => Some(format!(
+            "--global-prefix {}",
+            shell_word(&prefix.to_string_lossy())
+        )),
+        None if common.global => Some("-g".to_string()),
+        None => None,
+    }
+}
+
+/// The flags that pick WHICH tree a run acts on, as a pasteable suffix
+/// (leading space, empty for a default run): `--cwd`, `--manifest-path`,
+/// `-g` / `--global-prefix` and `--ecosystems`, each only when it differs
+/// from its default. A remedy a command prints repeats them, so running it
+/// verbatim acts on the tree the command just reported on (#464, #1219).
+pub(crate) fn scope_args(common: &GlobalArgs) -> String {
+    let mut out = String::new();
+    if common.cwd != std::path::Path::new(".") {
+        out.push_str(" --cwd ");
+        out.push_str(&shell_word(&common.cwd.to_string_lossy()));
+    }
+    if common.manifest_path != socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH {
+        out.push_str(" --manifest-path ");
+        out.push_str(&shell_word(&common.manifest_path));
+    }
+    if let Some(global) = global_scope_arg(common) {
+        out.push(' ');
+        out.push_str(&global);
+    }
+    if let Some(ecosystems) = common.ecosystems.as_deref().filter(|e| !e.is_empty()) {
+        out.push_str(" --ecosystems ");
+        out.push_str(&shell_word(&ecosystems.join(",")));
+    }
+    out
+}
+
+/// Where a physical copy lives, relative to `cwd` when it is inside it.
+/// Shared by `apply` and `rollback`.
+pub(crate) fn display_copy_path(package_path: &str, cwd: &std::path::Path) -> String {
+    let path = std::path::Path::new(package_path);
+    let canonical = std::fs::canonicalize(path).ok();
+    let rel = path
+        .strip_prefix(cwd)
+        .ok()
+        .or_else(|| canonical.as_deref().and_then(|c| c.strip_prefix(cwd).ok()));
+    match rel {
+        Some(r) if !r.as_os_str().is_empty() => r.display().to_string(),
+        _ => package_path.to_string(),
+    }
+}
 
 /// The one line every declined prompt prints (get, rollback, remove,
 /// `--update`).
@@ -257,6 +314,19 @@ mod tests {
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         let map: HashMap<&str, &str> = pairs.iter().copied().collect();
         move |k| map.get(k).map(|v| v.to_string())
+    }
+
+    #[test]
+    fn copy_path_outside_cwd_stays_absolute() {
+        assert_eq!(
+            display_copy_path("/elsewhere/node_modules/x", std::path::Path::new("/p")),
+            "/elsewhere/node_modules/x"
+        );
+        assert_eq!(display_copy_path("/p", std::path::Path::new("/p")), "/p");
+        assert_eq!(
+            display_copy_path("/p/node_modules/é", std::path::Path::new("/p")),
+            "node_modules/é"
+        );
     }
 
     #[test]

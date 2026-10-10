@@ -470,54 +470,6 @@ async fn bun_binary_inventory_works_without_an_install_or_runtime() {
     }
 }
 
-#[tokio::test]
-async fn bun_binary_vendor_integrity_follows_live_package_records() {
-    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.1.45/bun.lockb");
-    let mut lock = super::super::bun_lockb::BunLockb::parse(bytes).unwrap();
-    let package = lock
-        .packages()
-        .unwrap()
-        .into_iter()
-        .find(|package| package.name == "minimist")
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
-    let rel = ".socket/vendor/npm/11111111-1111-4111-8111-111111111111/minimist-1.2.2.tgz";
-    let first = format!("sha512-{}", "A".repeat(86) + "==");
-    lock.set_package(package.id, rel, &first).unwrap();
-    tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
-        .await
-        .unwrap();
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), rel).await,
-        Some(LockIntegrity::Sri(first))
-    );
-    let next = rel.replace(
-        "11111111-1111-4111-8111-111111111111",
-        "22222222-2222-4222-8222-222222222222",
-    );
-    lock.set_package(
-        package.id,
-        &next,
-        &format!("sha512-{}", "A".repeat(86) + "=="),
-    )
-    .unwrap();
-    tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
-        .await
-        .unwrap();
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), rel).await,
-        None,
-        "retired strings are not active resolutions"
-    );
-    assert!(wired_vendor_integrity(tmp.path(), &next).await.is_some());
-    write(tmp.path(), "bun.lock", BUN_LOCK).await;
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), &next).await,
-        None,
-        "text lock takes precedence"
-    );
-}
-
 /// A pnpm-lock.yaml whose lockfileVersion the probe refuses — pnpm 6
 /// wrote 5.3; only 5.4/6.0/9.0 route to a backend. This is the shape
 /// that reaches the version-refusal discovery fallback, where a live
@@ -999,7 +951,10 @@ async fn headerless_yarn_classic_lock_is_inventoried_as_classic_by_the_fallback(
         .filter(|l| !l.starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!headerless.contains("lockfile v1"), "fixture drops the header");
+    assert!(
+        !headerless.contains("lockfile v1"),
+        "fixture drops the header"
+    );
     write(tmp.path(), "yarn.lock", &headerless).await;
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
     assert_eq!(flavor, NpmLockFlavor::YarnClassic);
@@ -1657,6 +1612,94 @@ async fn gem_inventory_memory_view_reads_the_lock_bundler_loads() {
     assert_eq!(gem_purls(&entries), vec!["pkg:gem/rack@2.0.0"]);
 }
 
+/// #749 / #751: a gem project whose lock bundler loads is none
+/// socket-patch reads (a custom `BUNDLE_LOCKFILE`, an unsupported
+/// `BUNDLE_GEMFILE`, a `Gemfile` + `gems.rb` twin)
+/// yields no gem entries AND a `gem_lock_unsupported` diagnosis, so a
+/// lockfile-only scan says the gems were not scanned instead of reporting
+/// none. Supported layouts, and projects without gem files, stay quiet.
+#[tokio::test]
+async fn gem_inventory_diagnoses_a_lock_it_cannot_read() {
+    let diagnosed = |project: &MemoryProject| {
+        let project = project.clone();
+        async move {
+            let (entries, unsupported) =
+                inventory_project_diagnosed_in(&ProjectView::Memory(&project)).await;
+            let codes: Vec<&str> = unsupported.iter().map(|d| d.code).collect();
+            let detail = unsupported
+                .iter()
+                .find(|d| d.code == "gem_lock_unsupported")
+                .map(|d| d.detail.clone());
+            (gem_purls(&entries), codes, detail)
+        }
+    };
+    let lock =
+        |bundled: &str| rack_lock("https://rubygems.org/", "2.2.8").replace("2.6.9", bundled);
+
+    let mut custom = MemoryProject::new();
+    custom.insert_text("Gemfile", "gem \"rack\"\n");
+    custom.insert_text("Gemfile.lock", lock("2.6.2"));
+    custom.insert_text("custom.lock", lock("2.6.2"));
+    custom.insert_text(".bundle/config", "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n");
+    let (purls, codes, detail) = diagnosed(&custom).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+    let detail = detail.unwrap();
+    assert!(
+        detail.contains("NOT scanned") && detail.contains("custom.lock"),
+        "{detail}"
+    );
+
+    let mut gemfile = MemoryProject::new();
+    gemfile.insert_text("Gemfile.lock", lock("2.6.2"));
+    gemfile.insert_text(".bundle/config", "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n");
+    let (purls, codes, _) = diagnosed(&gemfile).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+
+    let mut twin = MemoryProject::new();
+    twin.insert_text("Gemfile", "gem \"rack\"\n");
+    twin.insert_text("gems.rb", "gem \"rack\"\n");
+    twin.insert_text("Gemfile.lock", lock("1.17.3"));
+    twin.insert_text("gems.locked", lock("2.6.2"));
+    let (purls, codes, detail) = diagnosed(&twin).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+    assert!(detail.unwrap().contains("gems.rb"));
+    // Locks that agree on the major still leave the installing bundler
+    // unknown: a twin is never read.
+    let mut bundler1 = twin.clone();
+    bundler1.insert_text("gems.locked", lock("1.17.3"));
+    let (purls, codes, _) = diagnosed(&bundler1).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+
+    // A symlinked spelling (a git mode-120000 entry, whose target the
+    // memory view doesn't carry) may still be a file to bundler, so the
+    // twin stays unread (security review on #768).
+    for linked in ["gems.rb", "Gemfile"] {
+        let mut symlinked = twin.clone();
+        symlinked.insert(linked, MemoryEntry::Symlink);
+        let (purls, codes, _) = diagnosed(&symlinked).await;
+        assert!(purls.is_empty(), "{linked}: {purls:?}");
+        assert_eq!(codes, vec!["gem_lock_unsupported"], "{linked}");
+    }
+
+    // Supported layouts: entries, no diagnosis.
+    let mut plain = MemoryProject::new();
+    plain.insert_text("Gemfile", "gem \"rack\"\n");
+    plain.insert_text("Gemfile.lock", lock("2.6.2"));
+    let (purls, codes, _) = diagnosed(&plain).await;
+    assert_eq!(purls, vec!["pkg:gem/rack@2.2.8"]);
+    assert!(codes.is_empty(), "{codes:?}");
+
+    // No gem files: a stray bundler setting is not a gem project.
+    let mut npm = MemoryProject::new();
+    npm.insert_text(".bundle/config", "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n");
+    let (_, codes, _) = diagnosed(&npm).await;
+    assert!(codes.is_empty(), "{codes:?}");
+}
+
 /// #736: ledger recovery's GEM remote set comes from the lock bundler
 /// loads too, never from an ignored twin's sources.
 #[tokio::test]
@@ -1699,35 +1742,6 @@ async fn inventories_script_and_pylock_files_without_installed_packages() {
         LockIntegrity::Sha256Hex(sha)
     );
     assert!(!entries.iter().any(|entry| entry.name == "local"));
-}
-
-#[tokio::test]
-async fn pylock_repair_uses_the_exact_artifact_hash_and_refuses_conflicts() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = ".socket/vendor/pypi/uuid/alpha-1-py3-none-any.whl";
-    let sha = "a".repeat(64);
-    let pylock = format!("lock-version='1.0'\n[[packages]]\nname='alpha'\nversion='1'\narchive={{path='{path}',hashes={{sha256='{sha}'}}}}\n");
-    write(tmp.path(), "pylock.toml", &pylock).await;
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), path).await,
-        Some(LockIntegrity::Sha256Hex(sha.clone()))
-    );
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), &format!("{path}.other")).await,
-        None
-    );
-    write(tmp.path(), "example.py.lock", &format!("version=1\n[[package]]\nname='alpha'\nversion='1'\nsource={{path='{path}'}}\nwheels=[{{filename='alpha-1-py3-none-any.whl',hash='sha256:{sha}'}}]\n")).await;
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), path).await,
-        Some(LockIntegrity::Sha256Hex(sha.clone()))
-    );
-    write(
-        tmp.path(),
-        "pylock.toml",
-        &pylock.replace(&sha, &"b".repeat(64)),
-    )
-    .await;
-    assert_eq!(wired_vendor_integrity(tmp.path(), path).await, None);
 }
 
 #[test]
@@ -2185,8 +2199,7 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
     let root = tmp.path().to_path_buf();
     // Every filename this module opens: the per-ecosystem inventories,
     // the npm-family readers (reached without the flavor probe touching
-    // the same file via the shrinkwrap/sibling/rush fallbacks), and
-    // wired_vendor_integrity (no probe at all).
+    // the same file via the shrinkwrap/sibling/rush fallbacks).
     let names = [
         "Cargo.lock",
         "go.sum",
@@ -2226,7 +2239,6 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
             inventory_vlt(&root).await,
             inventory_pnpm_lock_at(&root.join("shrinkwrap.yaml")).await,
             gem_remotes(&root).await,
-            wired_vendor_integrity(&root, ".socket/vendor/npm/x/x.tgz").await,
         )
     };
     let Ok(results) = tokio::time::timeout(deadline, all).await else {
@@ -2239,22 +2251,8 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
         }
         panic!("lockfile inventories must fail fast on FIFO lockfiles");
     };
-    let (
-        cargo,
-        go,
-        composer,
-        gem,
-        pypi,
-        npm,
-        pnpm,
-        yarn_c,
-        yarn_b,
-        bun,
-        vlt,
-        legacy,
-        remotes,
-        wired,
-    ) = results;
+    let (cargo, go, composer, gem, pypi, npm, pnpm, yarn_c, yarn_b, bun, vlt, legacy, remotes) =
+        results;
     for (label, opt) in [
         ("cargo", cargo),
         ("go", go),
@@ -2275,7 +2273,6 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
         );
     }
     assert!(remotes.is_empty(), "{remotes:?}");
-    assert!(wired.is_none(), "{wired:?}");
 }
 
 #[tokio::test]
@@ -2520,6 +2517,38 @@ packages:
         entry(&entries, "other").integrity,
         LockIntegrity::Sri("sha512-y==".into())
     );
+}
+
+/// #1271: a block keyed by an empty range (`left-pad@:` from
+/// `"left-pad": ""`), alone or merged ahead of another range, is a
+/// registry package lock-only discovery sees.
+#[tokio::test]
+async fn yarn_classic_empty_range_key_is_inventoried() {
+    for key in [
+        "left-pad@:",
+        "left-pad@, left-pad@^1.3.0:",
+        "\"@scope/pkg@\":",
+    ] {
+        let name = if key.contains("@scope") {
+            "@scope/pkg"
+        } else {
+            "left-pad"
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "yarn.lock",
+            &format!(
+                "# yarn lockfile v1\n\n\n{key}\n  version \"1.3.0\"\n  \
+                 resolved \"https://registry.yarnpkg.com/{name}/-/x-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e\"\n"
+            ),
+        )
+        .await;
+        let entries = inventory_yarn_classic(tmp.path()).await.unwrap();
+        let e = entry(&entries, name);
+        assert_eq!(e.version, "1.3.0", "{key}");
+        assert!(e.resolved.is_some(), "{key}: a registry copy");
+    }
 }
 
 /// Real classic-lock degenerations: a `resolved` URL without the legacy
@@ -2847,119 +2876,6 @@ async fn pure_wheel_rejects_short_hash_missing_hash_and_non_http_url() {
         "a".repeat(64)
     );
     assert_eq!(pure_wheel_from_uv_unit(&ftp), None, "non-http url");
-}
-
-/// The yarn-classic `integrity <sri>` branch of `wired_vendor_integrity`
-/// — the trust anchor for repair's no-ledger reconstruction on
-/// yarn-classic projects (rewired classic locks carry exactly this
-/// line). Rides along fail-soft: an unparseable JSON lock and a v1 lock
-/// without a `packages` map are both skipped, not fatal.
-#[tokio::test]
-async fn wired_vendor_integrity_reads_rewired_yarn_classic_and_skips_bad_json_locks() {
-    let tmp = tempfile::tempdir().unwrap();
-    let rel = ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
-    // Unparseable JSON lock: skipped fail-soft.
-    write(tmp.path(), "npm-shrinkwrap.json", "not json").await;
-    // v1 lock without a packages map: skipped fail-soft.
-    write(
-        tmp.path(),
-        "package-lock.json",
-        r#"{"lockfileVersion":1,"dependencies":{}}"#,
-    )
-    .await;
-    // The rewired classic block, exactly as yarn_classic_lock rewires it.
-    write(
-        tmp.path(),
-        "yarn.lock",
-        &format!(
-            "# yarn lockfile v1\n\n\
-                 \"left-pad@file:./{rel}\":\n  \
-                 version \"1.3.0\"\n  \
-                 resolved \"file:./{rel}#0000000000000000000000000000000000000000\"\n  \
-                 integrity sha512-ours==\n"
-        ),
-    )
-    .await;
-
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), rel).await,
-        Some(LockIntegrity::Sri("sha512-ours==".into())),
-        "the classic `integrity <sri>` line is the wired trust anchor"
-    );
-}
-
-/// The yarn / bun branches of `wired_vendor_integrity` read the entry
-/// models lockfile discovery reads, not a line window: a berry block whose
-/// carried sections push `checksum:` far below the reference, yarn 4.0.x's
-/// bare-hex checksum, a CRLF classic lock, a shadowed classic block (yarn
-/// keeps the last one) and bun's digest-less re-save (which must never
-/// borrow the next tuple's sha512).
-#[tokio::test]
-async fn wired_vendor_integrity_reads_yarn_and_bun_entries_structurally() {
-    let rel = ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
-    let hex = "ab".repeat(64);
-    let berry = |checksum: &str| {
-        format!(
-            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
-             \"left-pad@file:./{rel}::locator=app%40workspace%3A.\":\n  \
-             version: 1.3.0\n  \
-             resolution: \"left-pad@file:./{rel}#./{rel}::hash=abc&locator=app%40workspace%3A.\"\n  \
-             dependencies:\n    a: \"npm:1.0.0\"\n    b: \"npm:1.0.0\"\n    c: \"npm:1.0.0\"\n    d: \"npm:1.0.0\"\n    e: \"npm:1.0.0\"\n  \
-             checksum: {checksum}\n  \
-             languageName: node\n  \
-             linkType: hard\n"
-        )
-    };
-    for (checksum, want) in [
-        (format!("10c0/{hex}"), format!("10c0/{hex}")),
-        (hex.clone(), format!("10c0/{hex}")),
-    ] {
-        let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), "yarn.lock", &berry(&checksum)).await;
-        assert_eq!(
-            wired_vendor_integrity(tmp.path(), rel).await,
-            Some(LockIntegrity::BerryChecksum(want)),
-            "{checksum}"
-        );
-    }
-
-    let classic = |key: &str, sri: &str| {
-        format!(
-            "{key}:\n  version \"1.3.0\"\n  resolved \"file:./{rel}#0000000000000000000000000000000000000000\"\n  integrity {sri}\n"
-        )
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let lock = format!(
-        "# yarn lockfile v1\n\n{}\n{}",
-        classic("left-pad@^1.3.0", "sha512-shadowed=="),
-        classic("left-pad@^1.3.0", "sha512-live==")
-    )
-    .replace('\n', "\r\n");
-    write(tmp.path(), "yarn.lock", &lock).await;
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), rel).await,
-        Some(LockIntegrity::Sri("sha512-live==".into())),
-        "the live (last) block of a CRLF lock"
-    );
-
-    let bun = |ours: &str| {
-        format!(
-            "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \"name\": \"app\",\n    }},\n  }},\n  \"packages\": {{\n    \"left-pad\": [\"left-pad@./{rel}\", {{}}{ours}],\n\n    \"right-pad\": [\"right-pad@1.0.0\", \"\", {{}}, \"sha512-theirs==\"],\n  }}\n}}\n"
-        )
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "bun.lock", &bun(", \"sha512-ours==\"")).await;
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), rel).await,
-        Some(LockIntegrity::Sri("sha512-ours==".into()))
-    );
-    let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "bun.lock", &bun("")).await;
-    assert_eq!(
-        wired_vendor_integrity(tmp.path(), rel).await,
-        None,
-        "a digest-less re-save pins nothing"
-    );
 }
 
 /// `PnpmPackage::resolution_tokens` exposes the raw `resolution:` value the
@@ -3470,6 +3386,36 @@ async fn requirements_in_root_includes_are_inventoried() {
     assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
 }
 
+/// #1249: pip's `join_lines` strips the backslash of a continued line
+/// that is the file's last and flushes it at EOF, so `six==1.16.0 \` with
+/// nothing after it installs six 1.16.0. Lock-only discovery reads it as
+/// that pin, in the root file and in a `-r` include, LF and CRLF.
+#[tokio::test]
+async fn requirements_dangling_eof_continuation_is_inventoried() {
+    for root in ["six==1.16.0 \\", "six==1.16.0 \\\n", "six==1.16.0 \\\r\n"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "requirements.txt", root).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![("six".to_string(), "1.16.0".to_string())],
+            "{root:?}"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "requirements.txt", "-r dev.txt\n").await;
+    write(tmp.path(), "dev.txt", "idna==3.4\nsix==1.16.0 \\\n").await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("idna".to_string(), "3.4".to_string()),
+            ("six".to_string(), "1.16.0".to_string()),
+        ]
+    );
+}
+
 /// #721: pip decodes a requirements file by its BOM, so a UTF-16 root
 /// file and a UTF-16 include (what Windows PowerShell 5.1's `pip freeze >`
 /// writes) are inventoried like their UTF-8 text, on disk and in memory.
@@ -3505,6 +3451,56 @@ async fn requirements_utf16_files_are_inventoried() {
                 ("six".to_string(), "1.16.0".to_string()),
             ],
             "le={le}: {entries:?}"
+        );
+
+        let mut project = MemoryProject::new();
+        project.insert("requirements.txt", MemoryEntry::Binary(root_bytes.into()));
+        project.insert(
+            "requirements/base.txt",
+            MemoryEntry::Binary(base_bytes.into()),
+        );
+        let in_memory = super::pypi::inventory_pypi_locks_in(&ProjectView::Memory(&project))
+            .await
+            .unwrap();
+        assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
+    }
+}
+
+/// #1119: with no BOM, pip decodes a requirements file through a PEP 263
+/// coding line, so a Latin-1 root file and a Latin-1 include are
+/// inventoried on a fresh checkout instead of reading as "no requirements",
+/// on disk and in memory.
+#[tokio::test]
+async fn requirements_pep_263_files_are_inventoried() {
+    let latin1 = |pins: &str| {
+        let mut bytes = b"# -*- coding: latin-1 -*-\n# Maintainer: Jos\xe9\n".to_vec();
+        bytes.extend_from_slice(pins.as_bytes());
+        bytes
+    };
+    for (root_bytes, base_bytes) in [
+        // The root file itself.
+        (
+            latin1("-r requirements/base.txt\nidna==3.7\n"),
+            b"six==1.16.0\n".to_vec(),
+        ),
+        // Only the include.
+        (
+            b"-r requirements/base.txt\nidna==3.7\n".to_vec(),
+            latin1("six==1.16.0\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("requirements")).unwrap();
+        std::fs::write(tmp.path().join("requirements.txt"), &root_bytes).unwrap();
+        std::fs::write(tmp.path().join("requirements/base.txt"), &base_bytes).unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![
+                ("idna".to_string(), "3.7".to_string()),
+                ("six".to_string(), "1.16.0".to_string()),
+            ],
+            "{entries:?}"
         );
 
         let mut project = MemoryProject::new();
@@ -3559,6 +3555,105 @@ async fn requirements_index_option_in_an_include_spans_the_tree() {
         entry(&entries, "idna").integrity,
         LockIntegrity::Sha256AnyOf(vec![sha.clone()])
     );
+}
+
+/// REGRESSION (#735): Bun opens `bun.lock` through symlinks, so a
+/// dangling `bun.lock` link is absent to it and it installs from the
+/// `bun.lockb` beside it (verified with Bun 1.2.23 and 1.3.14:
+/// `bun install --frozen-lockfile` installs from the binary lock). The
+/// inventory and vendored routing must both pick `bun.lockb` too, instead of losing every package of the live lock.
+#[cfg(unix)]
+#[tokio::test]
+async fn bun_dangling_text_lock_link_leaves_the_binary_lock_live() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    let mut lock = super::super::bun_lockb::BunLockb::parse(bytes).unwrap();
+    let minimist = lock
+        .packages()
+        .unwrap()
+        .into_iter()
+        .find(|package| package.name == "minimist")
+        .unwrap();
+    let rel = ".socket/vendor/npm/11111111-1111-4111-8111-111111111111/minimist-1.2.2.tgz";
+    let sri = format!("sha512-{}", "A".repeat(86) + "==");
+    lock.set_package(minimist.id, rel, &sri).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink("missing-target", tmp.path().join("bun.lock")).unwrap();
+
+    let (entries, diagnoses) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(diagnoses.is_empty(), "{diagnoses:?}");
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("is-number".into(), "7.0.0".into())],
+        "the binary lock's registry packages (minimist is vendored)"
+    );
+    assert!(super::super::bun_lock::binary_lock_drives(tmp.path()));
+    // The hosted engine's view-level answer (disk and snapshot) agrees.
+    assert!(!bun_text_lock_drives(&ProjectView::Disk(tmp.path())));
+    let snapshot = DiskSnapshot::new(tmp.path());
+    assert!(!bun_text_lock_drives(&ProjectView::Snapshot(&snapshot)));
+}
+
+/// The #735 control: a `bun.lock` DIRECTORY is not absent to Bun — it
+/// opens it, fails to read it and ignores BOTH locks ("warn: Ignoring
+/// lockfile", Bun 1.2.23 and 1.3.14). The binary lock is therefore not
+/// live; every reader keeps choosing the text lock, whose unreadable read
+/// refuses rather than wiring a `bun.lockb` Bun would not install from.
+#[tokio::test]
+async fn bun_text_lock_directory_still_shadows_the_binary_lock() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("bun.lockb"), bytes)
+        .await
+        .unwrap();
+    tokio::fs::create_dir(tmp.path().join("bun.lock"))
+        .await
+        .unwrap();
+
+    let (entries, _) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(entries.is_empty(), "{entries:?}");
+    assert!(!super::super::bun_lock::binary_lock_drives(tmp.path()));
+    assert!(bun_text_lock_drives(&ProjectView::Disk(tmp.path())));
+}
+
+/// The #735 errno control: Bun falls back to `bun.lockb` only when opening
+/// `bun.lock` fails with ENOENT. A self-referencing link fails with ELOOP
+/// and a link through a regular file with ENOTDIR; Bun then prints
+/// "Ignoring lockfile" and installs from NEITHER lock (Bun 1.2.23 and
+/// 1.3.14). So the text lock keeps shadowing the binary one and nothing is
+/// inventoried from a `bun.lockb` Bun would not install from.
+#[cfg(unix)]
+#[tokio::test]
+async fn bun_text_lock_link_failing_with_other_errno_still_shadows_the_binary_lock() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    for target in ["bun.lock", "package.json/x"] {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package.json"), "{}")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(target, tmp.path().join("bun.lock")).unwrap();
+
+        let (entries, _) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty(), "{target}: {entries:?}");
+        assert!(
+            !super::super::bun_lock::binary_lock_drives(tmp.path()),
+            "{target}"
+        );
+        assert!(
+            bun_text_lock_drives(&ProjectView::Disk(tmp.path())),
+            "{target}"
+        );
+        let snapshot = DiskSnapshot::new(tmp.path());
+        assert!(
+            bun_text_lock_drives(&ProjectView::Snapshot(&snapshot)),
+            "{target}"
+        );
+    }
 }
 
 #[tokio::test]

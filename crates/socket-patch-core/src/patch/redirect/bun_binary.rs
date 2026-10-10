@@ -1,6 +1,7 @@
 //! Native hosted redirects for bun.lockb. Structured package snapshots keep
 //! scoped rollback independent of other packages in the same binary lock.
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
+use crate::vendor::bun_lock_text::user_tarball_version;
 use crate::vendor::bun_lockb::BunLockb;
 
 pub(crate) const KIND: &str = "redirect_bun_lockb_package";
@@ -64,6 +65,29 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
                             ))
                 })
                 .collect();
+            // A user URL / `file:` tarball record of this version installs
+            // from its own resolution beside any redirected copy and stays
+            // unpatched (#497): never rewired, always reported.
+            for p in packages.iter().filter(|p| {
+                p.name == name
+                    && p.version.is_none()
+                    && !matching.iter().any(|m| m.id == p.id)
+                    && user_tarball_version(&name, &p.resolution) == Some(dep.version.as_str())
+            }) {
+                skipped.push(RewriteWarning {
+                    code: "redirect_bun_non_registry_entry_skipped".into(),
+                    detail: format!(
+                        "bun.lockb package #{} installs {name}@{} from a URL or local tarball, \
+                         not the registry, and CANNOT be redirected — bun installs it from that \
+                         resolution, so that copy stays UNPATCHED; depend on the registry \
+                         release to patch it",
+                        p.id, dep.version,
+                    ),
+                });
+            }
+            if matching.is_empty() && !skipped.is_empty() {
+                return Ok((Vec::new(), false));
+            }
             if matching.is_empty() {
                 return Err(format!(
                     "no rewritable bun.lockb entry for {name}@{}",
@@ -217,6 +241,50 @@ mod tests {
             result.warnings
         );
         assert!(result.bundled_skipped_uuids.contains("7.0.0"));
+    }
+
+    /// REGRESSION (#497): Bun 1.1.45 locks a root URL / `file:` tarball
+    /// dependency on is-number@6.0.0 beside is-odd's nested registry copy.
+    /// Bun installs the tarball record from its own resolution, so only the
+    /// registry record is redirected and the run says, loudly, that the
+    /// tarball copy stays unpatched; the in-run VEX must not assume it.
+    #[test]
+    fn user_tarball_records_are_reported_unpatched() {
+        let is_number_6 = DepOverride {
+            name: "is-number".into(),
+            artifact_url: "https://patch.example.test/6.0.0/is-number-6.0.0.tgz".into(),
+            ..dep("6.0.0")
+        };
+        for shape in ["url", "file"] {
+            let lock = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/bun-lockb-user-tarball")
+                    .join(shape)
+                    .join("bun.lockb"),
+            )
+            .unwrap();
+            let mut result = RewriteResult::default();
+            rewrite_bun_binary(&lock, std::slice::from_ref(&is_number_6), &mut result);
+            assert_eq!(result.edits.len(), 1, "{shape}: {:?}", result.edits);
+            assert!(result.confirmed_bun_binary_uuids.contains("6.0.0"));
+            let codes: Vec<_> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                ["redirect_bun_non_registry_entry_skipped"],
+                "{shape}: {:?}",
+                result.warnings
+            );
+            assert!(result.warnings[0].detail.contains("UNPATCHED"));
+            assert!(result.bundled_skipped_uuids.contains("6.0.0"), "{shape}");
+            let rewired = BunLockb::parse_packages(&result.binary_files["bun.lockb"]).unwrap();
+            assert!(
+                rewired.iter().any(|p| p.name == "is-number"
+                    && p.version.is_none()
+                    && p.resolution.ends_with("is-number-6.0.0.tgz")
+                    && !p.resolution.contains("patch.example.test")),
+                "{shape}: the tarball record keeps its resolution: {rewired:?}"
+            );
+        }
     }
 
     #[test]

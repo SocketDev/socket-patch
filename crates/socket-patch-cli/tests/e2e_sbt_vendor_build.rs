@@ -31,6 +31,11 @@
 //! VERSION,REQUIRED,SEED}` (`sbt_vendor_build_common`). Scratch trees go
 //! under `TMPDIR`.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::envelope::event_triples;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "maven_build_common/mod.rs"]
@@ -70,10 +75,6 @@ fn hex8(uuid: &str) -> &str {
     &uuid[..8]
 }
 
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
-
 /// One warmed fixture: the build at `proj`, its isolated `home` (whose
 /// Coursier / Ivy caches hold the installed packages, as sbt left them),
 /// the download fixture's Maven2 `mirror`, and the patched member of each
@@ -109,8 +110,8 @@ fn setup(
         )
         .unwrap();
     }
-    let home = SbtHome::new(&root);
-    let out = sbt.run(&proj, &home, &[], &["sbtVersion", "update"]);
+    let mut home = SbtHome::new(&root);
+    let out = sbt_vendor_build_common::warm_up(&sbt, &proj, &mut home);
     if !ok(&out) {
         let why = format!("warm-up `sbt update` failed:\n{}", dump(&out));
         sbt_vendor_build_common::skip(suite, &why);
@@ -337,18 +338,6 @@ fn fresh_checkout(proj: &Path, dst: &Path) {
     }
 }
 
-fn events(env: &serde_json::Value) -> Vec<(String, String, String)> {
-    env["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| {
-            let s = |k: &str| e[k].as_str().unwrap_or_default().to_string();
-            (s("purl"), s("action"), s("errorCode"))
-        })
-        .collect()
-}
-
 #[test]
 #[ignore = "real sbt + network (SOCKET_PATCH_SBT_E2E_*)"]
 fn sbt_vendor_offline_fresh_checkout() {
@@ -446,7 +435,7 @@ fn sbt_vendor_declared_bump_fails_closed() {
     let (code, env) = ctx.socket(&ctx.proj, &["vendor"]);
     assert_eq!(code, Some(1), "{env}");
     assert!(
-        events(&env)
+        event_triples(&env)
             .iter()
             .any(|(_, action, code)| action == "failed" && code == "vendor_sbt_pin_declared_newer"),
         "{env}"
@@ -538,7 +527,7 @@ fn sbt_vendor_rerun_noop() {
     let before = snapshot(&ctx.proj);
     let env = ctx.ok(&["vendor"]);
     assert_eq!(
-        events(&env),
+        event_triples(&env),
         [(
             purl(TEXT),
             "skipped".to_string(),

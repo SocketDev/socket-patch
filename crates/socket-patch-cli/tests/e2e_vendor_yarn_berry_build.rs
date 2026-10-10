@@ -45,13 +45,16 @@
 //! `scripts/yarn-berry-vex-matrix.sh`); `SOCKET_PATCH_YARN_E2E_REQUIRED=1`
 //! turns every soft-skip into a failure.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -89,10 +92,6 @@ macro_rules! skip {
 mod cache_env;
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 fn has_corepack_pm(pm: &str) -> bool {
     // Isolated too: this probe is what actually downloads the package manager
@@ -156,13 +155,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[u8]) {
@@ -737,7 +729,14 @@ async fn run_berry_capstone(driver: VendorDriver, yarnrc_extra: &str) {
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
     let out = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
         .args(args)
         .current_dir(cwd)
         .output()
@@ -818,16 +817,30 @@ fn yarn_berry_vendored_tarball_survives_a_tgz_gitignore_rule() {
     };
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
     git(&proj, &["add", "-A"]);
     git(&proj, &["commit", "-qm", "vendored"]);
     let fresh = tmp.path().join("fresh");
     git(
         tmp.path(),
-        &["clone", "-q", proj.to_str().unwrap(), fresh.to_str().unwrap()],
+        &[
+            "clone",
+            "-q",
+            proj.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
     );
     let fresh_global = tmp.path().join("fresh-yarn-global");
     let ci = corepack(
@@ -862,14 +875,26 @@ fn yarn_berry_vendor_refuses_a_gitignored_socket_dir() {
     let pkg_before = std::fs::read(proj.join("package.json")).unwrap();
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 1, "vendor must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 1,
+        "vendor must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stdout.contains("vendor_artifact_gitignored"),
         "refusal code expected:\n{stdout}"
     );
     assert_eq!(std::fs::read(proj.join("yarn.lock")).unwrap(), lock_before);
-    assert_eq!(std::fs::read(proj.join("package.json")).unwrap(), pkg_before);
+    assert_eq!(
+        std::fs::read(proj.join("package.json")).unwrap(),
+        pkg_before
+    );
     assert!(!proj.join(format!(".socket/vendor/npm/{UUID}")).exists());
 }

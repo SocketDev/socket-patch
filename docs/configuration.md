@@ -24,6 +24,11 @@ For the token, organization, and authenticated API URL, precedence is:
 | Organization | `--org` | `SOCKET_ORG_SLUG` | `SOCKET_CLI_ORG_SLUG` | `defaultOrg` (also accepts `org`) |
 | Authenticated API | `--api-url` | `SOCKET_API_URL` | `SOCKET_CLI_API_BASE_URL` | `apiBaseUrl` |
 
+With a token but no organization from any of these sources, Socket Patch asks
+the API for it (`GET /v0/organizations`) once per run. If that fails, the whole
+run uses the public patch API without the token (free patches only) and warns;
+set `--org` or `SOCKET_ORG_SLUG` to use your organization's patches.
+
 The separate Socket CLI writes that file through `socket login` or `socket config`.
 Socket Patch only reads it. Missing configuration is silent; an unreadable or
 invalid login file produces a warning and falls back to the other sources.
@@ -35,6 +40,11 @@ Empty environment values are treated as unset.
 - `--proxy-url` / `SOCKET_PROXY_URL` selects the public patch API endpoint. It is
   distinct from an HTTP forward proxy: use `HTTP_PROXY`, `HTTPS_PROXY`, and
   `NO_PROXY` for those.
+- HTTPS connections trust the bundled Mozilla (webpki) roots plus the operating
+  system's trust store (macOS keychain, Windows certificate store, the distro
+  bundle on Linux). `SSL_CERT_FILE` / `SSL_CERT_DIR` replace the system store
+  with the named bundle or directory, which is how to trust a TLS-inspecting
+  proxy's private CA. Certificate verification is never disabled.
 - `--offline` prohibits network access. `scan` and `get` require the patch API
   and refuse offline operation. Other commands can use locally available state;
   missing records or artifacts can still prevent completion.
@@ -124,6 +134,13 @@ socket-patch scan 'apps/*' --mode hosted
 
 Each PATH in hosted or vendored mode is a project directory. Paths outside the
 repository are rejected. For JSON output, scan one project per invocation.
+
+An agent-mode scan from the repository root also patches nested projects'
+`node_modules`. Each installed copy follows its own project root (the nearest
+directory with a lockfile), so these filters skip nested projects too. A package
+an included project also installs is patched in every copy, because patches are
+recorded per package version; the scan warns `policy_shared_copy` when that reaches
+a skipped project.
 
 ### Gradual rollout
 

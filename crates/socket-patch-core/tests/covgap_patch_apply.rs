@@ -60,7 +60,6 @@ async fn apply_foo(root: &Path, primary: &Path) -> socket_patch_core::patch::app
     );
     let sources = PatchSources {
         blobs_path: &blobs,
-        diffs_path: None,
         mem_blobs: None,
     };
     apply_package_patch(
@@ -68,7 +67,6 @@ async fn apply_foo(root: &Path, primary: &Path) -> socket_patch_core::patch::app
         primary,
         &files,
         &sources,
-        None,
         false,
         MismatchPolicy::Warn,
     )

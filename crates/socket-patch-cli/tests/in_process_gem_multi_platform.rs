@@ -230,18 +230,15 @@ fn scan_args(cwd: &Path, api_url: String, all_releases: bool) -> ScanArgs {
             api_url: Some(api_url),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["gem".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
         // apply (not sync) so the post-sync GC doesn't sweep beforeHash
         // blobs the later rollback/remove needs offline.
-        apply: true,
         prune: false,
         sync: false,
-        vendor: false,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
         all_releases,
         vex: Default::default(),
         rollout: Default::default(),

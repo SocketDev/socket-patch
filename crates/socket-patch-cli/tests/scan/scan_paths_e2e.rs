@@ -20,15 +20,13 @@
 //!   under `--json` or `--vex`, or an unparseable glob is a usage error
 //!   (exit 2).
 
+use crate::common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG: &str = "test-org";
 const ROOT_PURL: &str = "pkg:npm/root-dep@1.0.0";
@@ -357,6 +355,61 @@ async fn paths_never_narrow_the_prune_universe() {
     assert_eq!(v["paths"], serde_json::json!(["packages/app"]));
 }
 
+/// `scan --prune` keeps the beforeHash blob of every patch still in the
+/// manifest (#893): it is the only local restore data for an offline
+/// rollback, and `repair` cannot download it again. Only the originals of
+/// pruned patches are collected.
+#[tokio::test]
+async fn prune_keeps_before_blobs_of_active_patches() {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package_at(tmp.path(), "", "root-dep", "1.0.0");
+
+    let active_after = "a".repeat(64);
+    let active_before = "d".repeat(64);
+    let gone_after = "c".repeat(64);
+    let gone_before = "e".repeat(64);
+    let blobs: Vec<PathBuf> = [&active_after, &active_before, &gone_after, &gone_before]
+        .iter()
+        .map(|h| stage_blob(tmp.path(), h))
+        .collect();
+
+    let mut active = manifest_entry("11111111-1111-4111-8111-111111111111", &active_after);
+    active["files"]["package/index.js"]["beforeHash"] = active_before.clone().into();
+    let mut gone = manifest_entry("33333333-3333-4333-8333-333333333333", &gone_after);
+    gone["files"]["package/index.js"]["beforeHash"] = gone_before.clone().into();
+    let manifest = serde_json::json!({
+        "patches": { ROOT_PURL: active, "pkg:npm/gone@9.9.9": gone }
+    });
+    std::fs::write(
+        tmp.path().join(".socket/manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &server.uri(),
+        &["--mode", "agent", "--prune", "--yes"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(blobs[0].exists(), "active patch's afterHash blob survives");
+    assert!(
+        blobs[1].exists(),
+        "active patch's beforeHash blob must survive --prune; stdout={stdout}"
+    );
+    assert!(!blobs[2].exists(), "pruned patch's afterHash blob is swept");
+    assert!(
+        !blobs[3].exists(),
+        "pruned patch's beforeHash blob is swept"
+    );
+    let v = parse_envelope(&stdout);
+    assert_eq!(v["gc"]["removedBlobs"], 2, "got {v}");
+}
+
 // ---------------------------------------------------------------------------
 // 3. A scope matching nothing is a normal empty scan.
 // ---------------------------------------------------------------------------
@@ -572,24 +625,22 @@ async fn paths_with_hosted_or_vendored_mode_name_project_directories() {
             "a PATH that is not a directory is a usage error (exit 2) under --mode {mode}; \
              stdout={stdout}; stderr={stderr}"
         );
-        assert!(
-            stderr.contains("`packages/app` is not a directory"),
-            "stderr={stderr}"
-        );
-        assert!(
-            stdout.trim().is_empty(),
-            "a usage error must not print a JSON envelope; stdout={stdout}"
+        // Under --json a usage error prints the coded error on stdout.
+        assert_usage_error(
+            &stdout,
+            "path_not_directory",
+            "`packages/app` is not a directory",
         );
     }
 
     // --json keeps stdout one document: one project directory only.
     let (code, stdout, stderr) = run_scan(tmp.path(), "http://127.0.0.1:1", &["apps/*"]);
     assert_eq!(code, 2, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        stderr.contains("--json takes one project directory (2 given)"),
-        "stderr={stderr}"
+    assert_usage_error(
+        &stdout,
+        "invalid_args",
+        "--json takes one project directory (2 given)",
     );
-    assert!(stdout.trim().is_empty(), "stdout={stdout}");
 
     // --vex names one output document, so it takes one project directory
     // too: two runs would overwrite (or on a failure remove) the same file.
@@ -634,10 +685,23 @@ async fn paths_with_hosted_or_vendored_mode_name_project_directories() {
         code, 2,
         "an invalid glob must be a usage error (exit 2); stdout={stdout}; stderr={stderr}"
     );
+    assert_usage_error(&stdout, "path_glob_invalid", "invalid path pattern");
+}
+
+/// A `--json` usage error: exactly `{status: "error", error: {code,
+/// message}}` on stdout, the message containing `needle`.
+fn assert_usage_error(stdout: &str, code: &str, needle: &str) {
+    let v = parse_envelope(stdout);
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], code, "{v}");
     assert!(
-        stderr.to_lowercase().contains("invalid path pattern"),
-        "the error must name the invalid pattern; stderr={stderr}"
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(needle)),
+        "{v}"
     );
+    assert!(v.get("errorCode").is_none(), "{v}");
+    assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
 }
 
 // ---------------------------------------------------------------------------
@@ -684,4 +748,141 @@ async fn paths_echo_always_present() {
         "the zero-package envelope must carry the paths key too; got {v}"
     );
     assert_eq!(v["paths"], serde_json::json!([]));
+}
+
+// ---------------------------------------------------------------------------
+// 7. Scope sees EVERY installed copy of a purl, not just the crawler's
+//    one-per-name@version representative (#778).
+// ---------------------------------------------------------------------------
+
+/// One `scan --mode agent --dry-run <pattern>` against a fresh mock: the
+/// batch-POST bodies it sent (empty when the scope selected nothing) and
+/// its envelope.
+async fn scoped_agent_scan(root: &Path, pattern: &str) -> (Vec<String>, serde_json::Value) {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let (code, stdout, stderr) = run_scan(
+        root,
+        &server.uri(),
+        &[pattern, "--mode", "agent", "--dry-run"],
+    );
+    assert_eq!(
+        code, 0,
+        "scoped scan of {pattern} must exit 0; stdout={stdout}; stderr={stderr}"
+    );
+    let reqs = recorded(&server).await;
+    let bodies = batch_posts(&reqs).into_iter().map(req_body).collect();
+    (bodies, parse_envelope(&stdout))
+}
+
+/// pnpm's isolated linker: each member's `node_modules/<dep>` is a symlink
+/// into the root `node_modules/.pnpm` store, which the crawl reaches
+/// first. Scoping to the member must still select its dependencies, the
+/// same copies `rollback packages/a` selects.
+#[cfg(unix)]
+#[tokio::test]
+async fn paths_scope_selects_pnpm_member_linked_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0", "private": true }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages: ['packages/*']\n",
+    )
+    .unwrap();
+    for (member, name, version) in [("a", "left-pad", "1.3.0"), ("b", "is-number", "7.0.0")] {
+        write_npm_package_at(
+            root,
+            &format!("node_modules/.pnpm/{name}@{version}"),
+            name,
+            version,
+        );
+        let member_dir = root.join("packages").join(member);
+        std::fs::create_dir_all(member_dir.join("node_modules")).unwrap();
+        std::fs::write(
+            member_dir.join("package.json"),
+            format!(
+                r#"{{ "name": "{member}", "version": "1.0.0", "dependencies": {{ "{name}": "{version}" }} }}"#
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            format!("../../../node_modules/.pnpm/{name}@{version}/node_modules/{name}"),
+            member_dir.join("node_modules").join(name),
+        )
+        .unwrap();
+    }
+
+    for pattern in [
+        "packages/a",
+        "packages/a/**",
+        "packages/a/node_modules/left-pad",
+    ] {
+        let (bodies, v) = scoped_agent_scan(root, pattern).await;
+        assert_eq!(
+            bodies.len(),
+            1,
+            "scan {pattern} must query the batch API once; envelope {v}"
+        );
+        assert!(
+            bodies[0].contains("pkg:npm/left-pad@1.3.0"),
+            "scan {pattern} must select member a's left-pad; body: {}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[0].contains("is-number"),
+            "scan {pattern} must not select member b's is-number; body: {}",
+            bodies[0]
+        );
+        assert_eq!(v["scannedPackages"], 1, "scan {pattern}: {v}");
+    }
+}
+
+/// yarn classic / npm workspaces with a version conflict: two real member
+/// copies of left-pad@1.3.0 (no symlinks), the root at 1.2.0. Whichever
+/// member copy the walk meets first, BOTH members must scope to it.
+#[tokio::test]
+async fn paths_scope_selects_every_nested_member_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0", "private": true, "workspaces": ["packages/*"], "dependencies": { "left-pad": "1.2.0" } }"#,
+    )
+    .unwrap();
+    write_npm_package_at(root, "", "left-pad", "1.2.0");
+    for member in ["a", "b"] {
+        let prefix = format!("packages/{member}");
+        std::fs::create_dir_all(root.join(&prefix)).unwrap();
+        std::fs::write(
+            root.join(&prefix).join("package.json"),
+            format!(r#"{{ "name": "{member}", "version": "1.0.0", "dependencies": {{ "left-pad": "1.3.0" }} }}"#),
+        )
+        .unwrap();
+        write_npm_package_at(root, &prefix, "left-pad", "1.3.0");
+    }
+
+    for pattern in ["packages/a", "packages/b"] {
+        let (bodies, v) = scoped_agent_scan(root, pattern).await;
+        assert_eq!(
+            bodies.len(),
+            1,
+            "scan {pattern} must query the batch API once; envelope {v}"
+        );
+        assert!(
+            bodies[0].contains("pkg:npm/left-pad@1.3.0"),
+            "scan {pattern} must select its member copy of left-pad@1.3.0; body: {}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[0].contains("left-pad@1.2.0"),
+            "scan {pattern} must not select the root left-pad@1.2.0; body: {}",
+            bodies[0]
+        );
+        assert_eq!(v["scannedPackages"], 1, "scan {pattern}: {v}");
+    }
 }

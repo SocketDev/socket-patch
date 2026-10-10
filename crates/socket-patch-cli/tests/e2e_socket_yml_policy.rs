@@ -652,8 +652,8 @@ async fn invalid_file_fails_closed_before_any_request_or_write() {
     let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &[], &[]);
     assert_eq!(code, 1);
     assert_eq!(doc["status"], "error");
-    assert_eq!(doc["errorCode"], "socket_yml_invalid");
-    let message = doc["error"].as_str().unwrap();
+    assert_eq!(doc["error"]["code"], "socket_yml_invalid");
+    let message = doc["error"]["message"].as_str().unwrap();
     assert!(message.contains("patches.minSeverty"), "{message}");
     assert!(message.contains("did you mean `minSeverity`"), "{message}");
     assert!(message.contains("--no-socket-yml"), "{message}");
@@ -701,7 +701,7 @@ async fn both_files_disagreeing_is_ambiguous() {
     .unwrap();
     let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &[], &[]);
     assert_eq!(code, 1);
-    assert_eq!(doc["errorCode"], "socket_yml_ambiguous");
+    assert_eq!(doc["error"]["code"], "socket_yml_ambiguous");
 }
 
 #[tokio::test]
@@ -870,7 +870,7 @@ async fn report_only_json_fails_when_every_detail_query_fails() {
     assert_eq!(code, 1, "{doc:#}");
     assert_eq!(doc["status"], "error", "{doc:#}");
     assert!(
-        doc["error"]
+        doc["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("patch-detail queries failed"),
@@ -1092,6 +1092,123 @@ async fn agent_mode_retains_a_recorded_patch_the_policy_now_excludes() {
     assert_eq!(doc["policy"]["retained"][0]["upgradeAvailable"], true);
 }
 
+/// #554: an agent scan at the repo root crawls every nested project's
+/// `node_modules`; each copy is judged by the project root that owns it,
+/// so `ignorePaths` and the built-in `test/` default skip nested projects.
+#[tokio::test]
+#[serial]
+async fn agent_mode_judges_nested_project_copies_by_their_own_root() {
+    let server = MockServer::start().await;
+    mount_api(&server, catalog()).await;
+    let repo = Repo::new(Some(
+        "version: 2\npatches:\n  ignorePaths: [\"/services/legacy/\"]\n",
+    ));
+    // left-pad is installed in both web (admitted) and legacy (ignored).
+    write_npm_root(&repo.dir("services/legacy"), &["gamma", "left-pad"]);
+    let (code, doc) = scan_json(&repo.root, &server.uri(), &["--mode", "agent"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let index = |rel: &str, name: &str| index_at(&repo, rel, name);
+    assert_eq!(
+        index("services/web", "alpha"),
+        patched_index("alpha"),
+        "{doc:#}"
+    );
+    assert_eq!(
+        index("services/legacy", "gamma"),
+        orig_index("gamma"),
+        "ignored by patches.ignorePaths"
+    );
+    assert_eq!(
+        index("services/test", "delta"),
+        orig_index("delta"),
+        "a discovered test/ root is a built-in ignore"
+    );
+    let mut roots: Vec<(String, String)> = doc["policy"]["filtered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["purl"].is_null())
+        .map(|f| {
+            (
+                f["project"].as_str().unwrap().to_string(),
+                f["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    roots.sort();
+    assert_eq!(
+        roots,
+        [
+            (
+                "services/legacy".to_string(),
+                "policy_path_excluded".to_string()
+            ),
+            (
+                "services/test".to_string(),
+                "policy_path_excluded".to_string()
+            ),
+        ],
+        "{:#}",
+        doc["policy"]
+    );
+    // A package an admitted project also installs is patched per package
+    // version, so its copy in the ignored project is patched too: say so.
+    assert!(
+        warning_codes(&doc).contains(&"policy_shared_copy".to_string()),
+        "{doc:#}"
+    );
+    let shared = doc["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "policy_shared_copy")
+        .unwrap();
+    let detail = shared["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("pkg:npm/left-pad@1.0.0") && detail.contains("services/legacy"),
+        "{detail}"
+    );
+
+    // includePaths: the docs' headline example selects nested projects from
+    // the repo root (which itself is not included).
+    let repo = Repo::new(Some(
+        "version: 2\npatches:\n  includePaths: [\"/services/legacy/\"]\n",
+    ));
+    let (code, doc) = scan_json(&repo.root, &server.uri(), &["--mode", "agent"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(
+        index_at(&repo, "services/legacy", "gamma"),
+        patched_index("gamma"),
+        "{doc:#}"
+    );
+    assert_eq!(
+        index_at(&repo, "services/web", "alpha"),
+        orig_index("alpha"),
+        "{doc:#}"
+    );
+    let web_root = doc["policy"]["filtered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["purl"].is_null() && f["project"] == "services/web");
+    assert_eq!(
+        web_root.map(|f| &f["reason"]),
+        Some(&json!("policy_path_not_included")),
+        "{:#}",
+        doc["policy"]
+    );
+}
+
+fn index_at(repo: &Repo, rel: &str, name: &str) -> String {
+    std::fs::read_to_string(
+        repo.dir(rel)
+            .join("node_modules")
+            .join(name)
+            .join("index.js"),
+    )
+    .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Vendored
 // ---------------------------------------------------------------------------
@@ -1175,6 +1292,43 @@ async fn get_bypasses_the_policy_with_a_warning() {
     let (code, stdout, stderr) = run_cli(&web, &args, &[]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(!stdout.contains("policy_bypassed"), "{stdout}");
+}
+
+/// B29 (#453): `get <uuid>` dispatched before the policy check, so the
+/// most direct form of `get` overrode socket.yml silently. Every mode now
+/// warns like the purl/CVE forms.
+#[tokio::test]
+#[serial]
+async fn get_by_uuid_bypasses_the_policy_with_a_warning_in_every_mode() {
+    let server = MockServer::start().await;
+    mount_api(&server, catalog()).await;
+    let repo = Repo::new(Some("version: 2\npatches:\n  ignorePackages: [alpha]\n"));
+    let web = repo.dir("services/web");
+    for mode in ["hosted", "vendored", "agent"] {
+        let args = [
+            "get",
+            P_ALPHA.uuid,
+            "--mode",
+            mode,
+            "--json",
+            "--yes",
+            "--dry-run",
+            "--cwd",
+            web.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ];
+        let (code, stdout, stderr) = run_cli(&web, &args, &[]);
+        assert_eq!(code, 0, "{mode}: stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains("(policy_bypassed)") && stdout.contains("alpha"),
+            "{mode}: the envelope must carry the policy_bypassed warning: {stdout}"
+        );
+    }
 }
 
 #[tokio::test]

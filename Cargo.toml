@@ -14,13 +14,13 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "4.0.0"
+version = "5.0.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/SocketDev/socket-patch"
 
 [workspace.dependencies]
-socket-patch-core = { path = "crates/socket-patch-core", version = "=4.0.0" }
+socket-patch-core = { path = "crates/socket-patch-core", version = "=5.0.0" }
 clap = { version = "=4.5.60", features = ["derive", "env"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.149", features = ["preserve_order", "raw_value"] }
@@ -28,6 +28,15 @@ sha2 = "=0.10.9"
 sha1 = "=0.10.6"
 hex = "=0.4.3"
 reqwest = { version = "=0.12.28", features = ["rustls-tls", "json"], default-features = false }
+# Platform trust store (+ SSL_CERT_FILE / SSL_CERT_DIR) for every HTTPS
+# client, alongside the bundled webpki roots (utils::http::client_builder).
+# `rustls` and `webpki-roots` are the exact builds reqwest's `rustls-tls`
+# already pulls in (ring provider); the shared client config is built
+# from them directly.
+rustls-native-certs = "=0.8.4"
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "=1.0.6"
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio = { version = "=1.50.0", features = ["full"] }
 tokio-util = "=0.7.18"
 futures-util = { version = "=0.3.32", default-features = false, features = ["std"] }
@@ -42,7 +51,6 @@ aho-corasick = "=1.1.4"
 glob = "=0.3.4"
 toml_edit = "=0.25.12"
 once_cell = "=1.21.3"
-qbsdiff = "=1.4.4"
 rayon = "=1.12.0"
 tar = "=0.4.46"
 flate2 = "=1.1.9"
@@ -96,7 +104,7 @@ inherits = "release"
 lto = "thin"
 
 # Test-execution speed: `cargo test` builds dependencies with the dev
-# profile; at opt-level 0 the hash/compression/bsdiff hot loops are 10-100x
+# profile; at opt-level 0 the hash/compression hot loops are 10-100x
 # slower (the self_update fixtures gzip and sha256-hash the multi-MB debug
 # CLI binary per test: ~403s debug vs ~2s release). Workspace members are NOT matched by "*" — they stay
 # opt-level 0, so incremental compile speed, debugging, and llvm-cov line
@@ -107,7 +115,7 @@ opt-level = 1
 
 # The measured hot path gets full optimization: archive building
 # (flate2/zip over multi-MB payloads), SHA hashing in fixtures and in the
-# CLI's own verify paths, and qbsdiff bspatch in every apply test.
+# CLI's own verify paths.
 [profile.dev.package.sha2]
 opt-level = 3
 [profile.dev.package.sha1]
@@ -131,14 +139,6 @@ opt-level = 3
 [profile.dev.package.simd-adler32]
 opt-level = 3
 [profile.dev.package.zip]
-opt-level = 3
-[profile.dev.package.qbsdiff]
-opt-level = 3
-[profile.dev.package.bzip2]
-opt-level = 3
-[profile.dev.package.libbz2-rs-sys]
-opt-level = 3
-[profile.dev.package.suffix_array]
 opt-level = 3
 
 # macOS debug builds use unpacked split-debuginfo: every linked binary —

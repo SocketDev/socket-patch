@@ -41,21 +41,20 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
-    decode_json_string, has_workspace_packages, is_bundled_entry, lock_version, packages_bounds,
-    parse_entry_line, patched_dependency_detail, patched_dependency_key, patched_dependency_keys,
-    split_name_spec, BunEntry,
+    decode_json_string, default_trust_detail, has_workspace_packages, is_bundled_entry,
+    is_user_tarball_entry, lock_version, loses_default_trust, packages_bounds, parse_entry_line,
+    patched_dependency_detail, patched_dependency_key, patched_dependency_keys, split_name_spec,
+    BunEntry,
 };
 
-use super::common::{already_patched_result, refused};
+use super::common::refused;
 use super::npm_common::{
-    done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
-    stage_patch_pack, tgz_rel_leaf,
+    gate_packages, guard_revert_uuid_dir, refusal_code, tgz_rel_leaf, vendor_npm_family, NpmCommit,
+    NpmCoords, NpmLockBackend, NpmStagedPack, NpmVendorRequest, WireCx,
 };
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
-use super::state::{
-    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
-};
+use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 const BUN_LOCK: &str = "bun.lock";
@@ -82,7 +81,7 @@ pub async fn cleanup_binary_workspace_artifacts(
 
 /// The `WiringRecord.kind` this backend owns: key = the `packages` map key,
 /// original/new = the verbatim entry LINE.
-const KIND_LOCK_PACKAGE: &str = "bun_lock_package";
+pub(super) const KIND_LOCK_PACKAGE: &str = "bun_lock_package";
 
 /// Workspace gate: a `workspace:` packages entry in a lock whose
 /// `lockfileVersion` is below 2 refuses with `vendor_bun_workspace_unsupported`.
@@ -160,6 +159,9 @@ fn check_workspace_compatibility(
 /// project vendored before it grew a workspace member all reach the
 /// engine instead of dying here.
 pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, String)> {
+    if let Some(refusal) = super::npm_flavor::member_stray_lock_refusal(project_root).await {
+        return Err(refusal);
+    }
     let path = project_root.join(BUN_LOCK);
     let text = match read_regular_to_string(&path).await {
         Ok(text) => text,
@@ -312,347 +314,319 @@ pub async fn binary_vendor_paths(project_root: &Path) -> Result<Vec<String>, Str
 /// Vendor one installed npm package into a bun project (see the module doc).
 /// Same contract as `npm_lock::vendor_npm`: refuse-early / wire-last,
 /// `entry` present iff `result.success` and not a dry run, and an in-sync
-/// re-run synthesizes AlreadyPatched with no entry.
+/// re-run synthesizes AlreadyPatched with no entry. The flow is
+/// [`vendor_npm_family`]'s; [`BunTextBackend`] is the text-lock grammar
+/// (a project driven by `bun.lockb` routes to [`super::bun_binary`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor_bun<'a>(
     purl: &str,
-    installed_dir: impl Into<PackageSource<'a>>,
+    _installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
-    let installed_dir = installed_dir.into();
-    if binary_lock_drives(project_root) {
-        return super::bun_binary::vendor(
-            purl,
-            installed_dir,
-            project_root,
-            record,
-            sources,
-            vendored_at,
-            dry_run,
-            force,
-            service,
-        )
-        .await;
-    }
-    let mut warnings: Vec<VendorWarning> = Vec::new();
-
-    // ── 1. Coordinates (shared fail-closed guard) ─────────────────────────
-    let coords = match guard_coordinates(purl, record) {
-        Ok(coords) => coords,
-        Err(outcome) => return *outcome,
-    };
-    let (name, version) = (coords.name.as_str(), coords.version.as_str());
-
-    // ── 2. Read + strictly parse the lock (refuse before any write) ──────
-    let project = match read_project(project_root).await {
-        Ok(project) => project,
-        Err(outcome) => return *outcome,
-    };
-
-    // ── 3. Pre-flight: at least one rewritable instance ──────────────────
-    let (target_spec, target_leaf) = match preflight_package(&project, name, version) {
-        Ok(target) => target,
-        Err(outcome) => return *outcome,
-    };
-    for key in bundled_matches(&project.entries, &target_spec, name, &target_leaf) {
-        // LOUD: this copy ships inside its PARENT's tarball, which we do not
-        // repack — it stays the unpatched bytes after vendor (#469).
-        warnings.push(VendorWarning::new(
-            "vendor_bundled_instance_skipped",
-            format!(
-                "{BUN_LOCK} entry `{key}` is bundled inside its parent's tarball and CANNOT be \
-                 rewritten — that copy stays UNPATCHED; vendor or update the bundling parent \
-                 to cover it"
-            ),
-        ));
-    }
-    let BunProject {
-        mut lines, entries, ..
-    } = project;
-
-    // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix (the
-    // shared pipeline's `prepare_tgz_dest` builds the identical string).
-    let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, target_leaf);
-    // The sha512 of the artifact already sitting at the target path, if
-    // any — the one witness a digest-less in-sync tuple (see `classify`)
-    // still has of the digest Bun dropped: the lock line was written from
-    // these bytes. With a ledger anchor the shared pipeline reuses exactly
-    // these bytes (so this equals the staged integrity); without one it
-    // keeps today's behavior. Read BEFORE staging, which may overwrite the
-    // file; a missing or non-regular path (a `repair` rebuild after
-    // deletion, a FIFO) yields `None`, which the in-sync check below treats
-    // as "not provably the same bytes". Only a digest-less 2-tuple of OURS at this
-    // path can consume it, so every other re-run skips the read + hash.
-    let has_digestless_own_tuple = entries.iter().any(|e| {
-        e.elems.len() == 2
-            && matches!(
-                classify_rewritable(e, &target_spec, name, &target_leaf),
-                Some(TupleShape::Ours { path }) if path == rel_tgz
-            )
-    });
-    let prior_artifact_integrity: Option<String> = if has_digestless_own_tuple {
-        let abs = project_root.join(&coords.uuid_dir_rel).join(&target_leaf);
-        match tokio::fs::metadata(&abs).await {
-            Ok(meta) if meta.is_file() => tokio::fs::read(&abs)
-                .await
-                .ok()
-                .map(|bytes| crate::utils::digest::sha512_sri_of(&bytes)),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    // ── 4. Stage → patch → pack (shared flavor-agnostic pipeline) ────────
-    let (staged, result) = match stage_patch_pack(
+    let req = NpmVendorRequest {
         purl,
-        installed_dir,
         project_root,
         record,
-        sources,
+        vendored_at,
         dry_run,
-        force,
-        &mut warnings,
         service,
-    )
-    .await
-    {
-        Ok(pair) => pair,
-        Err(outcome) => return *outcome,
     };
-    let Some(staged) = staged else {
-        // Failed patch or dry run: wiring never ran, project byte-untouched.
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
+    if binary_lock_drives(project_root) {
+        return vendor_npm_family(&super::bun_binary::BunBinaryBackend, req).await;
+    }
+    vendor_npm_family(&BunTextBackend, req).await
+}
+
+/// The text-lock (`bun.lock`) half of [`vendor_bun`].
+struct BunTextBackend;
+
+/// [`BunTextBackend`]'s pre-flight product: the lock's lines and parsed
+/// entries, the target, and the digest witness read before staging.
+struct BunTextPlan {
+    lines: Vec<String>,
+    entries: Vec<BunEntry>,
+    target_spec: String,
+    target_leaf: String,
+    /// The sha512 of the artifact at the target path before staging (see
+    /// [`BunTextBackend::preflight`]).
+    prior_artifact_integrity: Option<String>,
+}
+
+impl NpmLockBackend for BunTextBackend {
+    type Plan = BunTextPlan;
+
+    fn flavor(&self) -> Option<&'static str> {
+        Some("bun")
+    }
+
+    async fn preflight(
+        &self,
+        project_root: &Path,
+        coords: &NpmCoords,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<BunTextPlan, Box<VendorOutcome>> {
+        let (name, version) = (coords.name.as_str(), coords.version.as_str());
+
+        // ── 2. Read + strictly parse the lock (refuse before any write) ──
+        let project = read_project(project_root).await?;
+
+        // ── 3. Pre-flight: at least one rewritable instance ──────────────
+        let (target_spec, target_leaf) = preflight_package(&project, name, version)?;
+        for key in bundled_matches(&project.entries, &target_spec, name, &target_leaf) {
+            // LOUD: this copy ships inside its PARENT's tarball, which we do
+            // not repack — it stays the unpatched bytes after vendor (#469).
+            warnings.push(VendorWarning::new(
+                "vendor_bundled_instance_skipped",
+                format!(
+                    "{BUN_LOCK} entry `{key}` is bundled inside its parent's tarball and CANNOT \
+                     be rewritten — that copy stays UNPATCHED; vendor or update the bundling \
+                     parent to cover it"
+                ),
+            ));
+        }
+        warnings.extend(default_trust_warning(
+            project.manifest.as_deref(),
+            Some(&project.lock_text),
+            name,
+            version,
+        ));
+        for key in user_tarball_matches(&project.entries, name, version) {
+            // LOUD: bun installs this copy from its own URL / `file:` spec,
+            // never the vendored tuple, so it stays the unpatched bytes (#497).
+            warnings.push(VendorWarning::new(
+                "vendor_non_registry_entry_skipped",
+                user_tarball_detail(&format!("{BUN_LOCK} entry `{key}`"), name, version),
+            ));
+        }
+        let BunProject { lines, entries, .. } = project;
+
+        // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix
+        // (the shared pipeline's `prepare_tgz_dest` builds the identical
+        // string).
+        let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, target_leaf);
+        // The sha512 of the artifact already sitting at the target path, if
+        // any — the one witness a digest-less in-sync tuple (see `classify`)
+        // still has of the digest Bun dropped: the lock line was written from
+        // these bytes. With a ledger anchor the shared pipeline reuses
+        // exactly these bytes (so this equals the staged integrity); without
+        // one it keeps today's behavior. Read BEFORE staging, which may
+        // overwrite the file; a missing or non-regular path (a `repair`
+        // rebuild after deletion, a FIFO) yields `None`, which the in-sync
+        // check treats as "not provably the same bytes". Only a digest-less
+        // 2-tuple of OURS at this path can consume it, so every other re-run
+        // skips the read + hash.
+        let has_digestless_own_tuple = entries.iter().any(|e| {
+            e.elems.len() == 2
+                && matches!(
+                    classify_rewritable(e, &target_spec, name, &target_leaf),
+                    Some(TupleShape::Ours { path }) if path == rel_tgz
+                )
+        });
+        let prior_artifact_integrity: Option<String> = if has_digestless_own_tuple {
+            let abs = project_root.join(&coords.uuid_dir_rel).join(&target_leaf);
+            match tokio::fs::metadata(&abs).await {
+                Ok(meta) if meta.is_file() => tokio::fs::read(&abs)
+                    .await
+                    .ok()
+                    .map(|bytes| crate::utils::digest::sha512_sri_of(&bytes)),
+                _ => None,
+            }
+        } else {
+            None
         };
-    };
-    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
-    debug_assert_eq!(staged.rel_tgz, rel_tgz);
-    let packed = staged.packed;
-    if staged.staged_pkg_json.is_some() {
+        Ok(BunTextPlan {
+            lines,
+            entries,
+            target_spec,
+            target_leaf,
+            prior_artifact_integrity,
+        })
+    }
+
+    async fn wire(
+        &self,
+        plan: BunTextPlan,
+        cx: &WireCx<'_>,
+        staged: &mut NpmStagedPack,
+        _warnings: &mut Vec<VendorWarning>,
+    ) -> Result<Option<NpmCommit>, String> {
+        let BunTextPlan {
+            mut lines,
+            entries,
+            target_spec,
+            target_leaf,
+            prior_artifact_integrity,
+        } = plan;
+        let name = cx.coords.name.as_str();
+        let project_root = cx.project_root;
+        let rel_tgz = staged.rel_tgz.as_str();
+        let packed = &staged.packed;
+
+        // ── 5. Rewrite every matching instance (in-memory) ────────────────
+        let mut wiring: Vec<WiringRecord> = Vec::new();
+        let mut changed = false;
+        // In-sync instances whose digest Bun dropped (see `classify`):
+        // re-pinned on disk WITHOUT a wiring record — the ledger already
+        // holds this instance's pristine original and `revert_one_record`
+        // recognises both spellings — so the run stays an AlreadyPatched
+        // no-op for the ledger while ≥ 1.3.10 consumers of the committed
+        // lock regain verification.
+        let mut healed = false;
+        for entry in &entries {
+            let Some(shape) = classify_rewritable(entry, &target_spec, name, &target_leaf) else {
+                continue;
+            };
+            let original_line = lines[entry.line_idx].clone();
+            // Lines come from a bare `split('\n')`, so a CRLF lock's lines
+            // carry a trailing `\r` (the grammar trims it away when
+            // parsing). Re-emit it verbatim: the surgery must never mix line
+            // endings.
+            let cr = if original_line.ends_with('\r') {
+                "\r"
+            } else {
+                ""
+            };
+            let local_tuple_line = |deps: &str| {
+                format!(
+                    "{indent}{key}: [\"{name}@{rel_tgz}\", {deps}, \"{integrity}\"]{comma}{cr}",
+                    indent = entry.indent,
+                    key = entry.key_raw,
+                    integrity = packed.integrity,
+                    comma = if entry.trailing_comma { "," } else { "" },
+                )
+            };
+            let (deps_verbatim, was_ours) = match shape {
+                TupleShape::Registry => (entry.elems[2].clone(), false),
+                TupleShape::Ours { path } => {
+                    if path == rel_tgz {
+                        match entry.elems.get(2) {
+                            // Idempotency: an instance already carrying this
+                            // exact path and integrity needs no edit and no
+                            // wiring record.
+                            Some(integrity)
+                                if *integrity == format!("\"{}\"", packed.integrity) =>
+                            {
+                                continue;
+                            }
+                            // Digest-less re-save of THIS wiring (Bun
+                            // 1.1.39–1.3.9) over the SAME bytes the lock was
+                            // written from (the artifact found at the path
+                            // before this run re-staged it equals the staged
+                            // one): heal the line in place, record nothing —
+                            // the ledger's fingerprint still holds.
+                            None if prior_artifact_integrity.as_deref()
+                                == Some(packed.integrity.as_str()) =>
+                            {
+                                lines[entry.line_idx] = local_tuple_line(&entry.elems[1]);
+                                healed = true;
+                                continue;
+                            }
+                            // Same path, different digest — or a digest-less
+                            // line whose artifact was missing or differed
+                            // before staging. A source flip does not reach
+                            // here when the ledger verifies the committed
+                            // tarball (it is reused, so the digests agree);
+                            // only a missing, corrupt or unanchored artifact
+                            // (a `repair` rebuild, a lost state.json) is
+                            // re-pinned below like any stale tuple of ours,
+                            // so the returned entry carries the rebuilt
+                            // artifact's fingerprint (`carry_forward_wiring`
+                            // refills the pristine original from the entry it
+                            // replaces).
+                            _ => {}
+                        }
+                    }
+                    (entry.elems[1].clone(), true)
+                }
+            };
+            let new_line = local_tuple_line(&deps_verbatim);
+            lines[entry.line_idx] = new_line.clone();
+            wiring.push(WiringRecord {
+                file: BUN_LOCK.to_string(),
+                kind: KIND_LOCK_PACKAGE.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(entry.key.clone()),
+                // Never record one of our own (stale) edits as the
+                // "original" — revert must restore the pre-vendor registry
+                // tuple, not a dangling `.socket/vendor/` pointer from an
+                // earlier uuid.
+                original: if was_ours {
+                    None
+                } else {
+                    Some(Value::String(original_line))
+                },
+                new: Some(Value::String(new_line)),
+            });
+            changed = true;
+        }
+
+        // A workspace lock Bun 1.4 migrated from a vendored `bun.lockb` keeps
+        // the member paths the binary normalization wrote as inter-workspace
+        // literals, so Bun re-resolves the workspace and drops the vendored
+        // tuples (#803). Restore each manifest's `workspace:` literal (Bun's
+        // own spelling) like the digest heal above: in place, with no wiring
+        // record, since a revert has no reason to put the path back.
+        let literal_heals = super::bun_lock_text::heal_workspace_literals(&mut lines, |dir| {
+            let rel = if dir.is_empty() {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            };
+            crate::utils::fs::read_regular_to_bytes_sync(&project_root.join(rel))
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        });
+        healed |= !literal_heals.is_empty();
+
+        // In sync (every instance already points at this uuid with the
+        // packed integrity, or with the digest Bun dropped, now re-pinned):
+        // the heal is the one write of such a run, and a failed write leaves
+        // the still-installable digest-less lock — reported as the failure
+        // it is, like every other lock write.
+        if changed || healed {
+            atomic_write_bytes_preserving_mode(
+                &project_root.join(BUN_LOCK),
+                lines.join("\n").as_bytes(),
+            )
+            .await
+            .map_err(|e| format!("cannot write {BUN_LOCK}: {e}"))?;
+        }
+        if !changed {
+            return Ok(None);
+        }
+        Ok(Some(NpmCommit {
+            wiring,
+            ..NpmCommit::default()
+        }))
+    }
+
+    fn manifest_warning(&self, name: &str, version: &str) -> VendorWarning {
         // The tuple's deps object mirrors the package's own manifest; the
         // spike has no fixture for a manifest-rewriting patch, so it is
         // preserved verbatim rather than recomputed (fail-safe + loud).
-        warnings.push(VendorWarning::new(
+        VendorWarning::new(
             "vendor_dep_manifest_stale",
             format!(
                 "the patch rewrites {name}@{version}'s package.json; its {BUN_LOCK} tuple's \
                  dependency object was preserved verbatim — if the patch changed dependency \
                  ranges, run `bun install` to re-resolve them"
             ),
-        ));
-    }
-
-    // ── 5. Rewrite every matching instance (in-memory) ────────────────────
-    let mut wiring: Vec<WiringRecord> = Vec::new();
-    let mut changed = false;
-    // In-sync instances whose digest Bun dropped (see `classify`): re-pinned
-    // on disk WITHOUT a wiring record — the ledger already holds this
-    // instance's pristine original and `revert_one_record` recognises both
-    // spellings — so the run stays an AlreadyPatched no-op for the ledger
-    // while ≥ 1.3.10 consumers of the committed lock regain verification.
-    let mut healed = false;
-    for entry in &entries {
-        let Some(shape) = classify_rewritable(entry, &target_spec, name, &target_leaf) else {
-            continue;
-        };
-        let original_line = lines[entry.line_idx].clone();
-        // Lines come from a bare `split('\n')`, so a CRLF lock's lines carry
-        // a trailing `\r` (the grammar trims it away when parsing). Re-emit
-        // it verbatim: the surgery must never mix line endings.
-        let cr = if original_line.ends_with('\r') {
-            "\r"
-        } else {
-            ""
-        };
-        let local_tuple_line = |deps: &str| {
-            format!(
-                "{indent}{key}: [\"{name}@{rel_tgz}\", {deps}, \"{integrity}\"]{comma}{cr}",
-                indent = entry.indent,
-                key = entry.key_raw,
-                integrity = packed.integrity,
-                comma = if entry.trailing_comma { "," } else { "" },
-            )
-        };
-        let (deps_verbatim, was_ours) = match shape {
-            TupleShape::Registry => (entry.elems[2].clone(), false),
-            TupleShape::Ours { path } => {
-                if path == rel_tgz {
-                    match entry.elems.get(2) {
-                        // Idempotency: an instance already carrying this exact
-                        // path and integrity needs no edit and no wiring record.
-                        Some(integrity) if *integrity == format!("\"{}\"", packed.integrity) => {
-                            continue;
-                        }
-                        // Digest-less re-save of THIS wiring (Bun 1.1.39–1.3.9)
-                        // over the SAME bytes the lock was written from (the
-                        // artifact found at the path before this run re-staged
-                        // it equals the staged one): heal the line in place,
-                        // record nothing — the ledger's fingerprint still holds.
-                        None if prior_artifact_integrity.as_deref()
-                            == Some(packed.integrity.as_str()) =>
-                        {
-                            lines[entry.line_idx] = local_tuple_line(&entry.elems[1]);
-                            healed = true;
-                            continue;
-                        }
-                        // Same path, different digest — or a digest-less line
-                        // whose artifact was missing or differed before staging.
-                        // A source flip does not reach here when the ledger
-                        // verifies the committed tarball (it is reused, so the
-                        // digests agree); only a missing, corrupt or unanchored
-                        // artifact (a `repair` rebuild, a lost state.json) is
-                        // re-pinned below like any stale tuple of ours, so the
-                        // returned entry carries the rebuilt artifact's
-                        // fingerprint (`carry_forward_wiring` refills the
-                        // pristine original from the entry it replaces).
-                        _ => {}
-                    }
-                }
-                (entry.elems[1].clone(), true)
-            }
-        };
-        let new_line = local_tuple_line(&deps_verbatim);
-        lines[entry.line_idx] = new_line.clone();
-        wiring.push(WiringRecord {
-            file: BUN_LOCK.to_string(),
-            kind: KIND_LOCK_PACKAGE.to_string(),
-            action: WiringAction::Rewritten,
-            key: Some(entry.key.clone()),
-            // Never record one of our own (stale) edits as the "original" —
-            // revert must restore the pre-vendor registry tuple, not a
-            // dangling `.socket/vendor/` pointer from an earlier uuid.
-            original: if was_ours {
-                None
-            } else {
-                Some(Value::String(original_line))
-            },
-            new: Some(Value::String(new_line)),
-        });
-        changed = true;
-    }
-
-    // A workspace lock Bun 1.4 migrated from a vendored `bun.lockb` keeps
-    // the member paths the binary normalization wrote as inter-workspace
-    // literals, so Bun re-resolves the workspace and drops the vendored
-    // tuples (#803). Restore each manifest's `workspace:` literal (Bun's own
-    // spelling) like the digest heal above: in place, with no wiring
-    // record, since a revert has no reason to put the path back.
-    let literal_heals = super::bun_lock_text::heal_workspace_literals(&mut lines, |dir| {
-        let rel = if dir.is_empty() {
-            "package.json".to_string()
-        } else {
-            format!("{dir}/package.json")
-        };
-        crate::utils::fs::read_regular_to_bytes_sync(&project_root.join(rel))
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-    });
-    healed |= !literal_heals.is_empty();
-
-    if !changed {
-        // Every instance already points at this uuid with the packed
-        // integrity (or with the digest Bun dropped, now re-pinned): in
-        // sync. The integrity is that of the reused committed tarball (or of
-        // a fresh acquisition that reproduced it when reuse missed);
-        // synthesize AlreadyPatched and record nothing. The
-        // heal is the one write of an in-sync run, and a failed write
-        // leaves the still-installable digest-less lock — reported as the
-        // failure it is, like every other lock write below.
-        if healed {
-            if let Err(e) = atomic_write_bytes_preserving_mode(
-                &project_root.join(BUN_LOCK),
-                lines.join("\n").as_bytes(),
-            )
-            .await
-            {
-                return done_failure_unstage(
-                    purl,
-                    format!("cannot write {BUN_LOCK}: {e}"),
-                    project_root,
-                    &coords.uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await;
-            }
-        }
-        return VendorOutcome::Done {
-            result: already_patched_result(purl, &project_root.join(&rel_tgz), &record.files),
-            entry: None,
-            warnings,
-        };
-    }
-
-    if let Err(e) = atomic_write_bytes_preserving_mode(
-        &project_root.join(BUN_LOCK),
-        lines.join("\n").as_bytes(),
-    )
-    .await
-    {
-        return done_failure_unstage(
-            purl,
-            format!("cannot write {BUN_LOCK}: {e}"),
-            project_root,
-            &coords.uuid_dir_rel,
-            uuid_dir_preexisted,
         )
-        .await;
-    }
-
-    // ── 6. Marker + ledger entry ──────────────────────────────────────────
-    let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
-    write_marker_or_warn(
-        &project_root.join(&coords.uuid_dir_rel),
-        &marker,
-        &mut warnings,
-    )
-    .await;
-
-    let entry = VendorEntry {
-        ecosystem: "npm".to_string(),
-        base_purl: coords.base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: rel_tgz,
-            sha256: packed.sha256_hex,
-            size: Some(packed.size),
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: Some("bun".to_string()),
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    };
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
     }
 }
 
-/// Whether the project's installs are driven by the native binary lock:
-/// no `bun.lock` beside a `bun.lockb`. [`vendor_bun`] routes those to
-/// [`super::bun_binary`], and the vendor loop's download plan follows the
-/// same routing.
+/// Whether the project's installs are driven by the native binary lock
+/// ([`super::lock_inventory::bun_binary_lock_drives`]). [`vendor_bun`]
+/// routes those to [`super::bun_binary`], and the vendor loop's download
+/// plan follows the same routing.
 pub(super) fn binary_lock_drives(project_root: &Path) -> bool {
-    !project_root.join(BUN_LOCK).exists() && project_root.join("bun.lockb").exists()
+    super::lock_inventory::bun_binary_lock_drives(project_root)
 }
 
 /// The text lock, read and strictly parsed before any write: version-
@@ -666,16 +640,33 @@ pub(super) struct BunProject {
     entries: Vec<BunEntry>,
     /// The project's own `patchedDependencies` keys (#367).
     user_patched: Vec<String>,
+    /// The root `package.json` text, `None` when unreadable.
+    manifest: Option<String>,
 }
 
-/// The root manifest's `patchedDependencies` keys, unioned with the copy
-/// Bun mirrors into the text `lock` when there is one. An unreadable or
-/// non-JSON manifest contributes none; the lock read stands on its own.
-pub(super) async fn read_user_patched(project_root: &Path, lock: Option<&str>) -> Vec<String> {
-    let manifest = read_regular_to_string(&project_root.join("package.json"))
+/// The root `package.json` text, `None` when unreadable: the manifest
+/// lookups ([`patched_dependency_keys`], [`loses_default_trust`]) then fall
+/// back on what the lock mirrors.
+pub(super) async fn read_manifest(project_root: &Path) -> Option<String> {
+    read_regular_to_string(&project_root.join("package.json"))
         .await
-        .ok();
-    patched_dependency_keys(manifest.as_deref(), lock)
+        .ok()
+}
+
+/// The warning for a package vendored to a local tarball that Bun 1.3.5+ no
+/// longer trusts by default (#371); `None` when its trust is unchanged.
+pub(super) fn default_trust_warning(
+    manifest: Option<&str>,
+    lock: Option<&str>,
+    name: &str,
+    version: &str,
+) -> Option<VendorWarning> {
+    loses_default_trust(manifest, lock, name).then(|| {
+        VendorWarning::new(
+            "vendor_bun_default_trust_lost",
+            default_trust_detail(name, version, "a vendored local tarball"),
+        )
+    })
 }
 
 /// Refuse to vendor a package the project patches itself with `bun patch`
@@ -724,12 +715,14 @@ pub(super) async fn read_project(project_root: &Path) -> Result<BunProject, Box<
             )));
         }
     };
-    let user_patched = read_user_patched(project_root, Some(&lock_text)).await;
+    let manifest = read_manifest(project_root).await;
+    let user_patched = patched_dependency_keys(manifest.as_deref(), Some(&lock_text));
     Ok(BunProject {
         lock_text,
         lines,
         entries,
         user_patched,
+        manifest,
     })
 }
 
@@ -763,6 +756,21 @@ pub(super) fn preflight_package(
                      and `bun install` will not help; vendor or update the bundling parent \
                      to cover them",
                     bundled.join(", ")
+                ),
+            )));
+        }
+        let user_tarballs = user_tarball_matches(&project.entries, name, version);
+        if !user_tarballs.is_empty() {
+            // Likewise: the package IS locked, from a URL / `file:` spec
+            // bun installs as written (#497).
+            return Err(Box::new(refused(
+                "vendor_lock_entry_not_rewritable",
+                format!(
+                    "every {BUN_LOCK} entry for {name}@{version} ({}) installs it from a URL \
+                     or local tarball, not the registry, and cannot be rewritten — those \
+                     copies stay UNPATCHED and `bun install` will not help; depend on the \
+                     registry release to vendor it",
+                    user_tarballs.join(", ")
                 ),
             )));
         }
@@ -841,8 +849,99 @@ pub(crate) async fn revert_bun(
 
 /// [`revert_bun`] with full [`RevertOpts`]: `keep_artifact` skips the
 /// artifact deletion — and the refusals that exist only to protect it —
-/// while the wiring restore runs unchanged.
+/// while the wiring restore runs unchanged. A revert that restores (or, on
+/// a dry run, would restore) the wiring adds [`REINSTALL_REQUIRED`] when
+/// the installed tree may keep the vendored copy, so a preview names the
+/// same `bun install --force` the real run will.
 pub(crate) async fn revert_bun_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let mut outcome = revert_bun_wiring(entry, project_root, opts).await;
+    // Only a revert that put a lock entry back can leave Bun keeping a
+    // copy: with the lock missing nothing was restored, and with the entry
+    // removed (`bun remove`) a plain `bun install` prunes the copy.
+    let restored_nothing = outcome.lock_entry_removed()
+        || outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == "vendor_lockfile_missing");
+    if outcome.success && !outcome.kept_artifact && !restored_nothing {
+        let stale = stale_hoisted_copies(project_root, [entry.base_purl.as_str()]).await;
+        if !stale.is_empty() {
+            outcome.warnings.push(VendorWarning::new(
+                REINSTALL_REQUIRED,
+                reinstall_advisory(&stale),
+            ));
+        }
+    }
+    outcome
+}
+
+/// A revert (or hosted unwind) left an installed copy Bun may keep: its
+/// hoisted linker does not re-extract a package whose lock entry moves
+/// from a local or URL tarball back to the registry record of the same
+/// `name@version`, so a plain `bun install` (`--frozen-lockfile` too)
+/// reports "no changes" and the patched bytes stay installed (#764,
+/// measured on 1.1.45, 1.2.23, 1.3.9, 1.3.14 and 1.4.2). The isolated
+/// linker relinks to the registry entry, and `bun install --force`
+/// reinstalls on both without touching the lock.
+pub const REINSTALL_REQUIRED: &str = "vendor_bun_reinstall_required";
+
+/// The `name@version` of each npm purl in `purls` whose installed copy Bun
+/// may keep after its lock entry returns to the registry (see
+/// [`REINSTALL_REQUIRED`]): `node_modules/<name>` is a real directory (an
+/// isolated install links it into `node_modules/.bun/`), or the tree has
+/// no `node_modules/.bun/` at all (a hoisted install, where a copy may sit
+/// nested under another package). A project with no `node_modules/` has
+/// nothing installed to keep.
+pub async fn stale_hoisted_copies<'a>(
+    project_root: &Path,
+    purls: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let modules = project_root.join("node_modules");
+    if !tokio::fs::metadata(&modules)
+        .await
+        .is_ok_and(|m| m.is_dir())
+    {
+        return Vec::new();
+    }
+    let hoisted_tree = tokio::fs::symlink_metadata(modules.join(".bun"))
+        .await
+        .is_err();
+    let mut stale = Vec::new();
+    for purl in purls {
+        let Some((name, version)) = super::npm_common::parse_npm_purl(purl) else {
+            continue;
+        };
+        let copy = tokio::fs::symlink_metadata(modules.join(&name)).await;
+        let kept = match copy {
+            Ok(m) => m.is_dir(),
+            Err(_) => hoisted_tree,
+        };
+        let label = format!("{name}@{version}");
+        if kept && !stale.contains(&label) {
+            stale.push(label);
+        }
+    }
+    stale
+}
+
+/// The [`REINSTALL_REQUIRED`] detail for the `name@version` labels in
+/// `stale` (shared with the hosted unwind's run-level advisory).
+pub fn reinstall_advisory(stale: &[String]) -> String {
+    format!(
+        "Bun's hoisted linker keeps the installed copy of {} when its lock entry returns to \
+         the registry: a plain `bun install` reports no changes and node_modules may still \
+         hold the patched bytes; run `bun install --force` (or delete node_modules and run \
+         `bun install`) to reinstall the upstream copy",
+        stale.join(", ")
+    )
+}
+
+/// The wiring restore behind [`revert_bun_opts`].
+async fn revert_bun_wiring(
     entry: &VendorEntry,
     project_root: &Path,
     opts: RevertOpts,
@@ -851,9 +950,7 @@ pub(crate) async fn revert_bun_opts(
         .wiring
         .iter()
         .any(|r| r.kind == super::bun_binary::KIND || r.kind == "bun_lockb_workspace_artifact")
-        || (entry.wiring.is_empty()
-            && !project_root.join(BUN_LOCK).exists()
-            && project_root.join("bun.lockb").exists())
+        || (entry.wiring.is_empty() && binary_lock_drives(project_root))
     {
         return super::bun_binary::revert(entry, project_root, opts).await;
     }
@@ -887,9 +984,10 @@ pub(crate) async fn revert_bun_opts(
             return blocked;
         }
     }
-    if dry_run {
-        return RevertOutcome::ok();
-    }
+    // A dry run replays the lock in memory like the wet run, only without
+    // the write and the artifact deletion: its preview then sees the same
+    // `vendor_lockfile_missing` / `vendor_lock_entry_removed` the wet run
+    // would, and names the same reinstall advice.
     let mut outcome = RevertOutcome::ok();
 
     // SECURITY: revert writes are restricted to the one file vendor edits — a
@@ -928,12 +1026,25 @@ pub(crate) async fn revert_bun_opts(
         }
     }
 
+    // An empty registry field means "the default registry", which a
+    // committed bunfig.toml or .npmrc can rebind (`registry`, a scope
+    // table); with either configuring one, an empty field proves nothing
+    // about where an upgrade installs from (#1155).
+    let default_registry_pinned =
+        !super::npm_common::project_may_redirect_registry(project_root).await;
     let mut dirty = false;
     if let Some(lines) = lines.as_mut() {
         for rec in entry.wiring.iter().rev().filter(|r| r.file == BUN_LOCK) {
-            revert_one_record(lines, rec, &entry.uuid, &mut dirty, &mut outcome.warnings);
+            revert_one_record(
+                lines,
+                rec,
+                &entry.uuid,
+                default_registry_pinned,
+                &mut dirty,
+                &mut outcome.warnings,
+            );
         }
-        if dirty {
+        if dirty && !dry_run {
             if let Err(e) = atomic_write_bytes_preserving_mode(
                 &project_root.join(BUN_LOCK),
                 lines.join("\n").as_bytes(),
@@ -952,6 +1063,9 @@ pub(crate) async fn revert_bun_opts(
     // deleting evidence out from under a lock we just refused to touch.
     if outcome.drift_skipped() {
         outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+    if dry_run {
         return outcome;
     }
 
@@ -982,10 +1096,11 @@ pub(crate) async fn revert_bun_opts(
     outcome
 }
 
-fn revert_one_record(
+pub(super) fn revert_one_record(
     lines: &mut [String],
     rec: &WiringRecord,
     entry_uuid: &str,
+    default_registry_pinned: bool,
     dirty: &mut bool,
     warnings: &mut Vec<VendorWarning>,
 ) {
@@ -1037,6 +1152,22 @@ fn revert_one_record(
                 .and_then(|path| parse_vendor_path(&path))
                 .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !exact && !ours_uuid {
+            // MOVED OFF THE VENDORED VERSION, not drifted (#1155): `bun
+            // update` / `bun add pkg@other` re-locked the entry at another
+            // registry version, so the vendored version left the lock graph
+            // exactly as after `bun remove`. Nothing to restore; the caller
+            // keeps the artifact only while the lock still resolves through
+            // it. A same-version re-resolution stays drift.
+            if let Some(live_version) = version_moved_off(rec, &parsed, default_registry_pinned) {
+                warnings.push(VendorWarning::new(
+                    super::LOCK_ENTRY_REMOVED_CODE,
+                    format!(
+                        "lock entry `{key}` now locks version {live_version}; the vendored \
+                         version is no longer installed, so there is nothing to restore"
+                    ),
+                ));
+                return;
+            }
             warnings.push(drifted(format!(
                 "lock entry `{key}` was re-resolved since vendoring; left alone"
             )));
@@ -1068,6 +1199,41 @@ fn revert_one_record(
     ));
 }
 
+/// The package name and registry version an entry tuple locks
+/// (`"left-pad@1.3.1"` → `("left-pad", "1.3.1")`), or `None` for any other
+/// spec (a vendored path, a URL, `file:`/`github:`).
+fn registry_name_version(entry: &BunEntry) -> Option<(String, String)> {
+    let spec = decode_json_string(entry.elems.first()?)?;
+    let (name, version) = split_name_spec(&spec)?;
+    let plain = !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    plain.then(|| (name.to_string(), version.to_string()))
+}
+
+/// The live entry's registry version when the user moved the package to
+/// another version from the same registry since vendoring: same package
+/// name, same registry field (the tuple's second element) as the pre-vendor
+/// tuple in `rec.original`, different version. `None` otherwise, which
+/// keeps the caller's drift verdict: an `original: None` record, a URL or
+/// `file:` spec, another package or another registry is not a plain upgrade
+/// and must keep the artifact and leave `vendor --check` red.
+fn version_moved_off(
+    rec: &WiringRecord,
+    live: &BunEntry,
+    default_registry_pinned: bool,
+) -> Option<String> {
+    let (live_name, live_version) = registry_name_version(live)?;
+    let original = parse_entry_line(rec.original.as_ref().and_then(Value::as_str)?).ok()?;
+    let (original_name, original_version) = registry_name_version(&original)?;
+    let live_registry = decode_json_string(live.elems.get(1)?)?;
+    let same_registry = Some(&live_registry) == decode_json_string(original.elems.get(1)?).as_ref()
+        && (!live_registry.is_empty() || default_registry_pinned);
+    (same_registry && live_name == original_name && live_version != original_version)
+        .then_some(live_version)
+}
+
 // ───────────────────────── vendor-specific classification ─────────────────
 // The conservative line grammar (`BunEntry`, `parse_*`, `scan_*`, …) lives in
 // `crate::vendor::bun_lock_text`; this module keeps only the vendor tuple
@@ -1085,17 +1251,18 @@ enum TupleShape {
 
 /// [`classify`] for the instances vendoring may rewrite: a bundled entry
 /// ([`is_bundled_entry`]) is unpacked from its parent's tarball and never
-/// read, so it is no rewrite target whatever its spec says (#469).
+/// read, so it is no rewrite target whatever its spec says (#469). The
+/// bundled check JSON-parses the meta, so it runs only on a match (#578).
 fn classify_rewritable(
     entry: &BunEntry,
     target_spec: &str,
     name: &str,
     target_leaf: &str,
 ) -> Option<TupleShape> {
-    if is_bundled_entry(entry) {
-        return None;
-    }
-    classify(entry, target_spec, name, target_leaf)
+    // The cheap spec match runs first; the bundled parse only for a match
+    // (#580).
+    let shape = classify(entry, target_spec, name, target_leaf)?;
+    (!is_bundled_entry(entry)).then_some(shape)
 }
 
 /// Keys of the bundled entries that resolve the target `name@version`.
@@ -1107,9 +1274,31 @@ fn bundled_matches(
 ) -> Vec<String> {
     entries
         .iter()
-        .filter(|e| is_bundled_entry(e) && classify(e, target_spec, name, target_leaf).is_some())
+        .filter(|e| classify(e, target_spec, name, target_leaf).is_some() && is_bundled_entry(e))
         .map(|e| e.key.clone())
         .collect()
+}
+
+/// Keys of the non-bundled entries that install `name@version` from a user
+/// URL / `file:` tarball (#497): bun installs those from their own spec, so
+/// no vendored tuple reaches them. The spec check runs first: the bundled
+/// check JSON-parses the meta, so it may run only on a match (#578).
+fn user_tarball_matches(entries: &[BunEntry], name: &str, version: &str) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| is_user_tarball_entry(e, name, version) && !is_bundled_entry(e))
+        .map(|e| e.key.clone())
+        .collect()
+}
+
+/// The stays-UNPATCHED detail for a user tarball copy at `label`, shared
+/// by the text and binary backends.
+pub(super) fn user_tarball_detail(label: &str, name: &str, version: &str) -> String {
+    format!(
+        "{label} installs {name}@{version} from a URL or local tarball, not the registry, \
+         and CANNOT be rewritten — bun installs it from that spec, so that copy stays \
+         UNPATCHED; depend on the registry release to vendor it"
+    )
 }
 
 /// Classify an entry against the target: `Some(Registry)` for the exact
@@ -1950,7 +2139,7 @@ mod tests {
         for entry in [&entry_b, &entry_a] {
             let outcome = revert_bun(entry, fx.root(), false).await;
             assert!(outcome.success, "{:?}", outcome.error);
-            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         }
         assert_eq!(fx.read_lock().await, BN4C_BEFORE_LOCK, "lock byte-restored");
         assert!(!fx
@@ -2032,7 +2221,7 @@ mod tests {
 
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         assert_eq!(
             fx.read_lock().await,
             crlf_before,
@@ -2102,6 +2291,58 @@ mod tests {
         );
     }
 
+    /// REGRESSION (#497): bun installs a remote-URL or `file:` tarball
+    /// dependency from its own spec, so vendoring the registry copy beside
+    /// it leaves the copy the app loads unpatched. The tarball tuple is
+    /// never rewired and is reported loudly (npm's #326); with no registry
+    /// copy the vendor refuses with the real reason and writes nothing.
+    #[tokio::test]
+    async fn user_tarball_copy_is_never_rewired_silently() {
+        let regular_line = BN3_BEFORE_LOCK
+            .lines()
+            .find(|l| l.contains("\"left-pad\": ["))
+            .unwrap();
+        let nested_line = regular_line.replace("\"left-pad\": [", "\"dep/left-pad\": [");
+        for user_line in [
+            r#"    "left-pad": ["left-pad@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],"#,
+            r#"    "left-pad": ["left-pad@./left-pad-1.3.0.tgz", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],"#,
+        ] {
+            // The tarball copy only.
+            let lock = BN3_BEFORE_LOCK.replace(regular_line, user_line);
+            let fx = fixture_with(&lock, "node_modules/left-pad").await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+            assert!(
+                detail.contains("left-pad") && detail.contains("UNPATCHED"),
+                "{detail}"
+            );
+            assert_eq!(fx.read_lock().await, lock, "refusal writes nothing");
+            assert!(!fx.root().join(".socket/vendor").exists());
+
+            // Beside a nested registry copy of the same version.
+            let lock =
+                BN3_BEFORE_LOCK.replace(regular_line, &format!("{user_line}\n\n{nested_line}"));
+            let fx = fixture_with(&lock, "node_modules/dep/node_modules/left-pad").await;
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            assert_eq!(entry.wiring.len(), 1);
+            assert_eq!(entry.wiring[0].key.as_deref(), Some("dep/left-pad"));
+            assert!(
+                fx.read_lock().await.contains(user_line),
+                "the tarball line keeps its bytes"
+            );
+            let skipped = warnings
+                .iter()
+                .find(|w| w.code == "vendor_non_registry_entry_skipped")
+                .unwrap_or_else(|| panic!("{user_line}: {warnings:?}"));
+            assert!(
+                skipped.detail.contains("`left-pad`") && skipped.detail.contains("UNPATCHED"),
+                "{}",
+                skipped.detail
+            );
+        }
+    }
+
     /// REGRESSION (#469), `bun.lockb`: a record only a bundled edge
     /// reaches refuses with the real reason; a record Bun shares between a
     /// regular and a bundled install is vendored for the regular install,
@@ -2165,6 +2406,65 @@ mod tests {
                 .any(|w| w.code == "vendor_bundled_instance_skipped"),
             "{warnings:?}"
         );
+    }
+
+    /// REGRESSION (#497), `bun.lockb`: Bun 1.1.45's record of a root URL /
+    /// `file:` tarball dependency is installed from its own resolution, so
+    /// vendoring is-odd's nested registry copy reports the tarball copy as
+    /// staying unpatched instead of succeeding silently, and that record is
+    /// left alone.
+    #[tokio::test]
+    async fn binary_user_tarball_record_is_reported_unpatched() {
+        for shape in ["url", "file"] {
+            let fx = fixture_with("", "node_modules/is-odd/node_modules/is-number").await;
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/bun-lockb-user-tarball")
+                .join(shape);
+            tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+                .await
+                .unwrap();
+            for file in ["bun.lockb", "package.json"] {
+                tokio::fs::copy(dir.join(file), fx.root().join(file))
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(
+                fx.installed.join("package.json"),
+                br#"{"name":"is-number","version":"6.0.0"}"#,
+            )
+            .await
+            .unwrap();
+            let blobs = fx.root().join(".socket/blobs");
+            let outcome = crate::vendor::test_support::vendor_bun(
+                "pkg:npm/is-number@6.0.0",
+                &fx.installed,
+                fx.root(),
+                &fx.record,
+                &PatchSources::blobs_only(&blobs),
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let (result, entry, warnings) = expect_done(outcome);
+            assert!(result.success, "{shape}: {:?}", result.error);
+            assert_eq!(entry.unwrap().wiring.len(), 1, "{shape}: the registry copy");
+            let skipped = warnings
+                .iter()
+                .find(|w| w.code == "vendor_non_registry_entry_skipped")
+                .unwrap_or_else(|| panic!("{shape}: {warnings:?}"));
+            assert!(skipped.detail.contains("UNPATCHED"), "{}", skipped.detail);
+            let lock = tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap();
+            let packages = crate::vendor::bun_lockb::BunLockb::parse_packages(&lock).unwrap();
+            assert!(
+                packages.iter().any(|p| p.name == "is-number"
+                    && p.version.is_none()
+                    && parse_vendor_path(&p.resolution).is_none()
+                    && p.resolution.ends_with("is-number-6.0.0.tgz")),
+                "{shape}: the tarball record keeps its resolution: {packages:?}"
+            );
+        }
     }
 
     /// REGRESSION (#367): a package the project patches itself with
@@ -2275,6 +2575,109 @@ mod tests {
         assert!(!fx.root().join(".socket/vendor").exists());
     }
 
+    /// Vendor `purl` from `fx` and return the run's
+    /// `vendor_bun_default_trust_lost` details.
+    async fn trust_lost_details(fx: &Fixture, purl: &str) -> Vec<String> {
+        let blobs = fx.root().join(".socket/blobs");
+        let outcome = crate::vendor::test_support::vendor_bun(
+            purl,
+            &fx.installed,
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let (result, _, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        warnings
+            .into_iter()
+            .filter(|w| w.code == "vendor_bun_default_trust_lost")
+            .map(|w| w.detail)
+            .collect()
+    }
+
+    /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
+    /// applies only to packages resolved from the npm registry, so a
+    /// default-trusted package vendored to a local tarball has its install
+    /// scripts skipped with exit 0. Vendoring says so, unless the project
+    /// declares `trustedDependencies` (package.json, or bun.lock's mirror),
+    /// which decides trust by name alone.
+    #[tokio::test]
+    async fn default_trusted_package_warns_that_trust_is_lost() {
+        let lock = BN3_BEFORE_LOCK.replace("left-pad", "simple-git-hooks");
+        let purl = "pkg:npm/simple-git-hooks@1.3.0";
+        let fx = fixture_with(&lock, "node_modules/simple-git-hooks").await;
+        let lost = trust_lost_details(&fx, purl).await;
+        assert_eq!(lost.len(), 1, "{lost:?}");
+        assert!(
+            lost[0].contains("simple-git-hooks@1.3.0") && lost[0].contains("trustedDependencies"),
+            "{}",
+            lost[0]
+        );
+
+        let mirrored = lock.replacen(
+            "  \"packages\": {",
+            "  \"trustedDependencies\": [\n    \"simple-git-hooks\",\n  ],\n  \"packages\": {",
+            1,
+        );
+        assert_ne!(mirrored, lock);
+        let fx = fixture_with(&mirrored, "node_modules/simple-git-hooks").await;
+        assert!(trust_lost_details(&fx, purl).await.is_empty());
+
+        let fx = fixture_with(&lock, "node_modules/simple-git-hooks").await;
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            BN3_PKG.replacen(
+                "\"version\": \"1.0.0\",",
+                "\"version\": \"1.0.0\",\n  \"trustedDependencies\": [],",
+                1,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(trust_lost_details(&fx, purl).await.is_empty());
+
+        // A package off the default list keeps the plain run quiet.
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        assert!(trust_lost_details(&fx, "pkg:npm/left-pad@1.3.0")
+            .await
+            .is_empty());
+    }
+
+    /// REGRESSION (#371), `bun.lockb`: the binary lock has no text mirror,
+    /// so the root manifest's `trustedDependencies` alone decides. Real Bun
+    /// 1.4.2 fixture: `simple-git-hooks` is on the default list.
+    #[tokio::test]
+    async fn binary_default_trusted_package_warns_that_trust_is_lost() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bun-lockb-trusted");
+        let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
+        let declared = manifest.replacen(
+            "\"private\": true,",
+            "\"private\": true,\n  \"trustedDependencies\": [\"simple-git-hooks\"],",
+            1,
+        );
+        assert_ne!(declared, manifest);
+        for (manifest, warns) in [(&manifest, true), (&declared, false)] {
+            let fx = fixture_with("", "node_modules/simple-git-hooks").await;
+            tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+                .await
+                .unwrap();
+            tokio::fs::copy(dir.join("bun.lockb"), fx.root().join("bun.lockb"))
+                .await
+                .unwrap();
+            tokio::fs::write(fx.root().join("package.json"), manifest)
+                .await
+                .unwrap();
+            let lost = trust_lost_details(&fx, "pkg:npm/simple-git-hooks@2.11.1").await;
+            assert_eq!(lost.len(), usize::from(warns), "{lost:?}");
+        }
+    }
+
     #[tokio::test]
     async fn unparseable_entry_line_fails_closed_before_any_write() {
         for bad in [
@@ -2366,6 +2769,39 @@ mod tests {
             tgz_first,
             "tarball byte-identical across re-runs"
         );
+    }
+
+    /// #920: the `package.json` advisory is emitted once, by the run that
+    /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
+    /// AlreadyPatched.
+    #[tokio::test]
+    async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
+        let mut fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let after: &[u8] = br#"{"name":"left-pad","version":"1.3.0","sideEffects":false}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash,
+            },
+        );
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code.starts_with("vendor_dep_manifest"))
+                .count()
+        };
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_none(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
     }
 
     // ── lockfileVersion 0 + workspace locks: real per-version grammar ─────
@@ -2506,7 +2942,7 @@ mod tests {
                 );
                 let outcome = revert_bun(&entry, fx.root(), false).await;
                 assert!(outcome.success, "{:?}", outcome.error);
-                assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+                assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
                 assert_eq!(
                     fx.read_lock().await,
                     lock,
@@ -2817,7 +3253,7 @@ mod tests {
         let entry = entry.expect("success carries a ledger entry");
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, lock, "lock byte-restored");
     }
 
@@ -2986,7 +3422,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "an unmoved entry is ours, not drift: {:?}",
             outcome.warnings
         );
@@ -2999,6 +3435,17 @@ mod tests {
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// A revert's lock-wiring advisories: every fixture installs a hoisted
+    /// `node_modules/left-pad`, whose [`REINSTALL_REQUIRED`] the tests below
+    /// that are about the lock leave out.
+    fn lock_warnings(outcome: &RevertOutcome) -> Vec<&VendorWarning> {
+        outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code != REINSTALL_REQUIRED)
+            .collect()
     }
 
     #[tokio::test]
@@ -3036,13 +3483,151 @@ mod tests {
 
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        // The hoisted install's copy is the only advisory (#764).
+        let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, [REINSTALL_REQUIRED], "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "lock byte-restored");
         assert!(!tgz_path.exists());
         assert!(!fx
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// #764: Bun's hoisted linker keeps `node_modules/<name>` when the lock
+    /// entry returns from the vendored tarball to the registry record, so a
+    /// plain `bun install` leaves the vendored bytes installed. The revert
+    /// says so and names the install that does reinstall (measured on Bun
+    /// 1.2.23, 1.3.14 and 1.4.2: `bun install --force` reinstalls and keeps
+    /// the lock).
+    #[tokio::test]
+    async fn revert_warns_that_bun_keeps_a_hoisted_copy() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        // The preview names the same install the real run will: the
+        // rollback's generic reinstall note otherwise promises that the
+        // next plain install refreshes the tree, which Bun's hoisted
+        // linker doesn't do.
+        let dry = revert_bun(&entry, fx.root(), true).await;
+        assert!(dry.success, "{:?}", dry.error);
+        let codes: Vec<&str> = dry.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, [REINSTALL_REQUIRED], "{:?}", dry.warnings);
+        assert!(
+            dry.warnings[0].detail.contains("`bun install --force`"),
+            "{}",
+            dry.warnings[0].detail
+        );
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let w = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == REINSTALL_REQUIRED)
+            .expect("the hoisted copy is reported");
+        assert!(w.detail.contains("left-pad@1.3.0"), "{}", w.detail);
+        assert!(w.detail.contains("`bun install --force`"), "{}", w.detail);
+    }
+
+    /// A preview names no reinstall the wet run would not: with `bun.lock`
+    /// gone, or the vendored entry removed (`bun remove`), nothing is
+    /// restored and the dry run says so like the wet run, without writing.
+    #[tokio::test]
+    async fn dry_run_revert_skips_the_advisory_when_nothing_is_restored() {
+        for removed_entry in [false, true] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let lock = fx.root().join(BUN_LOCK);
+            if removed_entry {
+                let text = tokio::fs::read_to_string(&lock).await.unwrap();
+                let kept: Vec<&str> = text
+                    .split('\n')
+                    .filter(|l| !l.contains(&entry.uuid))
+                    .collect();
+                tokio::fs::write(&lock, kept.join("\n")).await.unwrap();
+            } else {
+                tokio::fs::remove_file(&lock).await.unwrap();
+            }
+            let before = tokio::fs::read(&lock).await.ok();
+
+            let dry = revert_bun(&entry, fx.root(), true).await;
+            assert!(dry.success, "{:?}", dry.error);
+            assert!(
+                dry.warnings.iter().all(|w| w.code != REINSTALL_REQUIRED),
+                "removed_entry={removed_entry}: {:?}",
+                dry.warnings
+            );
+            assert_eq!(tokio::fs::read(&lock).await.ok(), before, "dry run wrote");
+            let wet = revert_bun(&entry, fx.root(), false).await;
+            assert!(
+                wet.warnings.iter().all(|w| w.code != REINSTALL_REQUIRED),
+                "removed_entry={removed_entry}: {:?}",
+                wet.warnings
+            );
+        }
+    }
+
+    /// The isolated linker relinks `node_modules/<name>` to the restored
+    /// registry entry, and a project with nothing installed has nothing to
+    /// keep: neither warns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_skips_the_advisory_without_a_hoisted_copy() {
+        for isolated in [true, false] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let modules = fx.root().join("node_modules");
+            if isolated {
+                let store = modules.join(".bun/left-pad@1.3.0/node_modules/left-pad");
+                tokio::fs::create_dir_all(store.parent().unwrap())
+                    .await
+                    .unwrap();
+                tokio::fs::rename(modules.join("left-pad"), &store)
+                    .await
+                    .unwrap();
+                std::os::unix::fs::symlink(&store, modules.join("left-pad")).unwrap();
+            } else {
+                tokio::fs::remove_dir_all(&modules).await.unwrap();
+            }
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .all(|w| w.code != REINSTALL_REQUIRED),
+                "isolated={isolated}: {:?}",
+                outcome.warnings
+            );
+        }
+    }
+
+    /// A hoisted tree (no `node_modules/.bun/`) may hold the copy nested
+    /// under another package; only an isolated tree proves it absent.
+    #[tokio::test]
+    async fn stale_hoisted_copies_reads_the_linker_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let purls = ["pkg:npm/@scope/a@1.0.0", "pkg:npm/b@2.0.0"];
+        assert!(stale_hoisted_copies(root, purls).await.is_empty());
+
+        tokio::fs::create_dir_all(root.join("node_modules/@scope/a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_hoisted_copies(root, purls).await,
+            ["@scope/a@1.0.0", "b@2.0.0"]
+        );
+
+        tokio::fs::create_dir_all(root.join("node_modules/.bun"))
+            .await
+            .unwrap();
+        assert_eq!(stale_hoisted_copies(root, purls).await, ["@scope/a@1.0.0"]);
     }
 
     /// bun.lock is a user-owned file we merely edit: the vendor rewrite and
@@ -3127,14 +3712,143 @@ mod tests {
         );
     }
 
+    /// #1155: `bun update` / `bun add left-pad@1.3.1` moved the vendored
+    /// package off its patched version. The vendored version left the lock
+    /// graph exactly as after `bun remove`, so the revert has nothing to
+    /// restore and the artifact goes once nothing resolves through it,
+    /// instead of a drift-keep that `vendor --check` can never clear.
+    #[tokio::test]
+    async fn revert_after_version_change_drops_the_unreferenced_artifact() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let upgraded_line = "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
+        let live = fx.read_lock().await;
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap();
+        let upgraded_lock = live.replace(new_line, upgraded_line);
+        assert_ne!(upgraded_lock, live, "test setup must move the entry");
+        tokio::fs::write(fx.root().join(BUN_LOCK), &upgraded_lock)
+            .await
+            .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_removed"
+                    && w.detail.contains("left-pad")
+                    && w.detail.contains("1.3.1")),
+            "the version change is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            fx.read_lock().await,
+            upgraded_lock,
+            "the user's upgraded lock is left byte-identical"
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "nothing resolves through the artifact, so it is removed"
+        );
+    }
+
+    /// #1155 provenance guard: a version change counts as an upgrade only
+    /// for the same package from the same registry field as the pre-vendor
+    /// tuple. Another registry or another package name stays drift.
+    #[tokio::test]
+    async fn revert_keeps_version_change_from_another_registry_as_drift() {
+        for moved_line in [
+            "    \"left-pad\": [\"left-pad@1.3.1\", \"https://evil.example.com/\", {}, \"sha512-other==\"],",
+            "    \"left-pad\": [\"not-left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],",
+        ] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let live = fx.read_lock().await;
+            let new_line = entry.wiring[0]
+                .new
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap();
+            let moved_lock = live.replace(new_line, moved_line);
+            assert_ne!(moved_lock, live, "test setup must move the entry");
+            tokio::fs::write(fx.root().join(BUN_LOCK), &moved_lock)
+                .await
+                .unwrap();
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{moved_line}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{moved_line}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{moved_line}: {:?}", outcome.warnings);
+            assert_eq!(fx.read_lock().await, moved_lock, "left alone");
+        }
+    }
+
+    /// #1155 provenance guard: an empty registry field means "the default
+    /// registry", and a committed bunfig.toml or .npmrc can rebind that.
+    /// With either naming a registry, a version change from `""` is not
+    /// proven to come from the pre-vendor registry, so it stays drift.
+    #[tokio::test]
+    async fn revert_keeps_default_registry_upgrade_as_drift_when_the_registry_is_configured() {
+        for (file, text) in [
+            (
+                "bunfig.toml",
+                "[install]\nregistry = \"https://evil.example.com/\"\n",
+            ),
+            (".npmrc", "registry=https://evil.example.com/\n"),
+            (
+                "bunfig.toml",
+                "[install.scopes]\n\"@s\" = \"https://evil.example.com/\"\n",
+            ),
+        ] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let upgraded_line =
+                "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
+            let live = fx.read_lock().await;
+            let new_line = entry.wiring[0]
+                .new
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap();
+            tokio::fs::write(
+                fx.root().join(BUN_LOCK),
+                live.replace(new_line, upgraded_line),
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(fx.root().join(file), text).await.unwrap();
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{file}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{file}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{file}: {:?}", outcome.warnings);
+        }
+    }
+
     #[tokio::test]
     async fn revert_leaves_drifted_entries_alone_with_warning() {
         let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
 
-        // The user re-resolved the entry behind our back (`bun update`).
-        let drifted_line = "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
+        // The user re-resolved the entry behind our back at the SAME
+        // version (a fork tarball). A version change is not drift (#1155);
+        // see `revert_after_version_change_drops_the_unreferenced_artifact`.
+        let drifted_line =
+            "    \"left-pad\": [\"left-pad@https://example.com/left-pad-1.3.0.tgz\", {}],";
         let live = fx.read_lock().await;
         let new_line = entry.wiring[0]
             .new
@@ -3192,7 +3906,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "no drift left after the undo: {:?}",
             outcome.warnings
         );
@@ -3309,7 +4023,7 @@ mod tests {
                  deletion guard must not fire: {:?}",
                 outcome.error
             );
-            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
             assert!(!outcome.kept_artifact, "preserve-state is not a drift-keep");
             assert!(tgz_path.exists(), "artifact kept");
             assert_eq!(
@@ -3415,6 +4129,14 @@ mod tests {
             "{:?}",
             outcome.warnings
         );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|w| w.code != REINSTALL_REQUIRED),
+            "nothing restored, so nothing for Bun to keep (#764): {:?}",
+            outcome.warnings
+        );
         assert!(!outcome.kept_artifact, "a missing lock is not a drift-keep");
         assert!(
             !fx.root()
@@ -3472,7 +4194,7 @@ mod tests {
         )
         .await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         assert!(!outcome.kept_artifact, "preserve-state is not a drift-keep");
         assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "wiring restored");
         assert!(tgz_path.exists(), "artifact deliberately kept");
@@ -3480,7 +4202,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "converged records are silent: {:?}",
             outcome.warnings
         );
@@ -3606,6 +4328,14 @@ mod tests {
             "{:?}",
             outcome.warnings
         );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|w| w.code != REINSTALL_REQUIRED),
+            "a removed dependency is pruned by a plain `bun install` (#764): {:?}",
+            outcome.warnings
+        );
         assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, without_entry, "nothing rewritten");
         assert!(
@@ -3675,7 +4405,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "already-converged is silent: {:?}",
             outcome.warnings
         );
@@ -3766,7 +4496,7 @@ mod tests {
         // The healed lock reverts through the ORIGINAL entry byte-exactly.
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK);
         assert!(!fx
             .root()
@@ -3790,7 +4520,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "a digest-less spelling of our own tuple is not drift: {:?}",
             outcome.warnings
         );
@@ -3832,7 +4562,7 @@ mod tests {
 
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(
-            outcome.success && outcome.warnings.is_empty(),
+            outcome.success && lock_warnings(&outcome).is_empty(),
             "{outcome:?}"
         );
         assert_eq!(fx.read_lock().await, crlf_before);
@@ -3870,7 +4600,7 @@ mod tests {
 
             let outcome = revert_bun(&entry, fx.root(), false).await;
             assert!(
-                outcome.success && outcome.warnings.is_empty(),
+                outcome.success && lock_warnings(&outcome).is_empty(),
                 "v{version}: {outcome:?}"
             );
             let original_line = entry.wiring[0]
@@ -4204,7 +4934,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "the converged re-run is silent: {:?}",
             outcome.warnings
         );
@@ -4339,5 +5069,52 @@ mod tests {
         let (planned, looped) = preflight_then_vendor(&fx).await;
         assert_eq!(looped, Err("vendor_lockfile_missing"));
         assert_eq!(planned, looped);
+    }
+
+    /// REGRESSION (#578): the vendor twin of the hosted hot loop. Every
+    /// per-target scan (`classify_rewritable`, `bundled_matches`) ran the
+    /// JSON-parsing bundled check on EVERY entry before the cheap spec
+    /// match; it may run only on the entries that resolve the target.
+    #[test]
+    fn bundled_check_runs_only_on_matching_entries() {
+        use crate::vendor::bun_lock_text::BUNDLED_CHECKS;
+
+        const ENTRIES: usize = 200;
+        let mut entries: Vec<BunEntry> = (0..ENTRIES)
+            .map(|i| {
+                parse_entry_line(&format!(
+                    "\"pkg{i}\": [\"pkg{i}@1.0.0\", \"\", {{}}, \"sha512-OLD==\"],"
+                ))
+                .unwrap()
+            })
+            .collect();
+        entries.push(
+            parse_entry_line(
+                "\"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }, \"sha512-OLD==\"],",
+            )
+            .unwrap(),
+        );
+
+        BUNDLED_CHECKS.with(|checks| checks.set(0));
+        let (spec, leaf) = ("pkg0@1.0.0", tgz_rel_leaf("pkg0", "1.0.0"));
+        let rewritable = entries
+            .iter()
+            .filter(|e| classify_rewritable(e, spec, "pkg0", &leaf).is_some())
+            .count();
+        let bundled = bundled_matches(&entries, spec, "pkg0", &leaf);
+        // The #497 user-tarball scan is a third per-target pass; with no
+        // tarball entry for the target it must make no bundled check.
+        let user_tarballs = user_tarball_matches(&entries, "pkg0", "1.0.0");
+        let checks = BUNDLED_CHECKS.with(std::cell::Cell::get);
+
+        assert_eq!(rewritable, 1, "only the registry tuple is rewritable");
+        assert_eq!(bundled, vec!["parent/pkg0".to_string()]);
+        assert!(user_tarballs.is_empty());
+        // Two matching entries, two scans: at most four checks, not 3 × 201.
+        assert!(
+            checks <= 4,
+            "{checks} bundled checks over {} entries",
+            ENTRIES + 1
+        );
     }
 }

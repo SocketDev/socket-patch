@@ -1,0 +1,18 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 0,
+  "workspaces": {
+    "": {
+      "name": "binary-lock-fixture",
+      "dependencies": {
+        "is-number": "7.0.0",
+        "minimist": "1.2.2",
+      },
+    },
+  },
+  "packages": {
+    "is-number": ["is-number@7.0.0", "", {}, "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng=="],
+
+    "minimist": ["minimist@.socket/vendor/npm/11111111-1111-4111-8111-111111111111/minimist-1.2.2.tgz", {}, "sha512-tJoY6Sh0/e+0aiqRNMYyJXEdNdp95czoj6rBpEerH5xRDOb3J889JCSXuyZuRm/KRNl0PHCP/7j+iiHAyeJAbQ=="],
+  }
+}

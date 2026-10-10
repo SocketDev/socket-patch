@@ -10,6 +10,10 @@
 //! All offline: `apply` runs against a pre-seeded `.socket/blobs/` cache,
 //! and the `scan` cases find zero installed packages so no API call fires.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -20,17 +24,13 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
-
 /// Build a `Command` for the CLI with the entire `SOCKET_*` environment
 /// scrubbed from the child process.
 ///
 /// Every embedded-VEX flag has an env fallback (`--vex`/`SOCKET_VEX`,
 /// `--vex-product`/`SOCKET_VEX_PRODUCT`, `--vex-no-verify`/
 /// `SOCKET_VEX_NO_VERIFY`, `--vex-doc-id`, `--vex-compact`), as do the
-/// `GlobalArgs` (`SOCKET_OFFLINE`, `SOCKET_FORCE`, `SOCKET_API_TOKEN`,
+/// `GlobalArgs` (`SOCKET_OFFLINE`, `SOCKET_API_TOKEN`,
 /// `SOCKET_ORG_SLUG`, …). If the ambient environment leaks any of these into
 /// the child, a test silently stops exercising the path it names —
 /// `apply_vex_failure_flips_exit_code` would no longer hit

@@ -10,9 +10,7 @@
 //!   with no installed copy ([`super::registry_fetch`]), verifying the bytes
 //!   against the integrity the lock records — FAIL-CLOSED: an entry whose
 //!   lock carries no content verifier is never fetched;
-//! * `repair` recovers ledger entries ([`recover_lock_entry`]) and the pin a
-//!   rewired lock records for a vendored artifact
-//!   ([`wired_vendor_integrity`]);
+//! * `repair` recovers ledger entries ([`recover_lock_entry`]);
 //! * ledger liveness (`vex::discover`) reads EVERY lock's instance
 //!   ([`inventory_project_every_lock`]) as evidence that a package resolves
 //!   from somewhere other than its patch.
@@ -66,19 +64,18 @@ pub(crate) mod pypi;
 pub(crate) mod recover;
 pub mod view;
 pub(crate) mod vlt;
-pub(crate) mod wired;
 pub(crate) mod yarn;
 
+pub use self::bun::{bun_binary_lock_drives, bun_text_lock_drives};
 pub(crate) use self::npm::{
-    npm_legacy_identity, npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes,
-    npm_lock_located_nodes, NpmLockNode,
+    npm_lock_bundled_nodes, npm_lock_entries, npm_lock_legacy_mirror_nodes, npm_lock_located_nodes,
+    NpmLockEntry, NpmLockNode, NpmLockSection,
 };
 #[cfg(test)]
 pub(crate) use self::npm_family::inventory_npm_lock;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
-pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView};
-pub use self::wired::wired_vendor_integrity;
+pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView, ReadSet};
 
 // The per-format views `inventory_project_diagnosed` unions (and the test
 // modules reach through `super::*`).
@@ -199,7 +196,9 @@ impl LockfileEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedNpmLayout {
     /// Stable diagnosis code, including `bun_lockb_invalid` for malformed
-    /// binary Bun locks and the flavor probe's Plug'n'Play refusal codes.
+    /// binary Bun locks, the flavor probe's Plug'n'Play refusal codes, and
+    /// `gem_lock_unsupported` for a Bundler lock bundler loads but
+    /// socket-patch cannot read (despite the name, not only npm).
     pub code: &'static str,
     /// Human-readable diagnosis with format or filesystem error details.
     pub detail: String,
@@ -318,6 +317,7 @@ async fn union_views_in(
         Ok(None) => {}
         Err(diag) => unsupported.push(diag),
     }
+    unsupported.extend(gem::unsupported_gem_layout_in(view).await);
     let views = [
         if every {
             cargo::inventory_cargo_lock_raw_in(view).await

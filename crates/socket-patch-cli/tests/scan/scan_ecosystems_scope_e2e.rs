@@ -19,15 +19,13 @@
 //! installed (`CARGO_HOME` points at an empty dir, so the cargo crawl finds
 //! nothing — hermetic, and a lockfile-only cargo entry either way).
 
-use std::path::{Path, PathBuf};
+use crate::common::binary;
+
+use std::path::Path;
 use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG: &str = "test-org";
 const INSTALLED_PURL: &str = "pkg:npm/installed-dep@1.0.0";
@@ -214,21 +212,16 @@ async fn gc_scan_keeps_the_unscoped_lockfile_only_count() {
     }
 }
 
-/// The crawl of a GC run itself is unscoped: a crate installed under
-/// `CARGO_HOME` (and absent from `Cargo.lock`, so only the cargo CRAWL can
-/// vouch for it) keeps its manifest entry under `-e npm --prune`, while an
-/// uninstalled npm entry is still prunable.
+/// The crawl of a GC run itself is unscoped: a crate installed in the
+/// project's `vendor/` tree (and absent from `Cargo.lock`, so only the
+/// cargo CRAWL can vouch for it; a locked project's registry cache is only
+/// looked up for its locked crates) keeps its manifest entry under
+/// `-e npm --prune`, while an uninstalled npm entry is still prunable.
 #[tokio::test]
 async fn gc_scan_crawls_the_unselected_ecosystems() {
     let tmp = tempfile::tempdir().unwrap();
     stage_project(tmp.path());
-    let krate = tmp
-        .path()
-        .join(".cargo-home")
-        .join("registry")
-        .join("src")
-        .join("index.crates.io-6f17d22bba15001f")
-        .join(format!("{INSTALLED_CRATE}-0.2.0"));
+    let krate = tmp.path().join("vendor").join(INSTALLED_CRATE);
     std::fs::create_dir_all(&krate).unwrap();
     std::fs::write(
         krate.join("Cargo.toml"),
@@ -260,7 +253,7 @@ async fn gc_scan_crawls_the_unselected_ecosystems() {
     ] {
         let (v, _) = scan(tmp.path(), extra).await;
         assert_eq!(
-            v["gc"]["prunableManifestEntries"],
+            v["gc"]["prunedManifestEntries"],
             serde_json::json!(["pkg:npm/orphan-npm@9.9.9"]),
             "{extra:?}: the installed crate must not read as uninstalled: {v}"
         );

@@ -21,8 +21,8 @@ name: Gradle patch compatibility
 #
 # 9.8.0 is the current release on services.gradle.org (re-checked
 # 2026-10-02; bump it here and in ci.yml together when a newer 9.x ships).
-# 7.6.6 is the last 7.x. Every distribution is sha256-checked against
-# services.gradle.org before use.
+# 7.6.6 is the last 7.x. scripts/install-gradle.sh pins every
+# distribution's sha256; add the new version's digest there too.
 #
 # Each mode runs its suites' `#[ignore]` tests by name prefix (the contract
 # scripts/ci-e2e-bundle.py --check enforces): agent = e2e_gradle_discovery_build
@@ -37,13 +37,23 @@ name: Gradle patch compatibility
 # download them. Every cell uploads its JSON probe reports
 # (gradle_build_common::probe_report: Gradle / JDK version, resolved jar path
 # and sha256, hash-dir naming, refresh / RO-cache / transform canaries).
+#
+# On pull_request the ubuntu `cells` are skipped: ci.yml's `e2e` PR tier runs
+# the same suites, filters, Gradle lines and JDKs on ubuntu on every PR and
+# in the merge queue. The ubuntu `extras` run on a PR only when it touches
+# Gradle code (`changes` below); every other PR gets them from the nightly
+# (#1177). Windows cells run on every PR that matches `paths:`, except
+# hosted on the middle Gradle lines (7.6.6, 8.14.3), which run nightly: a PR
+# runs hosted on Windows on 6.9.4 and 9.8.0 only (#1300).
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
+      - 'scripts/maven-sha512.json'
       - '.github/workflows/gradle-compatibility.yml'
       - 'scripts/ci-e2e-bundle.py'
+      - 'scripts/install-gradle.sh'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'crates/*/Cargo.toml'
@@ -98,9 +108,49 @@ env:
   SOCKET_TELEMETRY_DISABLED: '1'
 
 jobs:
+  changes:
+    # Whether this run needs the ubuntu `extras`: always off pull_request, and
+    # on a PR only when it touches Gradle code.
+    if: github.event.pull_request.draft != true
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    timeout-minutes: 5
+    outputs:
+      gradle_core: ${{ steps.diff.outputs.gradle_core }}
+    steps:
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          # The PR merge commit and its first parent, the base it merges into.
+          fetch-depth: 2
+
+      - name: Diff against the base
+        id: diff
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != pull_request ]; then
+            echo "gradle_core=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          core='^(\.github/workflows/gradle-compatibility\.yml$|scripts/install-gradle\.sh$'
+          core+='|crates/socket-patch-core/src/gradle/|crates/socket-patch-core/src/vendor/jvm/'
+          core+='|crates/socket-patch-core/src/crawlers/gradle_cache\.rs$'
+          core+='|crates/socket-patch-core/src/patch/redirect/([^/]*\.gradle|gradle\.rs|upstream/gradle\.rs)$'
+          core+='|crates/socket-patch-cli/tests/(gradle_|e2e_[^/]*gradle|e2e_vendor_jvm_build))'
+          if git diff --name-only HEAD^1 HEAD | grep -E "$core"; then
+            echo "gradle_core=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Gradle code changed; the ubuntu extras run nightly."
+            echo "gradle_core=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build ${{ matrix.os }}
-    if: github.event.pull_request.draft != true
+    needs: [changes]
     strategy:
       fail-fast: false
       matrix:
@@ -108,7 +158,9 @@ jobs:
         exclude:
           # macOS legs run on push to main (and nightly where scheduled), not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
-    runs-on: ${{ matrix.os }}
+          # On a PR only the ubuntu `extras` use the ubuntu build.
+          - os: ${{ github.event_name == 'pull_request' && needs.changes.outputs.gradle_core != 'true' && 'ubuntu-latest' || '' }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     env:
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -125,7 +177,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: gradle-compat
+          shared-key: e2e-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check the Gradle test-name prefixes
@@ -183,7 +235,19 @@ jobs:
         exclude:
           # macOS legs run on push to main (and nightly where scheduled), not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
-    runs-on: ${{ matrix.os }}
+          # ci.yml's `e2e` runs these ubuntu cells on every PR (#1177).
+          - os: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || '' }}
+          # Windows hosted on a PR: only the oldest (6.9.4) and newest (9.8.0)
+          # lines. The middle two are ~40 min each, 40% of a PR run's Windows
+          # minutes; they run nightly, and ci.yml's `e2e` runs hosted on all
+          # four lines on ubuntu on every PR (#1300).
+          - os: ${{ github.event_name == 'pull_request' && 'windows-latest' || '' }}
+            gradle: '7.6.6'
+            mode: hosted
+          - os: ${{ github.event_name == 'pull_request' && 'windows-latest' || '' }}
+            gradle: '8.14.3'
+            mode: hosted
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     steps: &cell-steps
       - name: Checkout
@@ -256,10 +320,22 @@ jobs:
           # TLS handshake with CRYPT_E_REVOCATION_OFFLINE whenever the CA's
           # revocation server is unreachable. A revoked certificate still fails;
           # the body is checked against a digest right after. A no-op elsewhere.
-          url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
-          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
+          # Use Maven Central's fast CDN, falling back to the slower Apache
+          # archive. Both must match the committed digest (ci.yml's copy).
+          file="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          url="https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/${file}"
+          archive_url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${file}"
+          if ! curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"; then
+            echo "::warning::Maven Central download failed; falling back to the Apache archive."
+            curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$archive_url" -o "$RUNNER_TEMP/maven.tgz"
+          fi
+          python - "$MAVEN_VERSION" "$RUNNER_TEMP/maven.tgz" <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+          expected = json.loads(Path("scripts/maven-sha512.json").read_text())[sys.argv[1]]
+          if hashlib.sha512(Path(sys.argv[2]).read_bytes()).hexdigest() != expected:
+              raise SystemExit("Maven archive SHA512 mismatch")
+          PY
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
           if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.cmd"; fi
@@ -273,16 +349,8 @@ jobs:
         shell: bash
         env:
           GRADLE_VERSION: ${{ matrix.gradle }}
-        run: |
-          # Download flags: see the Maven step above.
-          url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/gradle.zip"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
-          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
-          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
-          launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"
-          if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.bat"; fi
-          echo "SOCKET_PATCH_GRADLE_E2E_GRADLE=$launcher" >> "$GITHUB_ENV"
+        # Pinned digest, GitHub-release origin: see the script.
+        run: scripts/install-gradle.sh "$GRADLE_VERSION" "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Run the ${{ matrix.mode }} suites
         shell: bash
@@ -342,7 +410,8 @@ jobs:
 
   extras:
     name: gradle ${{ matrix.gradle }} / jdk ${{ matrix.java }} / ${{ matrix.mode }} / ${{ matrix.label }}
-    needs: [build]
+    needs: [changes, build]
+    if: needs.changes.outputs.gradle_core == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -366,7 +435,7 @@ jobs:
           # Only the suite that owns those tests: e2e_vendor_jvm_build has none,
           # and every landed suite a cell runs must run a test.
           - {os: ubuntu-latest, gradle: '8.14.3', java: '21', mode: vendor, label: real-central, real_central: '1', suites: 'e2e_vendor_gradle_build', test_filter: 'gradle_vendor_511 gradle_vendor_487'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     continue-on-error: ${{ matrix.record_only == 'true' }}
     steps: *cell-steps

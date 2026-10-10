@@ -156,10 +156,8 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
         packages: Vec::new(),
         common: global(cwd, api_url),
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: VexEmbedArgs {
@@ -464,6 +462,64 @@ async fn lock_only_pdm_project_redirects_attests_rescans_and_rolls_back() {
         "rollback must restore the pristine lock byte for byte"
     );
     assert_no_ledger(tmp.path());
+}
+
+/// #413: a `static_urls` lock on a project whose `[[tool.pdm.source]]`
+/// named `pypi` replaces PyPI with a private mirror. Rollback cannot know
+/// the mirror's file URLs, and restoring PyPI's would make `pdm sync`
+/// bypass the mirror, so both the dry run and the real rollback refuse
+/// (exit 1) and leave the hosted lock in place.
+#[tokio::test]
+#[serial]
+async fn static_urls_lock_on_a_private_index_is_not_rolled_back_to_pypi() {
+    const MIRROR: &str = "http://127.0.0.1:18780";
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = LOCK
+        .replace(
+            "strategy = [\"inherit_metadata\"]",
+            "strategy = [\"inherit_metadata\", \"static_urls\"]",
+        )
+        .replace("{file = \"", &format!("{{url = \"{MIRROR}/files/"));
+    write_project(tmp.path(), &lock);
+    let pyproject = format!(
+        "{PYPROJECT}\n[[tool.pdm.source]]\nname = \"pypi\"\nurl = \"{MIRROR}/simple\"\nverify_ssl = false\n"
+    );
+    std::fs::write(tmp.path().join("pyproject.toml"), &pyproject).unwrap();
+    let lock_path = tmp.path().join("pdm.lock");
+
+    let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
+    assert_eq!(code, 0, "hosted redirect must succeed");
+    let redirected = read(&lock_path);
+    assert!(redirected.contains(HOSTED_URL), "{redirected}");
+
+    mock_pypi(&server).await;
+    std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()));
+    for dry_run in [true, false] {
+        let code = rollback::run(RollbackArgs {
+            targets: Vec::new(),
+            common: GlobalArgs {
+                patch_server_url: Some(PATCH_SERVER.to_string()),
+                dry_run,
+                ..global(tmp.path(), server.uri())
+            },
+            preserve_state: false,
+        })
+        .await;
+        assert_eq!(code, 1, "dry_run={dry_run}: the restore is refused");
+        let after = read(&lock_path);
+        assert!(
+            !after.contains("files.pythonhosted.org"),
+            "dry_run={dry_run}: PyPI URLs must never replace the mirror's: {after}"
+        );
+        assert_eq!(
+            after, redirected,
+            "dry_run={dry_run}: the lock is untouched"
+        );
+    }
+    std::env::remove_var("SOCKET_PYPI_JSON_API");
+    assert_eq!(read(&tmp.path().join("pyproject.toml")), pyproject);
 }
 
 /// A PDM project whose `pyproject.toml` names `hatchling` as its build

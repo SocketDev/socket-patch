@@ -17,9 +17,9 @@ use crate::constants::npm_family::{BUN_LOCKB, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, V
 use crate::formats::governing_locks::{npm_locks_outside, NpmLockFamily};
 use crate::vendor::vlt_lock_text::{
     brotli_for_slot3, entry_text, has_brotli_flag, installs_outside_registry, is_default_registry,
-    is_registry_url_segment, nodes_block, parse_node_entry_text, parse_node_line,
-    parse_vendored_path, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
-    split_lines, DepId, DepIdKind, LockSniff, NodeEntry, ParsedLock, SectionSpan,
+    is_registry_url_segment, nodes_block, parse_node_line, parse_vendored_path, render_entry_line,
+    render_tuple_with_slots, sniff_lock, split_dep_id, split_lines, DepId, DepIdKind, LockSniff,
+    ParsedLock, SectionSpan,
 };
 
 /// The ledger kind of a hosted vlt node splice.
@@ -88,15 +88,6 @@ pub(super) fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning
         ));
     }
     Ok(HostedLock { parsed, nodes })
-}
-
-/// The lock-level refusal alone, run before any vendored vlt entry is
-/// reverted for a hosted takeover. An absent lock passes.
-pub fn preflight_vlt_hosted(files: &BTreeMap<String, String>) -> Result<(), RewriteWarning> {
-    match files.get(VLT_LOCK) {
-        Some(text) => parse_hosted_lock(text).map(|_| ()),
-        None => Ok(()),
-    }
 }
 
 /// Is `id` a registry node of `name@version`, and is its segment the
@@ -176,8 +167,7 @@ fn is_old_lockfile_ignored<'a>(
             && (dep_id.first.is_empty() || is_registry_url_segment(&dep_id.first, options))
     });
     let declares_modifiers = vlt_config.is_some_and(|text| {
-        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        serde_json::from_str::<Value>(text)
+        serde_json::from_str::<Value>(crate::formats::text::strip_bom(text))
             .ok()
             .and_then(|v| v.as_object().map(|o| o.contains_key("modifiers")))
             .unwrap_or(false)
@@ -295,29 +285,6 @@ fn ledger_key(name: &str, version: &str, extra: Option<&str>) -> String {
         Some(extra) => format!("{name}@{version}~{extra}"),
         None => format!("{name}@{version}"),
     }
-}
-
-/// The DepID a [`KIND`] ledger edit records, from its `original` entry
-/// text.
-pub fn edit_dep_id(edit: &FileEdit) -> Option<String> {
-    let text = edit.original.as_ref()?.as_str()?;
-    parse_node_entry_text(text).map(|entry| entry.key.to_string())
-}
-
-/// The node ids of a readable `vlt-lock.json`.
-pub fn lock_node_ids(text: &str) -> Option<std::collections::BTreeSet<String>> {
-    match sniff_lock(text) {
-        LockSniff::Readable(lock) => Some(lock.nodes()?.keys().cloned().collect()),
-        _ => None,
-    }
-}
-
-/// Does a ledger edit of [`KIND`] belong to `name@version`? Claims are by
-/// key, with a `~` boundary before a variant's extra segment.
-pub(crate) fn claims_key(key: &str, name: &str, version: &str) -> bool {
-    let base = format!("{name}@{version}");
-    key.strip_prefix(base.as_str())
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('~'))
 }
 
 /// The one nodes-section line index keyed `id` that parses under the node
@@ -567,111 +534,17 @@ pub(super) fn rewrite_vlt_lock(
     }
 }
 
-// ── revert ───────────────────────────────────────────────────────────────
-
-fn slot_value(entry: &NodeEntry<'_>, index: usize) -> Option<Value> {
-    match entry.slot(index) {
-        None | Some("null") => None,
-        Some(raw) => serde_json::from_str(raw).ok(),
-    }
-}
-
-fn same_slots(a: &NodeEntry<'_>, b: &NodeEntry<'_>) -> bool {
-    slot_value(a, 2) == slot_value(b, 2) && slot_value(a, 3) == slot_value(b, 3)
-}
-
-/// The recorded DepID and entries of a [`KIND`] edit.
-fn recorded(edit: &FileEdit) -> Result<(NodeEntry<'_>, NodeEntry<'_>), String> {
-    fn fragment(v: &Option<Value>) -> Option<&str> {
-        v.as_ref().and_then(Value::as_str)
-    }
-    let (Some(original), Some(new)) = (fragment(&edit.original), fragment(&edit.new)) else {
-        return Err(format!("{KIND} edit is missing its recorded fragments"));
-    };
-    let (Some(original), Some(new)) = (parse_node_entry_text(original), parse_node_entry_text(new))
-    else {
-        return Err(format!(
-            "{KIND} edit records fragments that are not vlt node entries"
-        ));
-    };
-    if original.key != new.key {
-        return Err(format!("{KIND} edit records two different DepIDs"));
-    }
-    Ok((original, new))
-}
-
-/// The nodes-section lines of `text` that hold `new`'s pin under another
-/// DepID: default-registry instances of the same `name@version` whose
-/// slots [2] and [3] are exactly `new`'s.
-fn carried_pin_lines(text: &str, lines: &[&str], new: &NodeEntry<'_>) -> Vec<usize> {
-    let Some(recorded_id) = split_dep_id(new.key) else {
-        return Vec::new();
-    };
-    let Some(identity) = recorded_id.registry_identity() else {
-        return Vec::new();
-    };
-    let LockSniff::Readable(lock) = sniff_lock(text) else {
-        return Vec::new();
-    };
-    let Some(span) = nodes_block(lines) else {
-        return Vec::new();
-    };
-    span.entry_lines()
-        .filter(|&i| {
-            parse_node_line(lines[i]).is_some_and(|line| {
-                line.entry.key != new.key
-                    && split_dep_id(line.entry.key).is_some_and(|id| {
-                        id.registry_identity() == Some(identity)
-                            && is_default_registry(&id.first, lock.options())
-                    })
-                    && same_slots(&line.entry, new)
-            })
-        })
-        .collect()
-}
-
-/// The DepIDs (with their slot [0] flags) a [`KIND`] edit's pin moved to
-/// when vlt re-keyed its node: empty while `text` still holds the recorded
-/// DepID.
-pub(crate) fn carried_pin_ids(text: &str, edit: &FileEdit) -> Vec<(String, Option<u64>)> {
-    let Ok((_, new)) = recorded(edit) else {
-        return Vec::new();
-    };
-    let lines = split_lines(text);
-    let prefix = format!("    \"{}\": ", new.key);
-    if lines.iter().any(|l| l.starts_with(prefix.as_str())) {
-        return Vec::new();
-    }
-    carried_pin_lines(text, &lines, &new)
-        .into_iter()
-        .filter_map(|i| parse_node_line(lines[i]))
-        .map(|l| (l.entry.key.to_string(), l.entry.elems[0].parse().ok()))
-        .collect()
-}
-
-/// The `original` a fresh edit takes when it supersedes `old`, a recorded
-/// edit whose DepID vanished, if vlt carried `old`'s pin to the fresh
-/// DepID: the fresh entry is then Socket's, not the registry's, so it gets
-/// `old`'s pristine slots back. `None` when the fresh entry is not `old`'s
-/// pin (a re-lock that dropped it already left the pristine entry).
-pub fn carried_pin_original(fresh: &FileEdit, old: &FileEdit) -> Option<Value> {
-    let fresh_original = parse_node_entry_text(fresh.original.as_ref()?.as_str()?)?;
-    let (old_original, old_new) = recorded(old).ok()?;
-    if !same_slots(&fresh_original, &old_new) {
-        return None;
-    }
-    let tuple = render_tuple_with_slots(
-        &fresh_original.elems,
-        has_brotli_flag(old_original.elems[0]),
-        old_original.slot(2).filter(|s| *s != "null"),
-        old_original.slot(3).filter(|s| *s != "null"),
-    );
-    Some(Value::String(entry_text(fresh_original.key, &tuple)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rewriter's lock-level refusal alone. An absent lock passes.
+    fn lock_level_refusal(files: &BTreeMap<String, String>) -> Result<(), RewriteWarning> {
+        match files.get(VLT_LOCK) {
+            Some(text) => parse_hosted_lock(text).map(|_| ()),
+            None => Ok(()),
+        }
+    }
 
     const SHA: &str = "sha512-PATCHED==";
     const URL: &str = "https://patch.socket.dev/patch/npm/t/u/left-pad-1.3.0.tgz";
@@ -721,17 +594,6 @@ mod tests {
 
     fn codes(result: &RewriteResult) -> Vec<&str> {
         result.warnings.iter().map(|w| w.code.as_str()).collect()
-    }
-
-    fn vlt_edit(original: &str, new: &str) -> FileEdit {
-        FileEdit {
-            path: VLT_LOCK.into(),
-            kind: KIND.into(),
-            action: "rewritten".into(),
-            key: Some("left-pad@1.3.0".into()),
-            original: Some(Value::String(original.into())),
-            new: Some(Value::String(new.into())),
-        }
     }
 
     const ID: &str = "~npm~left-pad@1.3.0";
@@ -814,6 +676,28 @@ mod tests {
         )));
     }
 
+    /// `vlt.json`'s `modifiers` probe reads past exactly one leading BOM
+    /// (`formats::text::strip_bom`): a second one is content, so the file
+    /// is not JSON and declares nothing.
+    #[test]
+    fn modifiers_probe_reads_past_one_vlt_json_bom_only() {
+        let lock = "{\n  \"lockfileVersion\": 0,\n  \"options\": {},\n  \"nodes\": {\n    \"··left-pad@1.3.0\": [0,\"left-pad\",\"sha512-REGISTRY==\"]\n  },\n  \"edges\": {}\n}\n";
+        let old_lockfile = |config: &str| {
+            let mut result = RewriteResult::default();
+            rewrite_vlt_lock(
+                &files(&[(VLT_LOCK, lock), (VLT_CONFIG, config)]),
+                &[dep("left-pad", "1.3.0", Some(SHA))],
+                false,
+                &mut result,
+            );
+            codes(&result).contains(&"redirect_vlt_old_lockfile_ignored")
+        };
+        assert!(!old_lockfile("{\"modifiers\": {}}"));
+        assert!(!old_lockfile("\u{feff}{\"modifiers\": {}}"));
+        assert!(old_lockfile("\u{feff}\u{feff}{\"modifiers\": {}}"));
+        assert!(old_lockfile("{}"));
+    }
+
     #[test]
     fn ledger_keys_carry_the_raw_extra_after_a_tilde() {
         let lock = lock_with(&[
@@ -837,26 +721,7 @@ mod tests {
                 "left-pad@1.3.0",
             ]
         );
-        for key in keys {
-            assert!(claims_key(key, "left-pad", "1.3.0"), "{key}");
-        }
         assert!(result.confirmed_vlt_uuids.contains("uuid-left-pad"));
-    }
-
-    #[test]
-    fn claims_stop_at_the_version_boundary() {
-        assert!(claims_key("@s/p@1.0.0", "@s/p", "1.0.0"));
-        assert!(claims_key("@s/p@1.0.0~peer.1", "@s/p", "1.0.0"));
-        for foreign in [
-            "left-pad@1.3.01",
-            "left-pad@1.3.0-rc.1",
-            "left-pad@1.3.0(peer)",
-            "left-pad@1.3.0_x",
-            "long-left-pad@1.3.0",
-            "left-pad@1.3",
-        ] {
-            assert!(!claims_key(foreign, "left-pad", "1.3.0"), "{foreign}");
-        }
     }
 
     #[test]
@@ -901,7 +766,7 @@ mod tests {
     #[test]
     fn lock_level_parse_refusals() {
         let refused = |text: &str| {
-            preflight_vlt_hosted(&files(&[(VLT_LOCK, text)]))
+            lock_level_refusal(&files(&[(VLT_LOCK, text)]))
                 .unwrap_err()
                 .detail
         };
@@ -912,10 +777,10 @@ mod tests {
             "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n    \"{ID}\": [\n      0,\n      \"left-pad\"\n    ]\n  }}\n}}\n"
         );
         assert!(refused(&pretty).contains("canonical layout"));
-        assert!(preflight_vlt_hosted(&files(&[])).is_ok());
-        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, "{\"nodes\": {}}")])).is_ok());
+        assert!(lock_level_refusal(&files(&[])).is_ok());
+        assert!(lock_level_refusal(&files(&[(VLT_LOCK, "{\"nodes\": {}}")])).is_ok());
         let ok = lock_with(&[&registry_entry()]);
-        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, &ok)])).is_ok());
+        assert!(lock_level_refusal(&files(&[(VLT_LOCK, &ok)])).is_ok());
     }
 
     #[test]
@@ -956,31 +821,6 @@ mod tests {
         assert!(result.warnings.is_empty());
     }
 
-    #[test]
-    fn a_superseding_edit_keeps_the_pristine_slots_of_a_carried_pin() {
-        let old_id = "~npm~left-pad@1.3.0~peer.1";
-        let new_id = "~npm~left-pad@1.3.0~peer.2";
-        let old = vlt_edit(
-            &format!("\"{old_id}\": [0,\"left-pad\",\"{REG_SHA}\"]"),
-            &format!("\"{old_id}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
-        );
-        let carried = vlt_edit(
-            &format!("\"{new_id}\": [1,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
-            &format!("\"{new_id}\": [1,\"left-pad\",\"sha512-P2==\",\"u2\"]"),
-        );
-        assert_eq!(
-            carried_pin_original(&carried, &old),
-            Some(Value::String(format!(
-                "\"{new_id}\": [1,\"left-pad\",\"{REG_SHA}\"]"
-            )))
-        );
-        let relocked = vlt_edit(
-            &format!("\"{new_id}\": [1,\"left-pad\",\"{REG_SHA}\"]"),
-            &format!("\"{new_id}\": [1,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
-        );
-        assert_eq!(carried_pin_original(&relocked, &old), None);
-    }
-
     /// #372: vlt 1.3 records the brotli bit (4) on a node that resolved
     /// the registry's `.tar.br` alternate. Such a lock is canonical; the
     /// pin points the node at the hosted `.tgz`, so it clears bit 4 (and
@@ -994,7 +834,7 @@ mod tests {
             &format!("\"{peer}\": [6,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"),
             "\"~npm~other@1.0.0\": [5,\"other\",\"sha512-O==\"]",
         ]);
-        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, &lock)])).is_ok());
+        assert!(lock_level_refusal(&files(&[(VLT_LOCK, &lock)])).is_ok());
 
         let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
         assert!(codes(&result).is_empty(), "{:?}", result.warnings);
@@ -1011,22 +851,5 @@ mod tests {
         // A re-run over its own pin is a no-op.
         let again = rewrite(written, &[dep("left-pad", "1.3.0", Some(SHA))]);
         assert!(again.edits.is_empty(), "{:?}", again.edits);
-
-        // Superseding a carried brotli pin restores the brotli bit with
-        // the pristine `.tar.br` slots.
-        let old = vlt_edit(
-            &format!("\"{peer}\": [6,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"),
-            &format!("\"{peer}\": [2,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
-        );
-        let carried = vlt_edit(
-            &format!("\"{ID}\": [2,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
-            &format!("\"{ID}\": [2,\"left-pad\",\"sha512-P2==\",\"u2\"]"),
-        );
-        assert_eq!(
-            carried_pin_original(&carried, &old),
-            Some(Value::String(format!(
-                "\"{ID}\": [6,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"
-            )))
-        );
     }
 }

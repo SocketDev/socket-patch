@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
+use crate::patch::apply::{normalize_file_path, ApplyResult};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::utils::fs::atomic_write_bytes;
 
@@ -34,10 +34,7 @@ use super::common::{already_patched_result, refused, service_offline_conflict};
 use super::npm_common::{
     declares_bundled_deps, done_failure, done_failure_unstage, guard_coordinates,
 };
-use super::service_fetch::{
-    fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal,
-};
-use super::source::PackageSource;
+use super::service_fetch::{fetch_verified_archive, ServicePolicy};
 use super::state::VENDOR_MARKER_FILE;
 use super::vlt_lock_text::vendored_dir_rel;
 use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
@@ -183,7 +180,7 @@ fn object_members(text: &str, open: usize) -> Option<Vec<JsonMember>> {
 /// The top-level members of a JSON object document (a leading BOM is kept
 /// out of the offsets' way, never stripped from the text).
 pub(crate) fn root_members(text: &str) -> Option<Vec<JsonMember>> {
-    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let body = crate::formats::text::strip_bom(text);
     serde_json::from_str::<serde_json::Map<String, Value>>(body).ok()?;
     let open = skip_ws(text.as_bytes(), text.len() - body.len());
     object_members(text, open)
@@ -508,6 +505,20 @@ fn gitignored_refusal(rel_dir: &str, rules: &str) -> VendorOutcome {
     refused(GITIGNORED, gitignored_detail(rel_dir, rules))
 }
 
+/// The `vendor_artifact_gitignored` refusal (code, detail) for a vendored
+/// artifact root (`dir_rel`, project-relative) that git ignores as a
+/// directory: a `.socket/` or `.socket/vendor/` rule no `.gitignore` inside
+/// the root can override (#831, #1061). `None` when git would look inside
+/// it, so the root's own `!*` `.gitignore` re-includes file rules such as
+/// `*.jar`.
+pub(crate) async fn ignored_root_refusal(
+    project_root: &Path,
+    dir_rel: &str,
+) -> Option<(&'static str, String)> {
+    let rules = gitignored(project_root, &[format!("{dir_rel}/")]).await?;
+    Some((GITIGNORED, gitignored_detail(dir_rel, &rules)))
+}
+
 pub(crate) const GITIGNORED: &str = "vendor_artifact_gitignored";
 
 /// The vendored dir was written, but git could not say whether it would
@@ -530,20 +541,15 @@ pub(crate) fn gitignored_detail(rel: &str, rules: &str) -> String {
 
 // ── pipeline ─────────────────────────────────────────────────────────────
 
-/// Reuse the committed dir, else build it from the patch
-/// service or the installed copy, then write it into place. Same result
+/// Reuse a verified committed directory, or acquire one from the patch service. Same result
 /// shape as [`super::npm_common::stage_patch_pack`]: `Err` is a refusal or
 /// a failure with the project untouched, `Ok((None, _))` a failed patch or
 /// a dry run, `Ok((Some(dir), _))` the artifact on disk.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_dir(
     purl: &str,
-    _installed_dir: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
-    _sources: &PatchSources<'_>,
     dry_run: bool,
-    _force: bool,
     warnings: &mut Vec<VendorWarning>,
     service: Option<&VendorServiceConfig>,
 ) -> Result<(Option<NpmStagedDir>, ApplyResult), Box<VendorOutcome>> {
@@ -556,7 +562,6 @@ pub(super) async fn stage_patch_dir(
         .keys()
         .any(|k| normalize_file_path(k) == "package.json");
 
-    let reusable = false;
     match super::reuse::reusable_committed_dir(project_root, record, &rel_dir).await {
         Ok(inventory) => {
             if !dry_run {
@@ -589,7 +594,7 @@ pub(super) async fn stage_patch_dir(
         Err(miss) => super::reuse::log_miss(purl, &miss),
     }
 
-    if let Some(refusal) = service_offline_conflict(service).filter(|_| !reusable) {
+    if let Some(refusal) = service_offline_conflict(service) {
         return Err(Box::new(refusal));
     }
 
@@ -600,33 +605,22 @@ pub(super) async fn stage_patch_dir(
         ))
     })?;
     let stage = stage_tmp.path().join("stage");
-    let mut result = None;
-    if let Some(cfg) = service.filter(|cfg| cfg.service_enabled()) {
-        match try_service_dir(
-            purl,
-            record,
-            cfg,
-            &stage,
-            &coords.name,
-            &coords.version,
-            warnings,
-        )
-        .await
-        {
-            ServiceDir::Used(()) => {
-                result = Some(already_patched_result(purl, &rel_abs, &record.files));
-            }
-            ServiceDir::HardFail(outcome) => return Err(outcome),
-        }
-    }
-    let result = match result {
-        Some(result) => {
-            prune_staged_node_modules(purl, &stage, &coords.name, &coords.version).await?;
-            apply_transforms(&stage, &coords.name, &coords.version).await?;
-            result
-        }
-        None => return Err(Box::new(super::service_fetch::required())),
-    };
+    let cfg = service
+        .filter(|cfg| cfg.service_enabled())
+        .ok_or_else(|| Box::new(super::service_fetch::required()))?;
+    try_service_dir(
+        purl,
+        record,
+        cfg,
+        &stage,
+        &coords.name,
+        &coords.version,
+        warnings,
+    )
+    .await?;
+    let result = already_patched_result(purl, &rel_abs, &record.files);
+    prune_staged_node_modules(purl, &stage, &coords.name, &coords.version).await?;
+    apply_transforms(&stage, &coords.name, &coords.version).await?;
     if dry_run {
         return Ok((None, result));
     }
@@ -853,8 +847,6 @@ async fn tree_matches_after_hashes(stage: &Path, record: &PatchRecord) -> bool {
     true
 }
 
-type ServiceDir = ServiceAttempt<()>;
-
 /// The service fast path: the prebuilt tarball, integrity- and
 /// afterHash-verified, extracted into `stage` with its first path component
 /// stripped whatever it is called. The fallback policy is the tarball
@@ -867,13 +859,11 @@ pub(super) async fn try_service_dir(
     name: &str,
     version: &str,
     warnings: &mut Vec<VendorWarning>,
-) -> ServiceDir {
-    let policy = ServicePolicy::new(cfg, ServiceTerminal::Failure(purl));
+) -> Result<(), Box<VendorOutcome>> {
+    let policy = ServicePolicy::Failure(purl);
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
-    let archive = match policy.settle(fetched, "artifact", "artifact", warnings) {
-        Ok(archive) => archive,
-        Err(attempt) => return attempt,
-    };
+    let archive = policy.settle(fetched, "artifact", "artifact")?;
+    let downloaded = archive.downloaded_warning(format_args!("{name}@{version}"));
     let (bytes, dest) = (archive.bytes, stage.to_path_buf());
     let extracted = tokio::task::spawn_blocking(move || {
         super::registry_fetch::extract_tgz_strict(&bytes, &dest)
@@ -882,30 +872,20 @@ pub(super) async fn try_service_dir(
     .map_err(|e| e.to_string())
     .and_then(|r| r);
     if let Err(e) = extracted {
-        return policy.hard(
+        return Err(policy.hard(
             "vendor_prebuilt_extract_failed",
             format!("prebuilt tarball for {name}@{version} is unsafe: {e}"),
-        );
+        ));
     }
     if !tree_matches_after_hashes(stage, record).await {
         let _ = remove_tree(stage).await;
-        return policy.miss(
-            warnings,
-            "vendor_prebuilt_layout_mismatch",
-            format!(
-                "prebuilt tarball for {name}@{version} does not carry the patched files \
+        return Err(policy.miss(format!(
+            "prebuilt tarball for {name}@{version} does not carry the patched files \
                  at their recorded paths"
-            ),
-        );
+        )));
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {name}@{version} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
-    ServiceDir::Used(())
+    warnings.push(downloaded);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -946,6 +926,11 @@ mod tests {
             Err(SpanError::Duplicate("devDependencies".into()))
         );
         assert_eq!(strip_dev_dependencies("[1]"), Err(SpanError::NotJson));
+        // A second BOM is content (#905): not a JSON object document.
+        assert_eq!(
+            strip_dev_dependencies("\u{feff}\u{feff}{\"devDependencies\":{}}"),
+            Err(SpanError::NotJson)
+        );
     }
 
     #[test]

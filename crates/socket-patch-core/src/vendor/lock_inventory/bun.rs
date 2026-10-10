@@ -29,17 +29,41 @@ pub(crate) fn bun_text_entries(text: &str) -> Result<Vec<BunEntry>, String> {
 
 // ── file selection ──
 
-/// Whether the project root has a text `bun.lock` (lstat, so a dangling
-/// symlink counts): bun reads it whenever it exists, so the binary
-/// `bun.lockb` beside it is not the live lock. Lockfile discovery answers
-/// the same question with `DiscoverCtx::exists` (the same lstat).
-pub(crate) async fn bun_text_lock_present(root: &Path) -> bool {
-    bun_text_lock_present_in(&ProjectView::Disk(root)).await
+/// Whether bun installs from the text `bun.lock` rather than a binary
+/// `bun.lockb` beside it — the ONE answer every Bun-aware path routes
+/// through (inventory, hosted, vendored, GC, repair, lockfile discovery).
+///
+/// Bun opens `bun.lock` following symlinks and falls back to `bun.lockb`
+/// only when that open fails with ENOENT, so this is `stat`, not `lstat`,
+/// and only `NotFound` means absent: a dangling link leaves the binary
+/// lock live (#735). An open that fails with anything but ENOENT — a
+/// self-referencing link (ELOOP), a link through a regular file
+/// (ENOTDIR), a link into an unreadable directory (EACCES) — shadows the
+/// binary lock just like an entry bun finds but cannot read (a directory,
+/// a FIFO): bun then ignores BOTH locks ("Ignoring lockfile"), so the
+/// text lock is chosen and its guarded read refuses rather than wiring a
+/// `bun.lockb` bun would not install from. (Bun 1.2.23 and 1.3.14,
+/// `bun install --frozen-lockfile`.) An in-memory link has no target to
+/// follow, so it keeps shadowing.
+pub fn bun_text_lock_drives(view: &ProjectView<'_>) -> bool {
+    match view {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let root = view
+                .disk_root_reading([BUN_LOCK])
+                .expect("a disk view has a root");
+            match std::fs::metadata(root.join(BUN_LOCK)) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            }
+        }
+        ProjectView::Memory(project) => project.contains(BUN_LOCK) || project.is_dir(BUN_LOCK),
+    }
 }
 
-/// [`bun_text_lock_present`] over a [`ProjectView`].
-pub(crate) async fn bun_text_lock_present_in(view: &ProjectView<'_>) -> bool {
-    view.exists_no_follow(BUN_LOCK).await
+/// Whether the binary `bun.lockb` is the lock bun installs from: present,
+/// and not shadowed by [`bun_text_lock_drives`].
+pub fn bun_binary_lock_drives(root: &Path) -> bool {
+    !bun_text_lock_drives(&ProjectView::Disk(root)) && root.join(BUN_LOCKB).exists()
 }
 
 // ── registry view ──

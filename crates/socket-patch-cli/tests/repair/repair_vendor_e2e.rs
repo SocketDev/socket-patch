@@ -9,6 +9,8 @@
 //! empty-wiring revert refusal. Their fixture pair is hand-written, modeled
 //! byte-for-byte on real `bundle lock` output (bundler 4.0.15).
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -18,10 +20,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::npm_e2e_common;
 use crate::vex_e2e_common;
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const PURL: &str = "pkg:npm/left-pad@1.3.0";
@@ -29,14 +27,6 @@ const ENCODED: &str = "pkg%3Anpm%2Fleft-pad%401.3.0";
 const BEFORE: &[u8] = b"before\n";
 const AFTER: &[u8] = b"after\n";
 const AFTER_B64: &str = "YWZ0ZXIK";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -210,10 +200,10 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
     )
 }
 
-/// `scan --vendor --yes` to establish a vendored project; returns the
+/// `scan --mode vendored --yes` to establish a vendored project; returns the
 /// vendored tarball path.
 fn vendor_project(root: &Path, mock_uri: &str, extra: &[&str]) -> PathBuf {
-    let mut argv = vec!["scan", "--vendor", "--yes"];
+    let mut argv = vec!["scan", "--mode", "vendored", "--yes"];
     argv.extend_from_slice(extra);
     let (code, stdout, stderr) = run_cli(root, mock_uri, &argv);
     assert_eq!(code, 0, "vendor setup failed: {stdout} {stderr}");
@@ -937,9 +927,9 @@ fn add_healthy_cargo_dir_entry(root: &Path) -> PathBuf {
     dir
 }
 
-/// `scan --vendor --yes` the gem fixture; returns the vendored copy dir.
+/// `scan --mode vendored --yes` the gem fixture; returns the vendored copy dir.
 fn vendor_gem_project(root: &Path, mock_uri: &str) -> PathBuf {
-    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--vendor", "--yes"]);
+    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--mode", "vendored", "--yes"]);
     assert_eq!(code, 0, "gem vendor setup failed: {stdout} {stderr}");
     let copy = root.join(gem_copy_rel());
     assert_eq!(

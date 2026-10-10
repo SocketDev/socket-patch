@@ -57,7 +57,7 @@ fn assert_error_envelope(v: &serde_json::Value, needle: &str) {
         v["status"], "error",
         "expected status=error envelope, got: {v}"
     );
-    let msg = v["error"]
+    let msg = v["error"]["message"]
         .as_str()
         .unwrap_or_else(|| panic!("error field must be a string, got: {v}"));
     assert!(!msg.is_empty(), "error message must not be empty: {v}");
@@ -510,13 +510,7 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
     .unwrap();
 
     let out = crate::common::hermetic_command(&binary())
-        .args([
-            "repair",
-            "--json",
-            "--download-mode",
-            "file",
-            "--download-only",
-        ])
+        .args(["repair", "--json", "--download-only"])
         .current_dir(tmp.path())
         .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token")

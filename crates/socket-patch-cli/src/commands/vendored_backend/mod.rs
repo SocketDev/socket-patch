@@ -16,13 +16,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::utils::group_commit::CommittedFile;
 use socket_patch_core::vendor::{
     save_state, RevertOpts, VendorServiceConfig, VendorState, VendorWarning,
 };
 
 use crate::args::GlobalArgs;
-use crate::commands::vendor::{dispatch_revert_one_opts, vendor_records_reusing};
+use crate::commands::vendor::{dispatch_revert_one_opts, vendor_records_reusing, EjectCapture};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::Envelope;
 
@@ -48,9 +47,12 @@ pub(crate) struct ApplyRequest<'a> {
     /// The npm half of a crawl this process already made over an untouched
     /// tree (see [`vendor_records_reusing`]).
     pub(crate) prior: Option<&'a NpmCrawlSnapshot>,
-    /// Receives every project file the run's group commit wrote, with the
-    /// bytes it held before (the eject's rollback undoes exactly these).
-    pub(crate) committed: Option<&'a mut Vec<CommittedFile>>,
+    /// The hosted→vendored eject's hand-back: every project file the run's
+    /// group commit wrote, with the bytes it held before (the eject's
+    /// rollback undoes exactly these), and the wired flavors. With it, the
+    /// run's human summary and "Next steps:" are left to the eject, which
+    /// prints them only once it knows the eject stands.
+    pub(crate) eject: Option<&'a mut EjectCapture>,
 }
 
 impl<'a> VendoredBackend<'a> {
@@ -71,7 +73,6 @@ impl<'a> VendoredBackend<'a> {
         let blobs = req.socket_dir.join("blobs");
         let sources = socket_patch_core::patch::apply::PatchSources {
             blobs_path: &blobs,
-            diffs_path: None,
             mem_blobs: None,
         };
         let records = &req.manifest.patches;
@@ -85,7 +86,7 @@ impl<'a> VendoredBackend<'a> {
             self.service,
             req.ledger,
             req.prior,
-            req.committed,
+            req.eject,
         ))
         .await
     }
@@ -107,11 +108,30 @@ impl<'a> VendoredBackend<'a> {
         for key in keys {
             // Captured before a clean revert drops the entry.
             let flavor = state.entries.get(key).and_then(|e| e.flavor.clone());
-            let result = revert_vendor_entry(&self.common.cwd, key, state, opts).await;
+            let mut result = revert_vendor_entry(&self.common.cwd, key, state, opts).await;
             let hard_failure = matches!(
                 result.step,
                 VendorRevertStep::Failed(_) | VendorRevertStep::LedgerWriteFailed(_)
             );
+            // The wiring is back on the registry while the installed tree
+            // may still hold the vendored build, which PDM, uv and Pipenv
+            // keep through a plain sync (#477): name the reinstall.
+            let unwired = matches!(
+                result.step,
+                VendorRevertStep::WouldRevert
+                    | VendorRevertStep::Reverted
+                    | VendorRevertStep::Preserved
+                    | VendorRevertStep::LedgerWriteFailed(_)
+            );
+            if unwired {
+                crate::commands::pypi_reinstall::push_vendor_advisory(
+                    &self.common.cwd,
+                    key,
+                    flavor.as_deref(),
+                    &mut result.warnings,
+                )
+                .await;
+            }
             out.push(RevertedEntry {
                 key: key.clone(),
                 flavor,
@@ -146,10 +166,10 @@ pub(crate) enum VendorRevertStep {
     Missing,
     /// The backend refused; nothing changed for this entry.
     Failed(String),
-    /// Drift-keep: the lock changed under us and the backend left both the
-    /// wiring and the artifact alone. Per `RevertOutcome`'s contract the
-    /// ledger entry — and any manifest record — must survive.
-    Kept,
+    /// The backend kept the artifact (see [`KeepCause`]). Per
+    /// `RevertOutcome`'s contract the ledger entry — and any manifest
+    /// record — must survive.
+    Kept(KeepCause),
     /// Dry run: the revert (or, with `keep_artifact`, the unwire) would
     /// succeed. Nothing changed.
     WouldRevert,
@@ -164,6 +184,46 @@ pub(crate) enum VendorRevertStep {
     /// Reverted on disk and dropped from the in-memory ledger, but the
     /// ledger write failed.
     LedgerWriteFailed(String),
+}
+
+/// Why a vendored revert kept the artifact and ledger entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum KeepCause {
+    /// Drift-keep: the lock changed under us and the backend left both
+    /// the wiring and the artifact alone.
+    Drift,
+    /// The recorded wiring was restored, but another project file (an
+    /// exported requirements file) still installs from the artifact
+    /// (`vendor_revert_residual_reference`, #1184). Nothing drifted: the
+    /// way out is to point that file back at the registry release.
+    Reference,
+}
+
+impl KeepCause {
+    /// The per-entry reason, after "`<what>` kept".
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            KeepCause::Drift => "lockfile wiring drifted",
+            KeepCause::Reference => {
+                "a project file still installs from the vendored artifact (see \
+                 vendor_revert_residual_reference); the recorded wiring was restored"
+            }
+        }
+    }
+
+    /// The remedy that finishes the unwind, for `then` (the command to
+    /// re-run).
+    pub(crate) fn remedy(self, then: &str) -> String {
+        match self {
+            KeepCause::Drift => {
+                format!("re-run `scan --mode vendored` to normalize, then {then}")
+            }
+            KeepCause::Reference => format!(
+                "point the file named by vendor_revert_residual_reference back at the \
+                 registry release (or re-export it from the restored lock), then {then}"
+            ),
+        }
+    }
 }
 
 pub(crate) struct VendorRevertResult {
@@ -188,7 +248,11 @@ pub(crate) async fn revert_vendor_entry(
     let step = if !outcome.success {
         VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
     } else if outcome.kept_artifact {
-        VendorRevertStep::Kept
+        VendorRevertStep::Kept(if outcome.kept_for_residual_reference() {
+            KeepCause::Reference
+        } else {
+            KeepCause::Drift
+        })
     } else if opts.dry_run {
         VendorRevertStep::WouldRevert
     } else if opts.keep_artifact {

@@ -33,16 +33,22 @@ use super::{
     OWNED_FILE_KIND, SETTINGS_FRAGMENT_KIND, VERIFICATION_FRAGMENT_KIND,
 };
 
-pub use super::safe_coordinates;
+use super::layout::{self, safe_coordinates};
+use crate::formats::text::{split_bom, strip_bom};
+use crate::formats::xml::{self, Element};
+use crate::utils::line_endings;
 
 /// The owned settings script. Its bytes change only with a CLI release.
 pub const SCRIPT: &str = include_str!("socket-patch.settings.gradle");
 /// Where [`SCRIPT`] lives, project-relative.
 pub const SCRIPT_REL: &str = ".socket/gradle/socket-patch.settings.gradle";
 /// The Gradle-only artifact tree root.
-pub const TREE_ROOT: &str = ".socket/vendor/gradle";
+use super::layout::GRADLE_TREE as TREE_ROOT;
 /// The tree root's `.gitattributes`, shared by every Gradle patch.
 pub const GITATTRIBUTES_REL: &str = ".socket/vendor/gradle/.gitattributes";
+/// The tree root's `.gitignore` (`!*`): re-includes the vendored jars
+/// against a user's `*.jar` rule (Java.gitignore), #620 / #1061.
+pub const GITIGNORE_REL: &str = ".socket/vendor/gradle/.gitignore";
 /// `.socket/gradle/`'s `.gitattributes` (`* -text`): the settings scripts
 /// there stay byte-exact on a `core.autocrlf` checkout (#429). Shared with
 /// the hosted script.
@@ -59,7 +65,7 @@ const HOSTED_SCRIPT_REL: &str = ".socket/gradle/socket-patch.hosted.settings.gra
 pub const INDEX_REL: &str = ".socket/vendor/gradle-index.tsv";
 pub const INDEX_HEADER: &str = "#socket-patch-gradle-index 1";
 pub const VERIFICATION_REL: &str = "gradle/verification-metadata.xml";
-pub const MARKER_NAME: &str = "socket-patch.vendor.json";
+use super::layout::MARKER_FILE as MARKER_NAME;
 /// Repository name shared by the script and the in-block entry: the script
 /// skips a handler that already holds it.
 const REPO_NAME: &str = "socketPatchVendor";
@@ -109,19 +115,14 @@ impl WiringTarget {
 
 /// The tree directory of `c` (same GAV).
 pub fn tree_dir(c: &Coords<'_>) -> String {
-    format!(
-        "{TREE_ROOT}/{}/{}/{}",
-        c.group_path(),
-        c.artifact_id,
-        c.version
-    )
+    c.tree_dir(TREE_ROOT, c.version)
 }
 
 /// The derived artifact-level `maven-metadata.xml` of `group:artifact`.
 pub fn derived_metadata_rel(group_id: &str, artifact_id: &str) -> String {
     format!(
         "{TREE_ROOT}/{}/{artifact_id}/{METADATA_NAME}",
-        group_id.replace('.', "/")
+        layout::group_path(group_id)
     )
 }
 
@@ -513,6 +514,12 @@ pub fn plan(
     records.push(created_or_adopted(SCRIPT_REL, read(SCRIPT_REL).is_some()));
     writes.push(text_write(SCRIPT_REL, SCRIPT.as_bytes().to_vec()));
     records.push(owned_file(read, GITATTRIBUTES_REL, &mut writes));
+    records.push(super::owned_file_with(
+        read,
+        GITIGNORE_REL,
+        super::coursier_tree::GITIGNORE.as_bytes(),
+        &mut writes,
+    ));
     records.push(owned_file(read, SCRIPT_GITATTRIBUTES_REL, &mut writes));
     records.push(vendor_gitattributes(read, &mut writes));
 
@@ -552,7 +559,7 @@ pub fn plan(
                 Some(&text[start..end]).filter(|f| !f.contains("origin=\"socket-patch\""));
             let mut replacement = replacement;
             if text[start..end].starts_with("<components") && text[start..end].ends_with("/>") {
-                let nl = newline_of(&text);
+                let nl = line_endings::terminator(&text);
                 let indent = line_indent(&text, start);
                 let shell = format!("<components>{nl}{indent}</components>");
                 records.pop();
@@ -912,7 +919,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
     let in_block_key = format!("in_block:{}:{}:{}", c.group_id, c.artifact_id, c.version);
     for (rel, text) in after.iter_mut() {
         let Some(t) = text.as_mut() else { continue };
-        if !is_settings_file(rel) {
+        if !layout::is_gradle_settings(rel) {
             continue;
         }
         let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
@@ -966,11 +973,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         // elements span lines in the file's vendor-time newline, and a
         // `core.autocrlf` checkout converts the whole file.
         let holds_to = |t: &str| {
-            t.contains(to)
-                || t.contains(&crate::gradle::eol::apply_eol(
-                    to,
-                    crate::gradle::eol::sniff_crlf(t.as_bytes()),
-                ))
+            t.contains(to) || t.contains(&line_endings::respell(to, line_endings::terminator(t)))
         };
         let Some(from) = op_str(w, "from") else {
             if holds_to(t) {
@@ -1041,7 +1044,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
     if others.is_empty() {
         after.insert(INDEX_REL.to_string(), None);
         for (rel, text) in after.iter_mut() {
-            if !is_settings_file(rel) {
+            if !layout::is_gradle_settings(rel) {
                 continue;
             }
             for w in recs(rel)
@@ -1050,8 +1053,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
             {
                 let Some(t) = text.as_deref() else { break };
                 let written = op_str(w, "text").unwrap_or_default();
-                let crlf = crate::gradle::eol::sniff_crlf(t.as_bytes());
-                let written_here = crate::gradle::eol::apply_eol(written, crlf);
+                let written_here = line_endings::respell(written, line_endings::terminator(t));
                 *text = match op_of(w) {
                     "create" if is_ours(Some(t.as_bytes()), written) => None,
                     "create" => {
@@ -1078,6 +1080,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         for (rel, expected) in [
             (SCRIPT_REL, SCRIPT),
             (GITATTRIBUTES_REL, super::TREE_GITATTRIBUTES),
+            (GITIGNORE_REL, super::coursier_tree::GITIGNORE),
             (SCRIPT_GITATTRIBUTES_REL, super::TREE_GITATTRIBUTES),
         ] {
             if rel == SCRIPT_GITATTRIBUTES_REL && hosted_left {
@@ -1111,8 +1114,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
                 },
                 ("line", Some(t)) => {
                     let written = op_str(w, "text").unwrap_or_default();
-                    let crlf = crate::gradle::eol::sniff_crlf(t.as_bytes());
-                    let here = crate::gradle::eol::apply_eol(written, crlf);
+                    let here = line_endings::respell(written, line_endings::terminator(t));
                     Some(
                         match t
                             .strip_suffix(here.as_str())
@@ -1161,40 +1163,62 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
 /// `core.autocrlf` checkout of a settings file vendor edited with LF).
 fn undo_replace_eol(text: &str, from: &str, to: &str) -> Option<String> {
     undo_replace(text, from, to).or_else(|| {
-        let crlf = crate::gradle::eol::sniff_crlf(text.as_bytes());
+        let nl = line_endings::terminator(text);
         let (from, to) = (
-            crate::gradle::eol::apply_eol(from, crlf),
-            crate::gradle::eol::apply_eol(to, crlf),
+            line_endings::respell(from, nl),
+            line_endings::respell(to, nl),
         );
         undo_replace(text, &from, &to)
     })
 }
 
 /// Whether the root settings file applies the script and the index lists
-/// `c`'s rows (the wiring revert and peers rely on).
+/// `c`'s rows (the wiring revert and peers rely on). A malformed index or
+/// non-UTF-8 settings file reads as unreferenced here; see
+/// [`references_checked`] for the undecidable verdict.
 pub fn references(read: ReadFn<'_>, c: &Coords<'_>) -> bool {
+    references_checked(read, c).unwrap_or(false)
+}
+
+/// [`references`], `None` when a file it decides by exists but cannot be
+/// parsed (a malformed index, a non-UTF-8 settings file): that proves
+/// nothing absent, so a GC must keep the tree.
+pub fn references_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Option<bool> {
     let gav = format!("{}:{}:{}", c.group_id, c.artifact_id, c.version);
-    let indexed = read(INDEX_REL)
-        .and_then(|b| String::from_utf8(b).ok())
-        .and_then(|index| index_rows(&index))
-        .is_some_and(|rows| {
-            rows.iter().any(|r| {
-                let cols: Vec<&str> = r.split('\t').collect();
-                cols.first() == Some(&gav.as_str()) && cols.get(3) == Some(&c.uuid)
-            })
-        });
-    let wiring = WiringTarget::vendored();
-    let applied = ["settings.gradle", "settings.gradle.kts"]
-        .iter()
-        .any(|rel| {
-            read(rel)
-                .and_then(|b| String::from_utf8(b).ok())
-                .is_some_and(|text| {
-                    let dsl = dsl::dsl_of(rel).unwrap_or(Dsl::Groovy);
-                    has_apply_line(&text, dsl, &wiring, "")
+    let indexed = match read(INDEX_REL) {
+        None => Some(false),
+        Some(bytes) => String::from_utf8(bytes)
+            .ok()
+            .and_then(|index| index_rows(&index))
+            .map(|rows| {
+                rows.iter().any(|r| {
+                    let cols: Vec<&str> = r.split('\t').collect();
+                    cols.first() == Some(&gav.as_str()) && cols.get(3) == Some(&c.uuid)
                 })
-        });
-    indexed && applied
+            }),
+    };
+    let wiring = WiringTarget::vendored();
+    let mut applied = Some(false);
+    for rel in layout::GRADLE_SETTINGS_FILES {
+        let Some(bytes) = read(rel) else {
+            continue;
+        };
+        match String::from_utf8(bytes) {
+            Ok(text) => {
+                let dsl = dsl::dsl_of(rel).unwrap_or(Dsl::Groovy);
+                if has_apply_line(&text, dsl, &wiring, "") {
+                    applied = Some(true);
+                    break;
+                }
+            }
+            Err(_) => applied = None,
+        }
+    }
+    match (indexed, applied) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
 }
 
 /// The liveness proof `vex` needs for this layout: `c` is
@@ -1251,11 +1275,6 @@ pub fn wired_checked(
         }
     }
     Ok(wired(read, list, c))
-}
-
-fn is_settings_file(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    name == "settings.gradle" || name == "settings.gradle.kts"
 }
 
 /// `text` without its first whole line whose trimmed body is `line`.
@@ -1404,14 +1423,7 @@ pub(crate) fn settings_target(
     };
     Ok(Target {
         dir: dir.to_string(),
-        rel: join_rel(
-            dir,
-            if kotlin {
-                "settings.gradle.kts"
-            } else {
-                "settings.gradle"
-            },
-        ),
+        rel: join_rel(dir, layout::GRADLE_SETTINGS_FILES[usize::from(kotlin)]),
         text: None,
         kotlin,
     })
@@ -1423,14 +1435,9 @@ fn read_settings(read: ReadFn<'_>, dir: &str) -> Result<Target, JvmRefusal> {
 
 /// The settings target of `buildSrc`, when the checkout has one.
 pub(crate) fn read_buildsrc(read: ReadFn<'_>) -> Result<Option<Target>, JvmRefusal> {
-    let present = [
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-    ]
-    .iter()
-    .any(|f| read(&format!("buildSrc/{f}")).is_some());
+    let present = layout::GRADLE_ROOT_FILES
+        .iter()
+        .any(|f| read(&format!("buildSrc/{f}")).is_some());
     if !present {
         return Ok(None);
     }
@@ -1462,15 +1469,10 @@ pub(crate) fn apply_line(t: &WiringTarget, kotlin: bool, prefix: &str) -> String
 /// DSL, counts (a user who reformatted the line keeps it, and a trailing
 /// comment such as a digest is ignored); one inside a comment does not.
 pub(crate) fn has_apply_line(text: &str, dsl: Dsl, t: &WiringTarget, prefix: &str) -> bool {
-    apply_line_token(text, dsl, t, prefix).is_some()
-}
-
-/// The `apply` token of the first live apply line of `t`'s script.
-fn apply_line_token(text: &str, dsl: Dsl, t: &WiringTarget, prefix: &str) -> Option<usize> {
     let path = format!("{prefix}{}", t.script_rel);
     let toks = dsl::tokens(text, dsl);
     (0..toks.len())
-        .find(|&i| {
+        .any(|i| {
             if !is_ident(toks.get(i), "apply") {
                 return false;
             }
@@ -1482,36 +1484,12 @@ fn apply_line_token(text: &str, dsl: Dsl, t: &WiringTarget, prefix: &str) -> Opt
                 && (is_punct(toks.get(j + 1), b':') || is_punct(toks.get(j + 1), b'='))
                 && matches!(toks.get(j + 2), Some(Token { tok: Tok::Str { value, .. }, .. }) if *value == path)
         })
-        .map(|i| toks[i].start)
-}
-
-/// `text` without the whole line holding the first live apply line of
-/// `t`'s script (whatever follows it on that line, e.g. an older digest).
-#[allow(dead_code)] // The hosted planner's digest rewrite.
-pub(crate) fn remove_apply_line(
-    text: &str,
-    dsl: Dsl,
-    t: &WiringTarget,
-    prefix: &str,
-) -> Option<String> {
-    let at = apply_line_token(text, dsl, t, prefix)?;
-    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
-    if !text[start..at].trim().is_empty() {
-        return None;
-    }
-    let end = text[at..].find('\n').map_or(text.len(), |i| at + i + 1);
-    Some(format!("{}{}", &text[..start], &text[end..]))
-}
-
-/// The newline the file already uses (CRLF when its first line ends so).
-fn newline_of(text: &str) -> &'static str {
-    crate::gradle::eol::newline_of(text)
 }
 
 fn append_line(text: &str, line: &str) -> String {
-    let nl = newline_of(text);
+    let nl = line_endings::terminator(text);
     let mut out = text.to_string();
-    if !out.is_empty() && !out.ends_with('\n') && out != "\u{feff}" {
+    if !strip_bom(&out).is_empty() && !out.ends_with('\n') {
         out.push_str(nl);
     }
     out.push_str(line);
@@ -1716,7 +1694,7 @@ fn scoped_in_block_entry(
         return InBlock::Unneeded;
     }
     let entry = in_block_line(kotlin, prefix, patch);
-    let nl = newline_of(text);
+    let nl = line_endings::terminator(text);
     let unit = indent_unit(text);
     let Some((pm_name, pm_open, pm_close)) = find_block(&toks, 0, toks.len(), scope) else {
         if scope == "buildscript" {
@@ -1857,7 +1835,7 @@ fn first_statement_offset(text: &str, toks: &[Token]) -> usize {
         }
     }
     // Never in front of a byte-order mark.
-    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let bom = split_bom(text).0.len();
     match toks.get(i) {
         Some(t) => text[..t.start].rfind('\n').map_or(0, |j| j + 1).max(bom),
         None => text.len(),
@@ -1907,25 +1885,8 @@ fn marker_json(patch: &JvmPatch<'_>, files: &[(String, &[u8])]) -> String {
 
 /// Whether an existing index row is one the script would accept.
 fn valid_index_row(row: &str) -> bool {
-    let cols: Vec<&str> = row.split('\t').collect();
-    let [gav, path, sha, uuid] = cols.as_slice() else {
-        return false;
-    };
-    let parts: Vec<&str> = gav.split(':').collect();
-    let [g, a, v] = parts.as_slice() else {
-        return false;
-    };
-    let dir = format!("{}/{a}/{v}/", g.replace('.', "/"));
-    safe_coordinates(g, a, v)
-        && path
-            .strip_prefix(&dir)
-            .is_some_and(|n| n.starts_with(&format!("{a}-{v}")) && !n.contains('/'))
-        && sha.len() == 64
-        && sha
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        && !uuid.is_empty()
-        && !uuid.chars().any(char::is_whitespace)
+    layout::index_row(row)
+        .is_some_and(|[.., uuid]| !uuid.is_empty() && !uuid.chars().any(char::is_whitespace))
 }
 
 /// Merge `rows` for `gav` into the existing index, replacing that GAV's
@@ -2046,31 +2007,27 @@ pub(crate) struct ArtifactHashes {
 /// signatures), so Gradle falls back to these (#487).
 const CHECKSUM_ELEMENTS: [&str; 4] = ["sha256", "sha512", "sha1", "md5"];
 
-/// Whether the artifact element `masked[start..end]` holds a checksum.
-fn has_checksum(masked: &str, start: usize, end: usize) -> bool {
+/// Whether the artifact element `art` of `masked` holds a checksum.
+fn has_checksum(masked: &str, art: &Element) -> bool {
     CHECKSUM_ELEMENTS
         .iter()
-        .any(|name| !xml_elements(masked, start, end, name).is_empty())
+        .any(|name| xml::children(masked, art, name).is_ok_and(|found| !found.is_empty()))
 }
 
-/// The artifact element `text[start..end]` (`tag_end` ends its start tag)
-/// with `<sha256 value=sha origin="socket-patch"/>` added after its other
-/// children, kept otherwise byte for byte.
-fn with_sha256(
-    text: &str,
-    masked: &str,
-    (start, tag_end, end): (usize, usize, usize),
-    sha: &str,
-) -> String {
+/// The artifact element `art` of `text` with `<sha256 value=sha
+/// origin="socket-patch"/>` added after its other children, kept otherwise
+/// byte for byte.
+fn with_sha256(text: &str, masked: &str, art: &Element, sha: &str) -> String {
     const UNIT: &str = "   ";
-    let nl = newline_of(text);
+    let (start, tag_end, end) = (art.start, art.inner_start, art.end);
+    let nl = line_endings::terminator(text);
     let indent = line_indent(text, start);
-    let name = xml_attr(&masked[start..tag_end], "name").unwrap_or_default();
+    let name = xml::attr(art.open_tag(masked), "name").unwrap_or_default();
     if tag_end == end {
         return artifact_element(name, sha, &indent, UNIT, nl);
     }
     let el = format!("<sha256 value=\"{sha}\" origin=\"socket-patch\"/>");
-    let close = end - "</artifact>".len();
+    let close = art.inner_end;
     let at = line_start(text, close);
     if at == close {
         // `</artifact>` follows other content on its line.
@@ -2084,41 +2041,51 @@ fn with_sha256(
     format!("{}{child}{el}{nl}{}", &text[start..at], &text[at..end])
 }
 
+/// `text` blanked for scanning ([`xml::blank_non_markup`]); a file that
+/// cannot be scanned (an unterminated CDATA section) reads as having no
+/// elements.
+fn masked_or_blank(text: &str) -> String {
+    xml::blank_non_markup(text).unwrap_or_default()
+}
+
+/// Every `<name>` element of the blanked `masked` (none when it does not
+/// scan).
+fn top_elements(masked: &str, name: &str) -> Vec<Element> {
+    xml::elements(masked, name).unwrap_or_default()
+}
+
+/// Every `<name>` child of `parent` in the blanked `masked` (none when it
+/// does not scan).
+fn child_elements(masked: &str, parent: &Element, name: &str) -> Vec<Element> {
+    xml::children(masked, parent, name).unwrap_or_default()
+}
+
 /// Whether Gradle may verify metadata of the vendored pom's parent chain or
 /// imported platforms that the file does not list (read from the file
 /// repository, the pom is parsed before the `.module` redirect). A parent
 /// the file already lists is fine; imports and platforms always warn.
 pub(crate) fn verifies_metadata(verification: &str) -> bool {
-    let masked = mask_xml_comments(verification);
-    !xml_elements(&masked, 0, masked.len(), "verify-metadata")
+    let masked = masked_or_blank(verification);
+    !top_elements(&masked, "verify-metadata")
         .iter()
-        .any(|&(_, tag_end, end)| {
-            end > tag_end && masked[tag_end..end - "</verify-metadata>".len()].trim() == "false"
-        })
+        .any(|e| e.inner(&masked).trim() == "false")
 }
 
 fn unverified_parent_chain(verification: &str, pom: &str, module: Option<&[u8]>) -> bool {
-    let vm = mask_xml_comments(verification);
+    let vm = masked_or_blank(verification);
     if !verifies_metadata(&vm) {
         return false;
     }
-    let masked = mask_xml_comments(pom);
+    let masked = masked_or_blank(pom);
     if masked.contains("<scope>import</scope>")
         || module.is_some_and(|m| String::from_utf8_lossy(m).contains("\"platform\""))
     {
         return true;
     }
-    let Some(&(_, tag_end, end)) = xml_elements(&masked, 0, masked.len(), "parent").first() else {
+    let Some(parent) = top_elements(&masked, "parent").into_iter().next() else {
         return false;
     };
-    let child = |name: &str| {
-        let (open, close) = (format!("<{name}>"), format!("</{name}>"));
-        let body = &masked[tag_end..end];
-        let s = body.find(&open)? + open.len();
-        body[s..]
-            .find(&close)
-            .map(|e| body[s..s + e].trim().to_string())
-    };
+    let child = |name: &str| xml::child_text(parent.inner(&masked), name).ok().flatten();
     let (Some(g), Some(a), Some(v)) = (child("groupId"), child("artifactId"), child("version"))
     else {
         return true;
@@ -2126,95 +2093,15 @@ fn unverified_parent_chain(verification: &str, pom: &str, module: Option<&[u8]>)
     // Listed means a checksum for the parent pom: a pgp-only entry cannot
     // verify the copy Gradle reads through the vendored repository.
     let pom = format!("{a}-{v}.pom");
-    !xml_elements(&vm, 0, vm.len(), "component")
-        .iter()
-        .any(|&(s, t, e)| {
-            let tag = &vm[s..t];
-            xml_attr(tag, "group") == Some(g.as_str())
-                && xml_attr(tag, "name") == Some(a.as_str())
-                && xml_attr(tag, "version") == Some(v.as_str())
-                && xml_elements(&vm, t, e, "artifact")
-                    .iter()
-                    .any(|&(as_, at, ae)| {
-                        xml_attr(&vm[as_..at], "name") == Some(pom.as_str())
-                            && has_checksum(&vm, at, ae)
-                    })
-        })
-}
-
-/// `text` with every `<!-- … -->` replaced by spaces (same byte offsets), so
-/// commented-out elements are never matched.
-fn mask_xml_comments(text: &str) -> String {
-    let mut bytes = text.as_bytes().to_vec();
-    let mut from = 0;
-    while let Some(j) = text[from..].find("<!--") {
-        let start = from + j;
-        let end = text[start..]
-            .find("-->")
-            .map_or(text.len(), |k| start + k + 3);
-        for b in &mut bytes[start..end] {
-            if *b != b'\n' && *b != b'\r' {
-                *b = b' ';
-            }
-        }
-        from = end;
-    }
-    String::from_utf8(bytes).unwrap_or_default()
-}
-
-/// The value of attribute `name` in the start tag `tag`.
-fn xml_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let mut rest = tag;
-    loop {
-        let at = rest.find(name)?;
-        let before = rest[..at].chars().last();
-        let after = rest[at + name.len()..].trim_start();
-        rest = &rest[at + name.len()..];
-        if !before.is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let Some(after) = after.strip_prefix('=') else {
-            continue;
-        };
-        let after = after.trim_start();
-        let quote = after.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
-        }
-        let body = &after[1..];
-        return body.find(quote).map(|e| &body[..e]);
-    }
-}
-
-/// Elements named `name` inside `masked[from..to]`: (start, end of start
-/// tag, end of element). Self-closing elements end with their start tag.
-fn xml_elements(masked: &str, from: usize, to: usize, name: &str) -> Vec<(usize, usize, usize)> {
-    let open = format!("<{name}");
-    let close = format!("</{name}>");
-    let mut out = Vec::new();
-    let mut i = from;
-    while let Some(j) = masked[i..to].find(&open) {
-        let s = i + j;
-        let next = masked.as_bytes().get(s + open.len()).copied();
-        if !matches!(next, Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')) {
-            i = s + open.len();
-            continue;
-        }
-        let Some(tag_end) = masked[s..to].find('>').map(|k| s + k + 1) else {
-            break;
-        };
-        let end = if masked[..tag_end].ends_with("/>") {
-            tag_end
-        } else {
-            match masked[tag_end..to].find(&close) {
-                Some(k) => tag_end + k + close.len(),
-                None => break,
-            }
-        };
-        out.push((s, tag_end, end));
-        i = end;
-    }
-    out
+    !top_elements(&vm, "component").iter().any(|comp| {
+        let tag = comp.open_tag(&vm);
+        xml::attr(tag, "group") == Some(g.as_str())
+            && xml::attr(tag, "name") == Some(a.as_str())
+            && xml::attr(tag, "version") == Some(v.as_str())
+            && child_elements(&vm, comp, "artifact").iter().any(|art| {
+                xml::attr(art.open_tag(&vm), "name") == Some(pom.as_str()) && has_checksum(&vm, art)
+            })
+    })
 }
 
 fn artifact_element(name: &str, sha: &str, indent: &str, unit: &str, nl: &str) -> String {
@@ -2294,30 +2181,31 @@ fn verification_artifact_edit(
             format!("{VERIFICATION_REL}: {why}"),
         )
     };
-    let masked = mask_xml_comments(text);
-    let nl = newline_of(text);
+    let masked = xml::blank_non_markup(text).map_err(|why| unparseable(&why))?;
+    let nl = line_endings::terminator(text);
     const UNIT: &str = "   ";
     let (a, v) = (patch.artifact_id, patch.version);
     let jar_name = file_name.to_string();
 
-    let Some(&(cs_start, cs_tag_end, cs_end)) =
-        xml_elements(&masked, 0, masked.len(), "components").first()
+    let Some(components) = xml::elements(&masked, "components")
+        .map_err(|why| unparseable(&why))?
+        .into_iter()
+        .next()
     else {
         return Err(unparseable("no <components> element"));
     };
-    let self_closing = cs_tag_end == cs_end;
-    let comps = if self_closing {
-        Vec::new()
-    } else {
-        xml_elements(&masked, cs_tag_end, cs_end, "component")
-    };
+    let (cs_start, cs_end) = (components.start, components.end);
+    let self_closing = components.inner_start == cs_end;
+    let comps =
+        xml::children(&masked, &components, "component").map_err(|why| unparseable(&why))?;
     let key = (patch.group_id, a, v);
-    for &(s, tag_end, end) in &comps {
-        let tag = &masked[s..tag_end];
+    for comp in &comps {
+        let (s, tag_end, end) = (comp.start, comp.inner_start, comp.end);
+        let tag = comp.open_tag(&masked);
         let (Some(g), Some(n), Some(ver)) = (
-            xml_attr(tag, "group"),
-            xml_attr(tag, "name"),
-            xml_attr(tag, "version"),
+            xml::attr(tag, "group"),
+            xml::attr(tag, "name"),
+            xml::attr(tag, "version"),
         ) else {
             return Err(unparseable("a <component> lacks group, name or version"));
         };
@@ -2327,17 +2215,18 @@ fn verification_artifact_edit(
         if tag_end == end {
             return Err(unparseable("the patched component is empty"));
         }
-        let arts = xml_elements(&masked, tag_end, end, "artifact");
+        let arts = xml::children(&masked, comp, "artifact").map_err(|why| unparseable(&why))?;
         let comp_indent = line_indent(text, s);
-        for &(as_, at_end, ae) in &arts {
-            if xml_attr(&masked[as_..at_end], "name") == Some(jar_name.as_str()) {
+        for art in &arts {
+            let (as_, ae) = (art.start, art.end);
+            if xml::attr(art.open_tag(&masked), "name") == Some(jar_name.as_str()) {
                 if keep_user {
                     // The user's entry is kept; a pgp-only one gets the
                     // checksum Gradle needs for the vendored repository.
-                    if has_checksum(&masked, at_end, ae) {
+                    if has_checksum(&masked, art) {
                         return Ok((as_, ae, text[as_..ae].to_string()));
                     }
-                    let el = with_sha256(text, &masked, (as_, at_end, ae), &h.jar);
+                    let el = with_sha256(text, &masked, art, &h.jar);
                     return Ok((as_, ae, el));
                 }
                 let indent = line_indent(text, as_);
@@ -2350,10 +2239,10 @@ fn verification_artifact_edit(
         let el = artifact_element(&jar_name, &h.jar, &indent, UNIT, nl);
         let before = arts
             .iter()
-            .find(|&&(as_, at_end, _)| {
-                xml_attr(&masked[as_..at_end], "name").is_some_and(|n| n > jar_name.as_str())
+            .find(|art| {
+                xml::attr(art.open_tag(&masked), "name").is_some_and(|n| n > jar_name.as_str())
             })
-            .map(|&(as_, _, _)| as_);
+            .map(|art| art.start);
         let at = before.map_or_else(
             || line_start(text, end - "</component>".len()),
             |as_| line_start(text, as_),
@@ -2364,7 +2253,7 @@ fn verification_artifact_edit(
     let cs_indent = line_indent(text, cs_start);
     let comp_indent = comps.first().map_or_else(
         || format!("{cs_indent}{UNIT}"),
-        |&(s, _, _)| line_indent(text, s),
+        |comp| line_indent(text, comp.start),
     );
     let art_indent = format!("{comp_indent}{UNIT}");
     let mut arts = vec![
@@ -2392,16 +2281,16 @@ fn verification_artifact_edit(
         let el = format!("<components>{nl}{comp}{cs_indent}</components>");
         return Ok((cs_start, cs_end, el));
     }
-    let before = comps.iter().find(|&&(s, tag_end, _)| {
-        let tag = &masked[s..tag_end];
+    let before = comps.iter().find(|comp| {
+        let tag = comp.open_tag(&masked);
         (
-            xml_attr(tag, "group").unwrap_or(""),
-            xml_attr(tag, "name").unwrap_or(""),
-            xml_attr(tag, "version").unwrap_or(""),
+            xml::attr(tag, "group").unwrap_or(""),
+            xml::attr(tag, "name").unwrap_or(""),
+            xml::attr(tag, "version").unwrap_or(""),
         ) > key
     });
     let at = match before {
-        Some(&(s, _, _)) => line_start(text, s),
+        Some(comp) => line_start(text, comp.start),
         None => line_start(text, cs_end - "</components>".len()),
     };
     Ok((at, at, comp))
@@ -2430,7 +2319,7 @@ pub(crate) fn metadata_record_present(text: &str, record: &WiringRecord) -> bool
     if parts.len() != 3 && parts.len() != 4 {
         return false;
     }
-    let masked = mask_xml_comments(text);
+    let masked = masked_or_blank(text);
     let verifies = verifies_metadata(&masked);
     let name = format!(
         "{}-{}.{}",
@@ -2438,45 +2327,35 @@ pub(crate) fn metadata_record_present(text: &str, record: &WiringRecord) -> bool
         parts[2],
         parts.get(3).unwrap_or(&"pom")
     );
-    xml_elements(&masked, 0, masked.len(), "component")
-        .iter()
-        .any(|&(start, tag_end, end)| {
-            let tag = &masked[start..tag_end];
-            if xml_attr(tag, "group") != Some(parts[0])
-                || xml_attr(tag, "name") != Some(parts[1])
-                || xml_attr(tag, "version") != Some(parts[2])
-            {
+    top_elements(&masked, "component").iter().any(|comp| {
+        let tag = comp.open_tag(&masked);
+        if xml::attr(tag, "group") != Some(parts[0])
+            || xml::attr(tag, "name") != Some(parts[1])
+            || xml::attr(tag, "version") != Some(parts[2])
+        {
+            return false;
+        }
+        child_elements(&masked, comp, "artifact").iter().any(|art| {
+            if xml::attr(art.open_tag(&masked), "name") != Some(name.as_str()) {
                 return false;
             }
-            xml_elements(&masked, tag_end, end, "artifact")
-                .iter()
-                .any(|&(s, t, e)| {
-                    if xml_attr(&masked[s..t], "name") != Some(name.as_str()) {
-                        return false;
-                    }
-                    // With metadata verification on, a pgp-only entry fails
-                    // the build (#487): trees vendored before the fix too.
-                    if verifies && !has_checksum(&masked, t, e) {
-                        return false;
-                    }
-                    match op_str(record, "to") {
-                        None => true,
-                        Some(to) => {
-                            xml_elements(to, 0, to.len(), "sha256")
-                                .iter()
-                                .all(|&(hs, ht, _)| {
-                                    xml_attr(&to[hs..ht], "value").is_some_and(|hash| {
-                                        xml_elements(&masked, t, e, "sha256").iter().any(
-                                            |&(cs, ct, _)| {
-                                                xml_attr(&masked[cs..ct], "value") == Some(hash)
-                                            },
-                                        )
-                                    })
-                                })
-                        }
-                    }
-                })
+            // With metadata verification on, a pgp-only entry fails
+            // the build (#487): trees vendored before the fix too.
+            if verifies && !has_checksum(&masked, art) {
+                return false;
+            }
+            match op_str(record, "to") {
+                None => true,
+                Some(to) => top_elements(to, "sha256").iter().all(|wrote| {
+                    xml::attr(wrote.open_tag(to), "value").is_some_and(|hash| {
+                        child_elements(&masked, art, "sha256")
+                            .iter()
+                            .any(|has| xml::attr(has.open_tag(&masked), "value") == Some(hash))
+                    })
+                }),
+            }
         })
+    })
 }
 
 /// Add only missing parent/BOM metadata to an existing verification file.
@@ -2570,6 +2449,25 @@ mod tests {
     const UUID: &str = "5e6f7081-92a3-4b4c-8d5e-6f708192a3b4";
     const GSON_POM: &[u8] =
         b"<project><parent><groupId>com.google.code.gson</groupId><artifactId>gson-parent</artifactId><version>2.10.1</version></parent></project>\n";
+
+    /// `append_line` and `first_statement_offset` treat exactly one
+    /// leading BOM as encoding (`formats::text`): a file holding only a
+    /// BOM gets no separator line, and nothing is inserted in front of it.
+    #[test]
+    fn appended_and_inserted_lines_skip_one_leading_bom() {
+        assert_eq!(append_line("", "x"), "x\n");
+        assert_eq!(append_line("\u{feff}", "x"), "\u{feff}x\n");
+        assert_eq!(append_line("a", "x"), "a\nx\n");
+        assert_eq!(
+            append_line("\u{feff}\u{feff}", "x"),
+            "\u{feff}\u{feff}\nx\n"
+        );
+        let offset = |text: &str| first_statement_offset(text, &dsl::tokens(text, Dsl::Groovy));
+        assert_eq!(offset("plugins {}\n"), 0);
+        assert_eq!(offset("\u{feff}plugins {}\n"), 3);
+        assert_eq!(offset("import a.B\nplugins {}\n"), 11);
+        assert_eq!(offset("\u{feff}import a.B\nplugins {}\n"), 14);
+    }
 
     fn patch() -> JvmPatch<'static> {
         JvmPatch {
@@ -2697,6 +2595,7 @@ mod tests {
                 (".socket/vendor/.gitattributes", false),
                 (".socket/vendor/gradle-index.tsv", false),
                 (".socket/vendor/gradle/.gitattributes", false),
+                (".socket/vendor/gradle/.gitignore", false),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar", true),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/gson-2.10.1.pom", true),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/socket-patch.vendor.json", true),
@@ -2726,6 +2625,7 @@ mod tests {
             text_of(&plan, ".socket/vendor/gradle/.gitattributes"),
             "* -text\n"
         );
+        assert_eq!(text_of(&plan, GITIGNORE_REL), "!*\n");
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
@@ -3464,6 +3364,71 @@ mod tests {
         }
     }
 
+    /// The shared scanner (`formats::xml`) fails closed where the private
+    /// one read up to the damage: an unterminated CDATA section, start tag
+    /// or element refuses the edit instead of planning against a prefix.
+    #[test]
+    fn malformed_verification_markup_is_refused() {
+        for bad in [
+            format!("{VM_HEAD}<![CDATA[ <component> {VM_TAIL}"),
+            format!("{VM_HEAD}      <component group=\"com.google.code.gson\" name=\"gson\" version=\"2.10.1\">\n{VM_TAIL}"),
+            format!("{VM_HEAD}      <component group=\"a\" name=\"b\" version=\"1\"{VM_TAIL}"),
+        ] {
+            let files = fs(&[("settings.gradle", ""), (VERIFICATION_REL, &bad)]);
+            let err = run(&files, &patch()).unwrap_err();
+            assert!(
+                err.detail.starts_with("reason: gradle_verification_unparseable: "),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Markup inside `<![CDATA[ … ]]>` is character data to Gradle's XML
+    /// parser, so no reader treats it as a component, an artifact or a
+    /// parent: the same rule `formats::maven` applies to `pom.xml`.
+    #[test]
+    fn cdata_markup_is_never_an_element() {
+        let hidden = |inner: &str| format!("<![CDATA[{inner}]]>");
+        let listed = vm_component("org.apache", "apache", "27", &[("apache-27.pom", "aa")]);
+        let adopted = adopt(
+            VERIFICATION_REL,
+            VERIFICATION_FRAGMENT_KIND,
+            "metadata:org.apache:apache:27:pom",
+        );
+        let vm = format!("{VM_HEAD}{listed}{VM_TAIL}");
+        assert!(metadata_record_present(&vm, &adopted));
+        let cdata = format!("{VM_HEAD}{}{VM_TAIL}", hidden(&listed));
+        assert!(!metadata_record_present(&cdata, &adopted));
+
+        let parent = "<parent><groupId>org.apache</groupId><artifactId>apache</artifactId><version>27</version></parent>";
+        let pom = format!("<project>{parent}</project>");
+        assert!(!unverified_parent_chain(&vm, &pom, None), "listed parent");
+        assert!(
+            unverified_parent_chain(&cdata, &pom, None),
+            "parent hidden in CDATA is unlisted"
+        );
+        let no_parent = format!(
+            "<project><description>{}</description></project>",
+            hidden(parent)
+        );
+        assert!(
+            !unverified_parent_chain(&cdata, &no_parent, None),
+            "no real parent"
+        );
+
+        let off = format!(
+            "{}{VM_TAIL}",
+            VM_HEAD.replace(
+                "<verify-metadata>true</verify-metadata>",
+                &format!(
+                    "<verify-metadata>false</verify-metadata>{}",
+                    hidden("<verify-metadata>true</verify-metadata>")
+                )
+            )
+        );
+        assert!(!verifies_metadata(&off));
+    }
+
     #[test]
     fn no_verification_file_is_created() {
         let files = fs(&[("settings.gradle", "")]);
@@ -3700,6 +3665,88 @@ mod tests {
         }
     }
 
+    /// The hosted takeover stages a vendored revert in a group that defers
+    /// artifact removals, then either drops the group (`--dry-run`), rolls
+    /// the revert back (a planner-refused, retracted takeover) or commits.
+    /// Only the commit may change the disk: the tree files, the derived
+    /// `maven-metadata.xml` (rewritten while a sibling version stays,
+    /// deleted with the last one) and the owned `.gitattributes` files all
+    /// stay byte-identical until then, and the commit lands exactly the
+    /// plain revert's result.
+    #[tokio::test]
+    async fn a_staged_revert_changes_nothing_until_its_group_commits() {
+        use crate::utils::group_commit::GroupCommit;
+        #[derive(Clone, Copy, Debug)]
+        enum End {
+            Drop,
+            Rollback,
+            Commit,
+        }
+        let sibling = JvmPatch {
+            version: "2.11.0",
+            uuid: UUID_B,
+            ..patch()
+        };
+        let shapes: [&[(&str, &str)]; 2] = [
+            &[("settings.gradle", "rootProject.name = 'x'\n")],
+            &[("settings.gradle", "plugins {\n  id 'x' version '1'\n}\n")],
+        ];
+        for files in shapes {
+            for with_sibling in [false, true] {
+                for end in [End::Drop, End::Rollback, End::Commit] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let root = dir.path();
+                    testing::populate(root, files);
+                    let mut ledger = BTreeMap::new();
+                    testing::vendor(root, Shape::Gradle, &patch(), &mut ledger)
+                        .await
+                        .unwrap();
+                    if with_sibling {
+                        testing::vendor(root, Shape::Gradle, &sibling, &mut ledger)
+                            .await
+                            .unwrap();
+                    }
+                    let (before, before_dirs) = (testing::snapshot(root), testing::dirs(root));
+
+                    // What the plain (unstaged) revert leaves, on a copy.
+                    let expected_dir = tempfile::tempdir().unwrap();
+                    for (rel, bytes) in &before {
+                        let path = expected_dir.path().join(rel);
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(path, bytes).unwrap();
+                    }
+                    let mut expected_ledger = ledger.clone();
+                    let out =
+                        testing::revert(expected_dir.path(), &patch(), &mut expected_ledger).await;
+                    assert!(out.success, "{out:?}");
+                    let expected = testing::snapshot(expected_dir.path());
+
+                    let group = GroupCommit::begin(root);
+                    group.defer_removals();
+                    let savepoint = group.savepoint();
+                    let out = testing::revert(root, &patch(), &mut ledger).await;
+                    assert!(out.success && !out.kept_artifact, "{out:?}");
+                    let ctx = format!("{files:?} sibling={with_sibling} {end:?}");
+                    assert_eq!(testing::snapshot(root), before, "staged: {ctx}");
+                    match end {
+                        End::Drop => drop(group),
+                        End::Rollback => {
+                            group.rollback_to(savepoint);
+                            group.commit().await.unwrap();
+                        }
+                        End::Commit => {
+                            group.commit().await.unwrap();
+                            assert_eq!(testing::snapshot(root), expected, "{ctx}");
+                            continue;
+                        }
+                    }
+                    assert_eq!(testing::snapshot(root), before, "{ctx}");
+                    assert_eq!(testing::dirs(root), before_dirs, "{ctx}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn an_apply_line_inside_a_comment_does_not_count() {
         let line = vendored_line(false, "");
@@ -3814,7 +3861,7 @@ mod tests {
     }
 
     /// The vendored defaults keep the historic line; the hosted target's
-    /// digest comment is ignored by the match and cut with its line.
+    /// digest comment is ignored by the match.
     #[test]
     fn wiring_target_spells_and_finds_apply_lines() {
         let vendored = WiringTarget::vendored();
@@ -3836,10 +3883,6 @@ mod tests {
         let newer = hosted("fedcba9876543210");
         assert!(has_apply_line(&text, Dsl::Kotlin, &newer, ""));
         assert!(!has_apply_line(&text, Dsl::Kotlin, &vendored, ""));
-        assert_eq!(
-            remove_apply_line(&text, Dsl::Kotlin, &newer, "").as_deref(),
-            Some("rootProject.name = \"x\"\r\ninclude(\"a\")\r\n")
-        );
         assert!(newer.owns_repository("socketPatchHosted_abc"));
         assert!(!newer.owns_repository("socketPatchHostedX"));
         assert_eq!(remove_line("a\n  b  \nc\n", "b").as_deref(), Some("a\nc\n"));
@@ -3853,7 +3896,7 @@ mod tests {
             let text = String::from_utf8(out[*rel].clone()).unwrap();
             out.insert(
                 rel.to_string(),
-                crate::gradle::eol::apply_eol(&text, true).into_bytes(),
+                line_endings::respell(&text, "\r\n").into_bytes(),
             );
         }
         out
@@ -3934,6 +3977,40 @@ mod tests {
             out["settings.gradle"],
             crlf(&files, &["settings.gradle"])["settings.gradle"]
         );
+    }
+
+    /// #815: a mixed CRLF/LF settings file gets its inserted lines in the
+    /// majority terminator (`line_endings::terminator`, the rule every
+    /// other line-inserting writer uses) — not the first line's — whichever
+    /// way the first line and the majority disagree, and the revert finds
+    /// what the forward pass wrote and restores the file byte for byte.
+    #[test]
+    fn mixed_settings_take_the_majority_terminator_and_revert_byte_exact() {
+        for (src, nl) in [
+            (
+                "rootProject.name = 'x'\ninclude 'a'\r\ninclude 'b'\r\n",
+                "\r\n",
+            ),
+            ("rootProject.name = 'x'\r\ninclude 'a'\ninclude 'b'\n", "\n"),
+        ] {
+            let files = fs(&[("settings.gradle", src)]);
+            let p = patch();
+            let plan = run(&files, &p).unwrap();
+            assert_eq!(
+                text_of(&plan, "settings.gradle"),
+                format!("{src}{}{nl}", vendored_line(false, "")),
+                "{src:?}"
+            );
+            let after = applied(&files, &plan);
+            assert!(run(&after, &p).unwrap().writes.is_empty(), "{src:?}");
+            let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+            assert!(undo.drifted.is_empty(), "{src:?}: {:?}", undo.drifted);
+            assert_eq!(
+                reverted(&after, &undo)["settings.gradle"],
+                src.as_bytes(),
+                "{src:?}"
+            );
+        }
     }
 
     /// A settings file vendor created is deleted once only whitespace is

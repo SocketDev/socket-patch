@@ -1,8 +1,8 @@
 //! End-to-end tests for the `scan` subcommand against the real Socket API.
 //!
-//! Exercises the `scan --apply` + opt-in GC pipeline introduced in v3.0:
+//! Exercises the `scan --mode agent` + opt-in GC pipeline introduced in v3.0:
 //!
-//! * `scan --json --apply --yes` adds, updates, and skips patches based on
+//! * `scan --json --mode agent --yes` adds, updates, and skips patches based on
 //!   the existing manifest, emitting the `apply.patches[]` action vocabulary
 //!   (`"added"`, `"updated"`, `"skipped"`).
 //! * A bare `scan --json` (hosted mode by default) emits the `updates`
@@ -10,8 +10,8 @@
 //!   by default; it never writes `.socket/manifest.json` or node_modules.
 //! * `--prune` opts into garbage collection (manifest pruning + orphan
 //!   file cleanup). Without it, scan leaves the manifest alone.
-//! * `--sync` is sugar for `--apply --prune` — the canonical bot mode.
-//! * `--dry-run` previews `--apply` / `--prune` / `--sync` actions
+//! * `--sync` is sugar for `--mode agent --prune` — the canonical bot mode.
+//! * `--dry-run` previews `--mode agent` / `--prune` / `--sync` actions
 //!   without mutating disk.
 //!
 //! Uses the same minimist@1.2.2 patch fixture as `e2e_npm.rs`. Tests are
@@ -27,13 +27,14 @@
 //! cargo test -p socket-patch-cli --test e2e_scan -- --ignored
 //! ```
 
-use std::path::{Path, PathBuf};
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
+use std::path::Path;
 use std::process::{Command, Output};
 
-use sha2::{Digest, Sha256};
-
-#[path = "common/cache_env.rs"]
-mod cache_env;
+use common::cache_env;
 
 // ---------------------------------------------------------------------------
 // Constants (shared with e2e_npm; duplicated here because Rust integration
@@ -54,17 +55,13 @@ const BEFORE_HASH: &str = "311f1e893e6eac502693fad8617dcf5353a043ccc0f7b4ba9fe38
 /// the API would return.
 const FAKE_ORPHAN_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// Fake UUID we plant in the manifest to force `scan --apply` into the
+/// Fake UUID we plant in the manifest to force `scan --mode agent` into the
 /// `"updated"` branch.
 const FAKE_OLD_UUID: &str = "11111111-1111-4111-8111-111111111111";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 fn has_command(cmd: &str) -> bool {
     let mut probe = Command::new(cmd);
@@ -90,14 +87,6 @@ fn require_npm() {
     );
 }
 
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
-
 fn git_sha256_file(path: &Path) -> String {
     let content = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     git_sha256(&content)
@@ -109,7 +98,7 @@ fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     // The binary binds a wide `SOCKET_*` env surface (SOCKET_CWD,
     // SOCKET_DRY_RUN, SOCKET_GLOBAL, SOCKET_GLOBAL_PREFIX, SOCKET_PROXY_URL,
     // SOCKET_MANIFEST_PATH, ...). An ambient value silently changes what
-    // these tests exercise — SOCKET_DRY_RUN=true turns every `scan --apply`
+    // these tests exercise — SOCKET_DRY_RUN=true turns every `scan --mode agent`
     // into a no-op preview, and SOCKET_GLOBAL aims mutations at the host's
     // *real* global node_modules. Scrub the whole prefix so only the flags
     // each test passes are in effect; removing SOCKET_API_TOKEN also forces
@@ -206,7 +195,7 @@ fn write_seed_manifest(cwd: &Path, purl: &str, uuid: &str) {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// `scan --json --apply --yes` against a fresh install should report a
+/// `scan --json --mode agent --yes` against a fresh install should report a
 /// single `action: "added"` entry for the minimist patch, write the
 /// manifest, and patch the file on disk. The specific UUID/afterHash
 /// the upstream API serves can change over time (multiple free patches
@@ -228,8 +217,8 @@ fn test_scan_apply_json_adds_new_patch() {
 
     let (stdout, _) = assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
-        "scan --json --apply --yes (fresh)",
+        &["scan", "--json", "--mode", "agent", "--yes"],
+        "scan --json --mode agent --yes (fresh)",
     );
     let v = parse_scan_json(&stdout);
 
@@ -278,7 +267,7 @@ fn test_scan_apply_json_adds_new_patch() {
     );
 }
 
-/// Re-running `scan --json --apply --yes` after the patch is already in
+/// Re-running `scan --json --mode agent --yes` after the patch is already in
 /// the manifest reports `action: "skipped"` and leaves the file alone.
 #[test]
 #[ignore]
@@ -290,7 +279,11 @@ fn test_scan_apply_json_skips_existing() {
     npm_run(cwd, &["install", "minimist@1.2.2"]);
 
     let index_js = cwd.join("node_modules/minimist/index.js");
-    assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "first run");
+    assert_run_ok(
+        cwd,
+        &["scan", "--json", "--mode", "agent", "--yes"],
+        "first run",
+    );
     // Capture the exact patched bytes after the first run. A correct
     // "skipped" re-run must leave the file *byte-for-byte identical*; merely
     // checking `!= BEFORE_HASH` would also pass if the second run re-applied
@@ -301,7 +294,11 @@ fn test_scan_apply_json_skips_existing() {
         "first run should have patched the file",
     );
 
-    let (stdout, _) = assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "second run");
+    let (stdout, _) = assert_run_ok(
+        cwd,
+        &["scan", "--json", "--mode", "agent", "--yes"],
+        "second run",
+    );
     let v = parse_scan_json(&stdout);
 
     let patches = v["apply"]["patches"]
@@ -322,7 +319,7 @@ fn test_scan_apply_json_skips_existing() {
 }
 
 /// Seeding a manifest with a fake old UUID for the minimist PURL forces
-/// `scan --apply` into the `"updated"` branch — the per-patch record
+/// `scan --mode agent` into the `"updated"` branch — the per-patch record
 /// carries `oldUuid` matching the fake.
 #[test]
 #[ignore]
@@ -336,7 +333,7 @@ fn test_scan_apply_json_updates_existing() {
 
     let (stdout, _) = assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
+        &["scan", "--json", "--mode", "agent", "--yes"],
         "scan with seeded fake UUID",
     );
     let v = parse_scan_json(&stdout);
@@ -455,7 +452,7 @@ fn test_scan_json_read_only_no_mutation() {
 }
 
 /// When a previously-patched package is uninstalled, passing `--prune`
-/// (or `--sync`) on the next `scan --apply --yes` prunes its manifest
+/// (or `--sync`) on the next `scan --mode agent --yes` prunes its manifest
 /// entry and sweeps the orphan blobs. JSON output reports it in
 /// `gc.prunedManifestEntries`.
 #[test]
@@ -470,7 +467,7 @@ fn test_scan_apply_prune_prunes_uninstalled_package() {
     // First run — patch is added (no --prune needed for the apply step).
     assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
+        &["scan", "--json", "--mode", "agent", "--yes"],
         "initial apply",
     );
     assert!(cwd.join(".socket/manifest.json").exists());
@@ -482,7 +479,7 @@ fn test_scan_apply_prune_prunes_uninstalled_package() {
 
     let (stdout, _) = assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes", "--prune"],
+        &["scan", "--json", "--mode", "agent", "--yes", "--prune"],
         "scan with --prune after uninstall",
     );
     let v = parse_scan_json(&stdout);
@@ -502,7 +499,7 @@ fn test_scan_apply_prune_prunes_uninstalled_package() {
     );
 }
 
-/// Default `scan --apply --yes` (no `--prune`) leaves manifest entries
+/// Default `scan --mode agent --yes` (no `--prune`) leaves manifest entries
 /// for uninstalled packages alone. The `gc` field is omitted entirely
 /// from JSON output — users wanting cleanup must opt in.
 #[test]
@@ -516,7 +513,7 @@ fn test_scan_apply_default_keeps_uninstalled_entries() {
 
     assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
+        &["scan", "--json", "--mode", "agent", "--yes"],
         "initial apply",
     );
     npm_run(cwd, &["uninstall", "minimist"]);
@@ -524,7 +521,7 @@ fn test_scan_apply_default_keeps_uninstalled_entries() {
 
     let (stdout, _) = assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
+        &["scan", "--json", "--mode", "agent", "--yes"],
         "scan without --prune",
     );
     let v = parse_scan_json(&stdout);
@@ -559,7 +556,7 @@ fn test_scan_apply_default_keeps_uninstalled_entries() {
 }
 
 /// Even without manifest changes, a stray orphan blob file in
-/// `.socket/blobs/` is removed by the next `scan --apply --yes --prune`
+/// `.socket/blobs/` is removed by the next `scan --mode agent --yes --prune`
 /// (GC must be opt-in via `--prune` or `--sync`).
 #[test]
 #[ignore]
@@ -571,7 +568,7 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
     npm_run(cwd, &["install", "minimist@1.2.2"]);
     assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
+        &["scan", "--json", "--mode", "agent", "--yes"],
         "initial apply",
     );
 
@@ -601,7 +598,7 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
 
     let (stdout, _) = assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes", "--prune"],
+        &["scan", "--json", "--mode", "agent", "--yes", "--prune"],
         "scan --prune with orphan blob present",
     );
     let v = parse_scan_json(&stdout);
@@ -641,7 +638,8 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
 
 /// `scan --json --dry-run --sync --yes` previews the full sync action:
 /// `apply.patches[]` is populated with would-be actions and `gc`
-/// reports `prunable*`/`orphan*` counts, but nothing on disk changes.
+/// reports the would-be `pruned*`/`removed*` counts, but nothing on disk
+/// changes.
 #[test]
 #[ignore]
 fn test_scan_dry_run_sync_previews_apply_and_gc() {
@@ -654,7 +652,7 @@ fn test_scan_dry_run_sync_previews_apply_and_gc() {
     // an orphan so there's prune + cleanup work to preview.
     assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
+        &["scan", "--json", "--mode", "agent", "--yes"],
         "initial apply",
     );
 
@@ -676,15 +674,15 @@ fn test_scan_dry_run_sync_previews_apply_and_gc() {
     let v = parse_scan_json(&stdout);
 
     // Preview output present.
-    let prunable = v["gc"]["prunableManifestEntries"]
+    let prunable = v["gc"]["prunedManifestEntries"]
         .as_array()
-        .expect("gc.prunableManifestEntries array");
+        .expect("gc.prunedManifestEntries array");
     assert!(
         prunable.iter().any(|p| p == NPM_PURL),
         "preview should list minimist as prunable; got {prunable:?}"
     );
     assert!(
-        v["gc"]["orphanBlobs"].as_u64().unwrap_or(0) >= 1,
+        v["gc"]["removedBlobs"].as_u64().unwrap_or(0) >= 1,
         "preview should count at least 1 orphan blob"
     );
     assert_eq!(v["apply"]["dryRun"], true);
@@ -718,7 +716,7 @@ fn test_scan_json_no_gc_field_without_prune() {
     npm_run(cwd, &["install", "minimist@1.2.2"]);
     assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
+        &["scan", "--json", "--mode", "agent", "--yes"],
         "initial apply",
     );
 

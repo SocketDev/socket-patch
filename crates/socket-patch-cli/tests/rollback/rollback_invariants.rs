@@ -4,14 +4,10 @@
 //! installed packages. Nothing reaches a real registry; network cases hit an
 //! unroutable localhost port.
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use sha2::{Digest, Sha256};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// A `rollback` command with the full `SOCKET_*` environment scrubbed and the
 /// working directory pinned. All tests build their child process through here
@@ -37,15 +33,6 @@ fn rollback_cmd(cwd: &Path) -> Command {
         }
     }
     cmd
-}
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 const MANIFEST_JSON: &str = r#"{
@@ -120,7 +107,9 @@ fn rollback_with_no_manifest_emits_error() {
     assert_eq!(v["status"], "error");
     // Pin the *specific* error so a regression that exits 1 for some other
     // reason (e.g. ambient env steering it elsewhere) can't pass.
-    let err = v["error"].as_str().expect("error message string");
+    let err = v["error"]["message"]
+        .as_str()
+        .expect("error message string");
     assert!(
         err.contains("Manifest not found"),
         "unexpected error message: {err}"
@@ -138,7 +127,9 @@ fn rollback_unknown_identifier_emits_error() {
     assert_eq!(code, 1, "unknown identifier must exit 1; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "error");
-    let err = v["error"].as_str().expect("error message string");
+    let err = v["error"]["message"]
+        .as_str()
+        .expect("error message string");
     assert!(
         err.contains("No patch found matching identifier"),
         "unexpected error: {err}"
@@ -171,7 +162,9 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
         "offline + missing blob must exit 1; stdout=\n{stdout}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert_eq!(v["status"], "partial_failure");
+    // Nothing could be rolled back: a total failure (#1066).
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["error"]["code"], "rollback_failed");
     assert_eq!(v["rolledBack"], 0);
     assert_eq!(v["alreadyOriginal"], 0);
     assert_eq!(v["dryRun"], false, "not a dry-run");
@@ -206,8 +199,8 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     // The error names the remedy; the per-file record names the blob.
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("socket-patch repair"),
-        "error must carry the repair remedy; got: {err}"
+        err.contains("Re-run without --offline") && !err.contains("repair"),
+        "error must carry the re-run remedy (repair cannot fetch originals, #893); got: {err}"
     );
     let verified = entry["filesVerified"]
         .as_array()
@@ -230,8 +223,8 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
         "message must name the missing hash; got: {msg}"
     );
     assert!(
-        msg.contains("--offline") && msg.contains("socket-patch repair"),
-        "message must name the offline gate and the repair remedy; got: {msg}"
+        msg.contains("--offline") && msg.contains("Re-run without --offline"),
+        "message must name the offline gate and the re-run remedy; got: {msg}"
     );
 }
 
@@ -258,8 +251,8 @@ fn rollback_offline_missing_blob_human_names_package_and_remedy() {
         "stderr must explain the offline gate; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("socket-patch repair"),
-        "stderr must carry the repair remedy; stderr=\n{stderr}"
+        stderr.contains("Re-run without --offline") && !stderr.contains("socket-patch repair"),
+        "stderr must carry the re-run remedy; stderr=\n{stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -302,7 +295,9 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
         "undownloadable blob must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert_eq!(v["status"], "partial_failure");
+    // The only patch failed: a total failure (#1066).
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
     assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
     let results = v["results"].as_array().expect("results array");
     assert_eq!(results.len(), 1, "stdout=\n{stdout}");
@@ -311,8 +306,8 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
     assert_eq!(entry["success"], false);
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("socket-patch repair"),
-        "error must carry the repair remedy; got: {err}"
+        err.contains("patch API is reachable") && !err.contains("repair"),
+        "error must carry the re-run remedy; got: {err}"
     );
     let verified = entry["filesVerified"]
         .as_array()
@@ -569,10 +564,10 @@ fn rollback_mixed_installed_gated_and_not_installed_entries() {
         "the gated package is installed — path must be reported; stdout=\n{stdout}"
     );
     // The pinned missing-blob abort envelope survives for the installed
-    // package: engine vocabulary + repair remedy.
+    // package: engine vocabulary + re-run remedy.
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("Cannot roll back: ") && err.contains("socket-patch repair"),
+        err.contains("Cannot roll back: ") && err.contains("Re-run without --offline"),
         "pinned abort error shape; got: {err}"
     );
     let verified = entry["filesVerified"]

@@ -27,8 +27,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::npm::{by_uuid, fetch_dists_on, read_or_refuse, refuse_all_in};
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::npm::fetch_dists_on;
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::vendor::vlt_lock_text::{
     brotli_for_slot3, default_registry_alias, entry_text, is_default_registry, nodes_block,
     parse_node_line, registry_base, render_entry_line, render_tuple_with_slots, sniff_lock,
@@ -794,6 +794,41 @@ mod tests {
             "{:?}",
             outcome.warnings
         );
+    }
+
+    /// A credentialed registry URL (`https://user:token@host/`) that can't
+    /// be read never leaks its userinfo into the `upstream_registry_fallback`
+    /// detail: rollback and remove print it and persist it in `--json`
+    /// output, which lands in CI logs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn registry_fallback_warning_drops_url_credentials() {
+        let server = registry(&[("left-pad", "1.3.0", Some(LP_UPSTREAM))]).await;
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        let host = server.uri().replace("http://", "");
+        let mirror = format!("http://ci-user:s3cret-token@{host}/private/");
+        let text = format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\"registries\":{{\"npm\":\"{mirror}\"}}}},\n  \"nodes\": {{\n    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-AA==\",\"{}\"]\n  }},\n  \"edges\": {{}}\n}}\n",
+            hosted(LP_UUID, "left-pad-1.3.0.tgz")
+        );
+        let (outcome, _) = run(&text, &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)], false).await;
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
+        assert!(refused(&outcome).is_empty(), "{:?}", refused(&outcome));
+        let fallback: Vec<&String> = outcome
+            .warnings
+            .iter()
+            .filter(|(code, _)| *code == "upstream_registry_fallback")
+            .map(|(_, detail)| detail)
+            .collect();
+        assert_eq!(fallback.len(), 1, "{:?}", outcome.warnings);
+        assert!(
+            fallback[0].contains(&format!("http://{host}/private")),
+            "{}",
+            fallback[0]
+        );
+        for secret in ["s3cret-token", "ci-user"] {
+            assert!(!fallback[0].contains(secret), "{}", fallback[0]);
+        }
     }
 
     #[tokio::test]

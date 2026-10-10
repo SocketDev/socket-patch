@@ -75,6 +75,16 @@ member `node_modules` trees. Keep the redirected lockfile and any generated
 installation error. VEX uses installed-file verification by default; exporting
 VEX does not automatically upload it or change Socket alert counts.
 
+A generated `pnpm-workspace.yaml` (`packages: ['.']` plus `trustLockfile: true`
+or the vendored `overrides:`) makes a single-package project a root-only
+workspace. pnpm 9.0.0–10.4.x then refuse `pnpm add <pkg>` with
+`ERR_PNPM_ADDING_TO_ROOT` unless given `-w`; 10.5.0 and later add normally. So
+neither mode creates the file when every pnpm pin of the project (the
+`node_modules/.modules.yaml` install record, package.json `packageManager`,
+`devEngines.packageManager`, `engines.pnpm`) names 9.0–10.4, which read neither
+setting from it. With no pin, or any pin that may be a later pnpm, the file is
+created as before.
+
 ## Run locally
 
 ```sh

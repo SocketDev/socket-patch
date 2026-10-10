@@ -40,8 +40,11 @@ layout: `npm`, `pnpm` (isolated `.pnpm` store with symlinks), `yarn-classic`,
 `vlt` (`.vlt` store), `pip` (hash-pinned `requirements.txt`), `uv`, `pylock`
 (PEP 751), `poetry`, `pipenv`, `pdm`, `hatch` (lockless: `hatch.toml`
 environment pins, rewritten in place), `bundler`, `composer`, `cargo`,
-`golang`, `nuget`, `maven` and `gradle` (`gradle.lockfile`, Gradle's
-`modules-2/files-2.1` cache; hosted mode wires the build through
+`golang`, `nuget` (a restored project: `packages.lock.json` plus
+`obj/project.assets.json`, so the crawl looks the restore's packages up
+in `~/.nuget/packages` instead of walking it), `maven` and `gradle`
+(`gradle.lockfile`, Gradle's `modules-2/files-2.1` cache; hosted mode
+wires the build through
 `.socket/gradle/`). Deno has no hosted rewrite and is not benchmarked
 separately.
 

@@ -30,6 +30,10 @@
 //! (the version it must report) and `SOCKET_PATCH_GRADLE_E2E_REQUIRED` (no
 //! SKIP) (`gradle_build_common`). Scratch trees go under `TMPDIR`.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
 
@@ -60,14 +64,6 @@ const SV: &str = "1.10.0-socket.1d3c1fd2";
 /// `commons-text:1.10.0` (3.5.0 on 1.3), so purging the fixture version from
 /// the local repository would break the plugin realm, not the project.
 const CLASSPATH_PLUGIN: &str = "org.apache.maven.plugins:maven-dependency-plugin:3.5.0";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
 
 /// `socket-patch <args>` with ambient `SOCKET_*` scrubbed, `m2` as the Maven
 /// repo and, when given, `gradle_home` as the `GRADLE_USER_HOME` the CLI
@@ -336,13 +332,12 @@ fn maven_tree_rel() -> String {
     format!(".socket/vendor/maven2/{GROUP_PATH}/{ARTIFACT}/{SV}")
 }
 
-/// `package` + `build-classpath` into each module's `target/cp.txt`.
-fn mvn_classpath(mvn: &Mvn, cwd: &Path, m2: &Path, settings: &Path, offline: bool) -> Output {
+/// `package` + `build-classpath` into each module's `target/cp.txt`, after
+/// `flags` (`-o`, `-U`).
+fn mvn_classpath(mvn: &Mvn, cwd: &Path, m2: &Path, settings: &Path, flags: &[&str]) -> Output {
     let goal = format!("{CLASSPATH_PLUGIN}:build-classpath");
-    let mut args = vec!["package", goal.as_str(), "-Dmdep.outputFile=target/cp.txt"];
-    if offline {
-        args.insert(0, "-o");
-    }
+    let mut args = flags.to_vec();
+    args.extend(["package", goal.as_str(), "-Dmdep.outputFile=target/cp.txt"]);
     mvn.run(cwd, m2, settings, &args)
 }
 
@@ -393,7 +388,10 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
         return;
     };
     write_reactor(&proj);
-    let out = mvn_classpath(&mvn, &proj, &m2, &settings, false);
+    // Online: the lifecycle plugins and CLASSPATH_PLUGIN are not warmed.
+    let out = with_central_fallback(SUITE, "pre-vendor reactor build", &settings, |s, flags| {
+        mvn_classpath(&mvn, &proj, &m2, s, flags)
+    });
     assert!(ok(&out), "pre-vendor reactor build:\n{}", dump(&out));
     let entry = classpath_entry(&proj.join("b"));
     assert_eq!(
@@ -427,6 +425,7 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
     let mut want_added = vec![
         ".mvn/maven.config".to_string(),
         ".socket/vendor/maven2/.gitattributes".to_string(),
+        ".socket/vendor/maven2/.gitignore".to_string(),
         format!("{tree}/{ARTIFACT}-{SV}.jar"),
         format!("{tree}/{ARTIFACT}-{SV}.jar.sha1"),
         format!("{tree}/{ARTIFACT}-{SV}.pom"),
@@ -517,7 +516,7 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
     let fresh = root.join("fresh");
     fresh_checkout_all(&proj, &fresh);
     purge(&m2);
-    let out = mvn_classpath(&mvn, &fresh, &m2, &settings, true);
+    let out = mvn_classpath(&mvn, &fresh, &m2, &settings, &["-o"]);
     assert!(ok(&out), "fresh offline reactor build:\n{}", dump(&out));
     assert_vendored_on_classpath(&fresh.join("a"), &patched, "root build, module a");
     assert_vendored_on_classpath(
@@ -758,6 +757,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         socket_patch_core::vendor::jvm::gradle::SCRIPT_REL.to_string(),
         socket_patch_core::vendor::jvm::gradle::INDEX_REL.to_string(),
         ".socket/vendor/gradle/.gitattributes".to_string(),
+        ".socket/vendor/gradle/.gitignore".to_string(),
         ".socket/gradle/.gitattributes".to_string(),
         ".socket/vendor/.gitattributes".to_string(),
         socket_patch_core::vendor::jvm::gradle::derived_metadata_rel(GROUP, ARTIFACT),

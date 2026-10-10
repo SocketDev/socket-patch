@@ -20,14 +20,14 @@
 //! this path (partialFailure, empty events, NO top-level error record —
 //! deliberately distinct from vendor's `no_local_source` hard error).
 
-use std::path::{Path, PathBuf};
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
+use std::path::Path;
 use std::process::Command;
 
 use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Run `socket-patch apply` in `cwd` with a scrubbed SOCKET_* environment
 /// so ambient developer/CI configuration (tokens, silent toggles) can't
@@ -154,6 +154,11 @@ fn apply_silent_online_download_failure_keeps_error_output() {
             .any(|l| l.contains("could not be downloaded")),
         "--silent must keep the download-failure error (errors only, \
          never nothing); stderr was: {stderr:?}"
+    );
+    assert!(
+        chatter.iter().any(|l| l.contains("Failed to download")),
+        "--silent must keep the per-blob failure reasons with the error; \
+         stderr was: {stderr:?}"
     );
 }
 

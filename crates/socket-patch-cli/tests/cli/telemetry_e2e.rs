@@ -8,17 +8,15 @@
 //! count). Each test runs the released binary in a tempdir against
 //! the mock URI.
 
-use std::path::{Path, PathBuf};
+use crate::common::binary;
+
+use std::path::Path;
 use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG_SLUG: &str = "telemetry-test-org";
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 fn write_root_package_json(root: &Path) {
     std::fs::write(
@@ -301,7 +299,10 @@ async fn scan_skips_telemetry_in_airgap_mode() {
         "offline scan must report an error envelope; stdout={stdout}"
     );
     assert!(
-        v["error"].as_str().unwrap_or_default().contains("offline"),
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("offline"),
         "offline scan's error must name the offline gate; stdout={stdout}"
     );
 
@@ -452,7 +453,10 @@ async fn get_skips_telemetry_in_airgap_mode() {
         "offline get must report an error envelope; stdout={stdout}"
     );
     assert!(
-        v["error"].as_str().unwrap_or_default().contains("offline"),
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("offline"),
         "offline get's error must name the offline gate; stdout={stdout}"
     );
 

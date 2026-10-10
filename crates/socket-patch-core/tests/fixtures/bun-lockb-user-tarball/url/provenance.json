@@ -1,0 +1,8 @@
+{
+  "bun": "1.1.45",
+  "os": "darwin",
+  "arch": "aarch64",
+  "command": "bun install (default binary lockfile)",
+  "note": "the root depends on is-number by its registry tarball URL; is-odd@3.0.1 depends on is-number@^6.0.0, a nested registry copy of the same version",
+  "sha256": "7da8ccbaf8f73baf34c31091d5ff2f97c3e6c3ef8661980fdedb43ed09789086"
+}

@@ -1,7 +1,8 @@
 //! The v5 vendored JVM backend (`docs/design/maven-vendoring.md`).
 //!
-//! Handles multi-module Maven reactors and Gradle builds automatically.
-//! Single-POM builds retain the legacy backend.
+//! Handles every Maven root (a single-module pom is planned as a reactor
+//! of one), Gradle builds, mixed Maven + Gradle roots, sbt builds and
+//! scala-cli directory builds.
 //!
 //! The planners are pure: they read project files through a [`ReadFn`] and
 //! return the full post-vendor bytes of every file they touch plus one
@@ -17,6 +18,7 @@ pub mod apply;
 pub mod coursier_gate;
 pub mod coursier_tree;
 pub mod gradle;
+pub mod layout;
 pub mod maven_reactor;
 pub mod sbt;
 pub mod sbt_gate;
@@ -120,7 +122,12 @@ pub struct Coords<'a> {
 impl Coords<'_> {
     /// `org.apache.commons` → `org/apache/commons`.
     pub fn group_path(&self) -> String {
-        self.group_id.replace('.', "/")
+        layout::group_path(self.group_id)
+    }
+
+    /// `version`'s directory of this GA in `tree` ([`layout::tree_dir`]).
+    pub fn tree_dir(&self, tree: &str, version: &str) -> String {
+        layout::tree_dir(tree, self.group_id, self.artifact_id, version)
     }
 
     /// First 8 lowercase hex of the uuid.
@@ -207,7 +214,8 @@ impl<'a> JvmPatch<'a> {
 /// Which JVM build the project root holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
-    /// A root `pom.xml` that declares `<modules>`.
+    /// A root `pom.xml`, whether it declares `<modules>` or is a single
+    /// module (a reactor of one).
     MavenReactor,
     /// No root `pom.xml`, and a Gradle settings or build script.
     Gradle,
@@ -218,8 +226,19 @@ pub enum Shape {
     Sbt,
     /// A scala-cli directory build ([`scala_cli::detect`]).
     ScalaCli,
-    /// Anything else (including a single-module pom, which stays legacy).
+    /// No root `pom.xml` and no Gradle, sbt or scala-cli build.
     Other,
+}
+
+/// The committed vendor trees a plan for `shape` writes into.
+pub(crate) fn shape_trees(shape: Shape) -> &'static [&'static str] {
+    match shape {
+        Shape::MavenReactor | Shape::Sbt => &[layout::MAVEN2_TREE],
+        Shape::Gradle => &[layout::GRADLE_TREE],
+        Shape::Mixed => &[layout::MAVEN2_TREE, layout::GRADLE_TREE],
+        Shape::ScalaCli => &[layout::COURSIER_TREE],
+        Shape::Other => &[],
+    }
 }
 
 /// A planned file: project-relative forward-slash path and its full new
@@ -309,32 +328,25 @@ pub struct Detected {
 }
 
 impl Detected {
-    /// The backend's planner shape: a single pom alone stays on the legacy
-    /// backend; next to a Gradle build it is planned as a one-pom reactor,
-    /// so both halves share one ledger entry.
+    /// The backend's planner shape. Any root pom, single-module or not, is
+    /// planned as a reactor; next to a Gradle build both halves are planned
+    /// together, so they share one ledger entry.
     pub fn shape(&self) -> Shape {
         if let Some(scala) = self.scala {
             return scala;
         }
         match (self.maven, self.gradle) {
             (Some(_), true) => Shape::Mixed,
-            (Some(MavenShape::Reactor), false) => Shape::MavenReactor,
+            (Some(_), false) => Shape::MavenReactor,
             (None, true) => Shape::Gradle,
-            _ => Shape::Other,
+            (None, false) => Shape::Other,
         }
     }
 }
 
-const GRADLE_FILES: &[&str] = &[
-    "settings.gradle",
-    "settings.gradle.kts",
-    "build.gradle",
-    "build.gradle.kts",
-];
-
 /// Every build the project root holds.
 pub fn detect_builds(read: ReadFn<'_>) -> Detected {
-    let maven = read("pom.xml").map(|pom| {
+    let maven = read(layout::POM_FILE).map(|pom| {
         if maven_reactor::declares_modules(&String::from_utf8_lossy(&pom)) {
             MavenShape::Reactor
         } else {
@@ -343,7 +355,7 @@ pub fn detect_builds(read: ReadFn<'_>) -> Detected {
     });
     Detected {
         maven,
-        gradle: GRADLE_FILES.iter().any(|f| read(f).is_some()),
+        gradle: layout::GRADLE_ROOT_FILES.iter().any(|f| read(f).is_some()),
         scala: sbt::detect(read).or_else(|| scala_cli::detect(read)),
     }
 }
@@ -371,22 +383,44 @@ pub fn plan_with_config(
     patch: &JvmPatch<'_>,
     config_enabled: bool,
 ) -> Result<JvmPlan, JvmRefusal> {
+    plan_with_external(shape, read, list, patch, config_enabled, None)
+}
+
+/// [`plan_with_config`] weighing the management a Maven pin would
+/// override from outside the checkout (see
+/// [`maven_reactor::plan_with_external`]).
+pub fn plan_with_external(
+    shape: Shape,
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    patch: &JvmPatch<'_>,
+    config_enabled: bool,
+    external: Option<&maven_reactor::ExternalPoms>,
+) -> Result<JvmPlan, JvmRefusal> {
     match shape {
-        Shape::MavenReactor => maven_reactor::plan_with_config(read, patch, config_enabled),
+        Shape::MavenReactor => {
+            maven_reactor::plan_with_external(read, patch, config_enabled, external)
+        }
         Shape::Gradle => gradle::plan(read, list, patch),
         Shape::Mixed => {
             // Both halves or neither: a refusal of either writes nothing.
-            let maven = maven_reactor::plan_with_config(read, patch, config_enabled)?;
+            let maven = maven_reactor::plan_with_external(read, patch, config_enabled, external)?;
             let gradle = gradle::plan(read, list, patch)?;
             Ok(compose(maven, gradle))
         }
         Shape::Sbt => sbt::plan(read, patch),
         Shape::ScalaCli => scala_cli::plan(read, patch),
-        Shape::Other => Err(JvmRefusal {
-            code: "vendor_jvm_shape_unsupported",
-            detail: "reason: no_build_file: not a multi-module Maven reactor or a Gradle build"
-                .to_string(),
-        }),
+        Shape::Other => Err(no_build_file_refusal()),
+    }
+}
+
+/// The refusal of a [`Shape::Other`] root.
+pub fn no_build_file_refusal() -> JvmRefusal {
+    JvmRefusal {
+        code: "vendor_jvm_shape_unsupported",
+        detail: "reason: no_build_file: no pom.xml, Gradle, sbt or scala-cli build at the \
+                 project root"
+            .to_string(),
     }
 }
 
@@ -412,26 +446,6 @@ fn compose(maven: JvmPlan, gradle: JvmPlan) -> JvmPlan {
         tree_dir: maven.tree_dir,
         jar_rel: maven.jar_rel,
     }
-}
-
-/// Safe coordinates that every written file accepts unescaped: g is
-/// dot-separated `[A-Za-z0-9_-]` segments, a is `[A-Za-z0-9_.-]`, v is
-/// `[A-Za-z0-9_.+-]` not ending in `+` nor starting with `latest.`; neither a
-/// nor v is all dots, and none holds `--` (it ends an XML comment).
-pub fn safe_coordinates(g: &str, a: &str, v: &str) -> bool {
-    let seg = |s: &str, extra: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c) || extra.contains(c))
-    };
-    g.split('.').all(|s| seg(s, ""))
-        && seg(a, ".")
-        && seg(v, ".+")
-        && !a.chars().all(|c| c == '.')
-        && !v.chars().all(|c| c == '.')
-        && !v.ends_with('+')
-        && !v.starts_with("latest.")
-        && ![g, a, v].iter().any(|s| s.contains("--"))
 }
 
 /// A fragment record. `op` (a JSON object with an `"op"` field) goes in
@@ -570,7 +584,7 @@ pub(crate) fn finish_writes(read: ReadFn<'_>, writes: Vec<FileWrite>) -> Vec<Fil
         .filter(|w| match read(&w.rel) {
             None => true,
             Some(cur) if !w.tree && eol_blind(&w.rel) => {
-                !crate::gradle::eol::eol_eq(&cur, &w.bytes)
+                !crate::utils::line_endings::eol_eq(&cur, &w.bytes)
             }
             Some(cur) => cur != w.bytes,
         })
@@ -586,6 +600,7 @@ pub(crate) fn eol_blind(rel: &str) -> bool {
         gradle::SCRIPT_REL,
         gradle::INDEX_REL,
         gradle::GITATTRIBUTES_REL,
+        gradle::GITIGNORE_REL,
         gradle::SCRIPT_GITATTRIBUTES_REL,
         gradle::VENDOR_GITATTRIBUTES_REL,
         maven_reactor::GITATTRIBUTES_REL,
@@ -620,7 +635,7 @@ pub(crate) const TREE_GITATTRIBUTES: &str = "* -text\n";
 
 /// Whether `current` is still the owned text `ours` (line endings aside).
 pub(crate) fn is_ours(current: Option<&[u8]>, ours: &str) -> bool {
-    current.is_some_and(|c| crate::gradle::eol::eol_eq(c, ours.as_bytes()))
+    current.is_some_and(|c| crate::utils::line_endings::eol_eq(c, ours.as_bytes()))
 }
 
 /// A disk round-trip harness for the planners' tests: vendor and revert
@@ -793,6 +808,7 @@ mod tests {
 
     #[test]
     fn safe_coordinates_follow_d15_and_forbid_comment_dashes() {
+        use super::layout::safe_coordinates;
         assert!(safe_coordinates(
             "org.apache.commons",
             "commons-text",
@@ -836,7 +852,7 @@ mod tests {
         };
         assert_eq!(detect(&reactor), Shape::MavenReactor);
         let single = |p: &str| (p == "pom.xml").then(|| b"<project></project>".to_vec());
-        assert_eq!(detect(&single), Shape::Other);
+        assert_eq!(detect(&single), Shape::MavenReactor);
         let gradle = |p: &str| (p == "settings.gradle.kts").then(Vec::new);
         assert_eq!(detect(&gradle), Shape::Gradle);
         let empty = |_: &str| None;
@@ -844,7 +860,7 @@ mod tests {
     }
 
     /// #395: a `pom.xml` next to a Gradle build is both, whichever kind of
-    /// pom it is; a single pom alone stays on the legacy backend.
+    /// pom it is; a single pom alone is a reactor of one (#973).
     #[test]
     fn detect_reports_both_builds_of_a_mixed_root() {
         let files = |pom: &'static [u8], gradle: Option<&'static str>| {
@@ -878,7 +894,7 @@ mod tests {
                 Shape::Mixed,
             ),
             (&reactor[..], None, MavenShape::Reactor, Shape::MavenReactor),
-            (&single[..], None, MavenShape::Single, Shape::Other),
+            (&single[..], None, MavenShape::Single, Shape::MavenReactor),
         ] {
             let read = files(pom, gradle);
             let d = detect_builds(&read);
@@ -967,6 +983,54 @@ mod tests {
         assert!(out.success && out.warnings.is_empty(), "{out:?}");
         assert_eq!(testing::snapshot(root), pristine);
         assert_eq!(testing::dirs(root), pristine_dirs);
+    }
+
+    /// #488: `vendor --check` weighs an imported BOM from the local
+    /// repository. A BOM it cannot read accepts the pin `vendor` wrote; a
+    /// BOM bumped to another version of the artifact reports the pin as
+    /// drift (the next `vendor` drops it).
+    #[tokio::test]
+    async fn check_weighs_an_imported_bom_from_the_local_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let repo = dir.path().join("m2");
+        let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.x</groupId>\n  \
+            <artifactId>app</artifactId>\n  <version>1</version>\n  <dependencyManagement>\n    \
+            <dependencies>\n      <dependency>\n        <groupId>com.corp</groupId>\n        \
+            <artifactId>corp-bom</artifactId>\n        <version>2</version>\n        \
+            <type>pom</type>\n        <scope>import</scope>\n      </dependency>\n    \
+            </dependencies>\n  </dependencyManagement>\n  <dependencies>\n    <dependency>\n      \
+            <groupId>org.apache.commons</groupId>\n      <artifactId>commons-text</artifactId>\n    \
+            </dependency>\n  </dependencies>\n</project>\n";
+        testing::populate(&root, &[("pom.xml", pom)]);
+        let mut ledger = std::collections::BTreeMap::new();
+        let p = mixed_patch();
+        // Vendored where the BOM managed the base version: pinned.
+        testing::vendor(&root, Shape::MavenReactor, &p, &mut ledger)
+            .await
+            .unwrap();
+        let entry = ledger.values().next().unwrap().clone();
+        assert!(std::fs::read_to_string(root.join("pom.xml"))
+            .unwrap()
+            .contains(&p.suffixed_version()));
+        apply::check_entry(&root, &entry, None).expect("no local BOM: the pin is accepted");
+        apply::check_entry(&root, &entry, Some(&repo)).expect("BOM absent from the repository");
+        let bom_dir = repo.join("com/corp/corp-bom/2");
+        std::fs::create_dir_all(&bom_dir).unwrap();
+        let bom = |version: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>com.corp</groupId>\
+                 <artifactId>corp-bom</artifactId><version>2</version><packaging>pom</packaging>\
+                 <dependencyManagement><dependencies><dependency><groupId>org.apache.commons\
+                 </groupId><artifactId>commons-text</artifactId><version>{version}</version>\
+                 </dependency></dependencies></dependencyManagement></project>"
+            )
+        };
+        std::fs::write(bom_dir.join("corp-bom-2.pom"), bom("1.10.0")).unwrap();
+        apply::check_entry(&root, &entry, Some(&repo)).expect("the BOM manages the base");
+        std::fs::write(bom_dir.join("corp-bom-2.pom"), bom("1.11.0")).unwrap();
+        let drift = apply::check_entry(&root, &entry, Some(&repo)).unwrap_err();
+        assert!(drift.contains("drifted"), "{drift}");
     }
 
     /// #395: a refusal by either half writes nothing for the other.

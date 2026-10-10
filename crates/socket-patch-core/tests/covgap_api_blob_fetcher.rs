@@ -20,13 +20,11 @@
 //! `tests/common/`, and these are api-suite-specific).
 
 use socket_patch_core::api::blob_fetcher::{
-    fetch_blobs_by_hash, fetch_missing_blobs, fetch_missing_sources, format_fetch_result,
-    DownloadMode, OnProgress,
+    fetch_blobs_by_hash, fetch_missing_blobs, format_fetch_result, OnProgress,
 };
 use socket_patch_core::api::client::{ApiClient, ApiClientOptions};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
-use socket_patch_core::patch::apply::PatchSources;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -41,19 +39,17 @@ fn dummy_client() -> ApiClient {
     ApiClient::new(ApiClientOptions {
         api_url: "http://127.0.0.1:1".to_string(),
         api_token: None,
-        use_public_proxy: true,
-        org_slug: None,
+        route: socket_patch_core::api::client::ApiRoute::Proxy,
     })
 }
 
 /// Public-proxy client pointed at a mock server `base` (binary fetches
-/// go to `<base>/patch/blob/<hash>` and `<base>/patch/diff/<uuid>`).
+/// go to `<base>/patch/blob/<hash>`).
 fn proxy_client(base: &str) -> ApiClient {
     ApiClient::new(ApiClientOptions {
         api_url: base.to_string(),
         api_token: None,
-        use_public_proxy: true,
-        org_slug: None,
+        route: socket_patch_core::api::client::ApiRoute::Proxy,
     })
 }
 
@@ -88,29 +84,6 @@ fn manifest_with_after_hashes(after: &[&str]) -> PatchManifest {
     }
 }
 
-/// Manifest carrying a set of patch UUIDs (each as its own PURL).
-fn manifest_with_uuids(uuids: &[&str]) -> PatchManifest {
-    let mut patches = HashMap::new();
-    for (i, uuid) in uuids.iter().enumerate() {
-        patches.insert(
-            format!("pkg:npm/test-{i}@1.0.0"),
-            PatchRecord {
-                uuid: (*uuid).to_string(),
-                exported_at: "2024-01-01T00:00:00Z".to_string(),
-                files: HashMap::new(),
-                vulnerabilities: HashMap::new(),
-                description: "test".to_string(),
-                license: "MIT".to_string(),
-                tier: "free".to_string(),
-            },
-        );
-    }
-    PatchManifest {
-        patches,
-        setup: None,
-    }
-}
-
 /// Count the directory entries under `dir` (proves an error path wrote
 /// nothing — neither a final entry nor `.socket-dl-*` staging litter).
 fn dir_entry_count(dir: &Path) -> usize {
@@ -122,7 +95,7 @@ fn dir_entry_count(dir: &Path) -> usize {
 // The target directory path is routed through a REGULAR FILE
 // (`tmp/notadir/<dir>`), so the writer's on-demand `create_dir_all` fails
 // with ENOTDIR on every platform, even as root. The presence probes that
-// run first (`get_missing_blobs` / `get_missing_archives`) also fail to
+// run first (`get_missing_blobs`) also fail to
 // stat through the file, so everything is reported missing and every
 // entry is fetched. Each download succeeds and hash-verifies; only the
 // disk write fails — so the outcome is the ordinary per-entry
@@ -221,56 +194,6 @@ async fn fetch_blobs_by_hash_uncreatable_blobs_dir_is_per_blob_write_failure() {
             .contains("Failed to write blob to disk"));
     }
     assert!(notadir.is_file(), "the blocking file must be left alone");
-}
-
-/// `fetch_missing_sources` in Diff mode when the archives directory
-/// cannot be created: `get_missing_archives` reports the uuid missing
-/// through the broken path, the archive is fetched, and the write is a
-/// per-archive "Failed to write archive to disk" failure. The blobs dir
-/// is not involved and stays empty.
-#[tokio::test]
-async fn fetch_missing_sources_diff_uncreatable_archives_dir_is_per_archive_write_failure() {
-    let tmp = tempfile::tempdir().unwrap();
-    let blobs = tmp.path().join("blobs");
-    std::fs::create_dir(&blobs).unwrap();
-    let notadir = tmp.path().join("notadir");
-    std::fs::write(&notadir, b"file blocking the path").unwrap();
-    let diffs = notadir.join("diffs");
-    let sources = PatchSources {
-        blobs_path: &blobs,
-        diffs_path: Some(&diffs),
-        mem_blobs: None,
-    };
-
-    let uuid = "11111111-1111-4111-8111-111111111111";
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path_matcher(format!("/patch/diff/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let manifest = manifest_with_uuids(&[uuid]);
-    let client = proxy_client(&server.uri());
-
-    let result =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
-    assert_eq!(result.total, 1);
-    assert_eq!(result.failed, 1);
-    assert_eq!(result.downloaded, 0);
-    assert_eq!(result.skipped, 0);
-    assert_eq!(result.results.len(), 1);
-    let entry = &result.results[0];
-    assert_eq!(entry.hash, uuid, "diff-mode results carry the patch uuid");
-    assert!(!entry.success);
-    let err = entry.error.as_deref().unwrap();
-    assert!(
-        err.contains("Failed to write archive to disk"),
-        "per-archive disk-write message expected: {err}"
-    );
-    assert!(notadir.is_file(), "the blocking file must be left alone");
-    // Diff mode never touches the blobs dir.
-    assert_eq!(dir_entry_count(&blobs), 0);
 }
 
 /// A fetch that lands nothing creates nothing: with every blob 404 the
@@ -435,64 +358,6 @@ async fn fetch_missing_blobs_disk_write_failure_is_per_blob_failure() {
 
     // Restore so tempdir teardown can't mask a failure.
     std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-/// Diff-archive twin: `fetch_diff` succeeds but the archive write
-/// fails → "Failed to write archive to disk", uuid carried in `hash`,
-/// no `<uuid>.tar.gz` and no stage litter.
-#[cfg(unix)]
-#[tokio::test]
-async fn fetch_missing_sources_diff_disk_write_failure_is_per_archive_failure() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let blobs = tmp.path().join("blobs");
-    let diffs = tmp.path().join("diffs");
-    std::fs::create_dir(&blobs).unwrap();
-    std::fs::create_dir(&diffs).unwrap();
-    std::fs::set_permissions(&diffs, std::fs::Permissions::from_mode(0o555)).unwrap();
-    if !write_into_dir_denied(&diffs) {
-        eprintln!("skipping: directory mode bits do not deny writes here (root?)");
-        return;
-    }
-
-    let uuid = "55555555-5555-4555-8555-555555555555";
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path_matcher(format!("/patch/diff/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let sources = PatchSources {
-        blobs_path: &blobs,
-        diffs_path: Some(&diffs),
-        mem_blobs: None,
-    };
-    let manifest = manifest_with_uuids(&[uuid]);
-    let client = proxy_client(&server.uri());
-
-    let result =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
-    assert_eq!(result.total, 1);
-    assert_eq!(result.downloaded, 0);
-    assert_eq!(result.failed, 1);
-    assert_eq!(result.results[0].hash, uuid);
-    let err = result.results[0].error.as_deref().unwrap();
-    assert!(
-        err.contains("Failed to write archive to disk"),
-        "archive disk-write arm message expected: {err}"
-    );
-    assert!(!diffs.join(format!("{uuid}.tar.gz")).exists());
-    assert_eq!(
-        dir_entry_count(&diffs),
-        0,
-        "no partial file, no stage litter"
-    );
-
-    std::fs::set_permissions(&diffs, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 // ── Mixed-outcome aggregation ────────────────────────────────────────

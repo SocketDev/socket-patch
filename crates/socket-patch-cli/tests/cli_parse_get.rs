@@ -1,8 +1,8 @@
 //! Clap parser snapshot tests for the `get` subcommand.
 //!
 //! These tests pin the public CLI contract for `socket-patch get`: every
-//! flag, every alias (including the hidden `--no-apply` and the visible
-//! `download` alias), and every default. Changing any assertion here is a
+//! flag and every default. The v4 spellings `--no-apply` and `download` were
+//! removed in v5 and must stay parse errors. Changing any assertion here is a
 //! breaking change to the CLI surface — see
 //! `crates/socket-patch-cli/CLI_CONTRACT.md`.
 //!
@@ -38,7 +38,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_ORG_SLUG",
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
     "SOCKET_VENDOR_SOURCE",
     "SOCKET_VENDOR_URL",
     "SOCKET_PATCH_SERVER_URL",
@@ -132,7 +131,6 @@ struct Snap {
     org: Option<String>,
     proxy_url: Option<String>,
     ecosystems: Option<Vec<String>>,
-    download_mode: String,
     vendor_source: String,
     vendor_url: Option<String>,
     patch_server_url: Option<String>,
@@ -167,7 +165,6 @@ fn snapshot(a: &GetArgs) -> Snap {
         org: a.common.org.clone(),
         proxy_url: a.common.proxy_url.clone(),
         ecosystems: a.common.ecosystems.clone(),
-        download_mode: a.common.download_mode.clone(),
         vendor_source: a.common.vendor_source.clone(),
         vendor_url: a.common.vendor_url.clone(),
         patch_server_url: a.common.patch_server_url.clone(),
@@ -210,7 +207,6 @@ fn expected_defaults(identifier: &str) -> Snap {
         org: None,
         proxy_url: None, // no clap default — resolved in core
         ecosystems: None,
-        download_mode: "diff".to_string(),
         vendor_source: "service".to_string(),
         vendor_url: None,
         patch_server_url: None,
@@ -259,13 +255,6 @@ fn all_releases_flag_sets_all_releases() {
     // Full-snapshot equality: proves the flag set `all_releases` AND left every
     // other field at its default (env scrubbed, so the `true` is the flag's).
     assert_eq!(snapshot(&a), want);
-}
-
-#[test]
-#[serial_test::serial]
-fn default_download_mode_is_diff() {
-    let a = parse_get(&["some-id"]);
-    assert_eq!(snapshot(&a), expected_defaults("some-id"));
 }
 
 // --- Positional --------------------------------------------------------------
@@ -419,7 +408,7 @@ fn json_flag_sets_json() {
     assert_eq!(snapshot(&a), want);
 }
 
-// --- save-only / --no-apply alias -------------------------------------------
+// --- save-only ------------------------------------------------------------------
 
 #[test]
 #[serial_test::serial]
@@ -432,55 +421,22 @@ fn save_only_flag_sets_save_only() {
 
 #[test]
 #[serial_test::serial]
-fn no_apply_hidden_alias_sets_save_only() {
-    // `--no-apply` is a hidden alias for `--save-only`. It does not appear in
-    // `--help` but is widely used in existing scripts — this is part of the
-    // CLI contract. With the env scrubbed, this can only pass if the alias is
-    // actually wired to `save_only` (not because SOCKET_SAVE_ONLY was set).
-    let a = parse_get(&["some-id", "--no-apply"]);
-    let mut want = expected_defaults("some-id");
-    want.save_only = true;
-    // The alias must set `save_only` and nothing else.
-    assert_eq!(snapshot(&a), want);
-    // ...and must be byte-for-byte equivalent to the canonical `--save-only`
-    // across the *entire* parsed surface, not just the `save_only` field.
-    let direct = parse_get(&["some-id", "--save-only"]);
-    assert_eq!(snapshot(&a), snapshot(&direct));
-}
-
-// --- download-mode -----------------------------------------------------------
-
-#[test]
-#[serial_test::serial]
-fn download_mode_package() {
-    let a = parse_get(&["some-id", "--download-mode", "package"]);
-    let mut want = expected_defaults("some-id");
-    want.download_mode = "package".to_string();
-    assert_eq!(snapshot(&a), want);
-}
-
-#[test]
-#[serial_test::serial]
-fn download_mode_diff() {
-    let a = parse_get(&["some-id", "--download-mode", "diff"]);
-    // Explicitly passing the default value must still parse to exactly defaults.
-    assert_eq!(snapshot(&a), expected_defaults("some-id"));
-}
-
-#[test]
-#[serial_test::serial]
-fn download_mode_file() {
-    let a = parse_get(&["some-id", "--download-mode", "file"]);
-    let mut want = expected_defaults("some-id");
-    want.download_mode = "file".to_string();
-    assert_eq!(snapshot(&a), want);
+fn removed_no_apply_alias_is_a_usage_error() {
+    // v5 removed the hidden `--no-apply` alias; `--save-only` (or
+    // SOCKET_SAVE_ONLY) is the only spelling.
+    let _scrub = EnvScrub::new();
+    let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--no-apply"]) {
+        Ok(_) => panic!("--no-apply should no longer parse"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
 // --- `--mode` selector (v4.0) --------------------------------------------
 //
 // `get --mode <hosted|vendored|agent>` reuses scan's `ScanMode` value-enum
 // (see cli_parse_scan.rs) so the two commands can never drift on mode
-// names. Unlike scan, `get` has NO legacy boolean spellings and no
+// names. Unlike scan, `get` has no `--sync` shorthand and no
 // `resolve_mode_flags` fold — the parsed enum IS the source of truth
 // (`None` = agent, today's behavior; the `--save-only` conflict is
 // enforced inside `run()`, not by clap — pinned in get_modes_e2e.rs).
@@ -574,22 +530,18 @@ fn mode_rejects_unknown_value() {
     }
 }
 
-// --- `download` visible alias for `get` -------------------------------------
+// --- removed `download` alias -------------------------------------------------
 
 #[test]
 #[serial_test::serial]
-fn download_visible_alias_routes_to_get() {
+fn removed_download_alias_is_a_usage_error() {
+    // v5 removed the `download` alias for `get`.
     let _scrub = EnvScrub::new();
-    let cli = Cli::try_parse_from(["socket-patch", "download", "some-id"]).expect("parse");
-    match cli.command {
-        Commands::Get(a) => {
-            // The alias must produce a `GetArgs` identical, across the entire
-            // parsed surface, to what bare `get some-id` produces — not some
-            // divergently-parsed command that merely happens to be `Get`.
-            assert_eq!(snapshot(&a), expected_defaults("some-id"));
-        }
-        _ => panic!("expected Get from `download` alias"),
-    }
+    let err = match Cli::try_parse_from(["socket-patch", "download", "some-id"]) {
+        Ok(_) => panic!("`download` should no longer parse"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
 }
 
 // --- Error paths -------------------------------------------------------------

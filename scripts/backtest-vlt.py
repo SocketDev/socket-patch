@@ -88,7 +88,7 @@ HISTORICAL_INTEGRITY = Path(__file__).with_name('vlt-historical-integrity.json')
 VERSIONS = ['0.0.0-16', '0.0.0-32', '1.0.0-rc.14', '1.0.0-rc.32', '1.0.4', '1.0.10', '1.2.0']
 MODES = ['hosted', 'vendored', 'agent']
 PURL = 'pkg:npm/minimist@1.2.2'
-UUID = '80630680-4da6-45f9-bba8-b888e0ffd58c'
+UUID = '642d7f02-ebc1-4ab0-99e2-07f5dd8463cb'
 NAME = 'minimist'
 VERSION = '1.2.2'
 TARGET = f'{NAME}@{VERSION}'
@@ -993,6 +993,7 @@ class Cell:
         self.envelopes = []
         self.fresh_patched = {}
         self.cli_failures = []
+        self.preflight_failures = []
 
     # CLI -------------------------------------------------------------------
     def cli(self, args, cwd=None):
@@ -1011,7 +1012,11 @@ class Cell:
         cwd = cwd or self.project
         verb = ['get', UUID] if self.spec.get('driver') == 'get' else ['scan']
         code, out, err = self.cli([*verb, '--mode', mode, '--yes', '--cwd', cwd], cwd)
-        return code, parse_envelope(out), err
+        envelope = parse_envelope(out)
+        # A successful run's envelope is not on the row; keep the preflight's
+        # reasons there so the transport retry sees them.
+        self.preflight_failures.extend(envelope_details(envelope, BLOCKED_CODES[0]))
+        return code, envelope, err
 
     def revert(self):
         if self.mode == 'hosted':
@@ -1064,7 +1069,7 @@ class Cell:
         ok = True
         for copy_dir in self.copies(root, lock_text):
             for key, hashes in self.record['files'].items():
-                path = copy_dir / key.split('/', 1)[1]
+                path = copy_dir / key.removeprefix('package/')
                 digest = git_hash(path.read_bytes()) if path.is_file() else None
                 details[str(path.relative_to(root))] = digest
                 ok = ok and digest == hashes.get(f'{side}Hash')
@@ -1204,6 +1209,8 @@ class Cell:
     def finish(self, row, checks, started):
         if self.cli_failures:
             row['cliFailures'] = self.cli_failures
+        if self.preflight_failures:
+            row['preflightFailures'] = self.preflight_failures
         row['failingChecks'] = [k for k, v in checks.items() if v is False]
         row['notEvaluated'] = [k for k, v in checks.items() if v is None]
         row.setdefault('codes', [])
@@ -1469,6 +1476,19 @@ class Cell:
 # The CLI's own report of a transport failure: a request error, or a 5xx from
 # the patch API (e.g. "API request failed with status 504: error code: 504").
 CLI_TRANSPORT_FAILURE = re.compile(r'error sending request for url \(|API request failed with status 5\d\d\b')
+# The hosted vlt artifact preflight's fetch of the artifact failed in transit
+# (vlt_preflight.rs `ArtifactProbe::failure`: "fetch error <e>", "http <5xx>").
+# The CLI withholds the dep, writes nothing and exits 0, so the cell reads as
+# a safe refusal although the cell's own probe of the same URL verified. The
+# fetch errors that are deterministic (an over-cap body, a non-http URL) and
+# every other reason (content-encoding, sha512 mismatch, 4xx) stay final.
+PREFLIGHT_TRANSPORT_FAILURE = re.compile(
+    r'vlt would fail to verify \S+: (?:http 5\d\d\b'
+    r'|fetch error (?!refusing a non-http)(?![^;]*too large))')
+# vlt's own registry fetch dropped (Node's errno codes for a connect or read
+# timeout, a reset connection and a temporary DNS failure). ENOTFOUND and
+# ECONNREFUSED stay final: a wrongly rewritten URL fails that way too.
+VLT_TRANSPORT_FAILURE = re.compile(r'\b(?:ETIMEDOUT|ECONNRESET|EAI_AGAIN)\b|socket hang up')
 
 
 def transient(row):
@@ -1481,7 +1501,9 @@ def transient(row):
     if probe and (probe.get('curlExit') or (probe.get('status') or 0) >= 500
                   or probe.get('status') is None):
         return True
-    return bool(CLI_TRANSPORT_FAILURE.search(json.dumps(row)))
+    text = json.dumps(row)
+    return any(p.search(text) for p in (CLI_TRANSPORT_FAILURE, PREFLIGHT_TRANSPORT_FAILURE,
+                                         VLT_TRANSPORT_FAILURE))
 
 
 def run_with_retries(cell_factory, job, attempts=3):

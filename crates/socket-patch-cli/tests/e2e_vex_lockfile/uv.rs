@@ -10,7 +10,7 @@
 //! rewriters (`rewrite_python_lock`, `rewrite_project_metadata`,
 //! `rewrite_script_metadata`) over real uv output (uv 0.11 `uv lock` /
 //! `uv lock --script` / `uv export --format pylock.toml` grammar), and the
-//! writer-driven cells run the real `scan --mode hosted --vex` / `scan --vendor
+//! writer-driven cells run the real `scan --mode hosted --vex` / `scan --mode vendored
 //! --vex` binaries against a wiremock patch API. The package is a made-up
 //! `vexfixture`, so no interpreter's global site-packages on the test host
 //! can hold a copy (a no-venv python project falls back to the global
@@ -36,8 +36,10 @@
 //!      installed + patched → attests after hashing; installed pristine →
 //!      `not_applied`; a pin-less hosted entry needs an installed tree.
 //!
-//! Plus the embedded entry points (`scan --mode hosted --vex`, `scan --vendor
+//! Plus the embedded entry points (`scan --mode hosted --vex`, `scan --mode vendored
 //! --vex`, `apply --vex`).
+
+use crate::common::binary;
 
 use crate::vex_e2e_common;
 
@@ -548,13 +550,13 @@ fn write_redirect_ledger(p: &Proj, ledger_purl: &str, record: PatchRecord, files
 /// shape every current vendor writer persists).
 fn write_vendor_ledger(p: &Proj, flavor: Flavor, rel: &str, sha: &str, record: PatchRecord) {
     let mut state = VendorState::new();
-    state.entries.insert(
-        flavor.api_purl(),
-        VendorEntry {
-            ecosystem: "pypi".to_string(),
-            base_purl: flavor.purl(),
-            uuid: record.uuid.clone(),
-            artifact: VendorArtifact {
+    let mut entry = VendorEntry {
+        flavor: Some(flavor.ledger_flavor().to_string()),
+        ..VendorEntry::new(
+            "pypi".to_string(),
+            flavor.purl(),
+            record.uuid.clone(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel.to_string(),
                 sha256: sha.to_string(),
@@ -562,7 +564,7 @@ fn write_vendor_ledger(p: &Proj, flavor: Flavor, rel: &str, sha: &str, record: P
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: flavor
+            flavor
                 .native_files()
                 .iter()
                 .map(|(file, _)| WiringRecord {
@@ -574,18 +576,10 @@ fn write_vendor_ledger(p: &Proj, flavor: Flavor, rel: &str, sha: &str, record: P
                     new: None,
                 })
                 .collect(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: Some(record),
-            flavor: Some(flavor.ledger_flavor().to_string()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
-    );
+        )
+    };
+    entry.record = Some(record);
+    state.entries.insert(flavor.api_purl(), entry);
     p.write(
         ".socket/vendor/state.json",
         serde_json::to_string_pretty(&state).unwrap(),
@@ -671,10 +665,6 @@ impl Api {
 }
 
 // ── running the CLI ─────────────────────────────────────────────────────
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// The CLI with the ambient `SOCKET_*` / python / uv discovery environment
 /// scrubbed and uv's cache pointed into `p.home`.
@@ -1368,7 +1358,7 @@ fn pinless_hosted_entry_needs_an_installed_tree() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Writer-driven: the REAL `scan --mode hosted --vex` / `scan --vendor --vex`
+// Writer-driven: the REAL `scan --mode hosted --vex` / `scan --mode vendored --vex`
 // write the wiring and the ledgers; then the manifest (and the ledgers) are
 // deleted and standalone `vex` must still attest — and stop attesting once
 // the real revert unwinds the wiring with the ledger left behind.
@@ -1631,7 +1621,7 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
     }
 }
 
-/// `scan --vendor --vex --vendor-source build` over the installed (pristine)
+/// `scan --mode vendored --vex --vendor-source build` over the installed (pristine)
 /// dist rebuilds the patched wheel into `.socket/vendor/pypi/<uuid>/`, wires
 /// the lock, writes the ledger (never a manifest: vendored mode is
 /// manifest-free) and attests in-run. A legacy manifest seeded beside the
@@ -1648,7 +1638,7 @@ fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
             // uv vendoring always edits the pyproject/lock pair.
             continue;
         }
-        let what = format!("{} scan --vendor", flavor.label());
+        let what = format!("{} scan --mode vendored", flavor.label());
         let p = Proj::new();
         p.write_files(&flavor.native_files());
         p.install(flavor.version(), PRISTINE);
@@ -1662,7 +1652,8 @@ fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
         let embedded = p.root.join("embedded.vex.json");
         let args = vec![
             "scan",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--vendor-source",
             "service",
             "--vex",

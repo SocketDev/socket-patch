@@ -29,14 +29,17 @@
 pub(crate) mod bun;
 pub mod cargo;
 pub mod composer;
-pub mod governing_locks;
 pub mod gem;
+pub mod governing_locks;
+pub(crate) mod json;
 pub(crate) mod maven;
 pub(crate) mod nuget;
+pub(crate) mod pipenv;
 pub mod pnpm;
 pub mod registry;
 pub mod sbt;
 pub mod text;
+pub(crate) mod xml;
 pub mod yarn;
 
 pub use registry::registry;

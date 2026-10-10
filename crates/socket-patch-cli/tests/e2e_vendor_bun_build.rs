@@ -74,13 +74,17 @@
 //! equal `bun --version`, so a CI leg cannot pass by running the wrong bun
 //! or no bun at all.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256, parse_json_envelope};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -135,10 +139,6 @@ const LOCK_V1_FROM: BunVersion = (1, 2, 0);
 const LOCK_V2_FROM: BunVersion = (1, 4, 0);
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// The REQUIRED gate: set AND non-empty. CI's e2e matrix passes
 /// `SOCKET_PATCH_BUN_E2E_REQUIRED: ${{ matrix.bun != '' && '1' || '' }}`,
@@ -295,13 +295,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
-
 fn b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -309,11 +302,6 @@ fn b64(bytes: &[u8]) -> String {
 
 fn sri(bytes: &[u8]) -> String {
     format!("sha512-{}", b64(&Sha512::digest(bytes)))
-}
-
-fn parse_envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("--json output is not JSON: {e}\nstdout:\n{stdout}"))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
@@ -1041,7 +1029,7 @@ fn stage_and_vendor(fx: &BunProject) {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
@@ -1112,7 +1100,7 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         code, 0,
         "repair failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["status"], "success", "repair envelope: {renv}");
     assert_eq!(
         renv["summary"]["rebuilt"], 1,
@@ -1150,7 +1138,7 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         code, 0,
         "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env2 = parse_envelope(&stdout);
+    let env2 = parse_json_envelope(&stdout);
     assert_eq!(env2["summary"]["failed"], 0, "re-run must not fail: {env2}");
     assert_eq!(
         env2["summary"]["applied"], 0,
@@ -1191,7 +1179,7 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
     assert_eq!(
@@ -1380,7 +1368,7 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
         code, 0,
         "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["found"], 1, "envelope: {env}");
     assert_eq!(env["downloaded"], 1, "envelope: {env}");
@@ -1575,7 +1563,7 @@ fn bun_vendor_survives_a_digest_dropping_lock_resave() {
         code, 0,
         "re-vendor over the re-saved lock failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env = parse_envelope(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "{env}");
     assert_eq!(env["summary"]["failed"], 0, "{env}");
     assert!(
@@ -1617,7 +1605,7 @@ fn bun_vendor_survives_a_digest_dropping_lock_resave() {
         code, 0,
         "repair failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["status"], "success", "{renv}");
     assert_eq!(renv["summary"]["rebuilt"], 1, "{renv}");
     assert!(vendored_tgz(&fx).is_file(), "the artifact must be rebuilt");
@@ -1655,7 +1643,7 @@ fn bun_vendor_survives_a_digest_dropping_lock_resave() {
         code, 0,
         "revert over the re-saved lock failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let renv = parse_envelope(&stdout);
+    let renv = parse_json_envelope(&stdout);
     assert_eq!(renv["status"], "success", "{renv}");
     assert_eq!(renv["summary"]["removed"], 1, "{renv}");
     let restored = std::fs::read_to_string(&lock_path).unwrap();

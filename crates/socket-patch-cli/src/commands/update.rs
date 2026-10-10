@@ -9,7 +9,7 @@
 
 use clap::Args;
 use socket_patch_core::update::{
-    self as core_update, asset_name_for_target, channel_label, current_version, detect_channel,
+    self as core_update, asset_name_for_target, channel_label_for, current_version, detect_channel,
     fetch_latest_version, is_newer, upgrade_hint_for, ChannelEnv, InstallChannel, UpdateEndpoints,
     UpdateError, UpdateRequest, UpdateTimeouts,
 };
@@ -58,7 +58,6 @@ pub struct UpdateArgs {
     /// on the requested version.
     #[arg(
         long,
-        env = "SOCKET_FORCE",
         default_value_t = false,
         value_parser = parse_bool_flag,
     )]
@@ -82,18 +81,9 @@ fn fail(args: &UpdateArgs, code: &str, message: &str) -> i32 {
         let env = error_envelope(Command::Update, args.common.dry_run, code, message);
         println!("{}", env.to_pretty_json());
     } else {
-        eprintln!("Error: {}", capitalize_first(message));
+        eprintln!("Error: {}", crate::ui::sentence_case(message));
     }
     1
-}
-
-/// `"could not ..."` → `"Could not ..."` (char-safe; empty stays empty).
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
 }
 
 /// The no-op message when there is nothing to install: a pin already
@@ -176,7 +166,7 @@ fn download_status(target: &semver::Version, asset: &str) -> String {
 /// rendered stderr line keeps update's own `Warning: <detail>` wording).
 fn note_warning(warnings: &mut Vec<RunWarning>, quiet: bool, code: &str, detail: String) {
     if !quiet {
-        eprintln!("Warning: {}", capitalize_first(&detail));
+        eprintln!("Warning: {}", crate::ui::sentence_case(&detail));
     }
     warnings.push(RunWarning {
         code: code.to_string(),
@@ -222,7 +212,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                 format!(
                     "this install is managed by {} — its next upgrade will overwrite \
                      the updated binary.",
-                    channel_label(channel)
+                    channel_label_for(channel, &install_path)
                 ),
             );
         } else {
@@ -233,7 +223,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                     "this socket-patch binary ({}) is managed by {}; update it with `{}` \
                      instead, or pass --force to replace it in place",
                     install_path.display(),
-                    channel_label(channel),
+                    channel_label_for(channel, &install_path),
                     hint
                 ),
             );
@@ -388,11 +378,13 @@ pub async fn run(args: UpdateArgs) -> i32 {
     if args.common.json {
         let mut env = Envelope::new(Command::Update);
         env.record(
-            PatchEvent::artifact(PatchAction::Downloaded).with_details(serde_json::json!({
-                "asset": outcome.asset,
-                "bytes": outcome.archive_bytes,
-                "sha256": outcome.archive_sha256,
-            })),
+            PatchEvent::artifact(PatchAction::Downloaded)
+                .with_bytes(outcome.archive_bytes)
+                .with_details(serde_json::json!({
+                    "asset": outcome.asset,
+                    "bytes": outcome.archive_bytes,
+                    "sha256": outcome.archive_sha256,
+                })),
         );
         env.record(
             PatchEvent::artifact(PatchAction::Updated).with_details(serde_json::json!({
@@ -512,12 +504,12 @@ mod tests {
             "Downloading socket-patch 9.9.9 (socket-patch-x.tar.gz)..."
         );
         assert_eq!(
-            capitalize_first("could not check for updates: x"),
+            crate::ui::sentence_case("could not check for updates: x"),
             "Could not check for updates: x"
         );
-        assert_eq!(capitalize_first(""), "");
-        assert_eq!(capitalize_first("éclair"), "Éclair");
-        assert_eq!(capitalize_first("Already"), "Already");
+        assert_eq!(crate::ui::sentence_case(""), "");
+        assert_eq!(crate::ui::sentence_case("éclair"), "Éclair");
+        assert_eq!(crate::ui::sentence_case("Already"), "Already");
     }
 
     #[test]

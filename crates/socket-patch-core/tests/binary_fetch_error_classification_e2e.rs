@@ -1,4 +1,4 @@
-//! The binary transport path (`fetch_blob` / `fetch_diff`, both sharing
+//! The binary transport path (`fetch_blob`, via
 //! `fetch_binary`) must classify authenticated 401 / 403 / 429 responses the
 //! same way the JSON path does.
 //!
@@ -25,8 +25,7 @@ fn authed_client(api_url: &str) -> ApiClient {
     ApiClient::new(ApiClientOptions {
         api_url: api_url.to_string(),
         api_token: Some("sktsec_token_placeholder_api".to_string()),
-        use_public_proxy: false,
-        org_slug: Some("my-org".to_string()),
+        route: socket_patch_core::api::client::ApiRoute::org("my-org"),
     })
 }
 

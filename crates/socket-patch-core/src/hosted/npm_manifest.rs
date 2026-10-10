@@ -23,7 +23,7 @@ pub fn decode_hosted_npm_manifest(bytes: &[u8], sha512: Option<&str>) -> Result<
         .ok_or_else(|| "hosted tarball has no package/package.json".to_string())?;
     let text = std::str::from_utf8(manifest)
         .map_err(|_| "hosted tarball package.json is not UTF-8".to_string())?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = crate::formats::text::strip_bom(text);
     if !serde_json::from_str::<serde_json::Value>(text).is_ok_and(|v| v.is_object()) {
         return Err("hosted tarball package.json is not a JSON object".to_string());
     }
@@ -41,6 +41,50 @@ pub async fn fetch_hosted_npm_manifest(
         .await
         .map_err(|error| format!("cannot fetch the hosted tarball: {error}"))?;
     decode_hosted_npm_manifest(&bytes, sha512)
+}
+
+/// What a yarn classic hosted pin reads from the served npm tarball.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedClassicArtifact {
+    /// The tarball's sha1 (hex), for the pin's `resolved "<url>#<sha1>"`
+    /// fragment when the grant carries none (#558). Yarn 1 names its cache
+    /// slot after that fragment, so a fragmentless URL shares the slot of
+    /// any fragmentless upstream copy of the same version.
+    pub sha1: String,
+    /// The tarball's own `package.json` text: yarn 1 installs the
+    /// dependencies the lock block's sub-maps name, so a patch that
+    /// changes them needs the block rewritten, and every new descriptor
+    /// locked (#591).
+    pub manifest: String,
+}
+
+/// [`HostedClassicArtifact`] from the served bytes, which must match the
+/// grant's sha512: that is what the pin's `integrity` line names, and a
+/// sha1 taken from any other bytes would pin a tarball yarn then refuses.
+pub fn decode_hosted_classic_artifact(
+    bytes: &[u8],
+    sha512: &str,
+) -> Result<HostedClassicArtifact, String> {
+    crate::vendor::registry_fetch::verify_sri(bytes, sha512)
+        .map_err(|_| "hosted tarball does not match its published sha512".to_string())?;
+    Ok(HostedClassicArtifact {
+        sha1: crate::utils::digest::sha1_hex_of(bytes),
+        manifest: decode_hosted_npm_manifest(bytes, None)?,
+    })
+}
+
+/// Download the served tarball and decode it
+/// ([`decode_hosted_classic_artifact`]).
+pub async fn fetch_hosted_classic_artifact(
+    client: &ApiClient,
+    url: &str,
+    sha512: &str,
+) -> Result<HostedClassicArtifact, String> {
+    let bytes = client
+        .download_artifact(url)
+        .await
+        .map_err(|error| format!("cannot fetch the hosted tarball: {error}"))?;
+    decode_hosted_classic_artifact(&bytes, sha512)
 }
 
 #[cfg(test)]
@@ -61,6 +105,22 @@ mod tests {
             builder.append_data(&mut header, path, *data).unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn classic_artifact_is_read_from_bytes_matching_the_sha512() {
+        let manifest = br#"{"name":"left-pad","dependencies":{"is-odd":"^3.0.0"}}"#;
+        let bytes = tgz(&[("package/package.json", manifest)]);
+        let sri = sha512_sri_of(&bytes);
+        let artifact = decode_hosted_classic_artifact(&bytes, &sri).unwrap();
+        assert_eq!(artifact.sha1, crate::utils::digest::sha1_hex_of(&bytes));
+        assert_eq!(artifact.manifest.as_bytes(), manifest);
+        let other = sha512_sri_of(b"other bytes");
+        assert!(decode_hosted_classic_artifact(&bytes, &other).is_err());
+        let no_manifest = tgz(&[("package/index.js", b"1")]);
+        assert!(
+            decode_hosted_classic_artifact(&no_manifest, &sha512_sri_of(&no_manifest)).is_err()
+        );
     }
 
     #[test]
@@ -95,5 +155,27 @@ mod tests {
             .unwrap_err()
             .contains("not a JSON object"));
         assert!(decode_hosted_npm_manifest(b"not gzip", None).is_err());
+    }
+
+    /// One leading BOM is encoding (npm strips it); a second is content
+    /// and leaves the manifest unparseable, as for every `formats::text`
+    /// reader.
+    #[test]
+    fn reads_past_one_bom_only() {
+        let one = tgz(&[(
+            "package/package.json",
+            "\u{feff}{\"name\":\"uuid\"}".as_bytes(),
+        )]);
+        assert_eq!(
+            decode_hosted_npm_manifest(&one, None).unwrap(),
+            "{\"name\":\"uuid\"}"
+        );
+        let two = tgz(&[(
+            "package/package.json",
+            "\u{feff}\u{feff}{\"name\":\"uuid\"}".as_bytes(),
+        )]);
+        assert!(decode_hosted_npm_manifest(&two, None)
+            .unwrap_err()
+            .contains("not a JSON object"));
     }
 }

@@ -8,6 +8,7 @@
 pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
+pub mod interrupt;
 /// The in-memory hosted engine, which lives in core
 /// ([`socket_patch_core::hosted::memory`]); re-exported under its old path
 /// for the `hosted-bundle` harness and the integration tests.
@@ -18,6 +19,7 @@ pub mod ui;
 pub mod update_notifier;
 
 use clap::{Parser, Subcommand};
+use socket_patch_core::utils::target::is_uuid_shaped;
 
 // CLI contract surface — subcommand names, visible_alias values, flag names,
 // defaults, JSON shapes, and exit codes are PUBLIC and SEMVER-SIGNIFICANT.
@@ -30,18 +32,21 @@ use clap::{Parser, Subcommand};
     version,
     propagate_version = true,
     after_help = "Patch a project:\n  \
-        socket-patch scan       Patch every dependency with a patch (hosted: rewrites lockfiles)\n  \
-        socket-patch get        Patch one package, CVE, GHSA or patch UUID\n  \
-        socket-patch list       Show the patches in this project\n\n\
+        socket-patch scan --dry-run   Preview hosted changes from dependency files\n  \
+        socket-patch scan             Write hosted references for dependencies with patches\n  \
+        socket-patch get              Patch one package, CVE, GHSA or patch UUID\n  \
+        socket-patch list             Show the patches in this project\n\n\
+        Supported lockfiles work from a fresh checkout; install dependencies after scanning.\n\n\
         Undo:\n  \
-        socket-patch remove     Unwind one patch (by PURL or UUID)\n  \
-        socket-patch rollback   Unwind every patch\n\n\
+        socket-patch remove           Unwind one patch (by PURL or UUID)\n  \
+        socket-patch rollback         Unwind every patch\n\n\
         Ship:\n  \
-        socket-patch vex        Emit an OpenVEX document for your vulnerability scanner\n  \
-        socket-patch vendor     Eject the patches into .socket/vendor/ for offline installs\n\n\
+        socket-patch vex              Emit an OpenVEX document for your vulnerability scanner\n  \
+        socket-patch vendor           Eject the patches into .socket/vendor/ for offline installs\n\n\
+        Repair artifacts (agent and vendored):\n  \
+        socket-patch repair           Restore missing or corrupt artifacts; clean unused ones\n\n\
         Agent mode (`scan --mode agent` edits installed files in place):\n  \
-        socket-patch apply      Re-apply .socket/manifest.json after each install (e.g. in CI)\n  \
-        socket-patch repair     Restore missing patch artifacts"
+        socket-patch apply            Re-apply .socket/manifest.json after each install (e.g. in CI)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -66,12 +71,20 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Find patches for installed packages and apply them by rewriting
-    /// lockfiles to Socket-hosted patched packages
+    /// Find patches from project dependency files; write hosted lockfile
+    /// references by default (preview with --dry-run)
+    ///
+    /// Rewrites lockfiles and related dependency files to use Socket-hosted
+    /// patched packages without prompting. Use `scan --dry-run` to preview
+    /// changes without writing them.
+    ///
+    /// Supported lockfiles can be scanned from a fresh checkout before
+    /// installing dependencies. Some workflows require installed packages or
+    /// build-tool resolution records first: agent mode patches installed
+    /// files, and sbt / scala-cli need their build tool's resolution records.
     Scan(commands::scan::ScanArgs),
 
     /// Patch one package, CVE, GHSA or patch UUID (hosted mode by default)
-    #[command(visible_alias = "download")]
     Get(commands::get::GetArgs),
 
     /// List the patches in this project: hosted and vendored lockfile
@@ -101,12 +114,12 @@ pub enum Commands {
     /// Agent mode: apply the patches in `.socket/manifest.json` in place
     Apply(commands::apply::ApplyArgs),
 
-    /// Agent mode: download missing patch artifacts and clean up unused ones
+    /// Restore agent or vendored patch artifacts and clean up unused ones
     ///
-    /// Restores missing blobs and diff/package archives, rebuilds missing
-    /// or corrupt vendored artifacts, then deletes the artifacts nothing
-    /// references.
-    #[command(visible_alias = "gc")]
+    /// Downloads missing agent patch data and redownloads missing or corrupt
+    /// vendored artifacts using the existing vendor ledger, then deletes
+    /// unreferenced artifacts. A lost `.socket/vendor/state.json` cannot be
+    /// reconstructed; restore it from version control.
     Repair(commands::repair::RepairArgs),
 
     // Internal parse target of the root `--update` flag (see the rewrite
@@ -252,22 +265,64 @@ pub fn try_parse_cli(argv: &[String]) -> Result<Cli, clap::Error> {
     Cli::from_arg_matches_mut(&mut matches).map_err(|e| e.format(&mut cli_command()))
 }
 
-/// Check whether `s` looks like a UUID (8-4-4-4-12 hex pattern).
-///
-/// Used by [`parse_argv_with_shortcuts`] to detect the convenience form
-/// `socket-patch <UUID>` and rewrite it to `socket-patch get <UUID>`, and
-/// by rollback's target resolver to decide whether a no-match identifier
-/// error should hint at the path-glob spelling.
-pub(crate) fn looks_like_uuid(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 {
-        return false;
+/// Is there a UUID-shaped operand among `args` (argv without argv[0])
+/// before the first subcommand name? A value-taking flag's value
+/// (`--org <UUID>`, `-o<v>`) is not an operand, so a UUID-shaped org slug
+/// or token never turns `socket-patch --org <UUID> scan --help` into
+/// `get`. After `--` every token is an operand.
+fn first_operand_is_uuid(args: &[String], subcommands: &[String]) -> bool {
+    // The rewrite parses `args` as `get`'s, so `get`'s value-taking flags
+    // (the shared global options included) decide what is a flag value.
+    let cmd = cli_command();
+    let get = cmd.find_subcommand("get").expect("get subcommand");
+    let mut longs: Vec<&str> = Vec::new();
+    let mut shorts: Vec<char> = Vec::new();
+    for arg in cmd.get_arguments().chain(get.get_arguments()) {
+        if !arg.get_action().takes_values() || arg.is_positional() {
+            continue;
+        }
+        longs.extend(arg.get_long());
+        longs.extend(arg.get_all_aliases().unwrap_or_default());
+        shorts.extend(arg.get_short());
+        shorts.extend(arg.get_all_short_aliases().unwrap_or_default());
     }
-    let expected = [8, 4, 4, 4, 12];
-    parts
-        .iter()
-        .zip(expected.iter())
-        .all(|(p, &len)| p.len() == len && p.chars().all(|c| c.is_ascii_hexdigit()))
+    let mut options_ended = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if !options_ended {
+            if a == "--" {
+                options_ended = true;
+                continue;
+            }
+            if subcommands.iter().any(|s| s == a) {
+                return false;
+            }
+            if let Some(long) = a.strip_prefix("--") {
+                if !long.contains('=') && longs.contains(&long) {
+                    i += 1;
+                }
+                continue;
+            }
+            if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+                // `-xo VALUE` or `-xoVALUE`: the first value-taking short
+                // consumes the rest of the cluster, or the next token
+                // when it ends the cluster.
+                let chars: Vec<char> = cluster.chars().collect();
+                if let Some(at) = chars.iter().position(|c| shorts.contains(c)) {
+                    if at + 1 == chars.len() {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+        }
+        if is_uuid_shaped(a) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse a full argv vector with two convenience rewrites on failure:
@@ -276,7 +331,81 @@ pub(crate) fn looks_like_uuid(s: &str) -> bool {
 /// no rewrite applies or the applicable rewrite also genuinely fails.
 ///
 /// Pulled out of `main.rs` so the fallback paths are unit-testable.
+///
+/// An unknown subcommand that names a retired one (`setup`, `unlock`), or
+/// whose clap typo tip would point at a hidden internal subcommand
+/// (`self-update`, `hosted-bundle`), gets a precise usage error instead of
+/// the misleading tip (B76). Still a usage error: exit 2.
 pub fn parse_argv_with_shortcuts(argv: Vec<String>) -> Result<Cli, clap::Error> {
+    parse_with_rewrites(argv).map_err(explain_unknown_subcommand)
+}
+
+/// Subcommands earlier majors had, with what to do instead.
+const RETIRED_SUBCOMMANDS: &[(&str, &str)] = &[
+    (
+        "setup",
+        "was removed in v5.0, together with the install hooks it wired. In CI, run \
+         `socket-patch apply` after each install (agent mode), or switch to \
+         `socket-patch scan --mode hosted` or `--mode vendored`, whose lockfile edits \
+         need no hook. To remove the old Bundler plugin, delete the Gemfile \
+         `plugin \"socket-patch\"` block and `.socket/bundler-plugin/`, then run \
+         `bundle plugin uninstall socket-patch` in every checkout that ran \
+         `bundle install` with it",
+    ),
+    (
+        "unlock",
+        "was removed in v4.0: a lock left by a crashed run never blocks the next run, \
+         so there is nothing to unlock",
+    ),
+];
+
+const SELF_UPDATE_TIP: &str = "to update socket-patch itself, run `socket-patch --update`";
+
+/// Hidden subcommands clap may still suggest as a typo fix, with the tip
+/// that replaces the suggestion (`None`: no tip).
+const HIDDEN_SUBCOMMAND_TIPS: &[(&str, Option<&str>)] = &[
+    ("self-update", Some(SELF_UPDATE_TIP)),
+    ("hosted-bundle", None),
+];
+
+/// Replace clap's tip for an unknown subcommand when it would mislead: a
+/// retired v4 spelling (`setup` suggests the hidden `self-update`) or any
+/// suggestion naming a hidden internal subcommand.
+fn explain_unknown_subcommand(err: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if err.kind() != ErrorKind::InvalidSubcommand {
+        return err;
+    }
+    let Some(ContextValue::String(name)) = err.get(ContextKind::InvalidSubcommand) else {
+        return err;
+    };
+    let message = if let Some((_, why)) = RETIRED_SUBCOMMANDS.iter().find(|(n, _)| n == name) {
+        format!("the `{name}` subcommand {why}")
+    } else if name == "update" {
+        // Self-update is the root `--update` flag, not a subcommand.
+        format!("unrecognized subcommand '{name}'\n\n  tip: {SELF_UPDATE_TIP}")
+    } else {
+        let suggested: Vec<&str> = match err.get(ContextKind::SuggestedSubcommand) {
+            Some(ContextValue::String(s)) => vec![s.as_str()],
+            Some(ContextValue::Strings(s)) => s.iter().map(String::as_str).collect(),
+            _ => Vec::new(),
+        };
+        let Some((_, tip)) = HIDDEN_SUBCOMMAND_TIPS
+            .iter()
+            .find(|(hidden, _)| suggested.contains(hidden))
+        else {
+            return err;
+        };
+        match tip {
+            Some(tip) => format!("unrecognized subcommand '{name}'\n\n  tip: {tip}"),
+            None => format!("unrecognized subcommand '{name}'"),
+        }
+    };
+    clap::Error::raw(ErrorKind::InvalidSubcommand, format!("{message}\n"))
+        .format(&mut cli_command())
+}
+
+fn parse_with_rewrites(argv: Vec<String>) -> Result<Cli, clap::Error> {
     match try_parse_cli(&argv) {
         Ok(cli) => Ok(cli),
         Err(err) => {
@@ -330,7 +459,18 @@ pub fn parse_argv_with_shortcuts(argv: Vec<String>) -> Result<Cli, clap::Error> 
                     Err(_) => Err(err),
                 };
             }
-            if argv.len() >= 2 && looks_like_uuid(&argv[1]) {
+            // The UUID shortcut keys on the first UUID-shaped token before
+            // any subcommand name, not just argv[1], so root-position flags
+            // are fine: `socket-patch --json <UUID>` is `get --json <UUID>`.
+            // The shape is the shared target grammar's
+            // ([`is_uuid_shaped`]), the same one `get` classifies with.
+            let subcommands: Vec<String> = cli_command()
+                .get_subcommands()
+                .flat_map(|c| std::iter::once(c.get_name()).chain(c.get_all_aliases()))
+                .map(str::to_string)
+                .collect();
+            let uuid_operand = first_operand_is_uuid(&argv[1..], &subcommands);
+            if uuid_operand {
                 let mut new_args = vec![argv[0].clone(), "get".into()];
                 new_args.extend_from_slice(&argv[1..]);
                 match try_parse_cli(&new_args) {
@@ -358,8 +498,9 @@ mod tests {
     //! uses — both of which are part of the CLI contract (see
     //! `CLI_CONTRACT.md`).
     use super::*;
+    use socket_patch_core::utils::target::is_uuid_shaped as looks_like_uuid;
 
-    // ---------- looks_like_uuid ----------
+    // ---------- looks_like_uuid (the shared core UUID shape) ----------
 
     #[test]
     fn looks_like_uuid_accepts_canonical_lowercase() {
@@ -478,6 +619,62 @@ mod tests {
             }
             _ => panic!("expected Commands::Get"),
         }
+    }
+
+    /// The shortcut keys on the first UUID-shaped operand, not just
+    /// argv[1]: `socket-patch --json <UUID>` used to fail with
+    /// "unexpected argument '--json'".
+    #[test]
+    fn fallback_rewrites_a_uuid_after_leading_flags() {
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "--json", UUID])).unwrap();
+        match cli.command {
+            Commands::Get(args) => {
+                assert_eq!(args.identifier, UUID);
+                assert!(args.common.json);
+            }
+            _ => panic!("expected the get subcommand"),
+        }
+        // A UUID after a real subcommand is that subcommand's operand.
+        assert!(parse_argv_with_shortcuts(argv(&["socket-patch", "list", UUID])).is_err());
+    }
+
+    #[test]
+    fn fallback_skips_a_uuid_shaped_flag_value() {
+        // A UUID-shaped flag value is the flag's value, not the shortcut
+        // operand: `--org <UUID> scan` must fail exactly as `--org acme
+        // scan` does, never parse as `get scan` (which would run `get`
+        // with `scan` as its identifier).
+        for flags in [
+            vec!["--org", UUID],
+            vec!["-o", UUID],
+            vec!["--api-token", UUID],
+        ] {
+            for tail in [vec!["scan"], vec!["scan", "--help"]] {
+                let mut args = vec!["socket-patch"];
+                args.extend(flags.iter().copied());
+                args.extend(tail.iter().copied());
+                let err = match parse_argv_with_shortcuts(argv(&args)) {
+                    Ok(cli) => panic!(
+                        "{args:?} was rewritten to {:?}",
+                        std::mem::discriminant(&cli.command)
+                    ),
+                    Err(e) => e,
+                };
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{args:?}"
+                );
+            }
+        }
+        assert!(!first_operand_is_uuid(
+            &argv(&["--org", UUID, "-o", UUID, "--org=x"]),
+            &[]
+        ));
+        assert!(first_operand_is_uuid(&argv(&["--org", "acme", UUID]), &[]));
+        assert!(first_operand_is_uuid(&argv(&["-oacme", UUID]), &[]));
+        assert!(first_operand_is_uuid(&argv(&["--org=acme", UUID]), &[]));
+        assert!(first_operand_is_uuid(&argv(&["--", UUID]), &[]));
     }
 
     #[test]

@@ -12,11 +12,29 @@ pub struct VulnerabilityInfo {
 }
 
 /// Hash information for a single patched file.
+///
+/// Both hashes are lowercase hex once deserialized, whatever case the
+/// manifest spells them in (#707): apply and rollback verification, blob
+/// names and vendored pins then compare them to a computed (lowercase)
+/// git-sha256 with plain `==`, and no comparison site needs its own case
+/// rule.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchFileInfo {
+    #[serde(deserialize_with = "deserialize_hash")]
     pub before_hash: String,
+    #[serde(deserialize_with = "deserialize_hash")]
     pub after_hash: String,
+}
+
+/// The manifest's hash case policy: a loaded hash is lowercase hex.
+fn deserialize_hash<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut hash = String::deserialize(deserializer)?;
+    hash.make_ascii_lowercase();
+    Ok(hash)
 }
 
 /// A single patch record in the manifest.
@@ -564,5 +582,116 @@ mod tests {
             serde_json::from_str::<PatchManifest>("{}").is_err(),
             "a manifest without a `patches` field must be rejected"
         );
+    }
+
+    /// #707: a hand-edited or third-party manifest may spell its hashes in
+    /// uppercase. They load as lowercase, the case every computed
+    /// git-sha256 and every blob name uses; an empty `beforeHash` (a
+    /// patch-added file) stays empty.
+    #[test]
+    fn test_patch_file_info_loads_hashes_lowercase() {
+        let upper = "ABCDEF0123456789".repeat(4);
+        let json = format!(r#"{{"beforeHash": "{upper}", "afterHash": "{upper}"}}"#);
+        let parsed: PatchFileInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.before_hash, upper.to_ascii_lowercase());
+        assert_eq!(parsed.after_hash, upper.to_ascii_lowercase());
+
+        let added: PatchFileInfo =
+            serde_json::from_str(r#"{"beforeHash": "", "afterHash": "AB"}"#).unwrap();
+        assert_eq!(added.before_hash, "");
+        assert_eq!(added.after_hash, "ab");
+
+        // Re-serializing writes the normalized spelling.
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(!json.contains(&upper), "{json}");
+    }
+
+    /// #707 end to end: the same patch, with its hashes uppercased in the
+    /// manifest, verifies, applies and rolls back exactly like the
+    /// lowercase one. Before the load normalized them, apply and rollback
+    /// compared the computed (lowercase) hash with `==` and reported
+    /// `HashMismatch` for bytes that matched.
+    #[tokio::test]
+    async fn test_uppercase_manifest_hashes_apply_and_roll_back() {
+        use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+        use crate::patch::apply::{
+            apply_package_patch, verify_file_patch, MismatchPolicy, PatchSources, VerifyStatus,
+        };
+        use crate::patch::rollback::{
+            rollback_package_patch, verify_file_rollback, VerifyRollbackStatus,
+        };
+
+        let original = b"module.exports = 'vulnerable';\n";
+        let patched = b"module.exports = 'fixed';\n";
+        let before = compute_git_sha256_from_bytes(original);
+        let after = compute_git_sha256_from_bytes(patched);
+
+        for upper in [false, true] {
+            let spell = |h: &str| {
+                if upper {
+                    h.to_ascii_uppercase()
+                } else {
+                    h.to_string()
+                }
+            };
+            let manifest_json = format!(
+                r#"{{"patches": {{"pkg:npm/demo@1.0.0": {{
+                    "uuid": "11111111-1111-4111-8111-111111111111",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{"package/index.js": {{"beforeHash": "{}", "afterHash": "{}"}}}},
+                    "vulnerabilities": {{}},
+                    "description": "d", "license": "MIT", "tier": "free"
+                }}}}}}"#,
+                spell(&before),
+                spell(&after)
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let manifest_path = dir.path().join("manifest.json");
+            std::fs::write(&manifest_path, manifest_json).unwrap();
+            let manifest = crate::manifest::operations::read_manifest(&manifest_path)
+                .await
+                .unwrap()
+                .unwrap();
+            let files = &manifest.patches["pkg:npm/demo@1.0.0"].files;
+            let info = &files["package/index.js"];
+
+            let pkg = dir.path().join("pkg");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(pkg.join("index.js"), original).unwrap();
+            // Blobs are stored under the lowercase name blob download uses.
+            let blobs = dir.path().join("blobs");
+            std::fs::create_dir_all(&blobs).unwrap();
+            std::fs::write(blobs.join(&before), original).unwrap();
+            std::fs::write(blobs.join(&after), patched).unwrap();
+
+            let verify = verify_file_patch(&pkg, "package/index.js", info).await;
+            assert_eq!(
+                verify.status,
+                VerifyStatus::Ready,
+                "upper={upper}: {verify:?}"
+            );
+            let applied = apply_package_patch(
+                "pkg:npm/demo@1.0.0",
+                &pkg,
+                files,
+                &PatchSources::blobs_only(&blobs),
+                false,
+                MismatchPolicy::Strict,
+            )
+            .await;
+            assert!(applied.success, "upper={upper}: {:?}", applied.error);
+            assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), patched);
+
+            let verify = verify_file_rollback(&pkg, "package/index.js", info, &blobs).await;
+            assert_eq!(
+                verify.status,
+                VerifyRollbackStatus::Ready,
+                "upper={upper}: {verify:?}"
+            );
+            let rolled =
+                rollback_package_patch("pkg:npm/demo@1.0.0", &pkg, files, &blobs, false).await;
+            assert!(rolled.success, "upper={upper}: {:?}", rolled.error);
+            assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), original);
+        }
     }
 }

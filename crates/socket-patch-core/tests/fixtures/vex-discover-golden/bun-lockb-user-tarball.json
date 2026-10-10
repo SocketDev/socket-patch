@@ -1,0 +1,36 @@
+{
+  "bun-lockb-user-tarball/file": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@6.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/is-odd@3.0.1",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb-user-tarball/url": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@6.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/is-odd@3.0.1",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  }
+}

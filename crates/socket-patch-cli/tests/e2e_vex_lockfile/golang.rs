@@ -43,6 +43,9 @@
 //! go-patches redirect (no uuid — a documented limitation, asserted below).
 //! Embedded: `scan --vex` and `apply --vex` on a manifest-less project.
 
+use crate::common::binary;
+use crate::common::envelope::codes_in;
+
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -77,10 +80,6 @@ const PRISTINE_GO: &[u8] = b"package bar // pristine\n";
 const PATCHED_GO: &[u8] = b"package bar // patched\n";
 
 // ── harness ───────────────────────────────────────────────────────────
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// A project under `<tmp>/app` plus private (empty unless a test fills them)
 /// module cache and GOPATH.
@@ -439,17 +438,6 @@ fn subcomponents(doc: &Value) -> Vec<String> {
     purls
 }
 
-fn warning_codes(run: &Run) -> Vec<String> {
-    run.env["warnings"]
-        .as_array()
-        .map(|w| {
-            w.iter()
-                .filter_map(|w| w["code"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 // ── golang fixtures ───────────────────────────────────────────────────
 
 fn go_socket_module(uuid: &str) -> String {
@@ -566,7 +554,11 @@ fn golang_hosted_a_attests_every_flavor_without_manifest_or_ledgers() {
         write_go_hosted(&fx, U, file);
         let run = fx.vex(&["--proxy-url", &api.uri()]);
         assert_attested(&fx, &run, GO_PURL, U, "redirected", &format!("{file:?}"));
-        assert!(warning_codes(&run).is_empty(), "{file:?}: {}", run.env);
+        assert!(
+            codes_in(&run.env["warnings"]).is_empty(),
+            "{file:?}: {}",
+            run.env
+        );
     }
 }
 
@@ -797,7 +789,11 @@ fn golang_vendored_a_attests_every_flavor_without_manifest_or_ledgers() {
         write_go_vendored(&fx, U, file, PATCHED_GO);
         let run = fx.vex(&["--proxy-url", &api.uri()]);
         assert_attested(&fx, &run, GO_PURL, U, "vendored", &format!("{file:?}"));
-        assert!(warning_codes(&run).is_empty(), "{file:?}: {}", run.env);
+        assert!(
+            codes_in(&run.env["warnings"]).is_empty(),
+            "{file:?}: {}",
+            run.env
+        );
     }
 }
 
@@ -812,7 +808,7 @@ fn golang_vendored_a_ignores_a_pristine_module_cache_copy() {
     let run = fx.vex(&["--proxy-url", &api.uri()]);
     assert_attested(&fx, &run, GO_PURL, U, "vendored", "pristine cache copy");
     // …and that immutable cache copy is not "drift" to disclose.
-    assert!(warning_codes(&run).is_empty(), "{}", run.env);
+    assert!(codes_in(&run.env["warnings"]).is_empty(), "{}", run.env);
 }
 
 #[test]

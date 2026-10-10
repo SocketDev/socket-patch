@@ -41,7 +41,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_ORG_SLUG",
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
     "SOCKET_VENDOR_SOURCE",
     "SOCKET_VENDOR_URL",
     "SOCKET_PATCH_SERVER_URL",
@@ -67,7 +66,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_VEX_NO_VERIFY",
     "SOCKET_VEX_DOC_ID",
     "SOCKET_VEX_COMPACT",
-    // ApplyArgs-specific
+    // Retired in v5 (#615); still scrubbed for hermeticity
     "SOCKET_FORCE",
     // ScanArgs-specific
     "SOCKET_BATCH_SIZE",
@@ -201,7 +200,6 @@ struct Snap {
     org: Option<String>,
     proxy_url: Option<String>,
     ecosystems: Option<Vec<String>>,
-    download_mode: String,
     vendor_source: String,
     vendor_url: Option<String>,
     patch_server_url: Option<String>,
@@ -236,7 +234,6 @@ fn snapshot(a: &VexArgs) -> Snap {
         org: a.common.org.clone(),
         proxy_url: a.common.proxy_url.clone(),
         ecosystems: a.common.ecosystems.clone(),
-        download_mode: a.common.download_mode.clone(),
         vendor_source: a.common.vendor_source.clone(),
         vendor_url: a.common.vendor_url.clone(),
         patch_server_url: a.common.patch_server_url.clone(),
@@ -278,7 +275,6 @@ fn expected_defaults() -> Snap {
         org: None,
         proxy_url: None, // no clap default — resolved in core
         ecosystems: None,
-        download_mode: "diff".to_string(),
         vendor_source: "service".to_string(),
         vendor_url: None,
         patch_server_url: None,

@@ -149,11 +149,11 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
     let mut state = VendorState::new();
     state.entries.insert(
         purl.to_string(),
-        VendorEntry {
-            ecosystem: "cargo".to_string(),
-            base_purl: purl.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "cargo".to_string(),
+            purl.to_string(),
+            UUID.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
@@ -161,18 +161,8 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![wiring],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
+            vec![wiring],
+        ),
     );
     let dir = cwd.join(".socket/vendor");
     std::fs::create_dir_all(&dir).unwrap();
@@ -606,28 +596,22 @@ fn write_detached_vendor_state(cwd: &Path, purl: &str, rel_path: &str, record: P
     state.entries.insert(
         purl.to_string(),
         VendorEntry {
-            ecosystem: "cargo".to_string(),
-            base_purl: purl.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: rel_path.to_string(),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: vec![wiring],
-            lock: None,
-            took_over_go_patches: false,
             detached: true,
             record: Some(record),
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "cargo".to_string(),
+                purl.to_string(),
+                UUID.to_string(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel_path.to_string(),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                vec![wiring],
+            )
         },
     );
     let dir = cwd.join(".socket/vendor");
@@ -984,28 +968,22 @@ fn detached_matrix_entry(
     wiring: WiringRecord,
 ) -> VendorEntry {
     VendorEntry {
-        ecosystem: eco.to_string(),
-        base_purl: purl.to_string(),
-        uuid: uuid.to_string(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: rel_path.to_string(),
-            sha256,
-            size: None,
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring: vec![wiring],
-        lock: None,
-        took_over_go_patches: false,
         detached: true,
         record: Some(record),
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
+        ..VendorEntry::new(
+            eco.to_string(),
+            purl.to_string(),
+            uuid.to_string(),
+            VendorArtifact {
+                yarn_berry10c0: None,
+                path: rel_path.to_string(),
+                sha256,
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            vec![wiring],
+        )
     }
 }
 
@@ -1343,6 +1321,128 @@ fn vendored_live_tree_out_of_sync_warns_but_attests() {
     );
 }
 
+/// REGRESSION (#599, with #635): Bun never prunes `node_modules/.bun`.
+/// After the in-place `bun install` that consumes a vendored tarball, the
+/// pre-vendor `lodash@4.17.21` registry entry stays on disk, pristine, while
+/// the importer and the `.bun/node_modules` hoist link now point at the
+/// tarball's entry (`lodash@.socket+vendor+npm+<uuid>+lodash-4.17.21.tgz`,
+/// the name real Bun 1.4.2 gives a `file:` tarball). Nothing can load the
+/// orphan, so it is no installed copy: no `vendored_tree_out_of_sync`
+/// warning, which re-running the install could never clear. Both the
+/// project-local store and the global store (`globalStore = true`: every
+/// `.bun` entry an absolute link into `<cache>/links/<entry>-<hash>`) are
+/// covered, each with a control whose live copy is unpatched and must
+/// still warn.
+#[cfg(unix)]
+#[test]
+fn vendored_bun_orphaned_store_entry_is_not_out_of_sync() {
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a";
+    let patched = b"patched npm bytes\n";
+    let pristine = b"original unpatched bytes\n";
+    for (global, live_patched) in [(false, true), (false, false), (true, true), (true, false)] {
+        let label = format!("global store {global}, live copy patched {live_patched}");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cwd = &tmp.path().join("app");
+        std::fs::create_dir_all(cwd).unwrap();
+
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+        let sha256 = sha256_hex(&write_member_tgz(
+            &cwd.join(&rel),
+            "package/index.js",
+            patched,
+        ));
+        let record = make_record(
+            uuid,
+            "package/index.js",
+            &after_hash,
+            "GHSA-sync-aaaa",
+            &["CVE-2026-10"],
+        );
+        let wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
+        let mut state = VendorState::new();
+        state.entries.insert(
+            purl.to_string(),
+            detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+        );
+        std::fs::write(
+            cwd.join(".socket/vendor/state.json"),
+            serde_json::to_string_pretty(&state).expect("serialize vendor state"),
+        )
+        .expect("write vendor state.json");
+
+        let store = cwd.join("node_modules/.bun");
+        let live_entry = format!("lodash@.socket+vendor+npm+{uuid}+lodash-4.17.21.tgz");
+        for (entry, hash, bytes) in [
+            ("lodash@4.17.21", "6a490709ba3c5c8f", &pristine[..]),
+            (
+                live_entry.as_str(),
+                "2fdd36c28041169b",
+                if live_patched {
+                    &patched[..]
+                } else {
+                    &pristine[..]
+                },
+            ),
+        ] {
+            let dir = if global {
+                tmp.path().join(format!("bun-cache/links/{entry}-{hash}"))
+            } else {
+                store.join(entry)
+            };
+            let pkg = dir.join("node_modules/lodash");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                r#"{"name":"lodash","version":"4.17.21"}"#,
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), bytes).unwrap();
+            if global {
+                std::fs::create_dir_all(&store).unwrap();
+                std::os::unix::fs::symlink(&dir, store.join(entry)).unwrap();
+            }
+        }
+        std::fs::create_dir_all(store.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(
+            format!("../{live_entry}/node_modules/lodash"),
+            store.join("node_modules/lodash"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            format!(".bun/{live_entry}/node_modules/lodash"),
+            cwd.join("node_modules/lodash"),
+        )
+        .unwrap();
+
+        let vex_path = cwd.join("out.vex.json");
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+                "--output",
+                vex_path.to_str().unwrap(),
+                "--product",
+                "pkg:npm/app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+        assert!(out.status.success(), "{label}: {env}");
+        assert_eq!(env["status"], "success", "{label}: {env}");
+        let out_of_sync = env["warnings"].as_array().is_some_and(|ws| {
+            ws.iter().any(|w| {
+                w["code"] == "vendored_tree_out_of_sync"
+                    && w["detail"].as_str().is_some_and(|d| d.contains(purl))
+            })
+        });
+        assert_eq!(out_of_sync, !live_patched, "{label}: {env}");
+    }
+}
+
 /// REGRESSION (#325): the lock rewires the hoisted `lodash@4.17.21` to the
 /// vendored tarball, but a parent package also BUNDLES `lodash@4.17.21`
 /// (`inBundle: true`). npm unpacks that copy from the parent's tarball, so
@@ -1604,6 +1704,248 @@ fn vendored_npm_patch_with_an_unwired_registry_copy_in_the_same_lock() {
                 .is_some_and(|r| r.contains("packages/b/node_modules/lodash")
                     && r.contains("re-run `socket-patch vendor`")),
             "{label}: the check names the unwired copy: {check_env}"
+        );
+    }
+}
+
+/// REGRESSION (#879): npm 7-12 `npm install` on a vendored lockfileVersion
+/// 2 lock (or shrinkwrap) re-saves the legacy `dependencies` mirror node
+/// WITHOUT `resolved` (npm never writes one for a `file:` resolution
+/// there) but with the patched `integrity`. npm 6 fails closed on that pin
+/// and npm 7+ installs from the still-wired `packages` entry, so `vex`
+/// attests and `vendor --check` passes. The same node pinned to the
+/// registry tarball's integrity is what npm 6 installs unpatched: both
+/// still fail (#432).
+#[test]
+fn vendored_npm_v2_mirror_without_resolved_keeps_the_patch_wired() {
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-8790-4879-8879-0a0a0a0a0a0a";
+    let patched = b"patched npm bytes\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    for lock_name in ["package-lock.json", "npm-shrinkwrap.json"] {
+        for (label, mirror_pin, wired) in [
+            ("patched pin", "sha512-cGF0Y2hlZA==", true),
+            ("registry pin", "sha512-T1JJR0lOQUw=", false),
+        ] {
+            let label = format!("{lock_name} {label}");
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let cwd = tmp.path();
+            let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+            let sha256 = sha256_hex(&write_member_tgz(
+                &cwd.join(&rel),
+                "package/index.js",
+                patched,
+            ));
+            let record = make_record(
+                uuid,
+                "package/index.js",
+                &after_hash,
+                "GHSA-mirr-aaaa",
+                &["CVE-2026-879"],
+            );
+            let mut wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
+            // What npm 8's `npm install` leaves: lockfileVersion 2 with a
+            // `resolved`-less mirror node.
+            let written = cwd.join("package-lock.json");
+            let mut lock: Value =
+                serde_json::from_str(&std::fs::read_to_string(&written).unwrap()).unwrap();
+            lock["lockfileVersion"] = serde_json::json!(2);
+            lock["dependencies"] = serde_json::json!({
+                "lodash": { "version": "4.17.21", "integrity": mirror_pin }
+            });
+            // The shrinkwrap shape keeps its package-lock.json twin: a
+            // shrinkwrap-only project is omitted from VEX on its own (#899).
+            std::fs::write(&written, lock.to_string()).unwrap();
+            std::fs::write(cwd.join(lock_name), lock.to_string()).unwrap();
+            wiring.file = lock_name.to_string();
+            let mut state = VendorState::new();
+            state.entries.insert(
+                purl.to_string(),
+                detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+            );
+            let dir = cwd.join(".socket/vendor");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("state.json"),
+                serde_json::to_string_pretty(&state).unwrap(),
+            )
+            .unwrap();
+
+            let vex_path = cwd.join("out.vex.json");
+            let out = cli()
+                .args([
+                    "vex",
+                    "--cwd",
+                    cwd.to_str().unwrap(),
+                    "--json",
+                    "--output",
+                    vex_path.to_str().unwrap(),
+                    "--product",
+                    "pkg:npm/app@1.0.0",
+                ])
+                .output()
+                .expect("invoke vex");
+            let env = String::from_utf8_lossy(&out.stdout).into_owned();
+            let check = cli()
+                .args([
+                    "vendor",
+                    "--check",
+                    "--cwd",
+                    cwd.to_str().unwrap(),
+                    "--json",
+                ])
+                .output()
+                .expect("invoke vendor --check");
+            let check_env = String::from_utf8_lossy(&check.stdout).into_owned();
+            if wired {
+                assert!(out.status.success(), "{label}: {env}");
+                let doc: Value =
+                    serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+                assert_eq!(
+                    doc["statements"].as_array().unwrap().len(),
+                    1,
+                    "{label}: {doc}"
+                );
+                assert!(check.status.success(), "{label}: {check_env}");
+            } else {
+                assert_eq!(out.status.code(), Some(1), "{label}: {env}");
+                assert!(!vex_path.exists(), "{label}: {env}");
+                assert_eq!(check.status.code(), Some(1), "{label}: {check_env}");
+            }
+        }
+    }
+}
+
+/// REGRESSION (#753): `lodash@4.17.21` sits beneath a dependency that
+/// ships its own npm-shrinkwrap.json (`"hasShrinkwrap": true`), and npm
+/// 7–11 install that copy from the dependency's shrinkwrap, ignoring the
+/// root lock. Neither a pre-fix lock whose ONLY copy (the nested one) was
+/// rewired to the vendored tarball, nor a vendored hoisted copy beside an
+/// unpatched nested one, may be attested by `vex`, and `vendor --check`
+/// must fail naming the shrinkwrapped copy (re-vendoring cannot reach it,
+/// so its generic "wiring missing; re-run vendor" advice would be wrong).
+#[test]
+fn vendored_npm_patch_with_a_copy_under_a_has_shrinkwrap_dependency() {
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-7537-4537-8537-0a0a0a0a0a0a";
+    let patched = b"patched npm bytes\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let nested = "node_modules/sw/node_modules/lodash";
+    for (label, only_nested_wired) in [
+        ("pre-fix lock, only the nested copy wired", true),
+        ("hoisted wired, nested registry copy", false),
+    ] {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cwd = tmp.path();
+        let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+        let sha256 = sha256_hex(&write_member_tgz(
+            &cwd.join(&rel),
+            "package/index.js",
+            patched,
+        ));
+        let record = make_record(
+            uuid,
+            "package/index.js",
+            &after_hash,
+            "GHSA-shrk-aaaa",
+            &["CVE-2026-753"],
+        );
+        let wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
+        let lock_path = cwd.join("package-lock.json");
+        let mut lock: Value =
+            serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+        let packages = lock["packages"].as_object_mut().unwrap();
+        let hoisted = packages["node_modules/lodash"].clone();
+        packages.insert(
+            "node_modules/sw".to_string(),
+            serde_json::json!({
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/sw/-/sw-1.0.0.tgz",
+                "integrity": "sha512-U1c=",
+                "hasShrinkwrap": true
+            }),
+        );
+        if only_nested_wired {
+            packages.shift_remove("node_modules/lodash");
+            packages.insert(nested.to_string(), hoisted);
+        } else {
+            packages.insert(
+                nested.to_string(),
+                serde_json::json!({
+                    "version": "4.17.21",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                    "integrity": "sha512-T1JJR0lOQUw="
+                }),
+            );
+        }
+        std::fs::write(&lock_path, lock.to_string()).unwrap();
+        let mut state = VendorState::new();
+        state.entries.insert(
+            purl.to_string(),
+            detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+        );
+        let dir = cwd.join(".socket/vendor");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let vex_path = cwd.join("out.vex.json");
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+                "--output",
+                vex_path.to_str().unwrap(),
+                "--product",
+                "pkg:npm/app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        let env: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{label}: vex envelope JSON on stdout ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        assert_eq!(out.status.code(), Some(1), "{label}: {env}");
+        assert!(
+            !vex_path.exists(),
+            "{label}: no VEX document may attest the purl: {env}"
+        );
+        assert!(
+            env.to_string().contains(nested),
+            "{label}: the envelope names the shrinkwrapped copy: {env}"
+        );
+
+        let check = cli()
+            .args([
+                "vendor",
+                "--check",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("invoke vendor --check");
+        let check_env: Value = serde_json::from_slice(&check.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{label}: vendor --check envelope JSON on stdout ({e}): {}",
+                String::from_utf8_lossy(&check.stdout)
+            )
+        });
+        assert_eq!(check.status.code(), Some(1), "{label}: {check_env}");
+        let event = &check_env["events"][0];
+        assert_eq!(event["errorCode"], "vendor_check_failed", "{check_env}");
+        assert!(
+            event["reason"].as_str().is_some_and(|r| r.contains(nested)
+                && r.contains("hasShrinkwrap")
+                && !r.contains("re-run `socket-patch vendor`")),
+            "{label}: the check names the shrinkwrapped copy: {check_env}"
         );
     }
 }
@@ -2257,21 +2599,6 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
     state.entries.insert(
         purl.to_string(),
         VendorEntry {
-            ecosystem: "npm".to_string(),
-            base_purl: purl.to_string(),
-            uuid: uuid.to_string(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: rel.clone(),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            // What `repair`'s reconstruction records for npm.
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             detached: true,
             record: Some(make_record(
                 uuid,
@@ -2281,11 +2608,20 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
                 &["CVE-2026-31"],
             )),
             flavor: Some("pnpm".to_string()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".to_string(),
+                purl.to_string(),
+                uuid.to_string(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel.clone(),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         },
     );
     std::fs::create_dir_all(cwd.join(".socket/vendor")).unwrap();
@@ -2378,20 +2714,6 @@ fn pnpm_bundled_copy_blocks_vex_but_not_vendor_check() {
         state.entries.insert(
             purl.to_string(),
             VendorEntry {
-                ecosystem: "npm".to_string(),
-                base_purl: purl.to_string(),
-                uuid: uuid.to_string(),
-                artifact: VendorArtifact {
-                    yarn_berry10c0: None,
-                    path: rel.clone(),
-                    sha256,
-                    size: None,
-                    platform_locked: None,
-                    file_inventory: None,
-                },
-                wiring: Vec::new(),
-                lock: None,
-                took_over_go_patches: false,
                 detached: true,
                 record: Some(make_record(
                     uuid,
@@ -2401,11 +2723,20 @@ fn pnpm_bundled_copy_blocks_vex_but_not_vendor_check() {
                     &["CVE-2026-1033"],
                 )),
                 flavor: Some("pnpm".to_string()),
-                uv: None,
-                pnpm: None,
-                poetry: None,
-                pdm: None,
-                pipenv: None,
+                ..VendorEntry::new(
+                    "npm".to_string(),
+                    purl.to_string(),
+                    uuid.to_string(),
+                    VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: rel.clone(),
+                        sha256,
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    Vec::new(),
+                )
             },
         );
         std::fs::create_dir_all(cwd.join(".socket/vendor")).unwrap();

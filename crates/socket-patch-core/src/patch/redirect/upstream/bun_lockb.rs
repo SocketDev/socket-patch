@@ -17,8 +17,8 @@
 
 use std::collections::BTreeSet;
 
-use super::npm::{by_uuid, fetch_dists, refuse_all_in};
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::npm::{bun_tarball_url, fetch_dists_on, BunConfigOrder, BunRegistrySettings};
+use super::{by_uuid, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::vendor::bun_lockb::{BunLockb, NORMALIZED_FORMAT_1, NORMALIZED_WORKSPACE};
 
 pub(super) async fn restore(
@@ -102,17 +102,28 @@ pub(super) async fn restore(
             .iter()
             .map(|(_, u, n, v)| (u.clone(), n.clone(), v.clone()))
             .collect();
-        let dists = fetch_dists(&wanted, ctx, &mut result).await;
+        // The record keeps the tarball URL Bun fetches from, which is the
+        // project registry's for a mirror (#992).
+        // A binary lock does not say which Bun wrote it (#1276).
+        let settings = BunRegistrySettings::read(view, rel, BunConfigOrder::Unknown).await;
+        let wanted = settings.refuse_ambiguous(rel, wanted, &mut result);
+        let dists = fetch_dists_on(
+            &wanted,
+            |n| settings.registry_with_credentials(n),
+            ctx,
+            &mut result,
+        )
+        .await;
         let mut changed = false;
         let mut restored = Vec::new();
         for (id, uuid, name, version) in hits {
             if result.refused.contains_key(&uuid) {
                 continue;
             }
-            let Some(dist) = dists.get(&(name.clone(), version.clone())) else {
+            let Some(found) = dists.get(&(name.clone(), version.clone())) else {
                 continue;
             };
-            let Some(integrity) = dist.integrity.as_deref() else {
+            let Some(integrity) = found.dist.integrity.as_deref() else {
                 result.refuse(
                     &uuid,
                     format!("the registry records no integrity for {name}@{version}"),
@@ -120,7 +131,9 @@ pub(super) async fn restore(
                 continue;
             };
             // Transactional per record: a failed rebuild leaves `lock` as is.
-            match lock.set_registry_package(id, &version, &dist.tarball, integrity) {
+            let tarball =
+                bun_tarball_url(settings.registry(&name).as_deref(), &name, &version, found);
+            match lock.set_registry_package(id, &version, &tarball, integrity) {
                 Ok(()) => {
                     restored.push(uuid);
                     changed = true;
@@ -288,6 +301,42 @@ mod tests {
             assert_eq!(outcome.reverted_files, ["bun.lockb"], "{dir}");
             assert!(after == original, "{dir}: not byte-exact");
         }
+    }
+
+    /// #992: in a project whose `bunfig.toml` names a mirror, the rebuilt
+    /// record keeps the mirror's tarball URL (Bun fetches from the URL
+    /// the record holds), read from the mirror's own version document.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hosted_record_restores_the_bunfig_registry_tarball() {
+        let original = fixture("1.2.23");
+        let integrity = minimist(&original).integrity.unwrap();
+        let server = registry(&integrity).await;
+        let mirror_url = format!("{}/mirror/minimist/-/minimist-1.2.2.tgz", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/mirror/minimist/1.2.2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dist": { "tarball": mirror_url, "integrity": integrity }
+            })))
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lockb"), hosted(&original)).unwrap();
+        std::fs::write(
+            tmp.path().join("bunfig.toml"),
+            format!("[install]\nregistry = \"{}/mirror/\"\n", server.uri()),
+        )
+        .unwrap();
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        let discovery = crate::vex::discover_patched_refs(tmp.path()).await;
+        let pins = HostedPin::all(&discovery);
+        let outcome = restore_upstream(tmp.path(), &pins, &vendor_opts()).await;
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        let after = std::fs::read(tmp.path().join("bun.lockb")).unwrap();
+        let restored = minimist(&after);
+        assert_eq!(restored.resolution, mirror_url);
+        assert_eq!(restored.integrity.as_deref(), Some(integrity.as_str()));
     }
 
     /// Where the hosted rewrite had to normalize workspace dependency

@@ -161,8 +161,7 @@ pub async fn run(args: HostedBundleArgs) -> i32 {
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| DEFAULT_SOCKET_API_URL.to_string()),
         api_token: Some(token),
-        use_public_proxy: false,
-        org_slug: Some(org),
+        route: socket_patch_core::api::client::ApiRoute::org(org),
     });
     match run_in_memory(input, Arc::new(client), CancellationToken::new()).await {
         Ok(output) => match serde_json::to_string_pretty(&output) {

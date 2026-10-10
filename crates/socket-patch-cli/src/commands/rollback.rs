@@ -2,7 +2,7 @@ use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::cleanup_blobs::{ArtifactReferences, CleanupResult};
+use socket_patch_core::manifest::cleanup_blobs::ArtifactReferences;
 use socket_patch_core::manifest::operations::{
     get_before_hash_blobs, read_manifest, write_manifest,
 };
@@ -13,21 +13,27 @@ use socket_patch_core::patch::rollback::{
     cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
     VerifyRollbackResult, VerifyRollbackStatus,
 };
-use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
-use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
+use socket_patch_core::telemetry::{
+    track_patch_rollback_failed, track_patch_rolled_back, TelemetryAuth,
+};
+use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::PurlKey;
+use socket_patch_core::utils::target::{is_path_shaped, Target, TargetKind};
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
-use crate::commands::apply::is_local_go;
+use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs};
+use crate::commands::hosted_unwind::run_hosted_leg;
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
-use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls, JvmScope};
+use crate::commands::vendored_backend::{
+    KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
+};
+use crate::ecosystem_dispatch::{
+    distinct_npm_copies, find_all_packages_for_rollback, partition_purls, JvmScope,
+};
 use crate::json_envelope::Command as EnvelopeCommand;
-use crate::looks_like_uuid;
 use crate::ui::{plural, StatusLine};
 
 #[derive(Args)]
@@ -76,31 +82,17 @@ pub(crate) fn join_clauses(clauses: &[String]) -> String {
     }
 }
 
-/// `msg` with its first character uppercased: human `Error: …` lines
-/// start with a capital even when the message (shared with the JSON
-/// envelope, which keeps it verbatim) does not. A message that opens with
-/// a value rather than a word — a purl, a patch UUID, a path, a flag — is
-/// returned unchanged: capitalizing it would corrupt text the user may
-/// copy and paste.
-pub(crate) fn capitalize_first(msg: &str) -> String {
-    let first_word = msg
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_end_matches([',', '.', ';', ':']);
-    let is_plain_word = !first_word.is_empty()
-        && first_word
-            .chars()
-            .all(|c| c.is_alphabetic() || c == '\'' || c == '-')
-        && first_word.chars().next().is_some_and(char::is_alphabetic);
-    if !is_plain_word {
-        return msg.to_string();
-    }
-    let mut chars = msg.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
+/// The `hosted_state_not_preservable` run warning: a `--preserve-state`
+/// run (rollback or remove) restored hosted pins to upstream anyway — the
+/// lockfile pins are hosted mode's only record, so there is no local
+/// state to keep.
+pub(crate) fn hosted_state_not_preservable_warning() -> (String, String) {
+    (
+        "hosted_state_not_preservable".into(),
+        "hosted wiring has no preservable local state: the lockfile pins are the only \
+         record, and they now resolve upstream; re-run `scan --mode hosted` to re-wire"
+            .into(),
+    )
 }
 
 /// Capitalize the first character and end with `?`.
@@ -108,7 +100,7 @@ pub(crate) fn as_question(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    format!("{}?", capitalize_first(text))
+    format!("{}?", crate::ui::sentence_case(text))
 }
 
 /// The default (destructive) rollback's confirmation prompt, naming only
@@ -143,21 +135,6 @@ fn rollback_prompt(manifest: usize, vendored: usize, hosted: usize) -> String {
         ));
     }
     as_question(&join_clauses(&clauses))
-}
-
-/// Where a physical copy lives, relative to `cwd` when it is inside it.
-/// Shared with `apply`.
-pub(crate) fn display_copy_path(package_path: &str, cwd: &Path) -> String {
-    let path = Path::new(package_path);
-    let canonical = std::fs::canonicalize(path).ok();
-    let rel = path
-        .strip_prefix(cwd)
-        .ok()
-        .or_else(|| canonical.as_deref().and_then(|c| c.strip_prefix(cwd).ok()));
-    match rel {
-        Some(r) if !r.as_os_str().is_empty() => r.display().to_string(),
-        _ => package_path.to_string(),
-    }
 }
 
 /// `Error: Failed to roll back <purl>: <why>` — the per-package failure
@@ -257,7 +234,7 @@ fn copy_label(
         .iter()
         .filter(|o| o.package_key == r.package_key)
         .count();
-    let copy = (copies > 1).then(|| display_copy_path(&r.package_path, cwd));
+    let copy = (copies > 1).then(|| crate::ui::display_copy_path(&r.package_path, cwd));
     match (copy, note) {
         (Some(c), Some(n)) => format!("  {} ({c}, {n})", r.package_key),
         (Some(c), None) => format!("  {} ({c})", r.package_key),
@@ -356,9 +333,38 @@ fn format_gc_freed(bytes: u64, dry_run: bool) -> String {
     )
 }
 
+/// Appended to the generic stale-install advisory when a Bun advisory
+/// fired in the same run: Bun's hoisted linker keeps the patched copy
+/// through a plain `bun install` (#764), so "the next package-manager
+/// install" alone would contradict it.
+const BUN_REINSTALL_QUALIFIER: &str =
+    " (Bun: a plain `bun install` keeps them; run `bun install --force`)";
+
+/// True when the run's leg warnings carry a Bun reinstall advisory.
+fn bun_reinstall_advised<'a>(mut codes: impl Iterator<Item = &'a str>) -> bool {
+    codes.any(|c| {
+        c == socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED
+            || c == "redirect_bun_reinstall_required"
+    })
+}
+
+/// The qualifiers the generic reinstall note gets next to a Bun (#764) or
+/// PyPI (#477) reinstall advisory.
+fn reinstall_qualifiers(bun: bool, pypi: bool) -> String {
+    format!(
+        "{}{}",
+        if bun { BUN_REINSTALL_QUALIFIER } else { "" },
+        if pypi {
+            crate::commands::pypi_reinstall::NOTE_QUALIFIER
+        } else {
+            ""
+        }
+    )
+}
+
 /// The reinstall note for packages whose wiring was undone but whose
 /// installed tree still holds patched bytes.
-fn format_reinstall_note(still_patched: usize, dry_run: bool) -> String {
+fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool, pypi: bool) -> String {
     let keep = match (still_patched == 1, dry_run) {
         (true, false) => "keeps its",
         (true, true) => "would keep its",
@@ -367,40 +373,51 @@ fn format_reinstall_note(still_patched: usize, dry_run: bool) -> String {
     };
     format!(
         "Note: {} {keep} patched bytes in installed trees until the next \
-         package-manager install.",
-        plural(still_patched, "unwired package", "unwired packages")
+         package-manager install{}.",
+        plural(still_patched, "unwired package", "unwired packages"),
+        reinstall_qualifiers(bun, pypi)
     )
 }
 
 /// One classified rollback target token.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RollbackTarget {
-    /// PURL or UUID — today's `patch_matches` semantics.
-    Identifier(String),
+    /// A UUID, purl or package name in the shared target grammar
+    /// ([`Target::matches_patch`]).
+    Identifier(Target),
     /// A path glob scoping the run to patches with an installed copy
     /// under a matching path.
     PathGlob(String),
 }
 
 /// Shape-classify a target token. Only path-SHAPED tokens become globs
-/// (separator, glob metachar, `./` prefix, or absolute); `pkg:` and every
-/// other bare word keep identifier semantics, so a truncated UUID or a
-/// package name typed without its `pkg:` prefix stays a safe
-/// "No patch found matching identifier" error instead of silently
+/// ([`is_path_shaped`]: separator, glob metachar, `./` prefix, or absolute;
+/// an npm `@scope/name` is a name); `pkg:` and every other token keep the
+/// shared target grammar, so a truncated UUID or a mistyped name stays a
+/// safe "No patch found matching identifier" error instead of silently
 /// selecting a directory subtree.
+///
+/// A path-shaped token without glob metacharacters (composer
+/// `vendor/pkg`, a go module path) is promoted back to a name once the
+/// stores are loaded, when it selects a recorded or hosted patch.
 pub(crate) fn classify_target(token: &str) -> RollbackTarget {
-    if token.starts_with("pkg:") {
-        return RollbackTarget::Identifier(token.to_string());
-    }
-    let path_shaped = token.contains('/')
-        || token.contains('\\')
-        || token.contains(['*', '?', '['])
-        || Path::new(token).is_absolute();
-    if path_shaped {
+    if is_path_shaped(token) {
         RollbackTarget::PathGlob(token.to_string())
     } else {
-        RollbackTarget::Identifier(token.to_string())
+        RollbackTarget::Identifier(Target::parse(token))
     }
+}
+
+/// A path-shaped token that could also be a slash-containing package
+/// name: relative, no glob metacharacter or backslash, no `.` / `..`
+/// segment (`./x` and `x/..` are always paths).
+fn is_name_shaped_path(token: &str) -> bool {
+    !token.contains(['*', '?', '[', '\\'])
+        && !std::path::Path::new(token).is_absolute()
+        && !token.starts_with('/')
+        && token
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 struct PatchToRollback {
@@ -456,7 +473,7 @@ pub(crate) enum InnerSelection<'a> {
     /// The legacy single-identifier filter (`remove`'s delegation): a
     /// no-match identifier is an error, a missing manifest is an error,
     /// and `None` selects the whole manifest.
-    Identifier(Option<&'a str>),
+    Identifier(Option<&'a Target>),
     /// A pre-resolved purl set from the CLI boundary's target resolver
     /// (identifiers ∪ path globs ∪ everything). No-match and
     /// missing-manifest handling already happened upstream, so an empty
@@ -551,12 +568,12 @@ async fn try_rollback_local_go(
 
 fn find_patches_to_rollback(
     manifest: &PatchManifest,
-    identifier: Option<&str>,
+    target: Option<&Target>,
 ) -> Vec<PatchToRollback> {
     manifest
         .patches
         .iter()
-        .filter(|(purl, patch)| identifier.is_none_or(|id| patch_matches(purl, &patch.uuid, id)))
+        .filter(|(purl, patch)| target.is_none_or(|t| t.matches_patch(purl, &patch.uuid)))
         .map(|(purl, patch)| PatchToRollback {
             purl: purl.clone(),
             patch: patch.clone(),
@@ -654,7 +671,7 @@ fn skipped_not_installed_json(purl: &str) -> serde_json::Value {
 /// human path gets. One failed result per affected package keeps the
 /// `failed` counter meaning "packages that failed" (the same per-package
 /// semantics as a mid-run failure) and names each missing blob hash plus
-/// the `socket-patch repair` remedy in machine-readable form, using the
+/// the re-run remedy in machine-readable form, using the
 /// engine's own `missing_blob` verify vocabulary. `reason_for` renders
 /// the per-hash diagnostic (offline gate vs. download failure).
 fn missing_blob_abort_results(
@@ -724,21 +741,14 @@ fn missing_blob_abort_results(
 }
 
 /// Legacy top-level error emission (the pre-envelope rollback shape):
-/// `{status: "error", error}` on `--json`, an `Error:` stderr line
-/// otherwise. Errors print even under --silent ("errors only", never
-/// "nothing").
-fn emit_rollback_error(json: bool, msg: &str) {
+/// `{status: "error", error: {code, message}}` on `--json`, an `Error:`
+/// stderr line otherwise. Errors print even under --silent ("errors only",
+/// never "nothing").
+fn emit_rollback_error(json: bool, code: &str, msg: &str) {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": msg,
-            }))
-            .expect("serializing an in-memory JSON value cannot fail")
-        );
+        crate::json_envelope::print_legacy_error(code, msg);
     } else {
-        eprintln!("Error: {}", capitalize_first(msg));
+        eprintln!("Error: {}", crate::ui::sentence_case(msg));
     }
 }
 
@@ -758,32 +768,6 @@ struct VendoredLegOutcome {
     kept: Vec<(String, String)>,
     failed: Vec<(String, String)>,
     warnings: Vec<(String, String)>,
-}
-
-/// What the hosted leg did. Shared with remove's hosted leg.
-#[derive(Default)]
-pub(crate) struct HostedLegOutcome {
-    pub(crate) reverted: Vec<String>,
-    pub(crate) failed: Vec<(String, String)>,
-    /// Scoped targets whose ecosystem has no per-purl hosted revert.
-    pub(crate) unsupported: Vec<String>,
-    pub(crate) warnings: Vec<(String, String)>,
-    pub(crate) edited_files: std::collections::BTreeSet<String>,
-}
-
-/// The `cleanup_failed` detail for one sweep pass labelled `label`: the
-/// directory-level error that stopped the pass, or — after a pass that
-/// kept sweeping past unlink failures — the files it could not remove
-/// (their counts of what WAS reclaimed still stand). `None` for a clean
-/// pass. Every consumer renders it as `<label> cleanup failed: …`.
-pub(crate) fn sweep_failure(label: &str, pass: &std::io::Result<CleanupResult>) -> Option<String> {
-    match pass {
-        Err(e) => Some(format!("{label} cleanup failed: {e}")),
-        Ok(r) if !r.failed.is_empty() => {
-            Some(format!("{label} cleanup failed: {}", r.failed.join("; ")))
-        }
-        Ok(_) => None,
-    }
 }
 
 /// Unwire the in-scope vendored entries. `preserve` keeps artifacts and
@@ -826,9 +810,17 @@ async fn run_vendored_leg(
                 }
                 out.failed.push((key, why));
             }
-            VendorRevertStep::Kept => out.kept.push((
+            VendorRevertStep::Kept(KeepCause::Drift) => out.kept.push((
                 key,
                 "lockfile wiring drifted; vendored state left untouched".to_string(),
+            )),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => out.kept.push((
+                key,
+                format!(
+                    "{}; vendored state kept — {}",
+                    cause.reason(),
+                    cause.remedy("roll back again")
+                ),
             )),
             VendorRevertStep::WouldRevert if preserve => {
                 if loud {
@@ -864,103 +856,6 @@ async fn run_vendored_leg(
             }
         }
     }
-    out
-}
-
-/// The patch-server origins that count as hosted, besides Socket's own:
-/// the operator's `--patch-server-url` (discovery's allowlist).
-pub(crate) fn patch_server_origins(common: &GlobalArgs) -> Vec<String> {
-    common
-        .patch_server_url
-        .iter()
-        .filter(|url| !url.trim().is_empty())
-        .cloned()
-        .collect()
-}
-
-/// Restore the in-scope hosted pins to their default upstream registry
-/// entries (core `patch::redirect::upstream`): v5 hosted mode keeps no
-/// ledger, so each pin's lock entry is re-resolved from the registry, and a
-/// pin that cannot be is refused with the `git checkout` remedy. Shared
-/// with remove's hosted leg.
-pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> HostedLegOutcome {
-    use socket_patch_core::patch::redirect::upstream::{
-        restore_upstream, PinStatus, RestoreOptions,
-    };
-
-    let mut out = HostedLegOutcome::default();
-    if pins.is_empty() {
-        return out;
-    }
-    // The vlt nodes the restored pins pin, read before the restore rewrites
-    // them: the heal below invalidates the patched installed copies once the
-    // registry pins are back.
-    let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
-        &common
-            .cwd
-            .join(socket_patch_core::constants::npm_family::VLT_LOCK),
-    )
-    .await
-    .ok();
-    let origins = patch_server_origins(common);
-    let purls: Vec<String> = pins.iter().map(|p| p.purl.clone()).collect();
-    let vlt_targets = vlt_lock
-        .as_deref()
-        .map(|lock| {
-            socket_patch_core::patch::redirect::vlt_heal::lock_targets(lock, &origins, &purls)
-        })
-        .unwrap_or_default();
-    let opts = RestoreOptions {
-        dry_run: common.dry_run,
-        offline: common.offline,
-        patch_server_origins: origins,
-        // A binary bun.lockb pin refuses with the checkout remedy: its
-        // rebuilt registry record is not byte-exact for every lock.
-        bun_lockb: false,
-    };
-    let outcome = restore_upstream(&common.cwd, pins, &opts).await;
-    for pin in &outcome.pins {
-        match &pin.status {
-            PinStatus::Restored => {
-                if !common.json && !common.silent {
-                    if common.dry_run {
-                        println!("Would restore {} to its upstream registry entry", pin.purl);
-                    } else {
-                        println!("Restored {} to its upstream registry entry", pin.purl);
-                    }
-                }
-                out.reverted.push(pin.purl.clone());
-            }
-            PinStatus::Refused(why) => {
-                // Errors print even under --silent: this drives exit 1.
-                if !common.json {
-                    eprintln!("Error: {}", capitalize_first(why));
-                }
-                out.failed.push((pin.purl.clone(), why.clone()));
-            }
-        }
-    }
-    if let Some(e) = &outcome.flush_error {
-        let why = format!("writing the restored lockfiles failed: {e}");
-        if !common.json {
-            eprintln!("Error: {}", capitalize_first(&why));
-        }
-        out.failed.push(("files".to_string(), why));
-    }
-    out.warnings.extend(
-        outcome
-            .warnings
-            .iter()
-            .map(|(code, detail)| (code.to_string(), detail.clone())),
-    );
-    out.edited_files
-        .extend(outcome.reverted_files.iter().cloned());
-    let unwound: Vec<_> = vlt_targets
-        .into_iter()
-        .filter(|t| out.reverted.iter().any(|p| p == &t.purl))
-        .collect();
-    out.warnings
-        .extend(crate::commands::scan::vlt_rollback_heal(common, &unwound).await);
     out
 }
 
@@ -1002,7 +897,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     // Classify targets up front: the glob validation is a pre-network
     // usage check.
-    let mut identifiers: Vec<String> = Vec::new();
+    let mut identifiers: Vec<Target> = Vec::new();
     let mut path_patterns: Vec<String> = Vec::new();
     for token in &args.targets {
         match classify_target(token) {
@@ -1011,20 +906,31 @@ pub async fn run(args: RollbackArgs) -> i32 {
         }
     }
 
-    // An unparseable glob is a usage error — same exit-2 stderr shape as
-    // scan's self-enforced mode conflicts.
+    // An unparseable glob is a usage error — same exit-2 shape as scan's
+    // self-enforced usage errors.
     let path_scope = match crate::path_scope::PathScope::parse(&path_patterns) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error: {}", capitalize_first(&e.to_string()));
-            return 2;
+            // Like emit_rollback_error: JSON keeps the verbatim message,
+            // only the human stderr line is sentence-cased.
+            let message = if args.common.json {
+                e.to_string()
+            } else {
+                crate::ui::sentence_case(&e.to_string())
+            };
+            return crate::json_envelope::usage_error(
+                crate::json_envelope::Command::Rollback,
+                args.common.json,
+                args.common.dry_run,
+                "path_glob_invalid",
+                &message,
+            );
         }
     };
 
     let (telemetry_client, _) =
         get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let api_token = telemetry_client.api_token().cloned();
-    let org_slug = telemetry_client.org_slug().cloned();
+    let telemetry = TelemetryAuth::for_client(&telemetry_client);
 
     let manifest_path = args.common.resolved_manifest_path();
     let cwd = args.common.cwd.clone();
@@ -1059,13 +965,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
     } else {
         Default::default()
     };
-    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
+    // Leftover `resolutions` selectors (#1203) unwind like pins: the
+    // restore retires them from the manifest.
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
 
     if manifest_missing && !vendor_ledger_exists && hosted_pins.is_empty() {
         // Hosted wiring the lockfiles name but cannot attribute is still
         // hosted state: refuse, naming it, instead of "Manifest not found".
         if let Some(refusal) = hosted_inventory.contested_refusal() {
-            emit_rollback_error(args.common.json, &refusal);
+            emit_rollback_error(args.common.json, "hosted_wiring_contested", &refusal);
             return 1;
         }
         // Only a pre-v5 hosted ledger left: no lockfile pins it any more,
@@ -1094,7 +1002,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else if let Some((_, detail)) = &warning {
-                eprintln!("Warning: {}", capitalize_first(detail));
+                eprintln!("Warning: {}", crate::ui::sentence_case(detail));
             } else if !args.common.silent {
                 println!(
                     "{} the pre-v5 hosted ledger {}: no lockfile pins a hosted patch.",
@@ -1120,6 +1028,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         if !wired.is_empty() {
             emit_rollback_error(
                 args.common.json,
+                "vendor_ledger_missing",
                 "lockfiles still reference .socket/vendor/ artifacts but the vendor ledger \
                  is missing — restore .socket/vendor/state.json from version control, then \
                  roll back (or restore the lockfiles with `git checkout -- <lockfile>`)",
@@ -1131,7 +1040,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": "error",
-                    "error": "Manifest not found",
+                    "error": {
+                        "code": "manifest_not_found",
+                        "message": "Manifest not found",
+                    },
                     "path": manifest_path.display().to_string(),
                 }))
                 .expect("serializing an in-memory JSON value cannot fail")
@@ -1193,19 +1105,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
         match read_manifest(&manifest_path).await {
             Ok(Some(m)) => m,
             Ok(None) => {
-                track_patch_rollback_failed(
-                    "Invalid manifest",
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
-                emit_rollback_error(args.common.json, "Invalid manifest");
+                track_patch_rollback_failed("Invalid manifest", &telemetry).await;
+                emit_rollback_error(args.common.json, "manifest_invalid", "Invalid manifest");
                 return 1;
             }
             Err(e) => {
                 let msg = e.to_string();
-                track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-                emit_rollback_error(args.common.json, &msg);
+                track_patch_rollback_failed(&msg, &telemetry).await;
+                emit_rollback_error(args.common.json, "manifest_unreadable", &msg);
                 return 1;
             }
         }
@@ -1228,6 +1135,38 @@ pub async fn run(args: RollbackArgs) -> i32 {
         .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
         .collect();
 
+    let ledgers = socket_patch_core::ledgers::Ledgers {
+        manifest: Some(&manifest),
+        vendor: vendor_state_result.as_ref().ok(),
+        redirect: None,
+    };
+    // A slash-containing package name (composer `vendor/pkg`, a go module
+    // path) is shaped like a path, but is a target first: one that selects
+    // a recorded or hosted patch is an identifier, as in `get` and
+    // `remove`; only otherwise is it a path glob.
+    let (identifiers, path_scope) = {
+        let mut identifiers = identifiers;
+        let mut globs: Vec<String> = Vec::new();
+        for raw in path_scope.raw() {
+            let named = is_name_shaped_path(raw)
+                .then(|| Target::parse(raw))
+                .filter(|t| {
+                    t.kind() == TargetKind::Name
+                        && (!ledgers.matching(t).is_empty()
+                            || redirect_records
+                                .iter()
+                                .any(|(purl, uuid)| t.matches_patch(purl, uuid)))
+                });
+            match named {
+                Some(t) => identifiers.push(t),
+                None => globs.push(raw.clone()),
+            }
+        }
+        let path_scope =
+            crate::path_scope::PathScope::parse(&globs).expect("a subset of the parsed patterns");
+        (identifiers, path_scope)
+    };
+
     let scoped = !identifiers.is_empty() || !path_scope.is_empty();
 
     // Identifier matching runs across ALL THREE stores; an identifier
@@ -1240,35 +1179,58 @@ pub async fn run(args: RollbackArgs) -> i32 {
         vendor_scope.extend(vendor_entries.iter().map(|(k, _)| k.clone()));
         hosted_scope.extend(redirect_records.iter().map(|(p, _)| p.clone()));
     }
-    let ledgers = socket_patch_core::ledgers::Ledgers {
-        manifest: Some(&manifest),
-        vendor: vendor_state_result.as_ref().ok(),
-        redirect: None,
-    };
     for id in &identifiers {
-        let found = ledgers.matching(id);
         // Hosted pins live in the lockfiles, not in a store: matched by the
-        // identifier, or as another generation of a matched manifest key.
-        let pins =
-            socket_patch_core::ledgers::hosted_pins_matching(&hosted_pins, id, &found.manifest);
+        // target, or as another generation of a matched manifest key.
+        let select = |id: &Target| {
+            let found = ledgers.matching(id);
+            let pins =
+                socket_patch_core::ledgers::hosted_pins_matching(&hosted_pins, id, &found.manifest);
+            (found, pins)
+        };
+        // A name reaching several packages by last segment (`core` →
+        // `@angular/core` and `@babel/core`) is refused across every
+        // store: `rollback` acts on one package per name, and only on the
+        // one the check settled on (`lodash` beside `@types/lodash` is
+        // `lodash` alone).
+        let settled = {
+            let (found, pins) = select(id);
+            id.settle(
+                found
+                    .manifest
+                    .iter()
+                    .map(String::as_str)
+                    .chain(found.vendor.iter().map(|(k, e)| e.ambiguity_purl(k, id)))
+                    .chain(pins.iter().map(|pin| pin.purl.as_str())),
+            )
+        };
+        let id = match settled {
+            Ok(settled) => settled,
+            Err(msg) => {
+                track_patch_rollback_failed(&msg, &telemetry).await;
+                emit_rollback_error(args.common.json, "ambiguous_target", &msg);
+                return 1;
+            }
+        };
+        let (found, pins) = select(&id);
         let matched = !found.is_empty() || !pins.is_empty();
         manifest_scope.extend(found.manifest);
         vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
         hosted_scope.extend(pins.into_iter().map(|pin| pin.purl));
         if !matched {
-            let hint = if id.starts_with("pkg:") || looks_like_uuid(id) {
+            let hint = if matches!(id.kind(), TargetKind::Purl | TargetKind::Uuid) {
                 String::new()
             } else {
                 format!(" (to target a directory instead, use ./{id} or {id}/**)")
             };
             let msg = format!("No patch found matching identifier: {id}{hint}");
-            track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_rollback_failed(&msg, &telemetry).await;
             if args.common.json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "status": "error",
-                        "error": msg,
+                        "error": { "code": "patch_not_found", "message": msg },
                         "rolledBack": 0,
                         "alreadyOriginal": 0,
                         "failed": 0,
@@ -1341,8 +1303,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
                  identifier or an unscoped rollback)",
                 unmatched.1
             );
-            track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-            emit_rollback_error(args.common.json, &msg);
+            track_patch_rollback_failed(&msg, &telemetry).await;
+            emit_rollback_error(args.common.json, "path_glob_no_match", &msg);
             return 1;
         }
         for purl in &path_selected {
@@ -1502,7 +1464,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             if !scoped {
                 if let Some(refusal) = hosted_inventory.contested_refusal() {
                     if !args.common.json {
-                        eprintln!("Error: {}", capitalize_first(&refusal));
+                        eprintln!("Error: {}", crate::ui::sentence_case(&refusal));
                     }
                     hosted_leg
                         .failed
@@ -1566,6 +1528,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     if vendored_excluded.contains(purl) {
                         return vendored_reverted_ok(purl);
                     }
+                    // A vendored Cargo crate whose shared-cache copy the
+                    // in-place leg restored too (#336) needs BOTH legs done.
+                    if purl_keys_cover(&vendored_keys, purl) && !vendored_reverted_ok(purl) {
+                        return false;
+                    }
                     succeeded_purls.contains(*purl)
                         || not_installed.contains(purl)
                         || superseded.contains(purl)
@@ -1611,48 +1578,54 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         .map(String::as_str),
                 );
                 let sweep = references.sweep(&socket_dir, args.common.dry_run).await;
-                let mut removed_counts = [0usize; 3];
-                for (slot, (label, result)) in removed_counts.iter_mut().zip([
-                    ("blob", sweep.blobs),
-                    ("diffs", sweep.diffs),
-                    ("packages", sweep.packages),
-                ]) {
-                    if let Some(detail) = sweep_failure(label, &result) {
+                for (label, result) in [
+                    ("blob", &sweep.blobs),
+                    ("diffs", &sweep.diffs),
+                    ("packages", &sweep.packages),
+                ] {
+                    if let Some(detail) = crate::ui::sweep_failure(label, result) {
                         run_warnings.push(("cleanup_failed".into(), detail));
                     }
-                    if let Ok(r) = result {
-                        *slot = r.blobs_removed;
-                        gc_bytes_freed += r.bytes_freed;
-                    }
                 }
-                gc_json = serde_json::json!({
-                    "removedBlobs": removed_counts[0],
-                    "removedDiffArchives": removed_counts[1],
-                    "removedPackageArchives": removed_counts[2],
-                    "bytesFreed": gc_bytes_freed,
-                });
+                let report = crate::json_envelope::GcReport::from_passes(
+                    sweep.blobs.as_ref().ok(),
+                    sweep.diffs.as_ref().ok(),
+                    sweep.packages.as_ref().ok(),
+                );
+                gc_bytes_freed = report.bytes_freed;
+                gc_json = report.to_value();
             }
 
             // ── run-level warnings ───────────────────────────────────────
             let unwired_any = !vendored_leg.reverted.is_empty()
                 || !vendored_leg.preserved.is_empty()
                 || !hosted_leg.reverted.is_empty();
+            let bun_advised = bun_reinstall_advised(
+                vendored_leg
+                    .warnings
+                    .iter()
+                    .chain(hosted_leg.warnings.iter())
+                    .map(|(code, _)| code.as_str()),
+            );
+            let pypi_advised = crate::commands::pypi_reinstall::advised(
+                vendored_leg
+                    .warnings
+                    .iter()
+                    .chain(hosted_leg.warnings.iter())
+                    .map(|(code, _)| code.as_str()),
+            );
             if unwired_any {
                 run_warnings.push((
                     "reinstall_required".into(),
-                    "unwired packages keep their patched bytes in installed trees until \
-                     the next package-manager install"
-                        .into(),
+                    format!(
+                        "unwired packages keep their patched bytes in installed trees until \
+                         the next package-manager install{}",
+                        reinstall_qualifiers(bun_advised, pypi_advised)
+                    ),
                 ));
             }
             if args.preserve_state && !hosted_leg.reverted.is_empty() {
-                run_warnings.push((
-                    "hosted_state_not_preservable".into(),
-                    "hosted wiring has no preservable local state: the lockfile pins are \
-                     the only record, and they now resolve upstream; re-run \
-                     `scan --mode hosted` to re-wire"
-                        .into(),
-                ));
+                run_warnings.push(hosted_state_not_preservable_warning());
             }
             if !path_scope.is_empty() {
                 let scope = path_scope.bind(&cwd);
@@ -1738,6 +1711,29 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .filter(|r| r.success && all_files_already_original(r))
                 .count();
             let failed_count = results.iter().filter(|r| !r.success).count();
+            // The top-level counters span every leg (#1066): a vendored or
+            // hosted unwind is a rollback, and a drift-keep, failure or
+            // unsupported hosted target is a failure, exactly as each one
+            // drives the status. A package wired through two legs counts
+            // once per leg; the per-leg arrays below say which.
+            let rolled_back_total = rolled_back_count
+                + vendored_leg.reverted.len()
+                + vendored_leg.preserved.len()
+                + hosted_leg.reverted.len();
+            let failed_total = failed_count
+                + vendored_leg.kept.len()
+                + vendored_leg.failed.len()
+                + hosted_leg.failed.len()
+                + hosted_leg.unsupported.len();
+            // Something failed and nothing reached the unpatched end state
+            // (rolled back, already original, or not installed): the run
+            // failed as a whole, so the status is an error (with `error`),
+            // not a partial failure.
+            let total_failure = !success
+                && failed_total > 0
+                && rolled_back_total == 0
+                && already_original_count == 0
+                && not_installed.is_empty();
 
             if let Some(e) = &manifest_write_failed {
                 if !args.common.json {
@@ -1754,11 +1750,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 // always present so consumers never null-check.
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    serde_json::to_string_pretty(&{
+                        let mut out = serde_json::json!({
                         "status": if success { "success" } else { "partial_failure" },
-                        "rolledBack": rolled_back_count,
+                        "rolledBack": rolled_back_total,
                         "alreadyOriginal": already_original_count,
-                        "failed": failed_count,
+                        "failed": failed_total,
                         "dryRun": args.common.dry_run,
                         "warnings": run_warnings
                             .iter()
@@ -1814,7 +1811,21 @@ pub async fn run(args: RollbackArgs) -> i32 {
                             .map(result_to_json)
                             .chain(not_installed.iter().map(|p| skipped_not_installed_json(p)))
                             .collect::<Vec<_>>(),
-                    }))
+                        });
+                        if total_failure {
+                            crate::json_envelope::set_error(
+                                &mut out,
+                                crate::json_envelope::EnvelopeError::new(
+                                    "rollback_failed",
+                                    format!(
+                                        "nothing was rolled back: {}",
+                                        plural(failed_total, "patch failed", "patches failed")
+                                    ),
+                                ),
+                            );
+                        }
+                        out
+                    })
                     .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else if !args.common.silent && !results.is_empty() {
@@ -1933,7 +1944,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 if still_patched > 0 {
                     println!(
                         "\n{}",
-                        format_reinstall_note(still_patched, args.common.dry_run)
+                        format_reinstall_note(
+                            still_patched,
+                            args.common.dry_run,
+                            bun_advised,
+                            pypi_advised
+                        )
                     );
                 }
             }
@@ -1957,25 +1973,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 }
                 for (code, detail) in &run_warnings {
                     if code == "vendor_state_unreadable" {
-                        eprintln!("Error ({code}): {}", capitalize_first(detail));
+                        eprintln!("Error ({code}): {}", crate::ui::sentence_case(detail));
                     }
                 }
             }
 
             if success {
-                track_patch_rolled_back(
-                    rolled_back_count,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_rolled_back(rolled_back_total, &telemetry).await;
             } else {
-                track_patch_rollback_failed(
-                    "One or more rollbacks failed",
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_rollback_failed("One or more rollbacks failed", &telemetry).await;
             }
 
             if success {
@@ -1985,13 +1991,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_rollback_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_rollback_failed(&e, &telemetry).await;
             if args.common.json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "status": "error",
-                        "error": e,
+                        "error": { "code": "rollback_failed", "message": e },
                         "rolledBack": 0,
                         "alreadyOriginal": 0,
                         "failed": 0,
@@ -2004,7 +2010,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             } else {
                 // Errors print even under --silent ("errors only", never
                 // "nothing"): exit 1 with no message would be undiagnosable.
-                eprintln!("Error: {}", capitalize_first(&e));
+                eprintln!("Error: {}", crate::ui::sentence_case(&e));
             }
             1
         }
@@ -2014,7 +2020,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
 /// The in-place (agent) rollback engine over an already-loaded `manifest`.
 /// `vendored_keys` is the ledger's ownership set (see
 /// [`VendorState::purl_keys`]): vendor-owned purls are excluded from the
-/// in-place restore. Both `run()` and `remove`'s delegation load each
+/// in-place restore, except a vendored Cargo crate whose shared-cache copy
+/// still carries an agent-mode patch (#336). Both `run()` and `remove`'s delegation load each
 /// store once under the lock and thread it in here.
 pub(crate) async fn rollback_patches_inner(
     common: &GlobalArgs,
@@ -2035,9 +2042,7 @@ pub(crate) async fn rollback_patches_inner(
     let mut blobs_path = socket_dir.join("blobs");
 
     let patches_to_rollback = match &selection {
-        InnerSelection::Identifier(identifier) => {
-            find_patches_to_rollback(manifest, identifier.as_deref())
-        }
+        InnerSelection::Identifier(identifier) => find_patches_to_rollback(manifest, *identifier),
         InnerSelection::Scope { purls, .. } => manifest
             .patches
             .iter()
@@ -2087,9 +2092,32 @@ pub(crate) async fn rollback_patches_inner(
     // ledger-key / base-purl / qualifier-stripped triple; the caller
     // degrades unreadable state to "nothing vendored".
     let is_vendored = |p: &str| purl_keys_cover(vendored_keys, p);
-    let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
+    let (vendored_targets, mut patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
         .into_iter()
         .partition(|p| is_vendored(&p.purl));
+    // Except a vendored Cargo crate whose shared registry-cache copy still
+    // carries an earlier agent-mode patch (#336): vendoring never touched
+    // that copy, and the manifest record about to be dropped holds the only
+    // before-blobs that can restore it. Only a copy that is actually
+    // patched is restored — the vendored copy under `.socket/vendor/` is
+    // never a rollback location — so a plain vendored crate (cache copy
+    // absent or pristine) is skipped exactly as before. A project `vendor/`
+    // dir (`cargo vendor`) hides the registry cache from the crawl, so its
+    // copies are looked up there too: the record is dropped after this run,
+    // and an unrestored copy would be orphaned with no before-blobs.
+    let vendored_purls: Vec<String> = vendored_targets.iter().map(|p| p.purl.clone()).collect();
+    let cache_patched = crate::ecosystem_dispatch::cargo_copies_still_patched(
+        manifest,
+        &vendored_purls,
+        &common.crawler_options(),
+        &blobs_path,
+        true,
+    )
+    .await;
+    let (cache_targets, vendored_targets): (Vec<_>, Vec<_>) = vendored_targets
+        .into_iter()
+        .partition(|p| cache_patched.contains(&p.purl));
+    patches_to_rollback.extend(cache_targets);
     let mut vendored_skipped: Vec<String> = vendored_targets.into_iter().map(|p| p.purl).collect();
     vendored_skipped.sort();
     if patches_to_rollback.is_empty() {
@@ -2157,12 +2185,32 @@ pub(crate) async fn rollback_patches_inner(
     // one would leave the other copy still patched (silently divergent from
     // the manifest's rolled-back state). The rollback loop below restores
     // every copy.
-    let all_packages_multi = find_all_packages_for_rollback(
+    let mut all_packages_multi = find_all_packages_for_rollback(
         &partitioned,
         &crawler_options,
         common.silent || common.json,
     )
     .await;
+    // The shared-cache copies of the vendored Cargo crates restored above
+    // (#336), including those a `cargo vendor` dir hides from the crawl.
+    let cache_purls: Vec<String> = cache_patched
+        .into_iter()
+        .filter(|p| in_scope.contains(p))
+        .collect();
+    if !cache_purls.is_empty() {
+        let shadowed =
+            crate::ecosystem_dispatch::find_cargo_copies(cache_purls, &crawler_options, true).await;
+        for (purl, paths) in shadowed {
+            let copies = all_packages_multi.entry(purl).or_default();
+            for path in paths {
+                if !copies.contains(&path) {
+                    copies.push(path);
+                }
+            }
+        }
+    }
+    // One restore per physical copy, as apply patches them (#633).
+    distinct_npm_copies(&mut all_packages_multi).await;
 
     // One representative path per PURL for the "is it installed" checks and
     // the abort envelope's path display. The before-blob gate and the
@@ -2410,8 +2458,7 @@ pub(crate) async fn rollback_patches_inner(
             // locally-drifted) root copy says nothing about a still-patched
             // nested duplicate, whose restore still needs the blob. Probing
             // only a representative copy skipped the download and wedged the
-            // online rollback with a mid-run `MissingBlob` failure. Mirrors
-            // apply's `mismatch_blob_gaps`.
+            // online rollback with a mid-run `MissingBlob` failure.
             let mut pkg_paths = all_packages_multi
                 .get(purl)
                 .expect("gate manifest holds only attempted targets, which the crawler discovered")
@@ -2482,7 +2529,7 @@ pub(crate) async fn rollback_patches_inner(
                     "Error: {} missing and --offline is set.",
                     plural(missing_blobs.len(), "blob is", "blobs are")
                 );
-                eprintln!("Run \"socket-patch repair\" to download missing blobs.");
+                eprintln!("Re-run without --offline to download the original blobs.");
             }
             let results = missing_blob_abort_results(
                 &abort_manifest,
@@ -2491,7 +2538,7 @@ pub(crate) async fn rollback_patches_inner(
                 |hash| {
                     format!(
                         "Before blob not found: {hash} and --offline prevents fetching. \
-                         Run \"socket-patch repair\" to download missing blobs."
+                         Re-run without --offline to download the original blobs."
                     )
                 },
             );
@@ -2572,7 +2619,7 @@ pub(crate) async fn rollback_patches_inner(
                         .unwrap_or("download failed");
                     format!(
                         "Before blob could not be downloaded: {hash} - {why}. \
-                         Run \"socket-patch repair\" to download missing blobs."
+                         Re-run once the patch API is reachable to download the original blobs."
                     )
                 },
             );
@@ -2656,10 +2703,29 @@ pub(crate) async fn rollback_patches_inner(
             continue;
         }
         let files = target.files.as_ref().unwrap_or(&patch.files);
+        let mut result = result;
         if let Some(warning) = superseded_record_skip(target, &result, files, superseded).await {
-            warnings.push(warning);
-            superseded_left.push(purl.clone());
-            continue;
+            // The superseded primary never reached its store copies; one
+            // still at this record's patched bytes (Bun's orphaned
+            // isolated-store entry, #1084) is restored here, or fails the
+            // run and keeps the record, before the record is dropped.
+            match socket_patch_core::patch::rollback::rollback_store_copies_holding_patch(
+                purl,
+                pkg_path,
+                files,
+                &blobs_path,
+                common.dry_run,
+            )
+            .await
+            {
+                Some(copies) if !copies.success => result = copies,
+                restored => {
+                    warnings.push(warning);
+                    superseded_left.push(purl.clone());
+                    results.extend(restored);
+                    continue;
+                }
+            }
         }
         if !result.success {
             has_errors = true;
@@ -2706,6 +2772,20 @@ pub(crate) async fn rollback_patches_inner(
             }
         }
         results.push(result);
+    }
+
+    // The restored crates' compiled copies in this project's build cache
+    // still hold the patched code cargo keyed on the package id (#387).
+    if !common.dry_run {
+        warnings.extend(
+            socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                &common.cwd,
+                results
+                    .iter()
+                    .filter(|r| r.success && !r.files_rolled_back.is_empty())
+                    .map(|r| r.package_key.as_str()),
+            ),
+        );
     }
 
     superseded_left.sort();
@@ -3220,12 +3300,13 @@ mod tests {
             dry_run,
             ..common.clone()
         };
+        let target = identifier.map(Target::parse);
         let outcome = rollback_patches_inner(
             &delegated_common,
             &socket_dir,
             &manifest,
             &vendored_keys,
-            InnerSelection::Identifier(identifier),
+            InnerSelection::Identifier(target.as_ref()),
             &HashMap::new(),
             None,
         )
@@ -3271,7 +3352,7 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_purl_match() {
         let manifest = make_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("pkg:npm/foo@1.0"));
+        let result = find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:npm/foo@1.0")));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].purl, "pkg:npm/foo@1.0");
     }
@@ -3279,14 +3360,15 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_purl_no_match() {
         let manifest = make_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("pkg:npm/nonexistent@1"));
+        let result =
+            find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:npm/nonexistent@1")));
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_find_patches_to_rollback_uuid_match() {
         let manifest = make_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("uuid-bar"));
+        let result = find_patches_to_rollback(&manifest, Some(&Target::parse("uuid-bar")));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].patch.uuid, "uuid-bar");
         assert_eq!(result[0].purl, "pkg:npm/bar@2.0");
@@ -3295,7 +3377,8 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_uuid_no_match() {
         let manifest = make_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("uuid-does-not-exist"));
+        let result =
+            find_patches_to_rollback(&manifest, Some(&Target::parse("uuid-does-not-exist")));
         assert!(result.is_empty());
     }
 
@@ -3325,7 +3408,8 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_base_purl_matches_all_variants() {
         let manifest = make_multi_variant_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
+        let result =
+            find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:pypi/six@1.16.0")));
         // Base PURL (no qualifier) expands to every release variant.
         assert_eq!(result.len(), 3);
         for p in &result {
@@ -3336,17 +3420,57 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_qualified_purl_matches_one_variant() {
         let manifest = make_multi_variant_manifest();
-        let result =
-            find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0?artifact_id=sdist"));
+        let result = find_patches_to_rollback(
+            &manifest,
+            Some(&Target::parse("pkg:pypi/six@1.16.0?artifact_id=sdist")),
+        );
         // A fully-qualified PURL targets exactly one variant.
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].purl, "pkg:pypi/six@1.16.0?artifact_id=sdist");
     }
 
+    /// Rollback shares the target grammar: a bare name (and an npm
+    /// `@scope/name`) is a package target, not a uuid-only identifier or a
+    /// path glob; only path-shaped tokens are globs.
+    #[test]
+    fn classify_target_uses_the_shared_grammar() {
+        assert!(matches!(
+            classify_target("lodash"),
+            RollbackTarget::Identifier(_)
+        ));
+        assert!(matches!(
+            classify_target("@babel/core"),
+            RollbackTarget::Identifier(_)
+        ));
+        assert!(matches!(
+            classify_target("pkg:npm/@s/x"),
+            RollbackTarget::Identifier(_)
+        ));
+        assert!(matches!(
+            classify_target("./node_modules"),
+            RollbackTarget::PathGlob(_)
+        ));
+        assert!(matches!(
+            classify_target("node_modules/**"),
+            RollbackTarget::PathGlob(_)
+        ));
+        let manifest = make_manifest();
+        let result = find_patches_to_rollback(&manifest, Some(&Target::parse("foo")));
+        assert_eq!(result.len(), 1, "a bare name selects its recorded patch");
+        assert_eq!(result[0].purl, "pkg:npm/foo@1.0");
+        let result = find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:npm/foo")));
+        assert_eq!(
+            result.len(),
+            1,
+            "a versionless purl selects its recorded patch"
+        );
+    }
+
     #[test]
     fn test_find_patches_to_rollback_base_purl_does_not_leak_other_packages() {
         let manifest = make_multi_variant_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
+        let result =
+            find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:pypi/six@1.16.0")));
         assert!(result.iter().all(|p| p.purl.contains("six@1.16.0")));
     }
 
@@ -5151,41 +5275,6 @@ mod tests {
     }
 
     #[test]
-    fn copy_path_outside_cwd_stays_absolute() {
-        assert_eq!(
-            display_copy_path("/elsewhere/node_modules/x", Path::new("/p")),
-            "/elsewhere/node_modules/x"
-        );
-        assert_eq!(display_copy_path("/p", Path::new("/p")), "/p");
-        assert_eq!(
-            display_copy_path("/p/node_modules/é", Path::new("/p")),
-            "node_modules/é"
-        );
-    }
-
-    #[test]
-    fn capitalize_first_is_char_safe() {
-        assert_eq!(capitalize_first(""), "");
-        assert_eq!(capitalize_first("path pattern x"), "Path pattern x");
-        assert_eq!(capitalize_first("Already"), "Already");
-        assert_eq!(capitalize_first("ülk"), "Ülk");
-        assert_eq!(capitalize_first("--preserve-state"), "--preserve-state");
-        assert_eq!(capitalize_first("cannot read x: y"), "Cannot read x: y");
-        assert_eq!(capitalize_first("can't, really"), "Can't, really");
-        // Values the user may copy back are never altered.
-        assert_eq!(
-            capitalize_first("pkg:npm/a@1 matches only hosted records"),
-            "pkg:npm/a@1 matches only hosted records"
-        );
-        assert_eq!(
-            capitalize_first("a1b2c3d4-0000-4000-8000-000000000000 matches nothing"),
-            "a1b2c3d4-0000-4000-8000-000000000000 matches nothing"
-        );
-        assert_eq!(capitalize_first("abcdef matches"), "Abcdef matches");
-        assert_eq!(capitalize_first(".socket/x is bad"), ".socket/x is bad");
-    }
-
-    #[test]
     fn rollback_failure_line() {
         assert_eq!(
             format_rollback_failure("pkg:npm/a@1", "boom"),
@@ -5424,14 +5513,53 @@ mod tests {
     #[test]
     fn reinstall_note_tense_and_number() {
         assert_eq!(
-            format_reinstall_note(1, false),
+            format_reinstall_note(1, false, false, false),
             "Note: 1 unwired package keeps its patched bytes in installed trees until the \
              next package-manager install."
         );
         assert_eq!(
-            format_reinstall_note(2, true),
+            format_reinstall_note(2, true, false, false),
             "Note: 2 unwired packages would keep their patched bytes in installed trees \
              until the next package-manager install."
         );
+    }
+
+    /// #764: next to a Bun advisory the generic note must not imply that
+    /// any install refreshes the copy.
+    #[test]
+    fn reinstall_note_defers_to_the_bun_advisory() {
+        assert_eq!(
+            format_reinstall_note(1, false, true, false),
+            "Note: 1 unwired package keeps its patched bytes in installed trees until the \
+             next package-manager install (Bun: a plain `bun install` keeps them; run \
+             `bun install --force`)."
+        );
+        assert!(bun_reinstall_advised(
+            ["cleanup_failed", "vendor_bun_reinstall_required"].into_iter()
+        ));
+        assert!(bun_reinstall_advised(
+            ["redirect_bun_reinstall_required"].into_iter()
+        ));
+        assert!(!bun_reinstall_advised(
+            ["redirect_vlt_reinstall_required"].into_iter()
+        ));
+    }
+
+    /// #477: next to a PyPI reinstall advisory the note must not imply
+    /// that the next sync refreshes the copy.
+    #[test]
+    fn reinstall_note_defers_to_the_pypi_advisory() {
+        let note = format_reinstall_note(1, false, false, true);
+        assert!(
+            note.contains("(PDM, uv and Pipenv keep a same-version install")
+                && note.contains("pypi_reinstall_required"),
+            "{note}"
+        );
+        assert!(crate::commands::pypi_reinstall::advised(
+            ["vendor_pypi_reinstall_required"].into_iter()
+        ));
+        assert!(crate::commands::pypi_reinstall::advised(
+            ["redirect_pypi_reinstall_required"].into_iter()
+        ));
     }
 }

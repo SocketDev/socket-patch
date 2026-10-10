@@ -21,6 +21,15 @@ pub(crate) struct NpmDist {
     pub integrity: Option<String>,
     /// The hex sha1 `dist.shasum`.
     pub shasum: Option<String>,
+    /// The version document's `bin`, as yarn reads a manifest's
+    /// ([`crate::formats::yarn::berry_entry::manifest_bin`]): what yarn
+    /// berry writes in the `bin:` section of the version's `npm:` entry
+    /// (#1131). Empty when the document declares none.
+    pub bin: std::collections::BTreeMap<String, String>,
+    /// Whether yarn's npm resolver gives this version the implicit
+    /// `node-gyp: "npm:latest"` dependency (see
+    /// `formats::yarn::berry_entry::registry_adds_node_gyp`, #737).
+    pub node_gyp: bool,
 }
 
 /// A Go module version's two go.sum hashes.
@@ -150,8 +159,8 @@ pub(crate) const OFFLINE: &str =
 
 type Cache<T> = Mutex<HashMap<(String, String), Result<T, String>>>;
 
-/// [`Cache`] keyed by (registry base, name, version).
-type RegistryCache<T> = Mutex<HashMap<(String, String, String), Result<T, String>>>;
+/// [`Cache`] keyed by (registry base, `Authorization` sent, name, version).
+type RegistryCache<T> = Mutex<HashMap<(String, Option<String>, String, String), Result<T, String>>>;
 
 /// One client per restore run; every lookup is cached (success and
 /// failure alike) so a pin wired in several files costs one request.
@@ -185,10 +194,27 @@ impl UpstreamClient {
     }
 
     async fn get_json(&self, url: &str) -> Result<Value, String> {
-        let resp = self
-            .http
-            .get(url)
-            .header("accept", "application/json")
+        self.get_json_authorized(url, None).await
+    }
+
+    /// [`Self::get_json`] sending `authorization` (a private registry's
+    /// credentials) as the `Authorization` header. reqwest drops the header
+    /// on a redirect to another host.
+    async fn get_json_authorized(
+        &self,
+        url: &str,
+        authorization: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut request = self.http.get(url).header("accept", "application/json");
+        if let Some(authorization) = authorization {
+            let mut value =
+                reqwest::header::HeaderValue::from_str(authorization).map_err(|_| {
+                    format!("GET {url}: the configured credentials are not a valid header")
+                })?;
+            value.set_sensitive(true);
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| format!("GET {url}: {e}"))?;
@@ -222,12 +248,32 @@ impl UpstreamClient {
         name: &str,
         version: &str,
     ) -> Result<NpmDist, String> {
+        self.npm_dist_authorized(base, None, name, version).await
+    }
+
+    /// [`Self::npm_dist_on`] sending `authorization` as the `Authorization`
+    /// header: the credentials the project configures for the private
+    /// registry at `base` (#992).
+    pub(crate) async fn npm_dist_authorized(
+        &self,
+        base: &str,
+        authorization: Option<&str>,
+        name: &str,
+        version: &str,
+    ) -> Result<NpmDist, String> {
         let base = base.trim_end_matches('/');
-        let key = (base.to_string(), name.to_string(), version.to_string());
+        let key = (
+            base.to_string(),
+            authorization.map(str::to_string),
+            name.to_string(),
+            version.to_string(),
+        );
         if let Some(hit) = self.npm.lock().await.get(&key) {
             return hit.clone();
         }
-        let result = self.fetch_npm_dist(base, name, version).await;
+        let result = self
+            .fetch_npm_dist(base, authorization, name, version)
+            .await;
         self.npm.lock().await.insert(key, result.clone());
         result
     }
@@ -235,6 +281,7 @@ impl UpstreamClient {
     async fn fetch_npm_dist(
         &self,
         base: &str,
+        authorization: Option<&str>,
         name: &str,
         version: &str,
     ) -> Result<NpmDist, String> {
@@ -246,7 +293,7 @@ impl UpstreamClient {
             "{base}/{encoded_name}/{}",
             crate::utils::uri::encode_uri_component(version)
         );
-        let doc = self.get_json(&url).await?;
+        let doc = self.get_json_authorized(&url, authorization).await?;
         let dist = doc
             .get("dist")
             .ok_or_else(|| format!("{url} carries no `dist` block"))?;
@@ -257,6 +304,8 @@ impl UpstreamClient {
             tarball,
             integrity: str_field("integrity"),
             shasum: str_field("shasum"),
+            bin: crate::formats::yarn::berry_entry::manifest_bin(&doc),
+            node_gyp: crate::formats::yarn::berry_entry::registry_adds_node_gyp(&doc),
         })
     }
 
@@ -653,7 +702,9 @@ pub(crate) const DEFAULT_GOSUMDB: &str = "https://sum.golang.org";
 /// The checksum database go would consult for `module`, or `None` when go
 /// would not (`GOSUMDB=off`, or the module matches `GONOSUMDB` /
 /// `GOPRIVATE`) — the hashes are then computed from the module proxy's
-/// bytes instead. An explicit `SOCKET_GOSUMDB_URL` always wins.
+/// bytes instead. An explicit `SOCKET_GOSUMDB_URL` always wins. The Go
+/// settings resolve from the environment, then the `go env -w` file
+/// ([`crate::utils::go_env`]).
 fn gosumdb_base(module: &str) -> Option<String> {
     if let Ok(v) = std::env::var("SOCKET_GOSUMDB_URL") {
         let v = v.trim().trim_end_matches('/').to_string();
@@ -661,7 +712,7 @@ fn gosumdb_base(module: &str) -> Option<String> {
             return Some(v);
         }
     }
-    let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    let nonempty = |key: &str| crate::utils::go_env::go_env(key).filter(|v| !v.trim().is_empty());
     if nonempty("GOSUMDB").is_some_and(|v| v.trim() == "off") {
         return None;
     }
@@ -797,11 +848,13 @@ mod tests {
                 .await;
             let client = UpstreamClient::new(false);
             client.npm.lock().await.insert(
-                (npm_registry_base(), "left-pad".into(), "1.3.0".into()),
+                (npm_registry_base(), None, "left-pad".into(), "1.3.0".into()),
                 Ok(NpmDist {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: registry_sri,
                     shasum: registry_sha1,
+                    bin: Default::default(),
+                    node_gyp: false,
                 }),
             );
             for _ in 0..2 {
@@ -857,11 +910,13 @@ mod tests {
                 .await;
             let client = UpstreamClient::new(false);
             client.npm.lock().await.insert(
-                (npm_registry_base(), "left-pad".into(), "1.3.0".into()),
+                (npm_registry_base(), None, "left-pad".into(), "1.3.0".into()),
                 Ok(NpmDist {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: Some("sha512-other".into()),
                     shasum: None,
+                    bin: Default::default(),
+                    node_gyp: false,
                 }),
             );
             assert!(

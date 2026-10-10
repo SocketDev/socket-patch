@@ -475,7 +475,7 @@ const VENDORED_PURL: &str = "pkg:npm/__remove_vendored__@1.0.0";
 const MANIFEST_UUID: &str = "55555555-5555-4555-8555-555555555555";
 /// The generation that was actually vendored — one behind the manifest.
 /// This is the documented `vendor_uuid_mismatch` state: `get` / `scan
-/// --apply` refreshed the manifest record while the re-vendor is still
+/// --mode agent` refreshed the manifest record while the re-vendor is still
 /// pending (repair reports it and declines to cross patch generations).
 const LEDGER_UUID: &str = "66666666-6666-4666-8666-666666666666";
 

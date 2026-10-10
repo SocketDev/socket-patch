@@ -163,7 +163,14 @@ fn indexed_npm_lock_rewrite_matches_golden() {
         let refs: Vec<&DepOverride> = deps.iter().collect();
         for lockfile in ["package-lock.json", "npm-shrinkwrap.json"] {
             let mut got = RewriteResult::default();
-            rewrite_one_npm_lock(&text, lockfile, &refs, &NpmOverrides::default(), &mut got);
+            rewrite_one_npm_lock(
+                &text,
+                parse_json_text(&text).ok(),
+                lockfile,
+                &refs,
+                &NpmOverrides::default(),
+                &mut got,
+            );
             record(&(&text, lockfile, &deps), &got);
             edits += got.edits.len();
             codes.extend(got.warnings.iter().map(|w| w.code.clone()));
@@ -255,7 +262,14 @@ fn indexed_yarn_classic_rewrite_matches_golden() {
             _ => {}
         }
         let files = BTreeMap::from([("yarn.lock".to_string(), text)]);
-        let deps = overrides(&pool, &mut rng);
+        let mut deps = overrides(&pool, &mut rng);
+        // A yarn classic pin needs a sha1 (#558): most grants carry one
+        // (or the hosted flow derives it); every seventh dep lacks it.
+        for (i, dep) in deps.iter_mut().enumerate() {
+            if dep.integrity.sha1.is_none() && i % 7 != 0 {
+                dep.integrity.sha1 = Some(format!("{i:04x}"));
+            }
+        }
         let mut got = RewriteResult::default();
         rewrite_yarn_classic(&files, &deps, &mut got);
         record(&(&files, &deps), &got);
@@ -265,6 +279,7 @@ fn indexed_yarn_classic_rewrite_matches_golden() {
     assert!(edits > 400, "edits: {edits}");
     for code in [
         "redirect_yarn_classic_missing_sha512",
+        "redirect_yarn_classic_missing_sha1",
         "redirect_yarn_classic_alias_skipped",
         "redirect_yarn_classic_entry_not_found",
         "redirect_yarn_classic_unresolved_entry_skipped",
