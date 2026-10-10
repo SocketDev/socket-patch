@@ -44,10 +44,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::constants::SOCKET_DIR;
-use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
+use crate::formats::yarn::berry_entry::{render_pinned_entry, Pin};
 use crate::formats::yarn::berry_gates::{self, BerryGate, Yarnrc, SUPPORTED_CACHE_KEY};
+use crate::formats::yarn::berry_prune::{cut_descriptors, prune_unreferenced};
 use crate::formats::yarn::blocks::{berry_field, block_eol, replace_block, scan_blocks, LockBlock};
 use crate::formats::yarn::patterns::{pattern_real_name, split_berry_key_patterns, split_pattern};
+use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{
@@ -83,6 +85,11 @@ static PKG_JSON_MEMO: ParseMemo<Value> = ParseMemo::new();
 /// Wiring kinds this backend owns.
 const KIND_RESOLUTION: &str = "yarn_berry_resolution";
 const KIND_LOCK_ENTRY: &str = "yarn_berry_lock_entry";
+/// An entry the pin left unreachable and vendoring dropped (or a shared
+/// key that lost a descriptor, #737): `original` holds the entry's lines,
+/// `new` the rewritten lines (absent when the whole entry went). Revert
+/// puts the original back.
+const KIND_LOCK_ENTRY_PRUNED: &str = "yarn_berry_lock_entry_pruned";
 
 /// Vendor one installed npm package into a yarn-berry (4.x, cacheKey 10c0)
 /// project. Same contract as [`super::npm_lock::vendor_npm`]: refuse-early,
@@ -92,26 +99,23 @@ const KIND_LOCK_ENTRY: &str = "yarn_berry_lock_entry";
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_yarn_berry<'a>(
     purl: &str,
-    installed_dir: impl Into<PackageSource<'a>>,
+    _installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     vendor_npm_family(
         &YarnBerryBackend,
         NpmVendorRequest {
             purl,
-            installed_dir: installed_dir.into(),
             project_root,
             record,
-            sources,
             vendored_at,
             dry_run,
-            force,
             service,
         },
     )
@@ -340,14 +344,14 @@ impl NpmLockBackend for YarnBerryBackend {
         let lock_key = format!("\"{name}@file:./{rel_tgz}::locator={locator}\"");
         // Yarn builds a `file:` entry from the tarball's own package.json,
         // whose `bin` keeps its published spelling where the registry
-        // entry's is normalized (#718). A tarball without a readable
-        // manifest keeps the registry's map (yarn cannot install it either
-        // way).
-        let tarball_bin = crate::patch::package::read_archive_bytes_to_map(&tgz_bytes)
+        // entry's is normalized (#718), and which never gets the npm
+        // resolver's implicit `node-gyp` dependency (#737). A tarball
+        // without a readable manifest keeps the registry's fields (yarn
+        // cannot install it either way).
+        let tarball_manifest = crate::patch::package::read_archive_bytes_to_map(&tgz_bytes)
             .ok()
             .and_then(|members| serde_json::from_slice::<Value>(members.get(PACKAGE_JSON)?).ok())
-            .filter(Value::is_object)
-            .map(|manifest| manifest_bin(&manifest));
+            .filter(Value::is_object);
         // The exact entry yarn 4 emits for a resolutions-driven `file:`
         // tarball (the B3 fixture shape), fields in yarn's order (#697).
         let lock_key_line = format!("{lock_key}:");
@@ -357,7 +361,7 @@ impl NpmLockBackend for YarnBerryBackend {
                 key_line: &lock_key_line,
                 resolution: &resolution,
                 checksum: Some(&checksum),
-                bin: tarball_bin.as_ref(),
+                manifest: tarball_manifest.as_ref(),
             },
         );
 
@@ -385,12 +389,41 @@ impl NpmLockBackend for YarnBerryBackend {
         let new_pkg_bytes = JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes))
             .render(&new_pkg)
             .map_err(|e| format!("cannot serialize {PACKAGE_JSON}: {e}"))?;
-        let new_lock_text = replace_block(
+        let mut new_lock_text = replace_block(
             &lock_text,
             target,
             &new_lines,
             block_eol(&lock_text, target),
         );
+        // The entries only the dropped dependency edges reached go too, or
+        // yarn deletes them on the next install (#737).
+        let pruned = {
+            let cut = cut_descriptors(&target.lines.join("\n"), &new_lines.join("\n"));
+            if cut.is_empty() {
+                Vec::new()
+            } else {
+                let mut doc = BerryStanzas::parse(&new_lock_text);
+                let mut moved = Vec::new();
+                let protected = new_pkg
+                    .get("resolutions")
+                    .and_then(Value::as_object)
+                    .map(|table| {
+                        table
+                            .keys()
+                            .filter_map(|sel| {
+                                crate::formats::yarn::patterns::resolution_selector_target(sel)
+                                    .map(str::to_string)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let pruned = prune_unreferenced(&mut doc.stanzas, cut, &protected, &mut moved);
+                if !pruned.is_empty() {
+                    new_lock_text = doc.render(&moved);
+                }
+                pruned
+            }
+        };
         commit_pair(
             project_root,
             &new_pkg_bytes,
@@ -429,6 +462,22 @@ impl NpmLockBackend for YarnBerryBackend {
                 new: Some(lines_to_json(&new_lines)),
             },
         ];
+        let stanza_lines =
+            |text: &str| -> Vec<String> { text.lines().map(str::to_string).collect() };
+        let mut wiring = wiring;
+        wiring.extend(pruned.into_iter().map(|p| {
+            WiringRecord {
+                file: YARN_LOCK.to_string(),
+                kind: KIND_LOCK_ENTRY_PRUNED.to_string(),
+                action: WiringAction::Rewritten,
+                key: stanza_key(&p.before).map(str::to_string),
+                original: Some(lines_to_json(&stanza_lines(&p.before))),
+                new: p
+                    .after
+                    .as_deref()
+                    .map(|after| lines_to_json(&stanza_lines(after))),
+            }
+        }));
         Ok(Some(NpmCommit {
             wiring,
             yarn_berry10c0: packed
@@ -714,6 +763,10 @@ pub async fn revert_yarn_berry_opts(
             Ok(mut text) => {
                 let mut changed = false;
                 for rec in lock_recs {
+                    if rec.kind == KIND_LOCK_ENTRY_PRUNED {
+                        changed |= restore_pruned_entry(&mut text, rec, &mut outcome.warnings);
+                        continue;
+                    }
                     changed |= revert_recorded_block(
                         &mut text,
                         rec,
@@ -872,6 +925,74 @@ pub async fn revert_yarn_berry_opts(
 }
 
 // ───────────────────────────── revert internals ─────────────────────────────
+
+/// Put back an entry vendoring pruned (see [`KIND_LOCK_ENTRY_PRUNED`]):
+/// the rewritten shared entry returns to its original lines, a removed one
+/// is inserted where yarn sorts it. Already restored is silent; anything
+/// else (the entry was re-resolved since) is left alone with a warning —
+/// the user's lock, not the artifact, is at stake, so it is not drift.
+fn restore_pruned_entry(
+    text: &mut String,
+    rec: &WiringRecord,
+    warnings: &mut Vec<VendorWarning>,
+) -> bool {
+    let Some(original) = rec
+        .original
+        .as_ref()
+        .and_then(super::yarn_classic_lock::json_to_lines)
+        .map(|lines| lines.join("\n"))
+    else {
+        return false;
+    };
+    let new = rec
+        .new
+        .as_ref()
+        .and_then(super::yarn_classic_lock::json_to_lines)
+        .map(|lines| lines.join("\n"));
+    let mut doc = BerryStanzas::parse(text);
+    if doc.stanzas.contains(&original) {
+        return false;
+    }
+    let Some(key) = stanza_key(&original).map(str::to_string) else {
+        return false;
+    };
+    let patterns = split_berry_key_patterns(&key);
+    let live = |s: &String| {
+        stanza_key(s).is_some_and(|k| {
+            split_berry_key_patterns(k)
+                .iter()
+                .any(|p| patterns.contains(p))
+        })
+    };
+    match new {
+        Some(new) => match doc.stanzas.iter().position(|s| *s == new) {
+            Some(at) => doc.stanzas[at] = original,
+            None => {
+                warnings.push(VendorWarning::new(
+                    "vendor_lock_entry_pruned_kept",
+                    format!(
+                        "lock entry `{key}` changed since vendoring dropped a descriptor \
+                         from it; left alone (run `yarn install` if it is incomplete)"
+                    ),
+                ));
+                return false;
+            }
+        },
+        None if doc.stanzas.iter().any(live) => {
+            warnings.push(VendorWarning::new(
+                "vendor_lock_entry_pruned_kept",
+                format!(
+                    "lock entry `{key}`, which vendoring dropped, was re-added since; \
+                     left alone"
+                ),
+            ));
+            return false;
+        }
+        None => doc.stanzas.push(original),
+    }
+    *text = doc.render(&[key]);
+    true
+}
 
 /// Remove our resolutions entry iff the live value still points into our
 /// uuid dir; drop the `resolutions` table when that leaves it empty (we only
@@ -2235,6 +2356,71 @@ __metadata:
             "bin map read from the packed tarball's package.json: {text}"
         );
         assert!(!text.contains("left-pad: bin/cli.js"), "{text}");
+    }
+
+    /// #737: yarn's npm resolver gives a registry entry whose scripts run
+    /// node-gyp an implicit `node-gyp: "npm:latest"` dependency; the `file:`
+    /// entry yarn builds from the tarball has none, and the entries only
+    /// node-gyp reached go with it (yarn drops them on the next install, so
+    /// `--immutable` fails YN0028 while they stay). Revert puts all of it
+    /// back byte for byte.
+    #[tokio::test]
+    async fn issue_737_implicit_node_gyp_and_its_subtree_are_dropped_and_reverted() {
+        let lock = B3_BEFORE_LOCK
+            .replace(
+                "  resolution: \"left-pad@npm:1.3.0\"\n  checksum:",
+                "  resolution: \"left-pad@npm:1.3.0\"\n  dependencies:\n    \
+                 node-gyp: \"npm:latest\"\n  checksum:",
+            )
+            .replace(
+                "\"vendor-spike@workspace:.\":",
+                "\"node-gyp@npm:latest\":\n  version: 13.1.0\n  resolution: \
+                 \"node-gyp@npm:13.1.0\"\n  dependencies:\n    nopt: \"npm:^10.0.0\"\n    \
+                 shared: \"npm:^1.0.0\"\n  checksum: 10c0/aa\n  languageName: node\n  \
+                 linkType: hard\n\n\"nopt@npm:^10.0.0\":\n  version: 10.0.1\n  resolution: \
+                 \"nopt@npm:10.0.1\"\n  checksum: 10c0/bb\n  languageName: node\n  \
+                 linkType: hard\n\n\"shared@npm:^1.0.0\":\n  version: 1.0.0\n  resolution: \
+                 \"shared@npm:1.0.0\"\n  checksum: 10c0/cc\n  languageName: node\n  \
+                 linkType: hard\n\n\"vendor-spike@workspace:.\":",
+            )
+            .replace(
+                "    left-pad: \"npm:1.3.0\"\n",
+                "    left-pad: \"npm:1.3.0\"\n    shared: \"npm:^1.0.0\"\n",
+            );
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+
+        let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        let (hash6, checksum) = fx.packed_berry_facts().await;
+        let expected = spike_after_lock(&hash6, &checksum).replace(
+            "\"vendor-spike@workspace:.\":",
+            "\"shared@npm:^1.0.0\":\n  version: 1.0.0\n  resolution: \"shared@npm:1.0.0\"\n  \
+             checksum: 10c0/cc\n  languageName: node\n  linkType: hard\n\n\
+             \"vendor-spike@workspace:.\":",
+        );
+        let expected = expected.replace(
+            "    left-pad: \"npm:1.3.0\"\n",
+            "    left-pad: \"npm:1.3.0\"\n    shared: \"npm:^1.0.0\"\n",
+        );
+        assert_eq!(text, expected);
+        let pruned: Vec<&WiringRecord> = entry
+            .wiring
+            .iter()
+            .filter(|w| w.kind == KIND_LOCK_ENTRY_PRUNED)
+            .collect();
+        assert_eq!(pruned.len(), 2, "{pruned:#?}");
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            lock,
+            "yarn.lock restored byte-for-byte, pruned entries included"
+        );
+        assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), fx.pkg_bytes);
     }
 
     #[tokio::test]

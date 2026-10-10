@@ -18,10 +18,12 @@ fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
 /// Directories are created fresh (writable, subject to umask) rather than
 /// mirroring the cache's read-only modes, so the copy can be patched and later
 /// removed without a chmod dance. File *contents* are copied via
-/// `std::fs::copy`, which also carries the source's mode bits (often `0o444` in
-/// the cache); the downstream apply pipeline replaces files via stage +
-/// rename (no write grant needed), and
-/// [`remove_tree`] relaxes perms on cleanup. Symlinks / specials are skipped —
+/// `std::fs::copy`, which also carries the source's permissions (`0o444` /
+/// the Windows read-only attribute in Go's module cache), so each copied file
+/// that lands read-only is then granted owner-write: the copy is a private,
+/// freshly created inode, and the apply pipeline's stage + rename cannot
+/// replace a read-only destination on Windows (`MoveFileEx` refuses it with
+/// `ERROR_ACCESS_DENIED`, #346). [`remove_tree`] relaxes perms on cleanup. Symlinks / specials are skipped —
 /// crates.io registry and Go module-cache sources contain none, and copying a
 /// dangling link would be unsafe.
 pub(crate) async fn fresh_copy(
@@ -78,9 +80,33 @@ fn copy_tree_blocking(src: &Path, dst: &Path, skip_file_name: Option<&str>) -> s
                 }
             }
             std::fs::copy(entry.path(), &target)?;
+            make_owner_writable(&target)?;
         }
     }
     Ok(())
+}
+
+/// Grant owner-write on a file [`copy_tree_blocking`] just created, when
+/// the copy carried a read-only mode/attribute over from its source. Only
+/// ever called on the fresh inode `std::fs::copy` wrote, never on a source
+/// or a link, so no shared inode's permissions change.
+fn make_owner_writable(path: &Path) -> std::io::Result<()> {
+    let mut perms = std::fs::metadata(path)?.permissions();
+    if !perms.readonly() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(perms.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: clears the read-only attribute, nothing else.
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+    }
+    std::fs::set_permissions(path, perms)
 }
 
 /// The previous [`copy_tree_blocking`], which created every file's parent,
@@ -113,6 +139,7 @@ fn copy_tree_blocking_reference(
                 std::fs::create_dir_all(p)?;
             }
             std::fs::copy(entry.path(), &target)?;
+            make_owner_writable(&target)?;
         }
     }
     Ok(())
@@ -511,6 +538,37 @@ mod tests {
         );
         // cleanup readonly src
         fs::set_permissions(src.path().join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// #346: a read-only source file (Go's module cache; the Windows
+    /// read-only attribute) yields an owner-writable copy, so the apply
+    /// pipeline's stage + rename can replace it on every platform. The
+    /// source keeps its read-only permission.
+    #[tokio::test]
+    async fn fresh_copy_files_are_writable_even_from_readonly_source() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let d = dst.path().join("copy");
+        let f = src.path().join("lib.go");
+        fs::write(&f, b"package lib\n").unwrap();
+        let mut ro = fs::metadata(&f).unwrap().permissions();
+        ro.set_readonly(true);
+        fs::set_permissions(&f, ro).unwrap();
+
+        fresh_copy(src.path(), &d, None).await.unwrap();
+
+        let copied = fs::metadata(d.join("lib.go")).unwrap().permissions();
+        assert!(!copied.readonly(), "the copy must be writable: {copied:?}");
+        #[cfg(unix)]
+        assert_eq!(copied.mode() & 0o777, 0o644, "only owner-write is added");
+        assert!(fs::metadata(&f).unwrap().permissions().readonly());
+        assert_eq!(fs::read(d.join("lib.go")).unwrap(), b"package lib\n");
+
+        // Let the temp dir clean up on Windows.
+        let mut rw = fs::metadata(&f).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        rw.set_readonly(false);
+        fs::set_permissions(&f, rw).unwrap();
     }
 
     #[cfg(unix)]

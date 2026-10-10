@@ -89,6 +89,11 @@ impl NpmOverrides {
         }
     }
 
+    /// True when the root `package.json` declares no `overrides` rule.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
     /// The spec an override makes npm install for the edge `dep_name@spec`
     /// whose dependent sits at the lock key `from`, or `None` when no
     /// override clearly applies.

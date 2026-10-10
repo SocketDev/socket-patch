@@ -30,7 +30,6 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
             global: false,
             global_prefix: None,
             json: true,
-            download_mode: "diff".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         identifier: identifier.to_string(),
@@ -773,65 +772,5 @@ async fn get_uuid_non_json_save_only() {
     args.common.json = false;
 
     assert_eq!(run(args).await, 0);
-    assert_patch_saved(tmp.path(), PURL, UUID);
-}
-
-// ---------------------------------------------------------------------------
-// Custom download mode
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial]
-async fn get_download_mode_package() {
-    let (server, url) = start_wiremock().await;
-    make_view_mock(&server, UUID, PURL, "free").await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let mut args = default_args(UUID, tmp.path());
-    args.common.api_url = Some(url);
-    args.common.download_mode = "package".to_string();
-    assert_eq!(run(args).await, 0);
-    // save_only short-circuits before apply, so download_mode is not
-    // consumed here; we still verify the patch was actually persisted.
-    assert_patch_saved(tmp.path(), PURL, UUID);
-}
-
-#[tokio::test]
-#[serial]
-async fn get_download_mode_file() {
-    let (server, url) = start_wiremock().await;
-    make_view_mock(&server, UUID, PURL, "free").await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let mut args = default_args(UUID, tmp.path());
-    args.common.api_url = Some(url);
-    args.common.download_mode = "file".to_string();
-    assert_eq!(run(args).await, 0);
-    assert_patch_saved(tmp.path(), PURL, UUID);
-}
-
-#[tokio::test]
-#[serial]
-async fn get_invalid_download_mode_handled() {
-    let (server, url) = start_wiremock().await;
-    make_view_mock(&server, UUID, PURL, "free").await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let mut args = default_args(UUID, tmp.path());
-    args.common.api_url = Some(url);
-    args.common.download_mode = "nonsense".to_string();
-
-    // FINDING: an invalid download mode is NOT validated on the save_only
-    // UUID path. `save_and_apply_patch` only parses download_mode when it
-    // actually runs apply (`!save_only && added`), so with save_only=true the
-    // bogus "nonsense" mode is silently accepted: the run still exits 0 and
-    // saves the patch. We assert that exact (current) behavior rather than
-    // the original `let _ = run(...)` no-op, so any change to validation here
-    // is caught. This is a latent gap, deliberately left for the maintainers.
-    let code = run(args).await;
-    assert_eq!(
-        code, 0,
-        "invalid download_mode is not validated under --save-only (exits 0)"
-    );
     assert_patch_saved(tmp.path(), PURL, UUID);
 }

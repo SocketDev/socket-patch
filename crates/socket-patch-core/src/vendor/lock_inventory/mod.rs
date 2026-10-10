@@ -10,9 +10,7 @@
 //!   with no installed copy ([`super::registry_fetch`]), verifying the bytes
 //!   against the integrity the lock records — FAIL-CLOSED: an entry whose
 //!   lock carries no content verifier is never fetched;
-//! * `repair` recovers ledger entries ([`recover_lock_entry`]) and the pin a
-//!   rewired lock records for a vendored artifact
-//!   ([`wired_vendor_integrity`]);
+//! * `repair` recovers ledger entries ([`recover_lock_entry`]);
 //! * ledger liveness (`vex::discover`) reads EVERY lock's instance
 //!   ([`inventory_project_every_lock`]) as evidence that a package resolves
 //!   from somewhere other than its patch.
@@ -66,7 +64,6 @@ pub(crate) mod pypi;
 pub(crate) mod recover;
 pub mod view;
 pub(crate) mod vlt;
-pub(crate) mod wired;
 pub(crate) mod yarn;
 
 pub use self::bun::{bun_binary_lock_drives, bun_text_lock_drives};
@@ -79,7 +76,6 @@ pub(crate) use self::npm_family::inventory_npm_lock;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
 pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView, ReadSet};
-pub use self::wired::wired_vendor_integrity;
 
 // The per-format views `inventory_project_diagnosed` unions (and the test
 // modules reach through `super::*`).
