@@ -27,7 +27,9 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs};
 use crate::commands::hosted_unwind::run_hosted_leg;
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
+use crate::commands::vendored_backend::{
+    KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
+};
 use crate::ecosystem_dispatch::{
     distinct_npm_copies, find_all_packages_for_rollback, partition_purls, JvmScope,
 };
@@ -346,9 +348,23 @@ fn bun_reinstall_advised<'a>(mut codes: impl Iterator<Item = &'a str>) -> bool {
     })
 }
 
+/// The qualifiers the generic reinstall note gets next to a Bun (#764) or
+/// PyPI (#477) reinstall advisory.
+fn reinstall_qualifiers(bun: bool, pypi: bool) -> String {
+    format!(
+        "{}{}",
+        if bun { BUN_REINSTALL_QUALIFIER } else { "" },
+        if pypi {
+            crate::commands::pypi_reinstall::NOTE_QUALIFIER
+        } else {
+            ""
+        }
+    )
+}
+
 /// The reinstall note for packages whose wiring was undone but whose
 /// installed tree still holds patched bytes.
-fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool) -> String {
+fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool, pypi: bool) -> String {
     let keep = match (still_patched == 1, dry_run) {
         (true, false) => "keeps its",
         (true, true) => "would keep its",
@@ -359,7 +375,7 @@ fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool) -> Stri
         "Note: {} {keep} patched bytes in installed trees until the next \
          package-manager install{}.",
         plural(still_patched, "unwired package", "unwired packages"),
-        if bun { BUN_REINSTALL_QUALIFIER } else { "" }
+        reinstall_qualifiers(bun, pypi)
     )
 }
 
@@ -794,9 +810,17 @@ async fn run_vendored_leg(
                 }
                 out.failed.push((key, why));
             }
-            VendorRevertStep::Kept => out.kept.push((
+            VendorRevertStep::Kept(KeepCause::Drift) => out.kept.push((
                 key,
                 "lockfile wiring drifted; vendored state left untouched".to_string(),
+            )),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => out.kept.push((
+                key,
+                format!(
+                    "{}; vendored state kept — {}",
+                    cause.reason(),
+                    cause.remedy("roll back again")
+                ),
             )),
             VendorRevertStep::WouldRevert if preserve => {
                 if loud {
@@ -941,7 +965,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
     } else {
         Default::default()
     };
-    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
+    // Leftover `resolutions` selectors (#1203) unwind like pins: the
+    // restore retires them from the manifest.
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
 
     if manifest_missing && !vendor_ledger_exists && hosted_pins.is_empty() {
         // Hosted wiring the lockfiles name but cannot attribute is still
@@ -1580,17 +1606,20 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     .chain(hosted_leg.warnings.iter())
                     .map(|(code, _)| code.as_str()),
             );
+            let pypi_advised = crate::commands::pypi_reinstall::advised(
+                vendored_leg
+                    .warnings
+                    .iter()
+                    .chain(hosted_leg.warnings.iter())
+                    .map(|(code, _)| code.as_str()),
+            );
             if unwired_any {
                 run_warnings.push((
                     "reinstall_required".into(),
                     format!(
                         "unwired packages keep their patched bytes in installed trees until \
                          the next package-manager install{}",
-                        if bun_advised {
-                            BUN_REINSTALL_QUALIFIER
-                        } else {
-                            ""
-                        }
+                        reinstall_qualifiers(bun_advised, pypi_advised)
                     ),
                 ));
             }
@@ -1876,7 +1905,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 if still_patched > 0 {
                     println!(
                         "\n{}",
-                        format_reinstall_note(still_patched, args.common.dry_run, bun_advised)
+                        format_reinstall_note(
+                            still_patched,
+                            args.common.dry_run,
+                            bun_advised,
+                            pypi_advised
+                        )
                     );
                 }
             }
@@ -2657,6 +2691,20 @@ pub(crate) async fn rollback_patches_inner(
             }
         }
         results.push(result);
+    }
+
+    // The restored crates' compiled copies in this project's build cache
+    // still hold the patched code cargo keyed on the package id (#387).
+    if !common.dry_run {
+        warnings.extend(
+            socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                &common.cwd,
+                results
+                    .iter()
+                    .filter(|r| r.success && !r.files_rolled_back.is_empty())
+                    .map(|r| r.package_key.as_str()),
+            ),
+        );
     }
 
     superseded_left.sort();
@@ -5384,12 +5432,12 @@ mod tests {
     #[test]
     fn reinstall_note_tense_and_number() {
         assert_eq!(
-            format_reinstall_note(1, false, false),
+            format_reinstall_note(1, false, false, false),
             "Note: 1 unwired package keeps its patched bytes in installed trees until the \
              next package-manager install."
         );
         assert_eq!(
-            format_reinstall_note(2, true, false),
+            format_reinstall_note(2, true, false, false),
             "Note: 2 unwired packages would keep their patched bytes in installed trees \
              until the next package-manager install."
         );
@@ -5400,7 +5448,7 @@ mod tests {
     #[test]
     fn reinstall_note_defers_to_the_bun_advisory() {
         assert_eq!(
-            format_reinstall_note(1, false, true),
+            format_reinstall_note(1, false, true, false),
             "Note: 1 unwired package keeps its patched bytes in installed trees until the \
              next package-manager install (Bun: a plain `bun install` keeps them; run \
              `bun install --force`)."
@@ -5413,6 +5461,24 @@ mod tests {
         ));
         assert!(!bun_reinstall_advised(
             ["redirect_vlt_reinstall_required"].into_iter()
+        ));
+    }
+
+    /// #477: next to a PyPI reinstall advisory the note must not imply
+    /// that the next sync refreshes the copy.
+    #[test]
+    fn reinstall_note_defers_to_the_pypi_advisory() {
+        let note = format_reinstall_note(1, false, false, true);
+        assert!(
+            note.contains("(PDM, uv and Pipenv keep a same-version install")
+                && note.contains("pypi_reinstall_required"),
+            "{note}"
+        );
+        assert!(crate::commands::pypi_reinstall::advised(
+            ["vendor_pypi_reinstall_required"].into_iter()
+        ));
+        assert!(crate::commands::pypi_reinstall::advised(
+            ["redirect_pypi_reinstall_required"].into_iter()
         ));
     }
 }
