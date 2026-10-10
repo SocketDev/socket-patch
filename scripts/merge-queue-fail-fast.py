@@ -13,6 +13,13 @@ No CI job sets `continue-on-error`, so one failed or timed-out job means
 failed and cancelled `needs`, and reports failure within seconds, and the
 queue evicts the entry and rebuilds the ones behind it.
 
+A job whose runner died is the exception (see `runner_lost`): it says
+nothing about the PR, and cancelling the run for it turned one dead runner
+into an eviction plus a burst of cancelled jobs. Those are left alone, so
+`ci-ok` decides when the run finishes. The job can't be re-run instead:
+`POST .../actions/jobs/{id}/rerun` is refused until the whole run has
+completed, and by then `ci-ok` has already reported.
+
 The script never fails its own job: any API error is a warning and the
 watch carries on (or gives up), leaving the run to finish as before.
 """
@@ -31,14 +38,32 @@ GATE = "ci-ok"
 # Job conclusions that make `ci-ok` fail. `cancelled` is left out: it
 # means someone (the queue, a janitor, a person) is already cancelling.
 FATAL = {"failure", "timed_out"}
+# Check-run annotations that mean the job's runner went away, not that a
+# step failed. On Depot runners these arrive as a job `failure` (its step
+# shows `cancelled`) about a minute into the job, whatever the job runs;
+# "lost communication" is the same death noticed by GitHub's 10-minute
+# heartbeat. Matched case-insensitively against failure-level messages.
+RUNNER_LOSS = ("lost communication", "shutdown signal", "step canceled by github")
 
 
 def fatal_jobs(jobs):
     """Names of the completed jobs whose conclusion dooms `ci-ok`."""
-    return sorted(
-        j["name"]
+    return sorted(j["name"] for j in failed_jobs(jobs))
+
+
+def failed_jobs(jobs):
+    return [
+        j
         for j in jobs
         if j.get("status") == "completed" and j.get("conclusion") in FATAL and j.get("name") != GATE
+    ]
+
+
+def runner_lost(annotations):
+    """True when a job's failure annotations say its runner died."""
+    return any(
+        a.get("annotation_level") == "failure" and any(m in (a.get("message") or "").lower() for m in RUNNER_LOSS)
+        for a in annotations
     )
 
 
@@ -74,6 +99,11 @@ def list_jobs(repo, run_id, token):
         page += 1
 
 
+def annotations(repo, job_id, token):
+    # A job's id is also its check-run id.
+    return request("GET", f"repos/{repo}/check-runs/{job_id}/annotations?per_page=100", token)
+
+
 def summary(text):
     print(text)
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -89,6 +119,7 @@ def main():
     interval = int(os.environ.get("POLL_SECONDS", "30"))
     deadline = time.monotonic() + int(os.environ.get("WATCH_MINUTES", "100")) * 60
     run = None
+    lost = {}  # job id -> runner_lost verdict; a completed job's annotations don't change
     while time.monotonic() < deadline:
         try:
             if run is None:
@@ -100,7 +131,15 @@ def main():
             if request("GET", f"repos/{repo}/actions/runs/{run['id']}", token)["status"] == "completed":
                 print("CI run completed; nothing to do")
                 return 0
-            failed = fatal_jobs(list_jobs(repo, run["id"], token))
+            failed = []
+            for j in failed_jobs(list_jobs(repo, run["id"], token)):
+                if j["id"] not in lost:
+                    lost[j["id"]] = runner_lost(annotations(repo, j["id"], token))
+                    if lost[j["id"]]:
+                        summary(f"Not cancelling for `{j['name']}`: its runner died ({j.get('html_url', '')}); `ci-ok` decides.")
+                if not lost[j["id"]]:
+                    failed.append(j["name"])
+            failed.sort()
             if failed:
                 request("POST", f"repos/{repo}/actions/runs/{run['id']}/cancel", token)
                 summary(
