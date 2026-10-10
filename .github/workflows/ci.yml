@@ -58,7 +58,8 @@ concurrency:
 # the repository variable CI_SCOPE is `full`, pull_request, merge_group and
 # push runs use one targeted e2e row per package manager (the rest are in
 # e2e-extended), one row each of the yarn and cargo VEX matrices, and skip
-# the Windows/macOS legs, test, test-release, old cargo toolchains and the
+# the Windows/macOS legs (except e2e-build-windows, which still compiles every
+# test target on Windows in the merge queue), test, test-release, old cargo toolchains and the
 # sbt Docker coverage slice. Everything runs in the nightly schedule and on
 # workflow_dispatch. Set CI_SCOPE=full to restore the old gate without a
 # commit. ci-ok treats skipped jobs as passing. hosted-e2e is not scoped:
@@ -1014,7 +1015,10 @@ jobs:
           retention-days: 3
 
   e2e-build-windows:
-    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    # Lean scope still compiles every test target on Windows in the merge
+    # queue (one job): lean pull_request runs skip Windows, and a cfg(unix)
+    # slip only shows up here (#1324). Its consumers stay full-scope only.
+    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'merge_group' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
     outputs:
       reuse: ${{ needs.clippy.outputs.reuse }}
