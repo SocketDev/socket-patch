@@ -65,6 +65,16 @@ fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
 /// always get parseable stdout — never empty output plus an exit code. The
 /// top-level `error` is `{code, message}` like every command's (v5.0).
 fn emit_json_error(scan_result: Option<serde_json::Value>, code: &str, message: &str) {
+    print_json(&json_error_envelope(scan_result, code, message));
+}
+
+/// The envelope [`emit_json_error`] prints, built without printing it, so
+/// [`run_redirect_selected`] can send its failure telemetry first.
+fn json_error_envelope(
+    scan_result: Option<serde_json::Value>,
+    code: &str,
+    message: &str,
+) -> serde_json::Value {
     let mut result = scan_result.unwrap_or_else(|| serde_json::json!({}));
     crate::json_envelope::set_error(
         &mut result,
@@ -77,9 +87,13 @@ fn emit_json_error(scan_result: Option<serde_json::Value>, code: &str, message: 
     if !result.get("redirect").is_some_and(|r| r.is_object()) {
         result["redirect"] = serde_json::json!({ "mode": "hosted" });
     }
+    result
+}
+
+fn print_json(value: &serde_json::Value) {
     println!(
         "{}",
-        serde_json::to_string_pretty(&result)
+        serde_json::to_string_pretty(value)
             .expect("serializing an in-memory JSON value cannot fail")
     );
 }
@@ -117,10 +131,15 @@ fn refuse(
     common: &crate::args::GlobalArgs,
     scan_result: Option<serde_json::Value>,
     refusal: &socket_patch_core::hosted::engine::Refusal,
+    json_error: &mut Option<serde_json::Value>,
 ) -> i32 {
     eprintln!("Error ({}): {}", refusal.code, refusal.message);
     if common.json {
-        emit_json_error(scan_result, &refusal.code, &refusal.message);
+        *json_error = Some(json_error_envelope(
+            scan_result,
+            &refusal.code,
+            &refusal.message,
+        ));
     }
     1
 }
@@ -140,6 +159,7 @@ fn refuse(
 fn acquire_hosted_lock(
     common: &crate::args::GlobalArgs,
     scan_result: &mut Option<serde_json::Value>,
+    json_error: &mut Option<serde_json::Value>,
 ) -> Result<LockGuard, i32> {
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
@@ -154,7 +174,7 @@ fn acquire_hosted_lock(
                 crate::commands::lock_cli::format_lock_error(&socket_dir, &err, timeout)
             );
             if common.json {
-                emit_json_error(scan_result.take(), code, &message);
+                *json_error = Some(json_error_envelope(scan_result.take(), code, &message));
             }
             Err(1)
         }
@@ -722,6 +742,7 @@ pub(crate) async fn run_redirect_selected(
         command,
         auth: socket_patch_core::telemetry::TelemetryAuth::for_client(api_client),
         sent: false,
+        json_error: None,
     };
     let code = run_redirect_selected_untracked(
         common,
@@ -744,6 +765,11 @@ pub(crate) async fn run_redirect_selected(
         )
         .await;
     }
+    // The `--json` error envelope prints only after the failure event went
+    // out, so a consumer that closes stdout on it cannot drop the event.
+    if let Some(envelope) = telemetry.json_error.take() {
+        print_json(&envelope);
+    }
     code
 }
 
@@ -753,6 +779,9 @@ struct HostedTelemetry {
     command: &'static str,
     auth: socket_patch_core::telemetry::TelemetryAuth,
     sent: bool,
+    /// A `--json` error envelope a failure path built, printed by
+    /// [`run_redirect_selected`] after the failure event is sent.
+    json_error: Option<serde_json::Value>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -818,7 +847,11 @@ async fn run_redirect_selected_untracked(
                     format_error_line(&message)
                 );
                 if common.json {
-                    emit_json_error(scan_result.take(), "reference_resolve_failed", &message);
+                    telemetry.json_error = Some(json_error_envelope(
+                        scan_result.take(),
+                        "reference_resolve_failed",
+                        &message,
+                    ));
                 }
                 return 1;
             }
@@ -853,6 +886,7 @@ async fn run_redirect_selected_untracked(
             common,
             scan_result.take(),
             &engine::bun_lockb_symlink_refusal(),
+            &mut telemetry.json_error,
         );
     }
     // A workspace member whose lock lives in an ancestor directory (pnpm
@@ -867,7 +901,12 @@ async fn run_redirect_selected_untracked(
     )
     .await
     {
-        return refuse(common, scan_result.take(), &refusal);
+        return refuse(
+            common,
+            scan_result.take(),
+            &refusal,
+            &mut telemetry.json_error,
+        );
     }
 
     // vlt artifact preflight: before any takeover or rewrite (dry runs
@@ -928,7 +967,7 @@ async fn run_redirect_selected_untracked(
         })
     });
     let mut lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
-        match acquire_hosted_lock(common, &mut scan_result) {
+        match acquire_hosted_lock(common, &mut scan_result, &mut telemetry.json_error) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
         }
@@ -972,7 +1011,14 @@ async fn run_redirect_selected_untracked(
     .await
     {
         Ok(t) => t,
-        Err(refusal) => return refuse(common, scan_result.take(), &refusal),
+        Err(refusal) => {
+            return refuse(
+                common,
+                scan_result.take(),
+                &refusal,
+                &mut telemetry.json_error,
+            )
+        }
     };
     takeover
         .stage(common, &group, &mut candidates, &mut skipped)
@@ -1268,7 +1314,7 @@ async fn run_redirect_selected_untracked(
     } = takeover.finish(common.dry_run, &mut vendor_state, &done.rewrite.warnings);
     // A takeover writes the vendored ledger: hold the lock for it too.
     if lock.is_none() && !common.dry_run && !takeover_migrated.is_empty() {
-        match acquire_hosted_lock(common, &mut scan_result) {
+        match acquire_hosted_lock(common, &mut scan_result, &mut telemetry.json_error) {
             Ok(guard) => lock = Some(guard),
             Err(code) => return code,
         }
@@ -1291,13 +1337,23 @@ async fn run_redirect_selected_untracked(
     // hosted → upstream restore's staged flush) already refuses linked
     // files, so the write side must too.
     if let Some(refusal) = engine::guard(&view, &done, &candidates) {
-        return refuse(common, scan_result.take(), &refusal);
+        return refuse(
+            common,
+            scan_result.take(),
+            &refusal,
+            &mut telemetry.json_error,
+        );
     }
     // Defense in depth for the Gradle planner: a settings file it plans to
     // CREATE (it never read one) must not already be on disk, or the
     // atomic write would replace the user's settings with the apply line.
     if let Some(refusal) = created_settings_over_existing(&common.cwd, &done) {
-        return refuse(common, scan_result.take(), &refusal);
+        return refuse(
+            common,
+            scan_result.take(),
+            &refusal,
+            &mut telemetry.json_error,
+        );
     }
 
     if !common.dry_run {
@@ -1379,7 +1435,11 @@ async fn run_redirect_selected_untracked(
     {
         eprintln!("{}", format_error_line(&message));
         if common.json {
-            emit_json_error(scan_result.take(), "lockfile_write_failed", &message);
+            telemetry.json_error = Some(json_error_envelope(
+                scan_result.take(),
+                "lockfile_write_failed",
+                &message,
+            ));
         }
         return 1;
     }

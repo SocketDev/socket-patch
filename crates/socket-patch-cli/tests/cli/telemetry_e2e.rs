@@ -1351,6 +1351,36 @@ async fn hosted_scan_failure_reports_patch_apply_failed() {
     assert_eq!(failed["error"]["type"], "Error");
 }
 
+/// The `--json` failure envelope (every run here is `--json`) prints only
+/// after `patch_apply_failed` is sent: with stdout closed from the start,
+/// its first write raises SIGPIPE, and the event must already be out.
+#[tokio::test]
+async fn hosted_scan_failure_delivers_telemetry_before_a_closed_stdout() {
+    let mock = setup_hosted_mock(500).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_hosted_npm_project(tmp.path());
+
+    let mut child = build_cmd(tmp.path(), &mock.uri(), "scan", &[], &[])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn socket-patch");
+    drop(child.stdout.take());
+    let status = child.wait().expect("wait socket-patch");
+    assert!(!status.success(), "{status:?}");
+
+    let bodies = telemetry_bodies(&mock).await;
+    let types: Vec<&str> = bodies
+        .iter()
+        .map(|b| b["event_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        ["patch_scanned", "patch_apply_failed"],
+        "{bodies:#?}"
+    );
+}
+
 /// `get --mode hosted` reports through the same path, under its own
 /// command name.
 #[tokio::test]
