@@ -380,7 +380,7 @@ async fn sync_keeps_entry_whose_shared_cache_copy_is_still_patched() {
     let json: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("scan --dry-run --sync JSON ({e}):\n{stdout}"));
     assert_eq!(
-        json["gc"]["prunableManifestEntries"],
+        json["gc"]["prunedManifestEntries"],
         serde_json::json!([ryu]),
         "{json:#}"
     );
