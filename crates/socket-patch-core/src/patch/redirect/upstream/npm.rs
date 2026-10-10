@@ -480,21 +480,226 @@ fn berry_registry_locator(
 use crate::formats::pnpm::workspace::yaml_top_level_value;
 use crate::formats::text::strip_bom;
 
-/// The registry a berry restore reads `name`'s version document from:
-/// `.yarnrc.yml`'s `npmRegistryServer`. A scoped package may resolve
-/// against an `npmScopes` registry instead, so with such a block present
-/// it keeps the default registry's document.
-fn berry_lookup_registry(yarnrc: Option<&str>, name: &str) -> Option<String> {
-    let text = yarnrc?;
-    // `top_level_key` skips the first line's BOM (`formats::text`).
-    let has_scopes = text
-        .lines()
-        .filter_map(crate::formats::pnpm::workspace::top_level_key)
-        .any(|(key, _)| key == "npmScopes");
-    if has_scopes && name.starts_with('@') {
-        return None;
+/// The registry yarn berry resolves `name` against (`Ok(None)`: yarn's
+/// default registry), read the way yarn merges its settings (#1017):
+///
+/// - a scoped `@scope/name` takes `npmScopes.<scope>.npmRegistryServer`
+///   from the highest-precedence rc file that sets it;
+/// - otherwise (and for a scope without its own server) the
+///   `YARN_NPM_REGISTRY_SERVER` environment variable, then the
+///   highest-precedence rc file's top-level `npmRegistryServer`.
+///
+/// `rcs` are the `.yarnrc.yml` texts yarn reads, highest precedence first
+/// ([`BerryRegistrySettings::read`]): the lock directory's, each parent
+/// directory's up to the filesystem root, then the home directory's. A
+/// value's `${VAR}` / `${VAR:-default}` / `${VAR-default}` references are
+/// expanded through `var` as yarn expands them. `Err` names why the
+/// registry cannot be known: a reference to an unset variable with no
+/// default (yarn refuses to run), or an `npmScopes` this reader cannot
+/// follow (a flow mapping).
+fn berry_lookup_registry(
+    rcs: &[String],
+    env_registry: Option<&str>,
+    name: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, String> {
+    if let Some((scope, _)) = name.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
+        let keys = [scope.to_string(), format!("@{scope}")];
+        for rc in rcs {
+            for key in &keys {
+                if let Some(value) =
+                    yaml_path_value(rc, &["npmScopes", key.as_str(), "npmRegistryServer"])?
+                {
+                    return yarn_expand_env(&value, var).map(Some);
+                }
+            }
+        }
     }
-    yaml_top_level_value(text, "npmRegistryServer")
+    if let Some(env) = env_registry.map(str::trim).filter(|v| !v.is_empty()) {
+        return Ok(Some(env.to_string()));
+    }
+    for rc in rcs {
+        if let Some(value) = yaml_path_value(rc, &["npmRegistryServer"])? {
+            return yarn_expand_env(&value, var).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The scalar at `path` in a YAML settings file of block mappings (the
+/// last occurrence of each key wins, quotes removed). `Ok(None)` when a
+/// key on the path is absent or null; `Err` when a mapping on the path is
+/// written in flow style, which this reader does not follow.
+fn yaml_path_value(text: &str, path: &[&str]) -> Result<Option<String>, String> {
+    // `top_level_key` skips the first line's BOM (one, as yarn's parser).
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+        .collect();
+    yaml_path_in(&lines, path)
+}
+
+fn yaml_path_in(lines: &[String], path: &[&str]) -> Result<Option<String>, String> {
+    use crate::formats::pnpm::workspace::top_level_key;
+    let Some((key, rest)) = path.split_first() else {
+        return Ok(None);
+    };
+    let Some((at, value)) = lines.iter().enumerate().rev().find_map(|(i, line)| {
+        top_level_key(line)
+            .filter(|(k, _)| k == key)
+            .map(|(_, value)| (i, value.to_string()))
+    }) else {
+        return Ok(None);
+    };
+    if matches!(value.as_str(), "~" | "null") {
+        return Ok(None);
+    }
+    if rest.is_empty() {
+        let value = value.trim_matches(['"', '\'']).to_string();
+        return Ok((!value.is_empty()).then_some(value));
+    }
+    if !value.is_empty() {
+        return Err(format!(
+            "`{}` is not written as a block mapping",
+            path.first().copied().unwrap_or_default()
+        ));
+    }
+    let end = lines[at + 1..]
+        .iter()
+        .position(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']))
+        .map_or(lines.len(), |p| at + 1 + p);
+    let children = &lines[at + 1..end];
+    let Some(indent) = children.iter().find_map(|line| {
+        let content = line.trim_start_matches(' ');
+        (!content.trim().is_empty() && !content.starts_with('#'))
+            .then(|| line.len() - content.len())
+    }) else {
+        return Ok(None);
+    };
+    let dedented: Vec<String> = children
+        .iter()
+        .map(|line| match line.get(indent..) {
+            Some(rest) if line[..indent].trim().is_empty() => rest.to_string(),
+            _ => String::new(),
+        })
+        .collect();
+    yaml_path_in(&dedented, rest)
+}
+
+/// A `.yarnrc.yml` registry value with its environment references read as
+/// yarn reads them: `${NAME}`, `${NAME-fallback}` (the fallback when `NAME`
+/// is unset) and `${NAME:-fallback}` (also when it is empty). A reference
+/// to an unset variable with no fallback is the error yarn stops on.
+///
+/// A reference to a variable that IS set is never expanded: the rc file
+/// (possibly a checked-in, lower-trust one) would choose which of this
+/// process's variables — a token, say — lands in a URL the restore
+/// requests and may print. That is `Err` too, so the restore falls back to
+/// the default registry with `upstream_registry_fallback`, as for the Bun
+/// and pnpm settings, which never expand an arbitrary variable either.
+fn yarn_expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let body = &rest[at + 2..];
+        let name_len = body
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(body.len());
+        let name = &body[..name_len];
+        let mut tail = &body[name_len..];
+        let colon = tail.starts_with(':');
+        if colon {
+            tail = &tail[1..];
+        }
+        let fallback = match tail.strip_prefix('-') {
+            Some(after) => match after.find('}') {
+                Some(close) => {
+                    tail = &after[close..];
+                    Some(&after[..close])
+                }
+                None => None,
+            },
+            None => None,
+        };
+        let Some(after) = tail.strip_prefix('}').filter(|_| !name.is_empty()) else {
+            // Not a reference yarn recognizes: kept literally.
+            out.push_str("${");
+            rest = body;
+            continue;
+        };
+        let set = var(name);
+        let expanded = match (set, fallback) {
+            (Some(v), _) if !v.is_empty() => {
+                return Err(format!(
+                    "it references the environment variable {name}, which socket-patch does \
+                     not expand into a registry URL"
+                ))
+            }
+            (Some(v), _) if !colon => v,
+            (_, Some(fallback)) => fallback.to_string(),
+            (_, None) => return Err(format!("the environment variable {name} is not set")),
+        };
+        out.push_str(&expanded);
+        rest = after;
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// The yarn berry settings that decide which registry a package resolves
+/// against: the `.yarnrc.yml` texts yarn reads for a lock, highest
+/// precedence first, and `YARN_NPM_REGISTRY_SERVER`.
+struct BerryRegistrySettings {
+    rcs: Vec<String>,
+    env_registry: Option<String>,
+}
+
+impl BerryRegistrySettings {
+    /// Yarn reads the rc file (`YARN_RC_FILENAME`, default `.yarnrc.yml`)
+    /// of the project directory and of every parent directory up to the
+    /// filesystem root (a closer one wins), then the home directory's,
+    /// below them all.
+    async fn read(view: &View<'_>, dir_prefix: &str) -> Self {
+        let rc_name = std::env::var("YARN_RC_FILENAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| ".yarnrc.yml".to_string());
+        let root = view.root().join(dir_prefix);
+        let root = tokio::fs::canonicalize(&root).await.unwrap_or(root);
+        let mut read: Vec<std::path::PathBuf> =
+            root.ancestors().map(|d| d.join(&rc_name)).collect();
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .filter(|h| !h.is_empty())
+            .map(std::path::PathBuf::from);
+        if let Some(home) = home {
+            let home = tokio::fs::canonicalize(&home).await.unwrap_or(home);
+            let rc = home.join(&rc_name);
+            if !read.contains(&rc) {
+                read.push(rc);
+            }
+        }
+        let mut rcs = Vec::new();
+        for path in read {
+            if let Ok(text) = crate::utils::fs::read_regular_to_string(&path).await {
+                rcs.push(text);
+            }
+        }
+        BerryRegistrySettings {
+            rcs,
+            env_registry: std::env::var("YARN_NPM_REGISTRY_SERVER").ok(),
+        }
+    }
+
+    fn registry(&self, name: &str) -> Result<Option<String>, String> {
+        berry_lookup_registry(
+            &self.rcs,
+            self.env_registry.as_deref(),
+            name,
+            &|key: &str| std::env::var(key).ok(),
+        )
+    }
 }
 
 async fn restore_berry(
@@ -654,10 +859,30 @@ async fn restore_berry(
         .iter()
         .map(|h| (h.uuid.clone(), h.name.clone(), h.version.clone()))
         .collect();
-    let project_registry = yarnrc
-        .as_deref()
-        .and_then(|text| yaml_top_level_value(text, "npmRegistryServer"));
-    let registry = |name: &str| berry_lookup_registry(yarnrc.as_deref(), name);
+    // The registry yarn resolves each package against, read from every
+    // settings source yarn merges (#1017); one it cannot be known for is
+    // restored from the default registry's document, with a warning.
+    let settings = BerryRegistrySettings::read(view, &dir_prefix).await;
+    let mut registries: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for hit in &hits {
+        if registries.contains_key(&hit.name) {
+            continue;
+        }
+        let registry = settings.registry(&hit.name).unwrap_or_else(|why| {
+            result.warnings.push((
+                "upstream_registry_fallback",
+                format!(
+                    "{}@{}: the registry yarn resolves it against could not be determined \
+                     ({why}), so the entry was restored from the default registry's version \
+                     document; check its tarball URL against the project's registry",
+                    hit.name, hit.version
+                ),
+            ));
+            None
+        });
+        registries.insert(hit.name.clone(), registry);
+    }
+    let registry = |name: &str| registries.get(name).cloned().flatten();
     let dists = fetch_dists_on(&wanted, registry, ctx, result).await;
     let mut changed = false;
     let mut moved: Vec<String> = Vec::new();
@@ -696,8 +921,12 @@ async fn restore_berry(
         let Some(dist) = dists.get(&(name.clone(), version.clone())).map(|d| &d.dist) else {
             continue;
         };
-        let locator =
-            berry_registry_locator(project_registry.as_deref(), &name, &version, &dist.tarball);
+        let locator = berry_registry_locator(
+            registries.get(&name).and_then(Option::as_deref),
+            &name,
+            &version,
+            &dist.tarball,
+        );
         let resolution = format!("  resolution: \"{locator}\"");
         let mut lines = stanza_lines(&blocks[idx]);
         if let Some(pinned) = with_body_field(&lines, "resolution", &resolution) {
@@ -2367,7 +2596,7 @@ mod tests {
         bun_registry_slot, bun_tarball_url, expand_url_env, modules_yaml_pnpm_major,
         non_default_registry, package_json_pnpm_major, pnpm_include_tarball, pnpm_lookup_registry,
         pnpm_tarball_guess_warning, registry_derives_tarball, rush_json_pnpm_major, rush_lock_root,
-        split_userinfo, yaml_top_level_value, PnpmTarballGuess, ProjectDist,
+        split_userinfo, yaml_top_level_value, yarn_expand_env, PnpmTarballGuess, ProjectDist,
     };
     use crate::patch::redirect::upstream::client::NpmDist;
 
@@ -3416,17 +3645,17 @@ mod tests {
     /// content, so the first key is not `npmScopes`.
     #[test]
     fn berry_scopes_probe_reads_past_one_bom_only() {
+        let lookup = |rc: &str, name: &str| {
+            berry_lookup_registry(&[rc.to_string()], None, name, &|_: &str| None).unwrap()
+        };
         let rc = "npmScopes:\n  s:\n    npmRegistryServer: https://s.example\n\
                   npmRegistryServer: https://m.example/\n";
         for bom in ["", "\u{feff}"] {
             let rc = format!("{bom}{rc}");
-            assert_eq!(berry_lookup_registry(Some(&rc), "@s/a"), None);
+            assert_eq!(lookup(&rc, "@s/a").as_deref(), Some("https://s.example"));
         }
         let rc = format!("\u{feff}\u{feff}{rc}");
-        assert_eq!(
-            berry_lookup_registry(Some(&rc), "@s/a").as_deref(),
-            Some("https://m.example/")
-        );
+        assert_eq!(lookup(&rc, "@s/a").as_deref(), Some("https://m.example/"));
         let rc = "npmRegistryServer: https://m.example/\n";
         for bom in ["", "\u{feff}"] {
             assert_eq!(
@@ -3440,24 +3669,135 @@ mod tests {
         );
     }
 
+    /// #1017: yarn resolves a package's registry from every settings
+    /// source it merges, not only the project rc's top-level key.
     #[test]
-    fn berry_reads_the_project_registry_except_for_npm_scopes() {
+    fn berry_reads_the_registry_from_every_yarn_settings_source() {
+        let none = |_: &str| None::<String>;
+        let lookup = |rcs: &[&str], env: Option<&str>, name: &str| {
+            let rcs: Vec<String> = rcs.iter().map(|s| s.to_string()).collect();
+            berry_lookup_registry(&rcs, env, name, &none)
+        };
         let rc = "npmRegistryServer: \"https://m.example/npm/\"\n";
         assert_eq!(
-            berry_lookup_registry(Some(rc), "a").as_deref(),
+            lookup(&[rc], None, "a").unwrap().as_deref(),
             Some("https://m.example/npm/")
         );
         assert_eq!(
-            berry_lookup_registry(Some(rc), "@s/a").as_deref(),
+            lookup(&[rc], None, "@s/a").unwrap().as_deref(),
             Some("https://m.example/npm/")
         );
-        let scoped = format!("{rc}npmScopes:\n  s:\n    npmRegistryServer: https://s.example\n");
+        assert_eq!(lookup(&[], None, "a").unwrap(), None);
+
+        // npmScopes: the scope's own server, else the top-level one.
+        let scoped = format!(
+            "{rc}npmScopes:\n  s:\n    npmAlwaysAuth: true\n    npmRegistryServer: \
+             \"https://s.example\"\n  t:\n    npmAlwaysAuth: true\n"
+        );
         assert_eq!(
-            berry_lookup_registry(Some(&scoped), "a").as_deref(),
+            lookup(&[&scoped], None, "a").unwrap().as_deref(),
             Some("https://m.example/npm/")
         );
-        assert_eq!(berry_lookup_registry(Some(&scoped), "@s/a"), None);
-        assert_eq!(berry_lookup_registry(None, "a"), None);
+        assert_eq!(
+            lookup(&[&scoped], None, "@s/a").unwrap().as_deref(),
+            Some("https://s.example")
+        );
+        assert_eq!(
+            lookup(&[&scoped], None, "@t/a").unwrap().as_deref(),
+            Some("https://m.example/npm/")
+        );
+        assert_eq!(
+            lookup(&[&scoped], None, "@u/a").unwrap().as_deref(),
+            Some("https://m.example/npm/")
+        );
+        // A scope beats the env registry; the env registry beats every rc.
+        let env = Some("https://env.example");
+        assert_eq!(
+            lookup(&[&scoped], env, "@s/a").unwrap().as_deref(),
+            Some("https://s.example")
+        );
+        assert_eq!(
+            lookup(&[&scoped], env, "a").unwrap().as_deref(),
+            Some("https://env.example")
+        );
+        assert_eq!(
+            lookup(&[], env, "a").unwrap().as_deref(),
+            Some("https://env.example")
+        );
+        assert_eq!(
+            lookup(&[rc], Some(" "), "a").unwrap().as_deref(),
+            Some("https://m.example/npm/")
+        );
+
+        // Layers: the closer rc wins per key; a farther one (a parent
+        // directory's, the home one) fills in what the closer one lacks.
+        let parent = "npmRegistryServer: https://parent.example\n";
+        let home = "npmScopes:\n  s:\n    npmRegistryServer: https://home-s.example\n";
+        let project = "nodeLinker: node-modules\n";
+        assert_eq!(
+            lookup(&[project, parent, home], None, "a")
+                .unwrap()
+                .as_deref(),
+            Some("https://parent.example")
+        );
+        assert_eq!(
+            lookup(&[project, parent, home], None, "@s/a")
+                .unwrap()
+                .as_deref(),
+            Some("https://home-s.example")
+        );
+        assert_eq!(
+            lookup(&[rc, parent], None, "a").unwrap().as_deref(),
+            Some("https://m.example/npm/")
+        );
+
+        // A flow-style npmScopes is not guessed at for a scoped name.
+        let flow = "npmScopes: {s: {npmRegistryServer: https://s.example}}\n";
+        assert!(lookup(&[flow], None, "@s/a").is_err());
+        assert_eq!(
+            lookup(&[flow, parent], None, "a").unwrap().as_deref(),
+            Some("https://parent.example")
+        );
+    }
+
+    #[test]
+    fn berry_registry_values_expand_env_references_like_yarn() {
+        let var = |name: &str| match name {
+            "REG" => Some("https://reg.example".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        for (value, want) in [
+            // A set variable is never expanded (the rc file must not pick
+            // which of the process's variables lands in a requested URL).
+            ("${REG}", Err(())),
+            ("${REG:-https://d.example}", Err(())),
+            ("${REG-https://d.example}", Err(())),
+            ("${UNSET:-https://d.example}", Ok("https://d.example")),
+            ("${UNSET-https://d.example}", Ok("https://d.example")),
+            ("${EMPTY:-https://d.example}", Ok("https://d.example")),
+            ("${EMPTY-https://d.example}", Ok("")),
+            ("${EMPTY}", Ok("")),
+            ("https://h/${REG}/x", Err(())),
+            ("https://h/${UNSET:-m}/x", Ok("https://h/m/x")),
+            ("plain $ {REG} ${", Ok("plain $ {REG} ${")),
+            ("${UNSET}", Err(())),
+        ] {
+            assert_eq!(
+                yarn_expand_env(value, &var).map_err(|_| ()),
+                want.map(str::to_string),
+                "{value}"
+            );
+        }
+        let rc = "npmRegistryServer: \"${REG:-http://127.0.0.1:8792}\"\n";
+        assert_eq!(
+            berry_lookup_registry(&[rc.to_string()], None, "a", &|_: &str| None)
+                .unwrap()
+                .as_deref(),
+            Some("http://127.0.0.1:8792")
+        );
+        let rc = "npmRegistryServer: \"${REG}\"\n";
+        assert!(berry_lookup_registry(&[rc.to_string()], None, "a", &|_: &str| None).is_err());
     }
 
     #[test]
