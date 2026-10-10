@@ -1147,7 +1147,18 @@ mod tests {
             }),
             ..ov.clone()
         };
-        let files = BTreeMap::from([("Gemfile".to_string(), lf.to_string())]);
+        // A CHECKSUMS-less lock resolving both (hosted mode pins only a
+        // version a lock resolves, #1125) and left untouched by the rewrite.
+        let files = BTreeMap::from([
+            ("Gemfile".to_string(), lf.to_string()),
+            (
+                "Gemfile.lock".to_string(),
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n      \
+                 rack (>= 3)\n      rails (>= 7)\n    rack (3.0.0)\n    rails (7.0.0)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n\nBUNDLED WITH\n   2.5.23\n"
+                    .to_string(),
+            ),
+        ]);
         let gemfile =
             rewrite_registry_redirect(&files, &[ov.clone(), rack_ov]).files["Gemfile"].clone();
         let rack = || Gem {

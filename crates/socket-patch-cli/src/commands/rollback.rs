@@ -655,7 +655,7 @@ fn skipped_not_installed_json(purl: &str) -> serde_json::Value {
 /// human path gets. One failed result per affected package keeps the
 /// `failed` counter meaning "packages that failed" (the same per-package
 /// semantics as a mid-run failure) and names each missing blob hash plus
-/// the `socket-patch repair` remedy in machine-readable form, using the
+/// the re-run remedy in machine-readable form, using the
 /// engine's own `missing_blob` verify vocabulary. `reason_for` renders
 /// the per-hash diagnostic (offline gate vs. download failure).
 fn missing_blob_abort_results(
@@ -2352,8 +2352,7 @@ pub(crate) async fn rollback_patches_inner(
             // locally-drifted) root copy says nothing about a still-patched
             // nested duplicate, whose restore still needs the blob. Probing
             // only a representative copy skipped the download and wedged the
-            // online rollback with a mid-run `MissingBlob` failure. Mirrors
-            // apply's `mismatch_blob_gaps`.
+            // online rollback with a mid-run `MissingBlob` failure.
             let mut pkg_paths = all_packages_multi
                 .get(purl)
                 .expect("gate manifest holds only attempted targets, which the crawler discovered")
@@ -2424,7 +2423,7 @@ pub(crate) async fn rollback_patches_inner(
                     "Error: {} missing and --offline is set.",
                     plural(missing_blobs.len(), "blob is", "blobs are")
                 );
-                eprintln!("Run \"socket-patch repair\" to download missing blobs.");
+                eprintln!("Re-run without --offline to download the original blobs.");
             }
             let results = missing_blob_abort_results(
                 &abort_manifest,
@@ -2433,7 +2432,7 @@ pub(crate) async fn rollback_patches_inner(
                 |hash| {
                     format!(
                         "Before blob not found: {hash} and --offline prevents fetching. \
-                         Run \"socket-patch repair\" to download missing blobs."
+                         Re-run without --offline to download the original blobs."
                     )
                 },
             );
@@ -2514,7 +2513,7 @@ pub(crate) async fn rollback_patches_inner(
                         .unwrap_or("download failed");
                     format!(
                         "Before blob could not be downloaded: {hash} - {why}. \
-                         Run \"socket-patch repair\" to download missing blobs."
+                         Re-run once the patch API is reachable to download the original blobs."
                     )
                 },
             );

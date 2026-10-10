@@ -1336,6 +1336,106 @@ async fn yarn_berry_pin_takes_bin_from_the_served_tarball() {
     }
 }
 
+/// #558 in the in-memory engine: a yarn classic pin whose grant carries
+/// only a sha512 takes its `#<sha1>` fragment from the served tarball
+/// (fetched through the provider and checked against that sha512); a
+/// tarball it cannot fetch drops the patch instead of pinning a
+/// fragmentless URL yarn 1 would serve stale cached bytes for.
+#[tokio::test]
+async fn issue_558_yarn_classic_pin_takes_sha1_from_the_served_tarball() {
+    use base64::Engine as _;
+    use sha1::Digest as _;
+
+    const UUID: &str = "55858558-5585-4558-8558-558558558558";
+    let tarball = {
+        let manifest = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/package.json", &manifest[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+    let sha512 = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&tarball))
+    );
+    let sha1 = hex::encode(sha1::Sha1::digest(&tarball));
+    let mut files = BTreeMap::new();
+    files.insert(
+        "package.json".to_string(),
+        b"{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"packageManager\": \"yarn@1.22.22\",\n  \"dependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n".to_vec(),
+    );
+    files.insert(
+        "yarn.lock".to_string(),
+        b"# yarn lockfile v1\n\n\nleft-pad@1.3.0:\n  version \"1.3.0\"\n  \
+          resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz\"\n  \
+          integrity sha512-UP==\n"
+            .to_vec(),
+    );
+
+    for served in [true, false] {
+        let server = MockServer::start().await;
+        let artifact = format!("/patch/npm/left-pad/1.3.0/tok/{UUID}/left-pad-1.3.0.tgz");
+        let url = format!("{}{artifact}", server.uri());
+        let patch = common::Patch {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            uuid: UUID.into(),
+            reference: serde_json::json!({
+                "status": "granted",
+                "url": url,
+                "purl": null,
+                "artifacts": [
+                    { "kind": "tarball", "url": url, "integrity": { "sha512": sha512 } }
+                ],
+                "registryOverride": null,
+            }),
+        };
+        mount_api(&server, &[patch]).await;
+        Mock::given(method("GET"))
+            .and(path(artifact))
+            .respond_with(if served {
+                ResponseTemplate::new(200).set_body_bytes(tarball.clone())
+            } else {
+                ResponseTemplate::new(404)
+            })
+            .mount(&server)
+            .await;
+
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        let changed = engine_changed(&output);
+        if served {
+            assert_eq!(project.redirected.len(), 1, "{:?}", project.skipped);
+            let lock = String::from_utf8(changed["yarn.lock"].clone()).unwrap();
+            assert!(
+                lock.contains(&format!(
+                    "  resolved \"{url}#{sha1}\"\n  integrity {sha512}\n"
+                )),
+                "{lock}"
+            );
+        } else {
+            assert!(project.redirected.is_empty(), "{:?}", project.redirected);
+            assert!(
+                project
+                    .skipped
+                    .iter()
+                    .any(|s| s.reason == "npm_tarball_unavailable"),
+                "{:?}",
+                project.skipped
+            );
+            assert!(!changed.contains_key("yarn.lock"), "{changed:?}");
+        }
+    }
+}
+
 /// #734 in memory: with no node_modules in the view, package.json's
 /// `packageManager` is the only pin. pnpm 9.15.9 gets its lock pinned and
 /// no root-only pnpm-workspace.yaml; pnpm 11 still gets the trust scaffold.

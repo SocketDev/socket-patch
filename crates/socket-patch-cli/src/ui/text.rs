@@ -175,6 +175,28 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{}{ELLIPSIS}", head.trim_end())
 }
 
+/// `word` as one argument a user can paste into their shell: bare when it
+/// holds only characters no shell treats specially, otherwise quoted (POSIX
+/// single quotes; double quotes on Windows, which cmd and PowerShell both
+/// read as one argument). A trailing run of backslashes is doubled inside
+/// the Windows quotes: the argv parser would otherwise read the last one as
+/// escaping the closing quote.
+pub(crate) fn shell_word(word: &str) -> String {
+    let plain = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '/' | '.' | '_' | '-' | ':' | '+' | '=' | ',' | '@')
+            || (cfg!(windows) && c == '\\')
+    };
+    if !word.is_empty() && word.chars().all(plain) {
+        word.to_string()
+    } else if cfg!(windows) {
+        let trailing = word.len() - word.trim_end_matches('\\').len();
+        format!("\"{word}{}\"", "\\".repeat(trailing))
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

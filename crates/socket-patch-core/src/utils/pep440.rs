@@ -130,6 +130,37 @@ pub(crate) fn is_exact_pin(specifier: &str) -> bool {
         .is_some_and(|pinned| parse(pinned).is_some())
 }
 
+/// The other spellings a registry may have published the pure release
+/// `version` (digits and dots only) under, as PEP 440 equality reads them:
+/// leading zeros dropped and the release padded with `.0` from its
+/// trailing-zero-trimmed form up to at least three segments (`1.16` →
+/// `1.16.0`; `1.16.0` → `1.16`; `01.16.0.0` → `1.16`, `1.16.0`). `version`
+/// itself is not included; anything that is not a pure release has none.
+pub(crate) fn equivalent_release_spellings(version: &str) -> Vec<String> {
+    let valid = !version.is_empty()
+        && version.split('.').all(|segment| {
+            !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if !valid {
+        return Vec::new();
+    }
+    let segments: Vec<String> = version.split('.').map(number).collect();
+    let mut trimmed = segments.clone();
+    while trimmed.len() > 1 && trimmed.last().is_some_and(|segment| segment == "0") {
+        trimmed.pop();
+    }
+    let mut out = Vec::new();
+    for len in trimmed.len()..=segments.len().max(3) {
+        let mut release = trimmed.clone();
+        release.resize(len, "0".to_string());
+        let spelling = release.join(".");
+        if spelling != version && !out.contains(&spelling) {
+            out.push(spelling);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +210,32 @@ mod tests {
             ("1.0 extra", "1.0"),
         ] {
             assert!(!versions_equal(a, b), "{a} != {b}");
+        }
+    }
+
+    #[test]
+    fn equivalent_release_spellings_pad_and_trim() {
+        assert_eq!(equivalent_release_spellings("1.16"), ["1.16.0"]);
+        assert_eq!(equivalent_release_spellings("1.16.0"), ["1.16"]);
+        assert_eq!(equivalent_release_spellings("1.16.0.0"), ["1.16", "1.16.0"]);
+        assert_eq!(equivalent_release_spellings("01.16.0"), ["1.16", "1.16.0"]);
+        assert_eq!(equivalent_release_spellings("2"), ["2.0", "2.0.0"]);
+        assert!(equivalent_release_spellings("2.8.2").is_empty());
+        for other in [
+            "1.0rc1",
+            "2.9.0.post0",
+            "1.0+local",
+            "",
+            "1..2",
+            "v1.0",
+            "1.*",
+        ] {
+            assert!(equivalent_release_spellings(other).is_empty(), "{other}");
+        }
+        for version in ["1.16", "1.16.0.0", "01.16.0"] {
+            for spelling in equivalent_release_spellings(version) {
+                assert!(versions_equal(version, &spelling), "{version} {spelling}");
+            }
         }
     }
 

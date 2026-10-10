@@ -82,7 +82,6 @@ fn defaults_no_positional() {
     assert!(!args.common.verbose);
     // Remaining global defaults the contract pins but the original test omitted.
     assert_eq!(args.common.proxy_url, None); // default applied in core resolver
-    assert_eq!(args.common.download_mode, "diff");
     assert!(!args.common.yes);
     assert_eq!(args.common.lock_timeout, None);
     assert!(!args.common.debug);
@@ -267,12 +266,6 @@ fn proxy_url_long() {
         args.common.proxy_url.as_deref(),
         Some("https://proxy.example")
     );
-}
-
-#[test]
-fn download_mode_long() {
-    let args = parse_rollback(&["--download-mode", "package"]);
-    assert_eq!(args.common.download_mode, "package");
 }
 
 #[test]

@@ -25,8 +25,48 @@ pub(crate) use prompt::confirm;
 pub use prompt::{select_one, SelectError};
 pub(crate) use status::StatusLine;
 pub(crate) use text::{
-    manifest_error_message, next_steps, plural, sentence_case, short_uuid, sweep_failure, truncate,
+    manifest_error_message, next_steps, plural, sentence_case, shell_word, short_uuid,
+    sweep_failure, truncate,
 };
+
+/// A global run's scope as one pasteable argument: `--global-prefix <dir>`
+/// (shell-quoted when needed) or `-g`; `None` for a project run.
+pub(crate) fn global_scope_arg(common: &GlobalArgs) -> Option<String> {
+    match &common.global_prefix {
+        Some(prefix) => Some(format!(
+            "--global-prefix {}",
+            shell_word(&prefix.to_string_lossy())
+        )),
+        None if common.global => Some("-g".to_string()),
+        None => None,
+    }
+}
+
+/// The flags that pick WHICH tree a run acts on, as a pasteable suffix
+/// (leading space, empty for a default run): `--cwd`, `--manifest-path`,
+/// `-g` / `--global-prefix` and `--ecosystems`, each only when it differs
+/// from its default. A remedy a command prints repeats them, so running it
+/// verbatim acts on the tree the command just reported on (#464, #1219).
+pub(crate) fn scope_args(common: &GlobalArgs) -> String {
+    let mut out = String::new();
+    if common.cwd != std::path::Path::new(".") {
+        out.push_str(" --cwd ");
+        out.push_str(&shell_word(&common.cwd.to_string_lossy()));
+    }
+    if common.manifest_path != socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH {
+        out.push_str(" --manifest-path ");
+        out.push_str(&shell_word(&common.manifest_path));
+    }
+    if let Some(global) = global_scope_arg(common) {
+        out.push(' ');
+        out.push_str(&global);
+    }
+    if let Some(ecosystems) = common.ecosystems.as_deref().filter(|e| !e.is_empty()) {
+        out.push_str(" --ecosystems ");
+        out.push_str(&shell_word(&ecosystems.join(",")));
+    }
+    out
+}
 
 /// Where a physical copy lives, relative to `cwd` when it is inside it.
 /// Shared by `apply` and `rollback`.

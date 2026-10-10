@@ -62,15 +62,15 @@ use super::parse_memo::ParseMemo;
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip};
 use super::revert::{self, KeepPolicy};
-use super::service_fetch::{
-    claim_prestaged, fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal,
-};
+use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServicePolicy};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
-use crate::formats::composer::{composer_lock_packages, ComposerLockPackage};
+use crate::formats::composer::{
+    composer_lock_packages, ComposerLockPackage, ORIGIN_BOUND_ENTRY_KEYS,
+};
 
 mod lock_text;
 pub(super) mod mirror_filters;
@@ -329,10 +329,8 @@ pub async fn vendor_composer<'a>(
             )
             .await
             {
-                ComposerServiceCopy::Used(()) => {
-                    already_patched_result(purl, &copy_dir, &record.files)
-                }
-                ComposerServiceCopy::HardFail(outcome) => return *outcome,
+                Ok(()) => already_patched_result(purl, &copy_dir, &record.files),
+                Err(outcome) => return *outcome,
             };
             mirror_filters::heal_or_warn(&copy_dir, record, &pkg, &mut warnings).await;
             warnings.push(VendorWarning::new(
@@ -372,8 +370,8 @@ pub async fn vendor_composer<'a>(
         match composer_service_copy(service, record, &pkg, &copy_dir, &uuid_dir, &mut warnings)
             .await
         {
-            ComposerServiceCopy::Used(()) => already_patched_result(purl, &copy_dir, &record.files),
-            ComposerServiceCopy::HardFail(outcome) => return *outcome,
+            Ok(()) => already_patched_result(purl, &copy_dir, &record.files),
+            Err(outcome) => return *outcome,
         };
     if let Err(detail) =
         mirror_filters::neutralize_or_conflict(&copy_dir, record, &pkg, &mut warnings).await
@@ -437,11 +435,11 @@ pub async fn vendor_composer<'a>(
     let marker = VendorMarker::new("composer", &base_purl, record, vendored_at);
     write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
-    let entry = VendorEntry {
-        ecosystem: "composer".to_string(),
+    let entry = VendorEntry::new(
+        "composer".to_string(),
         base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
+        record.uuid.clone(),
+        VendorArtifact {
             yarn_berry10c0: None,
             path: copy_rel,
             sha256: String::new(), // Directory integrity uses the complete inventory.
@@ -449,7 +447,7 @@ pub async fn vendor_composer<'a>(
             platform_locked: None,
             file_inventory,
         },
-        wiring: vec![WiringRecord {
+        vec![WiringRecord {
             file: COMPOSER_LOCK.to_string(),
             kind: WIRING_KIND.to_string(),
             action: WiringAction::Rewritten,
@@ -457,17 +455,7 @@ pub async fn vendor_composer<'a>(
             original: (!was_vendored).then_some(original_entry),
             new: Some(Value::Object(rewritten)),
         }],
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    };
+    );
 
     done(result, Some(entry), warnings)
 }
@@ -646,10 +634,6 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
     prune_empty_vendor_dirs(stage).await;
 }
 
-/// Outcome of attempting to materialise the composer copy from the patch
-/// service (`Used`: the prebuilt dist zip was extracted into `copy_dir`).
-type ComposerServiceCopy = ServiceAttempt<()>;
-
 /// Download the prebuilt dist zip, integrity-verify it, and extract it into
 /// `copy_dir` (dropping the zip's variable top-level dir). Maps each service
 /// outcome onto the `auto` / `service` fallback policy. The extracted zip IS
@@ -661,20 +645,14 @@ pub(super) async fn composer_service_copy(
     copy_dir: &Path,
     uuid_dir: &Path,
     warnings: &mut Vec<VendorWarning>,
-) -> ComposerServiceCopy {
-    let Some(cfg) = service else {
-        return ComposerServiceCopy::HardFail(Box::new(super::service_fetch::required()));
-    };
-    if !cfg.service_enabled() {
-        return ComposerServiceCopy::HardFail(Box::new(super::service_fetch::required()));
-    }
-    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+) -> Result<(), Box<VendorOutcome>> {
+    let cfg = service
+        .filter(|cfg| cfg.service_enabled())
+        .ok_or_else(|| Box::new(super::service_fetch::required()))?;
+    let policy = ServicePolicy::Refused;
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
     let subject = format!("dist zip for {pkg}");
-    let mut archive = match policy.settle(fetched, "dist zip", &subject, warnings) {
-        Ok(archive) => archive,
-        Err(attempt) => return attempt,
-    };
+    let mut archive = policy.settle(fetched, "dist zip", &subject)?;
     // Extract into a STAGE sibling and swap it into the copy dir only
     // once fully verified — a failure then leaves any pre-existing
     // (possibly live-wired) copy and its marker untouched and no husk
@@ -687,19 +665,19 @@ pub(super) async fn composer_service_copy(
         let _ = remove_tree(&stage).await;
         if let Err(e) = tokio::fs::create_dir_all(&stage).await {
             cleanup_failed_stage(&stage, uuid_dir, false).await;
-            return policy.hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_write_failed",
                 format!("cannot create {}: {e}", stage.display()),
-            );
+            ));
         }
         // composer dist zips carry a single variable top-level dir.
         let zip_bytes = std::mem::take(&mut archive.bytes);
         if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, extract_dist_zip).await {
             cleanup_failed_stage(&stage, uuid_dir, false).await;
-            return policy.hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_extract_failed",
                 format!("cannot extract the prebuilt dist zip: {e}"),
-            );
+            ));
         }
     }
     // Verify the EXTRACTED TREE, not just the archive bytes. The
@@ -715,31 +693,21 @@ pub(super) async fn composer_service_copy(
     // build.
     if !copy_matches_after_hashes(&stage, &record.files).await {
         cleanup_failed_stage(&stage, uuid_dir, false).await;
-        return policy.miss(
-            warnings,
-            "vendor_prebuilt_layout_mismatch",
-            format!(
-                "prebuilt dist zip for {pkg} extracted to an \
+        return Err(policy.miss(format!(
+            "prebuilt dist zip for {pkg} extracted to an \
                  unexpected layout (patched files absent at their \
                  recorded paths)"
-            ),
-        );
+        )));
     }
     if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
         cleanup_failed_stage(&stage, uuid_dir, false).await;
-        return policy.hard(
+        return Err(policy.hard(
             "vendor_prebuilt_write_failed",
             format!("cannot move the extracted dist into place: {e}"),
-        );
+        ));
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {pkg} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
-    ComposerServiceCopy::Used(())
+    warnings.push(archive.downloaded_warning(pkg));
+    Ok(())
 }
 
 /// Locate the package's entry: `packages[]` first, then `packages-dev[]`.
@@ -797,8 +765,7 @@ pub(crate) fn rewrite_lock_entry(
     let mut replaced_dist = false;
     for (k, v) in original {
         match k.as_str() {
-            "source" => {}
-            "transport-options" => {}
+            k if ORIGIN_BOUND_ENTRY_KEYS.contains(&k) => {}
             "dist" => {
                 out.insert("dist".to_string(), dist.clone());
                 out.insert("transport-options".to_string(), transport.clone());

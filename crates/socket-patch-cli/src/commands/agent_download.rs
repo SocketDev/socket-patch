@@ -374,8 +374,6 @@ pub struct DownloadParams {
     pub global_prefix: Option<PathBuf>,
     pub json: bool,
     pub silent: bool,
-    /// `--download-mode` value forwarded to the apply step.
-    pub download_mode: String,
     /// When `false` (the default — narrow), a release-variant package (PyPI
     /// `?artifact_id=`, RubyGems `?platform=`, Maven `?classifier=`) is
     /// filtered down to the variant(s) matching the locally-installed
@@ -1336,7 +1334,7 @@ pub(crate) async fn warn_on_vendored_uuid_drift(
 }
 
 /// The `GlobalArgs` a nested apply runs with: the caller's flags verbatim
-/// (`--verbose`, `--strict`, `--ecosystems`, `--download-mode` … all flow
+/// (`--verbose`, `--strict`, `--ecosystems` … all flow
 /// through; the API flags ride along but are inert — the nested apply runs
 /// on the caller's client), with the fields `get` owns overridden: the
 /// already-resolved manifest path (apply re-resolves a
@@ -1374,7 +1372,6 @@ pub(crate) fn nested_apply_args_from_params(
         cwd: params.cwd.clone(),
         global: params.global,
         global_prefix: params.global_prefix.clone(),
-        download_mode: params.download_mode.clone(),
         strict: params.strict,
         // Scope the nested apply like the caller was scoped: `None` would
         // apply the WHOLE manifest, mutating other ecosystems' packages the
