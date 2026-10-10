@@ -820,10 +820,15 @@ async fn write_nupkg(uuid_dir: &Path, nupkg_path: &Path, bytes: &[u8]) -> Result
     write_uuid_gitignore(uuid_dir).await
 }
 
-/// Write `<uuid>/.gitignore` ([`UUID_GITIGNORE`]) unless it already holds it.
+/// Write `<uuid>/.gitignore` ([`UUID_GITIGNORE`]) unless it already holds
+/// it, in either line ending: a `core.autocrlf` checkout spells it `!*\r\n`,
+/// and rewriting that to LF would dirty the tree on every re-vendor.
 async fn write_uuid_gitignore(uuid_dir: &Path) -> Result<(), String> {
     let path = uuid_dir.join(".gitignore");
-    if read_regular_to_string(&path).await.ok().as_deref() == Some(UUID_GITIGNORE) {
+    if read_regular_to_string(&path)
+        .await
+        .is_ok_and(|text| text.replace("\r\n", "\n") == UUID_GITIGNORE)
+    {
         return Ok(());
     }
     crate::utils::fs::atomic_write_bytes(&path, UUID_GITIGNORE.as_bytes())
@@ -2466,6 +2471,22 @@ mod tests {
         assert_eq!(
             tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
             lock_before
+        );
+    }
+
+    /// An autocrlf checkout of the uuid `.gitignore` is not rewritten.
+    #[tokio::test]
+    async fn a_crlf_uuid_gitignore_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, "!*\r\n").unwrap();
+        super::write_uuid_gitignore(tmp.path()).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"!*\r\n");
+        std::fs::write(&path, "stale\n").unwrap();
+        super::write_uuid_gitignore(tmp.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            super::UUID_GITIGNORE
         );
     }
 
