@@ -1067,6 +1067,20 @@ crate that means the **shared** `$CARGO_HOME/registry` cache: the patch affects 
 project on the machine, and is silently reset by `cargo clean` or a cache prune. Use
 `--mode vendored` for a project-local, committable patch.
 
+Cargo never re-checks a registry or `cargo vendor` crate's source files: it reuses the
+crate's compiled artifacts while the package id is unchanged. So after `apply` or
+`rollback` changes a crate's bytes, socket-patch deletes that crate's fingerprints
+(`.fingerprint/<crate>-<hash>/`, or `build/<crate>/<hash>/fingerprint/` in the newer
+build-dir layout; every version, profile and target triple) in the
+project's build directories, and the next `cargo build` recompiles it and relinks its
+dependents. Those directories are `CARGO_TARGET_DIR` / `CARGO_BUILD_TARGET_DIR`,
+`CARGO_BUILD_BUILD_DIR`, `build.target-dir` / `build.build-dir` from the project's
+`.cargo/config.toml` files and `$CARGO_HOME/config.toml`, and `<workspace root>/target`.
+A fingerprint that can't be removed, or a `build.build-dir` using
+`{workspace-path-hash}`, adds a `cargo_build_cache_stale` warning that names the crates
+to `cargo clean -p`. Other projects that share the registry cache keep their own build
+caches: run `cargo clean -p <crate>` there too.
+
 Run `cargo fetch` before `apply` on a fresh checkout or CI runner. Cargo unpacks a
 locked crate into `registry/src` only when it fetches or builds, so on a cold or pruned
 cache there is nothing to patch, and the next `cargo build` would compile the pristine
