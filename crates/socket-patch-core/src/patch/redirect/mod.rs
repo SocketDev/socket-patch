@@ -1024,14 +1024,25 @@ fn rewrite_hatch(
             .filter(|dep| dep.ecosystem == "pypi")
             .map(|dep| dep.patch_uuid.clone()),
     );
+    // A pylock Hatch derives from pyproject (locked environments, #479) is
+    // not an install source of its own: Hatch regenerates it from the
+    // pyproject, so this lane wires pyproject too (the python-lock lane
+    // still rewrites the lock, keeping the two consistent until Hatch
+    // regenerates it from the wired pyproject).
     if files.keys().any(|file| {
         matches!(
             file.as_str(),
             "uv.lock" | "poetry.lock" | "pdm.lock" | "Pipfile.lock"
-        ) || crate::utils::python_lock::is_python_lock_name(file)
+        ) || (crate::utils::python_lock::is_python_lock_name(file)
+            && !crate::utils::hatch::is_hatch_lock(files, file))
     }) {
         return;
     }
+    let hatch_locks: Vec<&str> = files
+        .keys()
+        .filter(|file| crate::utils::hatch::is_hatch_lock(files, file))
+        .map(String::as_str)
+        .collect();
     if files.contains_key("requirements.txt") {
         result
             .confirmed_hatch_uuids
@@ -1061,6 +1072,20 @@ fn rewrite_hatch(
         match crate::utils::hatch::rewrite(&current, &dep.name, &dep.version, &url) {
             Ok(edits) => {
                 result.confirmed_hatch_uuids.insert(dep.patch_uuid.clone());
+                if !edits.is_empty() && !hatch_locks.is_empty() {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_hatch_lock_regenerated".into(),
+                        detail: format!(
+                            "{}@{}: wired in the Hatch configuration as well as in {}, which \
+                             Hatch derives from it (locked environments) and regenerates on \
+                             the next environment sync; run `hatch dep lock` to refresh it \
+                             now (`hatch dep lock --check` reports it stale until then)",
+                            dep.name,
+                            dep.version,
+                            hatch_locks.join(", ")
+                        ),
+                    });
+                }
                 for (path, new) in edits {
                     result.edits.push(FileEdit {
                         path: path.clone(),
@@ -24418,6 +24443,77 @@ mod hatch_tests {
                 ..Default::default()
             },
         }
+    }
+
+    /// The pylock `hatch lock` (Hatch 1.17+, `created-by = "uv"`) writes for
+    /// a locked environment, pinning urllib3 from PyPI.
+    const HATCH_PYLOCK: &str = "lock-version = \"1.0\"\ncreated-by = \"uv\"\nrequires-python = \">=3.9\"\n\n[[packages]]\nname = \"urllib3\"\nversion = \"1.26.18\"\nindex = \"https://pypi.org/simple\"\nwheels = [{ url = \"https://files.pythonhosted.org/packages/b0/urllib3-1.26.18-py2.py3-none-any.whl\", upload-time = 2023-10-17T17:46:21Z, size = 143835, hashes = { sha256 = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" } }]\n";
+
+    /// #479: a Hatch project whose environments are locked carries a
+    /// `pylock*.toml` Hatch DERIVES from pyproject (and regenerates on the
+    /// next sync), so hosted mode wires pyproject — the declaration Hatch
+    /// locks and installs from — beside the lock, with a warning, instead
+    /// of rewriting only the lock (which Hatch then threw away).
+    #[test]
+    fn hatch_locked_env_pylock_also_wires_pyproject() {
+        let head = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"urllib3==1.26.18\"]\n";
+        for (config, lock) in [
+            (
+                "\n[tool.hatch.envs.default]\nlocked = true\ninstaller = \"uv\"\n",
+                "pylock.toml",
+            ),
+            ("\n[tool.hatch]\nlock-envs = true\n", "pylock.toml"),
+            (
+                "\n[tool.hatch.envs.test]\nlocked = true\n",
+                "pylock.test.toml",
+            ),
+        ] {
+            let files: BTreeMap<String, String> = [
+                ("pyproject.toml".to_string(), format!("{head}{config}")),
+                (lock.to_string(), HATCH_PYLOCK.to_string()),
+            ]
+            .into_iter()
+            .collect();
+            let result = rewrite_registry_redirect(&files, &[patch()]);
+            assert!(
+                result.confirmed_hatch_uuids.contains("test-uuid"),
+                "{config}: {:?}",
+                result.warnings
+            );
+            assert!(
+                result.files["pyproject.toml"].contains(&format!(
+                    "urllib3 @ {}#sha256={}",
+                    patch().artifact_url,
+                    "a".repeat(64)
+                )),
+                "{config}"
+            );
+            // The lock stays consistent with pyproject until Hatch
+            // regenerates it from the wired declaration.
+            assert!(
+                result.files[lock].contains(&patch().artifact_url),
+                "{config}"
+            );
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_hatch_lock_regenerated" && w.detail.contains(lock)),
+                "{config}: {:?}",
+                result.warnings
+            );
+        }
+        // Without locked environments a pylock is its own install source
+        // (`uv export`, `pip lock`): the lock lane keeps it, pyproject stays.
+        let files: BTreeMap<String, String> = [
+            ("pyproject.toml".to_string(), head.to_string()),
+            ("pylock.toml".to_string(), HATCH_PYLOCK.to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let result = rewrite_registry_redirect(&files, &[patch()]);
+        assert!(!result.files.contains_key("pyproject.toml"));
+        assert!(result.confirmed_hatch_uuids.is_empty());
     }
 
     #[test]
