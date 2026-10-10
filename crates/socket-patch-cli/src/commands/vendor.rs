@@ -51,7 +51,7 @@ use crate::commands::apply::{representative_file, result_to_event, variant_match
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{
-    ApplyRequest, RevertedEntry, VendorRevertStep, VendoredBackend,
+    ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
@@ -4081,11 +4081,22 @@ pub(crate) async fn reconcile_dropped(
             // Drift-skip keep: the backend left the drifted lock alone and
             // kept the artifacts, so the ledger entry must survive too — and
             // the genuine outcome is a COUNTED skip, not a removal.
-            VendorRevertStep::Kept => env.record(
+            VendorRevertStep::Kept(KeepCause::Drift) => env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_revert_kept",
                     "patch no longer in manifest, but its lock entries drifted since \
                      vendoring; artifacts and ledger entry kept",
+                ),
+            ),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    format!(
+                        "patch no longer in manifest, but {}; artifacts and ledger entry \
+                         kept — {}",
+                        cause.reason(),
+                        cause.remedy("re-run `vendor`")
+                    ),
                 ),
             ),
             VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
@@ -4184,11 +4195,21 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             // the genuine outcome is a COUNTED skip, not a removal.
             // (`record_warning` above already surfaced the per-record
             // details as uncounted advisory events.)
-            VendorRevertStep::Kept => env.record(
+            VendorRevertStep::Kept(KeepCause::Drift) => env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_revert_kept",
                     "lock entries drifted since vendoring; artifacts and ledger entry kept \
                      — undo the drift and re-run `vendor --revert` to finish",
+                ),
+            ),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    format!(
+                        "{}; artifacts and ledger entry kept — {}",
+                        cause.reason(),
+                        cause.remedy("re-run `vendor --revert` to finish")
+                    ),
                 ),
             ),
             VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {

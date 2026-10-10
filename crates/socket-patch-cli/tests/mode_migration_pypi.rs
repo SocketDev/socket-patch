@@ -2514,3 +2514,137 @@ async fn uv_workspace_hatch_member_is_refused_in_both_modes() {
         assert_eq!(tree(&ws), before, "vendored wrote nothing");
     }
 }
+
+/// #1184: a vendored Pipenv project whose `pipenv requirements >
+/// requirements.txt` export (made after vendoring) still installs from the
+/// vendored wheel. Every unwind restores Pipfile.lock and keeps the wheel
+/// and ledger entry while that export references it — correct — but must
+/// say so: no "lockfile wiring drifted" wording, no "re-run `scan --mode
+/// vendored` to normalize" remedy (that loops), and a remedy naming the
+/// file to re-export. Once the export is pointed back at the registry, the
+/// same unwind finishes.
+#[tokio::test]
+async fn pipenv_residual_export_keep_is_not_reported_as_drift() {
+    let wheel_dir = format!(".socket/vendor/pypi/{UUID}");
+    let export = format!(
+        "-i https://pypi.org/simple\n./{wheel_dir}/{WHEEL} ; python_version >= '2.7' and python_version not in '3.0, 3.1, 3.2'\n"
+    );
+    let no_drift = |label: &str, text: &str| {
+        for bad in ["drift", "normalize"] {
+            assert!(
+                !text.contains(bad),
+                "{label}: a residual-reference keep is not drift ({bad:?}):\n{text}"
+            );
+        }
+        assert!(
+            text.contains("vendor_revert_residual_reference") || text.contains("requirements.txt"),
+            "{label}: the keep names the referencing file:\n{text}"
+        );
+        assert!(
+            text.contains("re-export"),
+            "{label}: the remedy is to re-export the file:\n{text}"
+        );
+    };
+    for unwind in [
+        vec!["remove", PURL, "--yes"],
+        vec!["rollback", "--yes"],
+        vec!["vendor", "--revert"],
+    ] {
+        let (_tmp, root) = project();
+        let files = stage_pipenv(&root);
+        let pristine = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+        vendor_project(&root, files);
+        std::fs::write(root.join("requirements.txt"), &export).unwrap();
+
+        let (code, env) = run_cli(&root, &unwind, &[]);
+        let label = format!("{unwind:?}");
+        no_drift(&label, &env.to_string());
+        if unwind[0] == "remove" {
+            assert_eq!(code, 1, "{label}: the removal is not finished: {env:#}");
+            let (code, _stdout, stderr) = run_raw(&root, &unwind, &[]);
+            assert_eq!(code, 1, "{label} (human): {stderr}");
+            no_drift(&format!("{label} (human)"), &stderr);
+        }
+        let lock = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        assert_eq!(
+            lock(&std::fs::read_to_string(root.join("Pipfile.lock")).unwrap()),
+            lock(&pristine),
+            "{label}: Pipfile.lock is restored"
+        );
+        assert!(
+            root.join(&wheel_dir).exists(),
+            "{label}: the wheel the export installs from is kept"
+        );
+
+        // The prescribed fix: re-export from the restored lock.
+        std::fs::write(
+            root.join("requirements.txt"),
+            "-i https://pypi.org/simple\nsix==1.16.0\n",
+        )
+        .unwrap();
+        let (code, env) = run_cli(&root, &unwind, &[]);
+        assert_eq!(code, 0, "{label} after the re-export: {env:#}");
+        assert!(
+            !root.join(&wheel_dir).exists(),
+            "{label}: the wheel is reclaimed once nothing references it"
+        );
+    }
+}
+
+/// #1184, the hosted takeover lane: the same export keeps the vendored
+/// wheel, so the takeover refuses (the package stays vendored and patched)
+/// and must name the export, not "wiring edited since vendoring" with a
+/// `vendor --revert` remedy that leaves the project unpatched.
+#[tokio::test]
+async fn pipenv_residual_export_takeover_refusal_names_the_export() {
+    let (_tmp, root) = project();
+    let files = stage_pipenv(&root);
+    vendor_project(&root, files);
+    std::fs::write(
+        root.join("requirements.txt"),
+        format!("-i https://pypi.org/simple\n./.socket/vendor/pypi/{UUID}/{WHEEL}\n"),
+    )
+    .unwrap();
+    let vendored = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_vendored_revert_failed")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_else(|| panic!("the takeover is refused: {env:#}"))
+        .to_string();
+    assert!(
+        detail.contains("requirements.txt")
+            && detail.contains("`six==1.16.0`")
+            && detail.contains("re-export")
+            && !detail.contains("edited since vendoring")
+            && !detail.contains("vendor --revert"),
+        "{detail}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
+        vendored,
+        "the package stays vendored"
+    );
+
+    // The prescribed order converges: pin the file by hand, then the
+    // hosted scan takes the package over.
+    std::fs::write(
+        root.join("requirements.txt"),
+        "-i https://pypi.org/simple\nsix==1.16.0\n",
+    )
+    .unwrap();
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert!(
+        !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+        "the takeover reclaims the vendored wheel: {env:#}"
+    );
+}

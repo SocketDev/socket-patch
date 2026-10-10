@@ -166,10 +166,10 @@ pub(crate) enum VendorRevertStep {
     Missing,
     /// The backend refused; nothing changed for this entry.
     Failed(String),
-    /// Drift-keep: the lock changed under us and the backend left both the
-    /// wiring and the artifact alone. Per `RevertOutcome`'s contract the
-    /// ledger entry — and any manifest record — must survive.
-    Kept,
+    /// The backend kept the artifact (see [`KeepCause`]). Per
+    /// `RevertOutcome`'s contract the ledger entry — and any manifest
+    /// record — must survive.
+    Kept(KeepCause),
     /// Dry run: the revert (or, with `keep_artifact`, the unwire) would
     /// succeed. Nothing changed.
     WouldRevert,
@@ -184,6 +184,46 @@ pub(crate) enum VendorRevertStep {
     /// Reverted on disk and dropped from the in-memory ledger, but the
     /// ledger write failed.
     LedgerWriteFailed(String),
+}
+
+/// Why a vendored revert kept the artifact and ledger entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum KeepCause {
+    /// Drift-keep: the lock changed under us and the backend left both
+    /// the wiring and the artifact alone.
+    Drift,
+    /// The recorded wiring was restored, but another project file (an
+    /// exported requirements file) still installs from the artifact
+    /// (`vendor_revert_residual_reference`, #1184). Nothing drifted: the
+    /// way out is to point that file back at the registry release.
+    Reference,
+}
+
+impl KeepCause {
+    /// The per-entry reason, after "`<what>` kept".
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            KeepCause::Drift => "lockfile wiring drifted",
+            KeepCause::Reference => {
+                "a project file still installs from the vendored artifact (see \
+                 vendor_revert_residual_reference); the recorded wiring was restored"
+            }
+        }
+    }
+
+    /// The remedy that finishes the unwind, for `then` (the command to
+    /// re-run).
+    pub(crate) fn remedy(self, then: &str) -> String {
+        match self {
+            KeepCause::Drift => {
+                format!("re-run `scan --mode vendored` to normalize, then {then}")
+            }
+            KeepCause::Reference => format!(
+                "point the file named by vendor_revert_residual_reference back at the \
+                 registry release (or re-export it from the restored lock), then {then}"
+            ),
+        }
+    }
 }
 
 pub(crate) struct VendorRevertResult {
@@ -208,7 +248,11 @@ pub(crate) async fn revert_vendor_entry(
     let step = if !outcome.success {
         VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
     } else if outcome.kept_artifact {
-        VendorRevertStep::Kept
+        VendorRevertStep::Kept(if outcome.kept_for_residual_reference() {
+            KeepCause::Reference
+        } else {
+            KeepCause::Drift
+        })
     } else if opts.dry_run {
         VendorRevertStep::WouldRevert
     } else if opts.keep_artifact {

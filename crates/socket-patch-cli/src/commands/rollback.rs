@@ -27,7 +27,9 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs};
 use crate::commands::hosted_unwind::run_hosted_leg;
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
+use crate::commands::vendored_backend::{
+    KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
+};
 use crate::ecosystem_dispatch::{
     distinct_npm_copies, find_all_packages_for_rollback, partition_purls, JvmScope,
 };
@@ -808,9 +810,17 @@ async fn run_vendored_leg(
                 }
                 out.failed.push((key, why));
             }
-            VendorRevertStep::Kept => out.kept.push((
+            VendorRevertStep::Kept(KeepCause::Drift) => out.kept.push((
                 key,
                 "lockfile wiring drifted; vendored state left untouched".to_string(),
+            )),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => out.kept.push((
+                key,
+                format!(
+                    "{}; vendored state kept — {}",
+                    cause.reason(),
+                    cause.remedy("roll back again")
+                ),
             )),
             VendorRevertStep::WouldRevert if preserve => {
                 if loud {

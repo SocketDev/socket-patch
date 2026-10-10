@@ -694,6 +694,12 @@ impl RevertOpts {
 /// time (the dependency was removed). See [`RevertOutcome::lock_entry_removed`].
 pub const LOCK_ENTRY_REMOVED_CODE: &str = "vendor_lock_entry_removed";
 
+/// A PyPI revert restored the wiring it recorded, but another project file
+/// (a `pipenv requirements` / `uv export` / `poetry export` requirements
+/// file, a moved vendor line) still installs from the vendored wheel, so
+/// the artifact and ledger entry are kept until nothing references them.
+pub const RESIDUAL_REFERENCE_CODE: &str = "vendor_revert_residual_reference";
+
 /// The result of one backend `revert_*` call.
 #[derive(Debug)]
 pub struct RevertOutcome {
@@ -767,6 +773,36 @@ impl RevertOutcome {
         self.warnings
             .iter()
             .any(|w| w.code == LOCK_ENTRY_REMOVED_CODE)
+    }
+
+    /// True when the artifact was kept ONLY because another project file
+    /// still references it ([`RESIDUAL_REFERENCE_CODE`]): the recorded
+    /// wiring was restored and nothing drifted, so the way out is to point
+    /// that file back at the registry release, not to undo a drift (#1184).
+    pub fn kept_for_residual_reference(&self) -> bool {
+        self.kept_artifact
+            && !self.drift_skipped()
+            && self
+                .warnings
+                .iter()
+                .any(|w| w.code == RESIDUAL_REFERENCE_CODE)
+    }
+
+    /// [`Self::keep_artifact`] for a residual-reference keep: the wiring
+    /// was restored, but a project file the revert does not own still
+    /// installs from `uuid_dir_rel` (named by the
+    /// [`RESIDUAL_REFERENCE_CODE`] warning).
+    pub fn keep_artifact_for_reference(&mut self, uuid_dir_rel: &str) {
+        self.kept_artifact = true;
+        self.warnings.push(VendorWarning::new(
+            "vendor_artifact_kept",
+            format!(
+                "kept {uuid_dir_rel}: the recorded wiring was restored, but a project file \
+                 still installs from it (see the vendor_revert_residual_reference warning); \
+                 point that file back at the registry release (or re-export it from the \
+                 restored lock) and re-run the revert to finish cleaning up"
+            ),
+        ));
     }
 
     /// Mark the artifact dir as deliberately kept after a drift-skip and
