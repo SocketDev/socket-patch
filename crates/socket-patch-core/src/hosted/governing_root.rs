@@ -4,7 +4,7 @@
 //! either pins nothing and reports success (pnpm, #590; npm, yarn and Bun
 //! `package.json` workspaces, #884; vlt `vlt.json` workspaces, #942) or
 //! rewrites the member as a lockless project and breaks the workspace
-//! (cargo, #417).
+//! (cargo, #417; a uv workspace member with Hatch configuration, #1138).
 //!
 //! [`refusal`] spots these layouts before any takeover or write, so the run
 //! fails closed and names the directory to run from. It also refuses a
@@ -44,7 +44,8 @@ pub const PNPM_LOCKFILE_ELSEWHERE: &str = "redirect_pnpm_lockfile_elsewhere";
 
 /// Refusal code for an npm, yarn, Bun or vlt workspace member: an ancestor
 /// `package.json` (or, for vlt, `vlt.json`) lists the project directory in
-/// its `workspaces`, and the workspace's lock lives at that root.
+/// its `workspaces`, and the workspace's lock lives at that root. Also a uv
+/// workspace member (`[tool.uv.workspace] members`, #1138).
 pub const WORKSPACE_LOCKFILE_ELSEWHERE: &str = "redirect_workspace_lockfile_elsewhere";
 
 /// Refusal code for a pnpm workspace member with its own lock whose
@@ -84,6 +85,14 @@ pub async fn refusal(
     if candidates.iter().any(|c| c.dep.ecosystem == "cargo") {
         if let Some(refusal) = cargo_member_refusal(root).await {
             return Some(refusal);
+        }
+    }
+    if candidates.iter().any(|c| c.dep.ecosystem == "pypi") {
+        if let Some(workspace) = crate::utils::uv_workspace::governing_uv_workspace(root).await {
+            return Some(Refusal {
+                code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
+                message: crate::utils::uv_workspace::member_detail(root, &workspace),
+            });
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "npm") {

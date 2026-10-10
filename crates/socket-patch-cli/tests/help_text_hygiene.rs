@@ -202,15 +202,17 @@ fn vendor_and_repair_summaries_read_as_one_line() {
     );
     assert!(
         text.lines().any(|l| l
-            == "  repair    Agent mode: download missing patch artifacts and clean up unused ones"),
+            == "  repair    Restore agent or vendored patch artifacts and clean up unused ones"),
         "{text}"
     );
     let repair = long_help(&["repair"]);
     assert!(
         repair.starts_with(
-            "Agent mode: download missing patch artifacts and clean up unused ones\n\n\
-             Restores missing blobs and diff/package archives, rebuilds missing or corrupt \
-             vendored artifacts, then deletes the artifacts nothing references.\n"
+            "Restore agent or vendored patch artifacts and clean up unused ones\n\n\
+             Downloads missing agent patch data and redownloads missing or corrupt \
+             vendored artifacts using the existing vendor ledger, then deletes \
+             unreferenced artifacts. A lost `.socket/vendor/state.json` cannot be \
+             reconstructed; restore it from version control.\n"
         ),
         "{repair}"
     );
@@ -284,4 +286,22 @@ fn short_help_lists_about_eight_options_and_long_help_lists_all() {
         !long.contains("--apply") && !long.contains("--vendor "),
         "{long}"
     );
+}
+
+/// #923: service-only vendoring never reads the installed files, so
+/// `vendor --force` only bypasses the installed-variant probe. Its help
+/// must not promise a missing-file tolerance or a mismatch warning that
+/// no vendored backend implements.
+#[test]
+fn vendor_force_help_describes_only_the_variant_probe_bypass() {
+    let help = long_help(&["vendor"]);
+    let force = help
+        .split("--force")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  -").next())
+        .expect("vendor --help documents --force");
+    assert!(force.contains("variant probe"), "{force}");
+    for stale in ["Tolerate missing", "vendor_content_mismatch_overwritten"] {
+        assert!(!force.contains(stale), "stale {stale:?} in: {force}");
+    }
 }
