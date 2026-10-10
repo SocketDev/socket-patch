@@ -1114,7 +1114,12 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
     let wired = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
     let (code, envelope) = run_rollback_subprocess(tmp.path(), &[]);
     assert_eq!(code, 1, "{envelope}");
-    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    // Both pins refused, nothing restored: a total failure whose
+    // counters span the hosted leg (#1066).
+    assert_eq!(envelope["status"], "error", "{envelope}");
+    assert_eq!(envelope["error"]["code"], "rollback_failed", "{envelope}");
+    assert_eq!(envelope["failed"], 2, "{envelope}");
+    assert_eq!(envelope["rolledBack"], 0, "{envelope}");
     assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([]));
     let failed: Vec<&str> = envelope["hosted"]["failed"]
         .as_array()
@@ -1142,6 +1147,9 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(code, 1, "{envelope}");
     assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    // The top-level counters span the hosted leg (#1066): they were 0/0.
+    assert_eq!(envelope["rolledBack"], 1, "{envelope}");
+    assert_eq!(envelope["failed"], 1, "{envelope}");
     assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([IO_PURL]));
     assert_eq!(
         envelope["hosted"]["failed"][0]["purl"], LP_PURL,

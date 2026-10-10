@@ -14,6 +14,7 @@ use std::time::Duration;
 use crate::args::GlobalArgs;
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{run_vendor_gc, VendorGcSummary};
+use crate::json_envelope::GcReport;
 use crate::ui::sweep_failure;
 
 /// Aggregated outcome of a GC pass (or preview). Serialized into the
@@ -93,21 +94,24 @@ impl GcSummary {
         self.vendor_orphan_dirs = v.orphan_dirs;
     }
 
-    /// Serialize for a *mutating* GC pass (post-apply). `skipped` and
-    /// `warnings` are additive: present only when the lock could not be
-    /// taken / a post-revert rewrite failed.
-    fn to_apply_json(&self) -> serde_json::Value {
-        let mut json = serde_json::json!({
-            "prunedManifestEntries": self.pruned,
-            "removedBlobs": self.blobs.blobs_removed,
-            "removedDiffArchives": self.diffs.blobs_removed,
-            "removedPackageArchives": self.packages.blobs_removed,
-            "revertedVendoredEntries": self.vendored_reverted,
-            "keptVendoredEntries": self.vendored_kept,
-            "failedVendoredEntries": self.vendored_failed,
-            "removedVendorOrphanDirs": self.vendor_orphan_dirs,
-            "bytesFreed": self.total_bytes(),
-        });
+    /// The `gc` sub-object. One shape for both passes: the artifact half is
+    /// the `gc` object every GC-running command prints (`GcReport`), the
+    /// manifest and vendored halves are scan's. On a `--dry-run` preview the
+    /// counts are what the pass would remove, and the keys only a real pass
+    /// can fill (`keptVendoredEntries`, `failedVendoredEntries`, `skipped`,
+    /// `warnings`) are left out rather than reported as an empty check.
+    pub(super) fn to_json(&self, preview: bool) -> serde_json::Value {
+        let mut json =
+            GcReport::from_passes(Some(&self.blobs), Some(&self.diffs), Some(&self.packages))
+                .to_value();
+        json["prunedManifestEntries"] = serde_json::json!(self.pruned);
+        json["revertedVendoredEntries"] = serde_json::json!(self.vendored_reverted);
+        json["removedVendorOrphanDirs"] = serde_json::json!(self.vendor_orphan_dirs);
+        if preview {
+            return json;
+        }
+        json["keptVendoredEntries"] = serde_json::json!(self.vendored_kept);
+        json["failedVendoredEntries"] = serde_json::json!(self.vendored_failed);
         if let Some((code, message)) = &self.skipped {
             json["skipped"] = serde_json::json!({ "code": code, "message": message });
         }
@@ -119,29 +123,6 @@ impl GcSummary {
                 .collect();
         }
         json
-    }
-
-    /// The `gc` sub-object: [`Self::to_preview_json`] for a `--dry-run`
-    /// pass, [`Self::to_apply_json`] otherwise.
-    pub(super) fn to_json(&self, preview: bool) -> serde_json::Value {
-        if preview {
-            self.to_preview_json()
-        } else {
-            self.to_apply_json()
-        }
-    }
-
-    /// Serialize for a *non-mutating* GC pass (read-only preview).
-    fn to_preview_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "prunableManifestEntries": self.pruned,
-            "orphanBlobs": self.blobs.blobs_removed,
-            "orphanDiffArchives": self.diffs.blobs_removed,
-            "orphanPackageArchives": self.packages.blobs_removed,
-            "revertableVendoredEntries": self.vendored_reverted,
-            "vendorOrphanDirs": self.vendor_orphan_dirs,
-            "bytesReclaimable": self.total_bytes(),
-        })
     }
 }
 
@@ -338,9 +319,8 @@ pub(super) async fn run_vendor_only_gc(
     GcSummary::vendor_only(run_vendor_gc(common, manifest_path, false).await)
 }
 
-/// Dry-run preview of the apply-mode GC pass. Same shape as
-/// [`run_apply_gc`] but emits `prunable*`/`orphan*` field names and
-/// performs no mutation.
+/// Dry-run preview of the apply-mode GC pass. Same summary as
+/// [`run_apply_gc`] (what the pass would remove), with no mutation.
 async fn preview_apply_gc(
     common: &GlobalArgs,
     manifest_path: &Path,
@@ -390,8 +370,7 @@ async fn preview_apply_gc(
 }
 
 /// The `gc` sub-object for the JSON paths: a read-only preview under
-/// `--dry-run`, the mutating pass otherwise, serialized with the matching
-/// (`prunable*`/`orphan*` vs `pruned*`/`removed*`) field names.
+/// `--dry-run`, the mutating pass otherwise, both in the one `gc` shape.
 pub(super) async fn gc_json(
     common: &GlobalArgs,
     manifest_path: &Path,
@@ -403,11 +382,11 @@ pub(super) async fn gc_json(
     if dry_run {
         preview_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored)
             .await
-            .to_preview_json()
+            .to_json(true)
     } else {
         run_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored)
             .await
-            .to_apply_json()
+            .to_json(false)
     }
 }
 
@@ -880,7 +859,7 @@ mod tests {
         let blobs_dir = socket_dir.join("blobs");
         std::fs::create_dir_all(&blobs_dir).unwrap();
         let blob_path = blobs_dir.join(after_hash);
-        // Non-trivial size so `bytesReclaimable`/`bytesFreed` is observably > 0.
+        // Non-trivial size so `bytesFreed` is observably > 0.
         std::fs::write(&blob_path, vec![0u8; 64]).unwrap();
 
         let manifest_path = socket_dir.join("manifest.json");
@@ -942,7 +921,7 @@ mod tests {
         );
         assert!(
             preview.total_bytes() > 0,
-            "bytesReclaimable must be > 0 when an orphan blob would be freed"
+            "bytesFreed must be > 0 when an orphan blob would be freed"
         );
         // Preview is non-mutating: blob and manifest untouched.
         assert!(
@@ -1007,7 +986,7 @@ mod tests {
             )),
             "a lock-contended pass must say why it pruned nothing"
         );
-        let json = gc.to_apply_json();
+        let json = gc.to_json(false);
         assert_eq!(json["skipped"]["code"], "lock_held", "{json}");
         assert_eq!(
             json["prunedManifestEntries"],
@@ -1088,7 +1067,7 @@ mod tests {
         assert!(blob_path.exists(), "nothing may be swept on a lock fault");
         let m = read_manifest(&manifest_path).await.unwrap().unwrap();
         assert!(m.patches.contains_key("pkg:npm/gone@1.0.0"));
-        assert_eq!(gc.to_apply_json()["skipped"]["code"], "lock_io");
+        assert_eq!(gc.to_json(false)["skipped"]["code"], "lock_io");
     }
 
     #[tokio::test]
@@ -1296,10 +1275,10 @@ mod tests {
             "preview must not create a manifest file"
         );
         // The serialized degenerate preview is the normal all-zero shape.
-        let json = gc.to_preview_json();
-        assert_eq!(json["prunableManifestEntries"], serde_json::json!([]));
-        assert_eq!(json["orphanBlobs"], serde_json::json!(0));
-        assert_eq!(json["bytesReclaimable"], serde_json::json!(0));
+        let json = gc.to_json(true);
+        assert_eq!(json["prunedManifestEntries"], serde_json::json!([]));
+        assert_eq!(json["removedBlobs"], serde_json::json!(0));
+        assert_eq!(json["bytesFreed"], serde_json::json!(0));
 
         // Corrupt manifest, fresh tempdir.
         let tmp = tempfile::tempdir().unwrap();
@@ -1405,7 +1384,7 @@ mod tests {
         );
         assert!(
             gc.total_bytes() > 0,
-            "bytesReclaimable must include the unused entry's blob"
+            "bytesFreed must include the unused entry's blob"
         );
         assert_eq!(gc.vendor_orphan_dirs, 0, "no orphan uuid dirs on disk");
         // Preview is non-mutating: blob, manifest entry, and ledger intact.
@@ -1525,7 +1504,7 @@ mod tests {
              preview listed as revertable was deliberately not reclaimed"
         );
         assert_eq!(
-            gc.to_apply_json()["keptVendoredEntries"],
+            gc.to_json(false)["keptVendoredEntries"],
             serde_json::json!([PURL]),
             "scan --prune --json must carry the keep"
         );
@@ -1533,9 +1512,9 @@ mod tests {
         // `vendor_artifact_kept`) are already said by the keep above; they
         // must not also land in `gc.warnings[]`.
         assert!(
-            gc.to_apply_json().get("warnings").is_none(),
+            gc.to_json(false).get("warnings").is_none(),
             "a drift keep adds no gc warning: {}",
-            gc.to_apply_json()
+            gc.to_json(false)
         );
         // Nothing reclaimed: manifest record, blob, ledger entry, and
         // artifacts all survive (the drift-keep contract).
@@ -1597,7 +1576,7 @@ mod tests {
             Some(("lock_held", LOCK_MARKER.to_string())),
             "absorbing the vendored half leaves this pass's own skip reason alone"
         );
-        let apply = gc.to_apply_json();
+        let apply = gc.to_json(false);
         assert_eq!(
             apply["keptVendoredEntries"],
             serde_json::json!(["pkg:npm/a@1.0.0", "pkg:npm/b@1.0.0"])
@@ -1617,7 +1596,7 @@ mod tests {
             }]),
             "{apply}"
         );
-        let preview = gc.to_preview_json();
+        let preview = gc.to_json(true);
         for key in [
             "keptVendoredEntries",
             "failedVendoredEntries",
@@ -1635,7 +1614,7 @@ mod tests {
         // absent, not null).
         let clean = GcSummary::vendor_only(VendorGcSummary::default());
         assert!(clean.skipped.is_none());
-        let clean_json = clean.to_apply_json();
+        let clean_json = clean.to_json(false);
         assert!(clean_json.get("skipped").is_none(), "{clean_json}");
         assert!(clean_json.get("warnings").is_none(), "{clean_json}");
         // A failed rewrite in the vendored half is a warning, never a skip
@@ -1647,7 +1626,7 @@ mod tests {
         });
         assert!(io.skipped.is_none(), "the vendored half never sets skipped");
         assert_eq!(
-            io.to_apply_json()["warnings"][0]["code"],
+            io.to_json(false)["warnings"][0]["code"],
             "manifest_write_failed"
         );
         assert!(io.vendored_failed.is_empty());

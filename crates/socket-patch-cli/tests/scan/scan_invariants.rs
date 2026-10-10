@@ -888,11 +888,10 @@ async fn scan_prune_dry_run_reports_prunable_manifest_entries() {
     let gc = v["gc"]
         .as_object()
         .unwrap_or_else(|| panic!("--prune must emit gc field; full envelope was: {v}"));
-    // Dry-run uses the *prunable*/* orphan* preview field names per the
-    // CLI contract.
-    let prunable = gc["prunableManifestEntries"]
+    // Dry-run reports the would-be removals under the one `gc` shape.
+    let prunable = gc["prunedManifestEntries"]
         .as_array()
-        .expect("prunableManifestEntries present in dry-run gc");
+        .expect("prunedManifestEntries present in dry-run gc");
     assert_eq!(prunable.len(), 1);
     assert_eq!(prunable[0], "pkg:npm/uninstalled@1.0.0");
 

@@ -187,7 +187,7 @@ For a **9.0 root lock**, the CLI ensures `pnpm-workspace.yaml` carries `trustLoc
 
 **Agent-flow run-level warnings (additive).** An agent-mode apply (`--mode agent` / `--sync`, `--json`) may add a top-level `warnings[]` array of `{code, detail}` entries to the scan envelope (absent when none fired; each is also mirrored to stderr unless `--silent`). They surface cross-mode state the apply cannot change — never a status or exit-code change (hosted refusals set the precedent: exit 0 + warning). Codes (stable; new codes are additive/MINOR): `vendored_ownership_retained` — vendor-owned package(s) were skipped before download (the per-patch `skipped`/`vendored` records in `apply.patches[]` are unchanged); the detail names the purls and the migration path (`remove <purl>`, or `vendor --revert` which unwinds every vendored package, then re-run). `hosted_wiring_retained` — the lockfiles still pin scanned package(s) to a hosted patch (the agent run does not unwind hosted wiring — as of v5.0 that is `socket-patch rollback`'s job, which restores the upstream registry entries, or `remove <purl>` per package); the detail names the purls and the options (stay `--mode hosted`, migrate via `scan --mode vendored`, or `socket-patch rollback`). The warning keys on the hosted pins lockfile discovery finds at scan time, so a flow that restored the upstream entries retires it. The human path prints the same `hosted_wiring_retained` text to stderr after an apply; the vendored counterpart is already covered by its per-package `[skip] … (vendored …)` lines. `ownership_not_restored` (v5.0; `apply` and `rollback` `warnings[]` alike) — a file WAS patched (or restored) but its ownership could not be put back to the original uid/gid (the mode is still restored last); the detail is `<purl>: <path>: patched, but ownership could not be restored to uid N gid M: <error>` and the human line `Warning: <detail>` (stderr, muted by `--silent`); never a status or exit change. `cargo_build_cache_stale` (v5.0; `apply` and `rollback` `warnings[]` alike) — a cargo crate's bytes changed but its compiled copy in a project build directory could not be invalidated (a fingerprint directory that could not be removed, or a `build.build-dir` with a `{workspace-path-hash}` template); the detail names the crates to `cargo clean -p` before the next build, which may otherwise link the stale code; never a status or exit change.
 
-`scan --prune` opts into garbage collection. When set, `scan` removes manifest entries for packages no longer present in the crawl, then deletes orphan blob files, and every obsolete diff and package archive, from `.socket/`. A blob is an orphan when no patch left in the manifest references it: the afterHash and beforeHash blobs of every remaining patch are kept, the same retention policy `repair` uses (the beforeHash blobs are an offline rollback's only restore data, and `repair` downloads afterHash blobs only). Diff and legacy package archives are never kept, even for a remaining patch: nothing reads them any more. Off by default (v3.0) so a temporary uninstall doesn't silently destroy manifest state. Only entries whose ecosystem this run actually crawled are eligible: a `pkg:<type>/` with no crawler in this build (a newer CLI's ecosystem in the committed manifest) is exempt — the crawl never looked for them, so their absence is not evidence of removal (same fail-safe as the `--ecosystems` filter, which narrows the query but never the prune's installed set). A Cargo entry is also exempt while its agent-mode copy is still patched: the project crawl looks up only the crates `Cargo.lock` resolves, but a crate the lock bumped or dropped keeps its patched copy in the machine-wide `$CARGO_HOME/registry/src` cache (nothing deletes it), and the entry holds the only blobs that can restore that copy. The wet pass keeps it with a `cargo_cache_patch_kept` warning naming the `socket-patch rollback <purl>` that restores the copy and drops the entry; the preview leaves it out of `prunableManifestEntries`. The pass also reconciles vendored state (runs FIRST, under ONE apply-lock acquisition shared with the manifest prune — lock contention skips the whole pass without failing the scan; `--lock-timeout` is honored and a lock I/O error is reported rather than swallowed; the existence gate — a manifest file OR a vendor ledger file, both cheap stats; an emptied ledger is deleted on save, so its presence is its content proxy — runs BEFORE the lock, so a bare project never gets a `.socket/`; in the vendored scan arms the pass runs AFTER the vendor step): (a) ledger entries still tracked by a manifest record (manifest-mode entries written by standalone `vendor`) whose patch is gone from the manifest are reverted — `detached` entries (every `scan`/`get --mode vendored` entry, v5.0) have no manifest record to lose and are exempt from this leg; (b) EVERY ledger entry whose dependency is no longer in the lockfile graph is reverted and any manifest entry it still had dropped (v5.0: the check is about the lockfile, not the manifest, so embedded-record entries are no longer exempt; a missing or undeterminable lockfile keeps the entry, fail-safe); and (c) orphan `.socket/vendor/<eco>/<uuid>` dirs with no ledger entry are swept. The prune never deletes a zero-patch `.socket/manifest.json` (its `{"patches": {}}` + `setup` block stay). The JSON `gc` sub-object gains `revertedVendoredEntries` + `keptVendoredEntries` + `failedVendoredEntries` + `removedVendorOrphanDirs` (wet) / `revertableVendoredEntries` + `vendorOrphanDirs` (preview), plus two ADDITIVE wet-only keys: `skipped: {code, message}` — present exactly when the pass was skipped at the lock (`lock_held` | `lock_io`; every count is then zero) — and `warnings: [{code, detail}]` — `vendor_state_write_failed` / `manifest_write_failed` (entries were reverted but the ledger or manifest rewrite failed), `cleanup_failed` (an orphan sweep failed mid-way), `cargo_cache_patch_kept` (see above), and the reinstall advisories of the vendored reverts (`vendor_bun_reinstall_required`, `vendor_vlt_reinstall_required`, `vendor_pypi_reinstall_required`; a revert's other warnings, such as `vendor_lock_entry_removed` or a drift keep's, are not repeated here). Human mode prints `GC: skipped (<code>): <message>.`, one `GC: <detail>.` line per warning, and `GC: failed to revert N vendored entries: …` (singular for one) for `failedVendoredEntries`. `keptVendoredEntries` lists drift-kept entries the revert deliberately preserved (`vendor_artifact_kept` — undo the drift and re-run `vendor --revert` to finish); the preview cannot see drift (backends return before the wiring replay on dry runs), so `revertableVendoredEntries` may over-promise what a wet run will actually reclaim.
+`scan --prune` opts into garbage collection. When set, `scan` removes manifest entries for packages no longer present in the crawl, then deletes orphan blob files, and every obsolete diff and package archive, from `.socket/`. A blob is an orphan when no patch left in the manifest references it: the afterHash and beforeHash blobs of every remaining patch are kept, the same retention policy `repair` uses (the beforeHash blobs are an offline rollback's only restore data, and `repair` downloads afterHash blobs only). Diff and legacy package archives are never kept, even for a remaining patch: nothing reads them any more. Off by default (v3.0) so a temporary uninstall doesn't silently destroy manifest state. Only entries whose ecosystem this run actually crawled are eligible: a `pkg:<type>/` with no crawler in this build (a newer CLI's ecosystem in the committed manifest) is exempt — the crawl never looked for them, so their absence is not evidence of removal (same fail-safe as the `--ecosystems` filter, which narrows the query but never the prune's installed set). A Cargo entry is also exempt while its agent-mode copy is still patched: the project crawl looks up only the crates `Cargo.lock` resolves, but a crate the lock bumped or dropped keeps its patched copy in the machine-wide `$CARGO_HOME/registry/src` cache (nothing deletes it), and the entry holds the only blobs that can restore that copy. The wet pass keeps it with a `cargo_cache_patch_kept` warning naming the `socket-patch rollback <purl>` that restores the copy and drops the entry; the `--dry-run` preview leaves it out of `prunedManifestEntries` (and, like every `warnings` entry, reports no warning for it). The pass also reconciles vendored state (runs FIRST, under ONE apply-lock acquisition shared with the manifest prune — lock contention skips the whole pass without failing the scan; `--lock-timeout` is honored and a lock I/O error is reported rather than swallowed; the existence gate — a manifest file OR a vendor ledger file, both cheap stats; an emptied ledger is deleted on save, so its presence is its content proxy — runs BEFORE the lock, so a bare project never gets a `.socket/`; in the vendored scan arms the pass runs AFTER the vendor step): (a) ledger entries still tracked by a manifest record (manifest-mode entries written by standalone `vendor`) whose patch is gone from the manifest are reverted — `detached` entries (every `scan`/`get --mode vendored` entry, v5.0) have no manifest record to lose and are exempt from this leg; (b) EVERY ledger entry whose dependency is no longer in the lockfile graph is reverted and any manifest entry it still had dropped (v5.0: the check is about the lockfile, not the manifest, so embedded-record entries are no longer exempt; a missing or undeterminable lockfile keeps the entry, fail-safe); and (c) orphan `.socket/vendor/<eco>/<uuid>` dirs with no ledger entry are swept. The prune never deletes a zero-patch `.socket/manifest.json` (its `{"patches": {}}` + `setup` block stay). The JSON `gc` sub-object gains `revertedVendoredEntries` + `removedVendorOrphanDirs` (on a `--dry-run` preview, what the pass would revert and sweep, under the same keys — see "One GC shape") + the wet-only `keptVendoredEntries` + `failedVendoredEntries`, plus two ADDITIVE wet-only keys: `skipped: {code, message}` — present exactly when the pass was skipped at the lock (`lock_held` | `lock_io`; every count is then zero) — and `warnings: [{code, detail}]` — `vendor_state_write_failed` / `manifest_write_failed` (entries were reverted but the ledger or manifest rewrite failed), `cleanup_failed` (an orphan sweep failed mid-way), `cargo_cache_patch_kept` (see above), and the reinstall advisories of the vendored reverts (`vendor_bun_reinstall_required`, `vendor_vlt_reinstall_required`, `vendor_pypi_reinstall_required`; a revert's other warnings, such as `vendor_lock_entry_removed` or a drift keep's, are not repeated here). Human mode prints `GC: skipped (<code>): <message>.`, one `GC: <detail>.` line per warning, and `GC: failed to revert N vendored entries: …` (singular for one) for `failedVendoredEntries`. `keptVendoredEntries` lists drift-kept entries the revert deliberately preserved (`vendor_artifact_kept` — undo the drift and re-run `vendor --revert` to finish); the preview cannot see drift (backends return before the wiring replay on dry runs), so the preview's `revertedVendoredEntries` may over-promise what a wet run will actually reclaim.
 
 `scan` queries the patch API in `--batch-size` chunks. Authenticated runs POST `/v0/orgs/{slug}/patches/batch`; token-less runs POST `{proxy}/patch/batch` on the public proxy and degrade to per-package `GET /patch/by-package/:purl` requests in two cases: the deployed proxy predates the batch endpoint (legacy proxies answer the POST with their `400 "Unsupported endpoint"` catch-all), or the all-or-nothing batch validation rejects the chunk (e.g. a crawled PURL type the server doesn't recognize, such as `pkg:jsr/…` — the per-package path tolerates those individually, preserving the pre-batch scan semantics). Rate limits and over-capacity 503s surface instead of silently degrading.
 
@@ -1056,8 +1056,10 @@ v5.0 replaces v4's per-purl reverts and whole-ledger reverse replay (`revert_rem
 | `vendoredFailed` | `[{purl, error}]` | Vendored reverts that errored — entry, artifact, and manifest record all survive for a retry; drives exit 1 |
 | `hosted` | `{reverted: [purl], failed: [{purl, error}], unsupported: [purl], editedFiles: N}` | The hosted leg (v5.0: the upstream restore). `reverted` lists the pins restored (would-be on dry-run); `failed` the refused pins with the version-control remedy in `error` (the pseudo-purl `files` for a write failure); `unsupported` is kept for shape and is always empty (every ecosystem has a restore); `editedFiles` counts distinct files rewritten |
 | `manifest` | `{removedEntries: [purl], preserved: bool}` | Entries removed from the manifest (would-be removals on dry-run); `preserved` mirrors `--preserve-state` |
-| `gc` | `{skipped: true}` \| `{removedBlobs, removedDiffArchives, removedPackageArchives, bytesFreed}` | Skipped under `--preserve-state`, after a blob-gate abort, and under a corrupt vendor ledger |
+| `gc` | `{skipped: true}` \| `{removedBlobs, removedDiffArchives, removedPackageArchives, bytesFreed}` | The shared GC shape (see "One GC shape"). Skipped under `--preserve-state`, after a blob-gate abort, and under a corrupt vendor ledger |
 | `paths` | `[string]` | The path-glob targets verbatim (empty when none) |
+
+**Counters (v5.0, #1066)**: `rolledBack` and `failed` span every leg. `rolledBack` counts agent results that restored files, plus `vendoredReverted`, `vendoredPreserved` and `hosted.reverted`; `failed` counts failed agent results, plus `vendoredKept`, `vendoredFailed`, `hosted.failed` and `hosted.unsupported`. A package wired through two legs counts once per leg. `alreadyOriginal` stays agent-only. When something failed and nothing was rolled back or already original, the run failed as a whole: `status: "error"` with `error: {code: "rollback_failed", message}` (exit 1) instead of `partial_failure`.
 
 **Exit rules**: not-installed entries never flip the exit (the documented apply/rollback asymmetry — even an all-not-installed run exits 0 `success`). Everything that leaves the system still patched DOES flip it to `partial_failure` exit 1: agent-leg failures, vendored drift-keeps and revert failures, hosted refusals, a corrupt vendor ledger, and a failed manifest write. GC failures never affect the exit.
 
@@ -1252,7 +1254,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 ```jsonc
 {
-  "command":  "scan" | "apply" | "vex" | "vendor" | "rollback" | "get" | "list" | "remove" | "repair",
+  "command":  "scan" | "apply" | "vex" | "vendor" | "rollback" | "get" | "list" | "remove" | "repair" | "update",
   "status":   "success" | "partialFailure" | "error" | "noManifest" | "notFound",
   "dryRun":   false,
   "events": [ <PatchEvent>, ... ],
@@ -1265,20 +1267,28 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
     "failed":          0,
     "removed":         0,
     "verified":        0,
-    "bytesDownloaded": 0,
-    "bytesFreed":      0
+    "rebuilt":         0,   // omitted while zero (repair / vendor only)
+    "bytesFreed":      0    // = gc.bytesFreed; 0 when no GC ran
+  },
+  "gc": {                   // only when the run swept .socket/ (repair, remove)
+    "removedBlobs":           0,
+    "removedDiffArchives":    0,
+    "removedPackageArchives": 0,
+    "bytesFreed":             0
   },
   "error":    { "code": "...", "message": "..." }   // only on status=error
 }
 ```
 
-`events` is the load-bearing payload. `summary` is pre-computed from `events` so consumers don't have to walk the array. `error` is set only on top-level failures (e.g. `manifest_not_found`); per-patch failures appear as `events[*]` with `action: "failed"`.
+`events` is the load-bearing payload. `summary` is pre-computed from `events` so consumers don't have to walk the array; its action counters count patch-level events, so a GC carrier event (the artifact-level `removed`, or `verified` on a dry run, that `repair` and `remove` emit for a sweep) bumps none of them. The sweep itself is reported once, in `gc`. `error` is set only on top-level failures (e.g. `manifest_not_found`); per-patch failures appear as `events[*]` with `action: "failed"`.
+
+**One GC shape (v5.0).** Every command that sweeps orphan artifacts from `.socket/blobs`, `.socket/diffs` and `.socket/packages` reports the pass as the same `gc` object, `{removedBlobs, removedDiffArchives, removedPackageArchives, bytesFreed}`: the envelope's `gc` (`repair`, `remove`), rollback's `gc` and the `gc` of `scan --prune` / `--sync` (which adds its manifest and vendored keys beside them). On a dry run the counts are what the pass would remove, under the same keys (v5.0, MAJOR: scan's `--dry-run` preview no longer prints `prunableManifestEntries` / `orphanBlobs` / `orphanDiffArchives` / `orphanPackageArchives` / `revertableVendoredEntries` / `vendorOrphanDirs` / `bytesReclaimable`; it prints `prunedManifestEntries`, `removedBlobs`, `removedDiffArchives`, `removedPackageArchives`, `revertedVendoredEntries`, `removedVendorOrphanDirs` and `bytesFreed`, and leaves out only the keys a real pass alone can fill: `keptVendoredEntries`, `failedVendoredEntries`, `skipped`, `warnings`). `summary.bytesFreed` mirrors `gc.bytesFreed` on the envelope commands (0 when no GC ran: `repair --download-only`, `remove --preserve-state`, and every command without a GC pass). `gc` is absent when no sweep ran. v5.0 removes `summary.bytesDownloaded`, which no command ever emitted.
 
 ### `PatchEvent` shape
 
 ```jsonc
 {
-  "action":    "discovered" | "downloaded" | "applied" | "updated" | "skipped" | "failed" | "removed" | "verified",
+  "action":    "discovered" | "downloaded" | "applied" | "updated" | "skipped" | "failed" | "removed" | "verified" | "rebuilt",
   "purl":      "pkg:npm/foo@1.2.3",        // omitted on artifact-level events
   "uuid":      "<patch uuid>",              // optional
   "oldUuid":   "<previous uuid>",           // only when action=updated
@@ -1289,7 +1299,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
       "appliedVia":  "blob"   // only on action=applied; v5.0 drops "package" and "diff"
     }
   ],
-  "bytes":      1234,                       // optional (downloaded/removed)
+  "bytes":      1234,                       // only on the GC carrier event and --update's downloaded
   "reason":     "Files match afterHash",    // human-readable explanation (skipped)
   "errorCode":  "already_patched",          // stable snake_case routing tag
   "error":      "<message>",                // only when action=failed
@@ -1305,15 +1315,17 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 | Action       | Emitted by                            | Meaning |
 |--------------|---------------------------------------|---------|
-| `discovered` | `scan`, `list`                        | Patch exists upstream / in the manifest — no work taken. |
-| `downloaded` | `get`, `repair`, `scan --mode agent`  | Patch bytes were fetched from the registry. `bytes` set. |
-| `applied`    | `apply`, `scan --sync`                | Patch was written to disk. `files` enumerates what changed. |
-| `updated`    | `apply`, `scan --sync`, `get`         | A different UUID replaced an older one for this PURL. `oldUuid` set. |
-| `skipped`    | every command                         | No-op — already patched, not in scope, filtered, etc. `errorCode` carries the reason. |
-| `failed`     | every command                         | A specific patch attempt failed. `errorCode` + `error` set. |
-| `removed`    | `repair`, `remove`, `rollback`        | Data was removed from `.socket/` (or files rolled back). `bytes` optional. |
-| `verified`   | `apply --dry-run`, `scan --dry-run`   | The patch *would* apply cleanly. `files` lists previewed changes. |
-| `rebuilt`    | `repair`                              | A missing/corrupt vendored artifact was restored from its exact server download (v5.0: never a lost ledger entry — see `vendor_ledger_missing`). `summary.rebuilt` counts these (the field is omitted while zero). |
+| `discovered` | `list`                                | Patch recorded in the manifest, the vendor ledger or a hosted lockfile pin — no work taken. |
+| `downloaded` | `repair`, `--update`                  | `repair`: artifacts were fetched (one aggregate event, `details.count`). `--update`: the release archive was fetched (`bytes` = archive size). |
+| `applied`    | `apply`, `vendor`                     | Patch was written to disk (`vendor`: vendored). `files` enumerates what changed. |
+| `updated`    | `--update`                            | The binary was replaced (`details.from` / `details.to`). |
+| `skipped`    | every envelope command                | No-op — already patched, not in scope, filtered, etc. `errorCode` carries the reason. |
+| `failed`     | `apply`, `repair`, `vendor`           | A specific attempt failed. `errorCode` + `error` set. |
+| `removed`    | `remove`, `repair`, `vendor`          | A manifest entry or vendored state was removed, or (artifact-level, no `purl`) `.socket/` artifacts were swept — that GC carrier sets `bytes` and is not counted in `summary.removed`; the sweep's totals are the envelope's `gc`. |
+| `verified`   | `apply`, `remove`, `repair`, `vendor` (dry run); `vex`; `--update --dry-run` | The action *would* succeed cleanly (`files` lists previewed changes); `vex`: the patch verified and was attested. |
+| `rebuilt`    | `repair`, `vendor`                    | A missing/corrupt vendored artifact was restored from its exact server download (v5.0: never a lost ledger entry — see `vendor_ledger_missing`). `summary.rebuilt` counts these (the field is omitted while zero). |
+
+`scan`, `get` and `rollback` print their legacy shapes, not events (see [Migration status](#migration-status-v30)).
 
 ### Stable `errorCode` tags
 
@@ -1536,11 +1548,12 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 | Subcommand   | Emits |
 |--------------|---|
-| `apply`      | `Applied` · `Updated` · `Skipped` (already_patched / package_not_installed / vendored) · `Failed` · `Verified` (dry-run) |
-| `vendor`     | `Applied` (= vendored; `command` routes) · `Skipped` (refusals, warnings, unsupported ecosystems) · `Failed` · `Removed` (reconcile + `--revert`) · `Verified` (dry-run) |
+| `apply`      | `Applied` · `Skipped` (already_patched / package_not_installed / vendored) · `Failed` · `Verified` (dry-run) |
+| `vendor`     | `Applied` (= vendored; `command` routes) · `Rebuilt` (a reused artifact restored) · `Skipped` (refusals, warnings, unsupported ecosystems) · `Failed` · `Removed` (reconcile + `--revert`) · `Verified` (dry-run) |
 | `list`       | `Discovered` (with `details.vulnerabilities`, `details.tier`, `details.license`, `details.description`, `details.exportedAt`; hosted pins (v5.0: one per `(purl, uuid)` the lockfiles wire) additionally carry `details.mode: "hosted"` and `details.lockfiles: [<root-relative files wiring it>]` (no `details.ledger` — hosted mode keeps no ledger; the human listing labels them `Mode: hosted (wired in <files>)`), both additive and absent on manifest entries; v5.0: vendor-ledger records carry `details.mode: "vendored"` + `details.ledger: ".socket/vendor/state.json"` the same way, and the human listing labels them `Mode: vendored (recorded in .socket/vendor/state.json)`; a `state.json` that cannot be read or parsed degrades to nothing-to-consult with the stderr line `Warning: unreadable vendor ledger (<error>); its vendored patches are not listed` — muted by `--silent`, exit unchanged) |
-| `repair`    | `Downloaded` (or `Verified` on dry-run; `details: {count, mode: "file"}` — `mode` is always `"file"` since v5.0 removed the diff download path) · `Rebuilt` (vendored artifacts; `Verified` previews on dry-run) · `Skipped` (vendor_uuid_mismatch) · `Removed` (or `Verified`) · `Failed` events |
-| `remove`     | `Removed` (per purl; `Verified` on dry-run) · artifact-level `Removed`/`Verified` event (with `details.blobsRemoved`, `details.rolledBack`) |
+| `repair`    | `Downloaded` (or `Verified` on dry-run; `details: {count, mode: "file"}` — `mode` is always `"file"` since v5.0 removed the diff download path) · `Rebuilt` (vendored artifacts; `Verified` previews on dry-run) · `Skipped` (vendor_uuid_mismatch, cleanup_failed) · artifact-level `Removed` (or `Verified`) GC carrier (`details.count`, `details.checked`, `bytes`) · `Failed` events · top-level `gc` (absent under `--download-only`) |
+| `vex`        | `Verified` (one per attested subcomponent) · `Skipped` (omissions) — only under `--json --output` |
+| `remove`     | `Removed` (per purl; `Verified` on dry-run) · artifact-level `Removed`/`Verified` event (with `details.blobsRemoved`, `details.archivesRemoved`, `details.rolledBack`; `bytes` when the sweep removed something) · top-level `gc` (absent under `--preserve-state`) |
 | `--update`   | `Downloaded` → `Updated` (success) · `Skipped` (already_latest) · `Verified` (dry-run check, reason update_check) — see the Self-update contract section for details fields and top-level error codes |
 
 ### Migration status (v3.0)
@@ -1797,13 +1810,14 @@ socket-patch apply --json | jq '
 '
 ```
 
-GC summary (after `repair --json`):
+GC summary (after `repair --json`; `remove --json` prints the same `gc`):
 
 ```bash
 socket-patch repair --json | jq '{
-  removed:     .summary.removed,
-  bytesFreed:  .summary.bytesFreed,
-  failed:      .summary.failed
+  removedBlobs:    .gc.removedBlobs,
+  removedArchives: (.gc.removedDiffArchives + .gc.removedPackageArchives),
+  bytesFreed:      .summary.bytesFreed,
+  failed:          .summary.failed
 }'
 ```
 

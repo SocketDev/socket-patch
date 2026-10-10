@@ -931,7 +931,11 @@ fn vendored_unknown_ecosystem_fails_leg_in_both_modes() {
         "an unknown-backend entry must fail the run; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    // The vendored failure is the run's only outcome: a total failure
+    // (#1066), counted in the top-level `failed`.
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
+    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
     let failed = v["vendoredFailed"]
         .as_array()
         .expect("vendoredFailed array");
@@ -1301,7 +1305,11 @@ fn vendored_ledger_save_failure_fails_closed() {
         "a ledger save failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    // The vendored failure is the run's only outcome: a total failure
+    // (#1066), counted in the top-level `failed`.
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
+    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
     let failed = v["vendoredFailed"]
         .as_array()
         .expect("vendoredFailed array");
@@ -1797,7 +1805,11 @@ fn legacy_ledger_beside_a_live_pin_is_never_the_revert_source() {
     );
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    // Nothing was rolled back: a total failure (#1066), and the refused
+    // hosted pin counts in the top-level `failed`.
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
+    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
     assert_eq!(
         v["hosted"]["failed"][0]["purl"], LP_PURL,
         "stdout=\n{stdout}"
@@ -3185,7 +3197,9 @@ fn pypi_variant_group_with_no_installed_match_attempts_every_variant() {
         "a drifted install cannot roll back; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], json!("partial_failure"), "stdout=\n{stdout}");
+    // Both variants failed and nothing was rolled back: a total failure.
+    assert_eq!(v["status"], json!("error"), "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
     assert_eq!(v["failed"], json!(2), "stdout=\n{stdout}");
     let results = v["results"].as_array().expect("results array");
     let mut result_purls: Vec<&str> = results

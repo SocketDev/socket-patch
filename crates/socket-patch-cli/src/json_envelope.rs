@@ -27,6 +27,7 @@
 //! `jq` recipes.
 
 use serde::Serialize;
+use socket_patch_core::manifest::cleanup_blobs::CleanupResult;
 
 pub use socket_patch_core::patch::sidecars::{SidecarFile, SidecarFileAction, SidecarRecord};
 
@@ -90,6 +91,61 @@ pub struct Envelope {
     /// (and flips the exit code), not here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vex: Option<VexSummary>,
+    /// The artifact GC pass's outcome — the same `gc` object (same keys)
+    /// `rollback` and `scan --prune` print. Set by [`Envelope::set_gc`],
+    /// which also mirrors `bytesFreed` into `summary.bytesFreed`. Omitted
+    /// for runs that swept nothing (`repair --download-only`, `remove
+    /// --preserve-state`, every command without a GC pass).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gc: Option<GcReport>,
+}
+
+/// One artifact GC pass — the orphan sweeps of `.socket/blobs`,
+/// `.socket/diffs` and `.socket/packages` — serialized identically by
+/// every command that runs one: the envelope's `gc` (`repair`, `remove`),
+/// rollback's legacy `gc` and the `gc` of `scan --prune` / `--sync`. On a
+/// dry run the counts are what the pass would remove.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcReport {
+    pub removed_blobs: usize,
+    pub removed_diff_archives: usize,
+    pub removed_package_archives: usize,
+    pub bytes_freed: u64,
+}
+
+impl GcReport {
+    /// Fold the three passes' results; a pass that failed outright
+    /// (`None`) counts as empty — its `cleanup_failed` warning is the
+    /// caller's to report.
+    pub fn from_passes(
+        blobs: Option<&CleanupResult>,
+        diffs: Option<&CleanupResult>,
+        packages: Option<&CleanupResult>,
+    ) -> Self {
+        let count = |r: Option<&CleanupResult>| r.map_or(0, |r| r.blobs_removed);
+        Self {
+            removed_blobs: count(blobs),
+            removed_diff_archives: count(diffs),
+            removed_package_archives: count(packages),
+            bytes_freed: [blobs, diffs, packages]
+                .into_iter()
+                .flatten()
+                .map(|r| r.bytes_freed)
+                .sum(),
+        }
+    }
+
+    /// Blobs plus diff and package archives removed.
+    pub fn total_removed(&self) -> usize {
+        self.removed_blobs + self.removed_diff_archives + self.removed_package_archives
+    }
+
+    /// The `gc` object as a JSON value, for the legacy shapes that extend
+    /// it with command-specific keys (`scan --prune`).
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("GcReport serializes")
+    }
 }
 
 /// Summary of an OpenVEX document emitted as a side-effect of an
@@ -131,7 +187,15 @@ impl Envelope {
             sidecars: Vec::new(),
             warnings: Vec::new(),
             vex: None,
+            gc: None,
         }
+    }
+
+    /// Attach the run's artifact GC outcome (`gc`) and mirror its byte
+    /// count into `summary.bytesFreed`.
+    pub fn set_gc(&mut self, gc: GcReport) {
+        self.summary.bytes_freed = gc.bytes_freed;
+        self.gc = Some(gc);
     }
 
     /// Append an event and bump the matching summary counter. Centralizes
@@ -255,6 +319,11 @@ pub struct PatchEvent {
     /// Empty for actions that don't operate on files (e.g. `Downloaded`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<PatchEventFile>,
+    /// Byte count of the artifact-level GC event (`removed`, or `verified`
+    /// on a dry run: bytes freed) and of `--update`'s `downloaded` event
+    /// (archive size). Omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
     /// Human-readable explanation for `Skipped` or `Failed` events.
     /// Machine consumers should prefer `error_code` for routing decisions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,6 +371,7 @@ impl PatchEvent {
             uuid: None,
             old_uuid: None,
             files: Vec::new(),
+            bytes: None,
             reason: None,
             error_code: None,
             error: None,
@@ -324,6 +394,11 @@ impl PatchEvent {
 
     pub fn with_files(mut self, files: Vec<PatchEventFile>) -> Self {
         self.files = files;
+        self
+    }
+
+    pub fn with_bytes(mut self, bytes: u64) -> Self {
+        self.bytes = Some(bytes);
         self
     }
 
@@ -472,6 +547,10 @@ pub struct Summary {
     /// every other command's summary shape is unchanged.
     #[serde(skip_serializing_if = "u32_is_zero")]
     pub rebuilt: u32,
+    /// Bytes the run's artifact GC freed (would free, on a dry run) — the
+    /// envelope's `gc.bytesFreed`, 0 when no GC ran. Not derived from
+    /// `events`: GC is reported once, in `gc`.
+    pub bytes_freed: u64,
 }
 
 fn u32_is_zero(n: &u32) -> bool {
@@ -806,6 +885,7 @@ mod tests {
             (PatchAction::Failed, "failed"),
             (PatchAction::Removed, "removed"),
             (PatchAction::Verified, "verified"),
+            (PatchAction::Rebuilt, "rebuilt"),
         ] {
             let serialized = serde_json::to_string(&action).unwrap();
             assert_eq!(serialized, format!("\"{tag}\""));
@@ -1296,5 +1376,147 @@ mod tests {
                 "{start:?} + failed event must escalate to partialFailure"
             );
         }
+    }
+
+    /// The ```jsonc block under `heading` in CLI_CONTRACT.md.
+    /// CLI_CONTRACT.md with LF line endings: a Windows checkout may carry
+    /// CRLF, which the `"```jsonc\n"` fence match below would miss.
+    fn contract_doc() -> &'static str {
+        static DOC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        DOC.get_or_init(|| include_str!("../CLI_CONTRACT.md").replace("\r\n", "\n"))
+    }
+
+    fn contract_block(heading: &str) -> &'static str {
+        let doc = contract_doc();
+        let at = doc
+            .find(heading)
+            .unwrap_or_else(|| panic!("{heading} missing"));
+        let body = &doc[at..];
+        let start = body.find("```jsonc\n").expect("jsonc block") + "```jsonc\n".len();
+        let end = start + body[start..].find("```").expect("block end");
+        &body[start..end]
+    }
+
+    /// The `"key":` names at exactly `indent` spaces in `block`.
+    fn keys_at(block: &str, indent: usize) -> std::collections::BTreeSet<String> {
+        block
+            .lines()
+            .filter(|l| l.len() > indent && l[..indent].trim().is_empty())
+            .filter_map(|l| l[indent..].strip_prefix('"'))
+            .filter_map(|l| l.split_once('"').map(|(k, _)| k.to_string()))
+            .collect()
+    }
+
+    fn object_keys(value: serde_json::Value) -> std::collections::BTreeSet<String> {
+        value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// The contract's envelope schema names exactly the `summary`, `gc` and
+    /// top-level keys the envelope serializes — a documented counter no
+    /// command emits (as `bytesDownloaded` was) fails here (#1257).
+    #[test]
+    fn contract_envelope_block_matches_serialized_keys() {
+        let block = contract_block("### Envelope shape");
+        let section = |name: &str| {
+            let from = block.find(&format!("\"{name}\":")).expect(name);
+            let rest = &block[from..];
+            &rest[..rest.find("\n  }").expect("section end")]
+        };
+        let mut env = Envelope::new(Command::Repair);
+        env.summary.rebuilt = 1;
+        env.set_gc(GcReport::default());
+        env.mark_error(EnvelopeError::new("x", "y"));
+        let value = serde_json::to_value(&env).unwrap();
+        assert_eq!(
+            keys_at(section("summary"), 4),
+            object_keys(value["summary"].clone())
+        );
+        assert_eq!(keys_at(section("gc"), 4), object_keys(value["gc"].clone()));
+        let top: std::collections::BTreeSet<String> = object_keys(value)
+            .into_iter()
+            // Additive keys documented in their own sections.
+            .filter(|k| !matches!(k.as_str(), "sidecars" | "warnings" | "vex"))
+            .collect();
+        assert_eq!(keys_at(block, 2), top);
+    }
+
+    /// Every `PatchEvent` key the contract documents is serialized, and
+    /// every serialized key is documented; every action has a row.
+    #[test]
+    fn contract_patch_event_block_matches_serialized_keys() {
+        let block = contract_block("### `PatchEvent` shape");
+        let event = PatchEvent::new(PatchAction::Updated, "pkg:npm/a@1.0.0")
+            .with_uuid("u")
+            .with_old_uuid("o")
+            .with_files(vec![PatchEventFile {
+                path: "package/index.js".into(),
+                verified: true,
+                applied_via: Some(AppliedVia::Blob),
+            }])
+            .with_bytes(1)
+            .with_reason("c", "r")
+            .with_error("c", "e")
+            .with_details(serde_json::json!({}));
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(keys_at(block, 2), object_keys(value.clone()));
+        assert_eq!(
+            keys_at(block, 6),
+            object_keys(value["files"][0].clone()),
+            "files[] keys"
+        );
+        let doc = contract_doc();
+        for action in [
+            PatchAction::Discovered,
+            PatchAction::Downloaded,
+            PatchAction::Applied,
+            PatchAction::Updated,
+            PatchAction::Skipped,
+            PatchAction::Failed,
+            PatchAction::Removed,
+            PatchAction::Verified,
+            PatchAction::Rebuilt,
+        ] {
+            let tag = serde_json::to_value(action).unwrap();
+            let tag = tag.as_str().unwrap();
+            assert!(
+                block.contains(&format!("\"{tag}\"")),
+                "{tag} in the action enum"
+            );
+            assert!(
+                doc.contains(&format!("| `{tag}`")),
+                "{tag} has a vocabulary row"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_report_folds_passes_and_serializes_shared_keys() {
+        let pass = |removed, bytes| CleanupResult {
+            blobs_removed: removed,
+            bytes_freed: bytes,
+            ..CleanupResult::default()
+        };
+        let (blobs, packages) = (pass(3, 30), pass(1, 4));
+        let report = GcReport::from_passes(Some(&blobs), None, Some(&packages));
+        assert_eq!(report.total_removed(), 4);
+        assert_eq!(
+            report.to_value(),
+            serde_json::json!({
+                "removedBlobs": 3,
+                "removedDiffArchives": 0,
+                "removedPackageArchives": 1,
+                "bytesFreed": 34,
+            })
+        );
+        let mut env = Envelope::new(Command::Remove);
+        assert!(serde_json::to_value(&env).unwrap().get("gc").is_none());
+        assert_eq!(
+            serde_json::to_value(&env).unwrap()["summary"]["bytesFreed"],
+            0
+        );
+        env.set_gc(report);
+        let value = serde_json::to_value(&env).unwrap();
+        assert_eq!(value["gc"], report.to_value());
+        assert_eq!(value["summary"]["bytesFreed"], 34);
     }
 }

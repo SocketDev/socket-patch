@@ -162,7 +162,9 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
         "offline + missing blob must exit 1; stdout=\n{stdout}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert_eq!(v["status"], "partial_failure");
+    // Nothing could be rolled back: a total failure (#1066).
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["error"]["code"], "rollback_failed");
     assert_eq!(v["rolledBack"], 0);
     assert_eq!(v["alreadyOriginal"], 0);
     assert_eq!(v["dryRun"], false, "not a dry-run");
@@ -293,7 +295,9 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
         "undownloadable blob must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert_eq!(v["status"], "partial_failure");
+    // The only patch failed: a total failure (#1066).
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
     assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
     let results = v["results"].as_array().expect("results array");
     assert_eq!(results.len(), 1, "stdout=\n{stdout}");

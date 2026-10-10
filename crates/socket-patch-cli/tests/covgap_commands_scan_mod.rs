@@ -2883,7 +2883,7 @@ async fn scan_dry_run_prune_previews_gc_in_human_and_json() {
             if json {
                 let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
                 assert!(
-                    v["gc"]["prunableManifestEntries"]
+                    v["gc"]["prunedManifestEntries"]
                         .as_array()
                         .is_some_and(|a| a.iter().any(|p| p == stale)),
                     "{extra:?}: {v}"

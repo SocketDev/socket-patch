@@ -1578,26 +1578,22 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         .map(String::as_str),
                 );
                 let sweep = references.sweep(&socket_dir, args.common.dry_run).await;
-                let mut removed_counts = [0usize; 3];
-                for (slot, (label, result)) in removed_counts.iter_mut().zip([
-                    ("blob", sweep.blobs),
-                    ("diffs", sweep.diffs),
-                    ("packages", sweep.packages),
-                ]) {
-                    if let Some(detail) = crate::ui::sweep_failure(label, &result) {
+                for (label, result) in [
+                    ("blob", &sweep.blobs),
+                    ("diffs", &sweep.diffs),
+                    ("packages", &sweep.packages),
+                ] {
+                    if let Some(detail) = crate::ui::sweep_failure(label, result) {
                         run_warnings.push(("cleanup_failed".into(), detail));
                     }
-                    if let Ok(r) = result {
-                        *slot = r.blobs_removed;
-                        gc_bytes_freed += r.bytes_freed;
-                    }
                 }
-                gc_json = serde_json::json!({
-                    "removedBlobs": removed_counts[0],
-                    "removedDiffArchives": removed_counts[1],
-                    "removedPackageArchives": removed_counts[2],
-                    "bytesFreed": gc_bytes_freed,
-                });
+                let report = crate::json_envelope::GcReport::from_passes(
+                    sweep.blobs.as_ref().ok(),
+                    sweep.diffs.as_ref().ok(),
+                    sweep.packages.as_ref().ok(),
+                );
+                gc_bytes_freed = report.bytes_freed;
+                gc_json = report.to_value();
             }
 
             // ── run-level warnings ───────────────────────────────────────
@@ -1715,6 +1711,29 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .filter(|r| r.success && all_files_already_original(r))
                 .count();
             let failed_count = results.iter().filter(|r| !r.success).count();
+            // The top-level counters span every leg (#1066): a vendored or
+            // hosted unwind is a rollback, and a drift-keep, failure or
+            // unsupported hosted target is a failure, exactly as each one
+            // drives the status. A package wired through two legs counts
+            // once per leg; the per-leg arrays below say which.
+            let rolled_back_total = rolled_back_count
+                + vendored_leg.reverted.len()
+                + vendored_leg.preserved.len()
+                + hosted_leg.reverted.len();
+            let failed_total = failed_count
+                + vendored_leg.kept.len()
+                + vendored_leg.failed.len()
+                + hosted_leg.failed.len()
+                + hosted_leg.unsupported.len();
+            // Something failed and nothing reached the unpatched end state
+            // (rolled back, already original, or not installed): the run
+            // failed as a whole, so the status is an error (with `error`),
+            // not a partial failure.
+            let total_failure = !success
+                && failed_total > 0
+                && rolled_back_total == 0
+                && already_original_count == 0
+                && not_installed.is_empty();
 
             if let Some(e) = &manifest_write_failed {
                 if !args.common.json {
@@ -1731,11 +1750,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 // always present so consumers never null-check.
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    serde_json::to_string_pretty(&{
+                        let mut out = serde_json::json!({
                         "status": if success { "success" } else { "partial_failure" },
-                        "rolledBack": rolled_back_count,
+                        "rolledBack": rolled_back_total,
                         "alreadyOriginal": already_original_count,
-                        "failed": failed_count,
+                        "failed": failed_total,
                         "dryRun": args.common.dry_run,
                         "warnings": run_warnings
                             .iter()
@@ -1791,7 +1811,21 @@ pub async fn run(args: RollbackArgs) -> i32 {
                             .map(result_to_json)
                             .chain(not_installed.iter().map(|p| skipped_not_installed_json(p)))
                             .collect::<Vec<_>>(),
-                    }))
+                        });
+                        if total_failure {
+                            crate::json_envelope::set_error(
+                                &mut out,
+                                crate::json_envelope::EnvelopeError::new(
+                                    "rollback_failed",
+                                    format!(
+                                        "nothing was rolled back: {}",
+                                        plural(failed_total, "patch failed", "patches failed")
+                                    ),
+                                ),
+                            );
+                        }
+                        out
+                    })
                     .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else if !args.common.silent && !results.is_empty() {
@@ -1945,7 +1979,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             if success {
-                track_patch_rolled_back(rolled_back_count, &telemetry).await;
+                track_patch_rolled_back(rolled_back_total, &telemetry).await;
             } else {
                 track_patch_rollback_failed("One or more rollbacks failed", &telemetry).await;
             }

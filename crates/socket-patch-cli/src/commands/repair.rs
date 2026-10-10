@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
-use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, Status};
+use crate::json_envelope::{Command, Envelope, GcReport, PatchAction, PatchEvent, Status};
 use crate::ui::sweep_failure;
 
 #[derive(Args)]
@@ -477,9 +477,8 @@ async fn repair_inner(
 
     let mut downloaded_count = 0usize;
     let mut download_failed_count = 0usize;
-    let mut blobs_cleaned = 0usize;
     let mut blobs_checked = 0usize;
-    let mut bytes_freed = 0u64;
+    let mut gc: Option<GcReport> = None;
 
     // The envelope is built up-front: the vendored-artifact phase records
     // its events inline; the download/cleanup aggregates are appended at
@@ -597,7 +596,8 @@ async fn repair_inner(
             ("package", PACKAGE_ARCHIVE, sweep.packages),
         ];
         let mut results: Vec<(ArtifactNoun, CleanupResult)> = Vec::new();
-        for (label, noun, result) in passes {
+        let mut ok: [Option<usize>; 3] = [None, None, None];
+        for (slot, (label, noun, result)) in ok.iter_mut().zip(passes) {
             // A failed cleanup — the pass aborted, or it could not unlink
             // every orphan — is error output: `--silent` (suppress
             // NON-error output) must not mute it, and the JSON envelope
@@ -618,15 +618,13 @@ async fn repair_inner(
                 );
             }
             if let Ok(cleanup_result) = result {
+                blobs_checked += cleanup_result.blobs_checked;
+                *slot = Some(results.len());
                 results.push((noun, cleanup_result));
             }
         }
-
-        for (_, r) in &results {
-            blobs_checked += r.blobs_checked;
-            blobs_cleaned += r.blobs_removed;
-            bytes_freed += r.bytes_freed;
-        }
+        let pass = |i: usize| ok[i].map(|at| &results[at].1);
+        gc = Some(GcReport::from_passes(pass(0), pass(1), pass(2)));
         if !quiet {
             if stdout_started {
                 println!();
@@ -690,25 +688,37 @@ async fn repair_inner(
         ));
         env.mark_partial_failure();
     }
-    if blobs_cleaned > 0 {
+    // `None` when no sweep ran (`--download-only`, no manifest): no `gc`.
+    let swept = gc.is_some();
+    let gc = gc.unwrap_or_default();
+    if gc.total_removed() > 0 {
         let cleanup_action = if args.common.dry_run {
             PatchAction::Verified
         } else {
             PatchAction::Removed
         };
-        env.record(
-            PatchEvent::artifact(cleanup_action).with_details(serde_json::json!({
-                "count": blobs_cleaned,
-                "checked": blobs_checked,
-            })),
+        // Pushed directly rather than via `env.record`, as remove's GC
+        // carrier is: `summary.removed` / `summary.verified` count patch
+        // entries, and the sweep's totals live in `gc` (with the byte
+        // count mirrored into `summary.bytesFreed`).
+        env.events.push(
+            PatchEvent::artifact(cleanup_action)
+                .with_bytes(gc.bytes_freed)
+                .with_details(serde_json::json!({
+                    "count": gc.total_removed(),
+                    "checked": blobs_checked,
+                })),
         );
+    }
+    if swept {
+        env.set_gc(gc);
     }
     Ok((
         env,
         RepairCounts {
             downloaded: downloaded_count,
-            cleaned: blobs_cleaned,
-            bytes_freed,
+            cleaned: gc.total_removed(),
+            bytes_freed: gc.bytes_freed,
         },
     ))
 }
@@ -893,8 +903,26 @@ mod tests {
         // The referenced blob survives; the orphan is gone.
         assert!(socket.join("blobs").join(REFERENCED_HASH).exists());
         assert!(!socket.join("blobs").join(&orphan_hash).exists());
-        // A Removed event is recorded for the swept orphan.
-        assert_eq!(env.summary.removed, 1);
+        // The sweep is the envelope's `gc` (bytes mirrored into the
+        // summary) plus one carrier event; `summary.removed` counts patch
+        // entries, so the carrier does not bump it.
+        assert_eq!(
+            env.gc,
+            Some(GcReport {
+                removed_blobs: 1,
+                removed_diff_archives: 0,
+                removed_package_archives: 0,
+                bytes_freed: orphan_bytes.len() as u64,
+            })
+        );
+        assert_eq!(env.summary.bytes_freed, orphan_bytes.len() as u64);
+        assert_eq!(env.summary.removed, 0);
+        let carrier = env
+            .events
+            .iter()
+            .find(|e| e.action == PatchAction::Removed)
+            .expect("a Removed carrier event");
+        assert_eq!(carrier.bytes, Some(orphan_bytes.len() as u64));
     }
 
     /// `--download-only` skips the cleanup pass, so an orphan blob survives
@@ -913,12 +941,13 @@ mod tests {
         args.common.offline = false;
         args.download_only = true;
 
-        let (_env, counts) =
+        let (env, counts) =
             repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
                 .await
                 .expect("repair_inner");
 
         assert_eq!(counts.cleaned, 0, "download-only must skip cleanup");
+        assert_eq!(env.gc, None, "no sweep ran, so no `gc`");
         assert_eq!(counts.bytes_freed, 0);
         assert!(
             socket.join("blobs").join(&orphan_hash).exists(),
@@ -974,11 +1003,20 @@ mod tests {
             (orphan_diff.len() + orphan_pkg.len() + legacy_pkg.len() + stale_diff.len()) as u64,
             "bytes_freed must aggregate diff + package reclaim"
         );
-        // Cleanup is reported as a SINGLE batched `removed` artifact event whose
-        // `details.count` carries the tally — so the event-count summary is 1
-        // (`Summary::bump` increments once per event), and the 4-artifact count
-        // is asserted via `counts.cleaned` above and the event details here.
-        assert_eq!(env.summary.removed, 1, "one batched removal event");
+        // Cleanup is reported once, per kind, in `gc`, plus a SINGLE batched
+        // `removed` carrier event whose `details.count` carries the tally.
+        // The carrier is not a removed patch entry, so `summary.removed`
+        // stays 0.
+        assert_eq!(
+            env.gc,
+            Some(GcReport {
+                removed_blobs: 0,
+                removed_diff_archives: 2,
+                removed_package_archives: 2,
+                bytes_freed: counts.bytes_freed,
+            })
+        );
+        assert_eq!(env.summary.removed, 0, "the carrier bumps no counter");
         let removed = env
             .events
             .iter()
