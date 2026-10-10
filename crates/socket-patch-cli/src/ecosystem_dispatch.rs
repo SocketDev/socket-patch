@@ -799,6 +799,26 @@ pub async fn find_manifest_package_copies_reusing(
             .map(|(_, paths)| paths),
     )
     .await;
+    // A `gem env` home Bundler never loads this project's gems from (an
+    // explicit or deployment `path`) holds no copy the project runs, so an
+    // unpatched one there must not block the attestation (#1098). Default
+    // gems stay: Bundler loads those from the system home under any path.
+    if partitioned.contains_key(&Ecosystem::Gem) {
+        let unused = RubyCrawler
+            .bundler_unused_system_gem_homes(&crawler_options)
+            .await;
+        if !unused.is_empty() {
+            for (_, paths) in copies
+                .iter_mut()
+                .filter(|(purl, _)| purl.starts_with("pkg:gem/"))
+            {
+                paths.retain(|path| {
+                    !unused.iter().any(|home| path.starts_with(home))
+                        || socket_patch_core::crawlers::ruby_crawler::is_default_gem_copy(path)
+                });
+            }
+        }
+    }
     copies.retain(|_, paths| !paths.is_empty());
     // Verification also READS a `.bundle/config` bundle path the crawler
     // refused as a write root (it resolves outside the project): bundler

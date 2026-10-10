@@ -16,6 +16,7 @@ mod check_verifies_installed_tree;
 mod cli_gem_variant_mismatch_policy;
 mod covgap_commands_apply;
 mod e2e_safety_advisories;
+mod gem_stale_bundler_plugin;
 mod in_process_gem_config_warning;
 mod in_process_gem_fallback_home;
 mod in_process_gem_multicopy;
