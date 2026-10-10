@@ -2247,14 +2247,18 @@ fn cargo_manifest_package_id(
 }
 
 /// Whether a Cargo.lock `source` (or a `[patch.<url>]` key) names crates.io,
-/// in either the git-index or the sparse spelling.
+/// in either the git-index or the sparse spelling. Compared the way cargo's
+/// `CanonicalUrl` does: host casing, a trailing `/` and a `.git` suffix do
+/// not make a different source (and github paths are case-insensitive).
 fn is_crates_io_source(source: &str) -> bool {
     let url = source.trim();
     let url = url
         .strip_prefix("registry+")
         .or_else(|| url.strip_prefix("sparse+"))
         .unwrap_or(url)
-        .trim_end_matches('/');
+        .to_ascii_lowercase();
+    let url = url.trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
     url == "https://github.com/rust-lang/crates.io-index" || url == "https://index.crates.io"
 }
 
@@ -13691,6 +13695,10 @@ mod tests {
         for table in [
             "[patch.crates-io]",
             "[patch.\"https://github.com/rust-lang/crates.io-index\"]",
+            // Spellings cargo canonicalizes to the same crates.io source.
+            "[patch.\"https://github.com/rust-lang/crates.io-index.git\"]",
+            "[patch.\"https://GitHub.com/Rust-Lang/crates.io-index/\"]",
+            "[patch.\"sparse+https://Index.Crates.io/\"]",
         ] {
             let mut files = cargo_files(&format!(
                 "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
