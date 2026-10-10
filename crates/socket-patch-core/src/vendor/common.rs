@@ -609,6 +609,27 @@ pub(crate) fn pep508_name(spec: &str) -> &str {
     &s[..end]
 }
 
+/// Whether a dependency spec is a PEP 508 direct reference
+/// (`name[extras] @ <url>`: an `https://` / `file://` archive, a
+/// `git+…` checkout, …) rather than a registry requirement. Such a
+/// declaration is the user's own source choice, which neither writer may
+/// overwrite (#767).
+pub(crate) fn is_pep508_direct_reference(spec: &str) -> bool {
+    let spec = spec.trim_start();
+    let name = pep508_name(spec);
+    if name.is_empty() {
+        return false;
+    }
+    let mut rest = spec[name.len()..].trim_start();
+    if rest.starts_with('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        rest = rest[end + 1..].trim_start();
+    }
+    rest.starts_with('@')
+}
+
 /// The lock's `[[package]]` tables whose `name` canonicalizes (PEP 503) to
 /// `canon_name` — the poetry/pdm target-guard probe (uv records names
 /// pre-canonicalized and counts them directly instead).

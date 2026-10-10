@@ -385,6 +385,39 @@ pub(super) fn check_target_guards(
         }
     }
 
+    // A PEP 508 direct reference (`six @ https://…`, `six @ git+…`) in
+    // `[project]` / `[dependency-groups]` / the legacy `dev-dependencies` is
+    // the same user-authored source spelled in the requirement itself: a
+    // `[tool.uv.sources]` path beside it leaves the lock's root requirement
+    // carrying both `url` and `path`, which `uv sync --locked` rejects
+    // (#767).
+    let legacy_dev = p
+        .pyproject
+        .get("tool")
+        .and_then(|t| item_get(t, "uv"))
+        .and_then(|u| item_get(u, "dev-dependencies"))
+        .and_then(Item::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    if let Some(spec) = pyproject_dependency_specs(&p.pyproject)
+        .into_iter()
+        .map(|(_, spec)| spec)
+        .chain(legacy_dev)
+        .find(|spec| {
+            canonicalize_pypi_name(pep508_name(spec)) == canon_name
+                && super::common::is_pep508_direct_reference(spec)
+        })
+    {
+        return Err((
+            "pypi_uv_source_already_exists",
+            format!(
+                "pyproject.toml declares {canon_name} as the PEP 508 direct reference {spec:?}; \
+                 refusing to overwrite a user-authored source"
+            ),
+        ));
+    }
+
     // A user override pins this package already; layering ours on top would
     // change resolution behind the user's back.
     if let Some(overrides) = p
@@ -2811,6 +2844,34 @@ wheels = [
         .await
         .unwrap_err();
         assert_eq!(err.0, "pypi_uv_source_already_exists");
+    }
+
+    /// #767: a PEP 508 direct reference to the target in any declaration
+    /// table refuses before the wheel is built or anything is written.
+    #[tokio::test]
+    async fn guards_refuse_a_direct_reference_declaration() {
+        const WHEEL: &str = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl";
+        for pyproject in [
+            DIRECT_REGISTRY_PYPROJECT.replace("\"six==1.16.0\"", &format!("\"six @ {WHEEL}\"")),
+            DIRECT_REGISTRY_PYPROJECT.replace(
+                "\"six==1.16.0\"",
+                "\"six @ git+https://github.com/benjaminp/six@1.16.0\"",
+            ),
+            format!(
+                "{}\n[dependency-groups]\ndev = [\"six @ {WHEEL}\"]\n",
+                DIRECT_REGISTRY_PYPROJECT.replace("[\"six==1.16.0\"]", "[]")
+            ),
+            format!(
+                "{}\n[project.optional-dependencies]\nx = [\"six @ {WHEEL}\"]\n",
+                DIRECT_REGISTRY_PYPROJECT.replace("[\"six==1.16.0\"]", "[]")
+            ),
+        ] {
+            let tmp = write_pair(&pyproject, DIRECT_REGISTRY_LOCK).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let err = check_target_guards(&p, "six", UUID).unwrap_err();
+            assert_eq!(err.0, "pypi_uv_source_already_exists", "{pyproject}");
+            assert!(err.1.contains("PEP 508 direct reference"), "{}", err.1);
+        }
     }
 
     #[tokio::test]
