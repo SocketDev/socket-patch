@@ -634,6 +634,36 @@ pub async fn read_candidate_files(
         }
     }
 
+    // NuGet: the root config routes every project under the root, so each
+    // project's lock is pinned with it (#353, #514). The walk's answer rides
+    // a synthetic key (the lock paths, an unevaluable NuGetLockFilePath, or
+    // why the tree could not be listed) and every lock is read. The project
+    // files themselves stay out of the candidate texts. NuGet is disk-only
+    // (the in-memory engine refuses it).
+    if candidates.iter().any(|c| c.dep.ecosystem == "nuget")
+        && !matches!(view, ProjectView::Memory(_))
+    {
+        let mut lines: Vec<String> = Vec::new();
+        match crate::vendor::nuget_config::governed_locks_in(view).await {
+            Ok(governed) => {
+                for (project, detail) in &governed.unresolved {
+                    lines.push(format!("unresolved\t{project}\t{detail}"));
+                }
+                for rel in governed.locks {
+                    if !out.files.contains_key(&rel) {
+                        out.read(view, unreadable, &rel).await;
+                    }
+                    lines.push(format!("lock\t{rel}"));
+                }
+            }
+            Err(why) => lines.push(format!("error\t{why}")),
+        }
+        out.files.insert(
+            crate::patch::redirect::NUGET_LOCKS_KEY.to_string(),
+            lines.join("\n"),
+        );
+    }
+
     for path in view.python_lock_paths() {
         if let Some(script) = crate::utils::python_lock::script_of_lock(&path) {
             out.read(view, unreadable, script).await;

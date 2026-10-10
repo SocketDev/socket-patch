@@ -625,14 +625,32 @@ impl<'a> DiskSnapshot<'a> {
 }
 
 /// The UTF-8-named entries of directory `dir` on disk, sorted by name.
-async fn list_disk_dir(dir: &Path) -> io::Result<Vec<DirEntryInfo>> {
+/// `strict` fails the listing instead of skipping what it cannot see: a
+/// non-UTF-8 name, a `file_type()` error, or a read error mid-listing.
+async fn list_disk_dir(dir: &Path, strict: bool) -> io::Result<Vec<DirEntryInfo>> {
     let mut read = tokio::fs::read_dir(dir).await?;
     let mut out = Vec::new();
-    while let Ok(Some(entry)) = read.next_entry().await {
+    loop {
+        let entry = match read.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) if strict => return Err(e),
+            Err(_) => break,
+        };
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            if strict {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("non-UTF-8 name {:?}", entry.file_name()),
+                ));
+            }
             continue;
         };
-        let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
+        let is_dir = match entry.file_type().await {
+            Ok(t) => t.is_dir(),
+            Err(e) if strict => return Err(e),
+            Err(_) => false,
+        };
         out.push(DirEntryInfo { name, is_dir });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -882,14 +900,25 @@ impl<'a> ProjectView<'a> {
 
     /// The UTF-8-named entries of directory `rel`, sorted by name.
     pub async fn list_dir(&self, rel: &str) -> io::Result<Vec<DirEntryInfo>> {
+        self.list_dir_with(rel, false).await
+    }
+
+    /// [`Self::list_dir`] for a walk that must see the whole tree: a
+    /// non-UTF-8 name, an unreadable entry type or a read error mid-listing
+    /// fails the listing instead of being skipped.
+    pub async fn list_dir_strict(&self, rel: &str) -> io::Result<Vec<DirEntryInfo>> {
+        self.list_dir_with(rel, true).await
+    }
+
+    async fn list_dir_with(&self, rel: &str, strict: bool) -> io::Result<Vec<DirEntryInfo>> {
         if let ProjectView::Snapshot(snap) = self {
             snap.touch_listing(rel);
         }
         match self {
-            ProjectView::Disk(root) => list_disk_dir(&root.join(rel)).await,
+            ProjectView::Disk(root) => list_disk_dir(&root.join(rel), strict).await,
             ProjectView::Snapshot(snap) => {
                 let created = snap.overlaid_children(rel);
-                let mut out = match list_disk_dir(&snap.root.join(rel)).await {
+                let mut out = match list_disk_dir(&snap.root.join(rel), strict).await {
                     Ok(out) => out,
                     Err(e) if e.kind() == io::ErrorKind::NotFound && !created.is_empty() => {
                         Vec::new()
