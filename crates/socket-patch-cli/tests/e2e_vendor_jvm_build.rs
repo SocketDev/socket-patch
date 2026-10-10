@@ -425,6 +425,7 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
     let mut want_added = vec![
         ".mvn/maven.config".to_string(),
         ".socket/vendor/maven2/.gitattributes".to_string(),
+        ".socket/vendor/maven2/.gitignore".to_string(),
         format!("{tree}/{ARTIFACT}-{SV}.jar"),
         format!("{tree}/{ARTIFACT}-{SV}.jar.sha1"),
         format!("{tree}/{ARTIFACT}-{SV}.pom"),
@@ -756,6 +757,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         socket_patch_core::vendor::jvm::gradle::SCRIPT_REL.to_string(),
         socket_patch_core::vendor::jvm::gradle::INDEX_REL.to_string(),
         ".socket/vendor/gradle/.gitattributes".to_string(),
+        ".socket/vendor/gradle/.gitignore".to_string(),
         ".socket/gradle/.gitattributes".to_string(),
         ".socket/vendor/.gitattributes".to_string(),
         socket_patch_core::vendor::jvm::gradle::derived_metadata_rel(GROUP, ARTIFACT),

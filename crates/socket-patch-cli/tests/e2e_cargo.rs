@@ -373,7 +373,8 @@ async fn sync_keeps_entry_whose_shared_cache_copy_is_still_patched() {
             .unwrap()
     };
 
-    // The preview prunes only the pristine one.
+    // The preview prunes only the pristine one (v5.0 one GC shape: a dry
+    // run reports would-be prunes under the wet pass's key).
     let out = run(
         &[
             "scan",
@@ -394,7 +395,7 @@ async fn sync_keeps_entry_whose_shared_cache_copy_is_still_patched() {
     assert_eq!(
         manifest_pruned(&json),
         vec![serde_json::json!(ryu)],
-        "{json:#}"
+        "the preview must keep the still-patched cargo entry: {json:#}"
     );
 
     let out = run(
