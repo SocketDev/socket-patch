@@ -76,8 +76,43 @@ class Scheduling(unittest.TestCase):
             self.assertIn("pattern: e2e-bin-${{ matrix.os }}*", "\n".join(JOBS[family]))
         for job in ("e2e-build-macos", "e2e-macos", "cargo-vex-matrix-macos", "yarn-berry-e2e-macos"):
             # Never on pull_request; lean scope also skips them (CI_SCOPE).
-            self.assertIn("    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full'"
-                          " || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')", JOBS[job])
+            condition = next(line for line in JOBS[job] if line.startswith("    if:"))
+            self.assertTrue(condition.startswith("    if: (github.event_name != 'pull_request'"), condition)
+            self.assertTrue(condition.endswith(" && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule'"
+                                               " || github.event_name == 'workflow_dispatch')"), condition)
+
+    def test_reused_push_keeps_cache_writers_and_unqueued_jobs(self):
+        # A push whose SHA passed the merge queue still compiles (main is the
+        # only cache writer) and still runs what the queue never ran.
+        for job in ("clippy", "node-addon", "test", "test-release", "coverage", "e2e-build",
+                    "e2e-build-windows", "e2e-build-macos", "cargo-old-toolchains",
+                    "e2e-full", "cargo-vex-matrix-full", "yarn-berry-full", "hosted-e2e"):
+            with self.subTest(job=job):
+                condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
+                self.assertNotIn("outputs.reuse", condition)
+        for job in ("docker-base", "yarn-classic-matrix", "yarn-berry-e2e", "yarn-berry-e2e-macos"):
+            with self.subTest(job=job):
+                condition = next(line for line in JOBS[job] if line.startswith("    if:"))
+                self.assertIn("needs.clippy.outputs.reuse != 'true'", condition)
+        for family in ("e2e", "cargo-vex-matrix"):
+            for suffix in ("", "-windows", "-macos"):
+                build = "e2e-build" + suffix
+                with self.subTest(job=family + suffix):
+                    condition = next(line for line in JOBS[family + suffix] if line.startswith("    if:"))
+                    self.assertIn(f"needs.{build}.outputs.reuse != 'true'", condition)
+                    self.assertIn("      reuse: ${{ needs.clippy.outputs.reuse }}", JOBS[build])
+        self.assertIn("needs.e2e-build.outputs.reuse != 'true'",
+                      next(line for line in JOBS["e2e-extended"] if line.startswith("    if:")))
+        for job in ("test", "coverage", "cargo-old-toolchains"):
+            with self.subTest(job=job):
+                warm = [body for name, body in reader.steps(JOBS[job]) if name.startswith("Warm ")]
+                self.assertEqual(len(warm), 1)
+                self.assertIn("if: needs.clippy.outputs.reuse == 'true'", warm[0])
+                self.assertIn("--no-run", warm[0])
+        clippy = "\n".join(JOBS["clippy"])
+        self.assertIn("actions: read", clippy)
+        self.assertIn("reuse: ${{ steps.merge-queue.outputs.reuse }}", clippy)
+        self.assertIn("python3 scripts/ci-reuse-merge-group.py", clippy)
 
     def test_row_reader_preserves_both_os_siblings(self):
         jobs = reader.jobs("""jobs:

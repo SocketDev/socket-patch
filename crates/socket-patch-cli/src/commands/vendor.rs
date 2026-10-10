@@ -51,7 +51,7 @@ use crate::commands::apply::{representative_file, result_to_event, variant_match
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{
-    ApplyRequest, RevertedEntry, VendorRevertStep, VendoredBackend,
+    ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
@@ -865,28 +865,33 @@ fn format_revert_install_hint(cmd: &str) -> String {
     )
 }
 
-/// Run-level advisory shared by the `vendor` command and the scan-driven
+/// Run-level advisories shared by the `vendor` command and the scan-driven
 /// vendor step: warn (once, at the envelope level — not per package) when
 /// the project's classic `yarn.lock` carries vendored wiring that a stray
-/// yarn 2+ install would silently drop. The probe is state-based (it reads
-/// the on-disk lockfile), so callers invoke it unconditionally at
-/// envelope-finalize time — unwired projects and fully-reverted runs stay
-/// silent, and dry runs report the risk that already exists on disk.
+/// yarn 2+ install would silently drop, or that installs run from a
+/// workspace member directory cannot fetch (#691). The probes are
+/// state-based (they read the on-disk lockfile), so callers invoke them
+/// unconditionally at envelope-finalize time — unwired projects and
+/// fully-reverted runs stay silent, and dry runs report the risk that
+/// already exists on disk.
 pub(crate) fn note_classic_migration_risk(
     env: &mut Envelope,
     project_root: &Path,
     common: &GlobalArgs,
 ) {
-    let Some(w) = vendor::yarn_classic_berry_migration_risk(project_root) else {
-        return;
-    };
-    if !common.silent && !common.json {
-        eprintln!("Warning: {}", w.detail);
+    let warnings = [
+        vendor::yarn_classic_berry_migration_risk(project_root),
+        vendor::yarn_classic_workspace_member_risk(project_root),
+    ];
+    for w in warnings.into_iter().flatten() {
+        if !common.silent && !common.json {
+            eprintln!("Warning: {}", w.detail);
+        }
+        env.warnings.push(RunWarning {
+            code: w.code.to_string(),
+            detail: w.detail,
+        });
     }
-    env.warnings.push(RunWarning {
-        code: w.code.to_string(),
-        detail: w.detail,
-    });
 }
 
 /// The usage error for `vendor` under global scope, or `None` for a
@@ -4118,11 +4123,22 @@ pub(crate) async fn reconcile_dropped(
             // Drift-skip keep: the backend left the drifted lock alone and
             // kept the artifacts, so the ledger entry must survive too — and
             // the genuine outcome is a COUNTED skip, not a removal.
-            VendorRevertStep::Kept => env.record(
+            VendorRevertStep::Kept(KeepCause::Drift) => env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_revert_kept",
                     "patch no longer in manifest, but its lock entries drifted since \
                      vendoring; artifacts and ledger entry kept",
+                ),
+            ),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    format!(
+                        "patch no longer in manifest, but {}; artifacts and ledger entry \
+                         kept — {}",
+                        cause.reason(),
+                        cause.remedy("re-run `vendor`")
+                    ),
                 ),
             ),
             VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
@@ -4221,11 +4237,21 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             // the genuine outcome is a COUNTED skip, not a removal.
             // (`record_warning` above already surfaced the per-record
             // details as uncounted advisory events.)
-            VendorRevertStep::Kept => env.record(
+            VendorRevertStep::Kept(KeepCause::Drift) => env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_revert_kept",
                     "lock entries drifted since vendoring; artifacts and ledger entry kept \
                      — undo the drift and re-run `vendor --revert` to finish",
+                ),
+            ),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    format!(
+                        "{}; artifacts and ledger entry kept — {}",
+                        cause.reason(),
+                        cause.remedy("re-run `vendor --revert` to finish")
+                    ),
                 ),
             ),
             VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
@@ -4416,8 +4442,10 @@ pub(crate) struct VendorGcSummary {
     pub write_failures: Vec<(&'static str, String)>,
     /// The wet reverts' reinstall advisories (`code`, `detail`): Bun's
     /// `vendor_bun_reinstall_required` (#764) and vlt's
-    /// `vendor_vlt_reinstall_required`. Every other reverting command
-    /// surfaces these, and the GC must not drop them.
+    /// `vendor_vlt_reinstall_required`, and, for a manifest-dropped PyPI
+    /// entry under PDM, uv or Pipenv, `vendor_pypi_reinstall_required`
+    /// (#477). Every other reverting command surfaces these, and the GC
+    /// must not drop them.
     pub advisories: Vec<(&'static str, String)>,
 }
 
@@ -4430,6 +4458,7 @@ pub(crate) struct VendorGcSummary {
 const GC_FORWARDED_ADVISORIES: &[&str] = &[
     socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED,
     socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED,
+    crate::commands::pypi_reinstall::VENDOR_CODE,
 ];
 
 impl VendorGcSummary {
@@ -4533,7 +4562,19 @@ pub(crate) async fn run_vendor_gc(
                 continue;
             }
             let entry = state.entries.get(&purl).cloned().expect("listed above");
-            let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            let mut outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            // The patch left the manifest while the package stays locked:
+            // the restored lock pins the version the vendored build is
+            // installed as, which PDM, uv and Pipenv keep (#477).
+            if outcome.success && !outcome.kept_artifact {
+                crate::commands::pypi_reinstall::push_vendor_advisory(
+                    &common.cwd,
+                    &purl,
+                    entry.flavor.as_deref(),
+                    &mut outcome.warnings,
+                )
+                .await;
+            }
             out.take_advisories(&outcome);
             if !outcome.success {
                 out.failed.push(purl);
