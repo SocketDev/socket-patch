@@ -347,7 +347,10 @@ pub(crate) async fn plan(
     assume_live: &[String],
     api_client: &RunApiClient,
 ) -> Plan {
-    let root = common.cwd.as_path();
+    // The ledgers' project (#745): liveness and JVM wiring are judged where
+    // the ledger and the discovery that gates it were read.
+    let root_buf = common.project_root();
+    let root = root_buf.as_path();
     let Sources {
         manifest,
         vendor,

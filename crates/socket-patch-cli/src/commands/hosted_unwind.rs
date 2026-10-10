@@ -42,6 +42,9 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
     use socket_patch_core::patch::redirect::upstream::{
         restore_upstream, PinStatus, RestoreOptions,
     };
+    // The pins are the manifest's project's (#745): restore them there.
+    let rooted = common.at_project_root();
+    let common: &GlobalArgs = &rooted;
 
     let mut out = HostedLegOutcome::default();
     if pins.is_empty() {

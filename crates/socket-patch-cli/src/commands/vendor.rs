@@ -931,6 +931,23 @@ pub async fn run(args: VendorArgs) -> i32 {
     if args.check {
         return run_check(&args).await;
     }
+    // Every other form rewires (or unwires) `--cwd`'s lockfiles and vendor
+    // ledger: a manifest in another project would split the run (#745).
+    // `--check` above reads the manifest's project throughout.
+    let form = if args.revert {
+        "vendor --revert"
+    } else {
+        "vendor"
+    };
+    if let Some(message) = crate::commands::foreign_manifest_conflict(&args.common, form) {
+        return crate::json_envelope::usage_error(
+            Command::Vendor,
+            args.common.json,
+            args.common.dry_run,
+            crate::commands::FOREIGN_MANIFEST_PROJECT,
+            &message,
+        );
+    }
     apply_env_toggles(&args.common);
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -4537,8 +4554,13 @@ pub(crate) async fn run_vendor_gc(
     manifest_path: &Path,
     dry_run: bool,
 ) -> VendorGcSummary {
+    // The ledger, its artifacts and their wiring are the manifest's
+    // project's (#745): an agent-mode `scan --prune --manifest-path ../b/…`
+    // collects b's vendored state, never `--cwd`'s.
+    let rooted = common.at_project_root();
+    let common: &GlobalArgs = &rooted;
     let mut out = VendorGcSummary::default();
-    let mut state = match load_state(&common.cwd).await {
+    let mut state = match load_state(&common.project_root()).await {
         Ok(s) if !s.entries.is_empty() => s,
         // No ledger (or unreadable): only the orphan sweep could apply, and
         // without a trustworthy ledger it must not delete anything.
@@ -4652,7 +4674,7 @@ pub(crate) async fn run_vendor_gc(
         // artifacts; a failed ledger/manifest rewrite leaves records for
         // state that is gone, which must not pass silently.
         if ledger_dirty {
-            if let Err(e) = save_state(&common.cwd, &state).await {
+            if let Err(e) = save_state(&common.project_root(), &state).await {
                 let detail = format!(
                     "reverted vendored entries but could not update \
                      .socket/vendor/state.json: {e}"

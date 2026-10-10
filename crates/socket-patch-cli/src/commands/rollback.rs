@@ -863,6 +863,9 @@ async fn run_vendored_leg(
 /// describe (v5 never writes it; it is read only for migration). A wet run
 /// only; a failure is a warning (the file is inert).
 pub(crate) async fn retire_legacy_redirect_ledger(common: &GlobalArgs) -> Option<(String, String)> {
+    // The manifest's project's ledger and lockfiles (#745).
+    let rooted = common.at_project_root();
+    let common: &GlobalArgs = &rooted;
     let path = common
         .cwd
         .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
@@ -934,6 +937,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     let manifest_path = args.common.resolved_manifest_path();
     let cwd = args.common.cwd.clone();
+    // The project state — vendor ledger, its artifacts, the lockfiles'
+    // hosted pins and vendor references — belongs to the manifest's project
+    // (#745): with `--manifest-path` into another project, rollback unwinds
+    // THAT project's state, under that project's apply lock, and never
+    // touches `--cwd`'s. Installed copies are still found from `--cwd`.
+    let ledger_root = args.common.project_root();
 
     // ── state discovery ─────────────────────────────────────────────────
     // Rollback infers what to undo from three sources: the manifest
@@ -955,13 +964,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let project_state = crate::commands::project_state_in_scope(&args.common);
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
     let vendor_ledger_exists = project_state
-        && tokio::fs::metadata(cwd.join(".socket/vendor/state.json"))
+        && tokio::fs::metadata(ledger_root.join(".socket/vendor/state.json"))
             .await
             .is_ok();
     // The hosted pins the lockfiles wire (read-only discovery; the restore
     // re-reads every file under the lock before it writes).
     let hosted_inventory = if project_state {
-        crate::commands::hosted_inventory(&args.common, &cwd).await
+        crate::commands::hosted_inventory(&args.common, &ledger_root).await
     } else {
         Default::default()
     };
@@ -979,7 +988,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // Only a pre-v5 hosted ledger left: no lockfile pins it any more,
         // so there is nothing to restore — retire the stale file (a wet run
         // only) instead of failing on the missing manifest.
-        let legacy = cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+        let legacy = ledger_root.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
         if project_state && tokio::fs::symlink_metadata(&legacy).await.is_ok() {
             let warning = retire_legacy_redirect_ledger(&args.common).await;
             if args.common.json {
@@ -1021,7 +1030,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // ledger holds the pre-vendor originals, so it must come back from
         // version control first.)
         let wired = if project_state {
-            crate::commands::vendored_backend::repair::scan_vendor_references(&cwd).await
+            crate::commands::vendored_backend::repair::scan_vendor_references(&ledger_root).await
         } else {
             Default::default()
         };
@@ -1079,7 +1088,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // vendored manifest records (see the cleanup below): no vendored leg
     // runs, and the ledger does not own the global copies, so the in-place
     // leg restores them.
-    let loaded_vendor_state = socket_patch_core::vendor::load_state(&cwd).await;
+    let loaded_vendor_state = socket_patch_core::vendor::load_state(&ledger_root).await;
     let project_vendored_keys: HashSet<PurlKey> = loaded_vendor_state
         .as_ref()
         .map(VendorState::purl_keys)

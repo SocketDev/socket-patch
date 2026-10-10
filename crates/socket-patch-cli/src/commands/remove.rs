@@ -349,7 +349,6 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let loud = !args.common.json && !args.common.silent;
 
     let manifest_path = args.common.resolved_manifest_path();
-    let cwd = &args.common.cwd;
 
     // ── state discovery ─────────────────────────────────────────────────
     // A manifest-less project (vendored mode keeps its records in the
@@ -368,7 +367,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let project_state = crate::commands::project_state_in_scope(&args.common);
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
     let hosted_inventory = if project_state {
-        crate::commands::hosted_inventory(&args.common, cwd).await
+        crate::commands::hosted_inventory(&args.common, &args.common.project_root()).await
     } else {
         Default::default()
     };
@@ -377,7 +376,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
     if manifest_missing {
         let vendor_ledger_exists = project_state
-            && tokio::fs::metadata(cwd.join(VENDOR_STATE_REL))
+            && tokio::fs::metadata(args.common.project_root().join(VENDOR_STATE_REL))
                 .await
                 .is_ok();
         if !vendor_ledger_exists && hosted_pins.is_empty() {
@@ -459,8 +458,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // the vendored leg. An unreadable ledger degrades to "nothing vendored"
     // for the rollback and fails closed at the vendored leg — exactly where
     // the run is about to mutate vendored state.
+    // From the manifest's project, like the manifest itself (#745).
     let vendor_state_result = if project_state {
-        load_state(cwd).await
+        load_state(&args.common.project_root()).await
     } else {
         Ok(VendorState::default())
     };

@@ -431,7 +431,18 @@ impl GlobalArgs {
                     "is a directory, not a manifest file",
                 ));
             }
-            let root = self.project_root();
+            // The directory that must exist: the project of a `.socket/`
+            // manifest (`.socket/` itself is created on demand), else the
+            // manifest file's own directory.
+            let in_socket_dir = manifest.parent().and_then(Path::file_name)
+                == Some(std::ffi::OsStr::new(
+                    socket_patch_core::constants::SOCKET_DIR,
+                ));
+            let root = if in_socket_dir {
+                self.project_root()
+            } else {
+                self.socket_dir()
+            };
             if !creates_manifest && !root.is_dir() {
                 return Err(not_dir(
                     "--manifest-path",
@@ -491,33 +502,58 @@ impl GlobalArgs {
         }
     }
 
-    /// The project root whose `.socket/` state stores — manifest, vendor
-    /// ledger — belong together: the RESOLVED manifest's
-    /// directory, stepping out of a standard `.socket/` layout when the
-    /// manifest lives in one. For the default `<cwd>/.socket/manifest.json`
-    /// this is exactly `cwd`; for a `--manifest-path` into another project
-    /// it is that project's root (its `.socket` parent's parent); for a
-    /// bare file like `--manifest-path /tmp/x/abs.json` it is the file's
-    /// own directory. Every command that reads more than one store must
-    /// derive them from THIS root, so `--manifest-path` can never
-    /// interleave two projects' state (CLI_CONTRACT.md: both stores always
-    /// come from the SAME project).
+    /// The project root whose state stores — manifest, vendor ledger and
+    /// its `.socket/vendor/` artifacts — belong together. For the default
+    /// `<cwd>/.socket/manifest.json` this is exactly `cwd`; for a
+    /// `--manifest-path` into another project's `.socket/` it is that
+    /// project's root (the `.socket` parent's parent); a manifest file
+    /// outside any `.socket/` directory (`--manifest-path
+    /// state/patches.json`, `/etc/socket/manifest.json`) relocates only
+    /// the manifest — the project stays `cwd`. Every command derives every
+    /// store from THIS root, so `--manifest-path` can never interleave two
+    /// projects' state (CLI_CONTRACT.md `--manifest-path` row; #745).
     pub(crate) fn project_root(&self) -> PathBuf {
-        let manifest_path = self.resolved_manifest_path();
-        match manifest_path.parent() {
-            Some(dir)
-                if dir.file_name()
-                    == Some(std::ffi::OsStr::new(
-                        socket_patch_core::constants::SOCKET_DIR,
-                    )) =>
-            {
-                dir.parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| self.cwd.clone())
-            }
-            Some(dir) => dir.to_path_buf(),
-            None => self.cwd.clone(),
+        project_root_of(&self.resolved_manifest_path(), &self.cwd)
+    }
+
+    /// Whether the resolved manifest belongs to a project other than
+    /// `--cwd` ([`Self::project_root`] names a different directory). Only
+    /// a non-default `--manifest-path` / `SOCKET_MANIFEST_PATH` can make
+    /// this true.
+    pub(crate) fn manifest_project_is_foreign(&self) -> bool {
+        let root = self.project_root();
+        if root == self.cwd {
+            return false;
         }
+        match (
+            std::fs::canonicalize(&root),
+            std::fs::canonicalize(&self.cwd),
+        ) {
+            (Ok(root), Ok(cwd)) => root != cwd,
+            _ => true,
+        }
+    }
+
+    /// `self` with `cwd` moved to [`Self::project_root`] (and the manifest
+    /// path re-expressed relative to it, so it resolves to the same file):
+    /// the view the vendored backend runs under, so a revert or repair
+    /// touches the ledger, `.socket/vendor/` artifacts and lockfile wiring
+    /// of ONE project — the manifest's (#745). Borrowed unchanged for the
+    /// default layout.
+    pub(crate) fn at_project_root(&self) -> std::borrow::Cow<'_, GlobalArgs> {
+        let root = self.project_root();
+        if root == self.cwd {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let manifest = self.resolved_manifest_path();
+        let mut rooted = self.clone();
+        rooted.manifest_path = manifest
+            .strip_prefix(&root)
+            .unwrap_or(&manifest)
+            .to_string_lossy()
+            .into_owned();
+        rooted.cwd = root;
+        std::borrow::Cow::Owned(rooted)
     }
 
     /// The directory the manifest lives in — where `apply.lock` and `blobs/`
@@ -593,6 +629,23 @@ impl GlobalArgs {
             offline: self.offline,
         }
     }
+}
+
+/// [`GlobalArgs::project_root`] for a caller holding a resolved manifest
+/// path: the manifest's `.socket` parent's parent in the standard layout,
+/// else `cwd` (a manifest file outside any `.socket/` directory relocates
+/// only the manifest, not the project).
+pub(crate) fn project_root_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
+    manifest_path
+        .parent()
+        .filter(|dir| {
+            dir.file_name()
+                == Some(std::ffi::OsStr::new(
+                    socket_patch_core::constants::SOCKET_DIR,
+                ))
+        })
+        .and_then(Path::parent)
+        .map_or_else(|| cwd.to_path_buf(), Path::to_path_buf)
 }
 
 /// The `.socket/`-role directory for `manifest_path`: its parent, falling
@@ -1435,18 +1488,20 @@ mod tests {
         assert_eq!(args.socket_dir(), other.join(".socket"));
     }
 
-    /// A bare manifest file outside any `.socket/` layout: the file's own
-    /// directory plays both roles.
+    /// A bare manifest file outside any `.socket/` layout relocates only
+    /// the manifest: its directory holds the lock and artifacts, while the
+    /// project (vendor ledger, lockfiles) stays `cwd` (#745).
     #[test]
-    fn project_root_of_a_bare_manifest_file_is_its_directory() {
+    fn project_root_of_a_bare_manifest_file_is_cwd() {
         let args = GlobalArgs {
             cwd: PathBuf::from("/work/project"),
             manifest_path: "custom/mp.json".to_string(),
             ..GlobalArgs::default()
         };
         let custom = PathBuf::from("/work/project").join("custom");
-        assert_eq!(args.project_root(), custom);
+        assert_eq!(args.project_root(), PathBuf::from("/work/project"));
         assert_eq!(args.socket_dir(), custom);
+        assert!(!args.manifest_project_is_foreign());
     }
 
     /// `socket_dir_of` on a raw relative file name falls back to `cwd`,
