@@ -2033,14 +2033,17 @@ pub(crate) async fn rollback_patches_inner(
     // before-blobs that can restore it. Only a copy that is actually
     // patched is restored — the vendored copy under `.socket/vendor/` is
     // never a rollback location — so a plain vendored crate (cache copy
-    // absent or pristine) is skipped exactly as before.
+    // absent or pristine) is skipped exactly as before. A project `vendor/`
+    // dir (`cargo vendor`) hides the registry cache from the crawl, so its
+    // copies are looked up there too: the record is dropped after this run,
+    // and an unrestored copy would be orphaned with no before-blobs.
     let vendored_purls: Vec<String> = vendored_targets.iter().map(|p| p.purl.clone()).collect();
     let cache_patched = crate::ecosystem_dispatch::cargo_copies_still_patched(
         manifest,
         &vendored_purls,
         &common.crawler_options(),
         &blobs_path,
-        false,
+        true,
     )
     .await;
     let (cache_targets, vendored_targets): (Vec<_>, Vec<_>) = vendored_targets
@@ -2120,6 +2123,24 @@ pub(crate) async fn rollback_patches_inner(
         common.silent || common.json,
     )
     .await;
+    // The shared-cache copies of the vendored Cargo crates restored above
+    // (#336), including those a `cargo vendor` dir hides from the crawl.
+    let cache_purls: Vec<String> = cache_patched
+        .into_iter()
+        .filter(|p| in_scope.contains(p))
+        .collect();
+    if !cache_purls.is_empty() {
+        let shadowed =
+            crate::ecosystem_dispatch::find_cargo_copies(cache_purls, &crawler_options, true).await;
+        for (purl, paths) in shadowed {
+            let copies = all_packages_multi.entry(purl).or_default();
+            for path in paths {
+                if !copies.contains(&path) {
+                    copies.push(path);
+                }
+            }
+        }
+    }
     // One restore per physical copy, as apply patches them (#633).
     distinct_npm_copies(&mut all_packages_multi).await;
 

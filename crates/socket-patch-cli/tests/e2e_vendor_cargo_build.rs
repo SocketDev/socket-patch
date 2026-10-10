@@ -951,6 +951,18 @@ fn cargo_vendor_reports_applied_event() {
 /// building the patched crate.
 #[test]
 fn cargo_rollback_after_agent_to_vendored_restores_shared_cache() {
+    agent_to_vendored_rollback_restores_shared_cache(false);
+}
+
+/// #336 behind a `cargo vendor` dir: the project crawl then searches only
+/// `vendor/`, which hides the registry cache. The rollback still drops the
+/// record, so it must still find and restore the patched cache copy.
+#[test]
+fn cargo_rollback_after_agent_to_vendored_restores_cache_behind_cargo_vendor_dir() {
+    agent_to_vendored_rollback_restores_shared_cache(true);
+}
+
+fn agent_to_vendored_rollback_restores_shared_cache(cargo_vendor_dir: bool) {
     if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (agent-then-vendor)") {
         return;
     }
@@ -992,6 +1004,9 @@ fn cargo_rollback_after_agent_to_vendored_restores_shared_cache() {
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    if cargo_vendor_dir {
+        std::fs::create_dir_all(proj.join("vendor")).unwrap();
+    }
 
     let (code, stdout, stderr) = run_socket(
         &proj,

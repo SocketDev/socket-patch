@@ -90,9 +90,9 @@ pub async fn cargo_copies_still_patched<'a>(
 /// locates (the roots rollback restores), plus, with `shadowed_registry`,
 /// the shared `$CARGO_HOME/registry/src` copies of a local Cargo project
 /// with a `cargo vendor` dir, whose crawl searches only that dir — where
-/// an apply from before `cargo vendor` may have left the patch. Callers
-/// only READ the shadowed copies (the prune's keep decision): rollback
-/// never writes a registry copy its own crawl would not reach.
+/// an apply from before `cargo vendor` may have left the patch. The prune
+/// only reads them (its keep decision); rollback restores them only for a
+/// vendored crate whose record it is about to drop (#336).
 pub async fn find_cargo_copies(
     purls: Vec<String>,
     options: &CrawlerOptions,
