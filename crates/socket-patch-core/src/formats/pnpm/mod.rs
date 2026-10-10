@@ -494,6 +494,117 @@ impl<'t> PnpmLock<'t> {
     }
 }
 
+/// The packages a pnpm "current lockfile" — the `lock.yaml` pnpm writes in
+/// its virtual store (`node_modules/.pnpm/lock.yaml`) after every install —
+/// says are installed, by `(name, version)`. pnpm 7–12 keep a removed or
+/// upgraded-away package's store entry on disk for a while (#1197); the
+/// current lockfile is the record of which entries the install still uses.
+#[derive(Debug, Default)]
+pub(crate) struct InstalledPackages {
+    versions: HashSet<(String, String)>,
+    /// Names of entries whose version the lock does not state: every
+    /// version of these counts as installed.
+    any_version: HashSet<String>,
+}
+
+impl InstalledPackages {
+    /// Read a current lockfile in any lock generation (v5.4 `/name/1.0.0`,
+    /// v6 `/name@1.0.0`, v9 `name@1.0.0` keys; a non-registry entry by its
+    /// `name:` / `version:` fields, or a v9 key's name). `None` when the
+    /// text is not a pnpm lock, or holds an entry whose package cannot be
+    /// named — the caller must then keep every store entry.
+    pub(crate) fn from_lock_text(text: &str) -> Option<Self> {
+        if !grammar::is_pnpm_lock_text(text) {
+            return None;
+        }
+        // One line walk (the scan reads this on every run, for every
+        // package of the install): two-space `packages:` keys and their
+        // four-space `name:` / `version:` fields, nothing else.
+        let mut out = Self::default();
+        let mut entries = 0usize;
+        let mut in_packages = false;
+        let mut current: Option<(&str, Option<&str>, Option<&str>)> = None;
+        let mut finish = |entry: Option<(&str, Option<&str>, Option<&str>)>, out: &mut Self| {
+            let Some((key, field_name, field_version)) = entry else {
+                return Some(());
+            };
+            entries += 1;
+            out.insert_entry(key, field_name, field_version)
+        };
+        for raw in grammar::main_document(strip_bom(text)).split('\n') {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            if !line.is_empty() && !line.starts_with([' ', '#']) {
+                finish(current.take(), &mut out)?;
+                in_packages = line == "packages:";
+                continue;
+            }
+            if !in_packages {
+                continue;
+            }
+            if let Some((key, _, _)) = lines::parse_key_line(line, 2) {
+                finish(current.take(), &mut out)?;
+                current = Some((key, None, None));
+            } else if let (Some(entry), Some((field, _, value))) =
+                (current.as_mut(), lines::parse_key_line(line, 4))
+            {
+                let value = Some(grammar::unquote(value.trim())).filter(|v| !v.is_empty());
+                match field {
+                    "name" => entry.1 = value,
+                    "version" => entry.2 = value,
+                    _ => {}
+                }
+            }
+        }
+        finish(current.take(), &mut out)?;
+        // A lock listing no package at all says nothing about the store.
+        (entries > 0).then_some(out)
+    }
+
+    /// Record one `packages:` entry; `None` when its package cannot be
+    /// named.
+    fn insert_entry(
+        &mut self,
+        key: &str,
+        field_name: Option<&str>,
+        field_version: Option<&str>,
+    ) -> Option<()> {
+        let (name, version) = match classify_pnpm_key(key) {
+            PnpmKey::Registry { name, version } => (Some(name), Some(version)),
+            PnpmKey::V9File { name, .. } => (Some(name), field_version),
+            PnpmKey::LegacyFile { .. } => (field_name, field_version),
+            // A v9 url / git key still leads with `name@`; a legacy one
+            // names its package only in the `name:` field.
+            PnpmKey::Other => {
+                let base = strip_pnpm_peer_suffix(key);
+                let v9_name = (!base.starts_with('/'))
+                    .then(|| base.get(1..).and_then(|rest| rest.find('@')))
+                    .flatten()
+                    .map(|at| &base[..at + 1]);
+                (field_name.or(v9_name), field_version)
+            }
+        };
+        let name = name?;
+        match version {
+            Some(version) => {
+                self.versions
+                    .insert((name.to_string(), version.to_string()));
+            }
+            None => {
+                self.any_version.insert(name.to_string());
+            }
+        }
+        Some(())
+    }
+
+    /// Whether the lock installs `name@version`.
+    pub(crate) fn contains(&self, name: &str, version: &str) -> bool {
+        self.any_version.contains(name)
+            || self
+                .versions
+                .contains(&(name.to_string(), version.to_string()))
+    }
+}
+
 /// The uuid of every `packages:` / `snapshots:` block key that resolves
 /// into `.socket/vendor/npm/<uuid>/` — the block-key grammar the vendored
 /// planners splice with ([`lines::parse_key_line`] at two-space indent),
@@ -523,6 +634,48 @@ pub(crate) fn vendored_npm_uuids(text: &str) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1197: the current lockfile's packages, by name and version, in the
+    /// shapes real pnpm 7.33.7 / 8.15.9 / 10–12 write after an upgrade
+    /// (`left-pad` 1.3.0 → 1.2.0), plus non-registry entries.
+    #[test]
+    fn installed_packages_read_every_lock_generation() {
+        for (head, keys) in [
+            ("5.4", ["/@sindresorhus/is/4.6.0", "/left-pad/1.2.0"]),
+            ("6.0", ["/@sindresorhus/is@4.6.0", "/left-pad@1.2.0"]),
+            (
+                "9.0",
+                ["'@sindresorhus/is@4.6.0'", "left-pad@1.2.0(peer@1.0.0)"],
+            ),
+        ] {
+            let text = format!(
+                "lockfileVersion: '{head}'\n\npackages:\n\n  {}:\n    resolution: {{integrity: \
+                 sha512-a}}\n\n  {}:\n    resolution: {{integrity: sha512-b}}\n",
+                keys[0], keys[1]
+            );
+            let installed = InstalledPackages::from_lock_text(&text).unwrap();
+            assert!(installed.contains("@sindresorhus/is", "4.6.0"), "{text}");
+            assert!(installed.contains("left-pad", "1.2.0"), "{text}");
+            assert!(!installed.contains("left-pad", "1.3.0"), "{text}");
+        }
+        let text = "lockfileVersion: '9.0'\n\npackages:\n\n  \
+                    lp@file:lp.tgz:\n    resolution: {integrity: sha512-a, tarball: file:lp.tgz}\n    \
+                    version: 1.0.0\n\n  git-dep@https://codeload.github.com/u/r/tar.gz/abc:\n    \
+                    resolution: {tarball: https://codeload.github.com/u/r/tar.gz/abc}\n";
+        let installed = InstalledPackages::from_lock_text(text).unwrap();
+        assert!(installed.contains("lp", "1.0.0") && !installed.contains("lp", "0.9.0"));
+        assert!(
+            installed.contains("git-dep", "0.0.1"),
+            "no version: any version"
+        );
+        // A package the lock cannot name, or no lock at all: unknown.
+        let unnamed = "lockfileVersion: 5.4\n\npackages:\n\n  \
+                       registry.example.com/x/1.0.0:\n    resolution: {integrity: sha512-a}\n";
+        assert!(InstalledPackages::from_lock_text(unnamed).is_none());
+        assert!(InstalledPackages::from_lock_text("not: a lock\n").is_none());
+        // A lock listing no package says nothing about the store.
+        assert!(InstalledPackages::from_lock_text("lockfileVersion: 9\n").is_none());
+    }
 
     const UUID: &str = "11111111-1111-4111-8111-111111111111";
 

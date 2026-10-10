@@ -89,6 +89,11 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   below that); `uv lock --script` from 0.5.17; PEP 751 `uv pip compile
   --output-file pylock.toml` from 0.6.15. Earlier binaries record those lanes
   as unavailable, not as failures.
+- After an unwind (`rollback`, `remove`, `vendor --revert`) `uv sync` keeps
+  the patched build, because the restored lock pins the same version. The
+  unwind warns `vendor_pypi_reinstall_required` /
+  `redirect_pypi_reinstall_required` and names `uv sync --reinstall-package
+  <name>` (#477).
 - `[tool.uv] dev-dependencies` (the pre-PEP 735 dev group) is classified as a
   direct dependency, and every duplicate `requires-dist` / `requires-dev`
   entry for the package (extras, markers) is repointed, so `uv sync --locked`

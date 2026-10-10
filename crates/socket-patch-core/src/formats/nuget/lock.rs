@@ -127,6 +127,179 @@ pub(crate) fn other_versions_detail(
     )
 }
 
+/// MSBuild project files NuGet restores `PackageReference`s for.
+const PROJECT_EXTENSIONS: [&str; 3] = [".csproj", ".fsproj", ".vbproj"];
+
+/// Whether `name` (a basename) is an MSBuild project file.
+pub(crate) fn is_project_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    PROJECT_EXTENSIONS
+        .iter()
+        .any(|ext| lower.len() > ext.len() && lower.ends_with(ext))
+}
+
+/// The locks a project tree restores into, as root-relative `/` paths
+/// (#353, #514). Every project under the root inherits the root
+/// `nuget.config`, so the Socket source and mapping wired there reach every
+/// one of them, and each lock they restore must be pinned with it:
+///
+/// * the root `packages.lock.json`, when present (a project file NuGet
+///   restores from the root, or a lock with no project beside it);
+/// * per project, the lock NuGet reads: a literal `NuGetLockFilePath`
+///   (relative to the project), else `packages.<ProjectName>.lock.json`
+///   beside it (spaces in the name become `_`) when that file exists, else
+///   `packages.lock.json` beside it.
+///
+/// Only existing locks are returned. A `NuGetLockFilePath` this reader cannot
+/// evaluate (an MSBuild property or item reference, a `Condition`, an
+/// absolute path or one leaving the root) is returned in `unresolved` as
+/// `(project, detail)`: the writers refuse rather than leave a lock they
+/// cannot find on its upstream hash.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct GovernedLocks {
+    pub(crate) locks: Vec<String>,
+    pub(crate) unresolved: Vec<(String, String)>,
+}
+
+/// [`GovernedLocks`] of `projects` (`(root-relative project path, text)`),
+/// asking `exists` whether a root-relative file exists.
+pub(crate) fn governed_locks(
+    projects: &[(String, String)],
+    exists: impl Fn(&str) -> bool,
+) -> GovernedLocks {
+    let mut out = GovernedLocks::default();
+    if exists(PACKAGES_LOCK) {
+        out.locks.push(PACKAGES_LOCK.to_string());
+    }
+    for (project, text) in projects {
+        let (dir, file) = match project.rsplit_once('/') {
+            Some((dir, file)) => (dir, file),
+            None => ("", project.as_str()),
+        };
+        let join = |leaf: &str| {
+            if dir.is_empty() {
+                leaf.to_string()
+            } else {
+                format!("{dir}/{leaf}")
+            }
+        };
+        let lock = match lock_file_path_property(text) {
+            Some(Err(detail)) => {
+                out.unresolved.push((project.clone(), detail));
+                continue;
+            }
+            Some(Ok(value)) => {
+                match resolve_relative(dir, &value) {
+                    Some(rel) => rel,
+                    None => {
+                        out.unresolved.push((
+                        project.clone(),
+                        format!("NuGetLockFilePath `{value}` is absolute or leaves the project root"),
+                    ));
+                        continue;
+                    }
+                }
+            }
+            None => {
+                let stem = &file[..file.rfind('.').unwrap_or(file.len())];
+                let named = join(&format!("packages.{}.lock.json", stem.replace(' ', "_")));
+                if exists(&named) {
+                    named
+                } else {
+                    join(PACKAGES_LOCK)
+                }
+            }
+        };
+        if exists(&lock) && !out.locks.contains(&lock) {
+            out.locks.push(lock);
+        }
+    }
+    out
+}
+
+/// The project's literal `NuGetLockFilePath`: `None` when it sets none,
+/// `Some(Err)` when it sets one this reader cannot evaluate.
+fn lock_file_path_property(text: &str) -> Option<Result<String, String>> {
+    const OPEN: &str = "<NuGetLockFilePath";
+    const CLOSE: &str = "</NuGetLockFilePath>";
+    let text = strip_xml_comments(text);
+    let mut value: Option<Result<String, String>> = None;
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find(OPEN) {
+        let after = &rest[at + OPEN.len()..];
+        // `<NuGetLockFilePathX>` is another property.
+        if !after.starts_with(['>', ' ', '\t', '\r', '\n', '/']) {
+            rest = after;
+            continue;
+        }
+        let Some(gt) = after.find('>') else {
+            return Some(Err("an unterminated NuGetLockFilePath element".to_string()));
+        };
+        let attrs = after[..gt].trim();
+        if attrs.ends_with('/') {
+            // `<NuGetLockFilePath />`: an empty value, NuGet's default.
+            value = None;
+            rest = &after[gt + 1..];
+            continue;
+        }
+        let Some(end) = after[gt + 1..].find(CLOSE) else {
+            return Some(Err("an unterminated NuGetLockFilePath element".to_string()));
+        };
+        let raw = after[gt + 1..gt + 1 + end].trim();
+        rest = &after[gt + 1 + end + CLOSE.len()..];
+        if raw.is_empty() && attrs.is_empty() {
+            value = None;
+            continue;
+        }
+        value = Some(if !attrs.is_empty() {
+            Err(format!(
+                "NuGetLockFilePath `{raw}` is conditional ({attrs}); its value depends on the build"
+            ))
+        } else if raw.contains("$(") || raw.contains("@(") || raw.contains("%(") {
+            Err(format!(
+                "NuGetLockFilePath `{raw}` references MSBuild properties or items"
+            ))
+        } else {
+            Ok(raw.to_string())
+        });
+    }
+    value
+}
+
+fn strip_xml_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("<!--") {
+        out.push_str(&rest[..at]);
+        match rest[at + 4..].find("-->") {
+            Some(end) => rest = &rest[at + 4 + end + 3..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `value` (a project-relative path, either separator) resolved against
+/// the root-relative `dir`; `None` when it is absolute or leaves the root.
+fn resolve_relative(dir: &str, value: &str) -> Option<String> {
+    let value = value.replace('\\', "/");
+    if value.starts_with('/') || value.as_bytes().get(1) == Some(&b':') {
+        return None;
+    }
+    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    for seg in value.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            seg => parts.push(seg),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +348,78 @@ mod tests {
         // A spelling of the same version is not another version.
         let doc = parse_lock(&MULTI.replace("\"12.0.3\"", "\"13.0.3.0\"")).unwrap();
         assert!(other_versions(&doc, "Newtonsoft.Json", "13.0.3").is_empty());
+    }
+
+    fn exists_in(files: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |p| files.contains(&p)
+    }
+
+    #[test]
+    fn member_and_named_locks_are_governed() {
+        let projects = vec![
+            ("src/App/App.csproj".to_string(), "<Project />".to_string()),
+            (
+                "src/Lib/My Lib.fsproj".to_string(),
+                "<Project />".to_string(),
+            ),
+            ("tests/T/T.vbproj".to_string(), "<Project />".to_string()),
+        ];
+        let got = governed_locks(
+            &projects,
+            exists_in(&[
+                "packages.lock.json",
+                "src/App/packages.lock.json",
+                "src/Lib/packages.My_Lib.lock.json",
+                "src/Lib/packages.lock.json",
+            ]),
+        );
+        assert_eq!(
+            got.locks,
+            [
+                "packages.lock.json",
+                "src/App/packages.lock.json",
+                "src/Lib/packages.My_Lib.lock.json"
+            ]
+        );
+        assert!(got.unresolved.is_empty());
+    }
+
+    #[test]
+    fn lock_file_path_property_is_honored_or_refused() {
+        let project = |body: &str| {
+            vec![(
+                "src/App/App.csproj".to_string(),
+                format!("<Project><PropertyGroup>{body}</PropertyGroup></Project>"),
+            )]
+        };
+        let got = governed_locks(
+            &project("<NuGetLockFilePath>..\\locks/app.lock.json</NuGetLockFilePath>"),
+            exists_in(&["src/locks/app.lock.json", "src/App/packages.lock.json"]),
+        );
+        assert_eq!(got.locks, ["src/locks/app.lock.json"]);
+        // A commented-out property is not set.
+        let got = governed_locks(
+            &project("<!-- <NuGetLockFilePath>x.json</NuGetLockFilePath> -->"),
+            exists_in(&["src/App/packages.lock.json"]),
+        );
+        assert_eq!(got.locks, ["src/App/packages.lock.json"]);
+        for body in [
+            "<NuGetLockFilePath>$(MSBuildProjectDirectory)/l.json</NuGetLockFilePath>",
+            "<NuGetLockFilePath Condition=\"'$(CI)'=='true'\">l.json</NuGetLockFilePath>",
+            "<NuGetLockFilePath>../../../outside.json</NuGetLockFilePath>",
+            "<NuGetLockFilePath>/abs/l.json</NuGetLockFilePath>",
+        ] {
+            let got = governed_locks(&project(body), exists_in(&[]));
+            assert!(got.locks.is_empty(), "{body}");
+            assert_eq!(got.unresolved.len(), 1, "{body}");
+        }
+    }
+
+    #[test]
+    fn project_files_are_recognized_by_extension() {
+        assert!(is_project_file("App.csproj"));
+        assert!(is_project_file("App.FSPROJ"));
+        assert!(!is_project_file(".csproj"));
+        assert!(!is_project_file("App.sln"));
     }
 }
