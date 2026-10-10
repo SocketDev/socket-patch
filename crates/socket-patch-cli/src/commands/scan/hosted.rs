@@ -21,6 +21,7 @@ use crate::commands::vex::generate_vex_from_manifest_path;
 
 use super::{discover_selected, ScanArgs};
 
+mod nuget;
 mod python;
 mod takeover;
 
@@ -1420,6 +1421,15 @@ pub(crate) async fn run_redirect_selected(
         .await
     };
 
+    // NuGet global packages folder probe (#352): a copy extracted from the
+    // upstream bytes shadows the Socket source. Read-only, like the gem
+    // probe; skipped on --dry-run for the same reason.
+    let nuget_stale = if common.dry_run {
+        StaleInstallOutcome::default()
+    } else {
+        nuget::stale_install_warnings(common, &confirmed, &done.overrides).await
+    };
+
     // vlt warm-tree heal: stale installed copies of the Socket-owned nodes
     // are invalidated (classified only on a dry run or
     // with --no-vlt-install-cleanup), and every confirmed vlt purl whose
@@ -1579,6 +1589,7 @@ pub(crate) async fn run_redirect_selected(
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
                 !gem_stale.stale_purls.contains(purl)
+                    && !nuget_stale.stale_purls.contains(purl)
                     && !python_stale.stale_purls.contains(purl)
                     && !vlt_stale.stale_purls.contains(purl)
             })
@@ -1589,6 +1600,7 @@ pub(crate) async fn run_redirect_selected(
         params.known_stale = python_stale
             .stale_purls
             .iter()
+            .chain(&nuget_stale.stale_purls)
             .chain(&vlt_stale.stale_purls)
             .cloned()
             .collect();
@@ -1615,9 +1627,28 @@ pub(crate) async fn run_redirect_selected(
     engine_warnings.extend(done.rush_warnings.iter().cloned());
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
     engine_warnings.extend(done.npm_warnings.iter().cloned());
+    // A hosted Go `replace` breaks a committed vendor/ directory until
+    // `go mod vendor` re-records it in vendor/modules.txt (#343).
+    if !common.dry_run
+        && done
+            .rewritten
+            .iter()
+            .any(|f| f == "go.mod" || f.ends_with("/go.mod"))
+    {
+        for (code, detail) in socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+            &common.cwd,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        {
+            engine_warnings
+                .push(socket_patch_core::patch::redirect::RewriteWarning { code, detail });
+        }
+    }
     let mut warnings: Vec<serde_json::Value> =
         socket_patch_core::hosted::render::rewrite_warnings_json(&engine_warnings);
     warnings.extend(gem_stale.warnings.iter().cloned());
+    warnings.extend(nuget_stale.warnings.iter().cloned());
     warnings.extend(python_stale.warnings.iter().cloned());
     warnings.extend(vlt_stale.warnings.iter().cloned());
     warnings.extend(takeover_pre_warnings.iter().cloned());
@@ -2588,6 +2619,28 @@ mod tests {
                 assert_eq!(text, "packages:\n  - '.'\ntrustLockfile: true\n");
             }
             _ => panic!("no workspace file must plan a Create"),
+        }
+    }
+
+    /// #1096: an existing file with no keys at all (empty, comments only,
+    /// bare document markers) gains the root-only `packages` scaffold with
+    /// the trust key — pnpm 8.x–10.4 refuse a workspace file holding a key
+    /// but no `packages` — inside the document, every user byte intact.
+    #[test]
+    fn plan_workspace_trust_scaffolds_packages_in_a_keyless_file() {
+        const ADDED: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+        for (user, want) in [
+            ("", ADDED.to_string()),
+            ("\n", format!("{ADDED}\n")),
+            ("# settings\n", format!("# settings\n{ADDED}")),
+            ("---\n", format!("---\n{ADDED}")),
+            ("%YAML 1.2\n---\n", format!("%YAML 1.2\n---\n{ADDED}")),
+            ("---\n...\n", format!("---\n{ADDED}...\n")),
+        ] {
+            match plan_workspace_trust(Some(user)) {
+                TrustPlan::Scaffold(text) => assert_eq!(text, want, "{user:?}"),
+                _ => panic!("a keyless file must plan a Scaffold: {user:?}"),
+            }
         }
     }
 

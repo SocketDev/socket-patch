@@ -188,7 +188,10 @@ fn rollback_refuses_bun_global_store_packages() {
     );
 
     let v = run(&proj, "rollback");
-    assert_eq!(v["status"], "partial_failure", "{v}");
+    // Every package refused, nothing rolled back: the run failed as a
+    // whole (#1066).
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "{v}");
     assert_refused(&v, "pkg:npm/left-pad@1.3.0");
     assert_refused(&v, "pkg:npm/is-number@6.0.0");
     assert_eq!(std::fs::read(left_pad.join("index.js")).unwrap(), AFTER);

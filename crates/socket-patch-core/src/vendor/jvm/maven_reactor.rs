@@ -25,6 +25,9 @@ use super::layout::MAVEN2_TREE as TREE_ROOT;
 pub const MAVEN_CONFIG: &str = ".mvn/maven.config";
 /// The tree root's `.gitattributes`, shared by every Maven patch.
 pub const GITATTRIBUTES_REL: &str = ".socket/vendor/maven2/.gitattributes";
+/// The tree root's `.gitignore` (`!*`), shared with sbt: re-includes the
+/// vendored jars against a user's `*.jar` rule (Java.gitignore), #1061.
+pub use super::sbt::TREE_GITIGNORE_REL as GITIGNORE_REL;
 const OFFLINE_LINE: &str = "-Daether.offline.protocols=file";
 const OFFLINE_KEY: &str = "-Daether.offline.protocols=";
 const TAIL_KEY: &str = "-Dmaven.repo.local.tail=";
@@ -313,6 +316,12 @@ pub fn plan_with_external(
         ));
     }
     records.push(owned_file(read, GITATTRIBUTES_REL, &mut writes));
+    records.push(super::owned_file_with(
+        read,
+        GITIGNORE_REL,
+        super::coursier_tree::GITIGNORE.as_bytes(),
+        &mut writes,
+    ));
     let (tree_dir, jar_rel, tree) = tree_writes(patch, &sv, suffixed_pom);
     writes.extend(tree);
 
@@ -414,15 +423,17 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
                 before.insert(MAVEN_CONFIG.to_string(), Some(text));
             }
         }
-        let created = records.iter().any(|w| {
-            w.kind == OWNED_FILE_KIND && w.file == GITATTRIBUTES_REL && op_of(w) == "create"
-        });
-        if created && read(GITATTRIBUTES_REL).as_deref() == Some(TREE_GITATTRIBUTES.as_bytes()) {
-            before.insert(
-                GITATTRIBUTES_REL.to_string(),
-                Some(TREE_GITATTRIBUTES.to_string()),
-            );
-            after.insert(GITATTRIBUTES_REL.to_string(), None);
+        for (rel, body) in [
+            (GITATTRIBUTES_REL, TREE_GITATTRIBUTES),
+            (GITIGNORE_REL, super::coursier_tree::GITIGNORE),
+        ] {
+            let created = records
+                .iter()
+                .any(|w| w.kind == OWNED_FILE_KIND && w.file == rel && op_of(w) == "create");
+            if created && read(rel).as_deref() == Some(body.as_bytes()) {
+                before.insert(rel.to_string(), Some(body.to_string()));
+                after.insert(rel.to_string(), None);
+            }
         }
     }
     JvmUnplan {
@@ -667,6 +678,117 @@ pub fn contains_module(read: ReadFn<'_>, rel: &str) -> bool {
 }
 
 pub(crate) type Gav = (String, String, String);
+
+/// `(groupId, artifactId, version, relativePath)` of a pom's `<parent>`.
+pub(crate) type PomParent = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// One `<dependency>` of a [`PomModel`], as written (no interpolation).
+#[derive(Debug, Clone)]
+pub(crate) struct PomDecl {
+    pub group: String,
+    pub artifact: String,
+    pub version: Option<String>,
+    pub scope: Option<String>,
+    pub optional: bool,
+    pub kind: Option<String>,
+}
+
+/// The parts of a pom a dependency-graph walk reads: coordinates, parent,
+/// `<properties>`, `<dependencies>`, `<dependencyManagement>` and modules
+/// of the project (and of its profiles when asked). Plugin dependencies and
+/// exclusions are never declarations.
+#[derive(Debug, Clone)]
+pub(crate) struct PomModel {
+    pub group: Option<String>,
+    pub artifact: Option<String>,
+    pub version: Option<String>,
+    /// `(groupId, artifactId, version, relativePath)` of `<parent>`.
+    pub parent: Option<PomParent>,
+    pub props: BTreeMap<String, String>,
+    pub deps: Vec<PomDecl>,
+    pub managed: Vec<PomDecl>,
+    pub modules: Vec<String>,
+    /// `(groupId, artifactId, version)` of
+    /// `<distributionManagement><relocation>`: a missing part keeps the
+    /// pom's own.
+    pub relocation: Option<(Option<String>, Option<String>, Option<String>)>,
+}
+
+/// [`PomModel`] of `text`; `include_profiles` adds every profile's
+/// dependencies, management and modules (an over-approximation of the
+/// active ones).
+pub(crate) fn pom_model(text: &str, include_profiles: bool) -> Result<PomModel, String> {
+    let doc = Doc::parse(text.to_string())?;
+    let project = doc.project;
+    let mut roots = vec![project];
+    if include_profiles {
+        if let Some(profiles) = doc.child(project, "profiles") {
+            roots.extend(doc.children(profiles, "profile"));
+        }
+    }
+    let decl = |dep: usize| -> Option<PomDecl> {
+        Some(PomDecl {
+            group: doc.child_text(dep, "groupId")?,
+            artifact: doc.child_text(dep, "artifactId")?,
+            version: doc.child_text(dep, "version").filter(|v| !v.is_empty()),
+            scope: doc.child_text(dep, "scope").filter(|v| !v.is_empty()),
+            optional: doc.child_text(dep, "optional").as_deref() == Some("true"),
+            kind: doc.child_text(dep, "type").filter(|v| !v.is_empty()),
+        })
+    };
+    let (mut deps, mut managed, mut modules) = (Vec::new(), Vec::new(), Vec::new());
+    for &root in &roots {
+        if let Some(list) = doc.child(root, "dependencies") {
+            deps.extend(doc.children(list, "dependency").filter_map(decl));
+        }
+        if let Some(list) = doc
+            .child(root, "dependencyManagement")
+            .and_then(|dm| doc.child(dm, "dependencies"))
+        {
+            managed.extend(doc.children(list, "dependency").filter_map(decl));
+        }
+        for (list, item) in [("modules", "module"), ("subprojects", "subproject")] {
+            if let Some(list) = doc.child(root, list) {
+                modules.extend(doc.children(list, item).map(|m| doc.text_of(m)));
+            }
+        }
+    }
+    let mut props = BTreeMap::new();
+    if let Some(p) = doc.child(project, "properties") {
+        for &c in &doc.nodes[p].children {
+            props.insert(doc.nodes[c].name.clone(), doc.text_of(c));
+        }
+    }
+    Ok(PomModel {
+        group: doc.child_text(project, "groupId"),
+        artifact: doc.child_text(project, "artifactId"),
+        version: doc.child_text(project, "version"),
+        parent: doc.child(project, "parent").map(|p| {
+            (
+                doc.child_text(p, "groupId"),
+                doc.child_text(p, "artifactId"),
+                doc.child_text(p, "version"),
+                doc.child(p, "relativePath").map(|r| doc.text_of(r)),
+            )
+        }),
+        props,
+        deps,
+        managed,
+        modules,
+        relocation: doc
+            .child(project, "distributionManagement")
+            .and_then(|dm| doc.child(dm, "relocation"))
+            .map(|r| {
+                let part = |name| doc.child_text(r, name).filter(|v| !v.is_empty());
+                (part("groupId"), part("artifactId"), part("version"))
+            }),
+    })
+}
 
 /// Poms from outside the checkout (parents, imported BOMs) by GAV, as a
 /// caller fetched them: `None` when looked up and unavailable.

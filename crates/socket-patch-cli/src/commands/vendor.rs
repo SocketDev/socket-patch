@@ -51,7 +51,7 @@ use crate::commands::apply::{representative_file, result_to_event, variant_match
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{
-    ApplyRequest, RevertedEntry, VendorRevertStep, VendoredBackend,
+    ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
@@ -865,28 +865,33 @@ fn format_revert_install_hint(cmd: &str) -> String {
     )
 }
 
-/// Run-level advisory shared by the `vendor` command and the scan-driven
+/// Run-level advisories shared by the `vendor` command and the scan-driven
 /// vendor step: warn (once, at the envelope level — not per package) when
 /// the project's classic `yarn.lock` carries vendored wiring that a stray
-/// yarn 2+ install would silently drop. The probe is state-based (it reads
-/// the on-disk lockfile), so callers invoke it unconditionally at
-/// envelope-finalize time — unwired projects and fully-reverted runs stay
-/// silent, and dry runs report the risk that already exists on disk.
+/// yarn 2+ install would silently drop, or that installs run from a
+/// workspace member directory cannot fetch (#691). The probes are
+/// state-based (they read the on-disk lockfile), so callers invoke them
+/// unconditionally at envelope-finalize time — unwired projects and
+/// fully-reverted runs stay silent, and dry runs report the risk that
+/// already exists on disk.
 pub(crate) fn note_classic_migration_risk(
     env: &mut Envelope,
     project_root: &Path,
     common: &GlobalArgs,
 ) {
-    let Some(w) = vendor::yarn_classic_berry_migration_risk(project_root) else {
-        return;
-    };
-    if !common.silent && !common.json {
-        eprintln!("Warning: {}", w.detail);
+    let warnings = [
+        vendor::yarn_classic_berry_migration_risk(project_root),
+        vendor::yarn_classic_workspace_member_risk(project_root),
+    ];
+    for w in warnings.into_iter().flatten() {
+        if !common.silent && !common.json {
+            eprintln!("Warning: {}", w.detail);
+        }
+        env.warnings.push(RunWarning {
+            code: w.code.to_string(),
+            detail: w.detail,
+        });
     }
-    env.warnings.push(RunWarning {
-        code: w.code.to_string(),
-        detail: w.detail,
-    });
 }
 
 /// The usage error for `vendor` under global scope, or `None` for a
@@ -925,6 +930,23 @@ pub async fn run(args: VendorArgs) -> i32 {
     }
     if args.check {
         return run_check(&args).await;
+    }
+    // Every other form rewires (or unwires) `--cwd`'s lockfiles and vendor
+    // ledger: a manifest in another project would split the run (#745).
+    // `--check` above reads the manifest's project throughout.
+    let form = if args.revert {
+        "vendor --revert"
+    } else {
+        "vendor"
+    };
+    if let Some(message) = crate::commands::foreign_manifest_conflict(&args.common, form) {
+        return crate::json_envelope::usage_error(
+            Command::Vendor,
+            args.common.json,
+            args.common.dry_run,
+            crate::commands::FOREIGN_MANIFEST_PROJECT,
+            &message,
+        );
     }
     apply_env_toggles(&args.common);
 
@@ -1208,6 +1230,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     } else {
         None
     };
+    let go_sync_issues = tokio::sync::OnceCell::new();
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1238,6 +1261,26 @@ async fn run_check(args: &VendorArgs) -> i32 {
             // `vex`'s `vendor_unwired`.
             if !discovery.vendor_entry_live(root, entry).await {
                 failure = Some(unwired_check_failure(discovery, root, key, entry).await);
+            }
+        }
+        // The committed copy and its `replace` can be intact while the
+        // project no longer builds: vendor/modules.txt or the go.mod
+        // requirements out of step with the `replace` (#343, #618).
+        if failure.is_none() && entry.ecosystem == "golang" {
+            if let Some((module, _)) = socket_patch_core::utils::purl::parse_golang_purl(key) {
+                let issues: Vec<String> = go_sync_issues
+                    .get_or_init(|| async {
+                        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new())
+                            .await
+                    })
+                    .await
+                    .iter()
+                    .filter(|issue| issue.module() == module)
+                    .map(ToString::to_string)
+                    .collect();
+                if !issues.is_empty() {
+                    failure = Some(issues.join("; "));
+                }
             }
         }
         if vendor::jvm::apply::upstream_unverified(entry) {
@@ -3750,6 +3793,22 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
+    // A vendored Go module builds only if the committed vendor/modules.txt
+    // and the go.mod requirements agree with its `replace` (#343, #618).
+    if !common.dry_run && records.keys().any(|p| p.starts_with("pkg:golang/")) {
+        let warnings = socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+            &common.cwd,
+            &HashMap::new(),
+        )
+        .await;
+        for (code, detail) in warnings {
+            if !common.json && !common.silent {
+                eprintln!("Warning: {detail}");
+            }
+            env.warnings.push(RunWarning { code, detail });
+        }
+    }
+
     // A rolled-back eject's summary would describe a vendoring that was
     // undone: the eject prints it itself once it knows the outcome (#1005).
     match eject {
@@ -4081,11 +4140,22 @@ pub(crate) async fn reconcile_dropped(
             // Drift-skip keep: the backend left the drifted lock alone and
             // kept the artifacts, so the ledger entry must survive too — and
             // the genuine outcome is a COUNTED skip, not a removal.
-            VendorRevertStep::Kept => env.record(
+            VendorRevertStep::Kept(KeepCause::Drift) => env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_revert_kept",
                     "patch no longer in manifest, but its lock entries drifted since \
                      vendoring; artifacts and ledger entry kept",
+                ),
+            ),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    format!(
+                        "patch no longer in manifest, but {}; artifacts and ledger entry \
+                         kept — {}",
+                        cause.reason(),
+                        cause.remedy("re-run `vendor`")
+                    ),
                 ),
             ),
             VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
@@ -4184,11 +4254,21 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             // the genuine outcome is a COUNTED skip, not a removal.
             // (`record_warning` above already surfaced the per-record
             // details as uncounted advisory events.)
-            VendorRevertStep::Kept => env.record(
+            VendorRevertStep::Kept(KeepCause::Drift) => env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_revert_kept",
                     "lock entries drifted since vendoring; artifacts and ledger entry kept \
                      — undo the drift and re-run `vendor --revert` to finish",
+                ),
+            ),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    format!(
+                        "{}; artifacts and ledger entry kept — {}",
+                        cause.reason(),
+                        cause.remedy("re-run `vendor --revert` to finish")
+                    ),
                 ),
             ),
             VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
@@ -4379,8 +4459,10 @@ pub(crate) struct VendorGcSummary {
     pub write_failures: Vec<(&'static str, String)>,
     /// The wet reverts' reinstall advisories (`code`, `detail`): Bun's
     /// `vendor_bun_reinstall_required` (#764) and vlt's
-    /// `vendor_vlt_reinstall_required`. Every other reverting command
-    /// surfaces these, and the GC must not drop them.
+    /// `vendor_vlt_reinstall_required`, and, for a manifest-dropped PyPI
+    /// entry under PDM, uv or Pipenv, `vendor_pypi_reinstall_required`
+    /// (#477). Every other reverting command surfaces these, and the GC
+    /// must not drop them.
     pub advisories: Vec<(&'static str, String)>,
 }
 
@@ -4393,6 +4475,7 @@ pub(crate) struct VendorGcSummary {
 const GC_FORWARDED_ADVISORIES: &[&str] = &[
     socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED,
     socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED,
+    crate::commands::pypi_reinstall::VENDOR_CODE,
 ];
 
 impl VendorGcSummary {
@@ -4471,8 +4554,13 @@ pub(crate) async fn run_vendor_gc(
     manifest_path: &Path,
     dry_run: bool,
 ) -> VendorGcSummary {
+    // The ledger, its artifacts and their wiring are the manifest's
+    // project's (#745): an agent-mode `scan --prune --manifest-path ../b/…`
+    // collects b's vendored state, never `--cwd`'s.
+    let rooted = common.at_project_root();
+    let common: &GlobalArgs = &rooted;
     let mut out = VendorGcSummary::default();
-    let mut state = match load_state(&common.cwd).await {
+    let mut state = match load_state(&common.project_root()).await {
         Ok(s) if !s.entries.is_empty() => s,
         // No ledger (or unreadable): only the orphan sweep could apply, and
         // without a trustworthy ledger it must not delete anything.
@@ -4496,7 +4584,19 @@ pub(crate) async fn run_vendor_gc(
                 continue;
             }
             let entry = state.entries.get(&purl).cloned().expect("listed above");
-            let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            let mut outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            // The patch left the manifest while the package stays locked:
+            // the restored lock pins the version the vendored build is
+            // installed as, which PDM, uv and Pipenv keep (#477).
+            if outcome.success && !outcome.kept_artifact {
+                crate::commands::pypi_reinstall::push_vendor_advisory(
+                    &common.cwd,
+                    &purl,
+                    entry.flavor.as_deref(),
+                    &mut outcome.warnings,
+                )
+                .await;
+            }
             out.take_advisories(&outcome);
             if !outcome.success {
                 out.failed.push(purl);
@@ -4574,7 +4674,7 @@ pub(crate) async fn run_vendor_gc(
         // artifacts; a failed ledger/manifest rewrite leaves records for
         // state that is gone, which must not pass silently.
         if ledger_dirty {
-            if let Err(e) = save_state(&common.cwd, &state).await {
+            if let Err(e) = save_state(&common.project_root(), &state).await {
                 let detail = format!(
                     "reverted vendored entries but could not update \
                      .socket/vendor/state.json: {e}"
@@ -5756,7 +5856,7 @@ mod gc_tests {
     /// listed exactly once. The wet pass removes it from the ledger in (a)
     /// before (b) runs; the dry-run preview leaves the ledger untouched, so
     /// without excluding (a)-handled purls from (b) the same purl lands in
-    /// both lists and `scan --prune`'s `revertableVendoredEntries` preview
+    /// both lists and `scan --prune --dry-run`'s `revertedVendoredEntries` preview
     /// duplicates it (breaking preview/wet parity).
     #[tokio::test]
     async fn vendor_gc_dry_run_lists_dropped_and_unused_entry_once() {

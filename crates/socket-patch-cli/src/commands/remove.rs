@@ -1,7 +1,10 @@
 use clap::Args;
+use socket_patch_core::api::blob_fetcher::{DIFF_ARCHIVE, PACKAGE_ARCHIVE};
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::ledgers::hosted_pins_matching;
-use socket_patch_core::manifest::cleanup_blobs::{format_bytes, ArtifactReferences};
+use socket_patch_core::manifest::cleanup_blobs::{
+    format_bytes, format_cleanup_result_for, ArtifactReferences,
+};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
@@ -18,8 +21,12 @@ use super::rollback::{rollback_patches_inner, InnerSelection};
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::hosted_unwind::{run_hosted_leg, HostedLegOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
-use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
+use crate::commands::vendored_backend::{
+    KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
+};
+use crate::json_envelope::{
+    Command, Envelope, EnvelopeError, GcReport, PatchAction, PatchEvent, Status,
+};
 use crate::ui::short_uuid;
 use crate::ui::{plural, sweep_failure};
 
@@ -342,7 +349,6 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let loud = !args.common.json && !args.common.silent;
 
     let manifest_path = args.common.resolved_manifest_path();
-    let cwd = &args.common.cwd;
 
     // ── state discovery ─────────────────────────────────────────────────
     // A manifest-less project (vendored mode keeps its records in the
@@ -361,14 +367,16 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let project_state = crate::commands::project_state_in_scope(&args.common);
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
     let hosted_inventory = if project_state {
-        crate::commands::hosted_inventory(&args.common, cwd).await
+        crate::commands::hosted_inventory(&args.common, &args.common.project_root()).await
     } else {
         Default::default()
     };
-    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
+    // Leftover `resolutions` selectors (#1203) unwind like pins: the
+    // restore retires them from the manifest.
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
     if manifest_missing {
         let vendor_ledger_exists = project_state
-            && tokio::fs::metadata(cwd.join(VENDOR_STATE_REL))
+            && tokio::fs::metadata(args.common.project_root().join(VENDOR_STATE_REL))
                 .await
                 .is_ok();
         if !vendor_ledger_exists && hosted_pins.is_empty() {
@@ -450,8 +458,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // the vendored leg. An unreadable ledger degrades to "nothing vendored"
     // for the rollback and fails closed at the vendored leg — exactly where
     // the run is about to mutate vendored state.
+    // From the manifest's project, like the manifest itself (#745).
     let vendor_state_result = if project_state {
-        load_state(cwd).await
+        load_state(&args.common.project_root()).await
     } else {
         Ok(VendorState::default())
     };
@@ -595,7 +604,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     // ── nested in-place rollback ────────────────────────────────────────
     // Vendor-owned purls are excluded from the in-place restore (the
-    // vendored leg below reverts them); an unreadable ledger degrades to
+    // vendored leg below reverts them) unless their Cargo shared-cache copy
+    // still carries an agent-mode patch (#336); an unreadable ledger degrades to
     // "nothing vendored" here and fails closed at that leg.
     let vendored_keys: HashSet<PurlKey> = vendor_state_result
         .as_ref()
@@ -863,11 +873,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // this is the only way the removal can be empty): the remove did
         // not happen. NOT not_found; partialFailure keeps `summary.removed`
         // honest at 0.
-        let msg = format!(
-            "{}: every matching entry's vendored state drift-kept; nothing was \
-             removed (re-run `scan --mode vendored` to normalize, then remove)",
-            args.identifier
-        );
+        let msg = all_kept_message(&args.identifier, &vendor_leg.kept_causes);
         track_patch_remove_failed(&msg, &telemetry).await;
         if args.common.json {
             let mut env = Envelope::new(Command::Remove);
@@ -961,8 +967,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
         &updated_manifest,
         retained_not_installed.iter().copied(),
     );
-    let mut blobs_removed = 0;
-    let mut archives_removed = 0;
+    // `None` under `--preserve-state` (no sweep ran): no `gc` in the JSON.
+    let mut gc: Option<GcReport> = None;
     if !args.preserve_state {
         let sweep = references.sweep(&socket_dir, args.common.dry_run).await;
         // repair's posture: a failed pass (or a pass that could not unlink
@@ -973,9 +979,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 eprintln!("Warning: {detail}");
             }
         }
-        if let Ok(r) = sweep.blobs {
-            blobs_removed = r.blobs_removed;
+        // The GC lines are one block, opened by a blank line.
+        let mut gc_printed = false;
+        if let Ok(r) = &sweep.blobs {
             if loud && r.blobs_removed > 0 {
+                gc_printed = true;
                 println!(
                     "\n{}",
                     format_blob_sweep(
@@ -989,16 +997,35 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
         // Obsolete diff and package archives are swept whole (parity with
         // repair and scan --prune).
-        for (dir, result) in [("diffs", sweep.diffs), ("packages", sweep.packages)] {
-            if let Some(detail) = sweep_failure(dir, &result) {
+        for (dir, noun, result) in [
+            ("diffs", DIFF_ARCHIVE, &sweep.diffs),
+            ("packages", PACKAGE_ARCHIVE, &sweep.packages),
+        ] {
+            if let Some(detail) = sweep_failure(dir, result) {
                 if loud {
                     eprintln!("Warning: {detail}");
                 }
             }
+            // The archives the sweep took are named like repair names them,
+            // so the human run accounts for everything `gc` reports.
             if let Ok(r) = result {
-                archives_removed += r.blobs_removed;
+                if loud && r.blobs_removed > 0 {
+                    if !gc_printed {
+                        println!();
+                    }
+                    gc_printed = true;
+                    println!(
+                        "{}",
+                        format_cleanup_result_for(r, args.common.dry_run, noun)
+                    );
+                }
             }
         }
+        gc = Some(GcReport::from_passes(
+            sweep.blobs.as_ref().ok(),
+            sweep.diffs.as_ref().ok(),
+            sweep.packages.as_ref().ok(),
+        ));
     }
 
     // The dry-run footer closes the whole preview, the blob-cleanup
@@ -1096,14 +1123,25 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // single-patch removal that happened to sweep an orphan blob.
         // Consumers read the blob/rollback totals from `details`, never
         // from `summary.removed`.
-        if blobs_removed > 0 || rollback_count > 0 || archives_removed > 0 {
-            env.events.push(
+        // The sweep's per-kind totals and byte count are also the
+        // envelope's `gc` (`summary.bytesFreed`), the shape every GC-running
+        // command prints.
+        let report = gc.unwrap_or_default();
+        if report.total_removed() > 0 || rollback_count > 0 {
+            let mut carrier =
                 PatchEvent::artifact(removal_action).with_details(serde_json::json!({
-                    "blobsRemoved": blobs_removed,
+                    "blobsRemoved": report.removed_blobs,
                     "rolledBack": rollback_count,
-                    "archivesRemoved": archives_removed,
-                })),
-            );
+                    "archivesRemoved": report.removed_diff_archives
+                        + report.removed_package_archives,
+                }));
+            if report.total_removed() > 0 {
+                carrier = carrier.with_bytes(report.bytes_freed);
+            }
+            env.events.push(carrier);
+        }
+        if let Some(gc) = gc {
+            env.set_gc(gc);
         }
         // Any drift-kept entry means part of the requested removal did
         // NOT happen: the run is a partialFailure (exit 1) even when
@@ -1124,19 +1162,60 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // above are gated, so name the outcome once here.
         if !args.common.json {
             eprintln!(
-                "Error: {} matching entr{} drift-kept (vendored state and manifest \
-                 record retained); re-run `scan --mode vendored` to normalize, then \
-                 remove again",
-                vendor_leg.kept.len(),
-                if vendor_leg.kept.len() == 1 {
-                    "y was"
-                } else {
-                    "ies were"
-                }
+                "Error: {}",
+                kept_error_line(&vendor_leg.kept_causes, "manifest record")
             );
         }
         1
     }
+}
+
+/// The top-level error when every matching vendored entry was kept: the
+/// drift wording and its normalize remedy only for drift-keeps (#1184).
+fn all_kept_message(identifier: &str, causes: &[KeepCause]) -> String {
+    if causes.iter().all(|c| *c == KeepCause::Drift) {
+        return format!(
+            "{identifier}: every matching entry's vendored state drift-kept; nothing was \
+             removed (re-run `scan --mode vendored` to normalize, then remove)"
+        );
+    }
+    format!(
+        "{identifier}: every matching entry's vendored state was kept; nothing was removed \
+         ({})",
+        kept_remedies(causes)
+    )
+}
+
+/// The human error line for kept entries (`retained` names the record kept
+/// beside the vendored state).
+fn kept_error_line(causes: &[KeepCause], retained: &str) -> String {
+    let n = causes.len();
+    let entries = if n == 1 { "y was" } else { "ies were" };
+    if causes.iter().all(|c| *c == KeepCause::Drift) {
+        return format!(
+            "{n} matching entr{entries} drift-kept (vendored state and {retained} \
+             retained); re-run `scan --mode vendored` to normalize, then remove again"
+        );
+    }
+    format!(
+        "{n} matching entr{entries} kept (vendored state and {retained} retained); {}",
+        kept_remedies(causes)
+    )
+}
+
+/// One remedy per distinct keep cause.
+fn kept_remedies(causes: &[KeepCause]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for cause in [KeepCause::Reference, KeepCause::Drift] {
+        if causes.contains(&cause) {
+            let remedy = cause.remedy("remove again");
+            out.push(match cause {
+                KeepCause::Reference => remedy,
+                KeepCause::Drift => format!("for a drift-kept entry, {remedy}"),
+            });
+        }
+    }
+    out.join("; ")
 }
 
 /// The vendored leg's envelope material, collected by
@@ -1149,9 +1228,11 @@ struct RemoveVendorLeg {
     /// Backend warnings, drift-keeps and preserved entries — `Skipped`
     /// events.
     skipped: Vec<PatchEvent>,
-    /// Ledger keys whose revert drift-kept: entry, artifact and any
+    /// Ledger keys whose revert kept the artifact: entry, artifact and any
     /// manifest record stay.
     kept: Vec<String>,
+    /// Why each [`Self::kept`] entry was kept (same order).
+    kept_causes: Vec<KeepCause>,
     /// Entries actually reverted and dropped from the ledger (wet runs).
     reverted_count: usize,
     /// Entries unwired with their artifact and ledger entry kept
@@ -1222,29 +1303,29 @@ async fn revert_vendored_matches(
                 );
                 return Err(1);
             }
-            VendorRevertStep::Kept => {
-                // Drift-keep: the lock changed under us and the backend
-                // left both the wiring and the artifact alone. Per the
-                // RevertOutcome contract the ledger entry stays — and so
-                // must any manifest entry, or `vendor`'s reconcile would
-                // re-revert an entry whose backing record is gone.
+            VendorRevertStep::Kept(cause) => {
+                // The backend kept the artifact (a drift-keep, or a file
+                // that still installs from it). Per the RevertOutcome
+                // contract the ledger entry stays — and so must any
+                // manifest entry, or `vendor`'s reconcile would re-revert
+                // an entry whose backing record is gone.
+                let reason = cause.reason();
                 let (note, detail) = if manifest_backed {
                     (
                         "; its manifest entry was kept too",
-                        "lockfile wiring drifted; vendored state and manifest entry kept",
+                        format!("{reason}; vendored state and manifest entry kept"),
                     )
                 } else {
                     (
                         "",
-                        "lockfile wiring drifted; vendored state and ledger entry kept",
+                        format!("{reason}; vendored state and ledger entry kept"),
                     )
                 };
                 if loud {
-                    eprintln!(
-                        "Warning: Kept vendored state for {key}: lockfile wiring drifted{note}"
-                    );
+                    eprintln!("Warning: Kept vendored state for {key}: {reason}{note}");
                 }
                 leg.kept.push(key.clone());
+                leg.kept_causes.push(cause);
                 leg.skipped.push(
                     PatchEvent::new(PatchAction::Skipped, key.clone())
                         .with_reason("vendor_revert_kept", detail),
@@ -1570,11 +1651,7 @@ async fn remove_ledger_only(
         // top-level error names the outcome — nothing was removed.
         env.mark_partial_failure();
         if leg.kept.len() == keys.len() {
-            let msg = format!(
-                "{}: every matching entry's vendored state drift-kept; nothing was \
-                 removed (re-run `scan --mode vendored` to normalize, then remove)",
-                args.identifier
-            );
+            let msg = all_kept_message(&args.identifier, &leg.kept_causes);
             track_patch_remove_failed(&msg, telemetry).await;
             env.error = Some(EnvelopeError::new("vendor_revert_kept", msg));
         }
@@ -1592,14 +1669,8 @@ async fn remove_ledger_only(
         // are gated, so name the outcome once here.
         if !args.common.json {
             eprintln!(
-                "Error: {} matching entr{} drift-kept (vendored state and ledger record \
-                 retained); re-run `scan --mode vendored` to normalize, then remove again",
-                leg.kept.len(),
-                if leg.kept.len() == 1 {
-                    "y was"
-                } else {
-                    "ies were"
-                }
+                "Error: {}",
+                kept_error_line(&leg.kept_causes, "ledger record")
             );
         }
         1

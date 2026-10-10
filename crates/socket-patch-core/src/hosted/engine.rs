@@ -49,8 +49,9 @@ use super::guidance::{
     npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_replace_registry_host_detail,
     plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
     pnpm_lock_version_major, pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
-    pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_not_needed_detail,
-    pnpm_trust_policy_preamble, pnpm_trust_rush_detail, pnpm_trust_workspace_unreadable_detail,
+    pnpm_trust_keyless_members_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
+    pnpm_trust_not_needed_detail, pnpm_trust_policy_preamble, pnpm_trust_rush_detail,
+    pnpm_trust_scaffolded_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
     TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
     PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
@@ -631,6 +632,63 @@ pub async fn read_candidate_files(
         for rel in crate::utils::cargo_workspace::member_manifests_in(view) {
             out.read(view, unreadable, &rel).await;
         }
+    }
+
+    // NuGet merges the user config and every parent directory's config
+    // under the project's own: a catch-all mapping the rewriter creates
+    // must name their sources too (#354). Disk only (the in-memory engine
+    // refuses NuGet, and could not see them).
+    if candidates.iter().any(|c| c.dep.ecosystem == "nuget")
+        && !matches!(view, ProjectView::Memory(_))
+    {
+        // The configs live outside the project: read beside the view, then
+        // handed to it as such reads (asking for its raw root would end a
+        // re-scan read cache's recording).
+        if let Some(root) = view.disk_root_reading(std::iter::empty::<&str>()) {
+            let (inherited, touched) =
+                crate::vendor::nuget_config::inherited_source_keys_traced(root).await;
+            view.disk_root_reading(&touched);
+            out.files.insert(
+                crate::patch::redirect::NUGET_INHERITED_SOURCES_KEY.to_string(),
+                inherited.keys.join("\n"),
+            );
+            if inherited.mapped {
+                out.files.insert(
+                    crate::patch::redirect::NUGET_INHERITED_MAPPING_KEY.to_string(),
+                    String::new(),
+                );
+            }
+        }
+    }
+
+    // NuGet: the root config routes every project under the root, so each
+    // project's lock is pinned with it (#353, #514). The walk's answer rides
+    // a synthetic key (the lock paths, an unevaluable NuGetLockFilePath, or
+    // why the tree could not be listed) and every lock is read. The project
+    // files themselves stay out of the candidate texts. NuGet is disk-only
+    // (the in-memory engine refuses it).
+    if candidates.iter().any(|c| c.dep.ecosystem == "nuget")
+        && !matches!(view, ProjectView::Memory(_))
+    {
+        let mut lines: Vec<String> = Vec::new();
+        match crate::vendor::nuget_config::governed_locks_in(view).await {
+            Ok(governed) => {
+                for (project, detail) in &governed.unresolved {
+                    lines.push(format!("unresolved\t{project}\t{detail}"));
+                }
+                for rel in governed.locks {
+                    if !out.files.contains_key(&rel) {
+                        out.read(view, unreadable, &rel).await;
+                    }
+                    lines.push(format!("lock\t{rel}"));
+                }
+            }
+            Err(why) => lines.push(format!("error\t{why}")),
+        }
+        out.files.insert(
+            crate::patch::redirect::NUGET_LOCKS_KEY.to_string(),
+            lines.join("\n"),
+        );
     }
 
     for path in view.python_lock_paths() {
@@ -2240,15 +2298,31 @@ fn pnpm_trust(
             original: None,
             new: Some(serde_json::json!("true")),
         };
-        // No workspace file and a project pinned to pnpm 9.0–10.4: creating
-        // one would make it a root-only workspace those releases refuse
-        // `pnpm add` in, for a key they never read (#734).
+        // No workspace file (or one with no keys, which pnpm reads the
+        // same) and a project pinned to pnpm 9.0–10.4: creating one would
+        // make it a root-only workspace those releases refuse `pnpm add`
+        // in, for a key they never read (#734, #1096).
         let pinned_pre_10_5 = match &workspace {
-            Ok(None) if !symlinked => root_only_workspace_breaks_add(view),
+            Ok(text)
+                if !symlinked
+                    && text
+                        .as_deref()
+                        .is_none_or(crate::formats::pnpm::workspace::is_keyless) =>
+            {
+                root_only_workspace_breaks_add(view)
+            }
             _ => None,
         };
+        // A keyless file the lock was installed from as a multi-package
+        // workspace: only pnpm <= 10.4 reads one that way (every nested
+        // package), and the root-only scaffold would drop those members.
+        let keyless_members = pinned_pre_10_5.is_none()
+            && !symlinked
+            && matches!(&workspace, Ok(Some(text)) if crate::formats::pnpm::workspace::is_keyless(text))
+            && lock_lists_members(view);
         match workspace {
-            Ok(None) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
+            Ok(_) if keyless_members => pnpm_trust_keyless_members_detail(&server, options.dry_run),
+            Ok(_) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
                 &server,
                 pinned_pre_10_5.as_deref().unwrap_or_default(),
                 options.dry_run,
@@ -2265,6 +2339,10 @@ fn pnpm_trust(
                 TrustPlan::Append(text) => {
                     trust_config_write = Some((text, trust_edit("added")));
                     pnpm_trust_configured_detail(&server, false, options.dry_run)
+                }
+                TrustPlan::Scaffold(text) => {
+                    trust_config_write = Some((text, trust_edit("added")));
+                    pnpm_trust_scaffolded_detail(&server, options.dry_run)
                 }
                 TrustPlan::AlreadyTrue => {
                     pnpm_rerun_only = spliced_pnpm_locks == 0;
@@ -2383,7 +2461,17 @@ fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
 /// and the installed `node_modules/.modules.yaml`, both advisory: FIFO-safe
 /// on disk, and an in-memory entry that is not text counts as absent.
 fn root_only_workspace_breaks_add(view: &ProjectView<'_>) -> Option<String> {
-    let read = |rel: &str| match view {
+    let read = |rel: &str| read_advisory_text(view, rel);
+    pnpm_root_only_workspace_breaks_add(
+        read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
+        read("node_modules/.modules.yaml").as_deref(),
+    )
+}
+
+/// A project text file read for advice only: FIFO-safe on disk, and an
+/// in-memory entry that is not text (or is a link) counts as absent.
+fn read_advisory_text(view: &ProjectView<'_>, rel: &str) -> Option<String> {
+    match view {
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
             let cwd = view.disk_root().expect("a disk view has a root");
             crate::utils::fs::read_regular_to_string_sync(&cwd.join(rel)).ok()
@@ -2393,11 +2481,20 @@ fn root_only_workspace_breaks_add(view: &ProjectView<'_>) -> Option<String> {
             _ => None,
         },
         ProjectView::Memory(_) => None,
-    };
-    pnpm_root_only_workspace_breaks_add(
-        read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
-        read("node_modules/.modules.yaml").as_deref(),
-    )
+    }
+}
+
+/// Whether the root `pnpm-lock.yaml` lists workspace members besides the
+/// root: with a keyless pnpm-workspace.yaml that marks a pnpm <= 10.4
+/// install (see [`crate::formats::pnpm::workspace::lock_has_member_importers`]).
+fn lock_lists_members(view: &ProjectView<'_>) -> bool {
+    read_advisory_text(view, "pnpm-lock.yaml").is_some_and(|text| {
+        let doc =
+            crate::formats::pnpm::grammar::main_document(crate::formats::text::strip_bom(&text));
+        crate::formats::pnpm::workspace::lock_has_member_importers(
+            &crate::formats::pnpm::lines::split_lines(doc),
+        )
+    })
 }
 
 /// The ancestor `pnpm-workspace.yaml` governing a disk project's pnpm

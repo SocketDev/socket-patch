@@ -95,6 +95,7 @@ fn is_owned_file(rel: &str) -> bool {
     [
         maven_reactor::GITATTRIBUTES_REL,
         gradle::GITATTRIBUTES_REL,
+        gradle::GITIGNORE_REL,
         gradle::SCRIPT_GITATTRIBUTES_REL,
         gradle::VENDOR_GITATTRIBUTES_REL,
         gradle::SCRIPT_REL,

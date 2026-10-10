@@ -96,7 +96,7 @@ fn go_sum_line_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// `golang.org/x/mod/semver.Compare`: build metadata (`+incompatible`) is
 /// ignored and an invalid version sorts before every valid one.
-fn go_semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn go_semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     let parse = |v: &str| {
         v.strip_prefix('v')
             .and_then(|s| semver::Version::parse(s).ok())

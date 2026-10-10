@@ -525,7 +525,8 @@ async fn restore_maven_metadata(
 
 /// The owned files a Gradle tree needs beside its directory: the derived
 /// `maven-metadata.xml` (recomputed from the committed index) and the
-/// `.gitattributes` the entry created, rewritten when missing. Needs no
+/// `.gitattributes` / tree-root `.gitignore` the entry created, rewritten
+/// when missing. Needs no
 /// download, so `repair` also runs it for a healthy entry.
 pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result<(), String> {
     use super::jvm::gradle;
@@ -554,6 +555,17 @@ pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result
     for rel in [gradle::GITATTRIBUTES_REL, gradle::SCRIPT_GITATTRIBUTES_REL] {
         if created(rel) {
             wanted.push((rel.to_string(), "* -text\n".to_string()));
+        }
+    }
+    for rel in [
+        gradle::GITIGNORE_REL,
+        super::jvm::maven_reactor::GITIGNORE_REL,
+    ] {
+        if created(rel) {
+            wanted.push((
+                rel.to_string(),
+                super::jvm::coursier_tree::GITIGNORE.to_string(),
+            ));
         }
     }
     if created(gradle::VENDOR_GITATTRIBUTES_REL) {

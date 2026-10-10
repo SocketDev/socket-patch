@@ -274,7 +274,25 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
     {
         return Err(conflict);
     }
+    // Hosted and vendored mode rewire `--cwd`'s lockfiles and vendor
+    // ledger: a manifest in another project would split the run (#745).
+    if let Some(conflict) = foreign_mode_conflict(args) {
+        return Err(conflict);
+    }
     Ok(())
+}
+
+/// [`crate::commands::foreign_manifest_conflict`] for a resolved hosted or
+/// vendored `args.mode`.
+fn foreign_mode_conflict(args: &ScanArgs) -> Option<String> {
+    args.mode
+        .filter(|mode| *mode != ScanMode::Agent)
+        .and_then(|mode| {
+            crate::commands::foreign_manifest_conflict(
+                &args.common,
+                &format!("--mode {}", mode.cli_name()),
+            )
+        })
 }
 
 #[derive(Args, Clone)]
@@ -969,20 +987,20 @@ pub(super) struct OverlapTakeover {
 /// [`classify_overlap_takeover_with`] over the on-disk state: the
 /// lockfiles' hosted pins and the committed vendored ledger.
 #[cfg(test)]
-pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -> OverlapTakeover {
+pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, root: &Path) -> OverlapTakeover {
     // A malformed vendor ledger classifies like a missing one (this path
     // only feeds takeover warnings; corruption is a hard error on the
     // write/attest paths).
-    let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
+    let vendor = socket_patch_core::vendor::load_state(root).await.ok();
     // Nothing vendored, nothing to overlap: skip the lockfile walk (#993).
     let Some(vendor) = vendor.filter(|v| !v.entries.is_empty()) else {
         return OverlapTakeover::default();
     };
-    let discovery = crate::commands::discover_wiring(common, cwd).await;
+    let discovery = crate::commands::discover_wiring(common, root).await;
     let redirect = crate::commands::hosted_state_from_pins(
         &socket_patch_core::patch::redirect::upstream::HostedPin::all(&discovery),
     );
-    classify_overlap_takeover_with(cwd, Some(&redirect), Some(&vendor), &discovery).await
+    classify_overlap_takeover_with(root, Some(&redirect), Some(&vendor), &discovery).await
 }
 
 /// [`classify_overlap_takeover`] over already-loaded state (the hosted
@@ -1729,6 +1747,8 @@ async fn run_scan(
             .is_some_and(|conflict| conflict == message);
         let code = if global {
             "global_scope_unsupported"
+        } else if foreign_mode_conflict(&args).is_some_and(|conflict| conflict == message) {
+            crate::commands::FOREIGN_MANIFEST_PROJECT
         } else {
             "invalid_args"
         };
@@ -1751,6 +1771,15 @@ async fn run_scan(
             }
             Err(message) => return scan_usage_error(&args, "mode_ambiguous", &message),
         }
+    }
+    // Hosted and vendored mode refused a foreign manifest above; agent mode
+    // (and a report-only scan) still refuses one under `--vex`: it patches
+    // `--cwd`'s installed copies, the document attests the manifest's
+    // project (#745).
+    if let Some(message) =
+        crate::commands::foreign_manifest_vex_conflict(&args.common, &args.vex, "scan")
+    {
+        return scan_usage_error(&args, crate::commands::FOREIGN_MANIFEST_PROJECT, &message);
     }
 
     // The repo's socket.yml policy, read once per invocation before any
@@ -1852,8 +1881,7 @@ async fn run_scan(
     let manifest_path = args.common.resolved_manifest_path();
     // The stores, lock set and wiring discovery this run reads before it
     // writes anything, each loaded at most once (see `ProjectContext`).
-    let ctx =
-        crate::commands::context::ProjectContext::rooted(&args.common, args.common.cwd.clone());
+    let ctx = crate::commands::context::ProjectContext::new(&args.common);
     let socket_dir = args.common.socket_dir();
 
     let overrides = args.common.api_client_overrides();

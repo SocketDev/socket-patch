@@ -256,7 +256,7 @@ impl VendoredBackend<'_> {
     /// from `--vendor-source` over the run's client, built only when there
     /// is something to re-vendor.
     pub(crate) async fn repair(&self, req: RepairRequest<'_>, env: &mut Envelope) -> usize {
-        let common = self.common;
+        let common: &GlobalArgs = &self.common;
         let quiet = common.json || common.silent;
         let mut repaired = 0usize;
 

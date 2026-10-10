@@ -638,7 +638,8 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
 
 /// `scan --json --dry-run --sync --yes` previews the full sync action:
 /// `apply.patches[]` is populated with would-be actions and `gc`
-/// reports `prunable*`/`orphan*` counts, but nothing on disk changes.
+/// reports the would-be `pruned*`/`removed*` counts, but nothing on disk
+/// changes.
 #[test]
 #[ignore]
 fn test_scan_dry_run_sync_previews_apply_and_gc() {
@@ -673,15 +674,15 @@ fn test_scan_dry_run_sync_previews_apply_and_gc() {
     let v = parse_scan_json(&stdout);
 
     // Preview output present.
-    let prunable = v["gc"]["prunableManifestEntries"]
+    let prunable = v["gc"]["prunedManifestEntries"]
         .as_array()
-        .expect("gc.prunableManifestEntries array");
+        .expect("gc.prunedManifestEntries array");
     assert!(
         prunable.iter().any(|p| p == NPM_PURL),
         "preview should list minimist as prunable; got {prunable:?}"
     );
     assert!(
-        v["gc"]["orphanBlobs"].as_u64().unwrap_or(0) >= 1,
+        v["gc"]["removedBlobs"].as_u64().unwrap_or(0) >= 1,
         "preview should count at least 1 orphan blob"
     );
     assert_eq!(v["apply"]["dryRun"], true);

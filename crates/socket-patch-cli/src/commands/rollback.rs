@@ -27,7 +27,9 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs};
 use crate::commands::hosted_unwind::run_hosted_leg;
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
+use crate::commands::vendored_backend::{
+    KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
+};
 use crate::ecosystem_dispatch::{
     distinct_npm_copies, find_all_packages_for_rollback, partition_purls, JvmScope,
 };
@@ -346,9 +348,23 @@ fn bun_reinstall_advised<'a>(mut codes: impl Iterator<Item = &'a str>) -> bool {
     })
 }
 
+/// The qualifiers the generic reinstall note gets next to a Bun (#764) or
+/// PyPI (#477) reinstall advisory.
+fn reinstall_qualifiers(bun: bool, pypi: bool) -> String {
+    format!(
+        "{}{}",
+        if bun { BUN_REINSTALL_QUALIFIER } else { "" },
+        if pypi {
+            crate::commands::pypi_reinstall::NOTE_QUALIFIER
+        } else {
+            ""
+        }
+    )
+}
+
 /// The reinstall note for packages whose wiring was undone but whose
 /// installed tree still holds patched bytes.
-fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool) -> String {
+fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool, pypi: bool) -> String {
     let keep = match (still_patched == 1, dry_run) {
         (true, false) => "keeps its",
         (true, true) => "would keep its",
@@ -359,7 +375,7 @@ fn format_reinstall_note(still_patched: usize, dry_run: bool, bun: bool) -> Stri
         "Note: {} {keep} patched bytes in installed trees until the next \
          package-manager install{}.",
         plural(still_patched, "unwired package", "unwired packages"),
-        if bun { BUN_REINSTALL_QUALIFIER } else { "" }
+        reinstall_qualifiers(bun, pypi)
     )
 }
 
@@ -794,9 +810,17 @@ async fn run_vendored_leg(
                 }
                 out.failed.push((key, why));
             }
-            VendorRevertStep::Kept => out.kept.push((
+            VendorRevertStep::Kept(KeepCause::Drift) => out.kept.push((
                 key,
                 "lockfile wiring drifted; vendored state left untouched".to_string(),
+            )),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => out.kept.push((
+                key,
+                format!(
+                    "{}; vendored state kept — {}",
+                    cause.reason(),
+                    cause.remedy("roll back again")
+                ),
             )),
             VendorRevertStep::WouldRevert if preserve => {
                 if loud {
@@ -839,6 +863,9 @@ async fn run_vendored_leg(
 /// describe (v5 never writes it; it is read only for migration). A wet run
 /// only; a failure is a warning (the file is inert).
 pub(crate) async fn retire_legacy_redirect_ledger(common: &GlobalArgs) -> Option<(String, String)> {
+    // The manifest's project's ledger and lockfiles (#745).
+    let rooted = common.at_project_root();
+    let common: &GlobalArgs = &rooted;
     let path = common
         .cwd
         .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
@@ -910,6 +937,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     let manifest_path = args.common.resolved_manifest_path();
     let cwd = args.common.cwd.clone();
+    // The project state — vendor ledger, its artifacts, the lockfiles'
+    // hosted pins and vendor references — belongs to the manifest's project
+    // (#745): with `--manifest-path` into another project, rollback unwinds
+    // THAT project's state, under that project's apply lock, and never
+    // touches `--cwd`'s. Installed copies are still found from `--cwd`.
+    let ledger_root = args.common.project_root();
 
     // ── state discovery ─────────────────────────────────────────────────
     // Rollback infers what to undo from three sources: the manifest
@@ -931,17 +964,19 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let project_state = crate::commands::project_state_in_scope(&args.common);
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
     let vendor_ledger_exists = project_state
-        && tokio::fs::metadata(cwd.join(".socket/vendor/state.json"))
+        && tokio::fs::metadata(ledger_root.join(".socket/vendor/state.json"))
             .await
             .is_ok();
     // The hosted pins the lockfiles wire (read-only discovery; the restore
     // re-reads every file under the lock before it writes).
     let hosted_inventory = if project_state {
-        crate::commands::hosted_inventory(&args.common, &cwd).await
+        crate::commands::hosted_inventory(&args.common, &ledger_root).await
     } else {
         Default::default()
     };
-    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
+    // Leftover `resolutions` selectors (#1203) unwind like pins: the
+    // restore retires them from the manifest.
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
 
     if manifest_missing && !vendor_ledger_exists && hosted_pins.is_empty() {
         // Hosted wiring the lockfiles name but cannot attribute is still
@@ -953,7 +988,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // Only a pre-v5 hosted ledger left: no lockfile pins it any more,
         // so there is nothing to restore — retire the stale file (a wet run
         // only) instead of failing on the missing manifest.
-        let legacy = cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+        let legacy = ledger_root.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
         if project_state && tokio::fs::symlink_metadata(&legacy).await.is_ok() {
             let warning = retire_legacy_redirect_ledger(&args.common).await;
             if args.common.json {
@@ -995,7 +1030,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // ledger holds the pre-vendor originals, so it must come back from
         // version control first.)
         let wired = if project_state {
-            crate::commands::vendored_backend::repair::scan_vendor_references(&cwd).await
+            crate::commands::vendored_backend::repair::scan_vendor_references(&ledger_root).await
         } else {
             Default::default()
         };
@@ -1053,7 +1088,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // vendored manifest records (see the cleanup below): no vendored leg
     // runs, and the ledger does not own the global copies, so the in-place
     // leg restores them.
-    let loaded_vendor_state = socket_patch_core::vendor::load_state(&cwd).await;
+    let loaded_vendor_state = socket_patch_core::vendor::load_state(&ledger_root).await;
     let project_vendored_keys: HashSet<PurlKey> = loaded_vendor_state
         .as_ref()
         .map(VendorState::purl_keys)
@@ -1502,6 +1537,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     if vendored_excluded.contains(purl) {
                         return vendored_reverted_ok(purl);
                     }
+                    // A vendored Cargo crate whose shared-cache copy the
+                    // in-place leg restored too (#336) needs BOTH legs done.
+                    if purl_keys_cover(&vendored_keys, purl) && !vendored_reverted_ok(purl) {
+                        return false;
+                    }
                     succeeded_purls.contains(*purl)
                         || not_installed.contains(purl)
                         || superseded.contains(purl)
@@ -1547,26 +1587,22 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         .map(String::as_str),
                 );
                 let sweep = references.sweep(&socket_dir, args.common.dry_run).await;
-                let mut removed_counts = [0usize; 3];
-                for (slot, (label, result)) in removed_counts.iter_mut().zip([
-                    ("blob", sweep.blobs),
-                    ("diffs", sweep.diffs),
-                    ("packages", sweep.packages),
-                ]) {
-                    if let Some(detail) = crate::ui::sweep_failure(label, &result) {
+                for (label, result) in [
+                    ("blob", &sweep.blobs),
+                    ("diffs", &sweep.diffs),
+                    ("packages", &sweep.packages),
+                ] {
+                    if let Some(detail) = crate::ui::sweep_failure(label, result) {
                         run_warnings.push(("cleanup_failed".into(), detail));
                     }
-                    if let Ok(r) = result {
-                        *slot = r.blobs_removed;
-                        gc_bytes_freed += r.bytes_freed;
-                    }
                 }
-                gc_json = serde_json::json!({
-                    "removedBlobs": removed_counts[0],
-                    "removedDiffArchives": removed_counts[1],
-                    "removedPackageArchives": removed_counts[2],
-                    "bytesFreed": gc_bytes_freed,
-                });
+                let report = crate::json_envelope::GcReport::from_passes(
+                    sweep.blobs.as_ref().ok(),
+                    sweep.diffs.as_ref().ok(),
+                    sweep.packages.as_ref().ok(),
+                );
+                gc_bytes_freed = report.bytes_freed;
+                gc_json = report.to_value();
             }
 
             // ── run-level warnings ───────────────────────────────────────
@@ -1580,17 +1616,20 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     .chain(hosted_leg.warnings.iter())
                     .map(|(code, _)| code.as_str()),
             );
+            let pypi_advised = crate::commands::pypi_reinstall::advised(
+                vendored_leg
+                    .warnings
+                    .iter()
+                    .chain(hosted_leg.warnings.iter())
+                    .map(|(code, _)| code.as_str()),
+            );
             if unwired_any {
                 run_warnings.push((
                     "reinstall_required".into(),
                     format!(
                         "unwired packages keep their patched bytes in installed trees until \
                          the next package-manager install{}",
-                        if bun_advised {
-                            BUN_REINSTALL_QUALIFIER
-                        } else {
-                            ""
-                        }
+                        reinstall_qualifiers(bun_advised, pypi_advised)
                     ),
                 ));
             }
@@ -1681,6 +1720,29 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .filter(|r| r.success && all_files_already_original(r))
                 .count();
             let failed_count = results.iter().filter(|r| !r.success).count();
+            // The top-level counters span every leg (#1066): a vendored or
+            // hosted unwind is a rollback, and a drift-keep, failure or
+            // unsupported hosted target is a failure, exactly as each one
+            // drives the status. A package wired through two legs counts
+            // once per leg; the per-leg arrays below say which.
+            let rolled_back_total = rolled_back_count
+                + vendored_leg.reverted.len()
+                + vendored_leg.preserved.len()
+                + hosted_leg.reverted.len();
+            let failed_total = failed_count
+                + vendored_leg.kept.len()
+                + vendored_leg.failed.len()
+                + hosted_leg.failed.len()
+                + hosted_leg.unsupported.len();
+            // Something failed and nothing reached the unpatched end state
+            // (rolled back, already original, or not installed): the run
+            // failed as a whole, so the status is an error (with `error`),
+            // not a partial failure.
+            let total_failure = !success
+                && failed_total > 0
+                && rolled_back_total == 0
+                && already_original_count == 0
+                && not_installed.is_empty();
 
             if let Some(e) = &manifest_write_failed {
                 if !args.common.json {
@@ -1697,11 +1759,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 // always present so consumers never null-check.
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    serde_json::to_string_pretty(&{
+                        let mut out = serde_json::json!({
                         "status": if success { "success" } else { "partial_failure" },
-                        "rolledBack": rolled_back_count,
+                        "rolledBack": rolled_back_total,
                         "alreadyOriginal": already_original_count,
-                        "failed": failed_count,
+                        "failed": failed_total,
                         "dryRun": args.common.dry_run,
                         "warnings": run_warnings
                             .iter()
@@ -1757,7 +1820,21 @@ pub async fn run(args: RollbackArgs) -> i32 {
                             .map(result_to_json)
                             .chain(not_installed.iter().map(|p| skipped_not_installed_json(p)))
                             .collect::<Vec<_>>(),
-                    }))
+                        });
+                        if total_failure {
+                            crate::json_envelope::set_error(
+                                &mut out,
+                                crate::json_envelope::EnvelopeError::new(
+                                    "rollback_failed",
+                                    format!(
+                                        "nothing was rolled back: {}",
+                                        plural(failed_total, "patch failed", "patches failed")
+                                    ),
+                                ),
+                            );
+                        }
+                        out
+                    })
                     .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else if !args.common.silent && !results.is_empty() {
@@ -1876,7 +1953,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 if still_patched > 0 {
                     println!(
                         "\n{}",
-                        format_reinstall_note(still_patched, args.common.dry_run, bun_advised)
+                        format_reinstall_note(
+                            still_patched,
+                            args.common.dry_run,
+                            bun_advised,
+                            pypi_advised
+                        )
                     );
                 }
             }
@@ -1906,7 +1988,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             if success {
-                track_patch_rolled_back(rolled_back_count, &telemetry).await;
+                track_patch_rolled_back(rolled_back_total, &telemetry).await;
             } else {
                 track_patch_rollback_failed("One or more rollbacks failed", &telemetry).await;
             }
@@ -1947,7 +2029,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
 /// The in-place (agent) rollback engine over an already-loaded `manifest`.
 /// `vendored_keys` is the ledger's ownership set (see
 /// [`VendorState::purl_keys`]): vendor-owned purls are excluded from the
-/// in-place restore. Both `run()` and `remove`'s delegation load each
+/// in-place restore, except a vendored Cargo crate whose shared-cache copy
+/// still carries an agent-mode patch (#336). Both `run()` and `remove`'s delegation load each
 /// store once under the lock and thread it in here.
 pub(crate) async fn rollback_patches_inner(
     common: &GlobalArgs,
@@ -2018,9 +2101,32 @@ pub(crate) async fn rollback_patches_inner(
     // ledger-key / base-purl / qualifier-stripped triple; the caller
     // degrades unreadable state to "nothing vendored".
     let is_vendored = |p: &str| purl_keys_cover(vendored_keys, p);
-    let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
+    let (vendored_targets, mut patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
         .into_iter()
         .partition(|p| is_vendored(&p.purl));
+    // Except a vendored Cargo crate whose shared registry-cache copy still
+    // carries an earlier agent-mode patch (#336): vendoring never touched
+    // that copy, and the manifest record about to be dropped holds the only
+    // before-blobs that can restore it. Only a copy that is actually
+    // patched is restored — the vendored copy under `.socket/vendor/` is
+    // never a rollback location — so a plain vendored crate (cache copy
+    // absent or pristine) is skipped exactly as before. A project `vendor/`
+    // dir (`cargo vendor`) hides the registry cache from the crawl, so its
+    // copies are looked up there too: the record is dropped after this run,
+    // and an unrestored copy would be orphaned with no before-blobs.
+    let vendored_purls: Vec<String> = vendored_targets.iter().map(|p| p.purl.clone()).collect();
+    let cache_patched = crate::ecosystem_dispatch::cargo_copies_still_patched(
+        manifest,
+        &vendored_purls,
+        &common.crawler_options(),
+        &blobs_path,
+        true,
+    )
+    .await;
+    let (cache_targets, vendored_targets): (Vec<_>, Vec<_>) = vendored_targets
+        .into_iter()
+        .partition(|p| cache_patched.contains(&p.purl));
+    patches_to_rollback.extend(cache_targets);
     let mut vendored_skipped: Vec<String> = vendored_targets.into_iter().map(|p| p.purl).collect();
     vendored_skipped.sort();
     if patches_to_rollback.is_empty() {
@@ -2094,6 +2200,24 @@ pub(crate) async fn rollback_patches_inner(
         common.silent || common.json,
     )
     .await;
+    // The shared-cache copies of the vendored Cargo crates restored above
+    // (#336), including those a `cargo vendor` dir hides from the crawl.
+    let cache_purls: Vec<String> = cache_patched
+        .into_iter()
+        .filter(|p| in_scope.contains(p))
+        .collect();
+    if !cache_purls.is_empty() {
+        let shadowed =
+            crate::ecosystem_dispatch::find_cargo_copies(cache_purls, &crawler_options, true).await;
+        for (purl, paths) in shadowed {
+            let copies = all_packages_multi.entry(purl).or_default();
+            for path in paths {
+                if !copies.contains(&path) {
+                    copies.push(path);
+                }
+            }
+        }
+    }
     // One restore per physical copy, as apply patches them (#633).
     distinct_npm_copies(&mut all_packages_multi).await;
 
@@ -2657,6 +2781,33 @@ pub(crate) async fn rollback_patches_inner(
             }
         }
         results.push(result);
+    }
+
+    // Dropping a `replace` leaves a committed vendor/modules.txt recording
+    // it, which breaks every vendored build until it is regenerated (#343).
+    if !common.dry_run
+        && results
+            .iter()
+            .any(|r| r.success && is_local_go(&r.package_key, common))
+    {
+        let none = std::collections::HashMap::new();
+        warnings.extend(
+            socket_patch_core::vendor::go_consumer_sync::audit_warnings(&common.cwd, &none).await,
+        );
+    }
+
+    // The restored crates' compiled copies in this project's build cache
+    // still hold the patched code cargo keyed on the package id (#387).
+    if !common.dry_run {
+        warnings.extend(
+            socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                &common.cwd,
+                results
+                    .iter()
+                    .filter(|r| r.success && !r.files_rolled_back.is_empty())
+                    .map(|r| r.package_key.as_str()),
+            ),
+        );
     }
 
     superseded_left.sort();
@@ -5384,12 +5535,12 @@ mod tests {
     #[test]
     fn reinstall_note_tense_and_number() {
         assert_eq!(
-            format_reinstall_note(1, false, false),
+            format_reinstall_note(1, false, false, false),
             "Note: 1 unwired package keeps its patched bytes in installed trees until the \
              next package-manager install."
         );
         assert_eq!(
-            format_reinstall_note(2, true, false),
+            format_reinstall_note(2, true, false, false),
             "Note: 2 unwired packages would keep their patched bytes in installed trees \
              until the next package-manager install."
         );
@@ -5400,7 +5551,7 @@ mod tests {
     #[test]
     fn reinstall_note_defers_to_the_bun_advisory() {
         assert_eq!(
-            format_reinstall_note(1, false, true),
+            format_reinstall_note(1, false, true, false),
             "Note: 1 unwired package keeps its patched bytes in installed trees until the \
              next package-manager install (Bun: a plain `bun install` keeps them; run \
              `bun install --force`)."
@@ -5413,6 +5564,24 @@ mod tests {
         ));
         assert!(!bun_reinstall_advised(
             ["redirect_vlt_reinstall_required"].into_iter()
+        ));
+    }
+
+    /// #477: next to a PyPI reinstall advisory the note must not imply
+    /// that the next sync refreshes the copy.
+    #[test]
+    fn reinstall_note_defers_to_the_pypi_advisory() {
+        let note = format_reinstall_note(1, false, false, true);
+        assert!(
+            note.contains("(PDM, uv and Pipenv keep a same-version install")
+                && note.contains("pypi_reinstall_required"),
+            "{note}"
+        );
+        assert!(crate::commands::pypi_reinstall::advised(
+            ["vendor_pypi_reinstall_required"].into_iter()
+        ));
+        assert!(crate::commands::pypi_reinstall::advised(
+            ["redirect_pypi_reinstall_required"].into_iter()
         ));
     }
 }

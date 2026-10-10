@@ -32,6 +32,14 @@ pub(crate) struct NugetConfig {
     pub(crate) mappings: Vec<(String, Vec<String>)>,
     /// Keys `configuration/disabledPackageSources` turns off.
     pub(crate) disabled: BTreeSet<String>,
+    /// `configuration/packageSources` holds a `<clear />`: the sources every
+    /// farther config (parent directories, the user config) defined are
+    /// dropped, and only the ones after it count.
+    pub(crate) sources_cleared: bool,
+    /// Where each `mappings` row sits (parallel to it): the whole
+    /// `<packageSource>` element and each of its pattern tags, so a writer can
+    /// set one aside and put it back byte-exact.
+    pub(crate) mapping_spans: Vec<MappingSpan>,
     /// Live XML locations for writers. Routing readers and writers share
     /// the same treatment of comments, quoted attributes and element scope.
     pub(crate) configuration: Option<ConfigSection>,
@@ -40,6 +48,15 @@ pub(crate) struct NugetConfig {
     /// Preserve the routing reader's behavior on repeated sections, but do
     /// not let a writer guess which occurrence should receive an edit.
     pub(crate) repeated_sections: bool,
+}
+
+/// The byte ranges of one `packageSourceMapping/packageSource` element.
+#[derive(Debug, Clone)]
+pub(crate) struct MappingSpan {
+    /// The whole element, open tag through close tag.
+    pub(crate) element: Range<usize>,
+    /// Each `<package pattern=…/>` tag, parallel to the row's patterns.
+    pub(crate) patterns: Vec<Range<usize>>,
 }
 
 #[derive(Debug)]
@@ -65,6 +82,11 @@ fn section_mut<'a>(
 }
 
 fn record_clear(cfg: &mut NugetConfig, parents: &[&str], end: usize) {
+    if parents == ["configuration", "packageSources"] {
+        cfg.sources_cleared = true;
+        // NuGet drops what the file itself defined before the `<clear />`.
+        cfg.sources.clear();
+    }
     let section = match parents {
         ["configuration", "packageSources"] => cfg.package_sources.as_mut(),
         ["configuration", "packageSourceMapping"] => cfg.source_mapping.as_mut(),
@@ -98,6 +120,11 @@ pub(crate) fn parse_config(text: &str) -> Option<NugetConfig> {
     let mut stack: Vec<&str> = Vec::new();
     // Index into `cfg.mappings` of the open `<packageSource>` element.
     let mut open_mapping: Option<usize> = None;
+    // Index into `cfg.mapping_spans` of the open `<packageSource>` element.
+    let mut open_span: Option<usize> = None;
+    // `(span, pattern)` of an open (not self-closing) `<package>` element:
+    // its span runs through its close tag.
+    let mut open_pattern: Option<(usize, usize)> = None;
     let mut i = 0;
     while let Some(rel) = text[i..].find('<') {
         let at = i + rel;
@@ -124,6 +151,18 @@ pub(crate) fn parse_config(text: &str) -> Option<NugetConfig> {
             if name == "clear" {
                 record_clear(&mut cfg, &stack, i);
             }
+            if name == "package"
+                && stack[..] == ["configuration", "packageSourceMapping", "packageSource"]
+            {
+                if let Some((span, pattern)) = open_pattern.take() {
+                    cfg.mapping_spans[span].patterns[pattern].end = i;
+                }
+            }
+            if name == "packageSource" && stack[..] == ["configuration", "packageSourceMapping"] {
+                if let Some(idx) = open_span.take() {
+                    cfg.mapping_spans[idx].element.end = i;
+                }
+            }
         } else {
             let (tag, consumed) = parse_open_tag(&rest[1..])?;
             i = at + 1 + consumed;
@@ -140,7 +179,25 @@ pub(crate) fn parse_config(text: &str) -> Option<NugetConfig> {
             if tag.name == "clear" && tag.self_closing {
                 record_clear(&mut cfg, &stack, i);
             }
+            let (rows, patterns) = (
+                cfg.mappings.len(),
+                open_mapping.map(|idx| cfg.mappings[idx].1.len()),
+            );
             visit(&stack, &tag, &mut cfg, &mut open_mapping);
+            if cfg.mappings.len() > rows {
+                cfg.mapping_spans.push(MappingSpan {
+                    element: at..i,
+                    patterns: Vec::new(),
+                });
+                open_span = (!tag.self_closing).then(|| cfg.mapping_spans.len() - 1);
+            } else if let (Some(idx), Some(before)) = (open_mapping, patterns) {
+                if cfg.mappings[idx].1.len() > before {
+                    cfg.mapping_spans[idx].patterns.push(at..i);
+                    if !tag.self_closing {
+                        open_pattern = Some((idx, cfg.mapping_spans[idx].patterns.len() - 1));
+                    }
+                }
+            }
             if !tag.self_closing {
                 if stack.len() >= MAX_XML_DEPTH {
                     return None;
@@ -294,6 +351,120 @@ fn decode_entities(raw: &str) -> String {
     out
 }
 
+/// The package source keys NuGet merges from `chain`, farthest config first
+/// (the user config, then each parent directory down to the nearest): a
+/// config's `<clear />` drops every source a farther one defined. Keys keep
+/// their first-seen order; a nearer redefinition keeps its place.
+pub(crate) fn effective_source_keys<'a>(
+    chain: impl IntoIterator<Item = &'a NugetConfig>,
+) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for cfg in chain {
+        if cfg.sources_cleared {
+            keys.clear();
+        }
+        for (key, _) in &cfg.sources {
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+    }
+    keys
+}
+
+/// The comment a writer sets a competing mapping element aside in while the
+/// Socket source `key` is wired: `<!-- {key} moved: {element} -->`.
+fn set_aside_open(key: &str) -> String {
+    format!("<!-- {key} moved: ")
+}
+const SET_ASIDE_CLOSE: &str = " -->";
+
+/// Set aside every OTHER source's exact pattern for `id` (#462).
+///
+/// NuGet routes a package by its most specific pattern, and an exact id is
+/// as specific as it gets: when another source also names `id` exactly
+/// (Visual Studio's mapping UI writes such lists), the two tie and NuGet
+/// takes the package from whichever answers first — the patched bytes or
+/// the upstream ones. So while the Socket source `key` is wired, each such
+/// pattern is commented out where it stands (the whole `<packageSource>`
+/// when it was its only pattern: NuGet rejects an element with none), in a
+/// comment naming `key` that [`restore_set_aside`] turns back into the
+/// original bytes. A `socket-patch-*` key is no exception: the key alone
+/// proves nothing about the feed behind it (a stale uuid, or any URL under a
+/// Socket-looking name), and only the source this run wires may serve `id`.
+///
+/// `Ok((text, keys))` with the sources set aside (empty: nothing competed);
+/// `Err` when an element cannot be put in a comment (it holds `--`).
+pub(crate) fn set_aside_competing_patterns(
+    text: &str,
+    cfg: &NugetConfig,
+    key: &str,
+    id: &str,
+) -> Result<(String, Vec<String>), String> {
+    // The key opens the comment: `--` in it could close the comment early.
+    if key.contains("--") {
+        return Err(format!(
+            "source key {key} cannot name a set-aside comment (it holds `--`)"
+        ));
+    }
+    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    for ((source, patterns), span) in cfg.mappings.iter().zip(&cfg.mapping_spans) {
+        if source == key {
+            continue;
+        }
+        let hits: Vec<usize> = (0..patterns.len())
+            .filter(|&j| patterns[j].eq_ignore_ascii_case(id))
+            .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        if hits.len() == patterns.len() {
+            cuts.push(span.element.clone());
+        } else {
+            cuts.extend(hits.iter().map(|&j| span.patterns[j].clone()));
+        }
+        if !keys.contains(source) {
+            keys.push(source.clone());
+        }
+    }
+    cuts.sort_by_key(|r| std::cmp::Reverse(r.start));
+    let mut out = text.to_string();
+    for cut in cuts {
+        let inner = &text[cut.clone()];
+        if inner.contains("--") {
+            return Err(format!(
+                "nuget.config maps {id} to {} too, in markup that cannot be set aside in a comment",
+                keys.join(", ")
+            ));
+        }
+        out.replace_range(
+            cut,
+            &format!("{}{inner}{SET_ASIDE_CLOSE}", set_aside_open(key)),
+        );
+    }
+    Ok((out, keys))
+}
+
+/// Undo [`set_aside_competing_patterns`] for `key`: every comment it wrote
+/// becomes the original markup again, byte for byte.
+pub(crate) fn restore_set_aside(text: &str, key: &str) -> String {
+    let open = set_aside_open(key);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(&open) {
+        let after = &rest[at + open.len()..];
+        let Some(end) = after.find(SET_ASIDE_CLOSE) else {
+            break;
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(&after[..end]);
+        rest = &after[end + SET_ASIDE_CLOSE.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Encode `value` for a double-quoted attribute: the inverse of
 /// [`parse_config`]'s decoding, so a key read as `a&b` is written back as
 /// `a&amp;b` and keeps its identity.
@@ -315,5 +486,108 @@ mod tests {
         assert_eq!(super::decode_entities("a&amp;b&lt;&#x2F;&#47;"), "a&b<//");
         assert_eq!(super::decode_entities("&bogus;&"), "&bogus;&");
         assert_eq!(super::decode_entities("&#xD800;"), "&#xD800;");
+    }
+
+    #[test]
+    fn clear_drops_earlier_and_farther_sources() {
+        let cfg = super::parse_config(
+            "<configuration><packageSources><add key=\"old\" value=\"x\" /><clear /><add key=\"new\" value=\"y\" /></packageSources></configuration>",
+        )
+        .unwrap();
+        assert!(cfg.sources_cleared);
+        assert_eq!(cfg.sources, [("new".to_string(), "y".to_string())]);
+        let parent = super::parse_config(
+            "<configuration><packageSources><add key=\"a\" value=\"x\" /></packageSources></configuration>",
+        )
+        .unwrap();
+        let plain = super::parse_config(
+            "<configuration><packageSources><add key=\"b\" value=\"x\" /><add key=\"a\" value=\"z\" /></packageSources></configuration>",
+        )
+        .unwrap();
+        assert_eq!(super::effective_source_keys([&parent, &plain]), ["a", "b"]);
+        assert_eq!(super::effective_source_keys([&parent, &cfg]), ["new"]);
+    }
+
+    const COMPETING: &str = "<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n      <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n    <packageSource key=\"corp\">\n      <package pattern=\"newtonsoft.json\" />\n    </packageSource>\n    <packageSource key=\"socket-patch-u\">\n      <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n";
+
+    /// #462: another source's exact pattern for the id is set aside (the
+    /// whole element when it is its only pattern) and restored byte-exact.
+    #[test]
+    fn competing_exact_patterns_are_set_aside_and_restored() {
+        let cfg = super::parse_config(COMPETING).unwrap();
+        assert_eq!(cfg.mapping_spans.len(), cfg.mappings.len());
+        let (out, keys) = super::set_aside_competing_patterns(
+            COMPETING,
+            &cfg,
+            "socket-patch-u",
+            "NEWTONSOFT.JSON",
+        )
+        .unwrap();
+        assert_eq!(keys, ["nuget.org", "corp"]);
+        let after = super::parse_config(&out).unwrap();
+        let exact: Vec<&str> = after
+            .mappings
+            .iter()
+            .filter(|(_, p)| p.iter().any(|p| p.eq_ignore_ascii_case("newtonsoft.json")))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(exact, ["socket-patch-u"], "{out}");
+        assert!(after
+            .mappings
+            .iter()
+            .any(|(k, p)| k == "nuget.org" && p == &["*"]));
+        assert_eq!(super::restore_set_aside(&out, "socket-patch-u"), COMPETING);
+        // Idempotent: nothing left to set aside.
+        let (again, keys) =
+            super::set_aside_competing_patterns(&out, &after, "socket-patch-u", "Newtonsoft.Json")
+                .unwrap();
+        assert!(keys.is_empty());
+        assert_eq!(again, out);
+        // A `<package>` written with a close tag is set aside whole.
+        let open_close = COMPETING
+            .replace(
+                "<package pattern=\"newtonsoft.json\" />",
+                "<package pattern=\"newtonsoft.json\"></package>",
+            )
+            .replacen(
+                "<package pattern=\"Newtonsoft.Json\" />",
+                "<package pattern=\"Newtonsoft.Json\">\n      </package>",
+                1,
+            );
+        let cfg2 = super::parse_config(&open_close).unwrap();
+        let (out2, _) = super::set_aside_competing_patterns(
+            &open_close,
+            &cfg2,
+            "socket-patch-u",
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        assert!(super::parse_config(&out2).is_some(), "{out2}");
+        assert_eq!(
+            super::restore_set_aside(&out2, "socket-patch-u"),
+            open_close
+        );
+        // A key that could close the comment is refused.
+        assert!(super::set_aside_competing_patterns(
+            COMPETING,
+            &cfg,
+            "socket-patch-x-->",
+            "Newtonsoft.Json"
+        )
+        .is_err());
+        // A Socket-looking key is a competitor like any other.
+        let lookalike = COMPETING.replace("key=\"corp\"", "key=\"socket-patch-evil\"");
+        let cfg3 = super::parse_config(&lookalike).unwrap();
+        let (out3, keys3) = super::set_aside_competing_patterns(
+            &lookalike,
+            &cfg3,
+            "socket-patch-u",
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        assert_eq!(keys3, ["nuget.org", "socket-patch-evil"]);
+        assert_eq!(super::restore_set_aside(&out3, "socket-patch-u"), lookalike);
+        // Another key's markers are not ours to restore.
+        assert_eq!(super::restore_set_aside(&out, "socket-patch-v"), out);
     }
 }

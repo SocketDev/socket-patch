@@ -385,7 +385,32 @@ fn repair_offline_removes_orphan_blob() {
     assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
     assert_eq!(v["status"], "success");
-    assert_eq!(v["summary"]["removed"], 1, "one orphan should be removed");
+    // The paths CLI_CONTRACT.md's "GC summary" jq recipe reads (#1257): the
+    // shared `gc` object, its bytes mirrored into `summary.bytesFreed`.
+    let freed = b"orphaned content".len() as u64;
+    assert_eq!(
+        v["gc"],
+        serde_json::json!({
+            "removedBlobs": 1,
+            "removedDiffArchives": 0,
+            "removedPackageArchives": 0,
+            "bytesFreed": freed,
+        }),
+        "{v:#}"
+    );
+    assert_eq!(v["summary"]["bytesFreed"], freed);
+    assert_eq!(v["summary"]["failed"], 0);
+    // The GC carrier event carries the bytes but is not a removed patch
+    // entry, so `summary.removed` stays 0.
+    assert_eq!(v["summary"]["removed"], 0, "{v:#}");
+    let carrier = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "removed")
+        .expect("GC carrier event");
+    assert_eq!(carrier["bytes"], freed);
+    assert_eq!(carrier["details"]["count"], 1);
 
     // The referenced blob must survive; the orphan must be gone.
     assert!(
@@ -437,8 +462,10 @@ fn repair_dry_run_does_not_remove_orphan_blob() {
         "dry-run must report both blobs as checked; got {}",
         verified[0]
     );
-    // Summary must mirror the preview: one verified, zero actually removed.
-    assert_eq!(v["summary"]["verified"], 1);
+    // The preview is reported in `gc` (would-remove counts, like rollback's
+    // dry-run `gc`); the carrier bumps no counter, and nothing was removed.
+    assert_eq!(v["gc"]["removedBlobs"], 1, "{v:#}");
+    assert_eq!(v["summary"]["verified"], 0);
     assert_eq!(
         v["summary"]["removed"], 0,
         "dry-run must not record any actual removals"
@@ -495,6 +522,8 @@ fn repair_download_only_skips_cleanup() {
             .all(|e| e["action"] != "removed" && e["action"] != "verified"),
         "--download-only must emit no cleanup event; got events={events:?}"
     );
+    assert!(v.get("gc").is_none(), "no sweep ran, so no `gc`: {v:#}");
+    assert_eq!(v["summary"]["bytesFreed"], 0);
     // Both the referenced blob and the orphan must survive untouched.
     assert!(
         socket.join("blobs").join(REFERENCED_HASH).exists(),

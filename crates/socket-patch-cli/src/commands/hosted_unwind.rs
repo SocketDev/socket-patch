@@ -42,6 +42,9 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
     use socket_patch_core::patch::redirect::upstream::{
         restore_upstream, PinStatus, RestoreOptions,
     };
+    // The pins are the manifest's project's (#745): restore them there.
+    let rooted = common.at_project_root();
+    let common: &GlobalArgs = &rooted;
 
     let mut out = HostedLegOutcome::default();
     if pins.is_empty() {
@@ -127,6 +130,22 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
                 "redirect_bun_reinstall_required".to_string(),
                 bun_lock::reinstall_advisory(&stale),
             ));
+        }
+    }
+    // PDM, uv and Pipenv keep a same-version install through a plain sync
+    // (#477): name the reinstall that restores the upstream bytes.
+    if outcome.flush_error.is_none() {
+        use crate::commands::pypi_reinstall::{advisory, Tool, HOSTED_CODE};
+        let unwound: Vec<(String, Tool)> = outcome
+            .restored()
+            .filter(|pin| pin.purl.starts_with("pkg:pypi/"))
+            .filter_map(|pin| {
+                let tool = pin.files.iter().find_map(|f| Tool::of_file(f))?;
+                Some((pin.purl.clone(), tool))
+            })
+            .collect();
+        if let Some(detail) = advisory(&common.cwd, &unwound).await {
+            out.warnings.push((HOSTED_CODE.to_string(), detail));
         }
     }
     let unwound: Vec<_> = vlt_targets

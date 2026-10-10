@@ -1802,6 +1802,7 @@ packages:
                 created_pnpm_table: true,
                 created_workspace_file: false,
                 created_workspace_overrides: false,
+                created_workspace_packages: false,
             })
         );
         assert_eq!(entry.artifact.path, fx.rel_tgz());

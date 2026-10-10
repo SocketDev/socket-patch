@@ -9,6 +9,7 @@ pub mod hosted_bundle;
 pub(crate) mod hosted_unwind;
 pub mod list;
 pub(crate) mod lock_cli;
+pub(crate) mod pypi_reinstall;
 pub mod remove;
 pub mod repair;
 pub mod rollback;
@@ -149,6 +150,63 @@ pub(crate) fn global_mode_conflict(
         "{} cannot be used with --mode {}: global installs have no project lockfile to {why}",
         global_scope_flag(common),
         mode.cli_name(),
+    ))
+}
+
+/// The usage-error code of [`foreign_manifest_conflict`].
+pub(crate) const FOREIGN_MANIFEST_PROJECT: &str = "manifest_path_foreign_project";
+
+/// The usage error for a form that writes `--cwd`'s lockfiles and vendor
+/// ledger (`scan`/`get --mode hosted|vendored`, `vendor` other than
+/// `--check`) when `--manifest-path` resolves into another project, or
+/// `None`. Every store a run reads or writes belongs to ONE project — the
+/// manifest's ([`crate::args::GlobalArgs::project_root`]; #745) — and these
+/// forms rewire the lockfiles of `--cwd`, so there is no single project to
+/// write. `what` names the refused form (`--mode vendored`, `vendor`).
+pub(crate) fn foreign_manifest_conflict(
+    common: &crate::args::GlobalArgs,
+    what: &str,
+) -> Option<String> {
+    if !common.manifest_project_is_foreign() {
+        return None;
+    }
+    let root = common.project_root();
+    Some(format!(
+        "{what} cannot be used with a --manifest-path in another project: it rewires the \
+         lockfiles and vendor ledger of --cwd ({}), but the manifest belongs to {}. Run it \
+         from the manifest's project (--cwd {}) or drop --manifest-path",
+        common.cwd.display(),
+        root.display(),
+        root.display(),
+    ))
+}
+
+/// The usage error for an embedded `--vex` (`apply`, agent-mode `scan`)
+/// when `--manifest-path` resolves into another project, or `None` (no
+/// `--vex`, or the manifest is `--cwd`'s own). Same code as
+/// [`foreign_manifest_conflict`]. These forms patch `--cwd`'s installed
+/// copies, but the document's other sources — product, ledgers, lockfile
+/// wiring — belong to the manifest's project (#745), so one document would
+/// attest one project from another's state. Re-rooting the run instead
+/// would verify copies the run never patched. Standalone `vex` runs wholly
+/// in the manifest's project and stays allowed. `host` names the command.
+pub(crate) fn foreign_manifest_vex_conflict(
+    common: &crate::args::GlobalArgs,
+    vex: &vex::VexEmbedArgs,
+    host: &str,
+) -> Option<String> {
+    if vex.vex.is_none() || !common.manifest_project_is_foreign() {
+        return None;
+    }
+    let root = common.project_root();
+    Some(format!(
+        "--vex cannot be used with a --manifest-path in another project: {host} patches the \
+         installed packages of --cwd ({}), but the manifest belongs to {}, so the VEX \
+         document would mix the two projects. Run it from the manifest's project (--cwd {}), \
+         drop --manifest-path, or generate the document separately with `socket-patch vex`",
+        common.cwd.display(),
+        root.display(),
+        root.display(),
     ))
 }
 

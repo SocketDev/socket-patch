@@ -327,7 +327,7 @@ fn rhs_is_path(tok: &str) -> bool {
 /// Parse the `module path => target [version]` body of a replace directive
 /// (the part after the `replace` keyword, or a line inside a `replace ( … )`
 /// block). Returns `None` if there is no `=>` (not a replace body).
-fn parse_replace_body(body: &str) -> Option<ReplaceEntry> {
+pub(crate) fn parse_replace_body(body: &str) -> Option<ReplaceEntry> {
     let (lhs, rhs) = body.split_once("=>")?;
     let lhs: Vec<&str> = lhs.split_whitespace().map(unquote).collect();
     let rhs: Vec<&str> = rhs.split_whitespace().map(unquote).collect();
@@ -362,6 +362,19 @@ pub fn parse_replace_entries(content: &str) -> Vec<ReplaceEntry> {
     let mut out = Vec::new();
     let _ = for_each_directive_body(content, "replace", |_, body| {
         out.extend(parse_replace_body(body));
+        Ok(())
+    });
+    out
+}
+
+/// Parse a `go.work` file's `use` directives into the member directories
+/// they name (as written, unquoted), single-line and block form alike.
+pub fn parse_use_dirs(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let _ = for_each_directive_body(content, "use", |_, body| {
+        if let Some(tok) = body.split_whitespace().next() {
+            out.push(unquote(tok).to_string());
+        }
         Ok(())
     });
     out

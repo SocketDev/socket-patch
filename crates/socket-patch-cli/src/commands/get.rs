@@ -821,7 +821,7 @@ async fn filter_to_installed_purls(
     let found = find_packages_for_rollback(&partitioned, &common.crawler_options(), true).await;
     let mut present: HashSet<PurlKey> = found.keys().map(|k| PurlKey::new(k)).collect();
 
-    let ctx = super::context::ProjectContext::rooted(common, common.cwd.clone());
+    let ctx = super::context::ProjectContext::new(common);
     // Manifest membership counts as presence (read-only probe: a corrupt
     // manifest degrades to "no extension" here — the download path's
     // fail-closed read still guards every write).
@@ -1053,6 +1053,22 @@ pub async fn run(args: GetArgs) -> i32 {
             args.common.json,
             args.common.dry_run,
             "global_scope_unsupported",
+            &conflict,
+        );
+    }
+    // Hosted and vendored mode rewire `--cwd`'s lockfiles and vendor
+    // ledger: a manifest in another project would split the run (#745).
+    if let Some(conflict) = (mode != super::scan::ScanMode::Agent)
+        .then(|| {
+            super::foreign_manifest_conflict(&args.common, &format!("--mode {}", mode.cli_name()))
+        })
+        .flatten()
+    {
+        return usage_error(
+            JsonCommand::Get,
+            args.common.json,
+            args.common.dry_run,
+            super::FOREIGN_MANIFEST_PROJECT,
             &conflict,
         );
     }
@@ -2055,7 +2071,7 @@ async fn save_and_apply_patch(
     let mut warnings: Vec<String> = Vec::new();
     if changed {
         warn_on_vendored_uuid_drift(
-            &args.common.cwd,
+            &args.common.project_root(),
             quiet,
             &[serde_json::json!({
                 "purl": patch.purl,
@@ -2320,8 +2336,8 @@ async fn run_get_vendored(
         //
         // Human: `Error (<code>): <detail>` on stderr — an error, so it is
         // exempt from `--silent` like every other `Error (…)` line here.
-        bun_refusal = bun_vendor_preflight(&args.common.cwd, selected).await;
-        let ledger = load_state(&args.common.cwd).await;
+        bun_refusal = bun_vendor_preflight(&args.common.project_root(), selected).await;
+        let ledger = load_state(&args.common.project_root()).await;
         vlt_refusals = vlt_vendor_preflight_selected(
             &args.common.cwd,
             selected,
@@ -2380,7 +2396,7 @@ async fn run_get_vendored(
         .unwrap_or_default();
     let (dl_code, mut result, records) = if prefetched.is_some() {
         // The preflight above already read the lock: hand its outcome down.
-        let vendor_state = load_state(&args.common.cwd).await;
+        let vendor_state = load_state(&args.common.project_root()).await;
         Box::pin(download_patch_records_preflighted(
             selected,
             &params,

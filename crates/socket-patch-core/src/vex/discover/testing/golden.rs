@@ -132,6 +132,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
         install_trees,
         read: _,
         withheld: _,
+        stale_selectors,
         // Already folded into `unattested` by the time a run returns.
         unwired_copies: _,
     } = out;
@@ -262,6 +263,21 @@ fn render(out: &Discovery, root: &Path) -> Value {
     }
     if !shadowed.is_empty() {
         rendered["shadowed"] = shadowed.iter().map(render_ref).collect::<Vec<_>>().into();
+    }
+    if !stale_selectors.is_empty() {
+        rendered["stale_selectors"] = stale_selectors
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "file": path_str(&s.file),
+                    "selector": s.selector,
+                    "url": s.url,
+                    "purl": s.purl,
+                    "uuid": s.uuid,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
     }
     if !rewirable.is_empty() {
         rendered["rewirable"] = rewirable.iter().map(render_ref).collect::<Vec<_>>().into();

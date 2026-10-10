@@ -347,8 +347,8 @@ async fn scan_vendor_dry_run_reports_already_vendored() {
 
 /// `scan --json --mode vendored --dry-run --prune` (a legal combination —
 /// `--mode vendored` conflicts only with `--mode agent`/`--sync`): the vendor JSON
-/// path's dry-run arm must emit the GC PREVIEW (`prunable*`/`orphan*`
-/// field names, per `to_preview_json`) and mutate nothing on disk.
+/// path's dry-run arm must emit the GC PREVIEW (the one `gc` shape minus
+/// the wet-only keys) and mutate nothing on disk.
 #[tokio::test]
 async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
     let mock = MockServer::start().await;
@@ -377,17 +377,17 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
         .as_object()
         .unwrap_or_else(|| panic!("--prune must emit a gc sub-object; envelope={v}"));
     assert_eq!(
-        gc["prunableManifestEntries"],
+        gc["prunedManifestEntries"],
         serde_json::json!([STALE_PURL]),
         "envelope={v}"
     );
     assert!(
-        gc.contains_key("bytesReclaimable") && gc.contains_key("orphanBlobs"),
-        "dry+prune must use the preview field names; gc={gc:?}"
+        gc.contains_key("bytesFreed") && gc.contains_key("removedBlobs"),
+        "dry+prune uses the one gc shape; gc={gc:?}"
     );
     assert!(
-        !gc.contains_key("prunedManifestEntries") && !gc.contains_key("bytesFreed"),
-        "dry+prune must not use the mutating pass's field names; gc={gc:?}"
+        !gc.contains_key("keptVendoredEntries") && !gc.contains_key("failedVendoredEntries"),
+        "dry+prune must not claim the wet-only vendored checks; gc={gc:?}"
     );
 
     // Nothing mutated: the stale entry survives byte-for-byte.
@@ -417,7 +417,7 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["vendor"]["dryRun"], true, "envelope={v}");
     assert_eq!(
-        v["gc"]["prunableManifestEntries"],
+        v["gc"]["prunedManifestEntries"],
         serde_json::json!([STALE_PURL]),
         "the lock-free preview lists under a held lock: {v}"
     );
