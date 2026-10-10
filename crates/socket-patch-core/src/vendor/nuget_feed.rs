@@ -40,6 +40,10 @@ const CONFIG_SOURCE_WIRING_KIND: &str = "nuget_config_source";
 const CONFIG_MAPPING_WIRING_KIND: &str = "nuget_config_mapping";
 const LOCK_WIRING_KIND: &str = "nuget_lock_entry";
 
+/// `<uuid>/.gitignore`, exactly: re-include the vendored nupkg against the
+/// user's ignore rules (VisualStudio.gitignore's `*.nupkg`), #1061.
+const UUID_GITIGNORE: &str = "!*\n";
+
 /// The implicit default public NuGet source, seeded as the catch-all target
 /// when a from-scratch `<packageSourceMapping>` would otherwise have no
 /// pre-existing source to fan `*` out to (a socket-only mapping NU1100s every
@@ -174,6 +178,14 @@ async fn nuget_prelude(
     let uuid_dir = project_root.join(&uuid_dir_rel);
     let nupkg_path = project_root.join(&copy_rel);
     let source_key = crate::patch::redirect::generation::hosted_pin_name(&record.uuid);
+
+    // The nupkg must survive the commit the vendored workflow ends with: a
+    // rule ignoring the uuid dir itself can't be undone from inside it.
+    if let Some((code, detail)) =
+        super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await
+    {
+        return Err(refused(code, detail));
+    }
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
@@ -378,6 +390,10 @@ pub async fn vendor_nuget(
     // originals, and re-recording here would clobber them.
     if config_wired {
         if in_sync {
+            // A dir vendored before the re-include existed gains it now.
+            if !dry_run {
+                let _ = write_uuid_gitignore(&uuid_dir).await;
+            }
             return done(
                 already_patched_result(purl, &nupkg_path, &record.files),
                 None,
@@ -837,12 +853,19 @@ async fn materialise_patched_nupkg(
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
     match service_archive_copy(service, record, name, ".nupkg", warnings).await {
         Ok(bytes) => {
-            if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
+            let unwind = || async {
                 if !config_wired {
                     let _ = remove_tree(uuid_dir).await;
                     prune_empty_vendor_levels(uuid_dir).await;
                 }
+            };
+            if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
+                unwind().await;
                 return Err(Box::new(refused("vendor_prebuilt_write_failed", e)));
+            }
+            if let Err(refusal) = keep_nupkg_committable(uuid_dir, nupkg_path, warnings).await {
+                unwind().await;
+                return Err(Box::new(refusal));
             }
             Ok((
                 bytes,
@@ -853,14 +876,62 @@ async fn materialise_patched_nupkg(
     }
 }
 
-/// Write `bytes` to `nupkg_path`, creating the uuid dir. Errors are strings.
+/// Write `bytes` to `nupkg_path`, creating the uuid dir and its
+/// re-including `.gitignore`. Errors are strings.
 async fn write_nupkg(uuid_dir: &Path, nupkg_path: &Path, bytes: &[u8]) -> Result<(), String> {
     tokio::fs::create_dir_all(uuid_dir)
         .await
         .map_err(|e| format!("cannot create {}: {e}", uuid_dir.display()))?;
     atomic_write_artifact(nupkg_path, bytes)
         .await
-        .map_err(|e| format!("cannot write {}: {e}", nupkg_path.display()))
+        .map_err(|e| format!("cannot write {}: {e}", nupkg_path.display()))?;
+    write_uuid_gitignore(uuid_dir).await
+}
+
+/// Write `<uuid>/.gitignore` ([`UUID_GITIGNORE`]) unless it already holds
+/// it, in either line ending: a `core.autocrlf` checkout spells it `!*\r\n`,
+/// and rewriting that to LF would dirty the tree on every re-vendor.
+async fn write_uuid_gitignore(uuid_dir: &Path) -> Result<(), String> {
+    let path = uuid_dir.join(".gitignore");
+    if read_regular_to_string(&path)
+        .await
+        .is_ok_and(|text| text.replace("\r\n", "\n") == UUID_GITIGNORE)
+    {
+        return Ok(());
+    }
+    crate::utils::fs::atomic_write_bytes(&path, UUID_GITIGNORE.as_bytes())
+        .await
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Ask git whether it would commit the written nupkg and its `.gitignore`
+/// (#1061), probing from the uuid dir. Still ignored refuses
+/// `vendor_artifact_gitignored` (the caller unwinds); git failing to
+/// answer is only a warning.
+async fn keep_nupkg_committable(
+    uuid_dir: &Path,
+    nupkg_path: &Path,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<(), VendorOutcome> {
+    let leaf = nupkg_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let shown = nupkg_path.display().to_string();
+    match super::npm_dir::gitignore_probe(uuid_dir, &[leaf, ".gitignore".to_string()]).await {
+        Ok(Some(rules)) => Err(refused(
+            super::npm_dir::GITIGNORED,
+            super::npm_dir::gitignored_detail(&shown, &rules),
+        )),
+        Ok(None) => Ok(()),
+        Err(why) => {
+            warnings.push(VendorWarning::new(
+                super::npm_dir::GITIGNORE_UNCHECKED,
+                super::npm_dir::gitignore_unchecked_detail(&shown, &why),
+            ));
+            Ok(())
+        }
+    }
 }
 
 // ── nuget.config editing ───────────────────────────────────────────────────────
@@ -2707,6 +2778,89 @@ mod tests {
             tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
             lock_before
         );
+    }
+
+    /// An autocrlf checkout of the uuid `.gitignore` is not rewritten.
+    #[tokio::test]
+    async fn a_crlf_uuid_gitignore_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, "!*\r\n").unwrap();
+        super::write_uuid_gitignore(tmp.path()).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"!*\r\n");
+        std::fs::write(&path, "stale\n").unwrap();
+        super::write_uuid_gitignore(tmp.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            super::UUID_GITIGNORE
+        );
+    }
+
+    /// #1061: GitHub's stock VisualStudio.gitignore ignores `*.nupkg`. The
+    /// uuid dir gets a `.gitignore` that re-includes the vendored nupkg, so
+    /// the commit the vendored workflow ends with carries it.
+    #[tokio::test]
+    async fn a_nupkg_ignore_rule_is_overridden_by_the_uuid_gitignore() {
+        use crate::vendor::test_support::{git_project, VISUAL_STUDIO_GITIGNORE};
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        if git_project(root, VISUAL_STUDIO_GITIGNORE).is_none() {
+            return;
+        }
+        assert!(
+            super::super::npm_dir::gitignored(root, &[copy_rel()])
+                .await
+                .is_some(),
+            "precondition: the stock rules ignore the nupkg"
+        );
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(
+            std::fs::read_to_string(root.join(format!(".socket/vendor/nuget/{UUID}/.gitignore")))
+                .unwrap(),
+            UUID_GITIGNORE
+        );
+        assert_eq!(
+            super::super::npm_dir::gitignored(root, &[copy_rel()]).await,
+            None,
+            "git commits the vendored nupkg"
+        );
+    }
+
+    /// #1061: a rule ignoring the uuid dir itself can't be overridden from
+    /// inside it, so vendoring refuses before writing anything, dry run
+    /// included.
+    #[tokio::test]
+    async fn a_directory_ignore_rule_refuses_before_any_write() {
+        use crate::vendor::test_support::git_project;
+        for rule in [".socket/", ".socket/vendor/", "nuget/"] {
+            for dry_run in [false, true] {
+                let (dir, blobs, installed, record) = fixture(true, None).await;
+                let root = dir.path();
+                if git_project(root, &format!("{rule}\n")).is_none() {
+                    return;
+                }
+                let lock_before = tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap();
+                let (code, detail) =
+                    unwrap_refused(run_vendor(root, &blobs, &installed, &record, dry_run).await);
+                assert_eq!(code, "vendor_artifact_gitignored", "{rule}: {detail}");
+                assert!(detail.contains(rule), "{rule}: {detail}");
+                assert!(!root.join(".socket").exists(), "{rule}: nothing written");
+                assert!(!root.join("nuget.config").exists(), "{rule}: no config");
+                assert_eq!(
+                    tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
+                    lock_before
+                );
+                // An empty patch is refused too, never a calm success.
+                let mut empty = record.clone();
+                empty.files.clear();
+                let (code, _) =
+                    unwrap_refused(run_vendor(root, &blobs, &installed, &empty, dry_run).await);
+                assert_eq!(code, "vendor_artifact_gitignored", "{rule}: empty patch");
+            }
+        }
     }
 
     #[tokio::test]
