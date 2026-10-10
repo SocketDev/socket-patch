@@ -1233,9 +1233,17 @@ async fn hosted_scan_reports_patch_applied_with_hosted_mode() {
     let applied = &bodies[1];
     assert_eq!(applied["context"]["command"], "scan");
     assert_eq!(applied["metadata"]["mode"], "hosted");
+    // v5.0 records each confirmed pin as an `applied` event tagged
+    // `details.mode: "hosted"` (v4's `redirect.redirected` count).
+    let hosted_applied = doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "applied")
+        .count();
     assert_eq!(
-        applied["metadata"]["patches_count"],
-        doc["redirect"]["redirected"]
+        applied["metadata"]["patches_count"], hosted_applied,
+        "patches_count is the envelope's hosted applied events: {doc:#}"
     );
     assert_eq!(applied["metadata"]["patches_count"], 1);
     assert_eq!(

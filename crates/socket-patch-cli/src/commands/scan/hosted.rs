@@ -171,7 +171,7 @@ fn refuse(
     common: &crate::args::GlobalArgs,
     scan_result: Option<Envelope>,
     refusal: &socket_patch_core::hosted::engine::Refusal,
-    json_error: &mut Option<serde_json::Value>,
+    json_error: &mut Option<Envelope>,
 ) -> i32 {
     eprintln!("Error ({}): {}", refusal.code, refusal.message);
     if common.json {
