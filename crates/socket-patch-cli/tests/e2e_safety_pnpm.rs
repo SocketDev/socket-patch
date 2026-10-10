@@ -10,26 +10,73 @@
 //! suite proves that does NOT happen — patching A's view leaves B's
 //! view and the store entry byte-identical.
 //!
-//! Fixture: minimist@1.2.2 + its Socket patch (UUID
-//! `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb`, CVE-2021-44906) — same
-//! pair `e2e_npm.rs` uses, so the BEFORE/AFTER hashes are known.
+//! Fixture: a real pnpm install of minimist@1.2.2 plus a synthetic
+//! patch for its `index.js`, staged under `.socket/` so `apply` runs
+//! offline. The suite tests the CoW defense, not the patch catalog, so
+//! it must not depend on what the live patch API serves: when
+//! production republished the minimist patch on 2026-10-09 (#1293),
+//! every assertion here failed on a hash mismatch and the merge queue
+//! evicted entries for ~2 hours. The live catalog keeps its own
+//! coverage in `e2e_npm.rs` and `e2e_hosted_production.rs`.
 //!
-//! Network: yes (pnpm install + socket-patch get). Toolchain: pnpm.
-//! `#[ignore]` gated.
+//! Network: yes (pnpm install from the npm registry only). Toolchain:
+//! pnpm. `#[ignore]` gated.
 
 use std::path::{Path, PathBuf};
 
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{assert_run_ok, git_sha256_file, has_command, pnpm_run, write_package_json};
+use common::{
+    assert_run_ok, git_sha256, git_sha256_file, has_command, pnpm_run, write_blob,
+    write_minimal_manifest, write_package_json, PatchEntry,
+};
 
-const NPM_UUID: &str = "642d7f02-ebc1-4ab0-99e2-07f5dd8463cb";
+const MINIMIST_PURL: &str = "pkg:npm/minimist@1.2.2";
+const PATCH_UUID: &str = "00000000-0000-4000-8000-00000000e2e5";
 
 /// Git-SHA-256 of the *unpatched* `index.js` shipped with minimist 1.2.2.
+/// Pinned: published npm tarballs are immutable.
 const BEFORE_HASH: &str = "311f1e893e6eac502693fad8617dcf5353a043ccc0f7b4ba9fe385e838b67a10";
-/// Git-SHA-256 of the *patched* `index.js` after the security fix.
-const AFTER_HASH: &str = "ec956dcafb886f14315570bf3981d44aa12c561716abb46eed8b067aaa1f6bdf";
+
+/// Appended to the pristine `index.js` to form the patched bytes.
+const PATCH_MARKER: &[u8] = b"\n// socket-patch e2e_safety_pnpm synthetic patch\n";
+
+/// Stage a manifest + after-hash blob under `<proj>/.socket/` that
+/// patches minimist's `index.js` (pristine bytes + [`PATCH_MARKER`]),
+/// and return the patched file's git-SHA-256 (the "after hash").
+fn stage_patch(proj: &Path, original: &[u8]) -> String {
+    assert_eq!(
+        git_sha256(original),
+        BEFORE_HASH,
+        "stage_patch needs pristine bytes"
+    );
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(PATCH_MARKER);
+    let after_hash = git_sha256(&patched);
+    let socket = proj.join(".socket");
+    write_minimal_manifest(
+        &socket,
+        MINIMIST_PURL,
+        PATCH_UUID,
+        &[PatchEntry {
+            file_name: "package/index.js",
+            before_hash: BEFORE_HASH,
+            after_hash: &after_hash,
+        }],
+    );
+    write_blob(&socket, &after_hash, &patched);
+    after_hash
+}
+
+/// Run `socket-patch apply --offline` in `proj`; returns (stdout, stderr).
+fn apply_offline(proj: &Path) -> (String, String) {
+    assert_run_ok(
+        proj,
+        &["apply", "--offline"],
+        "socket-patch apply --offline",
+    )
+}
 
 // ── Setup helpers ─────────────────────────────────────────────────────
 
@@ -292,17 +339,14 @@ fn apply_in_a_does_not_mutate_b_or_store() {
         store_id
     };
 
-    // -- get + apply in proj_a only ----------------------------------
-    assert_run_ok(
-        &fx.proj_a,
-        &["get", NPM_UUID, "--mode", "agent"],
-        "socket-patch get",
-    );
+    // -- apply in proj_a only ----------------------------------------
+    let after_hash = stage_patch(&fx.proj_a, &original_bytes);
+    apply_offline(&fx.proj_a);
 
     // proj_a is patched.
     assert_eq!(
         git_sha256_file(&index_a),
-        AFTER_HASH,
+        after_hash,
         "proj_a's index.js should be patched"
     );
     // proj_b is NOT patched — the headline invariant.
@@ -401,17 +445,14 @@ fn pnpm_install_in_b_does_not_revert_a() {
         store_id
     };
 
-    assert_run_ok(
-        &fx.proj_a,
-        &["get", NPM_UUID, "--mode", "agent"],
-        "socket-patch get",
-    );
-    assert_eq!(git_sha256_file(&index_a), AFTER_HASH);
+    let after_hash = stage_patch(&fx.proj_a, &original_bytes);
+    apply_offline(&fx.proj_a);
+    assert_eq!(git_sha256_file(&index_a), after_hash);
 
     // Re-run pnpm install in proj_b with frozen lockfile — this
     // recomputes the install from cache; with CoW the cache is
-    // unmodified, so proj_b stays BEFORE_HASH and proj_a stays
-    // AFTER_HASH.
+    // unmodified, so proj_b stays BEFORE_HASH and proj_a keeps
+    // the patched bytes.
     let env_pairs: &[(&str, &str)] = &[];
     pnpm_run(
         &fx.proj_b,
@@ -427,7 +468,7 @@ fn pnpm_install_in_b_does_not_revert_a() {
 
     assert_eq!(
         git_sha256_file(&index_a),
-        AFTER_HASH,
+        after_hash,
         "proj_a's patch must survive `pnpm install --frozen-lockfile` in proj_b"
     );
     assert_eq!(
@@ -438,7 +479,7 @@ fn pnpm_install_in_b_does_not_revert_a() {
     // The shared store entry must still hold the original bytes: if apply
     // had mutated the store inode in place (no CoW), B's frozen reinstall
     // would re-materialise the patched bytes — or the store itself would
-    // already read AFTER_HASH here.
+    // already hold them here.
     assert_eq!(
         git_sha256_file(&store_copy),
         BEFORE_HASH,
@@ -483,10 +524,13 @@ fn apply_in_pnpm_project_emits_layout_note() {
     let root = tempfile::tempdir().unwrap();
     let fx = setup_two_pnpm_projects(root.path());
 
-    let (_stdout, stderr) = assert_run_ok(
-        &fx.proj_a,
-        &["get", NPM_UUID, "--mode", "agent"],
-        "socket-patch get",
+    let original_bytes = std::fs::read(fx.index_js_in(&fx.proj_a)).unwrap();
+    let after_hash = stage_patch(&fx.proj_a, &original_bytes);
+    let (_stdout, stderr) = apply_offline(&fx.proj_a);
+    assert_eq!(
+        git_sha256_file(&fx.index_js_in(&fx.proj_a)),
+        after_hash,
+        "apply should have patched proj_a's index.js"
     );
 
     // The exact phrasing is a stable contract. A bare `contains("pnpm")`

@@ -68,41 +68,38 @@ impl Fixture {
         } else {
             None
         };
-        match Ok::<_, String>(source.path()) {
-            Ok(dir) => match archive(purl, dir, record, sources).await {
-                Ok((leaf, bytes, secondary)) => {
-                    let uri = server.uri();
-                    let url = format!("{uri}/archive/{leaf}");
-                    let mut artifacts = vec![
-                        serde_json::json!({"kind":"tarball", "url":url, "integrity":{"sha512":super::sri(&bytes)}}),
-                    ];
-                    if purl.starts_with("pkg:npm/") {
-                        let name = crate::vendor::npm_common::parse_npm_purl(purl)
-                            .map(|p| p.0)
-                            .unwrap_or_default();
-                        if let Ok(checksum) =
-                            crate::vendor::berry_zip::berry_cache_checksum_10c0(&bytes, &name)
-                        {
-                            artifacts.push(serde_json::json!({"kind":"yarn-berry-zip", "integrity":{"yarnBerry10c0":checksum}}));
-                        }
+        match archive(purl, source.path(), record, sources).await {
+            Ok((leaf, bytes, secondary)) => {
+                let uri = server.uri();
+                let url = format!("{uri}/archive/{leaf}");
+                let mut artifacts = vec![
+                    serde_json::json!({"kind":"tarball", "url":url, "integrity":{"sha512":super::sri(&bytes)}}),
+                ];
+                if purl.starts_with("pkg:npm/") {
+                    let name = crate::vendor::npm_common::parse_npm_purl(purl)
+                        .map(|p| p.0)
+                        .unwrap_or_default();
+                    if let Ok(checksum) =
+                        crate::vendor::berry_zip::berry_cache_checksum_10c0(&bytes, &name)
+                    {
+                        artifacts.push(serde_json::json!({"kind":"yarn-berry-zip", "integrity":{"yarnBerry10c0":checksum}}));
                     }
-                    for (kind, name, bytes) in secondary {
-                        artifacts.push(serde_json::json!({"kind":kind,"url":format!("{uri}/archive/{name}"),"integrity":{"sha512":super::sri(&bytes)}}));
-                        Mock::given(method("GET"))
-                            .and(path(format!("/archive/{name}")))
-                            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-                            .mount(&server)
-                            .await;
-                    }
-                    Mock::given(method("POST")).and(path(super::PACKAGE_PATH)).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"results":{ &record.uuid: {"status":"granted", "purl":purl, "url":url, "artifacts":artifacts}}}))).mount(&server).await;
+                }
+                for (kind, name, bytes) in secondary {
+                    artifacts.push(serde_json::json!({"kind":kind,"url":format!("{uri}/archive/{name}"),"integrity":{"sha512":super::sri(&bytes)}}));
                     Mock::given(method("GET"))
-                        .and(path(format!("/archive/{leaf}")))
+                        .and(path(format!("/archive/{name}")))
                         .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
                         .mount(&server)
                         .await;
                 }
-                Err(_) => super::mount_no_results(&server).await,
-            },
+                Mock::given(method("POST")).and(path(super::PACKAGE_PATH)).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"results":{ &record.uuid: {"status":"granted", "purl":purl, "url":url, "artifacts":artifacts}}}))).mount(&server).await;
+                Mock::given(method("GET"))
+                    .and(path(format!("/archive/{leaf}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                    .mount(&server)
+                    .await;
+            }
             Err(_) => super::mount_no_results(&server).await,
         }
         Self {

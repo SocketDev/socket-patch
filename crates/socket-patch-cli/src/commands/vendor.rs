@@ -71,11 +71,11 @@ pub struct VendorArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Tolerate missing patch-target files in the staged copy (skip them
-    /// instead of failing) and bypass the variant probe for multi-release
-    /// ecosystems. Not needed for a beforeHash mismatch: vendoring always
-    /// overwrites mismatched content with the verified patched bytes and
-    /// warns (`vendor_content_mismatch_overwritten`).
+    /// Bypass the installed-variant probe for multi-release ecosystems
+    /// (vendor every recorded release variant, not just the one whose
+    /// bytes match the installed copy). Vendoring never reads the
+    /// installed files' content: it commits the patch server's verified
+    /// artifact, so a missing or locally edited file needs no flag.
     #[arg(
         short = 'f',
         long,
@@ -304,8 +304,7 @@ async fn takeover_dry_refusal(
 
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
 /// installed location (site-packages root for pypi, the package dir
-/// otherwise), or a fetched artifact the backend materialises only if it
-/// reaches a branch that reads it. Returns `None` for purls with no vendor
+/// otherwise), when available. Returns `None` for purls with no vendor
 /// backend in this build.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_vendor_one(
@@ -336,24 +335,22 @@ pub(crate) async fn dispatch_vendor_one(
     const SERVICE_ECOSYSTEMS: &[&str] = &[
         "npm", "pypi", "cargo", "golang", "composer", "gem", "nuget", "maven",
     ];
-    if let Some(cfg) = service {
-        if cfg.source.requires_service() && !SERVICE_ECOSYSTEMS.contains(&eco) {
-            return Some(VendorOutcome::Refused {
-                code: "vendor_service_unsupported_ecosystem",
-                detail: format!(
-                    "--vendor-source=service is not supported for `{eco}` \
+    if service.is_some() && !SERVICE_ECOSYSTEMS.contains(&eco) {
+        return Some(VendorOutcome::Refused {
+            code: "vendor_service_unsupported_ecosystem",
+            detail: format!(
+                "--vendor-source=service is not supported for `{eco}` \
                      (prebuilt downloads cover npm, pypi, cargo, golang, composer, \
                      gem, nuget, and maven)"
-                ),
-            });
-        }
+            ),
+        });
     }
     // Every backend takes the identical 9-argument tuple.
     macro_rules! vend {
-        ($backend:path) => {
+        ($backend:path, $source:expr) => {
             $backend(
                 purl,
-                pkg_path,
+                $source,
                 project_root,
                 record,
                 sources,
@@ -365,35 +362,10 @@ pub(crate) async fn dispatch_vendor_one(
             .await
         };
     }
-    // Maven and NuGet have no registry-fetch rung — `fetch_and_stage` serves
-    // no fetcher for either and `stage_local_artifact` is npm-only — so their
-    // source is the crawler's own directory. A ledger-driven maven re-run on
-    // a cold cache gets a deferred hint instead: the committed tree answers
-    // an in-sync re-run, and anything else refuses for the missing jar.
-    macro_rules! vend_installed {
-        ($backend:path) => {{
-            debug_assert!(
-                eco == "maven" || matches!(pkg_path, PackageSource::Installed(_)),
-                "{eco} has no fetch rung; a pending source would need materialising"
-            );
-            $backend(
-                purl,
-                pkg_path.path(),
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }};
-    }
     Some(match eco {
         // The flavor router probes the project's lockfile (package-lock /
         // yarn / pnpm / bun) and dispatches or refuses per flavor.
-        "npm" => vend!(vendor::npm_flavor::vendor_npm_any),
+        "npm" => vend!(vendor::npm_flavor::vendor_npm_any, pkg_path),
         "pypi" => {
             vendor::pypi::vendor_pypi_with_pipenv_version(
                 purl,
@@ -410,12 +382,12 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
-        "gem" => vend!(vendor::gem::vendor_gem),
-        "cargo" => vend!(vendor::cargo::vendor_cargo_crate),
-        "golang" => vend!(vendor::golang::vendor_go_module),
-        "composer" => vend!(vendor::composer_lock::vendor_composer),
-        "nuget" => vend_installed!(vendor::nuget_feed::vendor_nuget),
-        "maven" => vend_installed!(vendor::maven_repo::vendor_maven),
+        "gem" => vend!(vendor::gem::vendor_gem, pkg_path),
+        "cargo" => vend!(vendor::cargo::vendor_cargo_crate, pkg_path),
+        "golang" => vend!(vendor::golang::vendor_go_module, pkg_path),
+        "composer" => vend!(vendor::composer_lock::vendor_composer, pkg_path),
+        "nuget" => vend!(vendor::nuget_feed::vendor_nuget, pkg_path.path()),
+        "maven" => vend!(vendor::maven_repo::vendor_maven, pkg_path.path()),
         _ => return None,
     })
 }
@@ -3863,7 +3835,11 @@ fn print_vendor_closing(
                 &common.cwd.join("composer.lock"),
             ) {
                 let packages = super::composer_hints::vendored_composer_packages(&lock);
-                extra.extend(super::composer_hints::vendored_reinstall_hints(&packages));
+                let vendor_dir = super::composer_hints::vendor_dir_label(&common.cwd);
+                extra.extend(super::composer_hints::vendored_reinstall_hints(
+                    &packages,
+                    &vendor_dir,
+                ));
             }
         }
         for line in crate::ui::next_steps(&commit, &reinstall, &extra) {
@@ -4668,7 +4644,6 @@ mod dispatch_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
         let service = GlobalArgs {
@@ -5052,7 +5027,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5135,7 +5109,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5195,28 +5168,21 @@ mod variant_probe_tests {
     /// A ledger entry recording the wheel variant as vendored at `uuid`.
     fn wheel_entry(uuid: &str) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: BASE.into(),
-            uuid: uuid.into(),
-            artifact: socket_patch_core::vendor::state::VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/pypi/{uuid}/foo-1.0.0-py3-none-any.whl"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("requirements".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "pypi".into(),
+                BASE.into(),
+                uuid.into(),
+                socket_patch_core::vendor::state::VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/pypi/{uuid}/foo-1.0.0-py3-none-any.whl"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 
@@ -5248,7 +5214,6 @@ mod variant_probe_tests {
             let common = dry_run_over(tmp.path(), &site);
             let sources = PatchSources {
                 blobs_path: tmp.path(),
-                diffs_path: None,
                 mem_blobs: None,
             };
             let mut state = VendorState::default();
@@ -5300,7 +5265,6 @@ mod variant_probe_tests {
         let common = dry_run_over(tmp.path(), &site);
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5359,7 +5323,6 @@ mod variant_probe_tests {
         let common = dry_run_over(tmp.path(), &site);
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5457,28 +5420,22 @@ mod gc_tests {
 
     fn entry(detached: bool) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: PURL.into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             detached,
-            record: None,
             flavor: Some("package-lock".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                PURL.into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 
@@ -6642,11 +6599,11 @@ mod revert_dispatch_tests {
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
     fn entry_for(eco: &str, base_purl: &str) -> VendorEntry {
-        VendorEntry {
-            ecosystem: eco.into(),
-            base_purl: base_purl.into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            eco.into(),
+            base_purl.into(),
+            UUID.into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: format!(".socket/vendor/{eco}/{UUID}/artifact"),
                 sha256: String::new(),
@@ -6654,18 +6611,8 @@ mod revert_dispatch_tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+            Vec::new(),
+        )
     }
 
     /// The nuget and maven revert arms must route to their real backends —
@@ -6753,28 +6700,21 @@ mod persist_tests {
 
     fn npm_entry(base_purl: &str, uuid: &str) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: base_purl.into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/npm/{uuid}/pkg.tgz"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("package-lock".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                base_purl.into(),
+                uuid.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/npm/{uuid}/pkg.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 
@@ -7377,11 +7317,11 @@ mod unused_vendored_manifest_keys_tests {
     /// A ledger entry whose base purl is `base_purl`; only the purl
     /// matters to the manifest-key relation.
     fn entry(ecosystem: &str, base_purl: &str) -> VendorEntry {
-        VendorEntry {
-            ecosystem: ecosystem.into(),
-            base_purl: base_purl.into(),
-            uuid: "11111111-1111-4111-8111-111111111111".into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            ecosystem.into(),
+            base_purl.into(),
+            "11111111-1111-4111-8111-111111111111".into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: String::new(),
                 sha256: String::new(),
@@ -7389,18 +7329,8 @@ mod unused_vendored_manifest_keys_tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+            Vec::new(),
+        )
     }
 
     /// The keys an unused ledger entry `key` (base purl = the key) owns.

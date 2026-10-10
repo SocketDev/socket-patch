@@ -37,6 +37,68 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 > copy-out modes — `vendor`, `scan --mode vendored`, `scan --mode hosted` — never write
 > into the caches and avoid the issue entirely.
 
+## v5 support tiers
+
+The matrix above lists what each mode handles. This table says how much that support
+is worth for v5.x. v5 removes no format or mode: everything in the matrix works in v5.0
+and keeps working through v5.x.
+
+| Tier | Meaning |
+|---|---|
+| **Supported** | The default. Covered by CI. A regression is a release blocker. |
+| **Beta** | Works for the build shapes documented on this page and is tested in CI. Some shapes outside them are refused, and the open issues for that ecosystem describe shapes that are patched incompletely. Preview with `--dry-run` and confirm with a real build before you commit the result. |
+| **Legacy** | A format that the package manager itself has retired. socket-patch keeps reading and writing it in v5 and still fixes its bugs, but adds no new features for it. Prefer the upgrade path in the table below. |
+| **Not supported** | Refused with an error code that names the remedy. |
+
+| Ecosystem / format | agent | vendored | hosted |
+|---|---|---|---|
+| npm: package-lock / npm-shrinkwrap, yarn classic, yarn berry, pnpm lock v9, text `bun.lock`, vlt lock eras C–F | Supported | Supported | Supported |
+| npm: binary `bun.lockb` | Supported (agent mode patches `node_modules`, not the lock) | Legacy | Legacy |
+| npm: pnpm 7/8 locks (lockfileVersion 5.4 / 6.0) | Supported | Legacy | Supported |
+| npm: older pnpm locks (pnpm 1–6, `shrinkwrap.yaml`) | Supported | Not supported | Supported (see [npm hosted-mode notes](#npm-hosted-mode-notes) for the version floors) |
+| npm: vlt lock eras A0–B (before 1.0.0-rc.15) | Supported | Legacy (A0 is refused) | Legacy |
+| PyPI, Cargo, RubyGems, Go, NuGet, Composer | Supported | Supported | Supported, with the per-ecosystem limits in the matrix |
+| Maven (`pom.xml` builds) | Supported, with the [sidecar caveats](#maven--nuget-caveats) | Beta | Beta |
+| Gradle | Supported, with the [`files-2.1` advisories](#gradle) | Beta (Gradle 6.8+) | Beta (Gradle 6.8+) |
+| sbt / Mill / scala-cli | Beta | Beta (sbt and scala-cli directory builds; Mill is not wired) | Beta (Mill and scala-cli get manual snippets only) |
+| Deno | Supported | Not supported | Not supported |
+
+**Hosted and vendored Maven and Gradle are Beta in v5.** Each wiring is built to fail
+closed: hosted mode and vendored Maven pin a Socket-only `-socket.<hex8>` version, and
+vendored Gradle checks the SHA-256 of the vendored artifact, so a build that cannot get
+the patched artifact fails instead of silently building the upstream jar. But the pom
+and Gradle rewriters still have open gaps. For example: multi-module builds, `<classifier>`
+dependencies, dependencies declared inside profiles, plugins or comments, `${property}`
+coordinates, imported BOMs, and repository mirrors. The open
+[`pm:maven`](https://github.com/SocketDev/socket-patch/issues?q=is%3Aissue+is%3Aopen+label%3Apm%3Amaven)
+and [`pm:gradle`](https://github.com/SocketDev/socket-patch/issues?q=is%3Aissue+is%3Aopen+label%3Apm%3Agradle)
+issues track them. Before you rely on a JVM `--vex` attestation, run the build and check
+that it resolves the patched artifact of each patched dependency.
+
+### Legacy formats: upgrade and undo
+
+Each Legacy format has an upgrade path and an undo path. Both work in v5:
+
+| Format | Leave the legacy format | Undo socket-patch's changes |
+|---|---|---|
+| Binary `bun.lockb` | Bun 1.2+ writes text `bun.lock` by default. Undo socket-patch's changes (next column), convert with `bun install --save-text-lockfile --frozen-lockfile --lockfile-only`, delete `bun.lockb`, then rerun `socket-patch scan --mode <mode>` with the mode you used before | Vendored: `socket-patch rollback`. Hosted: `rollback` refuses a hosted `bun.lockb` pin, because the binary lock cannot be re-derived. Restore the lock from version control (`git checkout -- bun.lockb`), as the refusal says |
+| pnpm 7/8 lock, vendored | Run `socket-patch rollback`, re-lock with pnpm 9 or later, then rerun `socket-patch scan --mode vendored`. A pnpm 9+ lock is not path-bound (see `vendor_pnpm_legacy_absolute_specifier` in the matrix) | `socket-patch rollback` |
+| vlt eras A0–B | Run `socket-patch rollback`, re-lock with vlt 1.0 or later, then rerun `socket-patch scan --mode <mode>` with the mode you used before | `socket-patch rollback` |
+
+### Support policy
+
+- **v5.x minor and patch releases** do not remove a format or mode from the matrix,
+  and do not make a format refuse that v5.0 accepts. Bug fixes can still refuse a
+  specific input that would otherwise produce a wrong result. Each refusal has an error
+  code and a remedy.
+- **A tier can move up** (Beta to Supported) in any release. A move down, or a new
+  Legacy entry, is announced in the release notes and on this page.
+- **Removing write support for a Legacy format** can happen only in a major release.
+  The removed path becomes a refusal with an error code and a re-lock remedy. socket-patch
+  keeps reading the format for `list`, `vex` and `rollback`, so state that an older
+  socket-patch wrote can still be undone (or is refused with a version-control remedy,
+  as hosted `bun.lockb` is today).
+
 ## npm hosted-mode notes
 
 - **npm (package-lock.json / npm-shrinkwrap.json)** — every present npm lock is
@@ -133,7 +195,23 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   a reliable substitute. Run `socket-patch vex` after installation to verify
   the patched files. See the [compatibility matrix and workflow](testing/pnpm-compatibility.md).
 - **yarn classic** — the `yarn.lock` entry's `resolved` / `integrity` are
-  rewritten to the hosted tarball. A project that sets `yarn-offline-mirror`
+  rewritten to the hosted tarball. `resolved` always carries the tarball's
+  `#<sha1>` fragment: yarn 1 names its cache slot after it, so a fragmentless
+  URL would share the slot of an unpatched copy of the same version and a warm
+  cache would install those bytes (or fail the integrity check). For an entry it
+  hasn't pinned yet (or a grant with no sha1), the scan downloads the served
+  tarball and checks it against the grant's sha512. It pins the sha1 of those
+  bytes when the grant has none, and it compares the tarball's own
+  `package.json` with the lock: yarn 1 installs only the dependencies the lock
+  names, so when the patch adds a dependency (or changes a range) that no
+  `yarn.lock` block locks, the pin is refused with
+  `redirect_yarn_classic_dep_manifest_unlocked` (lock the new descriptor first,
+  for example with `yarn add`, then re-run). When every descriptor is already
+  locked, the entry's dependency sub-maps are rewritten to match
+  (`redirect_yarn_classic_dep_manifest_rewritten`). Vendored mode refuses the
+  same case with `vendor_dep_manifest_unlocked`. If the download, the check or
+  the `package.json` read fails, the patch is skipped as
+  `npm_tarball_unavailable`. A project that sets `yarn-offline-mirror`
   is refused with `redirect_yarn_classic_offline_mirror`. The mirror is
   resolved the way yarn 1 resolves it: the project's `.yarnrc` / `.npmrc`,
   the user's (`~/.yarnrc`, which `yarn config set` writes, and `~/.npmrc`),
@@ -153,7 +231,15 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   `"left-pad@catalog:<name>"`). Yarn then fetches it without npm registry credentials and
   hardened mode accepts it. The re-keyed entry is written the way yarn writes
   it, with its fields in yarn's order and its `bin:` map taken from the served
-  tarball's own `package.json`. For an entry that has a `bin:` map, the scan
+  tarball's own `package.json`. Yarn's npm resolver gives a package that runs
+  `node-gyp` in a script (every package shipping a `binding.gyp`: nan,
+  bufferutil, utf-8-validate, …) an implicit `node-gyp: "npm:latest"`
+  dependency, which yarn never gives a tarball entry, so the pin drops it and,
+  when nothing else needs node-gyp, the lock entries only it reached; vendored
+  mode does the same, and `vendor --revert` puts them back. Hosted `rollback`
+  puts the dependency back while the lock still resolves node-gyp; otherwise it
+  warns `yarn_berry_node_gyp_unresolved` (run `yarn install` once). For an entry
+  that has a `bin:` map or that implicit dependency, the scan
   downloads the served tarball to read it. If that download fails, the patch
   is skipped as `npm_manifest_unavailable`. A user-authored `resolutions` entry for the package
   is never overwritten (`redirect_yarn_berry_resolutions_conflict`), and
@@ -252,9 +338,15 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   remedy (then `bun install --force`: a plain install keeps the patched copy), while the hosted → vendored takeover rebuilds its npm registry record natively
   and vendors over it. Each restore reads the package's version document from the
   registry Bun resolves it against (`.npmrc` / `bunfig.toml` scope and default
-  registries, `BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), sending the credentials
+  registries, `BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), read from the project's
+  files and the user's own: `$XDG_CONFIG_HOME/.npmrc` or `~/.npmrc`, and the global
+  `$XDG_CONFIG_HOME/.bunfig.toml` or `~/.bunfig.toml` (#1276). Bun ≥ 1.4 takes a bunfig
+  key over an `.npmrc` one and Bun ≤ 1.3 the reverse, so when they disagree on a package
+  of a lockfileVersion-0/1 `bun.lock` or a `bun.lockb` (either Bun may install it) the
+  restore refuses that pin with the checkout remedy. It sends the credentials
   those settings give it — a bunfig `token` or `username` / `password` (`$VAR`
-  expanded only for `NPM_TOKEN`, `NODE_AUTH_TOKEN` and `BUN_AUTH_TOKEN`; any other
+  expanded only for `NPM_TOKEN`, `NODE_AUTH_TOKEN` and `BUN_AUTH_TOKEN` in the project's
+  files, any variable in the user's own; any other
   variable expands to nothing, so a project's config cannot send other secrets; in a
   registry URL only its `user:password@` part expands, which is sent as the
   `Authorization` header and never printed or written into the lock), else the `.npmrc` `//host/path/:_authToken` / `_auth` / `username` +
@@ -567,6 +659,13 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   repository whose grant URL changed (a rotated token) is refreshed in place. A suffixed
   literal no hosted repository in the pom minted (a vendored `socket-patch-vendor-<uuid>`
   pin, say) is still a mismatch and is skipped.
+* **Multi-module reactors are vendored-only (hosted Maven).** Hosted mode reads only
+  the root `pom.xml`, and a module's own literal `<version>` always beats a root
+  `<dependencyManagement>` pin, so a root pin would leave that module on the unpatched
+  upstream jar. A root that declares `<modules>` or `<subprojects>` (directly or in a
+  profile) is therefore refused with `redirect_maven_multimodule_unsupported` (`pom.xml` and
+  `.mvn/` are left untouched and the dep is not counted as redirected); use `scan --mode vendored`, whose reactor planner rewrites each module's
+  declaration. `vex` likewise does not attest a hosted pin found in a reactor root.
 * **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —
@@ -956,6 +1055,13 @@ Agent mode patches the crate in place wherever the crawler finds it. For a non-v
 crate that means the **shared** `$CARGO_HOME/registry` cache: the patch affects every
 project on the machine, and is silently reset by `cargo clean` or a cache prune. Use
 `--mode vendored` for a project-local, committable patch.
+
+Run `cargo fetch` before `apply` on a fresh checkout or CI runner. Cargo unpacks a
+locked crate into `registry/src` only when it fetches or builds, so on a cold or pruned
+cache there is nothing to patch, and the next `cargo build` would compile the pristine
+crate. `apply` therefore treats a crate that `Cargo.lock` resolves but that is not
+unpacked as not installed, not as a calm lockfile-only skip: a run where no targeted
+patch matched exits 1 and names `cargo fetch` as the remedy.
 
 ## Cargo: vendored wiring in Cargo.toml
 

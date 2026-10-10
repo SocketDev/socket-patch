@@ -105,6 +105,20 @@ pub fn plan_with_config(
     patch: &JvmPatch<'_>,
     config_enabled: bool,
 ) -> Result<JvmPlan, JvmRefusal> {
+    plan_with_external(read, patch, config_enabled, None)
+}
+
+/// [`plan_with_config`] that also weighs the management a local root's pin
+/// would override from outside the checkout: imported BOMs and parents
+/// resolved from a repository (#488). `external` holds those poms as the
+/// caller could fetch them ([`external_poms_needed`] says which); `None`
+/// skips the check (callers that plan only to probe a shape).
+pub fn plan_with_external(
+    read: ReadFn<'_>,
+    patch: &JvmPatch<'_>,
+    config_enabled: bool,
+    external: Option<&ExternalPoms>,
+) -> Result<JvmPlan, JvmRefusal> {
     let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
     if !safe_coordinates(g, a, v) {
         return Err(JvmRefusal {
@@ -147,6 +161,51 @@ pub fn plan_with_config(
             &mut unpinned,
             &mut managed_roots,
         );
+    }
+
+    if let Some(external) = external {
+        let lookup = |gav: &Gav| match external.get(gav) {
+            Some(Some(bytes)) => Lookup::Found(bytes.as_slice()),
+            _ => Lookup::Unavailable,
+        };
+        for root in reactor.wired_roots() {
+            if unpinned.contains(&root) || managed_roots.contains(&root) {
+                continue;
+            }
+            match reactor.external_management(&root, patch, &lookup) {
+                Ok(None) => {}
+                Ok(Some(conflict)) => {
+                    warnings.push(degraded(
+                        "conflicting_managed_version",
+                        format!(
+                            "{}: {}:{} is {} at {}, not {}; {root} is not pinned, so the build \
+                             keeps resolving {}",
+                            conflict.at,
+                            patch.group_id,
+                            patch.artifact_id,
+                            conflict.how,
+                            conflict.version,
+                            patch.version,
+                            conflict.version
+                        ),
+                    ));
+                    unpinned.insert(root);
+                }
+                Err(Missing::Unresolved(why) | Missing::Need(_, why)) => {
+                    warnings.push(degraded(
+                        "management_unresolved",
+                        format!(
+                            "{why}, so whether a pin of {}:{}:{} in {root} would override a \
+                             different managed version cannot be told; {root} is not pinned \
+                             (resolve the project once, e.g. `mvn -q dependency:resolve`, \
+                             and vendor again)",
+                            patch.group_id, patch.artifact_id, patch.version
+                        ),
+                    ));
+                    unpinned.insert(root);
+                }
+            }
+        }
     }
 
     let banning = reactor
@@ -608,6 +667,423 @@ pub fn contains_module(read: ReadFn<'_>, rel: &str) -> bool {
 }
 
 pub(crate) type Gav = (String, String, String);
+
+/// Poms from outside the checkout (parents, imported BOMs) by GAV, as a
+/// caller fetched them: `None` when looked up and unavailable.
+pub type ExternalPoms = BTreeMap<(String, String, String), Option<Vec<u8>>>;
+
+/// Most external poms one plan reads (a BOM graph is shallow; Spring Boot's
+/// imports a few dozen).
+const MAX_EXTERNAL_POMS: usize = 256;
+/// Deepest parent chain / import nesting followed outside the checkout.
+const MAX_EXTERNAL_DEPTH: usize = 16;
+
+/// An external pom as a lookup sees it.
+enum Lookup<'b> {
+    Found(&'b [u8]),
+    /// Looked up and unavailable (in no local cache, not fetchable).
+    Unavailable,
+    /// Not looked up yet: [`external_poms_needed`] collects these.
+    Unknown,
+}
+
+/// Why external management could not be decided: an unresolvable value,
+/// or a pom (with what it was needed for) that is unavailable or not yet
+/// looked up.
+enum Missing {
+    Unresolved(String),
+    Need(Gav, String),
+}
+
+/// Management from outside the checkout that disagrees with the patch.
+struct ManagedConflict {
+    /// The reactor pom whose effective model it is.
+    at: String,
+    /// How it is managed (`managed by the imported BOM g:a:v`, …).
+    how: String,
+    version: String,
+}
+
+/// The external poms [`plan_with_external`] still needs for `patch`, given
+/// `known` (fetched or found unavailable): call until it returns nothing,
+/// fetching each, then plan. Empty when the reactor cannot be read (the
+/// plan refuses it on its own).
+pub fn external_poms_needed(
+    read: ReadFn<'_>,
+    patch: &JvmPatch<'_>,
+    known: &ExternalPoms,
+) -> Vec<Gav> {
+    let Ok(reactor) = Reactor::discover(read) else {
+        return Vec::new();
+    };
+    if known.len() >= MAX_EXTERNAL_POMS {
+        return Vec::new();
+    }
+    let lookup = |gav: &Gav| match known.get(gav) {
+        Some(Some(bytes)) => Lookup::Found(bytes.as_slice()),
+        Some(None) => Lookup::Unavailable,
+        None => Lookup::Unknown,
+    };
+    let mut need = Vec::new();
+    for root in reactor.wired_roots() {
+        if let Err(Missing::Need(gav, _)) = reactor.external_management(&root, patch, &lookup) {
+            if !known.contains_key(&gav) && !need.contains(&gav) {
+                need.push(gav);
+            }
+        }
+    }
+    need
+}
+
+/// One pom outside the checkout, parsed.
+struct ExternalPom {
+    gav: Gav,
+    pom: Pom,
+}
+
+/// `${name}` interpolation through `lookup`; `None` when a name is
+/// undefined or the nesting is too deep.
+fn interpolate_by(
+    value: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_INTERPOLATION_DEPTH {
+        return None;
+    }
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let close = after.find('}')?;
+        let raw = lookup(&after[..close])?;
+        out.push_str(&interpolate_by(&raw, lookup, depth + 1)?);
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+impl Reactor {
+    /// Management of `patch`'s g:a that a pin in local root `root` would
+    /// override and that does not manage it at the patch's base version:
+    /// for each pom resolving through `root` whose own chain declares no
+    /// version for g:a in the checkout, the version an external parent
+    /// chain declares or manages, else the first imported BOM (the
+    /// project's own imports, then the external parents') that manages it.
+    /// `Ok(None)` when nothing outside the checkout manages g:a, or only at
+    /// the base version.
+    fn external_management<'b>(
+        &self,
+        root: &str,
+        patch: &JvmPatch<'_>,
+        lookup: &dyn Fn(&Gav) -> Lookup<'b>,
+    ) -> Result<Option<ManagedConflict>, Missing> {
+        let (g, a) = (patch.group_id, patch.artifact_id);
+        let ext_chain = self.external_chain(root, lookup)?;
+        // Every module under this root must agree: one module whose
+        // management already resolves the base version says nothing about
+        // the next, which may interpolate a different one the root pin would
+        // override.
+        'modules: for rel in self.scope.iter().filter(|rel| self.local_root(rel) == root) {
+            let locally_versioned = self.chain(rel).any(|p| {
+                let doc = &self.poms[p].doc;
+                doc.keyed_declarations(g, a)
+                    .iter()
+                    .any(|(dep, _)| doc.child(*dep, "version").is_some())
+            });
+            if locally_versioned {
+                continue;
+            }
+            // Maven interpolates after inheritance: the reactor pom's own
+            // chain overrides an external parent's properties.
+            let props = |name: &str| -> Option<String> {
+                self.lookup(rel, name).or_else(|| {
+                    ext_chain
+                        .iter()
+                        .find_map(|e| e.pom.props.get(name).cloned())
+                })
+            };
+            let resolve = |value: &str, what: &str| -> Result<String, Missing> {
+                interpolate_by(value, &props, 0).ok_or_else(|| {
+                    Missing::Unresolved(format!("{rel}: {what} {value} is not defined"))
+                })
+            };
+            // An external parent's own declaration or management of g:a.
+            for ext in &ext_chain {
+                let doc = &ext.pom.doc;
+                let (eg, ea, ev) = &ext.gav;
+                if let Some((dep, managed)) = jar_declaration(doc, g, a) {
+                    let Some(version) = doc.child_text(dep, "version") else {
+                        continue;
+                    };
+                    let v = resolve(
+                        &version,
+                        &format!("{g}:{a} version in parent {eg}:{ea}:{ev}"),
+                    )?;
+                    // An inherited `<dependencies>` literal is never
+                    // overridden by management, so a pin cannot reach it
+                    // even at the base version.
+                    if managed && is_base_like(&v, patch.version) {
+                        continue 'modules;
+                    }
+                    let how = if managed {
+                        "managed by"
+                    } else {
+                        "declared (a literal no pin overrides) by"
+                    };
+                    return Ok(Some(ManagedConflict {
+                        at: rel.clone(),
+                        how: format!("{how} the parent {eg}:{ea}:{ev}"),
+                        version: v,
+                    }));
+                }
+            }
+            // Imported BOMs: the reactor chain's own (nearest first), then
+            // the external parents'.
+            let mut imports: Vec<(Gav, String)> = Vec::new();
+            for p in self.chain(rel) {
+                for (ig, ia, iv) in imports_of(&self.poms[p].doc) {
+                    let what = format!("the BOM import {ig}:{ia} in {p}");
+                    let gav = (
+                        resolve(&ig, &what)?,
+                        resolve(&ia, &what)?,
+                        resolve(&iv, &what)?,
+                    );
+                    imports.push((gav, p.to_string()));
+                }
+            }
+            for ext in &ext_chain {
+                for (ig, ia, iv) in imports_of(&ext.pom.doc) {
+                    let (eg, ea, ev) = &ext.gav;
+                    let what = format!("the BOM import {ig}:{ia} in parent {eg}:{ea}:{ev}");
+                    let gav = (
+                        resolve(&ig, &what)?,
+                        resolve(&ia, &what)?,
+                        resolve(&iv, &what)?,
+                    );
+                    imports.push((gav, format!("{eg}:{ea}:{ev}")));
+                }
+            }
+            for (bom, _) in &imports {
+                let mut seen = BTreeSet::new();
+                if let Some(v) = bom_manages(bom, g, a, lookup, &mut seen, 0)? {
+                    if is_base_like(&v, patch.version) {
+                        continue 'modules;
+                    }
+                    let (bg, ba, bv) = bom;
+                    return Ok(Some(ManagedConflict {
+                        at: rel.clone(),
+                        how: format!("managed by the imported BOM {bg}:{ba}:{bv}"),
+                        version: v,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The parents of local root `root` outside the checkout, nearest
+    /// first.
+    fn external_chain<'b>(
+        &self,
+        root: &str,
+        lookup: &dyn Fn(&Gav) -> Lookup<'b>,
+    ) -> Result<Vec<ExternalPom>, Missing> {
+        let mut chain: Vec<ExternalPom> = Vec::new();
+        let mut parent = self.poms[root].parent.as_ref().map(|p| {
+            let local =
+                |v: &Option<String>| v.as_deref().and_then(|v| self.interpolate(root, v, 0));
+            (local(&p.group), local(&p.artifact), local(&p.version))
+        });
+        while let Some((pg, pa, pv)) = parent {
+            let (Some(pg), Some(pa), Some(pv)) = (pg, pa, pv) else {
+                return Err(Missing::Unresolved(format!(
+                    "a parent of {root} has no literal groupId/artifactId/version"
+                )));
+            };
+            if chain.len() >= MAX_EXTERNAL_DEPTH {
+                return Err(Missing::Unresolved(format!(
+                    "the parents of {root} nest too deep"
+                )));
+            }
+            let gav = (pg, pa, pv);
+            let pom = fetch_external(&gav, lookup, &format!("the parent of {root}"))?;
+            parent = pom
+                .parent
+                .as_ref()
+                .map(|p| (p.group.clone(), p.artifact.clone(), p.version.clone()));
+            chain.push(ExternalPom { gav, pom });
+        }
+        Ok(chain)
+    }
+}
+
+/// `gav` parsed, or why not.
+fn fetch_external<'b>(
+    gav: &Gav,
+    lookup: &dyn Fn(&Gav) -> Lookup<'b>,
+    role: &str,
+) -> Result<Pom, Missing> {
+    let (g, a, v) = gav;
+    let named = format!("{role} {g}:{a}:{v}");
+    if !safe_coordinates(g, a, v) {
+        return Err(Missing::Unresolved(format!(
+            "{named} has unsafe coordinates"
+        )));
+    }
+    match lookup(gav) {
+        Lookup::Found(bytes) => Pom::parse(&format!("{g}:{a}:{v}"), bytes.to_vec())
+            .map_err(|e| Missing::Unresolved(format!("{named} is unreadable ({})", e.detail))),
+        Lookup::Unavailable => Err(Missing::Need(
+            gav.clone(),
+            format!("{named} is in no local Maven repository"),
+        )),
+        Lookup::Unknown => Err(Missing::Need(
+            gav.clone(),
+            format!("{named} is not read yet"),
+        )),
+    }
+}
+
+/// The top-level declaration of g:a's main jar in `doc`: its
+/// `<dependencyManagement>` entry (`true`) before a `<dependencies>` one.
+fn jar_declaration(doc: &Doc, g: &str, a: &str) -> Option<(usize, bool)> {
+    let is_jar = |dep: usize| {
+        doc.child_text(dep, "groupId").as_deref() == Some(g)
+            && doc.child_text(dep, "artifactId").as_deref() == Some(a)
+            && doc
+                .child_text(dep, "classifier")
+                .is_none_or(|c| c.is_empty())
+            && doc
+                .child_text(dep, "type")
+                .is_none_or(|t| t.is_empty() || t == "jar")
+    };
+    let managed = doc
+        .child(doc.project, "dependencyManagement")
+        .and_then(|dm| doc.child(dm, "dependencies"))
+        .and_then(|deps| doc.children(deps, "dependency").find(|d| is_jar(*d)));
+    if let Some(dep) = managed {
+        return Some((dep, true));
+    }
+    doc.child(doc.project, "dependencies")
+        .and_then(|deps| doc.children(deps, "dependency").find(|d| is_jar(*d)))
+        .map(|dep| (dep, false))
+}
+
+/// The raw `(groupId, artifactId, version)` of each
+/// `<scope>import</scope>` BOM in `doc`, in order: the project's own, then
+/// each profile's (Maven appends an active profile's management after the
+/// project's). Profile activation is not evaluated, so every profile counts:
+/// a BOM that might apply is weighed rather than letting a root pin override
+/// it.
+fn imports_of(doc: &Doc) -> Vec<(String, String, String)> {
+    let profiles = doc
+        .child(doc.project, "profiles")
+        .into_iter()
+        .flat_map(|ps| doc.children(ps, "profile"));
+    std::iter::once(doc.project)
+        .chain(profiles)
+        .filter_map(|model| {
+            doc.child(model, "dependencyManagement")
+                .and_then(|dm| doc.child(dm, "dependencies"))
+        })
+        .flat_map(|deps| doc.children(deps, "dependency"))
+        .filter(|d| {
+            doc.child_text(*d, "scope").as_deref() == Some("import")
+                && doc.child_text(*d, "type").as_deref() == Some("pom")
+        })
+        .map(|d| {
+            (
+                doc.child_text(d, "groupId").unwrap_or_default(),
+                doc.child_text(d, "artifactId").unwrap_or_default(),
+                doc.child_text(d, "version").unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// The version BOM `bom` manages g:a at, in the BOM's own effective model
+/// (its parents' management and properties, then its own imports); `None`
+/// when it does not manage g:a.
+fn bom_manages<'b>(
+    bom: &Gav,
+    g: &str,
+    a: &str,
+    lookup: &dyn Fn(&Gav) -> Lookup<'b>,
+    seen: &mut BTreeSet<Gav>,
+    depth: usize,
+) -> Result<Option<String>, Missing> {
+    if !seen.insert(bom.clone()) {
+        return Ok(None);
+    }
+    if depth > MAX_EXTERNAL_DEPTH || seen.len() > MAX_EXTERNAL_POMS {
+        return Err(Missing::Unresolved(format!(
+            "the BOM imports under {}:{}:{} nest too deep",
+            bom.0, bom.1, bom.2
+        )));
+    }
+    // The BOM and its parents, nearest first.
+    let mut chain: Vec<ExternalPom> = Vec::new();
+    let mut next = Some(bom.clone());
+    while let Some(gav) = next {
+        if chain.len() >= MAX_EXTERNAL_DEPTH {
+            return Err(Missing::Unresolved(format!(
+                "the parents of the BOM {}:{}:{} nest too deep",
+                bom.0, bom.1, bom.2
+            )));
+        }
+        let role = if chain.is_empty() {
+            "the imported BOM".to_string()
+        } else {
+            format!("a parent of the imported BOM {}:{}:{}", bom.0, bom.1, bom.2)
+        };
+        let pom = fetch_external(&gav, lookup, &role)?;
+        next = pom
+            .parent
+            .as_ref()
+            .map(|p| (p.group.clone(), p.artifact.clone(), p.version.clone()))
+            .and_then(|(pg, pa, pv)| Some((pg?, pa?, pv?)));
+        chain.push(ExternalPom { gav, pom });
+    }
+    let props = |name: &str| -> Option<String> {
+        let own = &chain[0].pom;
+        match name {
+            "project.version" | "pom.version" | "version" => {
+                return own.effective_version().map(str::to_string)
+            }
+            "project.groupId" => return own.effective_group().map(str::to_string),
+            "project.parent.version" => return own.parent.as_ref()?.version.clone(),
+            _ => {}
+        }
+        chain.iter().find_map(|e| e.pom.props.get(name).cloned())
+    };
+    let resolve = |value: &str| -> Result<String, Missing> {
+        interpolate_by(value, &props, 0).ok_or_else(|| {
+            Missing::Unresolved(format!(
+                "the BOM {}:{}:{} manages {g}:{a} at {value}, which it does not define",
+                bom.0, bom.1, bom.2
+            ))
+        })
+    };
+    for ext in &chain {
+        if let Some((dep, true)) = jar_declaration(&ext.pom.doc, g, a) {
+            if let Some(version) = ext.pom.doc.child_text(dep, "version") {
+                return resolve(&version).map(Some);
+            }
+        }
+    }
+    for ext in &chain {
+        for (ig, ia, iv) in imports_of(&ext.pom.doc) {
+            let gav = (resolve(&ig)?, resolve(&ia)?, resolve(&iv)?);
+            if let Some(v) = bom_manages(&gav, g, a, lookup, seen, depth + 1)? {
+                return Ok(Some(v));
+            }
+        }
+    }
+    Ok(None)
+}
 
 /// Metadata needed to verify upstream parents and imported BOMs in Gradle.
 pub(crate) struct MetadataModel {
@@ -2519,6 +2995,299 @@ mod tests {
   </build>
 </project>
 "#;
+
+    // ── management from outside the checkout (#488) ──
+
+    fn bom(artifact: &str, version: &str, managed: &str) -> Vec<u8> {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>com.corp</groupId>\
+             <artifactId>{artifact}</artifactId><version>{version}</version>\
+             <packaging>pom</packaging><dependencyManagement><dependencies>{managed}\
+             </dependencies></dependencyManagement></project>"
+        )
+        .into_bytes()
+    }
+
+    fn corp(artifact: &str, version: &str) -> (String, String, String) {
+        ("com.corp".into(), artifact.into(), version.into())
+    }
+
+    /// A reactor whose root carries `root_extra` (a BOM import, a parent)
+    /// and whose module declares commons-text without a version.
+    fn external_reactor(root_head: &str, root_extra: &str) -> Fs {
+        let root = format!(
+            "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+             <modelVersion>4.0.0</modelVersion>\n  {root_head}\n  <groupId>com.example</groupId>\n  \
+             <artifactId>root</artifactId>\n  <version>1.0.0</version>\n  \
+             <packaging>pom</packaging>\n  <modules><module>a</module></modules>\n  \
+             {root_extra}\n</project>\n"
+        );
+        let a = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
+                 <groupId>com.example</groupId>\n    <artifactId>root</artifactId>\n    \
+                 <version>1.0.0</version>\n  </parent>\n  <artifactId>a</artifactId>\n  \
+                 <dependencies>\n    <dependency><groupId>org.apache.commons</groupId>\
+                 <artifactId>commons-text</artifactId></dependency>\n  </dependencies>\n\
+                 </project>\n";
+        fs(&[("pom.xml", &root), ("a/pom.xml", a)])
+    }
+
+    const IMPORT_BOM: &str = "<dependencyManagement><dependencies><dependency>\
+        <groupId>com.corp</groupId><artifactId>corp-bom</artifactId><version>${bom.version}</version>\
+        <type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement>";
+
+    /// Fetch what the planner asks for from `repo` (absent: unavailable),
+    /// then plan.
+    fn run_external(
+        files: &Fs,
+        repo: &ExternalPoms,
+    ) -> (Result<JvmPlan, JvmRefusal>, ExternalPoms) {
+        let read = |p: &str| files.get(p).cloned();
+        let mut known = ExternalPoms::new();
+        loop {
+            let need = external_poms_needed(&read, &patch(), &known);
+            if need.is_empty() {
+                break;
+            }
+            for gav in need {
+                let bytes = repo.get(&gav).cloned().flatten();
+                known.insert(gav, bytes);
+            }
+        }
+        (
+            plan_with_external(&read, &patch(), true, Some(&known)),
+            known,
+        )
+    }
+
+    fn root_pinned(plan: &JvmPlan, files: &Fs) -> bool {
+        let after = applied(files, plan);
+        text(&after, "pom.xml").contains(PIN_TAG)
+    }
+
+    #[test]
+    fn imported_bom_managing_another_version_leaves_the_root_unpinned() {
+        let files = external_reactor(
+            "<properties><bom.version>2</bom.version></properties>",
+            IMPORT_BOM,
+        );
+        let repo = ExternalPoms::from([(
+            corp("corp-bom", "2"),
+            Some(bom("corp-bom", "2", &dep("1.11.0"))),
+        )]);
+        let (plan, known) = run_external(&files, &repo);
+        let plan = plan.unwrap();
+        assert_eq!(known.keys().collect::<Vec<_>>(), [&corp("corp-bom", "2")]);
+        assert!(
+            reasons(&plan).contains(&"conflicting_managed_version".to_string()),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(plan.warnings.iter().any(|w| w.detail.contains("1.11.0")));
+        assert!(!root_pinned(&plan, &files), "the root must not be pinned");
+        // Without the external weighing (the pre-#488 plan) it was pinned.
+        assert!(root_pinned(&run(&files).unwrap(), &files));
+    }
+
+    #[test]
+    fn imported_bom_at_the_base_version_is_pinned() {
+        let files = external_reactor(
+            "<properties><bom.version>1</bom.version></properties>",
+            IMPORT_BOM,
+        );
+        let repo = ExternalPoms::from([(
+            corp("corp-bom", "1"),
+            Some(bom("corp-bom", "1", &dep("1.10.0"))),
+        )]);
+        let plan = run_external(&files, &repo).0.unwrap();
+        assert!(reasons(&plan).is_empty(), "{:?}", plan.warnings);
+        assert!(root_pinned(&plan, &files));
+    }
+
+    #[test]
+    fn a_bom_bump_after_vendoring_removes_the_pin() {
+        let v1 = external_reactor(
+            "<properties><bom.version>1</bom.version></properties>",
+            IMPORT_BOM,
+        );
+        let repo = ExternalPoms::from([
+            (
+                corp("corp-bom", "1"),
+                Some(bom("corp-bom", "1", &dep("1.10.0"))),
+            ),
+            (
+                corp("corp-bom", "2"),
+                Some(bom("corp-bom", "2", &dep("1.11.0"))),
+            ),
+        ]);
+        let first = run_external(&v1, &repo).0.unwrap();
+        let mut after = applied(&v1, &first);
+        assert!(text(&after, "pom.xml").contains(PIN_TAG));
+        let bumped = text(&after, "pom.xml").replace(
+            "<bom.version>1</bom.version>",
+            "<bom.version>2</bom.version>",
+        );
+        after.insert("pom.xml".into(), bumped.into_bytes());
+        let again = run_external(&after, &repo).0.unwrap();
+        assert!(reasons(&again).contains(&"conflicting_managed_version".to_string()));
+        assert!(
+            !root_pinned(&again, &after),
+            "the re-run must drop the pin, not report it in sync"
+        );
+    }
+
+    #[test]
+    fn a_later_module_importing_another_version_leaves_the_root_unpinned() {
+        // Module `a` sees the root's BOM at the base version; module `b`
+        // imports its own BOM managing another one. A root pin would
+        // override `b`'s management, so one agreeing module is not enough.
+        let mut files = external_reactor(
+            "<properties><bom.version>1</bom.version></properties>",
+            IMPORT_BOM,
+        );
+        let root = text(&files, "pom.xml")
+            .replace("<module>a</module>", "<module>a</module><module>b</module>");
+        files.insert("pom.xml".into(), root.into_bytes());
+        let b = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
+                 <groupId>com.example</groupId>\n    <artifactId>root</artifactId>\n    \
+                 <version>1.0.0</version>\n  </parent>\n  <artifactId>b</artifactId>\n  \
+                 <dependencyManagement><dependencies><dependency>\
+                 <groupId>com.corp</groupId><artifactId>corp-bom</artifactId><version>2</version>\
+                 <type>pom</type><scope>import</scope></dependency></dependencies>\
+                 </dependencyManagement>\n  \
+                 <dependencies>\n    <dependency><groupId>org.apache.commons</groupId>\
+                 <artifactId>commons-text</artifactId></dependency>\n  </dependencies>\n\
+                 </project>\n";
+        files.insert("b/pom.xml".into(), b.as_bytes().to_vec());
+        let repo = ExternalPoms::from([
+            (
+                corp("corp-bom", "1"),
+                Some(bom("corp-bom", "1", &dep("1.10.0"))),
+            ),
+            (
+                corp("corp-bom", "2"),
+                Some(bom("corp-bom", "2", &dep("1.11.0"))),
+            ),
+        ]);
+        let plan = run_external(&files, &repo).0.unwrap();
+        assert!(
+            reasons(&plan).contains(&"conflicting_managed_version".to_string()),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!root_pinned(&plan, &files), "the root must not be pinned");
+    }
+
+    #[test]
+    fn a_profile_bom_import_is_weighed() {
+        let profile = format!(
+            "<profiles><profile><id>corp</id><activation><activeByDefault>true\
+             </activeByDefault></activation>{IMPORT_BOM}</profile></profiles>"
+        );
+        let files = external_reactor(
+            "<properties><bom.version>2</bom.version></properties>",
+            &profile,
+        );
+        let repo = ExternalPoms::from([(
+            corp("corp-bom", "2"),
+            Some(bom("corp-bom", "2", &dep("1.11.0"))),
+        )]);
+        let plan = run_external(&files, &repo).0.unwrap();
+        assert!(
+            reasons(&plan).contains(&"conflicting_managed_version".to_string()),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!root_pinned(&plan, &files), "the root must not be pinned");
+    }
+
+    #[test]
+    fn a_nested_bom_import_is_followed() {
+        let files = external_reactor(
+            "<properties><bom.version>2</bom.version></properties>",
+            IMPORT_BOM,
+        );
+        let outer = "<dependency><groupId>com.corp</groupId><artifactId>inner-bom</artifactId>\
+            <version>7</version><type>pom</type><scope>import</scope></dependency>";
+        let repo = ExternalPoms::from([
+            (corp("corp-bom", "2"), Some(bom("corp-bom", "2", outer))),
+            (
+                corp("inner-bom", "7"),
+                Some(bom("inner-bom", "7", &dep("1.11.0"))),
+            ),
+        ]);
+        let plan = run_external(&files, &repo).0.unwrap();
+        assert!(reasons(&plan).contains(&"conflicting_managed_version".to_string()));
+        assert!(!root_pinned(&plan, &files));
+    }
+
+    #[test]
+    fn an_external_parent_managing_another_version_leaves_the_root_unpinned() {
+        let parent = "<parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId>\
+            <version>2</version><relativePath/></parent>";
+        let files = external_reactor(parent, "");
+        let repo = ExternalPoms::from([(
+            corp("corp-parent", "2"),
+            Some(bom("corp-parent", "2", &dep("1.11.0"))),
+        )]);
+        let plan = run_external(&files, &repo).0.unwrap();
+        assert!(reasons(&plan).contains(&"conflicting_managed_version".to_string()));
+        assert!(!root_pinned(&plan, &files));
+    }
+
+    #[test]
+    fn a_local_property_overriding_an_external_parents_version_is_honored() {
+        // The parent manages `${ct.version}` (1.10.0 by default); the local
+        // root overrides it to 1.11.0, which Maven interpolates after
+        // inheritance.
+        let parent = "<parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId>\
+            <version>3</version><relativePath/></parent>\n  \
+            <properties><ct.version>1.11.0</ct.version></properties>";
+        let files = external_reactor(parent, "");
+        let managed = "<dependency><groupId>org.apache.commons</groupId>\
+            <artifactId>commons-text</artifactId><version>${ct.version}</version></dependency>";
+        let mut parent_pom = String::from_utf8(bom("corp-parent", "3", managed)).unwrap();
+        parent_pom = parent_pom.replace(
+            "<packaging>pom</packaging>",
+            "<packaging>pom</packaging><properties><ct.version>1.10.0</ct.version></properties>",
+        );
+        let repo = ExternalPoms::from([(corp("corp-parent", "3"), Some(parent_pom.into_bytes()))]);
+        let plan = run_external(&files, &repo).0.unwrap();
+        assert!(
+            reasons(&plan).contains(&"conflicting_managed_version".to_string()),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!root_pinned(&plan, &files));
+    }
+
+    #[test]
+    fn unavailable_external_management_leaves_the_root_unpinned() {
+        let files = external_reactor(
+            "<properties><bom.version>2</bom.version></properties>",
+            IMPORT_BOM,
+        );
+        let plan = run_external(&files, &ExternalPoms::new()).0.unwrap();
+        assert!(
+            reasons(&plan).contains(&"management_unresolved".to_string()),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!root_pinned(&plan, &files));
+    }
+
+    #[test]
+    fn a_bom_that_does_not_manage_the_artifact_keeps_the_pin() {
+        let files = external_reactor(
+            "<properties><bom.version>2</bom.version></properties>",
+            IMPORT_BOM,
+        );
+        let other = "<dependency><groupId>junit</groupId><artifactId>junit</artifactId>\
+            <version>4.13.2</version></dependency>";
+        let repo = ExternalPoms::from([(corp("corp-bom", "2"), Some(bom("corp-bom", "2", other)))]);
+        let plan = run_external(&files, &repo).0.unwrap();
+        assert!(reasons(&plan).is_empty(), "{:?}", plan.warnings);
+        assert!(root_pinned(&plan, &files));
+    }
 
     fn module(name: &str, deps: &str) -> String {
         format!(

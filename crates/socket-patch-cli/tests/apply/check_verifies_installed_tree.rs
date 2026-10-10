@@ -339,3 +339,119 @@ fn check_fails_on_an_unpatched_copy_in_a_refused_bundle_path() {
     // The refused root is only read: the loaded copy stays unpatched.
     assert_eq!(std::fs::read(&loaded).unwrap(), GEM_ORIGINAL);
 }
+
+/// The `Run \`socket-patch …\`` remedy that ends a human drift report, as
+/// argv (without the leading `socket-patch`). Undoes the quoting
+/// `ui::shell_word` applies (POSIX `'…'`, Windows `"…"`).
+fn printed_remedy(stderr: &str) -> Vec<String> {
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("Run `socket-patch "))
+        .unwrap_or_else(|| panic!("no remedy line in {stderr}"));
+    let command = line
+        .strip_prefix("Run `socket-patch ")
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(command, _)| command)
+        .unwrap();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let mut in_word = false;
+    for c in command.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, ' ') => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Run `remedy` (+ `--offline`) as printed, then re-check with `check`.
+fn run_remedy_then_check(cwd: &Path, remedy: &[String], check: &[&str]) -> (i32, String) {
+    let mut argv: Vec<&str> = remedy.iter().map(String::as_str).collect();
+    argv.push("--offline");
+    let (code, stdout, stderr) = run_with_env(cwd, &argv, &[("SOCKET_TELEMETRY_DISABLED", "1")]);
+    assert_eq!(
+        code, 0,
+        "the printed remedy runs\nstdout={stdout}\nstderr={stderr}"
+    );
+    let (code, _stdout, stderr) = run_check(cwd, check);
+    (code, stderr)
+}
+
+/// Stores the patched bytes as the after-hash blob, so `apply --offline`
+/// can heal the tree.
+fn store_after_blob(project_root: &Path) {
+    let blobs = project_root.join(".socket/blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(git_sha256(PATCHED)), PATCHED).unwrap();
+}
+
+/// #1219: a `--cwd` check's remedy keeps `--cwd`. Before, it said plain
+/// `socket-patch apply`, which from the parent dir found no manifest,
+/// exited 0 and left the project unpatched.
+#[test]
+fn check_remedy_keeps_cwd_and_heals_the_checked_tree() {
+    let tmp = project(Some(ORIGINAL));
+    store_after_blob(tmp.path());
+    let parent = tmp.path().parent().unwrap();
+    let dir = tmp.path().file_name().unwrap().to_str().unwrap();
+
+    let (code, stdout, stderr) = run_check(parent, &["--cwd", dir]);
+    assert_eq!(code, 1, "drift\nstdout={stdout}\nstderr={stderr}");
+    let remedy = printed_remedy(&stderr);
+    assert_eq!(remedy, ["apply", "--cwd", dir], "{stderr}");
+
+    let (code, stderr) = run_remedy_then_check(parent, &remedy, &["--cwd", dir]);
+    assert_eq!(code, 0, "the remedy healed the checked tree: {stderr}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/check-target/index.js")).unwrap(),
+        PATCHED
+    );
+}
+
+/// #1219: a `--global-prefix` check's remedy keeps the prefix (quoted when
+/// it holds a space). Before, plain `socket-patch apply` patched the cwd
+/// project, reported the patch as not found and exited 0.
+#[test]
+fn check_remedy_keeps_global_prefix_and_heals_the_checked_tree() {
+    let tmp = project(None);
+    store_after_blob(tmp.path());
+    let prefix = tmp.path().join("global lib").join("node_modules");
+    let index = prefix.join("check-target/index.js");
+    std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+    std::fs::write(
+        prefix.join("check-target/package.json"),
+        r#"{ "name": "check-target", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(&index, ORIGINAL).unwrap();
+    let prefix_arg = prefix.to_str().unwrap();
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--global-prefix", prefix_arg]);
+    assert_eq!(code, 1, "drift\nstdout={stdout}\nstderr={stderr}");
+    let remedy = printed_remedy(&stderr);
+    assert_eq!(remedy, ["apply", "--global-prefix", prefix_arg], "{stderr}");
+
+    let (code, stderr) =
+        run_remedy_then_check(tmp.path(), &remedy, &["--global-prefix", prefix_arg]);
+    assert_eq!(code, 0, "the remedy healed the checked tree: {stderr}");
+    assert_eq!(std::fs::read(&index).unwrap(), PATCHED);
+}
