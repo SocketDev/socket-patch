@@ -5973,6 +5973,8 @@ const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 fn add_nuget_source(
     config: &str,
     parsed: &crate::formats::nuget::NugetConfig,
+    inherited: Option<&[String]>,
+    inherited_mapped: bool,
     reg: &str,
     index_url: &str,
     pkg_id: &str,
@@ -5980,11 +5982,34 @@ fn add_nuget_source(
     // The same source identities restore and VEX read, before Socket is added.
     let mut pre_existing_keys: Vec<&str> =
         parsed.sources.iter().map(|(key, _)| key.as_str()).collect();
+    let own_sources = !pre_existing_keys.is_empty();
+    // The sources NuGet merges in from the configs below this one (#354):
+    // once a mapping exists every source no pattern names is dropped, so a
+    // created catch-all must name them too — unless this file `<clear />`s
+    // them. `None` (the in-memory engine, which cannot see them) keeps the
+    // file-only reading.
+    let inherited: &[String] = match inherited {
+        Some(keys) if !parsed.sources_cleared => keys,
+        _ => &[],
+    };
+    for key in inherited {
+        if !pre_existing_keys.contains(&key.as_str()) {
+            pre_existing_keys.push(key);
+        }
+    }
     let creating_mapping = parsed
         .source_mapping
         .as_ref()
         .is_none_or(|section| section.close_start.is_none());
-    let seed_nuget_org = creating_mapping && pre_existing_keys.is_empty();
+    // nuget.org is only seeded when the inherited configs have it (or
+    // nothing): a parent that cleared it for a mirror keeps that choice.
+    // An inherited mapping already routes everything else (NuGet merges
+    // mappings too): no catch-all, which would widen a source it restricts.
+    let seed_nuget_org = creating_mapping
+        && !own_sources
+        && !inherited_mapped
+        && (inherited.is_empty() || inherited.iter().any(|k| k == NUGET_ORG_KEY));
+    let creating_mapping = creating_mapping && !inherited_mapped;
     let reg = nuget_xml_attribute(reg);
     let mut source_lines = format!(
         "    <add key=\"{reg}\" value=\"{}\" />",
@@ -5996,7 +6021,9 @@ fn add_nuget_source(
         source_lines.push_str(&format!(
             "\n    <add key=\"{NUGET_ORG_KEY}\" value=\"{NUGET_ORG_URL}\" />"
         ));
-        pre_existing_keys.push(NUGET_ORG_KEY);
+        if !pre_existing_keys.contains(&NUGET_ORG_KEY) {
+            pre_existing_keys.push(NUGET_ORG_KEY);
+        }
     }
     let out = if let Some(section) = &parsed.package_sources {
         insert_nuget_children(config, section, "packageSources", &source_lines)
@@ -6077,6 +6104,20 @@ fn nuget_xml_attribute(value: &str) -> String {
         .replace('\r', "&#xD;")
 }
 
+/// The synthetic candidate key carrying the package source keys the configs
+/// below the project's own NuGet merges in (the user config, parent
+/// directories), one per line ([`crate::vendor::nuget_config::inherited_source_keys`]).
+/// Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
+pub const NUGET_INHERITED_SOURCES_KEY: &str = "<socket-patch:nuget-inherited-sources>";
+
+/// The synthetic candidate key present when one of those configs maps
+/// packages already (`packageSourceMapping`, which NuGet merges too).
+pub const NUGET_INHERITED_MAPPING_KEY: &str = "<socket-patch:nuget-inherited-mapping>";
+
+/// A config with no sources, the base of a fresh one when the inherited
+/// configs dropped nuget.org.
+const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
+
 /// The synthetic candidate key carrying the locks the engine found every
 /// project under the root restoring into (#353, #514), one per line:
 /// `lock\t<rel>`, `unresolved\t<project>\t<why>` for a `NuGetLockFilePath`
@@ -6103,10 +6144,21 @@ fn rewrite_nuget(
         .into_iter()
         .find(|name| files.contains_key(*name))
         .unwrap_or(NUGET_CONFIG_FILE_NAMES[0]);
-    let mut config = files
-        .get(config_path)
-        .cloned()
-        .unwrap_or_else(default_nuget_config);
+    // The source keys the configs below this one define (the engine reads
+    // them from disk; absent in memory).
+    let inherited: Option<Vec<String>> = files
+        .get(NUGET_INHERITED_SOURCES_KEY)
+        .map(|keys| keys.lines().map(str::to_string).collect());
+    let mut config = files.get(config_path).cloned().unwrap_or_else(|| {
+        match &inherited {
+            // A parent cleared nuget.org (a mirror instead): a fresh config
+            // must not add it back (#354).
+            Some(keys) if !keys.is_empty() && !keys.iter().any(|k| k == NUGET_ORG_KEY) => {
+                EMPTY_NUGET_CONFIG.to_string()
+            }
+            _ => default_nuget_config(),
+        }
+    });
     // A config this run authors from scratch records its source edits as
     // `added` — the spelling every other rewriter uses for a created file.
     let source_action = if files.contains_key(config_path) {
@@ -6182,6 +6234,24 @@ fn rewrite_nuget(
     }
 
     for dep in &nuget {
+        // The uuid lands in the source key, the mapping and the set-aside
+        // comment: one carrying markup (`-->`, a quote, `<`) could write live
+        // nuget.config elements. Only ASCII alphanumerics and single hyphens
+        // pass (every canonical uuid does).
+        let uuid = &dep.patch_uuid;
+        if uuid.is_empty()
+            || uuid.contains("--")
+            || !uuid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_invalid_uuid".into(),
+                detail: format!(
+                    "{} has a malformed patch uuid; dependency skipped",
+                    dep.name
+                ),
+            });
+            continue;
+        }
         let Some(ov) = registry_override_of_kind(dep, "nuget-v3") else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_nuget_missing_override".into(),
@@ -6258,19 +6328,66 @@ fn rewrite_nuget(
             result.warnings.push(unwritable());
             continue;
         };
-        if !parsed.sources.iter().any(|(key, _)| key == &reg) {
+        let wired = parsed.sources.iter().any(|(key, _)| key == &reg);
+        let base = if wired {
+            config.clone()
+        } else {
             // A failed insert skips the WHOLE dep (no edit record, no lock
             // re-pin): a mapping without its source routes the patched id to
             // a source that was never defined, and a lock pinned at the
             // patched contentHash over an upstream fetch fails NU1403 — both
             // while the ledger would claim the redirect landed.
-            let Some(updated) = add_nuget_source(&config, &parsed, &reg, &ov.index_url, &dep.name)
-            else {
+            let Some(updated) = add_nuget_source(
+                &config,
+                &parsed,
+                inherited.as_deref(),
+                files.contains_key(NUGET_INHERITED_MAPPING_KEY),
+                &reg,
+                &ov.index_url,
+                &dep.name,
+            ) else {
                 result.warnings.push(unwritable());
                 continue;
             };
-            config = updated;
+            updated
+        };
+        // Another source naming the id exactly ties with ours, and NuGet
+        // takes the package from whichever answers first (#462): set that
+        // pattern aside while the patch is wired (the upstream restore puts
+        // it back), or skip the dep when it cannot be.
+        let Some(based) = crate::formats::nuget::parse_config(&base) else {
+            result.warnings.push(unwritable());
+            continue;
+        };
+        let (aside, moved) = match crate::formats::nuget::set_aside_competing_patterns(
+            &base, &based, &reg, &dep.name,
+        ) {
+            Ok(done) => done,
+            Err(why) => {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_nuget_mapping_conflict".into(),
+                    detail: format!("{why}; {} not redirected", dep.name),
+                });
+                continue;
+            }
+        };
+        if !moved.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_mapping_set_aside".into(),
+                detail: format!(
+                    "{config_path} also mapped {} to {}; that pattern is commented out while the \
+                     patch is wired, so the Socket source alone serves it (remove / rollback \
+                     restore it)",
+                    dep.name,
+                    moved.join(", ")
+                ),
+            });
+        }
+        if aside != config {
+            config = aside;
             config_changed = true;
+        }
+        if !wired {
             result.edits.push(FileEdit {
                 path: config_path.into(),
                 kind: "redirect_nuget_source".into(),
@@ -9252,6 +9369,30 @@ mod tests {
                 sha512: Some("sha512-PATCHED==".into()),
                 ..Default::default()
             },
+        }
+    }
+
+    #[test]
+    fn nuget_markup_in_the_patch_uuid_is_refused() {
+        let config = "<configuration>\n  <packageSources>\n    \
+                      <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+                      </packageSources>\n  <packageSourceMapping>\n    \
+                      <packageSource key=\"nuget.org\"><package pattern=\"Newtonsoft.Json\" /></packageSource>\n  \
+                      </packageSourceMapping>\n</configuration>\n";
+        let files = BTreeMap::from([("nuget.config".into(), config.to_string())]);
+        for uuid in [
+            "x --> <packageSources><clear /></packageSources> <!--",
+            "a\"b",
+            "",
+        ] {
+            let mut dep = nuget_override();
+            dep.patch_uuid = uuid.into();
+            let r = rewrite_registry_redirect(&files, &[dep]);
+            assert!(r.files.is_empty(), "{uuid}: {:?}", r.files);
+            assert!(r
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_nuget_invalid_uuid"));
         }
     }
 
@@ -23539,6 +23680,93 @@ packages:
             r.edits[0]
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// #462: the issue's config (an exact `Newtonsoft.Json` pattern under
+    /// nuget.org beside `*`): hosted sets that pattern aside so the Socket
+    /// source alone routes the id, and says so.
+    #[test]
+    fn nuget_competing_exact_pattern_is_set_aside() {
+        let config = "<configuration>\n  <packageSources>\n    <clear />\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n      <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n";
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), config.to_string());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert_eq!(warning_codes(&r), vec!["redirect_nuget_mapping_set_aside"]);
+        let out = &r.files["nuget.config"];
+        let parsed = crate::formats::nuget::parse_config(out).unwrap();
+        let exact: Vec<&str> = parsed
+            .mappings
+            .iter()
+            .filter(|(_, p)| p.iter().any(|p| p.eq_ignore_ascii_case("newtonsoft.json")))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(exact, ["socket-patch-uuid"], "{out}");
+        // The re-run over its own output is a no-op.
+        let mut again = BTreeMap::new();
+        again.insert("nuget.config".to_string(), out.clone());
+        let r = rewrite_registry_redirect(&again, &[nuget_override()]);
+        assert!(
+            r.files.is_empty() && r.warnings.is_empty(),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    fn nuget_catch_all(config: &str) -> Vec<String> {
+        crate::formats::nuget::parse_config(config)
+            .unwrap()
+            .mappings
+            .into_iter()
+            .filter(|(_, p)| p == &["*"])
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    /// #354: on disk the engine hands the rewriter the source keys NuGet
+    /// inherits; a created catch-all names them too, and a fresh config
+    /// does not re-add nuget.org a parent cleared.
+    #[test]
+    fn nuget_created_catch_all_names_inherited_sources() {
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "nuget.org\ncorp".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            nuget_catch_all(&r.files["nuget.config"]),
+            ["nuget.org", "corp"]
+        );
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "mirror".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let config = &r.files["nuget.config"];
+        assert_eq!(nuget_catch_all(config), ["mirror"], "{config}");
+        assert!(!config.contains("nuget.org"), "{config}");
+
+        // An inherited mapping already routes everything else: only the
+        // Socket pattern is written (#354 review).
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "nuget.org\ncorp".to_string(),
+        );
+        files.insert(NUGET_INHERITED_MAPPING_KEY.to_string(), String::new());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(nuget_catch_all(&r.files["nuget.config"]).is_empty());
+
+        // Without the key (the in-memory engine) the file alone decides.
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert_eq!(nuget_catch_all(&r.files["nuget.config"]), ["nuget.org"]);
     }
 
     /// A PRESENT but unparseable packages.lock.json refuses the whole nuget

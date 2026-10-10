@@ -546,17 +546,24 @@ pub async fn vendor_nuget(
     let new_hash = sha512_base64_of(&nupkg_bytes);
 
     // ── nuget.config wiring (runs after the artifact) ─────────────────────
-    let config_edit =
-        match build_config_edit(config_text.as_deref(), &source_key, &uuid_dir_rel, name) {
-            Ok(edit) => edit,
-            Err(detail) => {
-                let _ = remove_tree(&uuid_dir).await;
-                prune_empty_vendor_levels(&uuid_dir).await;
-                result.success = false;
-                result.error = Some(detail);
-                return done(result, None, warnings);
-            }
-        };
+    let inherited = super::nuget_config::inherited_sources(project_root).await;
+    let config_edit = match build_config_edit_with(
+        config_text.as_deref(),
+        &inherited.keys,
+        inherited.mapped,
+        &source_key,
+        &uuid_dir_rel,
+        name,
+    ) {
+        Ok(edit) => edit,
+        Err(detail) => {
+            let _ = remove_tree(&uuid_dir).await;
+            prune_empty_vendor_levels(&uuid_dir).await;
+            result.success = false;
+            result.error = Some(detail);
+            return done(result, None, warnings);
+        }
+    };
     let config_target = config_path
         .clone()
         .unwrap_or_else(|| project_root.join("nuget.config"));
@@ -568,6 +575,18 @@ pub async fn vendor_nuget(
         result.success = false;
         result.error = Some(format!("failed to write {}: {e}", config_target.display()));
         return done(result, None, warnings);
+    }
+
+    if !config_edit.set_aside.is_empty() {
+        warnings.push(VendorWarning::new(
+            "vendor_nuget_mapping_set_aside",
+            format!(
+                "nuget.config also mapped {name} to {}; that pattern is commented out while the \
+                 package is vendored, so the vendored feed alone serves it (vendor --revert \
+                 restores it)",
+                config_edit.set_aside.join(", ")
+            ),
+        ));
     }
 
     // ── packages.lock.json pinning (a failure here unwinds the config) ────
@@ -960,6 +979,8 @@ async fn keep_nupkg_committable(
 struct ConfigEdit {
     new_text: String,
     mapping_fragment: String,
+    /// Sources whose exact pattern for the id was set aside (#462).
+    set_aside: Vec<String>,
 }
 
 /// Resolve the existing config in NuGet's own probe order, or `None` when the
@@ -980,8 +1001,32 @@ async fn existing_config_path(project_root: &Path) -> Option<PathBuf> {
 /// nuget.org source so the load-bearing catch-all has a target; editing an
 /// existing file inserts our source (and, only when no `packageSourceMapping`
 /// existed, the catch-all over its pre-existing sources).
+#[cfg(test)]
 fn build_config_edit(
     original: Option<&str>,
+    source_key: &str,
+    source_rel: &str,
+    patched_id: &str,
+) -> Result<ConfigEdit, String> {
+    // No inherited configs: the file-only reading the writer had before
+    // #354 (its own tests cover the inherited sources).
+    build_config_edit_with(original, &[], false, source_key, source_rel, patched_id)
+}
+
+/// [`build_config_edit`] over `inherited`: the source keys the configs NuGet
+/// merges below this one define ([`super::nuget_config::inherited_source_keys`]).
+/// A mapping created here must fan `*` out to them too — once any mapping
+/// exists NuGet drops every source no pattern names, inherited ones
+/// included (#354) — and nuget.org is only seeded when the inherited set
+/// has it (or nothing): a parent that cleared nuget.org for a mirror keeps
+/// that choice. When an inherited config maps packages already
+/// (`inherited_mapped`), no catch-all is written at all: NuGet merges its
+/// patterns, which already route everything else, and a `*` here would widen
+/// a source it restricts.
+fn build_config_edit_with(
+    original: Option<&str>,
+    inherited: &[String],
+    inherited_mapped: bool,
     source_key: &str,
     source_rel: &str,
     patched_id: &str,
@@ -989,31 +1034,47 @@ fn build_config_edit(
     let mapping_fragment = format!(
         "    <packageSource key=\"{source_key}\">\n      <package pattern=\"{patched_id}\" />\n    </packageSource>\n"
     );
+    let seed_allowed = inherited.is_empty() || inherited.iter().any(|k| k == NUGET_ORG_SOURCE_KEY);
     match original {
         None => {
-            // Fresh config: nuget.org (the implicit default) is seeded as the
-            // catch-all target, our source added, and the mapping routes the
-            // patched id to us while `*` keeps everything else on nuget.org.
+            // Fresh config: our source, and a mapping that routes the
+            // patched id to us while `*` keeps everything else on the
+            // sources NuGet inherits. nuget.org (the implicit default) is
+            // seeded unless the inherited configs dropped it.
+            let mut catch_all: Vec<String> = if inherited_mapped {
+                Vec::new()
+            } else {
+                inherited.to_vec()
+            };
+            let mut sources = String::new();
+            if seed_allowed && !inherited_mapped {
+                sources.push_str(&format!(
+                    "    <add key=\"{NUGET_ORG_SOURCE_KEY}\" value=\"{NUGET_ORG_SOURCE_URL}\" />\n"
+                ));
+                if !catch_all.iter().any(|k| k == NUGET_ORG_SOURCE_KEY) {
+                    catch_all.insert(0, NUGET_ORG_SOURCE_KEY.to_string());
+                }
+            }
+            sources.push_str(&format!(
+                "    <add key=\"{source_key}\" value=\"{source_rel}\" />\n"
+            ));
+            let mut mapping = String::new();
+            for key in &catch_all {
+                mapping.push_str(&format!(
+                    "    <packageSource key=\"{}\">\n      <package pattern=\"*\" />\n    </packageSource>\n",
+                    crate::formats::nuget::xml_attribute(key)
+                ));
+            }
+            mapping.push_str(&mapping_fragment);
             let text = format!(
-                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-                 <configuration>\n\
-                 \x20 <packageSources>\n\
-                 \x20   <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n\
-                 \x20   <add key=\"{source_key}\" value=\"{source_rel}\" />\n\
-                 \x20 </packageSources>\n\
-                 \x20 <packageSourceMapping>\n\
-                 \x20   <packageSource key=\"nuget.org\">\n\
-                 \x20     <package pattern=\"*\" />\n\
-                 \x20   </packageSource>\n\
-                 \x20   <packageSource key=\"{source_key}\">\n\
-                 \x20     <package pattern=\"{patched_id}\" />\n\
-                 \x20   </packageSource>\n\
-                 \x20 </packageSourceMapping>\n\
-                 </configuration>\n"
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n\
+                 {sources}  </packageSources>\n  <packageSourceMapping>\n{mapping}  \
+                 </packageSourceMapping>\n</configuration>\n"
             );
             Ok(ConfigEdit {
                 new_text: text,
                 mapping_fragment,
+                set_aside: Vec::new(),
             })
         }
         Some(text) => {
@@ -1051,7 +1112,26 @@ fn build_config_edit(
                     catch_all_keys.push(key.clone());
                 }
             }
-            let seed_nuget_org = creating_mapping && catch_all_keys.is_empty();
+            let own_sources = !catch_all_keys.is_empty();
+            // NuGet merges the inherited sources under this file's unless it
+            // `<clear />`s them; the catch-all must name them too (#354).
+            let inherited: &[String] = if parsed.sources_cleared {
+                &[]
+            } else {
+                inherited
+            };
+            for key in inherited {
+                if !catch_all_keys.contains(key) {
+                    catch_all_keys.push(key.clone());
+                }
+            }
+            let seed_nuget_org = creating_mapping
+                && !own_sources
+                && !inherited_mapped
+                && (inherited.is_empty() || inherited.iter().any(|k| k == NUGET_ORG_SOURCE_KEY));
+            if inherited_mapped {
+                catch_all_keys.clear();
+            }
 
             let source_add = format!("    <add key=\"{source_key}\" value=\"{source_rel}\" />\n");
             let org_add = format!(
@@ -1060,7 +1140,9 @@ fn build_config_edit(
             // The sources we inject: the seeded nuget.org (when needed) then our
             // vendored source.
             let injected_sources = if seed_nuget_org {
-                catch_all_keys.push(NUGET_ORG_SOURCE_KEY.to_string());
+                if !catch_all_keys.iter().any(|k| k == NUGET_ORG_SOURCE_KEY) {
+                    catch_all_keys.push(NUGET_ORG_SOURCE_KEY.to_string());
+                }
                 format!("{org_add}{source_add}")
             } else {
                 source_add
@@ -1123,9 +1205,18 @@ fn build_config_edit(
                     }
                 }
             };
+            // Another source naming the id exactly ties with ours, and NuGet
+            // takes the package from whichever answers first (#462): that
+            // pattern is set aside in a comment while we are wired. The
+            // whole-file revert restores it, and so does the excision.
+            let wired = parse_wirable_config(&new_text)?;
+            let (new_text, set_aside) = crate::formats::nuget::set_aside_competing_patterns(
+                &new_text, &wired, source_key, patched_id,
+            )?;
             Ok(ConfigEdit {
                 new_text,
                 mapping_fragment,
+                set_aside,
             })
         }
     }
@@ -1294,7 +1385,9 @@ async fn revert_config_record(
     if dry_run {
         return Ok(true);
     }
-    let mut out = live.replacen(&source_add, "", 1);
+    // The patterns vendor set aside go back first (#462).
+    let mut out =
+        crate::formats::nuget::restore_set_aside(&live, source_key).replacen(&source_add, "", 1);
     if let Some(block) = mapping_block {
         out = out.replacen(&block, "", 1);
     }
@@ -4876,6 +4969,178 @@ mod tests {
             let err = wire(text).err().unwrap_or_else(|| panic!("wired {text:?}"));
             assert!(err.contains("malformed XML or a repeated section"), "{err}");
         }
+    }
+
+    fn catch_all_of(text: &str) -> Vec<String> {
+        crate::formats::nuget::parse_config(text)
+            .unwrap()
+            .mappings
+            .into_iter()
+            .filter(|(_, p)| p == &["*"])
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    fn wire_inheriting(original: Option<&str>, inherited: &[&str]) -> String {
+        let inherited: Vec<String> = inherited.iter().map(|k| k.to_string()).collect();
+        build_config_edit_with(
+            original,
+            &inherited,
+            false,
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .unwrap()
+        .new_text
+    }
+
+    /// #354: a mapping created here also fans `*` out to the sources NuGet
+    /// inherits (user config, parent directories) — NuGet drops every
+    /// source no pattern names.
+    #[test]
+    fn created_catch_all_names_inherited_sources() {
+        let own = "<configuration>\n  <packageSources>\n    <add key=\"local\" value=\"./feed\" />\n  </packageSources>\n</configuration>\n";
+        let t = wire_inheriting(Some(own), &["nuget.org", "corp"]);
+        assert_eq!(catch_all_of(&t), ["local", "nuget.org", "corp"], "{t}");
+        // A file that `<clear />`s them inherits nothing.
+        let cleared = own.replace("<packageSources>\n", "<packageSources>\n    <clear />\n");
+        let t = wire_inheriting(Some(&cleared), &["nuget.org", "corp"]);
+        assert_eq!(catch_all_of(&t), ["local"], "{t}");
+        // An existing mapping is the user's: nothing is fanned out.
+        let mapped = own.replace(
+            "</configuration>",
+            "  <packageSourceMapping>\n    <packageSource key=\"local\">\n      <package pattern=\"*\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>",
+        );
+        let t = wire_inheriting(Some(&mapped), &["nuget.org", "corp"]);
+        assert_eq!(catch_all_of(&t), ["local"], "{t}");
+    }
+
+    /// #354: a fresh config maps `*` to every inherited source, and only
+    /// seeds nuget.org when the inherited configs have it: a parent that
+    /// cleared nuget.org for a mirror keeps that choice.
+    #[test]
+    fn fresh_config_follows_the_inherited_sources() {
+        let t = wire_inheriting(None, &["nuget.org", "corp"]);
+        assert_eq!(catch_all_of(&t), ["nuget.org", "corp"], "{t}");
+        assert!(t.contains("<add key=\"nuget.org\""), "{t}");
+        let t = wire_inheriting(None, &["mirror"]);
+        assert_eq!(catch_all_of(&t), ["mirror"], "{t}");
+        assert!(!t.contains("nuget.org"), "{t}");
+        // An empty config the parent left: nuget.org seeded, as before.
+        let empty = "<configuration>\n</configuration>\n";
+        let t = wire_inheriting(Some(empty), &["mirror"]);
+        assert_eq!(catch_all_of(&t), ["mirror"], "{t}");
+        assert!(!t.contains("nuget.org"), "{t}");
+        // The common case (the user config's nuget.org) is byte-identical
+        // to the file-only writer.
+        assert_eq!(
+            wire_inheriting(None, &["nuget.org"]),
+            wire_inheriting(None, &[])
+        );
+    }
+
+    /// #462: the user's mapping also names the id exactly under nuget.org
+    /// (Visual Studio's mapping UI writes this). That pattern is set aside
+    /// while vendored, so the vendored feed alone serves the id, and revert
+    /// restores the config byte-exact.
+    #[tokio::test]
+    async fn competing_exact_mapping_is_set_aside_and_restored() {
+        let cfg = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear />\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n      <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n";
+        let (dir, blobs, installed, record) = fixture(true, Some(cfg)).await;
+        let root = dir.path();
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_nuget_mapping_set_aside"
+                    && w.detail.contains("nuget.org")),
+            "{warnings:?}"
+        );
+        let wired = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        let parsed = crate::formats::nuget::parse_config(&wired).unwrap();
+        let exact: Vec<&str> = parsed
+            .mappings
+            .iter()
+            .filter(|(_, p)| p.iter().any(|p| p == "Newtonsoft.Json"))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(exact, [source_key().as_str()], "{wired}");
+        // A sibling edit forces the excision path; it restores the pattern too.
+        tokio::fs::write(
+            root.join("nuget.config"),
+            wired.replace("</configuration>", "<!-- x -->\n</configuration>"),
+        )
+        .await
+        .unwrap();
+        let reverted = revert_nuget(&entry.unwrap(), root, false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        let after = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert_eq!(
+            after,
+            cfg.replace("</configuration>", "<!-- x -->\n</configuration>")
+        );
+    }
+
+    /// #354 review: an inherited config that maps packages already routes
+    /// everything else (NuGet merges mappings too), so no `*` catch-all is
+    /// written — it would widen a source the parent restricts.
+    #[test]
+    fn inherited_mapping_gets_no_catch_all() {
+        let own = "<configuration>\n  <packageSources>\n    <add key=\"local\" value=\"./feed\" />\n  </packageSources>\n</configuration>\n";
+        for original in [None, Some(own)] {
+            let t = build_config_edit_with(
+                original,
+                &["nuget.org".to_string(), "corp".to_string()],
+                true,
+                &source_key(),
+                &format!(".socket/vendor/nuget/{UUID}"),
+                "Newtonsoft.Json",
+            )
+            .unwrap()
+            .new_text;
+            assert!(catch_all_of(&t).is_empty(), "{t}");
+            let parsed = crate::formats::nuget::parse_config(&t).unwrap();
+            assert_eq!(
+                parsed.mappings,
+                [(source_key(), vec!["Newtonsoft.Json".to_string()])],
+                "{t}"
+            );
+        }
+    }
+
+    /// #354 end to end: the project sits under a directory whose
+    /// nuget.config defines a private feed; vendoring creates a config whose
+    /// catch-all keeps that feed (and the implicit nuget.org) eligible.
+    #[tokio::test]
+    async fn vendor_keeps_a_parent_directorys_feed_routable() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let outer = dir.path();
+        tokio::fs::write(
+            outer.join("nuget.config"),
+            "<configuration>\n  <packageSources>\n    <add key=\"corp\" value=\"https://corp.example/v3/index.json\" />\n  </packageSources>\n</configuration>\n",
+        )
+        .await
+        .unwrap();
+        // The project is a subdirectory: copy the fixture's lock into it.
+        let root = outer.join("app");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::rename(outer.join(PACKAGES_LOCK), root.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let t = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert_eq!(catch_all_of(&t), ["nuget.org", "corp"], "{t}");
     }
 
     /// A key listed twice gets one catch-all, and an `<add>` without a key
