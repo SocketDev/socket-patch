@@ -632,7 +632,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(app.join(PACKAGES_LOCK)).unwrap(),
-            lock(UPSTREAM)
+            lock(&upstream())
         );
     }
 
