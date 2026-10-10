@@ -6020,6 +6020,24 @@ fn rewrite_nuget(
     let mut lock_changed = false;
 
     for dep in &nuget {
+        // The uuid lands in the source key, the mapping and the set-aside
+        // comment: one carrying markup (`-->`, a quote, `<`) could write live
+        // nuget.config elements. Only ASCII alphanumerics and single hyphens
+        // pass (every canonical uuid does).
+        let uuid = &dep.patch_uuid;
+        if uuid.is_empty()
+            || uuid.contains("--")
+            || !uuid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_invalid_uuid".into(),
+                detail: format!(
+                    "{} has a malformed patch uuid; dependency skipped",
+                    dep.name
+                ),
+            });
+            continue;
+        }
         let Some(ov) = registry_override_of_kind(dep, "nuget-v3") else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_nuget_missing_override".into(),
@@ -9135,6 +9153,30 @@ mod tests {
                 sha512: Some("sha512-PATCHED==".into()),
                 ..Default::default()
             },
+        }
+    }
+
+    #[test]
+    fn nuget_markup_in_the_patch_uuid_is_refused() {
+        let config = "<configuration>\n  <packageSources>\n    \
+                      <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+                      </packageSources>\n  <packageSourceMapping>\n    \
+                      <packageSource key=\"nuget.org\"><package pattern=\"Newtonsoft.Json\" /></packageSource>\n  \
+                      </packageSourceMapping>\n</configuration>\n";
+        let files = BTreeMap::from([("nuget.config".into(), config.to_string())]);
+        for uuid in [
+            "x --> <packageSources><clear /></packageSources> <!--",
+            "a\"b",
+            "",
+        ] {
+            let mut dep = nuget_override();
+            dep.patch_uuid = uuid.into();
+            let r = rewrite_registry_redirect(&files, &[dep]);
+            assert!(r.files.is_empty(), "{uuid}: {:?}", r.files);
+            assert!(r
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_nuget_invalid_uuid"));
         }
     }
 

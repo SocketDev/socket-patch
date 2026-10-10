@@ -400,6 +400,12 @@ pub(crate) fn set_aside_competing_patterns(
     key: &str,
     id: &str,
 ) -> Result<(String, Vec<String>), String> {
+    // The key opens the comment: `--` in it could close the comment early.
+    if key.contains("--") {
+        return Err(format!(
+            "source key {key} cannot name a set-aside comment (it holds `--`)"
+        ));
+    }
     let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
     let mut keys: Vec<String> = Vec::new();
     for ((source, patterns), span) in cfg.mappings.iter().zip(&cfg.mapping_spans) {
@@ -560,6 +566,14 @@ mod tests {
             super::restore_set_aside(&out2, "socket-patch-u"),
             open_close
         );
+        // A key that could close the comment is refused.
+        assert!(super::set_aside_competing_patterns(
+            COMPETING,
+            &cfg,
+            "socket-patch-x-->",
+            "Newtonsoft.Json"
+        )
+        .is_err());
         // A Socket-looking key is a competitor like any other.
         let lookalike = COMPETING.replace("key=\"corp\"", "key=\"socket-patch-evil\"");
         let cfg3 = super::parse_config(&lookalike).unwrap();
