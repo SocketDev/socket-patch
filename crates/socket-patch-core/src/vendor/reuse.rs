@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
-use crate::utils::env_compat::is_debug_enabled;
 
 use super::state::{load_state_shared, VendorEntry};
 use super::verify::{
@@ -46,9 +45,10 @@ pub(crate) enum ReuseMiss {
 
 /// Debug-log a reuse miss (`SOCKET_DEBUG`); the caller then acquires.
 pub(crate) fn log_miss(purl: &str, miss: &ReuseMiss) {
-    if is_debug_enabled() {
-        eprintln!("[socket-patch debug] vendor reuse skipped for {purl}: {miss:?}");
-    }
+    crate::utils::env_compat::debug_log(
+        "debug",
+        &format!("vendor reuse skipped for {purl}: {miss:?}"),
+    );
 }
 
 fn norm(path: &str) -> String {
@@ -407,28 +407,21 @@ mod tests {
 
     fn entry_for(uuid: &str, rel: &str, bytes: &[u8]) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: "pkg:npm/left-pad@1.3.0".into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: rel.into(),
-                sha256: hex::encode(Sha256::digest(bytes)),
-                size: Some(bytes.len() as u64),
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             flavor: Some("package-lock".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-            detached: false,
-            record: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                "pkg:npm/left-pad@1.3.0".into(),
+                uuid.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel.into(),
+                    sha256: hex::encode(Sha256::digest(bytes)),
+                    size: Some(bytes.len() as u64),
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 

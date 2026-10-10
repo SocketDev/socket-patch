@@ -109,6 +109,11 @@ struct Shape {
     /// A shape hosted mode must REFUSE: the rewriter warning code every
     /// patch is skipped with. The scan must leave every file untouched.
     refused: Option<&'static str>,
+    /// A dependency line the fresh checkout adds AFTER the scan, which
+    /// locks its own crates.io copy of the (single) patched crate version
+    /// beside the Socket one (#679, #863): VEX must then attest nothing, and
+    /// `remove` must merge the Socket block into the crates.io one.
+    contest: Option<&'static str>,
 }
 
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
@@ -617,6 +622,11 @@ async fn run_shape(shape: Shape) -> Option<()> {
         stderr(&build)
     );
 
+    if let Some(dep) = shape.contest {
+        contest_after_scan(&shape, dep, &fresh, &fresh_home, &uri);
+        return Some(());
+    }
+
     // Post-install VEX over the fresh checkout: every patch is attested,
     // hash-verified against the extracted (patched) registry sources.
     let doc_path = fresh.join("doc.vex.json");
@@ -749,6 +759,153 @@ async fn run_shape(shape: Shape) -> Option<()> {
     Some(())
 }
 
+/// The cfg-if blocks of `dir`'s lock: `(version, source)`.
+fn locked_blocks(dir: &Path, name: &str) -> Vec<(String, Option<String>)> {
+    let lock = std::fs::read_to_string(dir.join("Cargo.lock")).unwrap();
+    cargo_e2e_matrix::parse_lock(&lock)
+        .into_iter()
+        .filter(|p| p.name == name)
+        .map(|p| (p.version, p.source))
+        .collect()
+}
+
+/// #679 / #863: `dep` added to the hosted fresh checkout locks a crates.io
+/// copy of the patched crate version beside the Socket one. VEX must not
+/// attest the crate (the build compiles the unpatched copy too), and
+/// `remove` must leave the single crates.io block cargo itself writes, so
+/// `cargo build --locked` still parses and accepts the lock.
+fn contest_after_scan(shape: &Shape, dep: &str, fresh: &Path, home: &Path, uri: &str) {
+    let [patch] = shape.patches.as_slice() else {
+        panic!("{}: a contest shape has one patch", shape.tag);
+    };
+    let toml_path = fresh.join("Cargo.toml");
+    let toml = std::fs::read_to_string(&toml_path).unwrap();
+    std::fs::write(
+        &toml_path,
+        toml.replace("[dependencies]\n", &format!("[dependencies]\n{dep}\n")),
+    )
+    .unwrap();
+    let build = cargo(fresh, &["build", "-q"], home);
+    assert!(build.status.success(), "{}: {}", shape.tag, stderr(&build));
+    let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
+    let twin = |dir: &Path| {
+        locked_blocks(dir, patch.name)
+            .iter()
+            .any(|(v, s)| v == patch.version && s.as_deref() == Some(crates_io))
+    };
+    if !twin(fresh) {
+        // crates.io resolved a newer release: lock the patched version, the
+        // case where the patch is for the newest release.
+        let other = locked_blocks(fresh, patch.name)
+            .into_iter()
+            .find(|(_, s)| s.as_deref() == Some(crates_io))
+            .map(|(v, _)| v)
+            .expect("the added dependency locks a crates.io copy");
+        let spec = format!("{crates_io}#{}@{other}", patch.name);
+        let update = cargo(
+            fresh,
+            &["update", "-p", &spec, "--precise", patch.version],
+            home,
+        );
+        assert!(
+            update.status.success(),
+            "{}: {}",
+            shape.tag,
+            stderr(&update)
+        );
+    }
+    let build = cargo(fresh, &["build", "-q", "--locked"], home);
+    assert!(build.status.success(), "{}: {}", shape.tag, stderr(&build));
+    let blocks = locked_blocks(fresh, patch.name)
+        .into_iter()
+        .filter(|(v, _)| v == patch.version)
+        .count();
+    assert_eq!(blocks, 2, "{}: the contested lock", shape.tag);
+
+    // VEX: the crate is not attested.
+    let doc_path = fresh.join("doc.vex.json");
+    let fresh_s = fresh.to_str().unwrap().to_string();
+    let (code, stdout, err) = run_socket(
+        fresh,
+        &[
+            "vex",
+            "--output",
+            doc_path.to_str().unwrap(),
+            "--product",
+            "pkg:cargo/consumer@0.1.0",
+            "--patch-server-url",
+            uri,
+            "--api-url",
+            uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--cwd",
+            &fresh_s,
+        ],
+        home,
+    );
+    let doc = std::fs::read_to_string(&doc_path).unwrap_or_default();
+    assert!(
+        !doc.contains(&patch.purl()),
+        "{}: a contested crate must not be attested (exit {code}):\n{doc}\n{stdout}\n{err}",
+        shape.tag
+    );
+    assert!(
+        format!("{stdout}{err}").contains("that copy stays UNPATCHED"),
+        "{}: the contest is diagnosed:\n{stdout}\n{err}",
+        shape.tag
+    );
+
+    // remove: one crates.io block, and the lock cargo itself writes.
+    let purl = patch.purl();
+    let (code, stdout, err) = run_socket_env(
+        fresh,
+        &[
+            "remove",
+            &purl,
+            "--cwd",
+            &fresh_s,
+            "--json",
+            "--yes",
+            "--no-telemetry",
+        ],
+        home,
+        &[("SOCKET_PATCH_SERVER_URL", uri)],
+    );
+    assert_eq!(
+        code, 0,
+        "{}: remove\nstdout:\n{stdout}\nstderr:\n{err}",
+        shape.tag
+    );
+    let blocks: Vec<_> = locked_blocks(fresh, patch.name)
+        .into_iter()
+        .filter(|(v, _)| v == patch.version)
+        .collect();
+    assert_eq!(
+        blocks,
+        [(patch.version.to_string(), Some(crates_io.to_string()))],
+        "{}: remove merges into the crates.io block",
+        shape.tag
+    );
+    assert!(
+        !std::fs::read_to_string(&toml_path)
+            .unwrap()
+            .contains("socket-patch-"),
+        "{}: the Cargo.toml pin is gone",
+        shape.tag
+    );
+    std::fs::write(fresh.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let build = cargo(fresh, &["build", "-q", "--locked", "--offline"], home);
+    assert!(
+        build.status.success(),
+        "{}: the restored lock builds unchanged under --locked:\n{}",
+        shape.tag,
+        stderr(&build)
+    );
+}
+
 /// Pin each patched version: a caret requirement locks the newest
 /// compatible release, which moves as crates.io publishes.
 fn pin_patched_versions(proj: &Path, home: &Path, patches: &[Patch]) {
@@ -814,6 +971,7 @@ async fn cargo_hosted_multi_version_pins_each_declaration_and_removes_cleanly() 
         crlf: false,
         lockless: false,
         refused: None,
+        contest: None,
     };
     let _ = run_shape(shape).await;
 }
@@ -837,6 +995,7 @@ async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
         crlf: false,
         lockless: false,
         refused: None,
+        contest: None,
     };
     let _ = run_shape(shape).await;
 }
@@ -875,6 +1034,7 @@ async fn cargo_hosted_config_trailing_bytes_are_restored() {
             crlf: false,
             lockless: false,
             refused: None,
+            contest: None,
         };
         if run_shape(shape).await.is_none() {
             return;
@@ -908,6 +1068,7 @@ async fn cargo_hosted_same_line_in_two_sections_removes_cleanly() {
         crlf: false,
         lockless: false,
         refused: None,
+        contest: None,
     };
     let _ = run_shape(shape).await;
 }
@@ -947,6 +1108,7 @@ async fn cargo_hosted_workspace_member_declaration_is_pinned() {
         crlf: false,
         lockless: false,
         refused: None,
+        contest: None,
     };
     let _ = run_shape(shape).await;
 }
@@ -969,6 +1131,7 @@ async fn cargo_hosted_crlf_project_keeps_its_line_endings() {
         crlf: true,
         lockless: false,
         refused: None,
+        contest: None,
     };
     let _ = run_shape(shape).await;
 }
@@ -994,6 +1157,7 @@ async fn cargo_hosted_refuses_a_crate_another_crate_depends_on() {
         crlf: false,
         lockless: false,
         refused: Some("redirect_cargo_transitive_dependents"),
+        contest: None,
     };
     let _ = run_shape(shape).await;
 }
@@ -1020,6 +1184,30 @@ async fn cargo_hosted_refuses_a_lockless_project_with_other_dependencies() {
         crlf: false,
         lockless: true,
         refused: Some("redirect_cargo_lockless_dependents"),
+        contest: None,
+    };
+    let _ = run_shape(shape).await;
+}
+
+/// #679 / #863: a dependency added after the hosted scan locks its own
+/// crates.io copy of the patched cfg-if 1.0.4.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_contested_by_a_later_crates_io_copy() {
+    let shape = Shape {
+        tag: "contested-later-dependent",
+        files: vec![
+            ("Cargo.toml", consumer_manifest("cfg-if = \"1.0.4\"\n")),
+            ("src/main.rs", "fn main() {}\n".to_string()),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: vec![(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
+        )],
+        crlf: false,
+        lockless: false,
+        refused: None,
+        contest: Some("crc32fast = \"=1.5.0\""),
     };
     let _ = run_shape(shape).await;
 }

@@ -80,6 +80,28 @@ pub struct Fixture {
     pub expect: Expect,
 }
 
+fn fixture(
+    scanned: usize,
+    patches: Vec<PatchSpec>,
+    rewritten: &[&str],
+    warnings: &[&'static str],
+) -> Fixture {
+    Fixture {
+        project: "project",
+        expect: Expect {
+            scanned,
+            redirected: patches.len(),
+            rewritten: rewritten.iter().map(|s| s.to_string()).collect(),
+            allowed_warnings: warnings.to_vec(),
+            ..Expect::default()
+        },
+        patches,
+        files: Vec::new(),
+        env_paths: Vec::new(),
+        env: Vec::new(),
+    }
+}
+
 /// The artifact host's base URL inside fixtures. The CLI is pointed at the
 /// mock with `SOCKET_PATCH_SERVER_URL`; references carry absolute URLs, so
 /// a fixture writes this placeholder and the engine rewrites it to the

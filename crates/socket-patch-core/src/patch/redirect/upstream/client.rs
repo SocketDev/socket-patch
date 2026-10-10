@@ -21,6 +21,15 @@ pub(crate) struct NpmDist {
     pub integrity: Option<String>,
     /// The hex sha1 `dist.shasum`.
     pub shasum: Option<String>,
+    /// The version document's `bin`, as yarn reads a manifest's
+    /// ([`crate::formats::yarn::berry_entry::manifest_bin`]): what yarn
+    /// berry writes in the `bin:` section of the version's `npm:` entry
+    /// (#1131). Empty when the document declares none.
+    pub bin: std::collections::BTreeMap<String, String>,
+    /// Whether yarn's npm resolver gives this version the implicit
+    /// `node-gyp: "npm:latest"` dependency (see
+    /// `formats::yarn::berry_entry::registry_adds_node_gyp`, #737).
+    pub node_gyp: bool,
 }
 
 /// A Go module version's two go.sum hashes.
@@ -295,6 +304,8 @@ impl UpstreamClient {
             tarball,
             integrity: str_field("integrity"),
             shasum: str_field("shasum"),
+            bin: crate::formats::yarn::berry_entry::manifest_bin(&doc),
+            node_gyp: crate::formats::yarn::berry_entry::registry_adds_node_gyp(&doc),
         })
     }
 
@@ -641,7 +652,9 @@ pub(crate) const DEFAULT_GOSUMDB: &str = "https://sum.golang.org";
 /// The checksum database go would consult for `module`, or `None` when go
 /// would not (`GOSUMDB=off`, or the module matches `GONOSUMDB` /
 /// `GOPRIVATE`) — the hashes are then computed from the module proxy's
-/// bytes instead. An explicit `SOCKET_GOSUMDB_URL` always wins.
+/// bytes instead. An explicit `SOCKET_GOSUMDB_URL` always wins. The Go
+/// settings resolve from the environment, then the `go env -w` file
+/// ([`crate::utils::go_env`]).
 fn gosumdb_base(module: &str) -> Option<String> {
     if let Ok(v) = std::env::var("SOCKET_GOSUMDB_URL") {
         let v = v.trim().trim_end_matches('/').to_string();
@@ -649,7 +662,7 @@ fn gosumdb_base(module: &str) -> Option<String> {
             return Some(v);
         }
     }
-    let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    let nonempty = |key: &str| crate::utils::go_env::go_env(key).filter(|v| !v.trim().is_empty());
     if nonempty("GOSUMDB").is_some_and(|v| v.trim() == "off") {
         return None;
     }
@@ -790,6 +803,8 @@ mod tests {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: registry_sri,
                     shasum: registry_sha1,
+                    bin: Default::default(),
+                    node_gyp: false,
                 }),
             );
             for _ in 0..2 {
@@ -850,6 +865,8 @@ mod tests {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: Some("sha512-other".into()),
                     shasum: None,
+                    bin: Default::default(),
+                    node_gyp: false,
                 }),
             );
             assert!(
