@@ -951,7 +951,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
     } else {
         Default::default()
     };
-    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
+    // Leftover `resolutions` selectors (#1203) unwind like pins: the
+    // restore retires them from the manifest.
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
 
     if manifest_missing && !vendor_ledger_exists && hosted_pins.is_empty() {
         // Hosted wiring the lockfiles name but cannot attribute is still
