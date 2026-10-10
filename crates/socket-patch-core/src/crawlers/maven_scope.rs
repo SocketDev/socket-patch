@@ -424,6 +424,25 @@ impl Walk<'_> {
             let Some(model) = self.model(&path, false) else {
                 return Some(());
             };
+            // A relocation stub (`<distributionManagement><relocation>`)
+            // has no jar: Maven resolves the coordinate it names instead.
+            if let Some((rg, ra, rv)) = model.relocation.clone() {
+                let (g, a, v) = &gav;
+                let props = vec![Node {
+                    model: Arc::clone(&model),
+                    path: path.clone(),
+                    local: false,
+                }];
+                let part = |p: Option<String>, own: &str| match p {
+                    Some(p) => interpolate(&p, &props),
+                    None => Some(own.to_string()),
+                };
+                if let (Some(rg), Some(ra), rv) = (part(rg, g), part(ra, a), part(rv, v)) {
+                    if (rg.as_str(), ra.as_str(), rv.as_deref()) != (g, a, Some(v.as_str())) {
+                        self.enqueue(&rg, &ra, rv);
+                    }
+                }
+            }
             let chain = self.chain(Node {
                 model,
                 path,
@@ -670,6 +689,69 @@ mod tests {
         ] {
             assert!(!scope.admits(g, a, v), "{g}:{a}:{v}");
         }
+    }
+
+    /// A relocation stub (no jar) leads to the coordinate it names, and on
+    /// to that artifact's own dependencies; a part the relocation omits
+    /// keeps the stub's own.
+    #[test]
+    fn relocation_stubs_are_followed_to_their_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cwd, repo) = (dir.path().join("p"), dir.path().join("m2"));
+        write(
+            &cwd,
+            "pom.xml",
+            &pom(
+                "com.example",
+                "app",
+                "1",
+                &deps(&[
+                    dep("mysql", "mysql-connector-java", Some("8.0.33"), ""),
+                    dep("old.group", "lib", Some("2"), ""),
+                ]),
+            ),
+        );
+        cache(
+            &repo,
+            "mysql",
+            "mysql-connector-java",
+            "8.0.33",
+            "<distributionManagement><relocation><groupId>com.mysql</groupId>\
+             <artifactId>mysql-connector-j</artifactId></relocation></distributionManagement>",
+        );
+        cache(
+            &repo,
+            "com.mysql",
+            "mysql-connector-j",
+            "8.0.33",
+            &deps(&[dep(
+                "com.google.protobuf",
+                "protobuf-java",
+                Some("3.21.9"),
+                "",
+            )]),
+        );
+        cache(&repo, "com.google.protobuf", "protobuf-java", "3.21.9", "");
+        cache(
+            &repo,
+            "old.group",
+            "lib",
+            "2",
+            "<distributionManagement><relocation><groupId>new.group</groupId>\
+             <version>${project.version}.1</version></relocation></distributionManagement>",
+        );
+        cache(&repo, "new.group", "lib", "2.1", "");
+        cache(&repo, "new.group", "lib", "3", "");
+        let scope = project_scope(&cwd, &repo).unwrap();
+        for (g, a, v) in [
+            ("mysql", "mysql-connector-java", "8.0.33"),
+            ("com.mysql", "mysql-connector-j", "8.0.33"),
+            ("com.google.protobuf", "protobuf-java", "3.21.9"),
+            ("new.group", "lib", "2.1"),
+        ] {
+            assert!(scope.admits(g, a, v), "{g}:{a}:{v}");
+        }
+        assert!(!scope.admits("new.group", "lib", "3"));
     }
 
     #[test]

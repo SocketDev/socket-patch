@@ -702,6 +702,10 @@ pub(crate) struct PomModel {
     pub deps: Vec<PomDecl>,
     pub managed: Vec<PomDecl>,
     pub modules: Vec<String>,
+    /// `(groupId, artifactId, version)` of
+    /// `<distributionManagement><relocation>`: a missing part keeps the
+    /// pom's own.
+    pub relocation: Option<(Option<String>, Option<String>, Option<String>)>,
 }
 
 /// [`PomModel`] of `text`; `include_profiles` adds every profile's
@@ -765,6 +769,13 @@ pub(crate) fn pom_model(text: &str, include_profiles: bool) -> Result<PomModel, 
         deps,
         managed,
         modules,
+        relocation: doc
+            .child(project, "distributionManagement")
+            .and_then(|dm| doc.child(dm, "relocation"))
+            .map(|r| {
+                let part = |name| doc.child_text(r, name).filter(|v| !v.is_empty());
+                (part("groupId"), part("artifactId"), part("version"))
+            }),
     })
 }
 
