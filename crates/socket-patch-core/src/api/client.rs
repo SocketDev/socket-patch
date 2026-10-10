@@ -21,8 +21,9 @@ use crate::api::vendor_prefetch::VendorPrefetch;
 pub use crate::api::vendor_prefetch::VendorPrefetchGuard;
 use crate::constants::USER_AGENT as USER_AGENT_VALUE;
 use crate::utils::digest::is_hex;
-use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
+use crate::utils::env_compat::{is_offline_env, proxy_url_from_env};
 use crate::utils::notice::{notice_once, Notice};
+use crate::utils::redact::{redact_url, redact_urls_in};
 use crate::utils::socket_cli_config;
 use crate::utils::target::is_uuid_shaped;
 
@@ -38,10 +39,12 @@ static MULTI_ORG_SHOWN: AtomicBool = AtomicBool::new(false);
 /// act on ("Connection refused", a DNS or TLS failure). Causes already
 /// spelled out by an outer message are skipped.
 fn network_error_detail(e: &reqwest::Error) -> String {
-    let mut msg = e.to_string();
+    // reqwest's text names the request URL: a grant URL, or one with
+    // userinfo from `--api-url` / a proxy, is quoted redacted.
+    let mut msg = redact_urls_in(&e.to_string()).into_owned();
     let mut source = std::error::Error::source(e);
     while let Some(cause) = source {
-        let part = cause.to_string();
+        let part = redact_urls_in(&cause.to_string()).into_owned();
         if !part.is_empty() && !msg.contains(&part) {
             msg.push_str(": ");
             msg.push_str(&part);
@@ -95,9 +98,14 @@ fn status_error(head: &str, status: StatusCode, text: &str) -> String {
     }
 }
 
-/// Log debug messages when debug mode is enabled.
+/// Log debug messages when debug mode is enabled. Every URL in `message`
+/// is redacted first: debug lines quote grant URLs and `--api-url`s, and
+/// debug output is routinely pasted into CI logs and bug reports.
 fn debug_log(message: &str) {
-    if is_debug_enabled() && !defer_debug_line(message) {
+    let Some(message) = crate::utils::env_compat::debug_message(message) else {
+        return;
+    };
+    if !defer_debug_line(&message) {
         eprintln!("[socket-patch debug] {}", message);
     }
 }
@@ -177,9 +185,9 @@ pub async fn hold_back_debug<T>(fut: impl std::future::Future<Output = T>) -> He
     HeldBack { value, debug }
 }
 
-/// The body of a 200 blob or diff response, read chunk by chunk.
+/// The body of a 200 blob response, read chunk by chunk.
 ///
-/// [`ApiClient::fetch_blob`] / [`ApiClient::fetch_diff`] return this instead
+/// [`ApiClient::fetch_blob`] returns this instead
 /// of the whole body so a large patch artifact streams to disk without being
 /// held in memory (#571). The per-read idle bound of [`ApiTimeouts`] applies
 /// to every chunk.
@@ -262,7 +270,7 @@ pub struct ApiClient {
     /// Header-free twin of `client` (User-Agent only, never Authorization)
     /// for the public-proxy and grant-tokenized serve requests, where
     /// sending the Socket bearer would leak it to a third party. Built once
-    /// here so every blob/diff/tarball download shares one connection pool
+    /// here so every blob/tarball download shares one connection pool
     /// instead of paying a fresh TLS-config build + handshake per request.
     plain: reqwest::Client,
     api_url: String,
@@ -1084,24 +1092,8 @@ impl ApiClient {
         self.fetch_binary("blob", hash).await
     }
 
-    /// Fetch a per-file diff archive (tar.gz of bsdiff deltas) by patch UUID.
-    ///
-    /// Returns the archive body as a [`BinaryBody`] stream, or `Ok(None)` if
-    /// not found (404). The public proxy serves these under
-    /// `/patch/diff/<uuid>`; the authenticated API serves them under
-    /// `/v0/orgs/<slug>/patches/diff/<uuid>`.
-    pub async fn fetch_diff(&self, uuid: &str) -> Result<Option<BinaryBody>, ApiError> {
-        if !is_uuid_shaped(uuid) {
-            return Err(ApiError::InvalidHash(format!(
-                "Invalid patch UUID: {}",
-                uuid
-            )));
-        }
-        self.fetch_binary("diff", uuid).await
-    }
-
     /// Build the URL (and an `is_authenticated` flag) for a binary fetch of
-    /// `kind` (`blob` / `diff`) identified by `identifier`.
+    /// `kind` (the URL segment, e.g. `blob`) identified by `identifier`.
     ///
     /// Follows the client's [`ApiRoute`], like the JSON endpoints: the org
     /// API's `/v0/orgs/<slug>/patches/...` with the bearer, or the proxy's
@@ -1124,10 +1116,10 @@ impl ApiClient {
         }
     }
 
-    /// Shared implementation for `fetch_blob` / `fetch_diff`.
+    /// Transport behind `fetch_blob`.
     ///
-    /// `kind` is the URL segment (`blob` / `diff`), doubling as the
-    /// noun in log + error messages. `identifier` is the hash or UUID
+    /// `kind` is the URL segment (`blob`), doubling as the
+    /// noun in log + error messages. `identifier` is the hash
     /// interpolated into the URL. A 200 returns the unread body: callers
     /// stream it to disk instead of buffering it whole.
     async fn fetch_binary(
@@ -1170,8 +1162,8 @@ impl ApiClient {
             return Ok(None);
         }
         // Classify 401/403/429 identically to the JSON transport path
-        // (`handle_json_response`). Without this an authenticated blob/diff/
-        // package fetch that 401s/403s would surface as `ApiError::Other`,
+        // (`handle_json_response`). Without this an authenticated blob
+        // fetch that 401s/403s would surface as `ApiError::Other`,
         // which `is_fallback_candidate` ignores — silently disabling the
         // auth→proxy fallback for binary downloads. `use_auth` is the
         // authenticated-endpoint flag, so `!use_auth` is the proxy case that
@@ -1694,7 +1686,8 @@ impl ApiClient {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return (
                 ServeDownload::Failed(ApiError::Other(format!(
-                    "refusing non-http(s) artifact URL `{url}`"
+                    "refusing non-http(s) artifact URL `{}`",
+                    redact_url(url)
                 ))),
                 None,
             );
@@ -1843,8 +1836,14 @@ pub(crate) struct DeferredAttempt {
 fn artifact_download_result(outcome: ServeDownload, url: &str) -> Result<Vec<u8>, ApiError> {
     match outcome {
         ServeDownload::Ok(bytes) => Ok(bytes),
-        ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
-        ServeDownload::Pending => Err(ApiError::Other(format!("artifact still building: {url}"))),
+        ServeDownload::NotFound => Err(ApiError::Other(format!(
+            "artifact not found: {}",
+            redact_url(url)
+        ))),
+        ServeDownload::Pending => Err(ApiError::Other(format!(
+            "artifact still building: {}",
+            redact_url(url)
+        ))),
         ServeDownload::Failed(e) => Err(e),
     }
 }
@@ -1992,7 +1991,7 @@ fn api_client(api_token: Option<&str>, timeouts: &ApiTimeouts) -> reqwest::Clien
     }
 
     timeouts
-        .apply(reqwest::Client::builder().default_headers(default_headers))
+        .apply(crate::utils::http::client_builder().default_headers(default_headers))
         .build()
         .expect("failed to build reqwest client")
 }
@@ -2009,7 +2008,7 @@ fn plain_client(timeouts: &ApiTimeouts) -> reqwest::Client {
         HeaderValue::from_static(USER_AGENT_VALUE),
     );
     timeouts
-        .apply(reqwest::Client::builder().default_headers(headers))
+        .apply(crate::utils::http::client_builder().default_headers(headers))
         .build()
         .expect("failed to build plain reqwest client")
 }
@@ -2831,7 +2830,8 @@ impl ApiClient {
     ) -> Result<Vec<u8>, ApiError> {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return Err(ApiError::Other(format!(
-                "refusing non-http(s) artifact URL `{url}`"
+                "refusing non-http(s) artifact URL `{}`",
+                redact_url(url)
             )));
         }
         let attempts = self.vendor_retry.attempts.max(1);
@@ -2883,13 +2883,19 @@ impl ApiClient {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND | StatusCode::GONE => {
                 return (
-                    Err(ApiError::Other(format!("artifact not found: {url}"))),
+                    Err(ApiError::Other(format!(
+                        "artifact not found: {}",
+                        redact_url(url)
+                    ))),
                     None,
                 )
             }
             StatusCode::REQUEST_TIMEOUT => {
                 return (
-                    Err(ApiError::Other(format!("artifact still building: {url}"))),
+                    Err(ApiError::Other(format!(
+                        "artifact still building: {}",
+                        redact_url(url)
+                    ))),
                     None,
                 )
             }
@@ -3260,8 +3266,7 @@ mod tests {
     /// `fetch_blob` must reject a malformed hash *before* any network I/O:
     /// the client points at a closed port, so a regression that bypasses the
     /// `is_hex(hash, 64)` guard surfaces as `ApiError::Network` instead
-    /// of `InvalidHash` (mirrors `invalid_uuid_is_failed_without_network`;
-    /// `fetch_diff`'s twin guard is already covered).
+    /// of `InvalidHash` (mirrors `invalid_uuid_is_failed_without_network`).
     #[tokio::test]
     async fn fetch_blob_invalid_hash_rejected_without_network() {
         let client = ApiClient::new(ApiClientOptions {
@@ -3830,21 +3835,6 @@ mod tests {
         assert!(!is_uuid_shaped("80630680xxxxx"));
     }
 
-    // ── fetch_diff validation tests ──────────────────────────────────
-    //
-    // These tests cover input validation only — they intentionally do
-    // NOT hit the network. The shared `fetch_binary` helper handles the
-    // transport, and `fetch_blob` already has integration coverage via
-    // the e2e_npm test.
-
-    #[tokio::test]
-    async fn test_fetch_diff_rejects_invalid_uuid() {
-        std::env::remove_var("SOCKET_API_TOKEN");
-        let (client, _) = get_api_client_from_env(None).await;
-        let result = client.fetch_diff("not-a-uuid").await;
-        assert!(matches!(result, Err(ApiError::InvalidHash(_))));
-    }
-
     // ── Token shape validation ─────────────────────────────────────────
 
     #[test]
@@ -4012,7 +4002,7 @@ mod tests {
     // ── classify_auth_error: shared 401/403/429 classification ──────────
     //
     // Both transport paths (including `fetch_binary`) route through this
-    // shared classifier, so an authenticated blob/diff/package fetch that
+    // shared classifier, so an authenticated blob fetch that
     // 401s/403s is recognized by `is_fallback_candidate` and the auth→proxy
     // fallback fires. These pin its contract directly.
 
@@ -4157,7 +4147,7 @@ mod tests {
         assert!(!looks_like_token_hash(""));
     }
 
-    // ── binary_url: proxy override must reach blob/diff/package fetches ──
+    // ── binary_url: proxy override must reach blob fetches ──
     //
     // `fetch_binary` must use the client's configured `api_url`, not
     // re-derive the proxy base from `SOCKET_PROXY_URL`/default, so a
@@ -4181,15 +4171,6 @@ mod tests {
     }
 
     #[test]
-    fn binary_url_proxy_covers_diff() {
-        let client = proxy_client("https://custom.proxy.example");
-        assert_eq!(
-            client.binary_url("diff", "uuid-1").0,
-            "https://custom.proxy.example/patch/diff/uuid-1"
-        );
-    }
-
-    #[test]
     fn binary_url_proxy_trims_trailing_slash() {
         // `new()` trims the trailing slash on api_url; binary_url also trims
         // defensively so the path never ends up with a doubled separator.
@@ -4207,11 +4188,11 @@ mod tests {
             api_token: Some("sktsec_x_api".into()),
             route: ApiRoute::org("my-org"),
         });
-        let (url, use_auth) = client.binary_url("diff", "uuid-123");
+        let (url, use_auth) = client.binary_url("blob", "deadbeef");
         assert!(use_auth);
         assert_eq!(
             url,
-            "https://api.socket.dev/v0/orgs/my-org/patches/diff/uuid-123"
+            "https://api.socket.dev/v0/orgs/my-org/patches/blob/deadbeef"
         );
     }
 
@@ -5118,6 +5099,36 @@ mod vendor_package_tests {
                 );
             }
             other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// The artifact errors quote the grant URL redacted: neither the grant
+    /// token nor userinfo reaches the error a caller shows.
+    #[tokio::test]
+    async fn download_artifact_errors_never_carry_a_credential() {
+        const GRANT: &str = "grant-level";
+        const UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        let grant_path = format!("/patch/pypi/a/1.0.0/{GRANT}/{UUID}/a.whl");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(grant_path.as_str()))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = auth_client(server.uri());
+        for url in [
+            format!("ftp://u:pw@h.example{grant_path}"),
+            format!(
+                "{}{grant_path}",
+                server.uri().replace("http://", "http://u:pw@")
+            ),
+        ] {
+            let msg = match client.download_artifact(&url).await {
+                Err(ApiError::Other(msg)) => msg,
+                other => panic!("expected Other, got {other:?}"),
+            };
+            assert!(!msg.contains(GRANT) && !msg.contains("u:pw"), "{msg}");
+            assert!(msg.contains(&format!("/<redacted>/{UUID}/")), "{msg}");
         }
     }
 

@@ -88,7 +88,20 @@ pub(crate) async fn restore(
                 source: source.clone(),
             });
         }
-        let lookups = hits.iter().map(|h| async move {
+        // A hit whose name@version crates.io ALSO locks (a dependency added
+        // after the pin resolved its own crates.io copy, which cargo cannot
+        // unify with the Socket one, #679) merges into that block: splicing
+        // crates.io's source into the Socket block would leave two
+        // identical blocks, which cargo refuses to parse (#863). The twin
+        // already carries the checksum, so no registry lookup is needed.
+        let twin_of = |h: &LockHit| {
+            model.packages().iter().any(|p| {
+                p.name == h.name
+                    && p.version == h.version
+                    && p.source.as_deref() == Some(CRATES_IO_SOURCE)
+            })
+        };
+        let lookups = hits.iter().filter(|h| !twin_of(h)).map(|h| async move {
             (
                 h.uuid.clone(),
                 ctx.client.cargo_cksum(&h.name, &h.version).await,
@@ -101,7 +114,12 @@ pub(crate) async fn restore(
                 .collect();
         let mut changed = false;
         let mut restored: Vec<(&LockHit, String)> = Vec::new();
+        let mut merged: Vec<&LockHit> = Vec::new();
         for hit in &hits {
+            if twin_of(hit) {
+                merged.push(hit);
+                continue;
+            }
             let cksum = match cksums.get(&hit.uuid) {
                 Some(Ok(c)) => c.clone(),
                 Some(Err(why)) => {
@@ -115,6 +133,9 @@ pub(crate) async fn restore(
             }
             restored.push((hit, cksum));
         }
+        // A pin refused on another hit (it wires two versions) is restored
+        // nowhere.
+        merged.retain(|h| !result.refused.contains_key(&h.uuid));
         // The entries' own source + checksum values, spliced at the parse's
         // spans (every hit is a distinct block: its source names its uuid).
         let spans = model
@@ -128,6 +149,30 @@ pub(crate) async fn restore(
             }
             if let Some(checksum) = &at.checksum {
                 splices.push((checksum.clone(), format!("\"{cksum}\"")));
+            }
+        }
+        for hit in &merged {
+            // The whole block, up to the next table header (its blank
+            // separator line included); a last block also drops the blank
+            // line before it.
+            let start = spans.packages[hit.index].header;
+            let range = match spans.headers.iter().copied().find(|&h| h > start) {
+                Some(next) => start..next,
+                None => {
+                    let kept = lock[..start].trim_end_matches('\n').len() + 1;
+                    kept.min(start)..lock.len()
+                }
+            };
+            splices.push((range, String::new()));
+            // A v1 lock's `[metadata]` checksum line for the Socket id.
+            let key =
+                crate::formats::cargo::metadata_checksum_key(&hit.name, &hit.version, &hit.source);
+            if let Some((_, line)) = spans.metadata.iter().find(|(k, _)| *k == key) {
+                let end = match lock[line.end..].find('\n') {
+                    Some(n) => line.end + n + 1,
+                    None => lock.len(),
+                };
+                splices.push((line.start..end, String::new()));
             }
         }
         splices.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
@@ -153,6 +198,13 @@ pub(crate) async fn restore(
                 .collect();
             lock = rebuilt.join("\n");
             result.handled.insert(hit.uuid.clone());
+            changed = true;
+        }
+        if !merged.is_empty() {
+            lock = merged_references(&lock, &model, &merged);
+            for hit in &merged {
+                result.handled.insert(hit.uuid.clone());
+            }
             changed = true;
         }
         if changed {
@@ -378,6 +430,46 @@ fn remove_appended_cargo_block(content: &str, fragment: &str) -> Option<String> 
     Some(format!("{before}{}", &content[pos + len..]))
 }
 
+/// Respell the dependents' references to each merged hit's crate the way
+/// cargo writes them once the Socket block is gone (`lock`: the text with
+/// the merged blocks removed; `model`: the lock before). A v1 lock spells
+/// every reference as the full package id, now the crates.io one. Later
+/// formats use the shortest unambiguous form: the bare name when the lock
+/// holds one block of that crate, `"<name> <version>"` when it holds one of
+/// that version, else the full crates.io id.
+fn merged_references(lock: &str, model: &CargoLock, merged: &[&LockHit]) -> String {
+    let v1 = !lock
+        .lines()
+        .take_while(|l| !l.starts_with('['))
+        .any(|l| l.starts_with("version"))
+        && lock.lines().any(|l| l.trim_end() == "[metadata]");
+    let mut out = lock.to_string();
+    for hit in merged {
+        let full = format!("\"{} {} ({CRATES_IO_SOURCE})\"", hit.name, hit.version);
+        let spelled = if v1 {
+            full.clone()
+        } else {
+            let left: Vec<_> = model
+                .packages()
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| p.name == hit.name && !merged.iter().any(|m| m.index == *i))
+                .map(|(_, p)| p)
+                .collect();
+            if left.len() == 1 {
+                format!("\"{}\"", hit.name)
+            } else if left.iter().filter(|p| p.version == hit.version).count() == 1 {
+                format!("\"{} {}\"", hit.name, hit.version)
+            } else {
+                full.clone()
+            }
+        };
+        let socket = format!("\"{} {} ({})\"", hit.name, hit.version, hit.source);
+        out = out.replace(&socket, &spelled).replace(&full, &spelled);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +585,179 @@ mod tests {
             after.as_deref().map(str::trim_start),
             Some(block(C).as_str())
         );
+    }
+
+    const CRATES_IO_CKSUM: &str =
+        "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801";
+    const SOCKET_CKSUM: &str = "cb5ea0124d6d4ab3fa7c9a2c4e20e8f0e2e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0";
+
+    fn socket_source(uuid: &str) -> String {
+        format!("sparse+https://patch.socket.dev/patch-registry/cargo/tok/{uuid}/index/")
+    }
+
+    /// Restore cfg-if's hosted pin `B` over `lock` (offline); the outcome
+    /// and the lock after.
+    async fn restore_lock(lock: &str) -> (super::super::RestoreOutcome, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            manifest("crc32fast = \"=1.5.0\"\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("Cargo.lock"), lock).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
+        std::fs::write(tmp.path().join(".cargo/config.toml"), block(B)).unwrap();
+        let pins = [super::super::HostedPin {
+            purl: "pkg:cargo/cfg-if@1.0.4".into(),
+            uuid: B.into(),
+            files: vec![
+                "Cargo.lock".into(),
+                "Cargo.toml".into(),
+                ".cargo/config.toml".into(),
+            ],
+        }];
+        let opts = super::super::RestoreOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let outcome = super::super::restore_upstream(tmp.path(), &pins, &opts).await;
+        let after = std::fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap();
+        (outcome, after)
+    }
+
+    /// The lock cargo writes once a later dependency (crc32fast) locks a
+    /// crates.io copy of the hosted-pinned cfg-if 1.0.4 (#679): two blocks
+    /// for one name@version, so every reference is a full package id.
+    /// `extra_cfg_if` also locks cfg-if 0.1.10.
+    fn contested_lock(extra_cfg_if: bool) -> String {
+        let socket = socket_source(B);
+        let old = if extra_cfg_if {
+            "[[package]]\nname = \"cfg-if\"\nversion = \"0.1.10\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"4785bdd1c96b2a846b2bd7cc02e86b6b3dbf14e7e53446c4f54c92a361040822\"\n\n"
+        } else {
+            ""
+        };
+        let old_dep = if extra_cfg_if {
+            " \"cfg-if 0.1.10\",\n"
+        } else {
+            ""
+        };
+        format!(
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\nversion = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n{old_dep} \
+             \"cfg-if 1.0.4 ({socket})\",\n \"crc32fast\",\n]\n\n\
+             {old}\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"{CRATES_IO_CKSUM}\"\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"{socket}\"\nchecksum = \"{SOCKET_CKSUM}\"\n\n\
+             [[package]]\nname = \"crc32fast\"\nversion = \"1.5.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"9d7fe8a1a6b8f4a28b3b6e2b0f7a1d1fa2f1e1d8c1c6b2a4d3e9f6a1b5c7d8e9\"\n\
+             dependencies = [\n \"cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\",\n]\n"
+        )
+    }
+
+    /// #863: restoring a hosted pin whose name@version crates.io ALSO locks
+    /// merges the Socket block into the existing crates.io one (no
+    /// duplicate block, which cargo refuses to parse) and spells every
+    /// reference the way cargo does for an unambiguous crate — the lock
+    /// `cargo generate-lockfile` would write. No registry lookup is needed:
+    /// the crates.io block already carries the checksum, so it works
+    /// offline.
+    #[tokio::test]
+    async fn restore_merges_into_an_existing_crates_io_twin() {
+        let (outcome, after) = restore_lock(&contested_lock(false)).await;
+        assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
+        let want = format!(
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\nversion = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if\",\n \"crc32fast\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"{CRATES_IO_CKSUM}\"\n\n\
+             [[package]]\nname = \"crc32fast\"\nversion = \"1.5.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"9d7fe8a1a6b8f4a28b3b6e2b0f7a1d1fa2f1e1d8c1c6b2a4d3e9f6a1b5c7d8e9\"\n\
+             dependencies = [\n \"cfg-if\",\n]\n"
+        );
+        assert_eq!(after, want);
+        CargoLock::parse(&after).expect("the restored lock parses");
+    }
+
+    /// With another cfg-if version locked too, the merged crate's
+    /// references keep their version (`"cfg-if 1.0.4"`): the name alone is
+    /// still ambiguous.
+    #[tokio::test]
+    async fn restore_merge_keeps_versioned_refs_while_the_name_is_ambiguous() {
+        let (outcome, after) = restore_lock(&contested_lock(true)).await;
+        assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
+        let model = CargoLock::parse(&after).expect("the restored lock parses");
+        let blocks: Vec<_> = model
+            .packages()
+            .iter()
+            .filter(|p| p.name == "cfg-if")
+            .map(|p| (p.version.as_str(), p.source.as_deref()))
+            .collect();
+        assert_eq!(
+            blocks,
+            [
+                ("0.1.10", Some(CRATES_IO_SOURCE)),
+                ("1.0.4", Some(CRATES_IO_SOURCE))
+            ],
+            "{after}"
+        );
+        assert!(!after.contains("patch.socket.dev"), "{after}");
+        assert!(
+            after.contains(
+                "dependencies = [\n \"cfg-if 0.1.10\",\n \"cfg-if 1.0.4\",\n \"crc32fast\",\n]"
+            ) && after.contains("dependencies = [\n \"cfg-if 1.0.4\",\n]"),
+            "{after}"
+        );
+    }
+
+    /// The v1 format spells every reference as a full id and files the
+    /// checksum in `[metadata]`: the merge keeps one crates.io metadata line
+    /// and full crates.io ids.
+    #[tokio::test]
+    async fn restore_merge_in_a_v1_lock() {
+        let socket = socket_source(B);
+        let lock = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 ({socket})\",\n \
+             \"crc32fast 1.5.0 (registry+https://github.com/rust-lang/crates.io-index)\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{socket}\"\n\n\
+             [[package]]\nname = \"crc32fast\"\nversion = \"1.5.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             dependencies = [\n \
+             \"cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\",\n]\n\n\
+             [metadata]\n\
+             \"checksum cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\" = \"{CRATES_IO_CKSUM}\"\n\
+             \"checksum cfg-if 1.0.4 ({socket})\" = \"{SOCKET_CKSUM}\"\n\
+             \"checksum crc32fast 1.5.0 (registry+https://github.com/rust-lang/crates.io-index)\" = \"00\"\n"
+        );
+        let (outcome, after) = restore_lock(&lock).await;
+        assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
+        let want = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\",\n \
+             \"crc32fast 1.5.0 (registry+https://github.com/rust-lang/crates.io-index)\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             [[package]]\nname = \"crc32fast\"\nversion = \"1.5.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             dependencies = [\n \
+             \"cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\",\n]\n\n\
+             [metadata]\n\
+             \"checksum cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\" = \"{CRATES_IO_CKSUM}\"\n\
+             \"checksum crc32fast 1.5.0 (registry+https://github.com/rust-lang/crates.io-index)\" = \"00\"\n"
+        );
+        assert_eq!(after, want);
     }
 }

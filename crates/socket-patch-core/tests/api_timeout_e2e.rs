@@ -195,7 +195,6 @@ async fn authenticated_calls_fail_as_network_on_a_stalled_server() {
     )
     .await;
     assert_stall_is_network("fetch_blob", api.fetch_blob(HASH)).await;
-    assert_stall_is_network("fetch_diff", api.fetch_diff(UUID)).await;
 }
 
 #[tokio::test]
@@ -210,7 +209,6 @@ async fn public_proxy_calls_fail_as_network_on_a_stalled_server() {
     )
     .await;
     assert_stall_is_network("fetch_blob", api.fetch_blob(HASH)).await;
-    assert_stall_is_network("fetch_diff", api.fetch_diff(UUID)).await;
 }
 
 #[tokio::test]
@@ -242,7 +240,7 @@ async fn stalled_json_bodies_are_network_errors_on_both_clients() {
     );
 }
 
-/// Read a blob/diff body to the end.
+/// Read a blob body to the end.
 async fn drain(mut body: BinaryBody) -> Result<Vec<u8>, ApiError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = body.chunk().await? {
@@ -258,10 +256,7 @@ async fn stalled_binary_bodies_are_network_errors_on_both_clients() {
     let uri = stalled_json_body_server().await;
     for proxy in [false, true] {
         let api = client(&uri, proxy);
-        for (what, body) in [
-            ("fetch_blob", api.fetch_blob(HASH).await),
-            ("fetch_diff", api.fetch_diff(UUID).await),
-        ] {
+        for (what, body) in [("fetch_blob", api.fetch_blob(HASH).await)] {
             let body = body
                 .unwrap_or_else(|e| panic!("{what} proxy={proxy}: headers arrived: {e:?}"))
                 .expect("200 serves a body");
