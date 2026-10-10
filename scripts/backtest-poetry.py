@@ -98,6 +98,50 @@ def vtuple(v):
     return tuple(int(x) for x in v.split("."))
 
 
+# ---------------------------------------------------- v5 `--json` envelope
+# Every command prints ONE envelope (CLI_CONTRACT.md "`scan` and `get` JSON
+# (v5.0)"): `status` (camelCase), `dryRun`, `events[]` (each `{action, purl,
+# uuid, errorCode, reason, error, details}`; hosted / vendored events carry
+# `details.mode`, agent events none), `summary`, top-level `warnings[{code,
+# detail}]` and `error{code, message}`. No `redirect.redirected`,
+# `vendor.summary`, `apply.*` or legacy rollback arrays any more.
+def leg_events(mode, envelope):
+    """The events of one leg: `details.mode` hosted / vendored; every other
+    mode (agent, agent-oot) reads the mode-less agent events."""
+    leg = mode if mode in ("hosted", "vendored") else None
+    return [e for e in (envelope or {}).get("events") or [] if (e.get("details") or {}).get("mode") == leg]
+
+
+def applied_count(mode, envelope, action=None):
+    """Patches the leg wired: its `applied` events (a hosted re-run still
+    emits `applied` for the pins it re-confirms), or on a `--dry-run` the
+    `verified` previews. `action` counts another action instead."""
+    action = action or ("verified" if (envelope or {}).get("dryRun") else "applied")
+    return sum(1 for e in leg_events(mode, envelope) if e.get("action") == action)
+
+
+def envelope_warnings(envelope):
+    """Every coded record of the run as `{code, detail, action, purl}`: the
+    top-level `error`, each event carrying an `errorCode` (refusals, skips,
+    failures, vendor advisories) and each run-level warning."""
+    env = envelope or {}
+    rows = []
+    if isinstance(env.get("error"), dict) and env["error"].get("code"):
+        rows.append({"code": env["error"]["code"], "detail": env["error"].get("message") or ""})
+    for e in env.get("events") or []:
+        if e.get("errorCode"):
+            rows.append({"code": e["errorCode"], "detail": e.get("reason") or e.get("error") or "", "action": e.get("action"), "purl": e.get("purl")})
+    for w in env.get("warnings") or []:
+        if isinstance(w, dict) and w.get("code"):
+            rows.append({"code": w["code"], "detail": w.get("detail") or ""})
+    return rows
+
+
+def envelope_codes(envelope):
+    """The sorted distinct codes of `envelope_warnings`."""
+    return sorted({w["code"] for w in envelope_warnings(envelope)})
+
+
 def save(path, data):
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
@@ -553,13 +597,6 @@ def main():
     def cli_cmd(project, *rest):
         return [cli, *rest, "--cwd", project, "--json", "--yes", "--no-telemetry"]
 
-    def applied_count(mode, envelope):
-        if mode == "hosted":
-            return envelope.get("redirect", {}).get("redirected", 0)
-        if mode == "vendored":
-            return envelope.get("vendor", {}).get("summary", {}).get("applied", 0)
-        return envelope.get("apply", {}).get("applied", 0)
-
     def lock_check(version, poetry, project, penv, log):
         """Poetry's own lock consistency check, whichever spelling exists."""
         v = vtuple(version)
@@ -650,10 +687,14 @@ def main():
             e1 = r1.json_or_empty()
             paths = [p for p in (e1.get("paths") or [])]
             pkgs = e1.get("packages") or []
+            # Legacy `apply.found`: distinct purls among the agent events of
+            # this dry run (the `verified` previews of the selection).
+            agent_events = leg_events("agent", e1)
+            found = len({ev.get("purl") for ev in agent_events if ev.get("purl")})
             info["bareScan"] = {
                 "exit": r1.rc,
                 "scannedPackages": e1.get("scannedPackages"),
-                "packagesWithPatches": e1.get("packagesWithPatches"),
+                "packagesWithPatches": len(pkgs),
                 "paths": paths[:10],
                 "urllib3Found": any("urllib3" in (p.get("purl") or "") for p in pkgs),
                 "packageDirs": [pth for p in pkgs for pth in (p.get("paths") or [])][:10],
@@ -665,10 +706,10 @@ def main():
             sees = any(
                 "urllib3" in (p.get("purl") or "") and not p.get("notInstalled")
                 for p in pkgs
-            ) and e1.get("apply", {}).get("found", 0) >= 1 and not any(
-                ev.get("errorCode") == "package_not_installed" for ev in e1.get("apply", {}).get("patches", [])
+            ) and found >= 1 and not any(
+                ev.get("errorCode") == "package_not_installed" for ev in agent_events
             )
-            check("bareScanSeesPoetryVenv", sees, {"scannedPackages": e1.get("scannedPackages"), "found": e1.get("apply", {}).get("found")}, operation=r1)
+            check("bareScanSeesPoetryVenv", sees, {"scannedPackages": e1.get("scannedPackages"), "found": found}, operation=r1)
             # 2. apply for real: BARE when the crawler found the venv (the fixed
             # CLI), else via `poetry run` (Poetry exports VIRTUAL_ENV).
             bare = bool(sees)
@@ -713,11 +754,10 @@ def main():
             # Fresh-clone scenario first: nothing installed, lock only.
             r0 = Run(cli_cmd(project, "scan", "--mode", "vendored"), project, env, case / "scan-lockonly.log")
             e0 = r0.json_or_empty()
-            events = e0.get("vendor", {}).get("events", [])
             info["lockOnlyVendor"] = {
                 "exit": r0.rc,
                 "applied": applied_count("vendored", e0),
-                "codes": sorted({ev.get("errorCode") for ev in events if ev.get("errorCode")}),
+                "codes": envelope_codes(e0),
             }
             check("lockOnlyVendorApplies", applied_count("vendored", e0) == 1, info["lockOnlyVendor"])
             # reset any partial state
@@ -740,7 +780,7 @@ def main():
         save(case / "cli-output.json", envelope)
         applied = applied_count(mode, envelope)
         info["applied"] = applied
-        warnings = envelope.get("redirect", {}).get("warnings", []) if mode == "hosted" else envelope.get("vendor", {}).get("events", [])
+        warnings = envelope_warnings(envelope)
         info["warnings"] = warnings[:8]
         lock_after = (project / "poetry.lock").read_bytes()
         check("pyprojectUnchanged", (project / "pyproject.toml").read_bytes() == pristine_pyproject)
@@ -880,7 +920,9 @@ def main():
         check("rollbackKeepsPyproject", (project / "pyproject.toml").read_bytes() == pristine_pyproject)
         if mode == "hosted":
             check("rollbackNoRedirectLedger", not (project / ".socket/vendor/redirect-state.json").exists(), operation=rb)
-            check("rollbackRestoredUpstream", PURL_BASE in ((erb.get("hosted") or {}).get("reverted") or []), erb.get("hosted"), operation=rb)
+            # v5: a hosted restore is a `rolledBack` event with details.mode hosted.
+            reverted = [e.get("purl") or "" for e in leg_events("hosted", erb) if e.get("action") == "rolledBack"]
+            check("rollbackRestoredUpstream", any(p == PURL_BASE or p.startswith(PURL_BASE + "?") for p in reverted), {"reverted": reverted, "hosted": erb.get("hosted")}, operation=rb)
         if mode == "vendored":
             check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists(), operation=rb)
         if mode == "agent":

@@ -2127,7 +2127,7 @@ async fn hatch_locked_env_pylock_wires_pyproject() {
     std::fs::write(root.join("pylock.toml"), &pylock).unwrap();
     let (code, env) = hosted_scan(&root, &server);
     assert_eq!(code, 0, "hosted: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     let pyproject = std::fs::read_to_string(root.join("pyproject.toml")).unwrap();
     assert!(
         pyproject.contains(&format!("six @ {hosted_url}")),
@@ -2201,7 +2201,7 @@ async fn lock_only_pep440_equivalent_pin_is_patched() {
         .unwrap();
         let (code, env) = hosted_scan(&root, &server);
         assert_eq!(code, 0, "{pin}: {env:#}");
-        assert_eq!(env["redirect"]["redirected"], 1, "{pin}: {env:#}");
+        assert_eq!(hosted_pinned(&env), 1, "{pin}: {env:#}");
         assert_eq!(env["packages"][0]["purl"], PURL, "{pin}: {env:#}");
         assert_eq!(env["packages"][0]["notInstalled"], true, "{pin}: {env:#}");
         let requirements = std::fs::read_to_string(root.join("requirements.txt")).unwrap();

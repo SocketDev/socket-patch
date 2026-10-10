@@ -200,7 +200,7 @@ async fn issue_558_sha512_only_grant_pins_the_served_tarballs_sha1() {
 
     let (code, doc, stderr) = scan(&root, &server.uri());
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(common::envelope::hosted_pins(&doc).len(), 1, "{doc:#}");
     let lock = std::fs::read_to_string(root.join("yarn.lock")).unwrap();
     assert!(
         lock.contains(&format!(
@@ -250,22 +250,23 @@ async fn issue_558_unfetchable_tarball_skips_the_patch() {
 }
 
 fn assert_skipped_untouched(root: &Path, doc: &Value, stderr: &str) -> String {
-    let skipped: Vec<&Value> = doc["redirect"]["skipped"]
-        .as_array()
-        .unwrap_or_else(|| panic!("redirect.skipped: {doc:#}\n{stderr}"))
-        .iter()
-        .filter(|s| s["reason"] == "npm_tarball_unavailable")
+    // v5.0: a hosted skip is a `skipped` event, its code the `errorCode`
+    // and its detail the `reason`.
+    let skipped: Vec<&Value> = common::envelope::mode_events(doc, "hosted")
+        .into_iter()
+        .filter(|s| s["action"] == "skipped" && s["errorCode"] == "npm_tarball_unavailable")
         .collect();
+    assert!(!skipped.is_empty(), "hosted skip: {doc:#}\n{stderr}");
     assert_eq!(skipped.len(), 1, "{doc:#}");
     assert_eq!(skipped[0]["purl"], PURL, "{doc:#}");
     // The served URL's grant token authorizes the org's download: never
     // shown, whatever the detail says.
-    let detail = skipped[0]["detail"].as_str().unwrap();
+    let detail = skipped[0]["reason"].as_str().unwrap();
     assert!(
         !detail.contains(TOKEN),
         "the grant token is redacted: {detail}"
     );
-    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    assert!(common::envelope::hosted_pins(&doc).is_empty(), "{doc:#}");
     assert_eq!(
         std::fs::read_to_string(root.join("yarn.lock")).unwrap(),
         LOCK,
@@ -297,8 +298,8 @@ async fn issue_591_served_dependency_the_lock_does_not_lock_is_refused() {
 
     let (code, doc, stderr) = scan(&root, &server.uri());
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
-    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
-    let warning = doc["redirect"]["warnings"]
+    assert!(common::envelope::hosted_pins(&doc).is_empty(), "{doc:#}");
+    let warning = doc["warnings"]
         .as_array()
         .unwrap()
         .iter()

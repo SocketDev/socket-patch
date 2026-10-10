@@ -1261,14 +1261,24 @@ async fn scan_prune_reverts_vendored_entry_after_version_upgrade() {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    // v5.0: the GC's reverts are `vendor_reverted` events, its drift keeps
+    // `vendor_revert_kept` events.
+    let purls_with = |code: &str| -> Vec<serde_json::Value> {
+        v["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["errorCode"] == code)
+            .map(|e| e["purl"].clone())
+            .collect()
+    };
     assert_eq!(
-        v["gc"]["revertedVendoredEntries"],
-        serde_json::json!([PURL]),
+        purls_with("vendor_reverted"),
+        vec![serde_json::json!(PURL)],
         "gc must revert the upgraded-away entry: {v}"
     );
-    assert_eq!(
-        v["gc"]["keptVendoredEntries"],
-        serde_json::json!([]),
+    assert!(
+        purls_with("vendor_revert_kept").is_empty(),
         "nothing resolves through the artifact, so nothing is kept: {v}"
     );
     assert!(

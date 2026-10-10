@@ -1227,10 +1227,11 @@ async fn redirect_scanned_project(
         rewritten.contains(&gemfile_name),
         "the {gemfile_name} rewrite must be reported: {env}"
     );
+    // `warnings` is omitted when the run has none.
     let warning_codes: Vec<&str> = env["warnings"]
         .as_array()
-        .expect("warnings")
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(|w| w["code"].as_str())
         .collect();
     if checksums_lock {

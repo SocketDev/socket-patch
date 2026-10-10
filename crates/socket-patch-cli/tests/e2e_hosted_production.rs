@@ -382,7 +382,7 @@ fn published_view_record_blocking(uuid: &str) -> serde_json::Value {
 /// Assert the hosted redirect actually rewrote something, and return the list
 /// of rewritten files.
 ///
-/// `redirected >= 1` is the anti-vacuity guard: a run that discovered nothing
+/// At least one hosted pin is the anti-vacuity guard: a run that discovered nothing
 /// also exits 0 with `"status": "success"`, so without this a broken crawler
 /// would look identical to a working redirect.
 fn assert_redirected(env: &serde_json::Value, expect_file: &str) -> Vec<String> {
@@ -398,7 +398,7 @@ fn assert_redirected(env: &serde_json::Value, expect_file: &str) -> Vec<String> 
         Some("hosted"),
         "redirect sub-object missing or not hosted mode:\n{env:#}"
     );
-    let n = redirect["redirected"].as_u64().unwrap_or(0);
+    let n = hosted_pin_count(env);
     assert!(
         n >= 1,
         "hosted redirect rewrote nothing — the patch is published and the \
@@ -420,18 +420,24 @@ fn assert_redirected(env: &serde_json::Value, expect_file: &str) -> Vec<String> 
     files
 }
 
-/// How many dependencies a hosted run redirected.
+/// How many dependencies a hosted run redirected: its `applied` (or, on a
+/// dry run, `verified`) events with `details.mode: "hosted"` (v5.0: the
+/// retired `redirect.redirected` counter).
 ///
-/// `scan --mode hosted` omits the whole `redirect` sub-object when discovery
-/// turned up nothing — a plain scan envelope comes back instead. For the
-/// documented-unsupported ecosystems (golang, deno) "no redirect object" and
-/// `"redirected": 0` are the same verdict, so normalize them.
-fn redirected_count(env: &serde_json::Value) -> u64 {
-    let redirect = &env["redirect"];
-    if redirect.is_null() {
-        return 0;
-    }
-    redirect["redirected"].as_u64().unwrap_or(0)
+/// `scan --mode hosted` reports no hosted event when discovery turned up
+/// nothing — a plain scan envelope comes back instead. For the
+/// documented-unsupported ecosystems (golang, deno) that is the same
+/// verdict as zero pins.
+fn hosted_pin_count(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -2469,7 +2475,7 @@ fn golang_hosted_redirects_only_via_goproxy_override() {
     .expect("write go.mod");
 
     let env_json = scan_hosted(&proj, &["--ecosystems", "golang"]);
-    let redirected = redirected_count(&env_json);
+    let redirected = hosted_pin_count(&env_json);
     if redirected == 0 {
         println!(
             "{LEG}: production publishes no golang hosted modules (or none \
@@ -2509,7 +2515,7 @@ fn deno_hosted_is_unsupported() {
 
     let env_json = scan_hosted(&proj, &["--ecosystems", "deno"]);
     assert_eq!(
-        redirected_count(&env_json),
+        hosted_pin_count(&env_json),
         0,
         "{LEG}: deno hosted mode redirected something, but hosted mode is \
          documented as unsupported for deno:\n{env_json:#}"

@@ -1005,7 +1005,7 @@ async fn yarn_berry_pin_drops_the_implicit_node_gyp_and_rollback_restores_it() {
             &server.uri(),
             &["--patch-server-url", &server.uri()],
         );
-        assert_eq!(env["redirect"]["redirected"], 1, "{label}: {env:#}");
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{label}: {env:#}");
         assert!(warning_codes(&env).is_empty(), "{label}: {env:#}");
         let lock = std::fs::read_to_string(&lock_path).unwrap();
         assert!(
@@ -6364,7 +6364,7 @@ async fn yarn_berry_rollback_restores_the_registry_bin_spelling() {
     let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
     assert_eq!(code, Some(0), "rollback: {env:#}");
     assert_eq!(
-        env["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&env),
         serde_json::json!([PURL]),
         "{env:#}"
     );

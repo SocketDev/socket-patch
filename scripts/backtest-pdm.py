@@ -256,6 +256,50 @@ def wanted(version, shape, mode):
     return True
 
 
+# ---------------------------------------------------- v5 `--json` envelope
+# Every command prints ONE envelope (CLI_CONTRACT.md "`scan` and `get` JSON
+# (v5.0)"): `status` (camelCase), `dryRun`, `events[]` (each `{action, purl,
+# uuid, errorCode, reason, error, details}`; hosted / vendored events carry
+# `details.mode`, agent events none), `summary`, top-level `warnings[{code,
+# detail}]` and `error{code, message}`. No `redirect.redirected`,
+# `vendor.summary`, `apply.*` or legacy rollback arrays any more.
+def leg_events(mode, envelope):
+    """The events of one leg: `details.mode` hosted / vendored; every other
+    mode (agent, agent-oot) reads the mode-less agent events."""
+    leg = mode if mode in ("hosted", "vendored") else None
+    return [e for e in (envelope or {}).get("events") or [] if (e.get("details") or {}).get("mode") == leg]
+
+
+def applied_count(mode, envelope, action=None):
+    """Patches the leg wired: its `applied` events (a hosted re-run still
+    emits `applied` for the pins it re-confirms), or on a `--dry-run` the
+    `verified` previews. `action` counts another action instead."""
+    action = action or ("verified" if (envelope or {}).get("dryRun") else "applied")
+    return sum(1 for e in leg_events(mode, envelope) if e.get("action") == action)
+
+
+def envelope_warnings(envelope):
+    """Every coded record of the run as `{code, detail, action, purl}`: the
+    top-level `error`, each event carrying an `errorCode` (refusals, skips,
+    failures, vendor advisories) and each run-level warning."""
+    env = envelope or {}
+    rows = []
+    if isinstance(env.get("error"), dict) and env["error"].get("code"):
+        rows.append({"code": env["error"]["code"], "detail": env["error"].get("message") or ""})
+    for e in env.get("events") or []:
+        if e.get("errorCode"):
+            rows.append({"code": e["errorCode"], "detail": e.get("reason") or e.get("error") or "", "action": e.get("action"), "purl": e.get("purl")})
+    for w in env.get("warnings") or []:
+        if isinstance(w, dict) and w.get("code"):
+            rows.append({"code": w["code"], "detail": w.get("detail") or ""})
+    return rows
+
+
+def envelope_codes(envelope):
+    """The sorted distinct codes of `envelope_warnings`."""
+    return sorted({w["code"] for w in envelope_warnings(envelope)})
+
+
 def save(path, data):
     Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -870,20 +914,6 @@ def main():
     def cli_cmd(project, *rest):
         return [cli, *rest, "--cwd", project, "--json", "--yes", "--no-telemetry"]
 
-    def applied_count(mode, envelope):
-        if mode == "hosted":
-            return envelope.get("redirect", {}).get("redirected", 0)
-        if mode == "vendored":
-            return envelope.get("vendor", {}).get("summary", {}).get("applied", 0)
-        return envelope.get("apply", {}).get("applied", 0)
-
-    def refusal_codes(mode, envelope):
-        if mode == "hosted":
-            return sorted({w.get("code") for w in envelope.get("redirect", {}).get("warnings", []) if w.get("code")})
-        if mode == "vendored":
-            return sorted({e.get("errorCode") for e in envelope.get("vendor", {}).get("events", []) if e.get("errorCode")})
-        return sorted({p.get("errorCode") for p in envelope.get("apply", {}).get("patches", []) if p.get("errorCode")})
-
     def hosted_uuid(text):
         """The patch uuid of the first patch.socket.dev URL in `text` (the
         LAST uuid-shaped path segment: an earlier one may be a grant token)."""
@@ -1171,7 +1201,7 @@ def main():
         if mode == "hosted" and not pep582:
             r0 = Run(cli_cmd(project, "scan", "--mode", "hosted"), project, cenv, case / "scan-lockonly.log", timeout=600, retry=True)
             e0 = r0.json_or_empty()
-            info["lockOnlyHosted"] = {"exit": r0.rc, "redirected": applied_count("hosted", e0), "codes": refusal_codes("hosted", e0), "lockfileOnlyPackages": e0.get("lockfileOnlyPackages"), "scannedPackages": e0.get("scannedPackages"), "crawledUrllib3": sorted(p["purl"] for p in e0.get("packages", []) if "urllib3" in p.get("purl", ""))}
+            info["lockOnlyHosted"] = {"exit": r0.rc, "redirected": applied_count("hosted", e0), "codes": envelope_codes(e0), "lockfileOnlyPackages": e0.get("lockfileOnlyPackages"), "scannedPackages": e0.get("scannedPackages"), "crawledUrllib3": sorted(p["purl"] for p in e0.get("packages", []) if "urllib3" in p.get("purl", ""))}
             shutil.rmtree(project / ".socket", ignore_errors=True)
             (project / lockname).write_bytes(pristine_lock)
 
@@ -1207,7 +1237,7 @@ def main():
         applied = applied_count(mode, envelope)
         info["applied"] = applied
         info["scannedPackages"] = envelope.get("scannedPackages")
-        codes = refusal_codes(mode, envelope)
+        codes = envelope_codes(envelope)
         info["codes"] = codes
         crawled = sorted(p.get("purl", "") for p in envelope.get("packages", []))
         info["crawledWithPatches"] = crawled
@@ -1292,7 +1322,10 @@ def main():
                 return finish("REFUSED-EXPECTED" if all(checks.values()) else "FAIL")
 
         if mode == "agent":
-            found = envelope.get("apply", {}).get("found", 0)
+            # Legacy `apply.found`: the distinct purls the agent leg touched
+            # (downloaded / updated / skipped / applied / failed) for this
+            # one-package selection.
+            found = len({e.get("purl") for e in leg_events("agent", envelope) if e.get("purl")})
             info["found"] = found
             if not check("appliedExactlyOne", applied == 1, {"applied": applied, "found": found, "codes": codes, "status": envelope.get("status")}, r):
                 return finish("FAIL")
@@ -1432,11 +1465,12 @@ def main():
             rs = Run(cli_cmd(project, "scan", *scan_mode), project, cenv, case / "rescan-after-relock.log", timeout=900, retry=True)
             ers = rs.json_or_empty()
             rescanned = (project / lockname).read_bytes()
-            info["rescanAfterRelock"] = {"exit": rs.rc, "applied": applied_count(mode, ers), "codes": refusal_codes(mode, ers), "patchInLock": marker in rescanned}
+            info["rescanAfterRelock"] = {"exit": rs.rc, "applied": applied_count(mode, ers), "codes": envelope_codes(ers), "patchInLock": marker in rescanned}
             rb1 = Run(cli_cmd(project, "rollback"), project, cenv, case / "rollback-after-relock.log", timeout=900)
             erb1 = rb1.json_or_empty()
             shutil.copyfile(project / lockname, case / "rollback-after-relock.lock")
-            failures = (erb1.get("hosted") or {}).get("failed") or erb1.get("vendoredFailed") or []
+            # v5 rollback: every leg failure is a `failed` event with an errorCode.
+            failures = [{"purl": e.get("purl"), "errorCode": e.get("errorCode"), "error": e.get("error")} for e in leg_events(mode, erb1) if e.get("action") == "failed"]
             rollback_note = {"exit": rb1.rc, "status": erb1.get("status"), "failed": failures[:3], "lockEqualsRelocked": (project / lockname).read_bytes() == relocked}
             if target_kept:
                 check("rescanAfterRelockApplies", rs.ok() and marker in rescanned, info["rescanAfterRelock"], rs)

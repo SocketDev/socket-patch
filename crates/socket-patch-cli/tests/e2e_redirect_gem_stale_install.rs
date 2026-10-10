@@ -476,13 +476,13 @@ async fn gem_hosted_scan_without_a_lock_pins_nothing() {
         let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
         let env = common::parse_json_envelope(&stdout);
         assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-        assert_eq!(
-            env["redirect"]["redirected"], 0,
+        assert!(
+            common::envelope::hosted_pins(&env).is_empty(),
             "nothing may be redirected: {env}\nstderr:\n{stderr}"
         );
-        let hit: Vec<&serde_json::Value> = env["redirect"]["warnings"]
+        let hit: Vec<&serde_json::Value> = env["warnings"]
             .as_array()
-            .expect("redirect.warnings")
+            .expect("warnings")
             .iter()
             .filter(|w| w["code"] == "redirect_gem_no_lockfile")
             .collect();
