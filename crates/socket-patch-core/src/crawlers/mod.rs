@@ -18,6 +18,7 @@ pub mod nuget_crawler;
 #[cfg(test)]
 pub(crate) mod oracle_support;
 pub mod pkg_managers;
+pub(crate) mod pnpm_layout;
 pub mod python_crawler;
 pub mod ruby_crawler;
 pub mod sbt_evidence;

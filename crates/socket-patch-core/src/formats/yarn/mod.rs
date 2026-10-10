@@ -3,11 +3,14 @@
 //!
 //! * which grammar a lock is ([`sniff_grammar`], [`is_berry_lock`]);
 //! * the block walk and field reads ([`blocks`]);
+//! * a classic block's dependency sub-maps against a patched manifest
+//!   ([`classic_deps`]);
 //! * key, descriptor and locator patterns ([`patterns`]);
 //! * where yarn 1 installs a block's copy from ([`source`]);
 //! * the stanza view the hosted berry writers re-key and re-order
 //!   entries in ([`stanzas`]);
-//! * the berry pinned-entry renderer ([`berry_entry`]).
+//! * the berry pinned-entry renderer ([`berry_entry`]) and the walk that
+//!   drops the entries a pin leaves unreachable ([`berry_prune`]).
 //!
 //! The vendored backends (`vendor::yarn_classic_lock`,
 //! `vendor::yarn_berry_lock`), the hosted rewriters and restorers
@@ -16,7 +19,9 @@
 
 pub(crate) mod berry_entry;
 pub mod berry_gates;
+pub(crate) mod berry_prune;
 pub(crate) mod blocks;
+pub(crate) mod classic_deps;
 pub(crate) mod patterns;
 pub(crate) mod source;
 pub(crate) mod stanzas;

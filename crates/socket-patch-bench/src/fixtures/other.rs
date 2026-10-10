@@ -12,7 +12,7 @@ use serde_json::json;
 use super::gen::{self, Rng, Tree};
 use super::npm::view_json;
 use super::pypi::pretty4;
-use super::{Expect, Fixture, Size, PATCH_HOST};
+use super::{fixture, Fixture, Size, PATCH_HOST};
 use crate::mock::PatchSpec;
 
 /// A generic package of a non-npm ecosystem.
@@ -83,30 +83,6 @@ fn spec(purl: String, uuid: String, view_file: &str, reference: serde_json::Valu
         tier: "free",
         severity: "high",
         reference,
-    }
-}
-
-fn fixture(
-    scanned: usize,
-    patches: Vec<PatchSpec>,
-    rewritten: &[&str],
-    warnings: &[&'static str],
-) -> Fixture {
-    Fixture {
-        project: "project",
-        expect: Expect {
-            scanned,
-            lockfile_only: 0,
-            redirected: patches.len(),
-            rewritten: rewritten.iter().map(|s| s.to_string()).collect(),
-            allowed_warnings: warnings.to_vec(),
-            rescan_lockfile_only: 0,
-            rescan_extra_scanned: 0,
-        },
-        patches,
-        files: Vec::new(),
-        env_paths: Vec::new(),
-        env: Vec::new(),
     }
 }
 
