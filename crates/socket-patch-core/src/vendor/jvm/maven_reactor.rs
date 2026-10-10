@@ -25,6 +25,9 @@ use super::layout::MAVEN2_TREE as TREE_ROOT;
 pub const MAVEN_CONFIG: &str = ".mvn/maven.config";
 /// The tree root's `.gitattributes`, shared by every Maven patch.
 pub const GITATTRIBUTES_REL: &str = ".socket/vendor/maven2/.gitattributes";
+/// The tree root's `.gitignore` (`!*`), shared with sbt: re-includes the
+/// vendored jars against a user's `*.jar` rule (Java.gitignore), #1061.
+pub use super::sbt::TREE_GITIGNORE_REL as GITIGNORE_REL;
 const OFFLINE_LINE: &str = "-Daether.offline.protocols=file";
 const OFFLINE_KEY: &str = "-Daether.offline.protocols=";
 const TAIL_KEY: &str = "-Dmaven.repo.local.tail=";
@@ -313,6 +316,12 @@ pub fn plan_with_external(
         ));
     }
     records.push(owned_file(read, GITATTRIBUTES_REL, &mut writes));
+    records.push(super::owned_file_with(
+        read,
+        GITIGNORE_REL,
+        super::coursier_tree::GITIGNORE.as_bytes(),
+        &mut writes,
+    ));
     let (tree_dir, jar_rel, tree) = tree_writes(patch, &sv, suffixed_pom);
     writes.extend(tree);
 
@@ -414,15 +423,17 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
                 before.insert(MAVEN_CONFIG.to_string(), Some(text));
             }
         }
-        let created = records.iter().any(|w| {
-            w.kind == OWNED_FILE_KIND && w.file == GITATTRIBUTES_REL && op_of(w) == "create"
-        });
-        if created && read(GITATTRIBUTES_REL).as_deref() == Some(TREE_GITATTRIBUTES.as_bytes()) {
-            before.insert(
-                GITATTRIBUTES_REL.to_string(),
-                Some(TREE_GITATTRIBUTES.to_string()),
-            );
-            after.insert(GITATTRIBUTES_REL.to_string(), None);
+        for (rel, body) in [
+            (GITATTRIBUTES_REL, TREE_GITATTRIBUTES),
+            (GITIGNORE_REL, super::coursier_tree::GITIGNORE),
+        ] {
+            let created = records
+                .iter()
+                .any(|w| w.kind == OWNED_FILE_KIND && w.file == rel && op_of(w) == "create");
+            if created && read(rel).as_deref() == Some(body.as_bytes()) {
+                before.insert(rel.to_string(), Some(body.to_string()));
+                after.insert(rel.to_string(), None);
+            }
         }
     }
     JvmUnplan {
