@@ -376,3 +376,40 @@ async fn lock_only_scan_discovers_pin_with_dangling_eof_continuation() {
     )
     .await;
 }
+
+/// #604: pip resolves `six==1.16`, `six==1.16.0.0` and `six==01.16.0` to
+/// the registry release `1.16.0` (PEP 440), but lock-only discovery queried
+/// only the spelled version, so the patch keyed `@1.16.0` was never found.
+/// Each spelling must also ask for the release's other spellings.
+#[tokio::test]
+async fn lock_only_scan_queries_pep440_equivalent_spellings() {
+    for (pin, spelled) in [
+        ("1.16", "1.16"),
+        ("1.16.0.0", "1.16.0.0"),
+        ("01.16.0", "01.16.0"),
+    ] {
+        for mode in [&[][..], &["--mode", "vendored"][..]] {
+            let mock = MockServer::start().await;
+            mount_empty_batch(&mock).await;
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("requirements.txt"),
+                format!("sp-fixture-six=={pin}\n"),
+            )
+            .unwrap();
+            let (code, v) = run_scan(tmp.path(), &mock.uri(), mode, &[]);
+            assert_eq!(code, 0, "{pin} {mode:?}: {v}");
+            assert_eq!(v["lockfileOnlyPackages"].as_u64(), Some(1), "{v}");
+            let purls = batch_purls(&mock).await;
+            for want in [
+                format!("pkg:pypi/sp-fixture-six@{spelled}"),
+                "pkg:pypi/sp-fixture-six@1.16.0".to_string(),
+            ] {
+                assert!(
+                    purls.contains(&want),
+                    "{pin} {mode:?}: {want} must reach the patch API; sent {purls:?}"
+                );
+            }
+        }
+    }
+}
