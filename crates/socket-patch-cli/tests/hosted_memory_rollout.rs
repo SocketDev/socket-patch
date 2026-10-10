@@ -15,7 +15,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 #[path = "hosted_memory_common/mod.rs"]
 mod common;
 
-use common::{build_input, run_disk_args, run_disk_with, run_engine, ORG};
+use common::{build_input, run_disk_args, run_disk_with, run_engine, sorted_redirect, ORG};
 
 const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 
@@ -326,8 +326,8 @@ async fn one_root_disk_and_memory_admit_and_defer_the_same_rows_until_converged(
             disk.stderr
         );
         assert_eq!(
-            project.redirect,
-            disk.envelope["redirect"],
+            sorted_redirect(&project.redirect),
+            disk.redirect,
             "run {}: the redirect blocks agree",
             run + 1
         );

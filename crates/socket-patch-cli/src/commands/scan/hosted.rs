@@ -17,10 +17,15 @@ use socket_patch_core::utils::concurrent::{
 };
 use socket_patch_core::utils::purl::purl_parts;
 
+use crate::commands::agent_download::tag_mode;
 use crate::commands::vex::generate_vex_from_manifest_path;
+use crate::json_envelope::{
+    Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, VexSummary,
+};
 
-use super::{discover_selected, ScanArgs};
+use super::{discover_selected, emit_scan, scan_envelope, ScanArgs};
 
+mod nuget;
 mod python;
 mod takeover;
 
@@ -37,7 +42,6 @@ pub(crate) use socket_patch_core::hosted::guidance::{
     pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
     TrustPlan,
 };
-pub(crate) use socket_patch_core::hosted::render::redirect_json_block;
 
 /// Most hosted wheel-metadata downloads in flight at once, below the patch
 /// API's own in-flight cap: each one buffers a whole wheel (up to
@@ -56,86 +60,123 @@ fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
 }
 
 /// The hosted-mode JSON error envelope, for bail-outs that return before the
-/// success envelope at the bottom of [`run_redirect`] is built. When the
-/// classic scan object (`scan_result`, threaded in from `run`) is present it
-/// is reused so the error envelope carries the SAME top-level scan keys as
-/// the success path — folding in `status`/`error` and a minimal `redirect`
-/// block — instead of a bare shape that flips the schema. When absent (never
-/// in JSON mode today) the bare envelope is emitted. A `--json` consumer must
-/// always get parseable stdout — never empty output plus an exit code. The
-/// top-level `error` is `{code, message}` like every command's (v5.0).
-fn emit_json_error(scan_result: Option<serde_json::Value>, code: &str, message: &str) {
-    print_json(&json_error_envelope(scan_result, code, message));
+/// success envelope at the bottom of [`run_redirect_selected`] is built:
+/// the caller's envelope (`scan_result`: scan's discovery payload, or
+/// `get`'s narrowing events) marked `status: "error"` with the coded
+/// `error`, printed once. A `--json` consumer must always get parseable
+/// stdout — never empty output plus an exit code.
+fn emit_json_error(
+    common: &crate::args::GlobalArgs,
+    scan_result: Option<Envelope>,
+    code: &str,
+    message: &str,
+) {
+    emit_scan(&json_error_envelope(common, scan_result, code, message));
 }
 
 /// The envelope [`emit_json_error`] prints, built without printing it, so
 /// [`run_redirect_selected`] can send its failure telemetry first.
 fn json_error_envelope(
-    scan_result: Option<serde_json::Value>,
+    common: &crate::args::GlobalArgs,
+    scan_result: Option<Envelope>,
     code: &str,
     message: &str,
-) -> serde_json::Value {
-    let mut result = scan_result.unwrap_or_else(|| serde_json::json!({}));
-    crate::json_envelope::set_error(
-        &mut result,
-        crate::json_envelope::EnvelopeError::new(code, message),
-    );
+) -> Envelope {
+    let mut env = scan_result.unwrap_or_else(|| scan_envelope(common));
+    env.mark_error(EnvelopeError::new(code, message));
     // The rollout block describes a successful run only.
-    if let Some(obj) = result.as_object_mut() {
-        obj.remove("rollout");
+    env.extra.remove("rollout");
+    env
+}
+
+/// The hosted run's `redirect` payload: `{mode: "hosted", rewrittenFiles}`
+/// (the files the rewrite changed — or would change, on a dry run). The
+/// per-patch outcomes are the envelope's events (`details.mode: "hosted"`)
+/// and its warnings the top-level `warnings`.
+pub(super) fn redirect_block(rewritten: Vec<String>) -> serde_json::Value {
+    serde_json::json!({ "mode": "hosted", "rewrittenFiles": rewritten })
+}
+
+/// The `redirect_prune_ignored` warning (`--prune` is a no-op in hosted
+/// mode; see the constants' doc in `run`'s module).
+pub(super) fn prune_ignored_warning() -> RunWarning {
+    RunWarning::new(
+        super::REDIRECT_PRUNE_IGNORED,
+        super::REDIRECT_PRUNE_IGNORED_DETAIL,
+    )
+}
+
+/// Warning code inside `vex.warnings` of a hosted run: the patches this
+/// run pinned are attested from their patch records, not hash-verified
+/// (their bytes are fetched at install time).
+pub(super) const VEX_HOSTED_UNVERIFIED: &str = "vex_hosted_unverified";
+
+/// Record a hosted run's per-patch outcomes into `env`, each event
+/// carrying `details.mode: "hosted"` and sorted by purl then uuid: `applied`
+/// (`verified` on a dry run) for each pin the rewrite confirmed, `skipped`
+/// with the skip's reason as `errorCode` (its detail, when it has one, as
+/// `reason`), and `skipped` / `redirect_unconfirmed` for each granted patch no lockfile entry pins
+/// (status and exit unchanged, pending #704).
+pub(super) fn record_hosted_events(
+    env: &mut Envelope,
+    confirmed: &[(String, String)],
+    unconfirmed: &[(String, String)],
+    skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
+    dry_run: bool,
+) {
+    let pinned = if dry_run {
+        PatchAction::Verified
+    } else {
+        PatchAction::Applied
+    };
+    let mut events: Vec<PatchEvent> = confirmed
+        .iter()
+        .map(|(purl, uuid)| PatchEvent::new(pinned, purl.as_str()).with_uuid(uuid.as_str()))
+        .chain(skipped.iter().map(|s| {
+            // The skip's code is its `errorCode`; its detail (when the
+            // engine gave one) the `reason`.
+            let mut event =
+                PatchEvent::new(PatchAction::Skipped, s.purl.as_str()).with_uuid(s.uuid.as_str());
+            event.error_code = Some(s.reason.clone());
+            event.reason = s.detail.clone();
+            event
+        }))
+        .chain(unconfirmed.iter().map(|(purl, uuid)| {
+            PatchEvent::new(PatchAction::Skipped, purl.as_str())
+                .with_uuid(uuid.as_str())
+                .with_reason(
+                    socket_patch_core::hosted::render::REDIRECT_UNCONFIRMED,
+                    "no lockfile entry pinning it could be rewritten",
+                )
+        }))
+        .collect();
+    events.sort_by(|a, b| (&a.purl, &a.uuid).cmp(&(&b.purl, &b.uuid)));
+    for event in events {
+        env.record(tag_mode(event, Some("hosted")));
     }
-    if !result.get("redirect").is_some_and(|r| r.is_object()) {
-        result["redirect"] = serde_json::json!({ "mode": "hosted" });
-    }
-    result
 }
 
-fn print_json(value: &serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value)
-            .expect("serializing an in-memory JSON value cannot fail")
-    );
-}
-
-/// Build the hosted `--json` success envelope: the classic scan object
-/// (`scan_result`, built by `run` — scannedPackages / totalPatches /
-/// canAccessPaidPatches plus the `packages` enumeration) with the redirect
-/// summary NESTED under `redirect`, mirroring vendored mode's nested `vendor`
-/// block. Extracted so the schema (classic scan keys + nested `redirect`) is
-/// unit-testable without a live API. When `scan_result` is absent (never in
-/// JSON mode today) a minimal `{status:"success"}` base is used so stdout is
-/// still parseable.
-fn build_redirect_json_envelope(
-    scan_result: Option<serde_json::Value>,
-    redirect: serde_json::Value,
-) -> serde_json::Value {
-    let mut result = scan_result.unwrap_or_else(|| serde_json::json!({ "status": "success" }));
-    result["status"] = serde_json::json!("success");
-    result["redirect"] = redirect;
-    result
-}
-
-/// The `redirect_prune_ignored` warning object (`--prune` is a no-op in
-/// hosted mode; see the constants' doc in `run`'s module).
-pub(super) fn prune_ignored_warning() -> serde_json::Value {
-    serde_json::json!({
-        "code": super::REDIRECT_PRUNE_IGNORED,
-        "detail": super::REDIRECT_PRUNE_IGNORED_DETAIL,
-    })
+/// A `{code, detail}` warning object (the shape the stale-install probes
+/// build) as a [`RunWarning`].
+fn run_warning_of(w: &serde_json::Value) -> RunWarning {
+    RunWarning::new(
+        w["code"].as_str().unwrap_or_default(),
+        w["detail"].as_str().unwrap_or_default(),
+    )
 }
 
 /// An engine refusal (nothing was written): `Error (<code>): <message>` on
 /// stderr plus the `--json` error envelope carrying the code, exit 1.
 fn refuse(
     common: &crate::args::GlobalArgs,
-    scan_result: Option<serde_json::Value>,
+    scan_result: Option<Envelope>,
     refusal: &socket_patch_core::hosted::engine::Refusal,
     json_error: &mut Option<serde_json::Value>,
 ) -> i32 {
     eprintln!("Error ({}): {}", refusal.code, refusal.message);
     if common.json {
         *json_error = Some(json_error_envelope(
+            common,
             scan_result,
             &refusal.code,
             &refusal.message,
@@ -153,13 +194,12 @@ fn refuse(
 /// nothing leaves no residue. Contention / IO failures render through the
 /// shared [`crate::commands::lock_cli::lock_failure`] mapping — the
 /// `lock_held` / `lock_io` codes and the "(waited …)" clause match every
-/// other mutating command — into the hosted error envelope (NOT
-/// `acquire_or_emit`, whose `Envelope` would replace the classic scan / get
-/// object) plus the stderr line and, for a live holder, the wait hint.
+/// other mutating command — into the caller's error envelope plus the
+/// stderr line and, for a live holder, the wait hint.
 fn acquire_hosted_lock(
     common: &crate::args::GlobalArgs,
-    scan_result: &mut Option<serde_json::Value>,
-    json_error: &mut Option<serde_json::Value>,
+    scan_result: &mut Option<Envelope>,
+    json_error: &mut Option<Envelope>,
 ) -> Result<LockGuard, i32> {
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
@@ -174,7 +214,12 @@ fn acquire_hosted_lock(
                 crate::commands::lock_cli::format_lock_error(&socket_dir, &err, timeout)
             );
             if common.json {
-                *json_error = Some(json_error_envelope(scan_result.take(), code, &message));
+                *json_error = Some(json_error_envelope(
+                    common,
+                    scan_result.take(),
+                    code,
+                    &message,
+                ));
             }
             Err(1)
         }
@@ -554,11 +599,10 @@ pub(super) async fn run_redirect(
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
     policy: &super::policy::ScanPolicy,
-    // The classic scan object `run` builds for the `--json` path (`Some` in
-    // JSON mode, `None` for human output). The redirect result is NESTED into
-    // it so the hosted `--json` envelope stays schema-consistent with every
-    // other scan; `.take()` at each terminal (error or success) folds it in.
-    mut scan_result: Option<serde_json::Value>,
+    // The scan envelope `run` builds for the `--json` path (`Some` in JSON
+    // mode, `None` for human output). The redirect outcome is recorded into
+    // it; `.take()` at each terminal (error or success) prints it.
+    mut scan_result: Option<Envelope>,
     // Scan's pending telemetry, flushed by `discover_selected` before
     // anything below writes to stdout.
     telemetry: &mut socket_patch_core::telemetry::PendingTelemetry,
@@ -574,6 +618,10 @@ pub(super) async fn run_redirect(
     stage: &mut super::rollout::Stage,
     // Scan's pre-redirect lockfile discovery (see `rollout::Gate::prior`).
     prior: Option<super::rollout::Prior<'_>>,
+    // `--prune` / `--sync`, gated by the policy exactly as the human arm
+    // gates it (`patches.enabled: false` writes nothing, the GC included):
+    // only feeds the `redirect_prune_ignored` warning.
+    prune: bool,
 ) -> i32 {
     // Same discovery/selection as agent and vendored mode.
     let discovered = match discover_selected(
@@ -597,7 +645,12 @@ pub(super) async fn run_redirect(
         // stdout is never empty on failure.
         Err((code, message)) => {
             if args.common.json {
-                emit_json_error(scan_result.take(), super::PATCH_DETAILS_FAILED, &message);
+                emit_json_error(
+                    &args.common,
+                    scan_result.take(),
+                    super::PATCH_DETAILS_FAILED,
+                    &message,
+                );
             } else if code == 0 && !args.common.silent {
                 // Unreachable from scan (it never prompts, so selection
                 // cannot be cancelled); kept for a code-0 selection error.
@@ -626,7 +679,7 @@ pub(super) async fn run_redirect(
     run_redirect_selected(
         &args.common,
         &args.vex,
-        args.prune || args.sync,
+        prune,
         api_client,
         &pairs,
         scan_result,
@@ -719,8 +772,9 @@ fn discovery_after_writes<'d>(
 ///
 /// `scan_result` must be `Some` exactly when `common.json` is set (the
 /// human/JSON split keys on `common.json`; a `--json` caller passing `None`
-/// would get a minimal envelope that drops its own keys). `prune_requested`
-/// only feeds the `redirect_prune_ignored` warning — `get` passes `false`.
+/// would get a bare scan envelope without its own payload).
+/// `prune_requested` only feeds the `redirect_prune_ignored` warning —
+/// `get` passes `false`.
 ///
 /// Telemetry: a run with a non-empty selection reports `patch_applied`
 /// (`mode: "hosted"`, sent before the result prints) or, on a non-zero
@@ -733,7 +787,7 @@ pub(crate) async fn run_redirect_selected(
     prune_requested: bool,
     api_client: &socket_patch_core::api::client::ApiClient,
     selected: &[(String, String)],
-    scan_result: Option<serde_json::Value>,
+    scan_result: Option<Envelope>,
     npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
     rollout: Option<super::rollout::Gate<'_>>,
     command: &'static str,
@@ -768,7 +822,7 @@ pub(crate) async fn run_redirect_selected(
     // The `--json` error envelope prints only after the failure event went
     // out, so a consumer that closes stdout on it cannot drop the event.
     if let Some(envelope) = telemetry.json_error.take() {
-        print_json(&envelope);
+        emit_scan(&envelope);
     }
     code
 }
@@ -781,7 +835,7 @@ struct HostedTelemetry {
     sent: bool,
     /// A `--json` error envelope a failure path built, printed by
     /// [`run_redirect_selected`] after the failure event is sent.
-    json_error: Option<serde_json::Value>,
+    json_error: Option<Envelope>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -791,7 +845,7 @@ async fn run_redirect_selected_untracked(
     prune_requested: bool,
     api_client: &socket_patch_core::api::client::ApiClient,
     selected: &[(String, String)],
-    mut scan_result: Option<serde_json::Value>,
+    mut scan_result: Option<Envelope>,
     npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
     // `scan`'s rollout gate: NEW rows past the budget are deferred after
     // every write-free eligibility check below (§5.2). `get` passes `None`.
@@ -848,6 +902,7 @@ async fn run_redirect_selected_untracked(
                 );
                 if common.json {
                     telemetry.json_error = Some(json_error_envelope(
+                        common,
                         scan_result.take(),
                         "reference_resolve_failed",
                         &message,
@@ -1144,6 +1199,43 @@ async fn run_redirect_selected_untracked(
             }
         }
     }
+    // A yarn classic pin reads the served tarball: its sha1 is the
+    // `resolved` fragment yarn 1 keys its cache slot on when the grant
+    // carries none (#558), and its package.json's dependencies must match
+    // the lock block's sub-maps, every new descriptor locked (#591). The
+    // tarball is checked against the grant's sha512; one that cannot be
+    // fetched, verified or read drops its patch.
+    let classic_targets: Vec<(String, String, DepOverride)> =
+        engine::yarn_classic_artifact_targets(
+            &candidates,
+            &read.files,
+            &resolve_outer_yarn_mirror_for_process(&common.cwd),
+        )
+        .into_iter()
+        .filter_map(|dep| {
+            let sha512 = dep.integrity.sha512.clone()?;
+            Some((dep.artifact_url.clone(), sha512, dep.clone()))
+        })
+        .collect();
+    for (url, sha512, dep) in classic_targets {
+        status.set(format!("Fetching hosted tarball for {}...", dep.name));
+        match socket_patch_core::hosted::npm_manifest::fetch_hosted_classic_artifact(
+            api_client, &url, &sha512,
+        )
+        .await
+        {
+            Ok(artifact) => engine::record_classic_artifact(
+                &mut candidates,
+                &mut python_metadata,
+                &url,
+                &artifact,
+            ),
+            Err(detail) => {
+                unavailable_python_artifacts.insert(url.clone());
+                skipped.push(engine::npm_tarball_unavailable(&dep, &detail));
+            }
+        }
+    }
     status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
     // The Pipfile.lock reference shape depends on the installing Pipenv
@@ -1436,6 +1528,7 @@ async fn run_redirect_selected_untracked(
         eprintln!("{}", format_error_line(&message));
         if common.json {
             telemetry.json_error = Some(json_error_envelope(
+                common,
                 scan_result.take(),
                 "lockfile_write_failed",
                 &message,
@@ -1496,6 +1589,15 @@ async fn run_redirect_selected_untracked(
         .await
     };
 
+    // NuGet global packages folder probe (#352): a copy extracted from the
+    // upstream bytes shadows the Socket source. Read-only, like the gem
+    // probe; skipped on --dry-run for the same reason.
+    let nuget_stale = if common.dry_run {
+        StaleInstallOutcome::default()
+    } else {
+        nuget::stale_install_warnings(common, &confirmed, &done.overrides).await
+    };
+
     // vlt warm-tree heal: stale installed copies of the Socket-owned nodes
     // are invalidated (classified only on a dry run or
     // with --no-vlt-install-cleanup), and every confirmed vlt purl whose
@@ -1535,7 +1637,7 @@ async fn run_redirect_selected_untracked(
     // and stderr) about any overlap left, WITHOUT deleting the other ledger.
     // Classified over the lockfiles as this run left them and the vendored
     // ledger as the takeover left it.
-    let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut takeover_warnings: Vec<RunWarning> = Vec::new();
     // Nothing vendored, nothing to overlap: skip the lockfile walk (#993).
     let vendor_now = vendor_state.as_ref().ok().filter(|v| !v.entries.is_empty());
     let superseded = if vendor_now.is_none() {
@@ -1585,17 +1687,17 @@ async fn run_redirect_selected_untracked(
         .redirect
     };
     if !superseded.is_empty() {
-        takeover_warnings.push(serde_json::json!({
-            "code": super::REDIRECT_SUPERSEDES_VENDORED,
-            "detail": super::mode_takeover_detail(&superseded),
-        }));
+        takeover_warnings.push(RunWarning::new(
+            super::REDIRECT_SUPERSEDES_VENDORED,
+            super::mode_takeover_detail(&superseded),
+        ));
     }
 
     // `--prune` is a no-op in hosted mode (both hosted terminals return
     // before the GC blocks): make that explicit in the JSON `warnings[]`
     // rather than silently dropping the flag. The human path warns once up
     // front in `run`.
-    let mut prune_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut prune_warnings: Vec<RunWarning> = Vec::new();
     if prune_requested {
         prune_warnings.push(prune_ignored_warning());
     }
@@ -1655,6 +1757,7 @@ async fn run_redirect_selected_untracked(
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
                 !gem_stale.stale_purls.contains(purl)
+                    && !nuget_stale.stale_purls.contains(purl)
                     && !python_stale.stale_purls.contains(purl)
                     && !vlt_stale.stale_purls.contains(purl)
             })
@@ -1665,6 +1768,7 @@ async fn run_redirect_selected_untracked(
         params.known_stale = python_stale
             .stale_purls
             .iter()
+            .chain(&nuget_stale.stale_purls)
             .chain(&vlt_stale.stale_purls)
             .cloned()
             .collect();
@@ -1691,12 +1795,33 @@ async fn run_redirect_selected_untracked(
     engine_warnings.extend(done.rush_warnings.iter().cloned());
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
     engine_warnings.extend(done.npm_warnings.iter().cloned());
-    let mut warnings: Vec<serde_json::Value> =
-        socket_patch_core::hosted::render::rewrite_warnings_json(&engine_warnings);
-    warnings.extend(gem_stale.warnings.iter().cloned());
-    warnings.extend(python_stale.warnings.iter().cloned());
-    warnings.extend(vlt_stale.warnings.iter().cloned());
-    warnings.extend(takeover_pre_warnings.iter().cloned());
+    // A hosted Go `replace` breaks a committed vendor/ directory until
+    // `go mod vendor` re-records it in vendor/modules.txt (#343).
+    if !common.dry_run
+        && done
+            .rewritten
+            .iter()
+            .any(|f| f == "go.mod" || f.ends_with("/go.mod"))
+    {
+        for (code, detail) in socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+            &common.cwd,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        {
+            engine_warnings
+                .push(socket_patch_core::patch::redirect::RewriteWarning { code, detail });
+        }
+    }
+    let mut warnings: Vec<RunWarning> = engine_warnings
+        .iter()
+        .map(|w| RunWarning::new(w.code.as_str(), w.detail.as_str()))
+        .collect();
+    warnings.extend(gem_stale.warnings.iter().map(run_warning_of));
+    warnings.extend(nuget_stale.warnings.iter().map(run_warning_of));
+    warnings.extend(python_stale.warnings.iter().map(run_warning_of));
+    warnings.extend(vlt_stale.warnings.iter().map(run_warning_of));
+    warnings.extend(takeover_pre_warnings.iter().map(run_warning_of));
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
 
@@ -1724,46 +1849,45 @@ async fn run_redirect_selected_untracked(
     }
     telemetry.sent = true;
     if common.json {
-        // Nest the redirect result under `redirect` inside the classic scan
-        // object (built by `run`, threaded in via `scan_result`), mirroring
-        // vendored mode's nested `vendor` block, so the hosted `--json`
-        // envelope keeps the same top-level scan keys as every other scan.
-        let redirect = redirect_json_block(
-            &confirmed,
-            &unconfirmed,
-            done.rewritten.clone(),
-            &skipped,
-            warnings,
-            common.dry_run,
-        );
-        let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
+        // Record the redirect outcome into the caller's envelope (scan's
+        // discovery payload, or get's narrowing events): per-patch events
+        // tagged `details.mode: "hosted"`, the `redirect` payload, and the
+        // engine's warnings hoisted to the top-level `warnings`.
+        let mut env = scan_result.take().unwrap_or_else(|| scan_envelope(common));
+        record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
+        env.set_extra("redirect", redirect_block(done.rewritten.clone()));
+        env.warnings.extend(warnings);
         if let Some(gate) = &rollout {
-            super::finish_rollout_json(gate.stage, &mut result);
+            super::finish_rollout_json(gate.stage, &mut env);
         }
         if let Some(statements) = vex_statements {
-            result["vex"] = serde_json::json!({
-                "path": vex.vex.as_ref().expect("vex_statements is Some only when --vex was given").display().to_string(),
-                "statements": statements,
-                "format": "openvex-0.2.0",
-                "verified": false,
+            // Hosted pins are attested from their records, not verified
+            // against installed bytes: said once, in `vex.warnings`.
+            let mut warnings = vec![RunWarning::new(
+                VEX_HOSTED_UNVERIFIED,
+                "hosted patches are attested from their patch records, not hash-verified \
+                 (their bytes are fetched at install time); run `socket-patch vex` after \
+                 installing to verify against the installed tree",
+            )];
+            warnings.extend(vex_warnings);
+            env.vex = Some(VexSummary {
+                path: vex
+                    .vex
+                    .as_ref()
+                    .expect("vex_statements is Some only when --vex was given")
+                    .display()
+                    .to_string(),
+                statements,
+                format: "openvex-0.2.0".to_string(),
+                warnings,
             });
-            // Same skip-if-empty `warnings` key as the agent arm's VEX block.
-            if !vex_warnings.is_empty() {
-                result["vex"]["warnings"] = serde_json::to_value(&vex_warnings)
-                    .expect("RunWarning is a plain string struct: serialization cannot fail");
-            }
         } else if let Some(e) = &vex_error {
-            crate::json_envelope::set_error(
-                &mut result,
-                crate::json_envelope::EnvelopeError::new(e.code.to_string(), e.message.clone()),
-            );
-            super::append_vex_error_warnings(&mut result, &vex_warnings);
+            env.mark_error(EnvelopeError::new(e.code.to_string(), e.message.clone()));
+            super::append_vex_error_warnings(&mut env, &vex_warnings);
+        } else if vex.vex.is_some() && common.dry_run {
+            env.warnings.push(super::vex_dry_run_warning());
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .expect("serializing an in-memory JSON value cannot fail")
-        );
+        emit_scan(&env);
     } else {
         if !common.silent {
             // Wrap long warnings only on a terminal: logs and pipes keep one
@@ -1789,12 +1913,7 @@ async fn run_redirect_selected_untracked(
             );
             let human_warnings: Vec<(&str, &str)> = warnings
                 .iter()
-                .map(|w| {
-                    (
-                        w["code"].as_str().unwrap_or_default(),
-                        w["detail"].as_str().unwrap_or_default(),
-                    )
-                })
+                .map(|w| (w.code.as_str(), w.detail.as_str()))
                 // The prune notice already printed up front (in `run`);
                 // successful takeovers printed above as progress lines.
                 .filter(|(code, _)| {
@@ -1870,7 +1989,12 @@ async fn run_redirect_selected_untracked(
             let mut next_steps = if common.dry_run {
                 Vec::new()
             } else {
-                format_next_steps(&human_files, &rewrite.edits, !takeover_migrated.is_empty())
+                format_next_steps(
+                    &common.cwd,
+                    &human_files,
+                    &rewrite.edits,
+                    !takeover_migrated.is_empty(),
+                )
             };
             next_steps.extend(deferred_steps);
             for line in next_steps {
@@ -2163,6 +2287,9 @@ fn describe_skip_reason(reason: &str) -> String {
         "npm_manifest_unavailable" => {
             "the hosted tarball's package.json could not be fetched".into()
         }
+        "npm_tarball_unavailable" => {
+            "the hosted tarball could not be fetched, verified or read".into()
+        }
         "redirect_bun_lock_unsupported" | "redirect_bun_lockb_invalid" => {
             "the Bun lockfile blocks the vendored-to-hosted migration (see the warning)".into()
         }
@@ -2282,8 +2409,10 @@ fn join_names(names: &[String], max: usize) -> String {
 /// rewritten files, reinstall so the installed tree picks up the patched
 /// artifacts, then verify with `vex`. After a vendored→hosted takeover
 /// (`vendored_removed`) the commit also has to carry the deleted vendored
-/// ledger entries and artifacts.
+/// ledger entries and artifacts. `cwd` locates the project's Composer
+/// vendor directory for the composer reinstall hint.
 fn format_next_steps(
+    cwd: &std::path::Path,
     files: &[String],
     edits: &[socket_patch_core::patch::redirect::FileEdit],
     vendored_removed: bool,
@@ -2306,7 +2435,9 @@ fn format_next_steps(
     } else if let Some(sbt) = socket_patch_core::patch::redirect::sbt::next_step_hint(files) {
         sbt.to_string()
     } else {
-        crate::commands::composer_hints::hosted_reinstall_hint(files, edits).unwrap_or_default()
+        let vendor_dir = crate::commands::composer_hints::vendor_dir_label(cwd);
+        crate::commands::composer_hints::hosted_reinstall_hint(files, edits, &vendor_dir)
+            .unwrap_or_default()
     };
     let mut extra = Vec::new();
     if files
@@ -2336,7 +2467,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
     prune_requested: bool,
     api_client: &'a socket_patch_core::api::client::ApiClient,
     selected: &'a [(String, String)],
-    scan_result: Option<serde_json::Value>,
+    scan_result: Option<Envelope>,
     npm_prior: Option<&'a crate::ecosystem_dispatch::NpmCrawlSnapshot>,
     rollout: Option<super::rollout::Gate<'a>>,
     command: &'static str,
@@ -2434,22 +2565,21 @@ use socket_patch_core::hosted::engine::SBT_OWNED_FILE_UNREADABLE;
 #[cfg(test)]
 mod tests {
     use super::{
-        build_redirect_json_envelope, gem_stale_cache_warning, gem_stale_install_warning,
-        gem_stale_install_warnings, installed_stale_positive_evidence,
-        npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
-        npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
-        npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
-        npm_allow_remote_user_set_detail, plan_workspace_trust, pnpm_heal_root,
-        pnpm_lock_carries_hosted_redirect, pnpm_lock_version_major, pnpm_trust_configured_detail,
-        pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
-        pnpm_trust_workspace_unreadable_detail, prune_ignored_warning, read_npmrc_for_allow_remote,
-        read_workspace_for_trust, redirect_json_block, TrustPlan,
-    };
-    use super::{
         describe_skip_reason, format_error_line, format_next_steps, format_redirect_summary,
         format_takeover_line, format_unredirected, format_warning, join_names,
         lock_entry_warning_count, pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder,
         split_sentences, wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
+    };
+    use super::{
+        gem_stale_cache_warning, gem_stale_install_warning, gem_stale_install_warnings,
+        installed_stale_positive_evidence, npm_allow_remote_already_detail,
+        npm_allow_remote_configured_detail, npm_allow_remote_env_set_detail,
+        npm_allow_remote_manual_detail, npm_allow_remote_outer_set_detail,
+        npm_allow_remote_unreadable_detail, npm_allow_remote_user_set_detail, plan_workspace_trust,
+        pnpm_heal_root, pnpm_lock_carries_hosted_redirect, pnpm_lock_version_major,
+        pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
+        pnpm_trust_workspace_unreadable_detail, prune_ignored_warning, read_npmrc_for_allow_remote,
+        read_workspace_for_trust, record_hosted_events, redirect_block, TrustPlan,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
 
@@ -2667,6 +2797,28 @@ mod tests {
                 assert_eq!(text, "packages:\n  - '.'\ntrustLockfile: true\n");
             }
             _ => panic!("no workspace file must plan a Create"),
+        }
+    }
+
+    /// #1096: an existing file with no keys at all (empty, comments only,
+    /// bare document markers) gains the root-only `packages` scaffold with
+    /// the trust key — pnpm 8.x–10.4 refuse a workspace file holding a key
+    /// but no `packages` — inside the document, every user byte intact.
+    #[test]
+    fn plan_workspace_trust_scaffolds_packages_in_a_keyless_file() {
+        const ADDED: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+        for (user, want) in [
+            ("", ADDED.to_string()),
+            ("\n", format!("{ADDED}\n")),
+            ("# settings\n", format!("# settings\n{ADDED}")),
+            ("---\n", format!("---\n{ADDED}")),
+            ("%YAML 1.2\n---\n", format!("%YAML 1.2\n---\n{ADDED}")),
+            ("---\n...\n", format!("---\n{ADDED}...\n")),
+        ] {
+            match plan_workspace_trust(Some(user)) {
+                TrustPlan::Scaffold(text) => assert_eq!(text, want, "{user:?}"),
+                _ => panic!("a keyless file must plan a Scaffold: {user:?}"),
+            }
         }
     }
 
@@ -3133,68 +3285,75 @@ mod tests {
         assert!(pnpm_heal_root(false, None, &overrides).is_none());
     }
 
-    /// The classic scan object `run` builds for the `--json` path with ≥1
-    /// discovered package (scannedPackages/totalPatches/… + the `packages`
-    /// enumeration). Mirrors the `serde_json::json!` in `scan::run`.
-    fn classic_scan_result() -> serde_json::Value {
-        serde_json::json!({
-            "status": "success",
-            "scannedPackages": 3,
-            "lockfileOnlyPackages": 0,
-            "packagesWithPatches": 1,
-            "totalPatches": 2,
-            "freePatches": 2,
-            "paidPatches": 0,
-            "canAccessPaidPatches": false,
-            "packages": [
-                { "purl": "pkg:npm/minimist@1.2.2", "patches": [ { "uuid": "abc-123" } ] }
-            ],
-            "updates": [],
-        })
-    }
-
+    /// The hosted outcome recorded into a scan envelope: one event per
+    /// selected patch, tagged `details.mode: "hosted"` and purl-sorted —
+    /// `applied` for a confirmed pin (`verified` on a dry run), `skipped`
+    /// with the skip's code, `skipped` / `redirect_unconfirmed` for a grant
+    /// nothing pins — counted in `summary`, beside the discovery payload,
+    /// the `redirect` block and the hoisted warnings.
     #[test]
-    fn hosted_json_envelope_nests_redirect_into_classic_scan_object() {
-        // With ≥1 package, the hosted `--json` envelope must carry the SAME
-        // top-level scan keys as a zero-discovery / non-hosted scan AND nest
-        // the redirect summary under `redirect`. Built through the ONE
-        // spelling of the block (`run`'s zero-discovery arm uses the same
-        // helper).
-        let redirect = redirect_json_block(
+    fn hosted_events_join_the_scan_envelope() {
+        use crate::json_envelope::{Command, Envelope};
+        use socket_patch_core::hosted::engine::SkippedPatch;
+        let mut env = Envelope::new(Command::Scan);
+        env.set_extra("scannedPackages", serde_json::json!(3));
+        let skipped: Vec<SkippedPatch> = serde_json::from_value(serde_json::json!([
+            {"purl": "pkg:npm/b@1.0.0", "uuid": "ub", "reason": "not_found"}
+        ]))
+        .unwrap();
+        record_hosted_events(
+            &mut env,
             &[("pkg:npm/minimist@1.2.2".to_string(), "abc-123".to_string())],
-            &[],
-            vec!["package-lock.json".to_string()],
-            &[],
-            vec![prune_ignored_warning()],
+            &[("pkg:npm/a@1.0.0".to_string(), "ua".to_string())],
+            &skipped,
             false,
         );
-        let envelope = build_redirect_json_envelope(Some(classic_scan_result()), redirect);
+        env.set_extra("redirect", redirect_block(vec!["package-lock.json".into()]));
+        env.warnings.push(prune_ignored_warning());
+        let v = env.to_value();
+        assert_eq!(v["command"], "scan");
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["scannedPackages"], 3);
+        let actions: Vec<(&str, &str, Option<&str>)> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                assert_eq!(e["details"]["mode"], "hosted", "{e}");
+                (
+                    e["action"].as_str().unwrap(),
+                    e["purl"].as_str().unwrap(),
+                    e["errorCode"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                ("skipped", "pkg:npm/a@1.0.0", Some("redirect_unconfirmed")),
+                ("skipped", "pkg:npm/b@1.0.0", Some("not_found")),
+                ("applied", "pkg:npm/minimist@1.2.2", None),
+            ]
+        );
+        assert_eq!(v["summary"]["applied"], 1);
+        assert_eq!(v["summary"]["skipped"], 2);
+        assert_eq!(
+            v["redirect"],
+            serde_json::json!({"mode": "hosted", "rewrittenFiles": ["package-lock.json"]})
+        );
+        assert_eq!(v["warnings"][0]["code"], "redirect_prune_ignored");
 
-        // Classic scan keys survive.
-        assert_eq!(envelope["status"], "success");
-        assert_eq!(envelope["scannedPackages"], 3);
-        assert_eq!(envelope["packagesWithPatches"], 1);
-        assert_eq!(envelope["totalPatches"], 2);
-        assert_eq!(envelope["freePatches"], 2);
-        assert_eq!(envelope["paidPatches"], 0);
-        assert_eq!(envelope["canAccessPaidPatches"], false);
-        assert!(envelope["updates"].is_array());
-
-        // Per-package / patch-uuid enumeration is present.
-        assert!(envelope["packages"].is_array());
-        assert_eq!(envelope["packages"][0]["purl"], "pkg:npm/minimist@1.2.2");
-        assert_eq!(envelope["packages"][0]["patches"][0]["uuid"], "abc-123");
-
-        // Redirect result is NESTED, preserving every sub-field, not replacing
-        // the whole envelope.
-        let r = &envelope["redirect"];
-        assert!(r.is_object());
-        assert_eq!(r["mode"], "hosted");
-        assert_eq!(r["redirected"], 1);
-        assert_eq!(r["rewrittenFiles"][0], "package-lock.json");
-        assert!(r["skipped"].is_array());
-        assert!(r["warnings"].is_array());
-        assert_eq!(r["dryRun"], false);
+        // A dry run previews the pin as `verified`.
+        let mut env = Envelope::new(Command::Scan);
+        record_hosted_events(
+            &mut env,
+            &[("pkg:npm/minimist@1.2.2".to_string(), "abc-123".to_string())],
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(env.summary.verified, 1);
+        assert_eq!(env.summary.applied, 0);
     }
 
     // ── gem stale-install probe (redirect_gem_stale_install) ──────────
@@ -4457,9 +4616,14 @@ mod tests {
 
     #[test]
     fn next_steps_name_the_rewritten_files_and_reinstall() {
-        assert!(format_next_steps(&[], &[], false).is_empty());
+        assert!(format_next_steps(std::path::Path::new("."), &[], &[], false).is_empty());
         assert_eq!(
-            format_next_steps(&["package-lock.json".to_string()], &[], false),
+            format_next_steps(
+                std::path::Path::new("."),
+                &["package-lock.json".to_string()],
+                &[],
+                false
+            ),
             vec![
                 "Next steps:".to_string(),
                 "  1. Commit package-lock.json to keep the hosted patches.".to_string(),
@@ -4470,6 +4634,7 @@ mod tests {
             ]
         );
         let steps = format_next_steps(
+            std::path::Path::new("."),
             &[
                 "pnpm-lock.yaml".to_string(),
                 "pnpm-workspace.yaml".to_string(),
@@ -4486,22 +4651,35 @@ mod tests {
 
     #[test]
     fn next_steps_add_the_vlt_ci_line_only_for_a_rewritten_vlt_lock() {
-        let steps = format_next_steps(&["vlt-lock.json".to_string()], &[], false);
+        let steps = format_next_steps(
+            std::path::Path::new("."),
+            &["vlt-lock.json".to_string()],
+            &[],
+            false,
+        );
         assert_eq!(
             steps.last().map(String::as_str),
             Some("  3. vlt: commit vlt-lock.json; CI should run `vlt ci`.")
         );
-        assert!(
-            !format_next_steps(&["package-lock.json".to_string()], &[], false)
-                .iter()
-                .any(|s| s.contains("vlt:"))
-        );
+        assert!(!format_next_steps(
+            std::path::Path::new("."),
+            &["package-lock.json".to_string()],
+            &[],
+            false
+        )
+        .iter()
+        .any(|s| s.contains("vlt:")));
     }
 
     #[test]
     fn next_steps_after_a_takeover_name_the_removed_vendored_state() {
         assert_eq!(
-            format_next_steps(&["pnpm-lock.yaml".to_string()], &[], true)[1],
+            format_next_steps(
+                std::path::Path::new("."),
+                &["pnpm-lock.yaml".to_string()],
+                &[],
+                true
+            )[1],
             "  1. Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
              pnpm-lock.yaml to keep the hosted patches."
         );

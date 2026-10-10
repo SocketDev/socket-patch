@@ -1,10 +1,10 @@
 //! Unified JSON output envelope shared across every subcommand.
 //!
-//! The `--json` output of `apply`, `list`, `remove`, `repair`/`gc`,
-//! `vendor`, `self-update` and `vex --json --output` (and every command's
-//! lock-contention error) uses this top-level shape; `scan`, `get`,
-//! and `rollback` still emit their legacy shapes (see
-//! CLI_CONTRACT.md's migration status):
+//! Every command's `--json` output uses this top-level shape (v5.0: `scan`,
+//! `get` and `rollback` joined `apply`, `list`, `remove`, `repair`,
+//! `vendor`, `--update` and `vex --json --output`). A command's own
+//! payload (scan's `packages`, rollback's `hosted`, …) rides beside the
+//! shared keys through [`Envelope::extra`]:
 //!
 //! ```json
 //! {
@@ -27,6 +27,7 @@
 //! `jq` recipes.
 
 use serde::Serialize;
+use socket_patch_core::manifest::cleanup_blobs::CleanupResult;
 
 pub use socket_patch_core::patch::sidecars::{SidecarFile, SidecarFileAction, SidecarRecord};
 
@@ -90,6 +91,74 @@ pub struct Envelope {
     /// (and flips the exit code), not here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vex: Option<VexSummary>,
+    /// The artifact GC pass's outcome — the same `gc` object (same keys)
+    /// `rollback` and `scan --prune` print. Set by [`Envelope::set_gc`],
+    /// which also mirrors `bytesFreed` into `summary.bytesFreed`. Omitted
+    /// for runs that swept nothing (`repair --download-only`, `remove
+    /// --preserve-state`, every command without a GC pass).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gc: Option<GcReport>,
+    /// Command-specific top-level keys, flattened beside the shared ones
+    /// (scan's `packages` / `redirect`, rollback's `hosted` / `manifest`,
+    /// …). A key here must never shadow a shared key; [`Envelope::set_extra`]
+    /// enforces that.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The keys every envelope owns. [`Envelope::set_extra`] refuses them so a
+/// command payload can't shadow the shared vocabulary.
+const SHARED_KEYS: &[&str] = &[
+    "command", "status", "dryRun", "events", "summary", "error", "sidecars", "warnings", "vex",
+    "gc",
+];
+
+/// One artifact GC pass — the orphan sweeps of `.socket/blobs`,
+/// `.socket/diffs` and `.socket/packages` — serialized identically by
+/// every command that runs one: the envelope's `gc` (`repair`, `remove`),
+/// rollback's legacy `gc` and the `gc` of `scan --prune` / `--sync`. On a
+/// dry run the counts are what the pass would remove.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcReport {
+    pub removed_blobs: usize,
+    pub removed_diff_archives: usize,
+    pub removed_package_archives: usize,
+    pub bytes_freed: u64,
+}
+
+impl GcReport {
+    /// Fold the three passes' results; a pass that failed outright
+    /// (`None`) counts as empty — its `cleanup_failed` warning is the
+    /// caller's to report.
+    pub fn from_passes(
+        blobs: Option<&CleanupResult>,
+        diffs: Option<&CleanupResult>,
+        packages: Option<&CleanupResult>,
+    ) -> Self {
+        let count = |r: Option<&CleanupResult>| r.map_or(0, |r| r.blobs_removed);
+        Self {
+            removed_blobs: count(blobs),
+            removed_diff_archives: count(diffs),
+            removed_package_archives: count(packages),
+            bytes_freed: [blobs, diffs, packages]
+                .into_iter()
+                .flatten()
+                .map(|r| r.bytes_freed)
+                .sum(),
+        }
+    }
+
+    /// Blobs plus diff and package archives removed.
+    pub fn total_removed(&self) -> usize {
+        self.removed_blobs + self.removed_diff_archives + self.removed_package_archives
+    }
+
+    /// The `gc` object as a JSON value, for the legacy shapes that extend
+    /// it with command-specific keys (`scan --prune`).
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("GcReport serializes")
+    }
 }
 
 /// Summary of an OpenVEX document emitted as a side-effect of an
@@ -131,7 +200,38 @@ impl Envelope {
             sidecars: Vec::new(),
             warnings: Vec::new(),
             vex: None,
+            gc: None,
+            extra: serde_json::Map::new(),
         }
+    }
+
+    /// Set a command-specific top-level key (see [`Envelope::extra`]).
+    ///
+    /// # Panics
+    /// When `key` is one of the shared envelope keys — a programming error.
+    pub fn set_extra(&mut self, key: &str, value: serde_json::Value) {
+        assert!(
+            !SHARED_KEYS.contains(&key),
+            "`{key}` is a shared envelope key, not a command payload key"
+        );
+        self.extra.insert(key.to_string(), value);
+    }
+
+    /// Append a run-level warning.
+    pub fn warn(&mut self, code: impl Into<String>, detail: impl Into<String>) {
+        self.warnings.push(RunWarning::new(code, detail));
+    }
+
+    /// Serialize to a JSON value.
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("envelope serialize")
+    }
+
+    /// Attach the run's artifact GC outcome (`gc`) and mirror its byte
+    /// count into `summary.bytesFreed`.
+    pub fn set_gc(&mut self, gc: GcReport) {
+        self.summary.bytes_freed = gc.bytes_freed;
+        self.gc = Some(gc);
     }
 
     /// Append an event and bump the matching summary counter. Centralizes
@@ -255,6 +355,11 @@ pub struct PatchEvent {
     /// Empty for actions that don't operate on files (e.g. `Downloaded`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<PatchEventFile>,
+    /// Byte count of the artifact-level GC event (`removed`, or `verified`
+    /// on a dry run: bytes freed) and of `--update`'s `downloaded` event
+    /// (archive size). Omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
     /// Human-readable explanation for `Skipped` or `Failed` events.
     /// Machine consumers should prefer `error_code` for routing decisions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,6 +407,7 @@ impl PatchEvent {
             uuid: None,
             old_uuid: None,
             files: Vec::new(),
+            bytes: None,
             reason: None,
             error_code: None,
             error: None,
@@ -324,6 +430,11 @@ impl PatchEvent {
 
     pub fn with_files(mut self, files: Vec<PatchEventFile>) -> Self {
         self.files = files;
+        self
+    }
+
+    pub fn with_bytes(mut self, bytes: u64) -> Self {
+        self.bytes = Some(bytes);
         self
     }
 
@@ -401,15 +512,18 @@ pub enum PatchAction {
     /// from verified sources (lockfiles and the vendor ledger untouched
     /// unless drift was healed).
     Rebuilt,
+    /// `rollback`: a patched package was restored to its original state
+    /// (`files` lists what was restored).
+    RolledBack,
 }
 
 /// Patch-source strategy used to apply a file. Mirrors the existing
 /// `socket_patch_core::patch::apply::AppliedVia` enum, but lives here so
-/// the JSON layer doesn't depend on core internals.
+/// the JSON layer doesn't depend on core internals. `blob` is the only
+/// value since v5 removed the diff download path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AppliedVia {
-    Diff,
     Blob,
 }
 
@@ -417,7 +531,6 @@ impl AppliedVia {
     pub fn from_core(via: socket_patch_core::patch::apply::AppliedVia) -> Self {
         use socket_patch_core::patch::apply::AppliedVia as Core;
         match via {
-            Core::Diff => AppliedVia::Diff,
             Core::Blob => AppliedVia::Blob,
         }
     }
@@ -451,15 +564,21 @@ pub enum Status {
     /// there's nothing to apply. Distinct from `Success` because some
     /// consumers want to early-exit on this state.
     NoManifest,
-    /// Reserved: the requested patch requires a paid plan but the caller's
-    /// API token isn't entitled. Nothing emits it yet (`get` reports this
-    /// via its legacy `status: "paid_required"` shape; scan never does).
-    /// Distinct from `Error` so PR bots can post a "upgrade your plan"
-    /// comment instead of failing.
+    /// `get`: the requested patch requires a paid plan but the caller's
+    /// API token isn't entitled. Distinct from `Error` so PR bots can post
+    /// an "upgrade your plan" comment instead of failing.
     PaidRequired,
-    /// `remove` / `rollback`: the patch identifier didn't resolve to
-    /// anything in the local manifest.
+    /// The identifier didn't resolve to a patch (`get`: none published;
+    /// `remove`: nothing in the local manifest).
     NotFound,
+    /// `get`: the identifier matched no installed package.
+    NotInstalled,
+    /// `get`: the search matched no package at all.
+    NoMatch,
+    /// `get`: the project has no packages to search.
+    NoPackages,
+    /// `get`: several patches match and the caller must pick one (exit 1).
+    SelectionRequired,
 }
 
 /// Pre-aggregated counts across all events in this envelope. Field names
@@ -475,14 +594,12 @@ pub struct Summary {
     pub failed: u32,
     pub removed: u32,
     pub verified: u32,
-    /// `repair`-only (vendored artifact rebuilds); omitted while zero so
-    /// every other command's summary shape is unchanged.
-    #[serde(skip_serializing_if = "u32_is_zero")]
     pub rebuilt: u32,
-}
-
-fn u32_is_zero(n: &u32) -> bool {
-    *n == 0
+    pub rolled_back: u32,
+    /// Bytes the run's artifact GC freed (would free, on a dry run) — the
+    /// envelope's `gc.bytesFreed`, 0 when no GC ran. Not derived from
+    /// `events`: GC is reported once, in `gc`.
+    pub bytes_freed: u64,
 }
 
 impl Summary {
@@ -497,6 +614,7 @@ impl Summary {
             PatchAction::Removed => self.removed += 1,
             PatchAction::Verified => self.verified += 1,
             PatchAction::Rebuilt => self.rebuilt += 1,
+            PatchAction::RolledBack => self.rolled_back += 1,
         }
     }
 }
@@ -522,71 +640,42 @@ impl EnvelopeError {
     }
 }
 
-/// The `{code, message}` object every `--json` failure carries as its
-/// top-level `error` — the serialized form of an [`EnvelopeError`].
-pub(crate) fn error_object(err: &EnvelopeError) -> serde_json::Value {
-    serde_json::json!({ "code": err.code, "message": err.message })
+/// The top-level error for a manifest that exists but couldn't be loaded.
+/// One mapping for every command (#931): malformed JSON or a schema
+/// violation (`read_manifest`'s `InvalidData`) is `manifest_invalid`; any
+/// other I/O failure is `manifest_unreadable`.
+pub(crate) fn manifest_load_error(
+    manifest_path: &std::path::Path,
+    err: &std::io::Error,
+) -> EnvelopeError {
+    EnvelopeError::new(
+        manifest_load_error_code(err),
+        crate::ui::manifest_error_message(manifest_path, err),
+    )
 }
 
-/// Mark a legacy (`scan` / `get` / `rollback`) JSON result as a top-level
-/// failure: `status: "error"` plus `error: {code, message}`. Any older
-/// top-level `errorCode` sibling is removed — the code lives in
-/// `error.code` (v5.0). Per-record `errorCode`s inside arrays are untouched.
-pub(crate) fn set_error(value: &mut serde_json::Value, err: EnvelopeError) {
-    // `status` first, so a fresh object reads `{status, error}`.
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("status".into(), serde_json::json!("error"));
+/// The code half of [`manifest_load_error`], for callers that carry a
+/// `&'static str` code (`vex`'s `VexGenError`).
+pub(crate) fn manifest_load_error_code(err: &std::io::Error) -> &'static str {
+    if err.kind() == std::io::ErrorKind::InvalidData {
+        "manifest_invalid"
+    } else {
+        "manifest_unreadable"
     }
-    set_error_keep_status(value, err);
-}
-
-/// [`set_error`] without touching `status`, for results whose status is
-/// itself the routing signal (get's `selection_required`).
-pub(crate) fn set_error_keep_status(value: &mut serde_json::Value, err: EnvelopeError) {
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("errorCode");
-        obj.insert("error".into(), error_object(&err));
-    }
-}
-
-/// The minimal legacy failure shape: `{status: "error", error: {code,
-/// message}}`.
-pub(crate) fn legacy_error(code: &str, message: &str) -> serde_json::Value {
-    let mut v = serde_json::json!({});
-    set_error(&mut v, EnvelopeError::new(code, message));
-    v
-}
-
-/// Print [`legacy_error`] on stdout.
-pub(crate) fn print_legacy_error(code: &str, message: &str) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&legacy_error(code, message)).expect("json serialize")
-    );
-}
-
-/// Whether `command` still prints its legacy (non-[`Envelope`]) JSON shape.
-fn is_legacy_shape(command: Command) -> bool {
-    matches!(command, Command::Scan | Command::Get | Command::Rollback)
 }
 
 /// The JSON a self-enforced usage error prints under `--json`: a full
-/// [`Envelope`] for commands already on it, the legacy error shape for
-/// `scan` / `get` / `rollback`.
+/// [`Envelope`] with `status: "error"`.
 pub(crate) fn usage_error_json(
     command: Command,
     dry_run: bool,
     code: &str,
     message: &str,
 ) -> serde_json::Value {
-    if is_legacy_shape(command) {
-        legacy_error(code, message)
-    } else {
-        let mut env = Envelope::new(command);
-        env.dry_run = dry_run;
-        env.mark_error(EnvelopeError::new(code, message));
-        serde_json::to_value(&env).expect("envelope serialize")
-    }
+    let mut env = Envelope::new(command);
+    env.dry_run = dry_run;
+    env.mark_error(EnvelopeError::new(code, message));
+    env.to_value()
 }
 
 /// Report a usage error a command enforces itself (clap's own parse errors
@@ -623,6 +712,15 @@ pub struct RunWarning {
     pub detail: String,
 }
 
+impl RunWarning {
+    pub fn new(code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests — pin the JSON serialization shape that downstream consumers see.
 // ---------------------------------------------------------------------------
@@ -632,54 +730,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn set_error_writes_object_and_drops_error_code() {
-        let mut v = serde_json::json!({
-            "status": "success",
-            "errorCode": "lock_held",
-            "error": "old",
-            "patches": [{ "errorCode": "apply_failed", "error": "per-record" }],
-        });
-        set_error(&mut v, EnvelopeError::new("lock_held", "held"));
-        assert_eq!(v["status"], "error");
-        assert_eq!(
-            v["error"],
-            serde_json::json!({"code": "lock_held", "message": "held"})
-        );
-        assert!(v.get("errorCode").is_none(), "{v}");
-        // Per-record keys are out of scope and untouched.
-        assert_eq!(v["patches"][0]["errorCode"], "apply_failed");
-        assert_eq!(v["patches"][0]["error"], "per-record");
-    }
-
-    #[test]
-    fn set_error_keep_status_leaves_status() {
-        let mut v = serde_json::json!({ "status": "selection_required" });
-        set_error_keep_status(&mut v, EnvelopeError::new("selection_required", "pick"));
-        assert_eq!(v["status"], "selection_required");
-        assert_eq!(v["error"]["code"], "selection_required");
-        assert_eq!(v["error"]["message"], "pick");
-    }
-
-    #[test]
-    fn legacy_error_has_minimal_shape() {
-        let v = legacy_error("manifest_unreadable", "bad json");
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "status": "error",
-                "error": { "code": "manifest_unreadable", "message": "bad json" },
-            })
-        );
-    }
-
-    #[test]
-    fn usage_error_json_legacy_vs_envelope() {
-        for cmd in [Command::Scan, Command::Get, Command::Rollback] {
-            let v = usage_error_json(cmd, true, "invalid_args", "bad");
-            assert_eq!(v, legacy_error("invalid_args", "bad"), "{cmd:?}");
-        }
+    fn usage_error_json_is_a_full_envelope_for_every_command() {
         for cmd in [
+            Command::Scan,
+            Command::Get,
             Command::Apply,
+            Command::Rollback,
             Command::List,
             Command::Remove,
             Command::Repair,
@@ -813,6 +869,7 @@ mod tests {
             (PatchAction::Failed, "failed"),
             (PatchAction::Removed, "removed"),
             (PatchAction::Verified, "verified"),
+            (PatchAction::Rebuilt, "rebuilt"),
         ] {
             let serialized = serde_json::to_string(&action).unwrap();
             assert_eq!(serialized, format!("\"{tag}\""));
@@ -984,7 +1041,7 @@ mod tests {
                 PatchEventFile {
                     path: "package/index.js".into(),
                     verified: true,
-                    applied_via: Some(AppliedVia::Diff),
+                    applied_via: Some(AppliedVia::Blob),
                 },
                 PatchEventFile {
                     path: "package/lib/util.js".into(),
@@ -998,7 +1055,7 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0]["path"], "package/index.js");
         assert_eq!(files[0]["verified"], true);
-        assert_eq!(files[0]["appliedVia"], "diff");
+        assert_eq!(files[0]["appliedVia"], "blob");
         assert_eq!(files[1]["appliedVia"], "blob");
     }
 
@@ -1193,7 +1250,6 @@ mod tests {
         // codes on these strings.
         for (status, tag) in [
             (Status::NoManifest, "noManifest"),
-            (Status::PaidRequired, "paidRequired"),
             (Status::NotFound, "notFound"),
         ] {
             let mut env = Envelope::new(Command::Remove);
@@ -1288,10 +1344,10 @@ mod tests {
         // ("Exit 1 when status is partialFailure (any events[*].action ==
         // \"failed\")"). `record` enforces that by escalating every
         // non-Error status — including the success-like specials
-        // (`notFound`, `noManifest`, `paidRequired`) — to PartialFailure.
+        // (`notFound`, `noManifest`) — to PartialFailure.
         // Only a hard `Error` outranks it. Pin that so the auto-escalation
         // can't regress to leaving a `failed` event under an exit-0 status.
-        for start in [Status::NotFound, Status::NoManifest, Status::PaidRequired] {
+        for start in [Status::NotFound, Status::NoManifest] {
             let mut env = Envelope::new(Command::Remove);
             env.status = start;
             env.record(
@@ -1304,5 +1360,147 @@ mod tests {
                 "{start:?} + failed event must escalate to partialFailure"
             );
         }
+    }
+
+    /// The ```jsonc block under `heading` in CLI_CONTRACT.md.
+    /// CLI_CONTRACT.md with LF line endings: a Windows checkout may carry
+    /// CRLF, which the `"```jsonc\n"` fence match below would miss.
+    fn contract_doc() -> &'static str {
+        static DOC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        DOC.get_or_init(|| include_str!("../CLI_CONTRACT.md").replace("\r\n", "\n"))
+    }
+
+    fn contract_block(heading: &str) -> &'static str {
+        let doc = contract_doc();
+        let at = doc
+            .find(heading)
+            .unwrap_or_else(|| panic!("{heading} missing"));
+        let body = &doc[at..];
+        let start = body.find("```jsonc\n").expect("jsonc block") + "```jsonc\n".len();
+        let end = start + body[start..].find("```").expect("block end");
+        &body[start..end]
+    }
+
+    /// The `"key":` names at exactly `indent` spaces in `block`.
+    fn keys_at(block: &str, indent: usize) -> std::collections::BTreeSet<String> {
+        block
+            .lines()
+            .filter(|l| l.len() > indent && l[..indent].trim().is_empty())
+            .filter_map(|l| l[indent..].strip_prefix('"'))
+            .filter_map(|l| l.split_once('"').map(|(k, _)| k.to_string()))
+            .collect()
+    }
+
+    fn object_keys(value: serde_json::Value) -> std::collections::BTreeSet<String> {
+        value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// The contract's envelope schema names exactly the `summary`, `gc` and
+    /// top-level keys the envelope serializes — a documented counter no
+    /// command emits (as `bytesDownloaded` was) fails here (#1257).
+    #[test]
+    fn contract_envelope_block_matches_serialized_keys() {
+        let block = contract_block("### Envelope shape");
+        let section = |name: &str| {
+            let from = block.find(&format!("\"{name}\":")).expect(name);
+            let rest = &block[from..];
+            &rest[..rest.find("\n  }").expect("section end")]
+        };
+        let mut env = Envelope::new(Command::Repair);
+        env.summary.rebuilt = 1;
+        env.set_gc(GcReport::default());
+        env.mark_error(EnvelopeError::new("x", "y"));
+        let value = serde_json::to_value(&env).unwrap();
+        assert_eq!(
+            keys_at(section("summary"), 4),
+            object_keys(value["summary"].clone())
+        );
+        assert_eq!(keys_at(section("gc"), 4), object_keys(value["gc"].clone()));
+        let top: std::collections::BTreeSet<String> = object_keys(value)
+            .into_iter()
+            // Additive keys documented in their own sections.
+            .filter(|k| !matches!(k.as_str(), "sidecars" | "warnings" | "vex"))
+            .collect();
+        assert_eq!(keys_at(block, 2), top);
+    }
+
+    /// Every `PatchEvent` key the contract documents is serialized, and
+    /// every serialized key is documented; every action has a row.
+    #[test]
+    fn contract_patch_event_block_matches_serialized_keys() {
+        let block = contract_block("### `PatchEvent` shape");
+        let event = PatchEvent::new(PatchAction::Updated, "pkg:npm/a@1.0.0")
+            .with_uuid("u")
+            .with_old_uuid("o")
+            .with_files(vec![PatchEventFile {
+                path: "package/index.js".into(),
+                verified: true,
+                applied_via: Some(AppliedVia::Blob),
+            }])
+            .with_bytes(1)
+            .with_reason("c", "r")
+            .with_error("c", "e")
+            .with_details(serde_json::json!({}));
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(keys_at(block, 2), object_keys(value.clone()));
+        assert_eq!(
+            keys_at(block, 6),
+            object_keys(value["files"][0].clone()),
+            "files[] keys"
+        );
+        let doc = contract_doc();
+        for action in [
+            PatchAction::Discovered,
+            PatchAction::Downloaded,
+            PatchAction::Applied,
+            PatchAction::Updated,
+            PatchAction::Skipped,
+            PatchAction::Failed,
+            PatchAction::Removed,
+            PatchAction::Verified,
+            PatchAction::Rebuilt,
+        ] {
+            let tag = serde_json::to_value(action).unwrap();
+            let tag = tag.as_str().unwrap();
+            assert!(
+                block.contains(&format!("\"{tag}\"")),
+                "{tag} in the action enum"
+            );
+            assert!(
+                doc.contains(&format!("| `{tag}`")),
+                "{tag} has a vocabulary row"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_report_folds_passes_and_serializes_shared_keys() {
+        let pass = |removed, bytes| CleanupResult {
+            blobs_removed: removed,
+            bytes_freed: bytes,
+            ..CleanupResult::default()
+        };
+        let (blobs, packages) = (pass(3, 30), pass(1, 4));
+        let report = GcReport::from_passes(Some(&blobs), None, Some(&packages));
+        assert_eq!(report.total_removed(), 4);
+        assert_eq!(
+            report.to_value(),
+            serde_json::json!({
+                "removedBlobs": 3,
+                "removedDiffArchives": 0,
+                "removedPackageArchives": 1,
+                "bytesFreed": 34,
+            })
+        );
+        let mut env = Envelope::new(Command::Remove);
+        assert!(serde_json::to_value(&env).unwrap().get("gc").is_none());
+        assert_eq!(
+            serde_json::to_value(&env).unwrap()["summary"]["bytesFreed"],
+            0
+        );
+        env.set_gc(report);
+        let value = serde_json::to_value(&env).unwrap();
+        assert_eq!(value["gc"], report.to_value());
+        assert_eq!(value["summary"]["bytesFreed"], 34);
     }
 }

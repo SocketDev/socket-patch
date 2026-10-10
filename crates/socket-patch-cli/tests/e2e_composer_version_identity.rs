@@ -278,8 +278,8 @@ async fn vendor_wires_and_attests_a_padded_composer_patch() {
         &["scan", "--mode", "vendored", "--vendor-source", "service"],
     );
     assert_eq!(code, 0, "scan --mode vendored must succeed: {env:#}");
-    assert_eq!(env["vendor"]["summary"]["applied"], 1, "{env:#}");
-    assert_eq!(env["vendor"]["summary"]["failed"], 0, "{env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
+    assert_eq!(env["summary"]["failed"], 0, "{env:#}");
 
     let copy_rel = format!(".socket/vendor/composer/{UUID}/psr/log@3.0.2.0");
     assert_eq!(
@@ -360,8 +360,8 @@ async fn hosted_redirect_repoints_a_padded_composer_patch() {
 
     let (code, env) = run_json(tmp.path(), &server.uri(), &["scan", "--mode", "hosted"]);
     assert_eq!(code, 0, "scan --mode hosted must succeed: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
-    let codes: Vec<&str> = env["redirect"]["warnings"]
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
+    let codes: Vec<&str> = env["warnings"]
         .as_array()
         .map(|w| w.iter().filter_map(|w| w["code"].as_str()).collect())
         .unwrap_or_default();

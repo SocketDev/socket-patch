@@ -1,8 +1,8 @@
 //! #704: every `--json` failure carries its top-level `error` as a
 //! `{code, message}` object, with no top-level `errorCode`, on every
 //! command. Self-enforced usage errors (exit 2) print that coded error on
-//! stdout: a full envelope for the envelope commands, `{status, error}` for
-//! `scan`, `get` and `rollback`. None of these cases reaches the network.
+//! stdout as a full envelope on every command (v5.0: `scan`, `get` and
+//! `rollback` included). None of these cases reaches the network.
 
 use std::path::Path;
 
@@ -52,19 +52,15 @@ fn assert_error_object(stdout: &str, code: &str) -> serde_json::Value {
     v
 }
 
-/// A legacy-shape usage error is exactly `{status, error}`.
-fn assert_legacy_usage(args: &[&str], env: &[(&str, &str)], code: &str) {
-    let tmp = tempfile::tempdir().unwrap();
-    let (exit, stdout, stderr) = run(tmp.path(), args, env);
-    assert_eq!(exit, 2, "{args:?}: stdout={stdout} stderr={stderr}");
-    let v = assert_error_object(&stdout, code);
-    assert_eq!(v.as_object().unwrap().len(), 2, "{args:?}: {v}");
-}
-
 /// An envelope-command usage error is a full envelope.
 fn assert_envelope_usage(args: &[&str], command: &str, code: &str) {
+    assert_envelope_usage_env(args, &[], command, code);
+}
+
+/// [`assert_envelope_usage`] with extra environment.
+fn assert_envelope_usage_env(args: &[&str], env: &[(&str, &str)], command: &str, code: &str) {
     let tmp = tempfile::tempdir().unwrap();
-    let (exit, stdout, stderr) = run(tmp.path(), args, &[]);
+    let (exit, stdout, stderr) = run(tmp.path(), args, env);
     assert_eq!(exit, 2, "{args:?}: stdout={stdout} stderr={stderr}");
     let v = assert_error_object(&stdout, code);
     assert_eq!(v["command"], command, "{v}");
@@ -73,65 +69,71 @@ fn assert_envelope_usage(args: &[&str], command: &str, code: &str) {
 
 #[test]
 fn scan_usage_errors_print_the_coded_error() {
-    assert_legacy_usage(
+    assert_envelope_usage(
         &["scan", "--mode", "hosted", "--global", "--json"],
-        &[],
+        "scan",
         "global_scope_unsupported",
     );
-    assert_legacy_usage(
+    assert_envelope_usage(
         &["scan", "--mode", "hosted", "missing-dir", "--json"],
-        &[],
+        "scan",
         "path_not_directory",
     );
-    assert_legacy_usage(
+    assert_envelope_usage(
         &["scan", "--mode", "hosted", "nothing-*", "--json"],
-        &[],
+        "scan",
         "path_glob_no_match",
     );
-    assert_legacy_usage(
+    assert_envelope_usage(
         &["scan", "--mode", "agent", "x[", "--json"],
-        &[],
+        "scan",
         "path_glob_invalid",
     );
-    assert_legacy_usage(
+    assert_envelope_usage_env(
         &["scan", "--mode", "agent", "--json"],
         &[("SOCKET_MAX_NEW_PATCHES", "lots")],
+        "scan",
         "invalid_env",
     );
-    assert_legacy_usage(
+    assert_envelope_usage_env(
         &["scan", "--mode", "agent", "--json"],
         &[("SOCKET_MIN_SEVERITY", "extreme")],
+        "scan",
         "invalid_env",
     );
 }
 
 #[test]
 fn get_usage_errors_print_the_coded_error() {
-    assert_legacy_usage(
+    assert_envelope_usage(
         &["get", "lodash", "--id", "--cve", "--json"],
-        &[],
+        "get",
         "invalid_args",
     );
-    assert_legacy_usage(
+    assert_envelope_usage(
         &["get", "lodash", "--id", "--json"],
-        &[],
+        "get",
         "identifier_invalid",
     );
-    assert_legacy_usage(
+    assert_envelope_usage(
         &["get", "lodash", "--save-only", "--mode", "hosted", "--json"],
-        &[],
+        "get",
         "invalid_args",
     );
-    assert_legacy_usage(
+    assert_envelope_usage(
         &["get", "lodash", "--mode", "hosted", "--global", "--json"],
-        &[],
+        "get",
         "global_scope_unsupported",
     );
 }
 
 #[test]
 fn rollback_usage_error_prints_the_coded_error() {
-    assert_legacy_usage(&["rollback", "x[", "--json"], &[], "path_glob_invalid");
+    assert_envelope_usage(
+        &["rollback", "x[", "--json"],
+        "rollback",
+        "path_glob_invalid",
+    );
     // JSON carries the verbatim message; only stderr is capitalized.
     let tmp = tempfile::tempdir().unwrap();
     let (_, stdout, _) = run(tmp.path(), &["rollback", "x[", "--json"], &[]);
@@ -196,11 +198,13 @@ fn offline_refusals_carry_a_code() {
     );
     assert_eq!(exit, 1);
     let v = assert_error_object(&stdout, "offline_unsupported");
-    assert_eq!(v["scannedPackages"], 0, "{v}");
+    assert_eq!(v["command"], "scan", "{v}");
+    assert_eq!(v["events"], serde_json::json!([]), "{v}");
 
     let (exit, stdout, _) = run(tmp.path(), &["get", "lodash", "--offline", "--json"], &[]);
     assert_eq!(exit, 1);
-    assert_error_object(&stdout, "offline_unsupported");
+    let v = assert_error_object(&stdout, "offline_unsupported");
+    assert_eq!(v["command"], "get", "{v}");
 }
 
 #[test]
@@ -209,6 +213,8 @@ fn rollback_on_an_empty_project_is_manifest_not_found() {
     let (exit, stdout, _) = run(tmp.path(), &["rollback", "--json"], &[]);
     assert_eq!(exit, 1, "{stdout}");
     let v = assert_error_object(&stdout, "manifest_not_found");
+    assert_eq!(v["command"], "rollback", "{v}");
+    assert_eq!(v["events"], serde_json::json!([]), "{v}");
     assert_eq!(v["error"]["message"], "Manifest not found", "{v}");
     assert!(v["path"].is_string(), "{v}");
 }
@@ -226,5 +232,7 @@ fn rollback_unknown_identifier_is_patch_not_found() {
     );
     assert_eq!(exit, 1, "{stdout}");
     let v = assert_error_object(&stdout, "patch_not_found");
-    assert_eq!(v["results"], serde_json::json!([]), "{v}");
+    assert_eq!(v["command"], "rollback", "{v}");
+    assert_eq!(v["events"], serde_json::json!([]), "{v}");
+    assert_eq!(v["summary"]["failed"], 0, "{v}");
 }

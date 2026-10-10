@@ -8,17 +8,18 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::formats::pipenv::{reserialized_around_reference, splice_entry};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
-use crate::vendor::lock_inventory::pypi::hosted_pypi_reference;
+use crate::vendor::lock_inventory::pypi::{hosted_pypi_reference, parse_pipfile_lock};
 
-use super::common::{ensure_unchanged, refuse_symlinked, serialize_json};
+use super::common::{ensure_unchanged, refuse_symlinked};
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::state::{PipenvMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
 /// The only file this backend ever writes (and the revert allowlist).
-const LOCK_FILE: &str = "Pipfile.lock";
+pub(super) const LOCK_FILE: &str = "Pipfile.lock";
 
 /// The `WiringRecord.kind` discriminator this backend owns.
 const KIND_LOCK_ENTRY: &str = "pipenv_lock_entry";
@@ -39,17 +40,14 @@ const NON_REGISTRY_KEYS: [&str; 6] = ["path", "git", "hg", "svn", "bzr", "editab
 /// A loaded-and-guard-checked pipenv project.
 #[derive(Debug)]
 pub(super) struct PipenvProject {
-    /// Parsed lock (the edit substrate — re-serialized canonically).
+    /// Parsed lock: what the guards and the wire step decide on. The write
+    /// splices only the changed entries into `lock_text`.
     /// Shared: the wire step takes its own copy before mutating.
     pub lock: Arc<Value>,
     /// Verbatim lock text the parse came from: the wire step re-reads the
     /// file and refuses when it no longer matches (a `pipenv lock` landed
     /// during the wheel build).
     pub lock_text: String,
-    /// The lock's line ending (`\r\n` when the checkout carries CRLF — git
-    /// autocrlf; Pipenv itself preserves it), reapplied on every write so the
-    /// wired lock and the reverted lock stay byte-comparable to the original.
-    pub crlf: bool,
     /// Non-fatal advisories raised during load. ALWAYS contains the
     /// `vendor_integrity_unverified` warning (Pipenv does not consistently
     /// enforce file-ref hashes: 2018–2022 verify the `hashes` list, 2023+ do
@@ -60,8 +58,7 @@ pub(super) struct PipenvProject {
 /// The run's Pipfile.lock parse. `load_pipenv_project` runs once per patched
 /// package and would re-parse the whole lock each time; an idempotent re-run
 /// parses bytes nothing has changed. Not re-seeded after a write: the wire
-/// step re-serializes with the lock's own line endings restored, so the
-/// document in hand is not the one those bytes parse to — the next package
+/// step holds the edited document only as spliced text, so the next package
 /// pays one parse. See [`ParseMemo`].
 static LOCK_MEMO: ParseMemo<Value> = ParseMemo::new();
 
@@ -100,9 +97,7 @@ pub(super) async fn load_pipenv_project(
         }
     };
     let lock = LOCK_MEMO
-        .parse(lock_text.as_bytes(), || {
-            serde_json::from_str::<Value>(&lock_text)
-        })
+        .parse(lock_text.as_bytes(), || parse_pipfile_lock(&lock_text))
         .map_err(|e| {
             (
                 "pypi_pipenv_lock_parse_failed",
@@ -150,7 +145,6 @@ pub(super) async fn load_pipenv_project(
     )];
     Ok(PipenvProject {
         lock,
-        crlf: lock_text.contains("\r\n"),
         lock_text,
         warnings,
     })
@@ -417,6 +411,7 @@ pub(super) async fn wire_pipenv_superseding(
     }
 
     let mut lock = (*p.lock).clone();
+    let mut new_text = p.lock_text.clone();
     let mut wiring: Vec<WiringRecord> = Vec::new();
     let mut sections: Vec<String> = Vec::new();
     for section in category_names(&lock) {
@@ -480,6 +475,7 @@ pub(super) async fn wire_pipenv_superseding(
                 Some(uuid) => superseded_record(superseded, &uuid, &section, &key)
                     .and_then(|rec| rec.original.clone()),
             };
+            new_text = splice_sorted(&new_text, &section, &key, Some(&new_value))?;
             map.insert(key.clone(), new_value.clone());
             wiring.push(WiringRecord {
                 file: LOCK_FILE.to_string(),
@@ -495,7 +491,6 @@ pub(super) async fn wire_pipenv_superseding(
         }
     }
 
-    let new_text = with_line_ending(to_canonical_json(&lock), p.crlf);
     // The edit was computed from the pre-flight snapshot; a `pipenv lock` /
     // editor save that landed during the wheel build must not be clobbered.
     ensure_unchanged(root, LOCK_FILE, &p.lock_text, "pypi_pipenv_changed").await?;
@@ -538,7 +533,7 @@ pub(super) async fn revert_pipenv(
         Err(e) => return RevertOutcome::failed(format!("cannot read {LOCK_FILE}: {e}")),
     };
     // Fail-closed: editing a lock we cannot parse risks destroying it.
-    let mut lock: Value = match serde_json::from_str(&lock_text) {
+    let mut lock: Value = match parse_pipfile_lock(&lock_text) {
         Ok(v) => v,
         Err(e) => {
             return RevertOutcome::failed(format!(
@@ -547,6 +542,7 @@ pub(super) async fn revert_pipenv(
         }
     };
     let mut warnings: Vec<VendorWarning> = Vec::new();
+    let mut new_text = lock_text.clone();
     let mut changed = false;
 
     for rec in entry.wiring.iter().rev() {
@@ -604,7 +600,7 @@ pub(super) async fn revert_pipenv(
         let relocked_away = |lock: &Value| {
             if rec.action == WiringAction::Rewritten
                 && rec.original.is_some()
-                && !to_canonical_json(lock).contains(&entry.uuid)
+                && !lock.to_string().contains(&entry.uuid)
             {
                 VendorWarning::new(
                     "vendor_lock_entry_relocked",
@@ -646,7 +642,7 @@ pub(super) async fn revert_pipenv(
         // untouched entry.
         let same_reference = rec.action == WiringAction::Rewritten
             && rec.original.is_some()
-            && crate::patch::redirect::pipenv_reserialized_around_reference(live, new_value);
+            && reserialized_around_reference(live, new_value);
         if live != new_value && !same_reference {
             // RELOCKED (not drift): `pipenv lock` / `update` regenerated the
             // entry to registry shape with a different hash list or key set
@@ -677,6 +673,10 @@ pub(super) async fn revert_pipenv(
         }
         match (rec.action, rec.original.as_ref()) {
             (WiringAction::Rewritten, Some(orig)) => {
+                new_text = match splice_sorted(&new_text, section, name, Some(orig)) {
+                    Ok(text) => text,
+                    Err((_, detail)) => return RevertOutcome::failed(detail),
+                };
                 map.insert(name.to_string(), orig.clone());
                 changed = true;
             }
@@ -685,16 +685,19 @@ pub(super) async fn revert_pipenv(
             // registry fragment to restore.
             (WiringAction::Rewritten, None) => warnings.push(drifted()),
             (WiringAction::Added, _) => {
+                new_text = match splice_sorted(&new_text, section, name, None) {
+                    Ok(text) => text,
+                    Err((_, detail)) => return RevertOutcome::failed(detail),
+                };
                 map.remove(name);
                 changed = true;
             }
         }
     }
 
-    // Only re-serialize when something was restored: a no-op revert must not
-    // churn a lock whose formatting we did not produce.
+    // Only write when something was restored: a no-op revert leaves the
+    // lock's bytes alone.
     if changed && !dry_run {
-        let new_text = with_line_ending(to_canonical_json(&lock), lock_text.contains("\r\n"));
         LOCK_MEMO.invalidate();
         if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, new_text.as_bytes()).await {
             return RevertOutcome {
@@ -821,44 +824,41 @@ pub fn stale_install_remedy(lock: Option<&Value>, name: &str) -> String {
     )
 }
 
-/// Pipenv preserves a lock's CRLF line endings; so do we, on both writes.
-fn with_line_ending(text: String, crlf: bool) -> String {
-    if crlf {
-        text.replace('\n', "\r\n")
-    } else {
-        text
-    }
-}
-
-/// pipenv's exact serialization (spike-verified): 4-space indent, ALL keys
-/// sorted at every nesting level, default separators, one trailing newline —
-/// byte-identical to `json.dumps(obj, indent=4, sort_keys=True) + "\n"` for
-/// the ASCII content pipenv locks carry.
-fn to_canonical_json(value: &Value) -> String {
-    fn sorted(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                let mut out = Map::new();
-                for k in keys {
-                    out.insert(k.clone(), sorted(&map[k]));
-                }
-                Value::Object(out)
-            }
-            Value::Array(arr) => Value::Array(arr.iter().map(sorted).collect()),
-            other => other.clone(),
-        }
-    }
-    let bytes = serialize_json(&sorted(value), "    ")
-        .expect("serializing a serde_json::Value cannot fail");
-    String::from_utf8(bytes).expect("serde_json emits UTF-8")
+/// Splice one entry into the lock text in Pipenv's layout: every object
+/// key-sorted, as `json.dumps(sort_keys=True)` writes it (see
+/// [`splice_entry`]). `None` removes the entry.
+fn splice_sorted(
+    text: &str,
+    section: &str,
+    name: &str,
+    value: Option<&Value>,
+) -> Result<String, (&'static str, String)> {
+    let sorted = value.map(|value| {
+        let mut value = value.clone();
+        value.sort_all_objects();
+        value
+    });
+    splice_entry(text, section, name, sorted.as_ref()).map_err(|e| {
+        (
+            "pypi_pipenv_write_failed",
+            format!("cannot edit {LOCK_FILE}: {e}"),
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::pipenv::format_entry;
     use crate::vendor::state::VendorArtifact;
+
+    /// A whole lock as Pipenv writes it, `json.dumps(indent=4,
+    /// sort_keys=True) + "\n"`, through the same renderer the splices use.
+    fn pipenv_dumps(value: &Value) -> String {
+        let mut value = value.clone();
+        value.sort_all_objects();
+        format_entry(&value, "{", 0).unwrap() + "\n"
+    }
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
     const REL_WHEEL: &str =
@@ -1039,28 +1039,22 @@ mod tests {
 
     fn entry_for(wiring: Vec<WiringRecord>, meta: PipenvMeta) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: REL_WHEEL.into(),
-                sha256: WHEEL_SHA.into(),
-                size: Some(11053),
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("pipenv".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
             pipenv: Some(meta),
+            ..VendorEntry::new(
+                "pypi".into(),
+                "pkg:pypi/six@1.16.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: REL_WHEEL.into(),
+                    sha256: WHEEL_SHA.into(),
+                    size: Some(11053),
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
         }
     }
 
@@ -1123,12 +1117,12 @@ mod tests {
         let mut before: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
         let six_registry = before["default"]["six"].clone();
         before["develop"]["six"] = six_registry;
-        let before_text = to_canonical_json(&before);
+        let before_text = pipenv_dumps(&before);
 
         let mut after: Value = serde_json::from_str(LOCK_DIRECT_VENDORED).unwrap();
         let six_vendored = after["default"]["six"].clone();
         after["develop"]["six"] = six_vendored;
-        let after_text = to_canonical_json(&after);
+        let after_text = pipenv_dumps(&after);
 
         let tmp = write_lock(&before_text).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
@@ -1176,7 +1170,7 @@ mod tests {
     /// `json.dumps(indent=4, sort_keys=True) + "\n"` byte-for-byte, so a
     /// parse → serialize round trip of a pipenv-written lock is the identity.
     #[test]
-    fn canonical_serializer_is_byte_stable_against_pipenv_output() {
+    fn entry_renderer_is_byte_stable_against_pipenv_output() {
         for fixture in [
             LOCK_DIRECT_REGISTRY,
             LOCK_DIRECT_VENDORED,
@@ -1184,12 +1178,12 @@ mod tests {
             LOCK_TRANSITIVE_VENDORED,
         ] {
             let value: Value = serde_json::from_str(fixture).unwrap();
-            assert_eq!(to_canonical_json(&value), fixture);
+            assert_eq!(pipenv_dumps(&value), fixture);
         }
         // And it actively sorts keys at every level (pipenv's sort_keys).
         let scrambled: Value = serde_json::from_str(r#"{"b": {"z": 1, "a": 2}, "a": []}"#).unwrap();
         assert_eq!(
-            to_canonical_json(&scrambled),
+            pipenv_dumps(&scrambled),
             "{\n    \"a\": [],\n    \"b\": {\n        \"a\": 2,\n        \"z\": 1\n    }\n}\n"
         );
     }
@@ -1345,6 +1339,48 @@ mod tests {
             assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
             assert_eq!(read_lock(tmp.path()).await, before, "byte-identical revert");
         }
+    }
+
+    /// #1128: Pipenv writes non-ASCII as `\uXXXX`. Vendoring rewrites only
+    /// the target entry, so an unrelated escaped entry keeps its bytes, and
+    /// wire + revert is byte-identical.
+    #[tokio::test]
+    async fn non_ascii_lock_wires_only_the_target_and_reverts_byte_identically() {
+        let develop = r#""develop": {
+        "mylib": {
+            "editable": true,
+            "path": "./libs/caf\u00e9"
+        }
+    }"#;
+        let before = LOCK_DIRECT_REGISTRY.replace(r#""develop": {}"#, develop);
+        let wired = LOCK_DIRECT_VENDORED.replace(r#""develop": {}"#, develop);
+        assert_ne!(before, LOCK_DIRECT_REGISTRY);
+        let tmp = write_lock(&before).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        assert_eq!(read_lock(tmp.path()).await, wired, "only six is rewritten");
+
+        let outcome = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(read_lock(tmp.path()).await, before, "byte-identical revert");
+    }
+
+    /// #1128: a BOM-prefixed lock vendors and reverts with the BOM kept,
+    /// as hosted mode rewrites it.
+    #[tokio::test]
+    async fn bom_prefixed_lock_wires_and_reverts_with_the_bom_kept() {
+        let before = format!("\u{feff}{LOCK_DIRECT_REGISTRY}");
+        let tmp = write_lock(&before).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            format!("\u{feff}{LOCK_DIRECT_VENDORED}")
+        );
+
+        let outcome = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(read_lock(tmp.path()).await, before, "byte-identical revert");
     }
 
     #[tokio::test]
@@ -1586,7 +1622,7 @@ mod tests {
         let drifted = {
             let mut live: Value = serde_json::from_str(&read_lock(tmp.path()).await).unwrap();
             live["default"]["six"]["markers"] = serde_json::json!("python_version >= '3.99'");
-            to_canonical_json(&live)
+            pipenv_dumps(&live)
         };
         tokio::fs::write(tmp.path().join("Pipfile.lock"), &drifted)
             .await
@@ -1618,7 +1654,7 @@ mod tests {
     async fn guard_refuses_non_object_lock_entry() {
         let mut lock: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
         lock["default"]["six"] = serde_json::json!("1.16.0");
-        let tmp = write_lock(&to_canonical_json(&lock)).await;
+        let tmp = write_lock(&pipenv_dumps(&lock)).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
 
         let err = check_target_guards(&p, "six", UUID, "1.16.0", &[]).unwrap_err();
@@ -1667,7 +1703,7 @@ mod tests {
     async fn wire_handles_lock_without_develop_section() {
         let mut before: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
         before.as_object_mut().unwrap().remove("develop");
-        let before_text = to_canonical_json(&before);
+        let before_text = pipenv_dumps(&before);
         let tmp = write_lock(&before_text).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
         assert_eq!(
@@ -1681,7 +1717,7 @@ mod tests {
         after.as_object_mut().unwrap().remove("develop");
         assert_eq!(
             read_lock(tmp.path()).await,
-            to_canonical_json(&after),
+            pipenv_dumps(&after),
             "default wired to the fixture shape; no develop key invented"
         );
         assert_eq!(wiring.len(), 1);
@@ -1699,7 +1735,7 @@ mod tests {
         let six_registry = registry["default"]["six"].clone();
         let mut before: Value = serde_json::from_str(LOCK_DIRECT_VENDORED).unwrap();
         before["develop"]["six"] = six_registry.clone();
-        let before_text = to_canonical_json(&before);
+        let before_text = pipenv_dumps(&before);
 
         let tmp = write_lock(&before_text).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
@@ -1729,7 +1765,7 @@ mod tests {
         after["develop"]["six"] = six_vendored;
         assert_eq!(
             read_lock(tmp.path()).await,
-            to_canonical_json(&after),
+            pipenv_dumps(&after),
             "develop wired; default bytes unchanged"
         );
     }
@@ -1816,7 +1852,7 @@ mod tests {
         use serde_json::json;
         let mut no_develop: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
         no_develop.as_object_mut().unwrap().remove("develop");
-        let no_develop_text = to_canonical_json(&no_develop);
+        let no_develop_text = pipenv_dumps(&no_develop);
         let vendored_six =
             serde_json::from_str::<Value>(LOCK_DIRECT_VENDORED).unwrap()["default"]["six"].clone();
 
@@ -1917,7 +1953,7 @@ mod tests {
         // mentions the vendored wheel.
         let mut relocked: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
         relocked["default"].as_object_mut().unwrap().remove("six");
-        let relocked_text = to_canonical_json(&relocked);
+        let relocked_text = pipenv_dumps(&relocked);
         let tmp = write_lock(&relocked_text).await;
         let outcome =
             revert_pipenv(&entry_for(vec![record.clone()], meta()), tmp.path(), false).await;
@@ -1935,7 +1971,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("six".into(), vendored_six);
-        let moved_text = to_canonical_json(&moved);
+        let moved_text = pipenv_dumps(&moved);
         let tmp = write_lock(&moved_text).await;
         let outcome = revert_pipenv(&entry_for(vec![record], meta()), tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
@@ -1980,7 +2016,7 @@ mod tests {
         expected["default"].as_object_mut().unwrap().remove("six");
         assert_eq!(
             read_lock(tmp.path()).await,
-            to_canonical_json(&expected),
+            pipenv_dumps(&expected),
             "only default.six removed"
         );
 
@@ -2057,7 +2093,7 @@ mod tests {
         dependency["extras"] = serde_json::json!(["test"]);
         lock["default"] = serde_json::json!({});
         lock["tests"] = serde_json::json!({"Six":dependency});
-        let before = to_canonical_json(&lock);
+        let before = pipenv_dumps(&lock);
         let tmp = write_lock(&before).await;
         let project = load_pipenv_project(tmp.path()).await.unwrap();
         assert!(check_target_guards(&project, "six", UUID, "1.17.0", &[]).is_err());

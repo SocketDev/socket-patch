@@ -8,7 +8,7 @@ use crate::formats::yarn::blocks::{
     berry_field, classic_field, live_blocks, scan_blocks, LockBlock,
 };
 use crate::formats::yarn::patterns::{
-    parse_berry_locator, pattern_real_name, split_berry_key_patterns, split_key_patterns,
+    classic_pattern_real_name, parse_berry_locator, split_berry_key_patterns, split_key_patterns,
     split_pattern, split_resolved_sha1, BerryLocator,
 };
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
@@ -87,6 +87,58 @@ pub(crate) fn berry_entries(text: &str) -> BerryLock {
     BerryLock { cache_key, entries }
 }
 
+/// Whether a root `package.json` `resolutions` selector routing to the
+/// hosted `url` is leftover wiring the berry `lock` no longer installs
+/// (#1203): no live entry resolves `url` (as its tarball locator or an
+/// older pin's `__archiveUrl=` binding), and no live entry is keyed by a
+/// descriptor the selector matches (`name@range` matches that exact
+/// descriptor, a range-less selector any descriptor of the package). `yarn
+/// remove` and `yarn up` leave such a selector behind: yarn never edits
+/// `resolutions`, and a selector matching no descriptor is inert. A
+/// selector that DOES match a descriptor the lock resolves elsewhere is not
+/// leftover: the lock and the manifest disagree.
+pub(crate) fn berry_selector_routes_nothing(lock: &BerryLock, selector: &str, url: &str) -> bool {
+    use crate::formats::yarn::patterns::resolution_selector_target;
+    let Some(target) = resolution_selector_target(selector) else {
+        return false;
+    };
+    let selector = selector.trim();
+    let last = selector
+        .rfind(target)
+        .map(|i| &selector[i..])
+        .unwrap_or(target);
+    let range = split_pattern(last).map(|(_, range)| range);
+    for entry in lock.entries.iter().filter(|e| e.live) {
+        if let Some(locator) = entry.locator() {
+            if locator.reference == url
+                || locator.archive_url().is_some_and(|archive| {
+                    archive == url
+                        || crate::utils::purl::percent_decode_purl_component(archive) == url
+                })
+            {
+                return false;
+            }
+        }
+        for pattern in &entry.patterns {
+            let Some((name, descriptor)) = split_pattern(pattern) else {
+                continue;
+            };
+            if name != target {
+                continue;
+            }
+            match range {
+                None => return false,
+                Some(want) => {
+                    if descriptor == want || descriptor.strip_prefix("npm:") == Some(want) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 /// A berry `checksum:` value as the pin yarn enforces: `<cacheKey>/<hex>`,
 /// or — yarn 4.0.x's spelling under cacheKey `10c0` (4.1+ prefixes the
 /// cache key) — bare 128-hex promoted to `10c0/<hex>`. `None` for anything
@@ -129,7 +181,7 @@ fn classic_registry_view(text: &str) -> Vec<LockfileEntry> {
         if yarn_classic_lock::block_points_into_vendor(&block.lines) {
             continue;
         }
-        let Some(name) = patterns.first().and_then(|p| pattern_real_name(p)) else {
+        let Some(name) = patterns.first().and_then(|p| classic_pattern_real_name(p)) else {
             continue;
         };
         let Some(version) = classic_field(&block.lines, "version") else {

@@ -29,6 +29,98 @@ pub fn crawl_covers_purl(purl: &str) -> bool {
     Ecosystem::from_purl(purl).is_some()
 }
 
+/// Of `purls` (manifest keys), the Cargo ones whose agent-mode in-place
+/// patch may still be on disk: a copy [`find_cargo_copies`] locates
+/// (`shadowed_registry`: see there) with at least one file at its record's afterHash, or one that cannot be read to
+/// tell (an I/O error, an unsafe key: kept fail-closed). Sorted.
+///
+/// Cargo is the one ecosystem whose patched copy outlives the project's
+/// use of it: the registry cache is shared machine-wide and nothing
+/// deletes a crate from it when a project vendors the crate (#336) or
+/// stops locking it (#1278). Its manifest record holds the only
+/// before-blobs that can restore that copy, so callers about to drop the
+/// record must first restore the copy (`rollback`) or keep the record
+/// (`scan --prune`). A vendored crate's committed copy under
+/// `.socket/vendor/` is never one of these locations.
+pub async fn cargo_copies_still_patched<'a>(
+    manifest: &socket_patch_core::manifest::schema::PatchManifest,
+    purls: impl IntoIterator<Item = &'a String>,
+    options: &CrawlerOptions,
+    blobs_path: &std::path::Path,
+    shadowed_registry: bool,
+) -> Vec<String> {
+    use socket_patch_core::patch::rollback::{verify_file_rollback, VerifyRollbackStatus};
+    let cargo: Vec<String> = purls
+        .into_iter()
+        .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
+        .filter(|p| manifest.patches.contains_key(p.as_str()))
+        .cloned()
+        .collect();
+    if cargo.is_empty() {
+        return Vec::new();
+    }
+    let found = find_cargo_copies(cargo, options, shadowed_registry).await;
+    let mut patched = Vec::new();
+    for (purl, paths) in &found {
+        let Some(record) = manifest.patches.get(purl) else {
+            continue;
+        };
+        'copies: for path in paths {
+            for (file, info) in &record.files {
+                let v = verify_file_rollback(path, file, info, blobs_path).await;
+                let still = match v.status {
+                    VerifyRollbackStatus::Ready | VerifyRollbackStatus::MissingBlob => true,
+                    VerifyRollbackStatus::NotFound => !v.is_absent(),
+                    VerifyRollbackStatus::AlreadyOriginal | VerifyRollbackStatus::HashMismatch => {
+                        false
+                    }
+                };
+                if still {
+                    patched.push(purl.clone());
+                    break 'copies;
+                }
+            }
+        }
+    }
+    patched.sort();
+    patched
+}
+
+/// The copies of the Cargo `purls` [`find_all_packages_for_rollback`]
+/// locates (the roots rollback restores), plus, with `shadowed_registry`,
+/// the shared `$CARGO_HOME/registry/src` copies of a local Cargo project
+/// with a `cargo vendor` dir, whose crawl searches only that dir — where
+/// an apply from before `cargo vendor` may have left the patch. The prune
+/// only reads them (its keep decision); rollback restores them only for a
+/// vendored crate whose record it is about to drop (#336).
+pub async fn find_cargo_copies(
+    purls: Vec<String>,
+    options: &CrawlerOptions,
+    shadowed_registry: bool,
+) -> HashMap<String, Vec<PathBuf>> {
+    let partitioned = HashMap::from([(Ecosystem::Cargo, purls)]);
+    let mut found = find_all_packages_for_rollback(&partitioned, options, true).await;
+    let local = !options.global && options.global_prefix.is_none();
+    let cargo_project =
+        options.cwd.join("Cargo.toml").is_file() || options.cwd.join("Cargo.lock").is_file();
+    if shadowed_registry && local && cargo_project && options.cwd.join("vendor").is_dir() {
+        let registry = CrawlerOptions {
+            cwd: options.cwd.clone(),
+            global: true,
+            global_prefix: None,
+        };
+        for (purl, paths) in find_all_packages_for_rollback(&partitioned, &registry, true).await {
+            let copies = found.entry(purl).or_default();
+            for path in paths {
+                if !copies.contains(&path) {
+                    copies.push(path);
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Partition PURLs by ecosystem, filtering by the `--ecosystems` flag if set.
 pub fn partition_purls(
     purls: &[String],
@@ -707,6 +799,26 @@ pub async fn find_manifest_package_copies_reusing(
             .map(|(_, paths)| paths),
     )
     .await;
+    // A `gem env` home Bundler never loads this project's gems from (an
+    // explicit or deployment `path`) holds no copy the project runs, so an
+    // unpatched one there must not block the attestation (#1098). Default
+    // gems stay: Bundler loads those from the system home under any path.
+    if partitioned.contains_key(&Ecosystem::Gem) {
+        let unused = RubyCrawler
+            .bundler_unused_system_gem_homes(&crawler_options)
+            .await;
+        if !unused.is_empty() {
+            for (_, paths) in copies
+                .iter_mut()
+                .filter(|(purl, _)| purl.starts_with("pkg:gem/"))
+            {
+                paths.retain(|path| {
+                    !unused.iter().any(|home| path.starts_with(home))
+                        || socket_patch_core::crawlers::ruby_crawler::is_default_gem_copy(path)
+                });
+            }
+        }
+    }
     copies.retain(|_, paths| !paths.is_empty());
     // Verification also READS a `.bundle/config` bundle path the crawler
     // refused as a write root (it resolves outside the project): bundler

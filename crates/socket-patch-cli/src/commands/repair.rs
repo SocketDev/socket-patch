@@ -1,14 +1,13 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{
-    fetch_missing_sources, format_fetch_failures, format_fetch_successes, get_missing_archives,
-    get_missing_blobs, ArtifactNoun, DownloadMode, BLOB, DIFF_ARCHIVE, PACKAGE_ARCHIVE,
+    fetch_missing_blobs, format_fetch_failures, format_fetch_successes, get_missing_blobs,
+    ArtifactNoun, BLOB, DIFF_ARCHIVE, PACKAGE_ARCHIVE,
 };
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::manifest::cleanup_blobs::{
     format_all_in_use, format_cleanup_result_for, ArtifactReferences, CleanupResult,
 };
 use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::patch::apply::PatchSources;
 use socket_patch_core::telemetry::{
     track_patch_repair_failed, track_patch_repaired, TelemetryAuth,
 };
@@ -16,9 +15,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
-use crate::commands::fetch_stage::files_diffs_cannot_cover;
 use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
-use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, Status};
+use crate::json_envelope::{
+    Command, Envelope, EnvelopeError, GcReport, PatchAction, PatchEvent, Status,
+};
 use crate::ui::sweep_failure;
 
 #[derive(Args)]
@@ -75,25 +75,27 @@ pub async fn run(args: RepairArgs) -> i32 {
         // bare directory would get. Only cheap existence probes (and the
         // read-only lockfile scans) run before the lock, so a project with
         // nothing to repair never grows `.socket/`.
+        // The vendored phase runs at the manifest's project (#745).
         let state_file = args
             .common
-            .cwd
+            .project_root()
             .join(socket_patch_core::vendor::VENDOR_STATE_REL);
         let mut has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok();
         if !has_vendor_traces {
-            let refs =
-                crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd)
-                    .await;
+            let refs = crate::commands::vendored_backend::repair::scan_vendor_references(
+                &args.common.project_root(),
+            )
+            .await;
             has_vendor_traces = !refs.is_empty();
             vendor_references = Some(refs);
         }
         if !has_vendor_traces {
             let legacy_ledger = args
                 .common
-                .cwd
+                .project_root()
                 .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
             let hosted = tokio::fs::metadata(&legacy_ledger).await.is_ok()
-                || !crate::commands::hosted_inventory(&args.common, &args.common.cwd)
+                || !crate::commands::hosted_inventory(&args.common, &args.common.project_root())
                     .await
                     .is_empty();
             if hosted {
@@ -154,8 +156,10 @@ pub async fn run(args: RepairArgs) -> i32 {
     let vendor_references = match vendor_references {
         Some(refs) => refs,
         None => {
-            crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd)
-                .await
+            crate::commands::vendored_backend::repair::scan_vendor_references(
+                &args.common.project_root(),
+            )
+            .await
         }
     };
 
@@ -227,12 +231,12 @@ pub async fn run(args: RepairArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_repair_failed(&e, &telemetry).await;
+            track_patch_repair_failed(&e.message, &telemetry).await;
             if args.common.json {
-                let env = error_envelope(Command::Repair, args.common.dry_run, "repair_failed", &e);
+                let env = error_envelope(Command::Repair, args.common.dry_run, &e.code, &e.message);
                 println!("{}", env.to_pretty_json());
             } else {
-                eprintln!("Error: {e}");
+                eprintln!("Error: {}", e.message);
             }
             1
         }
@@ -267,7 +271,7 @@ fn format_id_list(ids: &[String], noun: ArtifactNoun, cap: usize) -> Vec<String>
     lines
 }
 
-/// `Found 2 missing diff archives` / `Found 1 missing blob`.
+/// `Found 2 missing blobs` / `Found 1 missing blob`.
 fn format_found_missing(n: usize, noun: ArtifactNoun) -> String {
     format!("Found {}", noun.count(n).replacen(' ', " missing ", 1))
 }
@@ -352,12 +356,6 @@ fn format_final_line(
     }
 }
 
-/// The `.socket/` source directories a download pass writes into.
-struct SourcePaths<'a> {
-    blobs: &'a Path,
-    diffs: &'a Path,
-}
-
 /// What one download pass did: how many artifacts were missing, and how
 /// many of them it downloaded or failed to.
 #[derive(Default)]
@@ -367,19 +365,18 @@ struct DownloadPass {
     failed: usize,
 }
 
-/// Step 1's pass over `missing` (non-empty), the `mode` artifacts `m`
+/// Step 1's pass over `missing` (non-empty), the `afterHash` blobs `m`
 /// references: the `--offline` warning, the `--dry-run` preview, or the
-/// download and its result lines.
+/// download into `blobs_path` and its result lines.
 async fn download_pass(
     args: &RepairArgs,
     client: &mut Option<ApiClient>,
     m: &socket_patch_core::manifest::schema::PatchManifest,
     missing: &[String],
-    mode: DownloadMode,
-    paths: &SourcePaths<'_>,
+    blobs_path: &Path,
 ) -> DownloadPass {
     let quiet = args.common.json || args.common.silent;
-    let noun = mode.noun();
+    let noun = BLOB;
     let mut pass = DownloadPass {
         missing: missing.len(),
         ..DownloadPass::default()
@@ -413,12 +410,7 @@ async fn download_pass(
         );
     }
     let client = client.as_ref().expect("client built just above");
-    let sources = PatchSources {
-        blobs_path: paths.blobs,
-        diffs_path: Some(paths.diffs),
-        mem_blobs: None,
-    };
-    let fetch_result = fetch_missing_sources(m, &sources, mode, client, None).await;
+    let fetch_result = fetch_missing_blobs(m, blobs_path, client, None).await;
     status.finish();
     pass.downloaded = fetch_result.downloaded;
     pass.failed = fetch_result.failed;
@@ -471,19 +463,15 @@ async fn repair_inner(
     client: &mut Option<ApiClient>,
     // `(eco, uuid, rel)` lockfile vendor references, scanned once by `run`.
     vendor_references: Vec<(String, String, String)>,
-) -> Result<(Envelope, RepairCounts), String> {
+) -> Result<(Envelope, RepairCounts), EnvelopeError> {
     // `Ok(None)` = no manifest (vendor-only repair); present-but-invalid
-    // stays a hard error.
+    // stays a hard error, under the shared manifest-load code (#931).
     let manifest = read_manifest(manifest_path)
         .await
-        .map_err(|e| crate::ui::manifest_error_message(manifest_path, &e))?;
+        .map_err(|e| crate::json_envelope::manifest_load_error(manifest_path, &e))?;
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &args.common.cwd);
     let blobs_path = socket_dir.join("blobs");
-    let diffs_path = socket_dir.join("diffs");
-
-    let download_mode =
-        DownloadMode::parse(&args.common.download_mode).map_err(|e| e.to_string())?;
 
     // `--silent` ("suppress non-error output") must mute the human-readable
     // progress just like `--json` does — otherwise a silent repair still
@@ -495,9 +483,8 @@ async fn repair_inner(
 
     let mut downloaded_count = 0usize;
     let mut download_failed_count = 0usize;
-    let mut blobs_cleaned = 0usize;
     let mut blobs_checked = 0usize;
-    let mut bytes_freed = 0u64;
+    let mut gc: Option<GcReport> = None;
 
     // The envelope is built up-front: the vendored-artifact phase records
     // its events inline; the download/cleanup aggregates are appended at
@@ -505,21 +492,19 @@ async fn repair_inner(
     let mut env = Envelope::new(Command::Repair);
     env.dry_run = args.common.dry_run;
 
-    // Step 1: Check for and download missing artifacts in the requested
-    // mode. Counts below refer to whatever kind of artifact was requested
-    // (file blobs or diff archives).
+    // Step 1: Check for and download missing per-file blobs.
     //
     // VENDORED-in-sync manifest entries are excluded: vendor flows keep
     // patch content in memory and the committed artifact IS the patch, so
-    // a fully-vendored project legitimately has no `.socket/blobs|diffs|
-    // packages` — repair must not re-litter them (or fail trying). The
+    // a fully-vendored project legitimately has no `.socket/blobs` —
+    // repair must not re-litter them (or fail trying). The
     // cleanup phase below still uses the FULL manifest, so it never sweeps
     // sources an in-place apply may need for rollback.
     // Loaded ONCE under the lock; the vendored phase below takes the raw
     // result (an unreadable ledger is ITS loud failure), while this scoping
     // degrades to "nothing vendored" — a corrupt ledger must not hide the
     // manifest's own missing sources.
-    let ledger = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+    let ledger = socket_patch_core::vendor::load_state(&args.common.project_root()).await;
     let no_entries = std::collections::HashMap::new();
     let vendor_entries = ledger.as_ref().map(|s| &s.entries).unwrap_or(&no_entries);
     // Lockfile vendor references count as vendored even with no ledger
@@ -546,29 +531,21 @@ async fn repair_inner(
             setup: m.setup.clone(),
         }
     });
-    let missing_artifacts: Vec<String> = match (&scoped_manifest, download_mode) {
-        (None, _) => Vec::new(),
-        (Some(m), DownloadMode::File) => get_missing_blobs(m, &blobs_path)
-            .await
-            .into_iter()
-            .collect(),
-        (Some(m), DownloadMode::Diff) => get_missing_archives(m, &diffs_path)
+    let missing_artifacts: Vec<String> = match &scoped_manifest {
+        None => Vec::new(),
+        Some(m) => get_missing_blobs(m, &blobs_path)
             .await
             .into_iter()
             .collect(),
     };
-    let noun = download_mode.noun();
-    let paths = SourcePaths {
-        blobs: &blobs_path,
-        diffs: &diffs_path,
-    };
+    let noun = BLOB;
     // Whether stdout already carries a line, so the blank separators
     // between sections never open the output (the offline warning goes
     // to stderr).
     let mut stdout_started = !args.common.offline || missing_artifacts.is_empty();
     let primary = match scoped_manifest.as_ref() {
         Some(m) if !missing_artifacts.is_empty() => {
-            download_pass(args, client, m, &missing_artifacts, download_mode, &paths).await
+            download_pass(args, client, m, &missing_artifacts, &blobs_path).await
         }
         _ => {
             if !quiet {
@@ -576,24 +553,6 @@ async fn repair_inner(
             }
             DownloadPass::default()
         }
-    };
-    // A diff archive has no delta for a file the patch creates, so in diff
-    // mode that file's blob is downloaded too: without it, a later
-    // `apply --offline` cannot apply the patch.
-    let created = match (&scoped_manifest, download_mode) {
-        (Some(m), DownloadMode::Diff) => {
-            let created = files_diffs_cannot_cover(m);
-            let missing: Vec<String> = get_missing_blobs(&created, &blobs_path)
-                .await
-                .into_iter()
-                .collect();
-            if missing.is_empty() {
-                DownloadPass::default()
-            } else {
-                download_pass(args, client, &created, &missing, DownloadMode::File, &paths).await
-            }
-        }
-        _ => DownloadPass::default(),
     };
     let missing_count = primary.missing;
     downloaded_count += primary.downloaded;
@@ -605,6 +564,7 @@ async fn repair_inner(
     // ledger entry are reported. Runs under `--download-only` too:
     // restoring artifacts IS repair's download half. The reference scan
     // and ledger load above are handed over, not repeated.
+    let vendored_since = env.events.len();
     let vendor_redownloaded =
         crate::commands::vendored_backend::VendoredBackend::new(&args.common, None)
             .repair(
@@ -617,6 +577,11 @@ async fn repair_inner(
                 &mut env,
             )
             .await;
+    // Vendored-leg events say so (`details.mode`), as in every envelope.
+    crate::commands::vendored_backend::tag_event_mode(
+        &mut env.events[vendored_since..],
+        crate::commands::VENDORED_MODE_LABEL,
+    );
     if !quiet && vendor_redownloaded > 0 {
         stdout_started = true;
         println!(
@@ -629,11 +594,12 @@ async fn repair_inner(
         );
     }
 
-    // Step 2: Clean up unused artifacts across all three directories. The
-    // summary prints once all three passes are in, so "nothing to clean
-    // up" is only said when all three really are empty.
+    // Step 2: Clean up unused artifacts across all three directories
+    // (`.socket/diffs` and `.socket/packages` are obsolete: every file in
+    // them goes). The summary prints once all three passes are in, so
+    // "nothing to clean up" is only said when all three really are empty.
     if let (false, Some(manifest)) = (args.download_only, manifest.as_ref()) {
-        let sweep = ArtifactReferences::for_apply(manifest)
+        let sweep = ArtifactReferences::active(manifest)
             .sweep(&socket_dir, args.common.dry_run)
             .await;
         let passes = [
@@ -642,7 +608,8 @@ async fn repair_inner(
             ("package", PACKAGE_ARCHIVE, sweep.packages),
         ];
         let mut results: Vec<(ArtifactNoun, CleanupResult)> = Vec::new();
-        for (label, noun, result) in passes {
+        let mut ok: [Option<usize>; 3] = [None, None, None];
+        for (slot, (label, noun, result)) in ok.iter_mut().zip(passes) {
             // A failed cleanup — the pass aborted, or it could not unlink
             // every orphan — is error output: `--silent` (suppress
             // NON-error output) must not mute it, and the JSON envelope
@@ -663,15 +630,13 @@ async fn repair_inner(
                 );
             }
             if let Ok(cleanup_result) = result {
+                blobs_checked += cleanup_result.blobs_checked;
+                *slot = Some(results.len());
                 results.push((noun, cleanup_result));
             }
         }
-
-        for (_, r) in &results {
-            blobs_checked += r.blobs_checked;
-            blobs_cleaned += r.blobs_removed;
-            bytes_freed += r.bytes_freed;
-        }
+        let pass = |i: usize| ok[i].map(|at| &results[at].1);
+        gc = Some(GcReport::from_passes(pass(0), pass(1), pass(2)));
         if !quiet {
             if stdout_started {
                 println!();
@@ -686,24 +651,13 @@ async fn repair_inner(
         // so a piped stdout never ends in a stray blank line when the
         // line itself goes to stderr.
         let other_failure = matches!(env.status, Status::PartialFailure | Status::Error);
-        let failed = download_failed_count + created.failed;
-        let line = if download_failed_count > 0 && created.failed > 0 {
-            format!(
-                "Repair finished with errors: {} and {} were not downloaded.",
-                noun.count(download_failed_count),
-                BLOB.count(created.failed)
-            )
-        } else if download_failed_count > 0 {
-            format_final_line(
-                download_failed_count,
-                other_failure,
-                noun,
-                args.common.dry_run,
-            )
-        } else {
-            format_final_line(created.failed, other_failure, BLOB, args.common.dry_run)
-        };
-        if failed > 0 || other_failure {
+        let line = format_final_line(
+            download_failed_count,
+            other_failure,
+            noun,
+            args.common.dry_run,
+        );
+        if download_failed_count > 0 || other_failure {
             if stdout_started {
                 eprintln!();
             }
@@ -733,7 +687,9 @@ async fn repair_inner(
         env.record(
             PatchEvent::artifact(action).with_details(serde_json::json!({
                 "count": count,
-                "mode": download_mode.as_tag(),
+                // Constant since v5 (blobs are the only download); kept so
+                // the event's shape is unchanged.
+                "downloadMode": "file",
             })),
         );
     }
@@ -744,47 +700,37 @@ async fn repair_inner(
         ));
         env.mark_partial_failure();
     }
-    if created.downloaded > 0
-        || (!args.common.offline && args.common.dry_run && created.missing > 0)
-    {
-        let (action, count) = if args.common.dry_run {
-            (PatchAction::Verified, created.missing)
-        } else {
-            (PatchAction::Downloaded, created.downloaded)
-        };
-        env.record(
-            PatchEvent::artifact(action).with_details(serde_json::json!({
-                "count": count,
-                "mode": DownloadMode::File.as_tag(),
-            })),
-        );
-    }
-    if created.failed > 0 {
-        env.record(PatchEvent::artifact(PatchAction::Failed).with_error(
-            "download_failed",
-            format!("{} failed to download", BLOB.count(created.failed)),
-        ));
-        env.mark_partial_failure();
-    }
-    if blobs_cleaned > 0 {
+    // `None` when no sweep ran (`--download-only`, no manifest): no `gc`.
+    let swept = gc.is_some();
+    let gc = gc.unwrap_or_default();
+    if gc.total_removed() > 0 {
         let cleanup_action = if args.common.dry_run {
             PatchAction::Verified
         } else {
             PatchAction::Removed
         };
-        env.record(
-            PatchEvent::artifact(cleanup_action).with_details(serde_json::json!({
-                "count": blobs_cleaned,
-                "checked": blobs_checked,
-            })),
+        // Pushed directly rather than via `env.record`, as remove's GC
+        // carrier is: `summary.removed` / `summary.verified` count patch
+        // entries, and the sweep's totals live in `gc` (with the byte
+        // count mirrored into `summary.bytesFreed`).
+        env.events.push(
+            PatchEvent::artifact(cleanup_action)
+                .with_bytes(gc.bytes_freed)
+                .with_details(serde_json::json!({
+                    "count": gc.total_removed(),
+                    "checked": blobs_checked,
+                })),
         );
+    }
+    if swept {
+        env.set_gc(gc);
     }
     Ok((
         env,
         RepairCounts {
-            downloaded: downloaded_count + created.downloaded,
-            cleaned: blobs_cleaned,
-            bytes_freed,
+            downloaded: downloaded_count,
+            cleaned: gc.total_removed(),
+            bytes_freed: gc.bytes_freed,
         },
     ))
 }
@@ -878,7 +824,6 @@ mod tests {
                 manifest_path: ".socket/manifest.json".to_string(),
                 offline: true,
                 json: true,
-                download_mode: "file".to_string(),
                 ..GlobalArgs::default()
             },
             download_only: false,
@@ -886,11 +831,14 @@ mod tests {
     }
 
     /// True when `env` carries the download / would-download artifact event
-    /// (identified by its `details.mode` field, unique to that event).
+    /// (identified by its `details.downloadMode` field, unique to that event).
     fn has_download_event(env: &Envelope) -> bool {
-        env.events
-            .iter()
-            .any(|e| e.details.as_ref().and_then(|d| d.get("mode")).is_some())
+        env.events.iter().any(|e| {
+            e.details
+                .as_ref()
+                .and_then(|d| d.get("downloadMode"))
+                .is_some()
+        })
     }
 
     /// Regression for the offline + dry-run leak: with `--offline` set, the
@@ -970,8 +918,26 @@ mod tests {
         // The referenced blob survives; the orphan is gone.
         assert!(socket.join("blobs").join(REFERENCED_HASH).exists());
         assert!(!socket.join("blobs").join(&orphan_hash).exists());
-        // A Removed event is recorded for the swept orphan.
-        assert_eq!(env.summary.removed, 1);
+        // The sweep is the envelope's `gc` (bytes mirrored into the
+        // summary) plus one carrier event; `summary.removed` counts patch
+        // entries, so the carrier does not bump it.
+        assert_eq!(
+            env.gc,
+            Some(GcReport {
+                removed_blobs: 1,
+                removed_diff_archives: 0,
+                removed_package_archives: 0,
+                bytes_freed: orphan_bytes.len() as u64,
+            })
+        );
+        assert_eq!(env.summary.bytes_freed, orphan_bytes.len() as u64);
+        assert_eq!(env.summary.removed, 0);
+        let carrier = env
+            .events
+            .iter()
+            .find(|e| e.action == PatchAction::Removed)
+            .expect("a Removed carrier event");
+        assert_eq!(carrier.bytes, Some(orphan_bytes.len() as u64));
     }
 
     /// `--download-only` skips the cleanup pass, so an orphan blob survives
@@ -990,12 +956,13 @@ mod tests {
         args.common.offline = false;
         args.download_only = true;
 
-        let (_env, counts) =
+        let (env, counts) =
             repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
                 .await
                 .expect("repair_inner");
 
         assert_eq!(counts.cleaned, 0, "download-only must skip cleanup");
+        assert_eq!(env.gc, None, "no sweep ran, so no `gc`");
         assert_eq!(counts.bytes_freed, 0);
         assert!(
             socket.join("blobs").join(&orphan_hash).exists(),
@@ -1003,9 +970,10 @@ mod tests {
         );
     }
 
-    /// Cleanup must sweep orphaned diff archives and every legacy
-    /// `.socket/packages/` archive (nothing reads them, so even one named
-    /// after a manifest UUID goes) in addition to blobs, and the reclaimed
+    /// Cleanup must sweep every obsolete `.socket/diffs/` and
+    /// `.socket/packages/` archive (nothing reads them since v5, so even
+    /// one named after a manifest UUID goes) in addition to blobs, and the
+    /// reclaimed
     /// counts/bytes from all three directories must aggregate into a single
     /// `RepairCounts`. Guards against a regression where a cleanup pass uses
     /// the wrong directory or drops its tallies.
@@ -1014,9 +982,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket = make_socket(tmp.path());
 
-        // A referenced diff archive (named after the manifest UUID) must
-        // survive; a legacy package archive under the same name must not.
-        write_archive(&socket, "diffs", REFERENCED_UUID, b"kept-diff");
+        // Archives named after the manifest UUID are swept too: the diff
+        // download path is gone, so a stale referenced diff archive is junk.
+        let stale_diff = b"stale diff"; // 10 bytes
+        write_archive(&socket, "diffs", REFERENCED_UUID, stale_diff);
         let legacy_pkg = b"legacy package"; // 14 bytes
         write_archive(&socket, "packages", REFERENCED_UUID, legacy_pkg);
 
@@ -1042,22 +1011,27 @@ mod tests {
                 .await
                 .expect("repair_inner");
 
-        // Both orphans and the legacy package archive go; the referenced
-        // diff archive stays.
-        assert_eq!(
-            counts.cleaned, 3,
-            "orphans and legacy archives should be swept"
-        );
+        // Every archive goes, referenced or not.
+        assert_eq!(counts.cleaned, 4, "all obsolete archives should be swept");
         assert_eq!(
             counts.bytes_freed,
-            (orphan_diff.len() + orphan_pkg.len() + legacy_pkg.len()) as u64,
+            (orphan_diff.len() + orphan_pkg.len() + legacy_pkg.len() + stale_diff.len()) as u64,
             "bytes_freed must aggregate diff + package reclaim"
         );
-        // Cleanup is reported as a SINGLE batched `removed` artifact event whose
-        // `details.count` carries the tally — so the event-count summary is 1
-        // (`Summary::bump` increments once per event), and the 3-artifact count
-        // is asserted via `counts.cleaned` above and the event details here.
-        assert_eq!(env.summary.removed, 1, "one batched removal event");
+        // Cleanup is reported once, per kind, in `gc`, plus a SINGLE batched
+        // `removed` carrier event whose `details.count` carries the tally.
+        // The carrier is not a removed patch entry, so `summary.removed`
+        // stays 0.
+        assert_eq!(
+            env.gc,
+            Some(GcReport {
+                removed_blobs: 0,
+                removed_diff_archives: 2,
+                removed_package_archives: 2,
+                bytes_freed: counts.bytes_freed,
+            })
+        );
+        assert_eq!(env.summary.removed, 0, "the carrier bumps no counter");
         let removed = env
             .events
             .iter()
@@ -1069,14 +1043,14 @@ mod tests {
                 .as_ref()
                 .and_then(|d| d.get("count"))
                 .and_then(serde_json::Value::as_u64),
-            Some(3),
-            "the batched removal event must report 3 swept artifacts"
+            Some(4),
+            "the batched removal event must report 4 swept artifacts"
         );
 
-        assert!(socket
-            .join("diffs")
-            .join(format!("{REFERENCED_UUID}.tar.gz"))
-            .exists());
+        assert!(
+            !socket.join("diffs").exists(),
+            "the emptied obsolete diffs dir is removed"
+        );
         assert!(!socket
             .join("packages")
             .join(format!("{REFERENCED_UUID}.tar.gz"))
@@ -1193,7 +1167,7 @@ mod tests {
             "22222222-2222-4222-8222-222222222222",
             "11111111-1111-4111-8111-111111111111",
         ]);
-        // Diff-mode UUIDs print in full, in sorted order.
+        // UUID-keyed archive ids print in full, in sorted order.
         assert_eq!(
             format_id_list(&uuids, DIFF_ARCHIVE, 5),
             vec![
@@ -1222,21 +1196,14 @@ mod tests {
     #[test]
     fn found_missing_line() {
         assert_eq!(format_found_missing(1, BLOB), "Found 1 missing blob");
-        assert_eq!(
-            format_found_missing(12, DIFF_ARCHIVE),
-            "Found 12 missing diff archives"
-        );
+        assert_eq!(format_found_missing(12, BLOB), "Found 12 missing blobs");
     }
 
     #[test]
     fn offline_warning_singular_and_plural() {
         assert_eq!(
-            format_offline_warning(
-                &ids(&["11111111-1111-4111-8111-111111111111"]),
-                DIFF_ARCHIVE
-            ),
-            "Warning: 1 diff archive is missing (offline mode - not downloading):\n\
-             \x20 - 11111111-1111-4111-8111-111111111111"
+            format_offline_warning(&ids(&["a"]), BLOB),
+            "Warning: 1 blob is missing (offline mode - not downloading):\n  - a"
         );
         assert_eq!(
             format_offline_warning(&ids(&["b", "a"]), BLOB),
@@ -1315,8 +1282,8 @@ mod tests {
             "Dry run: no changes made."
         );
         assert_eq!(
-            format_final_line(1, false, DIFF_ARCHIVE, false),
-            "Repair finished with errors: 1 diff archive was not downloaded."
+            format_final_line(1, false, BLOB, false),
+            "Repair finished with errors: 1 blob was not downloaded."
         );
         assert_eq!(
             format_final_line(2, true, BLOB, false),

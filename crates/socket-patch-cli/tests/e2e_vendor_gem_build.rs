@@ -1204,8 +1204,8 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
     );
     let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["found"], 1, "envelope: {env}");
-    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert_eq!(env["command"], "get", "envelope: {env}");
+    assert_eq!(env["summary"]["downloaded"], 1, "envelope: {env}");
     // get's vendored envelope (CLI_CONTRACT.md "get --mode and installed
     // narrowing"): `applied` is dropped (structurally zero — nothing is
     // applied in place), and the vendor Envelope nests under "vendor".
@@ -1213,17 +1213,12 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
         env.get("applied").is_none(),
         "get --mode vendored must drop the `applied` key: {env}"
     );
-    assert_eq!(env["patches"][0]["purl"], purl.as_str(), "envelope: {env}");
-    assert_eq!(env["patches"][0]["uuid"], UUID, "envelope: {env}");
-    assert_eq!(
-        env["vendor"]["summary"]["applied"], 1,
-        "one package vendored: {env}"
-    );
-    assert_eq!(
-        env["vendor"]["summary"]["failed"], 0,
-        "no vendor failures: {env}"
-    );
-    let applied = env["vendor"]["events"]
+    assert_eq!(env["events"][0]["action"], "downloaded", "envelope: {env}");
+    assert_eq!(env["events"][0]["purl"], purl.as_str(), "envelope: {env}");
+    assert_eq!(env["events"][0]["uuid"], UUID, "envelope: {env}");
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+    assert_eq!(env["summary"]["failed"], 0, "no vendor failures: {env}");
+    let applied = env["events"]
         .as_array()
         .expect("vendor events array")
         .iter()

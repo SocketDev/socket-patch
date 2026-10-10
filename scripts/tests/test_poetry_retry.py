@@ -77,6 +77,10 @@ def exercise_case(transport_site):
 
         ns["oracle"] = oracle
 
+        def hosted_event(action):
+            # v5 envelope: a hosted pin / restore is an event tagged details.mode hosted.
+            return {"action": action, "purl": ns["PURL_BASE"], "details": {"mode": "hosted"}}
+
         class FakeRun(poetry.Run):
             def __init__(self, cmd, cwd, env, log, timeout=None):
                 self.cmd = list(map(str, cmd))
@@ -90,31 +94,32 @@ def exercise_case(transport_site):
                     (venv / "bin/python").touch()
                     self.out = str(venv)
                 elif log.name == "scan-bare-dryrun.log":
-                    self.out = json.dumps({"packages": [{"purl": ns["PURL_BASE"]}], "apply": {"found": 1}})
+                    self.out = json.dumps({"status": "success", "dryRun": True, "packages": [{"purl": ns["PURL_BASE"]}],
+                                           "events": [{"action": "verified", "purl": ns["PURL_BASE"]}]})
                     if first and transport_site == "oot_prior_functional_failure":
                         self.out = "{}"
                 elif log.name == "scan-apply.log":
                     if first:
-                        self.out = json.dumps({"error": TRANSPORT})
+                        self.out = json.dumps({"status": "error", "events": [], "error": {"code": "patch_fetch_failed", "message": TRANSPORT}})
                     else:
                         manifest = project / ".socket/manifest.json"
                         manifest.parent.mkdir(parents=True, exist_ok=True)
                         manifest.write_text('{"patches": {"fixture": {}}}')
-                        self.out = json.dumps({"apply": {"applied": 1}})
+                        self.out = json.dumps({"status": "success", "events": [{"action": "applied", "purl": ns["PURL_BASE"]}]})
                 elif log.name == "scan.log":
                     if first and transport_site == "required_scan_json_transport":
-                        self.out = json.dumps({"status": "error", "error": {"message": TRANSPORT}})
+                        self.out = json.dumps({"status": "error", "events": [], "error": {"code": "patch_fetch_failed", "message": TRANSPORT}})
                     else:
                         (project / "poetry.lock").write_bytes(patched)
-                        self.out = json.dumps({"status": "success", "redirect": {"redirected": 1, "warnings": []}})
+                        self.out = json.dumps({"status": "success", "events": [hosted_event("applied")]})
                 elif log.name == "rescan.log":
-                    self.out = json.dumps({"status": "success", "redirect": {"redirected": 0, "warnings": []}})
+                    self.out = json.dumps({"status": "success", "events": [hosted_event("applied")]})
                     if first and churn:
                         (project / "poetry.lock").write_bytes(patched + b"# unwanted churn\n")
                     if first and transport_site == "rescan_churn_transport":
                         self.rc, self.err = 1, TRANSPORT
                     if first and transport_site == "rescan_churn_json_transport":
-                        self.out = json.dumps({"error": TRANSPORT})
+                        self.out = json.dumps({"status": "error", "events": [], "error": {"code": "patch_fetch_failed", "message": TRANSPORT}})
                 elif log.name == "install-warm.log":
                     (project / "poetry.lock").write_bytes(patched)
                     if first and transport_site == "successful_install_warning":
@@ -133,11 +138,13 @@ def exercise_case(transport_site):
                     if first and transport_site == "required_rollback_transport":
                         self.rc, self.err = 1, "API request failed with status 503: unavailable"
                     elif first and transport_site == "required_rollback_json_transport":
-                        self.out = json.dumps({"error": "API request failed with status 503: unavailable"})
+                        self.out = json.dumps({"command": "rollback", "status": "error", "events": [],
+                                               "error": {"code": "rollback_failed", "message": "API request failed with status 503: unavailable"}})
                     else:
                         (project / "poetry.lock").write_bytes(pristine)
                         (project / ".socket/manifest.json").unlink(missing_ok=True)
-                        self.out = json.dumps({"hosted": {"reverted": [ns["PURL_BASE"]]}})
+                        self.out = json.dumps({"command": "rollback", "status": "success", "events": [hosted_event("rolledBack")],
+                                               "hosted": {"editedFiles": 1}})
                 log.write_text(f"$ {' '.join(self.cmd)}\n# exit {self.rc}\n--- stdout\n{self.out}\n--- stderr\n{self.err}")
 
         ns["Run"] = FakeRun
@@ -209,7 +216,7 @@ class PoetryRetryClassificationTests(unittest.TestCase):
         for envelope in ({"error": {"message": TRANSPORT}},
                          {"warnings": [{"code": "api_batch_failed", "detail": TRANSPORT}]},
                          {"warnings": [{"code": "patch_details_failed", "detail": "could not fetch details for pkg:pypi/urllib3@1.26.18: Rate limit exceeded (HTTP 429, gave up after 3 retries). Please try again later."}]},
-                         {"vendor": {"events": [{"action": "skipped", "errorCode": "download_failed", "reason": TRANSPORT}]}}):
+                         {"events": [{"action": "skipped", "errorCode": "download_failed", "reason": TRANSPORT, "details": {"mode": "vendored"}}]}):
             with self.subTest(envelope=envelope):
                 self.assertTrue(poetry.operation_transport_failure(operation(rc=0, out=json.dumps(envelope), err="")))
         for envelope in ({"status": "success", "detail": TRANSPORT},

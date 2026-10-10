@@ -24,8 +24,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::{
     assert_no_event_code, find_event, hosted_line, line_integrity, lock_line, patch_record, read,
-    run_json, vendor_cli, write_bun_project, HOSTED_URL, LEFT_PAD_REGISTRY_LINE, NAME,
-    PATCHED_INDEX, PATCHED_SHA512, PURL, UUID, VERSION,
+    run_json, run_json_env, vendor_cli, write_bun_project, HOSTED_URL, LEFT_PAD_REGISTRY_LINE,
+    NAME, PATCHED_INDEX, PATCHED_SHA512, PURL, UUID, VERSION,
 };
 
 const SCOPED_NAME: &str = "@corp/widget";
@@ -135,13 +135,29 @@ impl Registries {
 /// leaves it (the lock's URL 3-tuples, no ledger) beside its bunfig.toml;
 /// returns the pristine registry lock.
 fn write_hosted_project(root: &Path, registries: &Registries) -> String {
+    let pristine = write_hosted_lock(root, registries, 2);
+    std::fs::write(root.join("bunfig.toml"), registries.bunfig()).unwrap();
+    pristine
+}
+
+/// [`write_hosted_project`] with no project registry settings, its lock
+/// written as `lock_version` (2: Bun ≥ 1.4; 1: Bun 1.2 – 1.3, which Bun
+/// 1.4 keeps as is); returns the pristine registry lock.
+fn write_hosted_lock(root: &Path, registries: &Registries, lock_version: u8) -> String {
     let pristine = registries.pristine_lock();
+    let pristine = if lock_version == 2 {
+        pristine
+    } else {
+        pristine.replace(
+            "\"lockfileVersion\": 2,\n  \"configVersion\": 1,",
+            &format!("\"lockfileVersion\": {lock_version},"),
+        )
+    };
     write_bun_project(
         root,
         &pristine,
         &[(NAME, VERSION), (SCOPED_NAME, SCOPED_VERSION)],
     );
-    std::fs::write(root.join("bunfig.toml"), registries.bunfig()).unwrap();
     let hosted = pristine
         .replace(
             &registries.left_pad_line(),
@@ -280,5 +296,197 @@ async fn bun_takeover_then_vendor_revert_keeps_the_bunfig_and_scope_registry_url
         read(root, "bun.lock"),
         pristine,
         "the revert lands on the Bun-written registry lock"
+    );
+}
+
+// ── #1276: Bun's user and global config layers ──────────────────────────────
+
+/// The variable a user's own `.npmrc` takes the scope's token from. Not one
+/// of the token variables a project's files may expand: the user wrote
+/// this file, and Bun expands any variable in it.
+const USER_TOKEN_VAR: &str = "CORP_REGISTRY_TOKEN";
+
+impl Registries {
+    /// The registries as a user `.npmrc` spells them: the default registry,
+    /// the `@corp` scope and its token keyed by the scope registry's path.
+    fn user_npmrc(&self) -> String {
+        let uri = self.server.uri();
+        let host_path = uri.trim_start_matches("http:");
+        format!(
+            "registry={uri}/mirror/\n@corp:registry={uri}/corp/\n\
+             {host_path}/corp/:_authToken=${{{USER_TOKEN_VAR}}}\n"
+        )
+    }
+
+    /// A registry with nothing on it: a restore that reads it lands on the
+    /// default registry, which does not know `@corp/widget`.
+    fn decoy(&self) -> String {
+        format!("{}/decoy/", self.server.uri())
+    }
+}
+
+/// `remove` of both pins in a project whose registries are set only at
+/// user level, with `home` as `HOME` and `env` on top: lands on the
+/// pristine lock.
+fn assert_removes_restore_pristine(
+    root: &Path,
+    home: &Path,
+    env: &[(&str, String)],
+    pristine: &str,
+) {
+    let cwd = root.to_str().unwrap();
+    let mut env = env.to_vec();
+    env.push(("HOME", home.to_str().unwrap().to_string()));
+    env.push(("USERPROFILE", home.to_str().unwrap().to_string()));
+    env.push((USER_TOKEN_VAR, SCOPE_TOKEN.to_string()));
+    for purl in [PURL, SCOPED_PURL] {
+        let (code, env) = run_json_env(
+            root,
+            &["remove", purl, "--yes", "--json", "--cwd", cwd],
+            &env,
+        );
+        assert_eq!(code, 0, "remove {purl}: {env:#}");
+        assert!(env["error"].is_null(), "{env:#}");
+        assert_no_registry_fallback(&env);
+    }
+    assert_eq!(
+        read(root, "bun.lock"),
+        pristine,
+        "each slot holds the tarball URL of the registry Bun resolved it against"
+    );
+}
+
+/// #1276: a private scope (and the default registry) set only in the
+/// user's `~/.npmrc`, the usual home of a scope's token, is the registry
+/// the restore reads, with the token that file gives it.
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_remove_reads_registries_set_only_in_the_user_npmrc() {
+    let registries = Registries::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, home) = (tmp.path().join("proj"), tmp.path().join("home"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let pristine = write_hosted_lock(&root, &registries, 2);
+    std::fs::write(home.join(".npmrc"), registries.user_npmrc()).unwrap();
+    assert_removes_restore_pristine(&root, &home, &[], &pristine);
+}
+
+/// #1276: with `XDG_CONFIG_HOME` set, Bun reads `$XDG_CONFIG_HOME/.npmrc`
+/// in place of `~/.npmrc` and only `$XDG_CONFIG_HOME/.bunfig.toml` as the
+/// global bunfig (measured on Bun 1.1.39 – 1.4.2); the `~` copies here
+/// would send both packages to a registry that has neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_remove_reads_the_xdg_config_home_npmrc_and_bunfig() {
+    let registries = Registries::start().await;
+    for global in [".npmrc", ".bunfig.toml"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, home) = (tmp.path().join("proj"), tmp.path().join("home"));
+        let xdg = tmp.path().join("xdg");
+        for dir in [&root, &home, &xdg] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let pristine = write_hosted_lock(&root, &registries, 2);
+        let decoy = registries.decoy();
+        std::fs::write(
+            home.join(".npmrc"),
+            format!("registry={decoy}\n@corp:registry={decoy}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".bunfig.toml"),
+            format!("[install]\nregistry = \"{decoy}\"\n"),
+        )
+        .unwrap();
+        let config = if global == ".npmrc" {
+            registries.user_npmrc()
+        } else {
+            registries.bunfig()
+        };
+        std::fs::write(xdg.join(global), config).unwrap();
+        // The XDG `.npmrc` replaces `~/.npmrc` only when it exists; the
+        // bunfig leg has none, so its `~/.npmrc` decoy must lose to the
+        // global bunfig on this lockfileVersion-2 (Bun ≥ 1.4) lock.
+        assert_removes_restore_pristine(
+            &root,
+            &home,
+            &[("XDG_CONFIG_HOME", xdg.to_str().unwrap().to_string())],
+            &pristine,
+        );
+    }
+}
+
+/// #1276: a global `~/.bunfig.toml` (no `XDG_CONFIG_HOME`) carries the
+/// registries, the scope's token included.
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_remove_reads_registries_set_only_in_the_global_bunfig() {
+    let registries = Registries::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, home) = (tmp.path().join("proj"), tmp.path().join("home"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let pristine = write_hosted_lock(&root, &registries, 2);
+    std::fs::write(home.join(".bunfig.toml"), registries.bunfig()).unwrap();
+    assert_removes_restore_pristine(&root, &home, &[], &pristine);
+}
+
+/// #1276: Bun ≥ 1.4 (the first to write lockfileVersion 2) takes a key
+/// any bunfig sets over any `.npmrc`; Bun ≤ 1.3 the other way round. On a
+/// lockfileVersion-2 lock the global bunfig's registries win over the
+/// project `.npmrc`'s.
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_remove_on_a_v2_lock_takes_bunfig_over_npmrc() {
+    let registries = Registries::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, home) = (tmp.path().join("proj"), tmp.path().join("home"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let pristine = write_hosted_lock(&root, &registries, 2);
+    let decoy = registries.decoy();
+    std::fs::write(
+        root.join(".npmrc"),
+        format!("registry={decoy}\n@corp:registry={decoy}\n"),
+    )
+    .unwrap();
+    std::fs::write(home.join(".bunfig.toml"), registries.bunfig()).unwrap();
+    assert_removes_restore_pristine(&root, &home, &[], &pristine);
+}
+
+/// #1276: on a lockfileVersion-1 lock, which Bun 1.2 – 1.3 write and Bun
+/// 1.4 keeps, a `.npmrc` and a bunfig that name different registries for
+/// the package leave the registry Bun resolves it against unknown. The
+/// restore refuses with the checkout remedy instead of guessing, and
+/// leaves the pin in place.
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_remove_refuses_when_npmrc_and_bunfig_disagree_on_a_v1_lock() {
+    let registries = Registries::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, home) = (tmp.path().join("proj"), tmp.path().join("home"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    write_hosted_lock(&root, &registries, 1);
+    let hosted = read(&root, "bun.lock");
+    let decoy = registries.decoy();
+    std::fs::write(home.join(".npmrc"), format!("@corp:registry={decoy}\n")).unwrap();
+    std::fs::write(root.join("bunfig.toml"), registries.bunfig()).unwrap();
+    let cwd = root.to_str().unwrap();
+    let env = [
+        ("HOME", home.to_str().unwrap().to_string()),
+        ("USERPROFILE", home.to_str().unwrap().to_string()),
+    ];
+    let (code, env) = run_json_env(
+        &root,
+        &["remove", SCOPED_PURL, "--yes", "--json", "--cwd", cwd],
+        &env,
+    );
+    assert_ne!(code, 0, "the restore can't tell the registry: {env:#}");
+    let text = env.to_string();
+    assert!(
+        text.contains("Bun 1.4") && text.contains(&decoy) && text.contains("/corp/"),
+        "the refusal names both registries and the Bun versions behind them: {env:#}"
+    );
+    assert_eq!(
+        lock_line(&read(&root, "bun.lock"), SCOPED_NAME),
+        lock_line(&hosted, SCOPED_NAME),
+        "the pin stays in place"
     );
 }

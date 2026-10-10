@@ -180,10 +180,14 @@ async fn get_uuid_with_401_falls_back_to_proxy() {
     assert_eq!(code, 0, "graceful fallback must exit 0; stderr={stderr}");
     let v = json_stdout(&out);
     assert_eq!(
-        v["status"], "not_found",
+        v["status"], "notFound",
         "after proxy 404 the patch is not found, got: {v}"
     );
-    assert_eq!(v["found"], 0, "not_found envelope reports zero found: {v}");
+    assert_eq!(
+        v["events"],
+        serde_json::json!([]),
+        "notFound reports no events: {v}"
+    );
 }
 
 /// A 500 is NOT a fallback candidate: it must surface as a hard error
@@ -459,10 +463,14 @@ async fn get_by_ghsa_with_404_reports_not_found() {
     assert_eq!(code, 0, "GHSA 404 is a graceful not-found, exit 0");
     let v = json_stdout(&out);
     assert_eq!(
-        v["status"], "not_found",
+        v["status"], "notFound",
         "404 search must map to not_found, got: {v}"
     );
-    assert_eq!(v["found"], 0, "not_found envelope reports zero found: {v}");
+    assert_eq!(
+        v["events"],
+        serde_json::json!([]),
+        "notFound reports no events: {v}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -510,13 +518,7 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
     .unwrap();
 
     let out = crate::common::hermetic_command(&binary())
-        .args([
-            "repair",
-            "--json",
-            "--download-mode",
-            "file",
-            "--download-only",
-        ])
+        .args(["repair", "--json", "--download-only"])
         .current_dir(tmp.path())
         .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token")

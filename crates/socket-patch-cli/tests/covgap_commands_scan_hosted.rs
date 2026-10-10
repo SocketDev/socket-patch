@@ -16,6 +16,9 @@
 //! be read back; no parent-process env is ever mutated, so no
 //! serialization is needed.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -26,6 +29,37 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod common;
 use common::envelope::codes_in;
 
+/// The hosted `skipped` events as the pre-v5.0 `redirect.skipped[]` rows
+/// (`{purl, uuid, reason: <errorCode>, detail?: <reason>}`).
+fn hosted_skipped(doc: &Value) -> Vec<Value> {
+    doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "skipped")
+        .map(|e| {
+            let mut row = json!({"purl": e["purl"], "uuid": e["uuid"], "reason": e["errorCode"]});
+            if e["reason"].is_string() {
+                row["detail"] = e["reason"].clone();
+            }
+            row
+        })
+        .collect()
+}
+
+/// How many pins a hosted run wrote (`applied`) or would write (`verified`).
+fn hosted_pinned(doc: &Value) -> u64 {
+    doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
+}
+
 const ORG: &str = "test-org";
 const NAME: &str = "covgap-hosted";
 const VERSION: &str = "1.0.0";
@@ -33,6 +67,8 @@ const PURL: &str = "pkg:npm/covgap-hosted@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const HOSTED_URL: &str = "http://patch.test/patch/npm/covgap-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/covgap-hosted-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
+/// The grant's sha1: yarn classic pins it as `resolved`'s `#` fragment (#558).
+const PATCHED_SHA1: &str = "5ba15ba15ba15ba15ba15ba15ba15ba15ba15ba1";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const GHSA: &str = "GHSA-cvgp-hstd-aaaa";
 
@@ -94,7 +130,7 @@ async fn mock_granted_reference(server: &MockServer, uuid: &str, purl: &str, url
                 "artifacts": [{
                     "kind": "tarball",
                     "url": url,
-                    "integrity": { "sha512": PATCHED_SHA512 }
+                    "integrity": { "sha512": PATCHED_SHA512, "sha1": PATCHED_SHA1 }
                 }],
                 "registryOverride": null
             }
@@ -368,7 +404,7 @@ fn scan_hosted_json(
 
 /// The `detail` of the first warning carrying `code` (panics when absent).
 fn warning_detail<'a>(doc: &'a Value, code: &str) -> &'a str {
-    doc["redirect"]["warnings"]
+    doc["warnings"]
         .as_array()
         .into_iter()
         .flatten()
@@ -411,11 +447,11 @@ async fn granted_reference_with_unparseable_purl_is_skipped_as_bad_purl() {
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "a fully-skipped redirect still exits 0: {doc:#}");
     assert_eq!(
-        doc["redirect"]["skipped"],
+        Value::Array(hosted_skipped(&doc)),
         json!([{ "purl": "not-a-purl", "uuid": UUID, "reason": "bad_purl" }]),
         "the skipped entry must carry the SERVED purl and the bad_purl reason: {doc:#}"
     );
-    assert_eq!(doc["redirect"]["redirected"], 0, "envelope: {doc:#}");
+    assert_eq!(hosted_pinned(&doc), 0, "envelope: {doc:#}");
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock_before,
@@ -457,11 +493,11 @@ async fn granted_reference_without_url_is_skipped_as_no_url() {
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "a fully-skipped redirect still exits 0: {doc:#}");
     assert_eq!(
-        doc["redirect"]["skipped"],
+        Value::Array(hosted_skipped(&doc)),
         json!([{ "purl": PURL, "uuid": UUID, "reason": "no_url" }]),
         "the skipped entry must carry the no_url reason: {doc:#}"
     );
-    assert_eq!(doc["redirect"]["redirected"], 0, "envelope: {doc:#}");
+    assert_eq!(hosted_pinned(&doc), 0, "envelope: {doc:#}");
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock_before,
@@ -510,15 +546,14 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
         "the refusal must name the fail-closed outcome and the manual path: {detail}"
     );
     assert!(
-        doc["redirect"]["skipped"]
-            .as_array()
-            .is_some_and(|s| s.iter().any(|e| e["purl"] == PURL
-                && e["uuid"] == UUID
-                && e["reason"] == "vendored_revert_failed")),
+        Some(&hosted_skipped(&doc)).is_some_and(|s| s.iter().any(|e| e["purl"] == PURL
+            && e["uuid"] == UUID
+            && e["reason"] == "vendored_revert_failed")),
         "the refusal must be accounted as skipped: {doc:#}"
     );
     assert_eq!(
-        doc["redirect"]["redirected"], 0,
+        hosted_pinned(&doc),
+        0,
         "a refused purl is never counted redirected: {doc:#}"
     );
     // The refused-purl cleanup dropped the override: the rewrite landed
@@ -732,8 +767,9 @@ async fn hosted_lock_held_refuses_before_any_write() {
         "no --lock-timeout: no waited clause; {doc:#}"
     );
     assert_eq!(
-        doc["redirect"]["mode"], "hosted",
-        "the hosted error envelope keeps its redirect block: {doc:#}"
+        doc.get("redirect"),
+        None,
+        "a hosted error envelope has no redirect payload (nothing was rewritten): {doc:#}"
     );
 
     // Wet human: the stderr line carries the stable code and the hint.
@@ -752,17 +788,15 @@ async fn hosted_lock_held_refuses_before_any_write() {
     // nothing), so it previews the rewrite instead of contending.
     let (code, doc) = scan_hosted_json(root, &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "a dry run never contends: {doc:#}");
-    assert_eq!(doc["redirect"]["dryRun"], true, "{doc:#}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(doc["dryRun"], true, "{doc:#}");
+    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
 
     // Zero grants under the held lock: nothing to write, so no lock taken.
     let (code, doc) = scan_hosted_json(root, &no_grant.uri(), &[], &[]);
     assert_eq!(code, 0, "an all-skipped run never contends: {doc:#}");
-    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    assert_eq!(hosted_pinned(&doc), 0, "{doc:#}");
     assert!(
-        doc["redirect"]["skipped"]
-            .as_array()
-            .is_some_and(|s| s.iter().any(|e| e["reason"] == "not_found")),
+        Some(&hosted_skipped(&doc)).is_some_and(|s| s.iter().any(|e| e["reason"] == "not_found")),
         "{doc:#}"
     );
 
@@ -892,8 +926,9 @@ async fn hosted_lock_io_when_a_file_squats_on_socket_dir() {
         "the fault names the squatting path: {error}"
     );
     assert_eq!(
-        doc["redirect"]["mode"], "hosted",
-        "the hosted error envelope keeps its redirect block: {doc:#}"
+        doc.get("redirect"),
+        None,
+        "a hosted error envelope has no redirect payload (nothing was rewritten): {doc:#}"
     );
 
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
@@ -974,7 +1009,7 @@ async fn successful_wet_hosted_run_leaves_nothing_under_socket() {
     write_npm_project(root, NAME);
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
     assert!(
         !root.join(".socket/apply.lock").exists(),
         "apply.lock never outlives the run"
@@ -1181,7 +1216,7 @@ async fn cargo_other_version_vendored_wiring_does_not_refuse_the_redirect() {
         &[],
         &[("CARGO_HOME", cargo_home_s.as_str())],
     );
-    let codes: Vec<&str> = doc["redirect"]["warnings"]
+    let codes: Vec<&str> = doc["warnings"]
         .as_array()
         .into_iter()
         .flatten()
@@ -1192,8 +1227,7 @@ async fn cargo_other_version_vendored_wiring_does_not_refuse_the_redirect() {
         "another version's wiring is not this version's lost ledger: {doc:#}"
     );
     assert!(
-        !doc["redirect"]["skipped"]
-            .as_array()
+        !Some(&hosted_skipped(&doc))
             .is_some_and(|s| s.iter().any(|e| e["reason"] == "vendored_revert_failed")),
         "{doc:#}"
     );
@@ -1284,12 +1318,12 @@ async fn ledgerless_cargo_wiring_refuses(manifest_wiring: bool) {
         "the refusal must name the missing ledger: {detail}"
     );
     assert!(
-        doc["redirect"]["skipped"].as_array().is_some_and(|s| s
+        Some(&hosted_skipped(&doc)).is_some_and(|s| s
             .iter()
             .any(|e| e["purl"] == CPURL && e["reason"] == "vendored_revert_failed")),
         "the refusal must be accounted as skipped: {doc:#}"
     );
-    assert_eq!(doc["redirect"]["redirected"], 0, "envelope: {doc:#}");
+    assert_eq!(hosted_pinned(&doc), 0, "envelope: {doc:#}");
     assert_eq!(
         std::fs::read(root.join(".cargo/config.toml")).ok(),
         config_before,
@@ -1313,7 +1347,7 @@ async fn ledgerless_cargo_wiring_refuses(manifest_wiring: bool) {
 /// executable or installed dependencies. A fresh clone works immediately.
 /// No run writes a redirect ledger (v5), and `rollback` cannot restore a
 /// binary `bun.lockb` pin to its upstream entry: it refuses the pin
-/// (`partial_failure`, exit 1) naming the `git checkout` remedy and leaves
+/// (`rollback_failed`, exit 1) naming the `git checkout` remedy and leaves
 /// the lock byte-identical.
 #[tokio::test]
 async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
@@ -1349,7 +1383,7 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
 
     let (code, preview) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &env);
     assert_eq!(code, 0, "{preview:#}");
-    assert_eq!(preview["redirect"]["redirected"], 1, "{preview:#}");
+    assert_eq!(hosted_pinned(&preview), 1, "{preview:#}");
     assert!(preview["redirect"]["rewrittenFiles"]
         .as_array()
         .unwrap()
@@ -1365,7 +1399,7 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
 
     let (code, applied) = scan_hosted_json(tmp.path(), &server.uri(), &[], &env);
     assert_eq!(code, 0, "{applied:#}");
-    assert_eq!(applied["redirect"]["redirected"], 1, "{applied:#}");
+    assert_eq!(hosted_pinned(&applied), 1, "{applied:#}");
     let patched = std::fs::read(tmp.path().join("bun.lockb")).unwrap();
     assert_ne!(patched, original);
     assert!(patched
@@ -1380,7 +1414,7 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
 
     let (code, rerun) = scan_hosted_json(tmp.path(), &server.uri(), &[], &env);
     assert_eq!(code, 0, "{rerun:#}");
-    assert_eq!(rerun["redirect"]["redirected"], 1, "{rerun:#}");
+    assert_eq!(hosted_pinned(&rerun), 1, "{rerun:#}");
     assert_eq!(
         std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
         patched
@@ -1403,10 +1437,12 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
         "a binary bun.lockb pin is refused: {stdout}\n{stderr}"
     );
     let doc: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
-    assert_eq!(doc["status"], "partial_failure", "{doc:#}");
-    let failed = doc["hosted"]["failed"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{doc:#}"));
+    // The refused pin is the only outcome: a total failure (#1066).
+    assert_eq!(doc["status"], "error", "{doc:#}");
+    assert_eq!(doc["error"]["code"], "rollback_failed", "{doc:#}");
+    assert_eq!(doc["summary"]["failed"], 1, "{doc:#}");
+    let failed_view = rollback_json::hosted_failed(&doc);
+    let failed = failed_view.as_array().unwrap_or_else(|| panic!("{doc:#}"));
     assert_eq!(failed.len(), 1, "{doc:#}");
     assert_eq!(failed[0]["purl"], purl, "{doc:#}");
     let error = failed[0]["error"].as_str().unwrap_or_default();
@@ -1443,7 +1479,7 @@ async fn malformed_bun_lockb_reports_format_error_without_spawning_bun() {
         let (code, doc) =
             scan_hosted_json(tmp.path(), &server.uri(), extra, &[("PATH", path.as_str())]);
         assert_eq!(code, 0, "{doc:#}");
-        assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+        assert_eq!(hosted_pinned(&doc), 0, "{doc:#}");
         assert!(warning_detail(&doc, "redirect_bun_lockb_invalid").contains("bun.lockb"));
         assert_eq!(
             std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
@@ -1476,7 +1512,7 @@ async fn unreadable_bun_lockb_is_preserved_and_reports_the_io_error() {
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[("PATH", path.as_str())]);
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    assert_eq!(hosted_pinned(&doc), 0, "{doc:#}");
     assert!(warning_detail(&doc, "redirect_bun_lockb_invalid").contains("cannot read bun.lockb"));
     assert_eq!(std::fs::read(&lock).unwrap(), original);
     assert!(!tmp.path().join("bun.lock").exists());
@@ -1582,7 +1618,7 @@ async fn fifo_bun_lockb_refuses_before_spawning_bun_and_never_wedges() {
         );
         let detail = warning_detail(&doc, "redirect_bun_lockb_invalid");
         assert!(detail.contains("not a regular file"), "{extra:?}: {detail}");
-        let codes = codes_in(&doc["redirect"]["warnings"]);
+        let codes = codes_in(&doc["warnings"]);
         assert_eq!(
             codes
                 .iter()
@@ -1595,7 +1631,7 @@ async fn fifo_bun_lockb_refuses_before_spawning_bun_and_never_wedges() {
             !codes.contains(&"redirect_npm_no_lockfile".to_string()),
             "{extra:?}: the existing binary lock must not be reported missing: {codes:?}"
         );
-        assert_eq!(doc["redirect"]["redirected"], 0, "{extra:?}: {doc:#}");
+        assert_eq!(hosted_pinned(&doc), 0, "{extra:?}: {doc:#}");
         assert!(
             !marker.exists(),
             "{extra:?}: bun must never be spawned on a FIFO bun.lockb (it blocks on it too)"
@@ -1624,9 +1660,10 @@ fn assert_sibling_lock_outcome(
     dry_run: bool,
 ) {
     assert!(warning_detail(doc, "redirect_bun_lockb_invalid").contains("bun.lockb"));
-    assert_eq!(doc["redirect"]["dryRun"], dry_run, "{doc:#}");
+    assert_eq!(doc["dryRun"], dry_run, "{doc:#}");
     assert_eq!(
-        doc["redirect"]["redirected"], 0,
+        hosted_pinned(&doc),
+        0,
         "a failed primary binary lock must never be confirmed by {sibling}: {doc:#}"
     );
     assert!(
@@ -1810,7 +1847,7 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
         lock.contains(&format!("tarball: {HOSTED_URL}")),
         "the redirect must land despite the workspace fallback:\n{lock}"
     );
-    assert_eq!(doc["redirect"]["redirected"], 1, "envelope: {doc:#}");
+    assert_eq!(hosted_pinned(&doc), 1, "envelope: {doc:#}");
     // FINDING-5 seam: the user's workspace file was NOT overwritten with the
     // root-only scaffold.
     assert_eq!(
@@ -1910,7 +1947,8 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
         "the overlap warning never flips the exit code: {doc:#}"
     );
     assert_eq!(
-        doc["redirect"]["redirected"], 1,
+        hosted_pinned(&doc),
+        1,
         "anchor: Y must redirect normally: {doc:#}"
     );
     let detail = warning_detail(&doc, "redirect_supersedes_vendored");
@@ -2050,8 +2088,8 @@ async fn human_vex_success_summary_names_statements_path_and_ledger_caveat() {
 }
 
 /// `--json` `--vex` run: VEX advisories are muted on stderr under --json,
-/// so the hosted envelope's `vex.warnings` must carry them (same
-/// skip-if-empty key as the agent arm), instead of dropping them.
+/// so the hosted envelope's `vex.warnings` must carry them (after the
+/// `vex_hosted_unverified` advisory every hosted attestation carries).
 #[tokio::test]
 async fn json_vex_block_carries_the_vex_run_warnings() {
     let server = MockServer::start().await;
@@ -2073,10 +2111,13 @@ async fn json_vex_block_carries_the_vex_run_warnings() {
     let warnings = v["vex"]["warnings"]
         .as_array()
         .unwrap_or_else(|| panic!("{v}"));
-    assert_eq!(warnings.len(), 1, "{v}");
-    assert_eq!(warnings[0]["code"], "product_not_iri", "{v}");
+    // v5.0: a hosted attestation always leads with `vex_hosted_unverified`
+    // (its pins are attested from their records, not hash-verified).
+    assert_eq!(warnings.len(), 2, "{v}");
+    assert_eq!(warnings[0]["code"], "vex_hosted_unverified", "{v}");
+    assert_eq!(warnings[1]["code"], "product_not_iri", "{v}");
     assert_eq!(
-        warnings[0]["detail"],
+        warnings[1]["detail"],
         "Product override \"consumer\" (--vex-product) is neither a PURL (pkg:...) nor an \
          absolute IRI; it is emitted verbatim as the OpenVEX product @id, which the spec \
          requires to be an IRI — strict consumers may reject the document. Prefer \
@@ -2099,7 +2140,13 @@ async fn json_vex_block_carries_the_vex_run_warnings() {
         &[],
     );
     assert_eq!(code, 0, "{v}");
-    assert!(v["vex"].get("warnings").is_none(), "{v}");
+    let codes: Vec<&str> = v["vex"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{v}"))
+        .iter()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert_eq!(codes, ["vex_hosted_unverified"], "{v}");
 }
 
 /// Human Rush run: the `redirect_rush_repo_state_stale` detail reaches
@@ -2491,16 +2538,17 @@ async fn vlt_takeover_refusal_before_revert() {
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[]);
 
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    assert_eq!(hosted_pinned(&doc), 0, "{doc:#}");
     assert!(
-        doc["redirect"]["skipped"].as_array().is_some_and(|s| s
+        Some(&hosted_skipped(&doc)).is_some_and(|s| s
             .iter()
             .any(|e| e["purl"] == PURL && e["reason"] == "vendored_revert_failed")),
         "{doc:#}"
     );
     assert!(warning_detail(&doc, "redirect_vendored_revert_failed").contains("vlt-lock.json"));
-    assert!(!codes_in(&doc["redirect"]["warnings"])
-        .contains(&"redirect_takeover_reverted_vendored".to_string()));
+    assert!(
+        !codes_in(&doc["warnings"]).contains(&"redirect_takeover_reverted_vendored".to_string())
+    );
     assert_eq!(
         std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
         state_before
@@ -2578,8 +2626,7 @@ async fn vlt_decides_before_binary_bun_and_a_refused_uuid_is_never_confirmed() {
 
     let (refused, tmp) = run(true);
     assert!(
-        codes_in(&refused["redirect"]["warnings"])
-            .contains(&"redirect_vlt_unsupported_lock_key".to_string()),
+        codes_in(&refused["warnings"]).contains(&"redirect_vlt_unsupported_lock_key".to_string()),
         "{refused:#}"
     );
     assert!(
@@ -2589,11 +2636,11 @@ async fn vlt_decides_before_binary_bun_and_a_refused_uuid_is_never_confirmed() {
             .contains(&json!("bun.lockb")),
         "the binary lock is still rewritten: {refused:#}"
     );
-    assert_eq!(refused["redirect"]["redirected"], 0, "{refused:#}");
+    assert_eq!(hosted_pinned(&refused), 0, "{refused:#}");
     drop(tmp);
 
     let (confirmed, _tmp) = run(false);
-    assert_eq!(confirmed["redirect"]["redirected"], 1, "{confirmed:#}");
+    assert_eq!(hosted_pinned(&confirmed), 1, "{confirmed:#}");
 }
 
 /// REGRESSION (#899): npm 12 never reads npm-shrinkwrap.json. A project
@@ -2630,7 +2677,7 @@ async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
         &[],
     );
     // Still redirected: npm <= 11 installs from the shrinkwrap.
-    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
     let lock = std::fs::read_to_string(tmp.path().join("npm-shrinkwrap.json")).unwrap();
     assert!(lock.contains(HOSTED_URL), "{lock}");
     assert!(
@@ -2675,8 +2722,7 @@ async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
     );
     assert_eq!(code, 0, "{doc:#}");
     assert!(
-        !codes_in(&doc["redirect"]["warnings"])
-            .contains(&"redirect_npm_shrinkwrap_only".to_string()),
+        !codes_in(&doc["warnings"]).contains(&"redirect_npm_shrinkwrap_only".to_string()),
         "{doc:#}"
     );
     assert_eq!(doc["vex"]["statements"], 1, "{doc:#}");
@@ -2717,6 +2763,59 @@ fn write_yarn_classic_project(root: &Path, package_manager: Option<&str>) {
     .unwrap();
 }
 
+/// A granted reference whose tarball the mock serves (a yarn classic pin
+/// reads it, #558 / #591), with the grant's hashes matching it; returns its
+/// URL.
+async fn mock_served_classic_reference(server: &MockServer) -> String {
+    use base64::Engine as _;
+    use sha1::Digest as _;
+    let manifest = format!(r#"{{"name":"{NAME}","version":"{VERSION}"}}"#);
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "package/package.json", manifest.as_bytes())
+        .unwrap();
+    let tgz = builder.into_inner().unwrap().finish().unwrap();
+    let artifact = format!("/patch/npm/{NAME}/{VERSION}/22222222-2222-4222-8222-222222222222/{UUID}/{NAME}-{VERSION}.tgz");
+    let url = format!("{}{artifact}", server.uri());
+    mock_reference_results(
+        server,
+        json!({
+            UUID: {
+                "status": "granted",
+                "url": url,
+                "purl": PURL,
+                "artifacts": [{
+                    "kind": "tarball",
+                    "url": url,
+                    "integrity": {
+                        "sha512": format!(
+                            "sha512-{}",
+                            base64::engine::general_purpose::STANDARD
+                                .encode(sha2::Sha512::digest(&tgz))
+                        ),
+                        "sha1": hex::encode(sha1::Sha1::digest(&tgz)),
+                    }
+                }],
+                "registryOverride": null
+            }
+        }),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(artifact))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
+        .mount(server)
+        .await;
+    url
+}
+
 /// #907: a hosted pin in a classic yarn.lock is dropped by the next yarn 2+
 /// (berry) install exactly like vendored wiring, so `scan --mode hosted`
 /// must warn `redirect_yarn_classic_berry_migration_risk` — on a dry run, on
@@ -2727,7 +2826,7 @@ async fn hosted_yarn_classic_pin_warns_berry_migration_risk() {
     for package_manager in [None, Some("yarn@4.18.1")] {
         let server = MockServer::start().await;
         mock_discovery(&server, PURL, UUID).await;
-        mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+        let hosted_url = mock_served_classic_reference(&server).await;
         mock_view(&server, UUID, PURL).await;
         let tmp = tempfile::tempdir().unwrap();
         write_yarn_classic_project(tmp.path(), package_manager);
@@ -2739,7 +2838,7 @@ async fn hosted_yarn_classic_pin_warns_berry_migration_risk() {
         ] {
             let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), extra, &[]);
             assert_eq!(code, 0, "{package_manager:?} {label}: {doc:#}");
-            let codes = codes_in(&doc["redirect"]["warnings"]);
+            let codes = codes_in(&doc["warnings"]);
             assert_eq!(
                 codes
                     .iter()
@@ -2753,7 +2852,7 @@ async fn hosted_yarn_classic_pin_warns_berry_migration_risk() {
         }
         let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
         assert!(
-            lock.contains(HOSTED_URL),
+            lock.contains(&hosted_url),
             "the warning never blocks the pin: {lock}"
         );
     }
@@ -2766,14 +2865,14 @@ async fn hosted_yarn_classic_pin_warns_berry_migration_risk() {
 async fn hosted_yarn_classic_pin_with_yarn1_package_manager_stays_silent() {
     let server = MockServer::start().await;
     mock_discovery(&server, PURL, UUID).await;
-    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    let hosted_url = mock_served_classic_reference(&server).await;
     mock_view(&server, UUID, PURL).await;
     let tmp = tempfile::tempdir().unwrap();
     write_yarn_classic_project(tmp.path(), Some("yarn@1.22.22"));
 
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    let codes = codes_in(&doc["redirect"]["warnings"]);
+    let codes = codes_in(&doc["warnings"]);
     assert!(
         !codes
             .iter()
@@ -2781,5 +2880,5 @@ async fn hosted_yarn_classic_pin_with_yarn1_package_manager_stays_silent() {
         "a yarn 1 pin suppresses the advisory: {codes:?}"
     );
     let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
-    assert!(lock.contains(HOSTED_URL), "{lock}");
+    assert!(lock.contains(&hosted_url), "{lock}");
 }

@@ -1287,8 +1287,11 @@ pub fn embedded_rescan_of_a_manifest_less_checkout(flavors: &[Flavor]) {
         );
         if mode == Mode::Vendored {
             assert_eq!(code, Some(1), "{what}: {env}\n{stderr}");
-            assert_eq!(
-                env["vendor"]["events"][0]["errorCode"], "vendor_ledger_entry_missing",
+            assert!(
+                env["events"]
+                    .as_array()
+                    .is_some_and(|e| e.iter().any(|e| e["action"] == "failed"
+                        && e["errorCode"] == "vendor_ledger_entry_missing")),
                 "{env}"
             );
             assert!(!vex_out.exists(), "failed scan cannot emit VEX");

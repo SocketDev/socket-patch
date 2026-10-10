@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::pnpm_layout::MODULES_YAML as PNPM_MODULES_YAML;
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
 use crate::formats::text::strip_bom;
@@ -42,7 +43,8 @@ const SKIP_DIRS: &[&str] = &[
 ///   store and the projects' own `node_modules` hold only links to their
 ///   direct deps.
 ///
-/// - pnpm's `modulesDir` (see [`pnpm_modules_dirs`]): pnpm installs the
+/// - pnpm's `modulesDir` (see
+///   [`super::pnpm_layout::configured_modules_dirs`]): pnpm installs the
 ///   project there instead of `node_modules`, and from pnpm 10.12 its
 ///   virtual store follows (`<modulesDir>/.pnpm`), so nothing of the
 ///   install is under a dir named `node_modules` (#661).
@@ -56,91 +58,17 @@ pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     if start_path.join("rush.json").is_file() {
         roots.push(start_path.join("common").join("temp").join("node_modules"));
     }
-    roots.extend(pnpm_modules_dirs(start_path));
+    roots.extend(super::pnpm_layout::configured_modules_dirs(start_path));
     roots.retain(|root| root.is_dir());
     let mut seen = HashSet::new();
     roots.retain(|root| seen.insert(root.clone()));
     roots
 }
 
-/// The project's pnpm `modulesDir` install roots, other than
-/// `node_modules` itself:
-/// - the configured setting ([`pnpm_modules_dir_setting`]), resolved
-///   against the project like pnpm does, and honored only strictly inside
-///   it (the value comes from the scanned project and names a tree apply
-///   WRITES into; see [`resolve_modules_folder`]);
-/// - any direct child dir holding pnpm's `.modules.yaml` install record,
-///   which pnpm writes into whatever modules dir it used. That finds an
-///   install whose `modulesDir` came from pnpm's global config or the
-///   environment, which the project's files do not show.
-fn pnpm_modules_dirs(start_path: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(dir) =
-        pnpm_modules_dir_setting(start_path).and_then(|raw| resolve_modules_folder(&[], &raw))
-    {
-        dirs.push(start_path.join(dir));
-    }
-    let Some((entries, _)) = read_dir_entries_sync(start_path) else {
-        return dirs;
-    };
-    for entry in entries {
-        let name = entry.file_name();
-        if name == OsStr::new("node_modules") || !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let dir = start_path.join(name);
-        if std::fs::symlink_metadata(dir.join(PNPM_MODULES_YAML)).is_ok_and(|m| m.is_file()) {
-            dirs.push(dir);
-        }
-    }
-    dirs
-}
-
-/// The raw pnpm `modulesDir` setting that applies to the project at
-/// `start_path`: `modulesDir:` in the nearest `pnpm-workspace.yaml` at or
-/// above it (the workspace's settings file on pnpm 10+, which wins over
-/// `.npmrc`), else `modules-dir` from the nearest `.npmrc` at or above it
-/// that sets it (pnpm up to 10). Read with
-/// [`crate::utils::fs::read_regular_to_string_sync`]: the files belong to
-/// the (untrusted) project.
-fn pnpm_modules_dir_setting(start_path: &Path) -> Option<String> {
-    let read = |path: PathBuf| crate::utils::fs::read_regular_to_string_sync(&path).ok();
-    let from_workspace = start_path
-        .ancestors()
-        .find_map(|dir| read(dir.join("pnpm-workspace.yaml")))
-        .and_then(|yaml| {
-            crate::formats::text::strip_bom(&yaml)
-                .lines()
-                .filter_map(crate::formats::pnpm::workspace::top_level_key)
-                .rfind(|(key, _)| key == "modulesDir")
-                .map(|(_, value)| unquote_yaml_scalar(value))
-        });
-    from_workspace
-        .or_else(|| {
-            start_path.ancestors().find_map(|dir| {
-                let npmrc = read(dir.join(".npmrc"))?;
-                crate::patch::redirect::npmrc::npmrc_top_level_value(&npmrc, "modules-dir")
-            })
-        })
-        .filter(|value| !value.is_empty())
-}
-
-/// A YAML flow scalar's value: quotes removed (`''` is a literal quote
-/// inside single quotes), a plain scalar as is.
-fn unquote_yaml_scalar(raw: &str) -> String {
-    if raw.starts_with('"') {
-        if let Ok(value) = serde_json::from_str::<String>(raw) {
-            return value;
-        }
-    } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-        return inner.replace("''", "'");
-    }
-    raw.to_string()
-}
-
 /// Whether the installed pnpm tree of the project at `project` keeps its
 /// virtual store where the crawler does not look: a `.modules.yaml` in
-/// `node_modules` or a pnpm modules dir ([`pnpm_modules_dirs`]) records a
+/// `node_modules` or a pnpm modules dir
+/// ([`super::pnpm_layout::configured_modules_dirs`]) records a
 /// `virtualStoreDir` outside the project, as pnpm's global virtual store
 /// (`enableGlobalVirtualStore`) and a `virtualStoreDir` that climbs out
 /// do. Only direct deps are linked into the project then, so a package
@@ -148,7 +76,7 @@ fn unquote_yaml_scalar(raw: &str) -> String {
 /// and must not be read as absent (#696). `false` with no pnpm install.
 pub fn pnpm_store_outside_project(project: &Path) -> bool {
     let mut modules_dirs = vec![project.join("node_modules")];
-    modules_dirs.extend(pnpm_modules_dirs(project));
+    modules_dirs.extend(super::pnpm_layout::configured_modules_dirs(project));
     modules_dirs.iter().any(|nm| {
         let Ok(text) = crate::utils::fs::read_regular_to_string_sync(&nm.join(PNPM_MODULES_YAML))
         else {
@@ -242,7 +170,7 @@ fn yarnrc_modules_folder(start_path: &Path) -> Option<String> {
 /// resolved lexically, and a value that is absolute, drive-qualified, or
 /// resolves outside the project or to the project itself fails closed —
 /// the project then discovers nothing there, as before.
-fn resolve_modules_folder(project_in_rc_dir: &[String], raw: &str) -> Option<String> {
+pub(super) fn resolve_modules_folder(project_in_rc_dir: &[String], raw: &str) -> Option<String> {
     if raw.starts_with(['/', '\\']) {
         return None;
     }
@@ -670,6 +598,55 @@ fn live_bun_store_entries_sync(
         return Some(quick);
     }
     walk(None, None)
+}
+
+/// The packages pnpm's current lockfile (`<virtual store>/lock.yaml`,
+/// rewritten on every install) says the install uses; `None` when there
+/// is none or it cannot be read in full, and then no entry is dropped.
+fn pnpm_current_lockfile_sync(
+    store_path: &Path,
+) -> Option<crate::formats::pnpm::InstalledPackages> {
+    let text = crate::utils::fs::read_regular_to_string_sync(&store_path.join("lock.yaml")).ok()?;
+    crate::formats::pnpm::InstalledPackages::from_lock_text(&text)
+}
+
+/// Whether the pnpm store entry `entry_name` is an orphan (#1197): pnpm
+/// 7–11 keep a removed or upgraded-away package's entry until
+/// `modules-cache-max-age` (7 days) expires and pnpm 12 until `pnpm prune`,
+/// with nothing linking to it. It is one when the package it holds — named
+/// by the entry (a registry `name@version` entry, or a `name@file+…`
+/// tarball entry) and confirmed by its package.json — is not in the
+/// current lockfile. An entry that cannot be named or read stays.
+fn orphaned_pnpm_store_entry_sync(
+    store_path: &Path,
+    entry_name: &str,
+    installed: &crate::formats::pnpm::InstalledPackages,
+) -> bool {
+    let (name, version) = match decode_pnpm_store_entry_name(entry_name) {
+        Some((name, version)) => (name, Some(version)),
+        None => match entry_name.get(1..).and_then(|rest| rest.find("@file+")) {
+            Some(at) => (entry_name[..at + 1].replace('+', "/"), None),
+            None => return false,
+        },
+    };
+    // The common case, a live registry entry, costs no read.
+    if version
+        .as_deref()
+        .is_some_and(|version| installed.contains(&name, version))
+    {
+        return false;
+    }
+    let manifest = store_path
+        .join(entry_name)
+        .join("node_modules")
+        .join(&name)
+        .join("package.json");
+    let Some((found_name, found_version)) = read_package_json_sync(&manifest) else {
+        return false;
+    };
+    found_name == name
+        && version.is_none_or(|version| version == found_version)
+        && !installed.contains(&name, &found_version)
 }
 
 /// What [`live_bun_store_entries_sync`] found, by index into the
@@ -1302,10 +1279,6 @@ fn decode_npm_store_entry_name(entry_name: &str) -> Option<(String, String)> {
     }
     Some((key[..at].to_string(), version.to_string()))
 }
-
-/// The `node_modules` child in which pnpm records its install state,
-/// including where the virtual store lives.
-const PNPM_MODULES_YAML: &str = ".modules.yaml";
 
 /// The `virtualStoreDir` value of a `.modules.yaml`: JSON on pnpm 10+,
 /// YAML before (a top-level `virtualStoreDir:` scalar, maybe quoted).
@@ -3168,7 +3141,12 @@ impl NpmCrawler {
             events.extend(Self::gather_store_entries(entries));
         }
         if let Some(store_path) = relocated_pnpm_store {
-            let entries = Self::list_pnpm_store_entries_sync(&store_path, true);
+            let entries = Self::list_pnpm_shaped_store_entries_sync(
+                &store_path,
+                StoreLayout::Pnpm,
+                true,
+                true,
+            );
             events.extend(Self::gather_store_entries(entries));
         }
         if !global_store_entries.is_empty() {
@@ -3404,7 +3382,9 @@ impl NpmCrawler {
     /// (see [`PNPM_SHAPED_STORES`]), entry names decoded under `layout`.
     ///
     /// With `live_only` (the scan) a Bun store's orphaned entries are
-    /// skipped (see [`live_bun_store_entries_sync`]); the resolver and the
+    /// skipped (see [`live_bun_store_entries_sync`]), and so are the pnpm
+    /// store entries its current lockfile no longer installs (see
+    /// [`orphaned_pnpm_store_entry_sync`]); the resolver and the
     /// peer-variant finder keep them, since rollback must still restore a
     /// patched orphan a later install can re-link.
     fn list_pnpm_shaped_store_entries_sync(
@@ -3415,8 +3395,17 @@ impl NpmCrawler {
     ) -> Vec<StoreEntryDir> {
         let decode = |name: &str| layout.decode_pnpm_shaped(name);
         let candidates = pnpm_shaped_store_candidates_sync(store_path, layout);
-        // pnpm prunes its store on install; Bun never does (#599), so the
-        // scan, a judgement of the live install, skips its orphans.
+        // Bun never prunes its store (#599), and pnpm 7–12 keep a removed
+        // or upgraded-away entry for a while (#1197), so the scan, a
+        // judgement of the live install, skips their orphans.
+        let mut candidates = candidates;
+        if layout == StoreLayout::Pnpm && live_only {
+            if let Some(installed) = pnpm_current_lockfile_sync(store_path) {
+                candidates.retain(|entry| {
+                    !orphaned_pnpm_store_entry_sync(store_path, &entry.name_str, &installed)
+                });
+            }
+        }
         let live = (layout == StoreLayout::Bun && live_only)
             .then(|| live_bun_store_entries_sync(store_path, &candidates))
             .flatten();
@@ -6760,6 +6749,100 @@ mod tests {
         let candidates = pnpm_shaped_store_candidates_sync(&store, StoreLayout::Bun);
         assert_eq!(candidates.len(), 2);
         assert!(live_bun_store_entries_sync(&store, &candidates).is_none());
+    }
+
+    /// #1197: pnpm 7–11 keep a removed (or upgraded-away) package's
+    /// `.pnpm/<name>@<version>` entry for days, and pnpm 12 keeps an
+    /// upgraded-away one until `pnpm prune`. The current lockfile pnpm
+    /// writes beside the entries (`.pnpm/lock.yaml`) no longer lists it, so
+    /// the scan skips it; a vendored entry it lists by its `version:` stays,
+    /// as does every entry when there is no current lockfile. Restoring
+    /// operations still reach the orphan.
+    #[tokio::test]
+    async fn test_pnpm_store_entries_the_current_lockfile_drops_are_not_scanned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".pnpm");
+        std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let number = store.join("is-number@7.0.0/node_modules/is-number");
+        write_pkg(&number, "is-number", "7.0.0");
+        link_dir(&number, &nm.join("is-number"));
+        let vendored =
+            store.join("@s+lp@file+.socket+vendor+npm+u+s-lp-1.0.0.tgz/node_modules/@s/lp");
+        write_pkg(&vendored, "@s/lp", "1.0.0");
+        std::fs::create_dir_all(nm.join("@s")).unwrap();
+        link_dir(&vendored, &nm.join("@s/lp"));
+        // Orphans: a removed package, an upgraded-away version and a
+        // vendored entry of the old version.
+        let removed = store.join("left-pad@1.3.0/node_modules/left-pad");
+        write_pkg(&removed, "left-pad", "1.3.0");
+        let old = store.join("@s+lp@0.9.0/node_modules/@s/lp");
+        write_pkg(&old, "@s/lp", "0.9.0");
+        let old_vendored = store.join("ms@file+.socket+vendor+npm+v+ms-2.1.3.tgz/node_modules/ms");
+        write_pkg(&old_vendored, "ms", "2.1.3");
+        let ms = store.join("ms@2.1.2/node_modules/ms");
+        write_pkg(&ms, "ms", "2.1.2");
+        link_dir(&ms, &nm.join("ms"));
+
+        let unfiltered = scan_paths(&root).await;
+        for orphan in [&removed, &old, &old_vendored] {
+            assert!(
+                unfiltered.iter().any(|(_, path)| path == orphan),
+                "no current lockfile, nothing dropped: {unfiltered:?}"
+            );
+        }
+
+        std::fs::write(
+            store.join("lock.yaml"),
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      \
+             is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n\n  \
+             '@s/lp@file:.socket/vendor/npm/u/s-lp-1.0.0.tgz':\n    resolution: {integrity: \
+             sha512-x, tarball: file:.socket/vendor/npm/u/s-lp-1.0.0.tgz}\n    version: 1.0.0\n\n  \
+             is-number@7.0.0:\n    resolution: {integrity: sha512-y}\n\n  \
+             ms@2.1.2:\n    resolution: {integrity: sha512-z}\n\nsnapshots:\n\n  \
+             '@s/lp@file:.socket/vendor/npm/u/s-lp-1.0.0.tgz': {}\n\n  is-number@7.0.0: {}\n\n  \
+             ms@2.1.2: {}\n",
+        )
+        .unwrap();
+        let scanned = scan_paths(&root).await;
+        assert_eq!(
+            scanned,
+            vec![
+                ("pkg:npm/@s/lp@1.0.0".to_string(), nm.join("@s/lp")),
+                ("pkg:npm/is-number@7.0.0".to_string(), nm.join("is-number")),
+                ("pkg:npm/ms@2.1.2".to_string(), nm.join("ms")),
+            ]
+        );
+
+        // The pnpm 7 (v5.4) and pnpm 8 (v6.0) key grammars read the same.
+        for packages in [
+            "packages:\n\n  /is-number/7.0.0:\n    resolution: {integrity: sha512-y}\n\n  \
+             /ms/2.1.2:\n    resolution: {integrity: sha512-z}\n\n  \
+             file:.socket/vendor/npm/u/s-lp-1.0.0.tgz:\n    resolution: {integrity: sha512-x}\n    \
+             name: '@s/lp'\n    version: 1.0.0\n",
+            "packages:\n\n  /is-number@7.0.0:\n    resolution: {integrity: sha512-y}\n\n  \
+             /ms@2.1.2:\n    resolution: {integrity: sha512-z}\n\n  \
+             file:.socket/vendor/npm/u/s-lp-1.0.0.tgz:\n    resolution: {integrity: sha512-x}\n    \
+             name: '@s/lp'\n    version: 1.0.0\n",
+        ] {
+            std::fs::write(
+                store.join("lock.yaml"),
+                format!("lockfileVersion: '6.0'\n\n{packages}"),
+            )
+            .unwrap();
+            assert_eq!(scan_paths(&root).await, scanned, "{packages}");
+        }
+
+        // Restoring operations still reach the orphan.
+        let purls = vec!["pkg:npm/left-pad@1.3.0".to_string()];
+        let found = NpmCrawler::new().find_by_purls(&nm, &purls).await.unwrap();
+        assert_eq!(
+            found
+                .get("pkg:npm/left-pad@1.3.0")
+                .map(|copies| copies.iter().map(|p| p.path.clone()).collect::<Vec<_>>()),
+            Some(vec![removed.clone()])
+        );
     }
 
     /// #599: Bun never prunes `.bun`. After an in-place `bun install` that

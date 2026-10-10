@@ -230,6 +230,17 @@ pub enum Shape {
     Other,
 }
 
+/// The committed vendor trees a plan for `shape` writes into.
+pub(crate) fn shape_trees(shape: Shape) -> &'static [&'static str] {
+    match shape {
+        Shape::MavenReactor | Shape::Sbt => &[layout::MAVEN2_TREE],
+        Shape::Gradle => &[layout::GRADLE_TREE],
+        Shape::Mixed => &[layout::MAVEN2_TREE, layout::GRADLE_TREE],
+        Shape::ScalaCli => &[layout::COURSIER_TREE],
+        Shape::Other => &[],
+    }
+}
+
 /// A planned file: project-relative forward-slash path and its full new
 /// bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,12 +383,28 @@ pub fn plan_with_config(
     patch: &JvmPatch<'_>,
     config_enabled: bool,
 ) -> Result<JvmPlan, JvmRefusal> {
+    plan_with_external(shape, read, list, patch, config_enabled, None)
+}
+
+/// [`plan_with_config`] weighing the management a Maven pin would
+/// override from outside the checkout (see
+/// [`maven_reactor::plan_with_external`]).
+pub fn plan_with_external(
+    shape: Shape,
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    patch: &JvmPatch<'_>,
+    config_enabled: bool,
+    external: Option<&maven_reactor::ExternalPoms>,
+) -> Result<JvmPlan, JvmRefusal> {
     match shape {
-        Shape::MavenReactor => maven_reactor::plan_with_config(read, patch, config_enabled),
+        Shape::MavenReactor => {
+            maven_reactor::plan_with_external(read, patch, config_enabled, external)
+        }
         Shape::Gradle => gradle::plan(read, list, patch),
         Shape::Mixed => {
             // Both halves or neither: a refusal of either writes nothing.
-            let maven = maven_reactor::plan_with_config(read, patch, config_enabled)?;
+            let maven = maven_reactor::plan_with_external(read, patch, config_enabled, external)?;
             let gradle = gradle::plan(read, list, patch)?;
             Ok(compose(maven, gradle))
         }
@@ -573,6 +600,7 @@ pub(crate) fn eol_blind(rel: &str) -> bool {
         gradle::SCRIPT_REL,
         gradle::INDEX_REL,
         gradle::GITATTRIBUTES_REL,
+        gradle::GITIGNORE_REL,
         gradle::SCRIPT_GITATTRIBUTES_REL,
         gradle::VENDOR_GITATTRIBUTES_REL,
         maven_reactor::GITATTRIBUTES_REL,
@@ -955,6 +983,54 @@ mod tests {
         assert!(out.success && out.warnings.is_empty(), "{out:?}");
         assert_eq!(testing::snapshot(root), pristine);
         assert_eq!(testing::dirs(root), pristine_dirs);
+    }
+
+    /// #488: `vendor --check` weighs an imported BOM from the local
+    /// repository. A BOM it cannot read accepts the pin `vendor` wrote; a
+    /// BOM bumped to another version of the artifact reports the pin as
+    /// drift (the next `vendor` drops it).
+    #[tokio::test]
+    async fn check_weighs_an_imported_bom_from_the_local_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let repo = dir.path().join("m2");
+        let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.x</groupId>\n  \
+            <artifactId>app</artifactId>\n  <version>1</version>\n  <dependencyManagement>\n    \
+            <dependencies>\n      <dependency>\n        <groupId>com.corp</groupId>\n        \
+            <artifactId>corp-bom</artifactId>\n        <version>2</version>\n        \
+            <type>pom</type>\n        <scope>import</scope>\n      </dependency>\n    \
+            </dependencies>\n  </dependencyManagement>\n  <dependencies>\n    <dependency>\n      \
+            <groupId>org.apache.commons</groupId>\n      <artifactId>commons-text</artifactId>\n    \
+            </dependency>\n  </dependencies>\n</project>\n";
+        testing::populate(&root, &[("pom.xml", pom)]);
+        let mut ledger = std::collections::BTreeMap::new();
+        let p = mixed_patch();
+        // Vendored where the BOM managed the base version: pinned.
+        testing::vendor(&root, Shape::MavenReactor, &p, &mut ledger)
+            .await
+            .unwrap();
+        let entry = ledger.values().next().unwrap().clone();
+        assert!(std::fs::read_to_string(root.join("pom.xml"))
+            .unwrap()
+            .contains(&p.suffixed_version()));
+        apply::check_entry(&root, &entry, None).expect("no local BOM: the pin is accepted");
+        apply::check_entry(&root, &entry, Some(&repo)).expect("BOM absent from the repository");
+        let bom_dir = repo.join("com/corp/corp-bom/2");
+        std::fs::create_dir_all(&bom_dir).unwrap();
+        let bom = |version: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>com.corp</groupId>\
+                 <artifactId>corp-bom</artifactId><version>2</version><packaging>pom</packaging>\
+                 <dependencyManagement><dependencies><dependency><groupId>org.apache.commons\
+                 </groupId><artifactId>commons-text</artifactId><version>{version}</version>\
+                 </dependency></dependencies></dependencyManagement></project>"
+            )
+        };
+        std::fs::write(bom_dir.join("corp-bom-2.pom"), bom("1.10.0")).unwrap();
+        apply::check_entry(&root, &entry, Some(&repo)).expect("the BOM manages the base");
+        std::fs::write(bom_dir.join("corp-bom-2.pom"), bom("1.11.0")).unwrap();
+        let drift = apply::check_entry(&root, &entry, Some(&repo)).unwrap_err();
+        assert!(drift.contains("drifted"), "{drift}");
     }
 
     /// #395: a refusal by either half writes nothing for the other.

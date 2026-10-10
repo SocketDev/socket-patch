@@ -81,7 +81,8 @@ pub enum NpmPkgManager {
 /// 2. `node_modules/.vlt/` is a directory, or `node_modules/.vlt-lock.json`
 ///    is a file → vlt.
 /// 3. `bun.lock` or `bun.lockb` (+ `node_modules/`) → bun.
-/// 4. `node_modules/.modules.yaml` or `node_modules/.pnpm/` → pnpm.
+/// 4. `.modules.yaml` or `.pnpm/` in `node_modules/` or the configured
+///    `modulesDir` → pnpm.
 /// 5. `yarn.lock` (without PnP markers) + `node_modules/` → yarn classic.
 /// 6. `node_modules/` exists → npm.
 /// 7. Otherwise → unknown.
@@ -140,8 +141,9 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
         return NpmPkgManager::Bun;
     }
 
-    // 4. pnpm — markers live inside node_modules/.
-    if node_modules.join(".modules.yaml").is_file() || node_modules.join(".pnpm").is_dir() {
+    // 4. pnpm — markers live inside node_modules/ or the configured
+    //    modules dir (`modulesDir`, #1129).
+    if super::pnpm_layout::installed_store(project_root) {
         return NpmPkgManager::Pnpm;
     }
 
@@ -294,9 +296,10 @@ pub fn live_pnp_marker_with(
 /// verified against a real `pnpm install` with pnpm 10.28.2). The
 /// reclassification requires ALL of:
 ///
-/// * an installed pnpm store (`node_modules/.modules.yaml` or
-///   `node_modules/.pnpm/`) — a bare `pnpm-lock.yaml` left behind in a
-///   yarn-berry repo must not escape the refusal;
+/// * an installed pnpm store (`.modules.yaml` or `.pnpm/` in
+///   `node_modules/` or the configured `modulesDir`, see
+///   [`super::pnpm_layout::installed_store_in`]) — a bare `pnpm-lock.yaml`
+///   left behind in a yarn-berry repo must not escape the refusal;
 /// * `pnpm-lock.yaml` at the root — an installed store without pnpm's
 ///   lockfile is not attributable to pnpm's PnP mode;
 /// * NO `yarn.lock` — a tree carrying both lockfiles alongside the
@@ -314,9 +317,9 @@ pub(crate) fn pnpm_pnp_layout(project_root: &Path) -> bool {
 
 /// [`pnpm_pnp_layout`] over a [`crate::vendor::lock_inventory::ProjectView`].
 pub(crate) fn pnpm_pnp_layout_in(view: &crate::vendor::lock_inventory::ProjectView<'_>) -> bool {
-    (view.is_file("node_modules/.modules.yaml") || view.is_dir("node_modules/.pnpm"))
-        && view.is_file("pnpm-lock.yaml")
+    view.is_file("pnpm-lock.yaml")
         && !view.is_file("yarn.lock")
+        && super::pnpm_layout::installed_store_in(view)
 }
 
 /// The yarn Plug'n'Play loader of a project: the text of each loader file

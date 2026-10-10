@@ -361,35 +361,29 @@ fn write_vendor_ledger(
     state.entries.insert(
         purl.to_string(),
         VendorEntry {
-            ecosystem: eco.to_string(),
-            base_purl: purl.to_string(),
-            uuid: uuid.to_string(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: artifact_rel.to_string(),
-                sha256,
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: vec![WiringRecord {
-                file: wiring.0.to_string(),
-                kind: wiring.1.to_string(),
-                action: WiringAction::Rewritten,
-                key: None,
-                original: None,
-                new: None,
-            }],
-            lock: None,
-            took_over_go_patches: false,
             detached: true,
             record: Some(rec),
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                eco.to_string(),
+                purl.to_string(),
+                uuid.to_string(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: artifact_rel.to_string(),
+                    sha256,
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                vec![WiringRecord {
+                    file: wiring.0.to_string(),
+                    kind: wiring.1.to_string(),
+                    action: WiringAction::Rewritten,
+                    key: None,
+                    original: None,
+                    new: None,
+                }],
+            )
         },
     );
     fx.put(
@@ -1382,7 +1376,7 @@ fn nuget_scan_hosted_wiring_reattests_without_manifest_or_ledger() {
     let api = serve_hosted_api(golden, NUGET_PURL, NUGET_HOSTED_UUID, nuget_hosted_view());
     let (code, env, stderr) = scan_hosted_vex(&fx, &api);
     assert_eq!(code, Some(0), "scan --mode hosted --vex: {env}\n{stderr}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env}");
+    assert_eq!(hosted_pinned(&env), 1, "{env}");
     // The in-run VEX attests on the fresh pin (`assume_applied`: the
     // restore that consumes it has not run yet), never on the pristine
     // shared-folder copy.
@@ -1494,4 +1488,18 @@ fn nuget_apply_vex_attests_but_agent_mode_needs_the_manifest() {
     // And no lockfile/config wiring appeared from `apply`.
     assert!(!fx.cwd.join("nuget.config").exists());
     assert!(!fx.cwd.join("packages.lock.json").exists());
+}
+
+/// How many hosted pins the run wrote (v5.0: the `applied` / `verified`
+/// events with `details.mode: "hosted"`, formerly `redirect.redirected`).
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

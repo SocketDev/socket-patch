@@ -2,24 +2,6 @@
 //! and npm `allow-remote` auto-config planners and every warning text they
 //! emit, shared verbatim by the disk and in-memory engines.
 
-/// `scheme://[user[:pass]@]host[:port]/…` → `host[:port]`, NEVER userinfo.
-/// For user-facing messages that name where a lockfile now points — the
-/// hosted artifact host follows `--api-url`, so hardcoding `patch.socket.dev`
-/// would misname it in custom-server environments. The port is kept (it is
-/// part of the authority the lock records); credentials are stripped: a
-/// credentialed artifact URL (`https://user:secret@host/…`) must never leak
-/// `user:secret` into the warning text or the persisted `--json` envelope —
-/// both land in CI logs. Split by hand because this crate has no URL-parser
-/// dependency (reqwest is dev-only here); per RFC 3986 a raw `@` in the
-/// authority can ONLY be the userinfo terminator (it is percent-encoded
-/// everywhere else), so the tail after the LAST `@` is exactly host[:port].
-pub fn url_host(url: &str) -> Option<&str> {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    (!host.is_empty()).then_some(host)
-}
-
 /// Repo-relative path of the pnpm workspace manifest the trustLockfile
 /// auto-config edits (the same file the vendor backend's override surface
 /// uses).
@@ -257,15 +239,39 @@ pub fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) 
         (true, true) => "`trustLockfile: true` would be written to a new",
         (false, true) => "`trustLockfile: true` would be merged into the existing",
     };
+    let undo = format!("delete {PNPM_WORKSPACE_REL}");
+    trust_configured_detail(server, how, created.then_some(undo.as_str()), dry_run)
+}
+
+/// The auto-config variant for an existing pnpm-workspace.yaml with no keys
+/// ([`TrustPlan::Scaffold`]): the trust key went in with the root-only
+/// `packages` field, which makes the project a root-only workspace just as
+/// a created file does.
+pub fn pnpm_trust_scaffolded_detail(server: &str, dry_run: bool) -> String {
+    let how = if dry_run {
+        "`trustLockfile: true` (with the root-only `packages: ['.']` that pnpm \
+         8–10.4 require once the file holds a key) would be merged into the existing"
+    } else {
+        "`trustLockfile: true` (with the root-only `packages: ['.']` that pnpm \
+         8–10.4 require once the file holds a key) was merged into the existing"
+    };
+    let undo =
+        format!("remove the added `packages` and `trustLockfile` lines from {PNPM_WORKSPACE_REL}");
+    trust_configured_detail(server, how, Some(&undo), dry_run)
+}
+
+/// `undo` (set when the edit made the project a root-only workspace) names
+/// how to take the edit back.
+fn trust_configured_detail(server: &str, how: &str, undo: Option<&str>, dry_run: bool) -> String {
     // A created file makes the project a root-only workspace, where pnpm
     // 9.0–10.4 refuse `pnpm add` without `-w` (#734); a project pinned to
     // those releases never gets one, so the note names the pin as the way
     // out for an unpinned project with no install record.
-    let root_only = if created {
+    let root_only = if let Some(undo) = undo {
         let then = if dry_run {
             "before the real run".to_string()
         } else {
-            format!("then delete {PNPM_WORKSPACE_REL} and re-run")
+            format!("then {undo} and re-run")
         };
         format!(
             " On pnpm 9.0–10.4 a root-only workspace needs `pnpm add -w <pkg>` \
@@ -280,6 +286,26 @@ pub fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) 
     format!(
         "{}, so {how} {PNPM_WORKSPACE_REL} — commit it alongside the lock; \
          installs need no extra flags.{root_only} {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The keyless-workspace variant (#1096): pnpm-workspace.yaml holds no keys
+/// and the lock lists workspace members, which only pnpm <= 10.4 install
+/// from such a file (as every nested package). Those releases never read
+/// `trustLockfile` and refuse a workspace file holding a key without
+/// `packages`, while a root-only `packages` would drop the members, so
+/// nothing is written.
+pub fn pnpm_trust_keyless_members_detail(server: &str, dry_run: bool) -> String {
+    let was = if dry_run { "would be" } else { "was" };
+    format!(
+        "{}. {PNPM_WORKSPACE_REL} has no keys and pnpm-lock.yaml lists workspace \
+         members, which only pnpm <=10.4 installs from such a file; that pnpm does \
+         not read `trustLockfile` and refuses a workspace file holding keys but no \
+         `packages`, so nothing {was} written. After upgrading to pnpm >=11, list the \
+         members under `packages:` in {PNPM_WORKSPACE_REL} and re-run \
+         `socket-patch scan --mode hosted`, or install with \
+         `pnpm install --trust-lockfile`. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
     )
 }
@@ -318,6 +344,13 @@ pub enum TrustPlan {
     /// Workspace file exists without a `trustLockfile:` key: append exactly
     /// one line after the last non-empty line, every other byte preserved.
     Append(String),
+    /// Workspace file exists but holds no key at all (empty, comments only,
+    /// bare document markers — "no workspace" to pnpm): the root-only
+    /// `packages` scaffold goes in with the trust key, since pnpm 8.x–10.4
+    /// refuse a workspace file holding a key but no `packages` (#1096).
+    /// Every user byte is preserved, so rollback can take both back out
+    /// ([`TRUST_SCAFFOLD_LINES`]).
+    Scaffold(String),
     /// Already `trustLockfile: true` — nothing to write.
     AlreadyTrue,
     /// The user explicitly set `trustLockfile: <value>` (non-true). Their
@@ -330,6 +363,15 @@ pub enum TrustPlan {
     Unsupported(String),
 }
 
+/// The lines the trust auto-config writes into a file with no keys (and,
+/// newline-terminated, the whole file it creates): the root-only `packages`
+/// scaffold and the trust key.
+pub const TRUST_SCAFFOLD_LINES: [&str; 3] = [
+    crate::formats::pnpm::workspace::PACKAGES_SCAFFOLD[0],
+    crate::formats::pnpm::workspace::PACKAGES_SCAFFOLD[1],
+    "trustLockfile: true",
+];
+
 /// Decide how to ensure `trustLockfile: true` in pnpm-workspace.yaml.
 /// Line splices only (never a YAML library), mirroring the vendor backend's
 /// workspace surgery: untouched lines stay byte-identical, so a revert can
@@ -340,6 +382,16 @@ pub fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
         return TrustPlan::Create("packages:\n  - '.'\ntrustLockfile: true\n".to_string());
     };
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    if crate::formats::pnpm::workspace::is_keyless(text) {
+        // Several (empty) documents: a splice would land in the last one,
+        // while pnpm reads the first.
+        let anchor = match block_insert_point(&lines) {
+            Ok(anchor) => anchor,
+            Err(why) => return TrustPlan::Unsupported(why),
+        };
+        lines.splice(anchor..anchor, TRUST_SCAFFOLD_LINES.map(str::to_string));
+        return TrustPlan::Scaffold(lines.join("\n"));
+    }
     // Where the key would go — refused when the document is not a single
     // block mapping, so the scan for an existing key below is meaningful.
     let anchor = match block_insert_point(&lines) {

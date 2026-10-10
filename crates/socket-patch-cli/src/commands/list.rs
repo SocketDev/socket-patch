@@ -346,21 +346,10 @@ pub async fn run(args: ListArgs) -> i32 {
     let manifest = match &loaded.manifest {
         Ok(manifest) => manifest.as_ref(),
         Err(e) => {
-            // `InvalidData` (bad JSON or schema) is the contract's
-            // `manifest_invalid`; everything else is `manifest_unreadable`
-            // (see CLI_CONTRACT.md error-code table). Ledger records never
-            // mask either: a present-but-broken manifest is an error state.
-            let code = if e.kind() == std::io::ErrorKind::InvalidData {
-                "manifest_invalid"
-            } else {
-                "manifest_unreadable"
-            };
-            emit_error(
-                &args,
-                code,
-                crate::ui::manifest_error_message(&manifest_path, e),
-                Vec::new(),
-            );
+            // Ledger records never mask a present-but-broken manifest: it
+            // is an error state.
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, e);
+            emit_error(&args, &err.code, err.message, Vec::new());
             return 1;
         }
     };
@@ -404,6 +393,27 @@ pub async fn run(args: ListArgs) -> i32 {
             });
         } else if !args.common.silent {
             eprintln!("Warning: {}", crate::ui::sentence_case(detail));
+        }
+    }
+    // A hosted `resolutions` selector no lock installs any more (#1203) is
+    // no patch either: say how to retire it.
+    for pin in &inventory.stale {
+        // Named by file and purl, as the contested refusal names files: a
+        // hosted URL carries its grant token, which output never prints.
+        let detail = format!(
+            "{} keeps a hosted `resolutions` entry for {} that no lockfile installs any \
+             more; `socket-patch remove {}` removes that entry alone",
+            pin.files.join(", "),
+            pin.purl,
+            pin.purl
+        );
+        if args.common.json {
+            warnings.push(RunWarning {
+                code: "hosted_resolution_orphaned".to_string(),
+                detail,
+            });
+        } else if !args.common.silent {
+            eprintln!("Warning: {}", crate::ui::sentence_case(&detail));
         }
     }
     let vendor_state = crate::commands::vendor_state_lenient(&loaded.vendor, args.common.silent);

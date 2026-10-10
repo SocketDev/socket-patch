@@ -10,6 +10,14 @@
 //! install, so `yarn install --immutable` fails with YN0028.
 //!
 //! [`render_pinned_entry`] is the one place both writers build that entry.
+//!
+//! One difference is not a spelling: yarn's npm resolver adds an implicit
+//! `node-gyp: "npm:latest"` dependency to a registry entry whose manifest
+//! runs `node-gyp` in a script without declaring it (the registry injects
+//! `install: node-gyp rebuild` for any package shipping a `binding.gyp`).
+//! The tarball and `file:` resolvers read the tarball's manifest as is and
+//! add nothing, so the pin drops that dependency (#737), and the entries
+//! only it reached go with it (see [`super::berry_prune`]).
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -58,6 +66,96 @@ fn unscoped(name: &str) -> &str {
     }
 }
 
+/// The package name yarn's npm resolver adds as an implicit dependency.
+const NODE_GYP: &str = "node-gyp";
+
+/// The implicit dependency's line in an entry's `dependencies:` map.
+const IMPLICIT_NODE_GYP_LINE: &str = "    node-gyp: \"npm:latest\"";
+
+/// Whether `manifest` declares `node-gyp` itself (yarn reads
+/// `optionalDependencies` into `dependencies`).
+fn declares_node_gyp(manifest: &Value, fields: &[&str]) -> bool {
+    fields.iter().any(|field| {
+        manifest
+            .get(field)
+            .and_then(Value::as_object)
+            .is_some_and(|deps| deps.contains_key(NODE_GYP))
+    })
+}
+
+/// Whether yarn's npm resolver gives the registry version document
+/// `manifest` the implicit `node-gyp: "npm:latest"` dependency: a script
+/// mentions `node-gyp` (the registry's injected `node-gyp rebuild`, or a
+/// `node-gyp-build` hook), and the manifest declares no `node-gyp`
+/// dependency or peer dependency of its own.
+pub(crate) fn registry_adds_node_gyp(manifest: &Value) -> bool {
+    !declares_node_gyp(
+        manifest,
+        &["dependencies", "optionalDependencies", "peerDependencies"],
+    ) && manifest
+        .get("scripts")
+        .and_then(Value::as_object)
+        .is_some_and(|scripts| {
+            scripts
+                .values()
+                .any(|script| script.as_str().is_some_and(|s| s.contains(NODE_GYP)))
+        })
+}
+
+/// Whether an entry's lines (key first, or body only) carry the implicit
+/// `node-gyp: "npm:latest"` dependency line.
+pub(crate) fn has_implicit_node_gyp<S: AsRef<str>>(lines: &[S]) -> bool {
+    lines
+        .iter()
+        .any(|l| l.as_ref().trim_end_matches('\r') == IMPLICIT_NODE_GYP_LINE)
+}
+
+/// `lines` (an entry, key first) with the implicit `node-gyp: "npm:latest"`
+/// dependency added in yarn's (sorted) place, opening a `dependencies:` map
+/// in yarn's field order when the entry has none. Unchanged when the entry
+/// already depends on `node-gyp`.
+pub(crate) fn with_implicit_node_gyp(lines: &[String]) -> Vec<String> {
+    if lines.iter().any(|l| dependency_name(l) == Some(NODE_GYP)) {
+        return lines.to_vec();
+    }
+    let mut fields = split_fields(lines.iter().skip(1).map(String::as_str));
+    match fields.iter_mut().find(|(name, _)| name == "dependencies") {
+        Some((_, deps)) => {
+            let at = deps
+                .iter()
+                .skip(1)
+                .position(|l| dependency_name(l).is_some_and(|n| n > NODE_GYP))
+                .map_or(deps.len(), |i| i + 1);
+            deps.insert(at, IMPLICIT_NODE_GYP_LINE.to_string());
+        }
+        None => fields.push((
+            "dependencies".to_string(),
+            vec![
+                "  dependencies:".to_string(),
+                IMPLICIT_NODE_GYP_LINE.to_string(),
+            ],
+        )),
+    }
+    fields.sort_by(|(a, _), (b, _)| field_order(a).cmp(&field_order(b)));
+    let mut out: Vec<String> = lines.iter().take(1).cloned().collect();
+    out.extend(fields.into_iter().flat_map(|(_, lines)| lines));
+    out
+}
+
+/// The dependency name a `dependencies:` map line names (`    name: range`,
+/// the name unquoted).
+fn dependency_name(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("    ")?;
+    if rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let name = match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        None => rest.split(':').next()?,
+    };
+    (!name.is_empty()).then_some(name)
+}
+
 /// What a pin sets in the entry; everything else carries over from the
 /// registry entry.
 pub(crate) struct Pin<'a> {
@@ -67,30 +165,34 @@ pub(crate) struct Pin<'a> {
     pub resolution: &'a str,
     /// The new `checksum:` value. `None` keeps the registry entry's line.
     pub checksum: Option<&'a str>,
-    /// The tarball manifest's `bin` (see [`manifest_bin`]). `None` keeps the
-    /// registry entry's `bin:` section; an empty map drops it.
-    pub bin: Option<&'a BTreeMap<String, String>>,
+    /// The served tarball's own `package.json`. Its `bin` (see
+    /// [`manifest_bin`]) replaces the registry entry's `bin:` section (an
+    /// empty map drops it), and the registry's implicit `node-gyp`
+    /// dependency is dropped unless the manifest declares one. `None`
+    /// keeps both registry fields.
+    pub manifest: Option<&'a Value>,
 }
 
 /// The pinned entry's lines (no line endings), built from the registry
 /// entry's body lines (`registry_body`: every line after its key) the way
 /// yarn writes it: the pin's resolution, checksum and `bin:` in place of the
-/// registry's, `languageName` and `linkType` defaulted when the registry
-/// entry has none, and every field in yarn's order.
+/// registry's, the registry's implicit `node-gyp` dependency dropped,
+/// `languageName` and `linkType` defaulted when the registry entry has
+/// none, and every field in yarn's order.
 pub(crate) fn render_pinned_entry<S: AsRef<str>>(
     registry_body: &[S],
     pin: &Pin<'_>,
 ) -> Vec<String> {
-    let mut fields: Vec<(String, Vec<String>)> = Vec::new();
-    for line in registry_body.iter().map(AsRef::as_ref) {
-        match field_name(line) {
-            Some(name) => fields.push((name.to_string(), vec![line.to_string()])),
-            // A deeper-indented line belongs to the field above it; one
-            // before any field rides at the head of the body.
-            None => match fields.last_mut() {
-                Some((_, lines)) => lines.push(line.to_string()),
-                None => fields.push((String::new(), vec![line.to_string()])),
-            },
+    let mut fields = split_fields(registry_body.iter().map(AsRef::as_ref));
+    if let Some(manifest) = pin.manifest {
+        if !declares_node_gyp(manifest, &["dependencies", "optionalDependencies"]) {
+            for (name, lines) in fields.iter_mut() {
+                if name == "dependencies" {
+                    lines.retain(|l| l.trim_end_matches('\r') != IMPLICIT_NODE_GYP_LINE);
+                }
+            }
+            // A map left with only its header line is no map at all.
+            fields.retain(|(name, lines)| name != "dependencies" || lines.len() > 1);
         }
     }
     let mut set = |name: &str, lines: Vec<String>| {
@@ -106,7 +208,8 @@ pub(crate) fn render_pinned_entry<S: AsRef<str>>(
     if let Some(checksum) = pin.checksum {
         set("checksum", vec![format!("  checksum: {checksum}")]);
     }
-    if let Some(bin) = pin.bin {
+    if let Some(bin) = pin.manifest.map(manifest_bin) {
+        let bin = &bin;
         let mut lines = Vec::new();
         if !bin.is_empty() {
             lines.push("  bin:".to_string());
@@ -125,6 +228,23 @@ pub(crate) fn render_pinned_entry<S: AsRef<str>>(
     let mut out = vec![pin.key_line.to_string()];
     out.extend(fields.into_iter().flat_map(|(_, lines)| lines));
     out
+}
+
+/// An entry body's lines grouped by the field they belong to, in order.
+fn split_fields<'a>(body: impl Iterator<Item = &'a str>) -> Vec<(String, Vec<String>)> {
+    let mut fields: Vec<(String, Vec<String>)> = Vec::new();
+    for line in body {
+        match field_name(line) {
+            Some(name) => fields.push((name.to_string(), vec![line.to_string()])),
+            // A deeper-indented line belongs to the field above it; one
+            // before any field rides at the head of the body.
+            None => match fields.last_mut() {
+                Some((_, lines)) => lines.push(line.to_string()),
+                None => fields.push((String::new(), vec![line.to_string()])),
+            },
+        }
+    }
+    fields
 }
 
 /// A body line's field name when it opens a field (two-space indent).
@@ -191,7 +311,7 @@ mod tests {
                 key_line: "\"a@https://h/a-1.0.0.tgz\":",
                 resolution: "a@https://h/a-1.0.0.tgz",
                 checksum: Some("10c0/ab"),
-                bin: None,
+                manifest: None,
             },
         );
         assert_eq!(
@@ -225,7 +345,7 @@ mod tests {
                 key_line: "k:",
                 resolution: "r",
                 checksum: None,
-                bin: Some(&BTreeMap::new()),
+                manifest: Some(&json!({})),
             },
         );
         assert_eq!(
@@ -251,13 +371,130 @@ mod tests {
                 key_line: "k:",
                 resolution: "r",
                 checksum: Some("c"),
-                bin: None,
+                manifest: None,
             },
         );
         assert_eq!(
             &out[..3],
             ["k:", "    orphan-submap-line", "  version: 1.3.0"]
         );
+    }
+
+    /// #737: real yarn 4.12.0 output. The registry entry of nan@2.22.0
+    /// carries the npm resolver's implicit `node-gyp: "npm:latest"`; the
+    /// entry yarn writes for its tarball URL (here pinned through
+    /// `resolutions`) has none, because the tarball resolver reads the
+    /// manifest as is. bufferutil keeps its declared dependency.
+    #[test]
+    fn issue_737_pin_drops_the_registry_implicit_node_gyp() {
+        let nan = body(
+            "  version: 2.22.0\n  resolution: \"nan@npm:2.22.0\"\n  dependencies:\n    \
+             node-gyp: \"npm:latest\"\n  checksum: 10c0/d5\n  languageName: node\n  \
+             linkType: hard",
+        );
+        let url = "https://registry.npmjs.org/nan/-/nan-2.22.0.tgz";
+        let key = format!("\"nan@{url}\":");
+        let resolution = format!("nan@{url}");
+        let manifest = json!({"name": "nan", "version": "2.22.0", "scripts": {
+            "rebuild-tests": "node-gyp rebuild --directory test"}});
+        let pin = Pin {
+            key_line: &key,
+            resolution: &resolution,
+            checksum: Some("10c0/d5"),
+            manifest: Some(&manifest),
+        };
+        assert_eq!(
+            render_pinned_entry(&nan, &pin).join("\n"),
+            format!(
+                "{key}\n  version: 2.22.0\n  resolution: \"{resolution}\"\n  \
+                 checksum: 10c0/d5\n  languageName: node\n  linkType: hard"
+            )
+        );
+
+        let bufferutil = body(
+            "  version: 4.0.8\n  resolution: \"bufferutil@npm:4.0.8\"\n  dependencies:\n    \
+             node-gyp: \"npm:latest\"\n    node-gyp-build: \"npm:^4.3.0\"\n  checksum: 10c0/36\n  \
+             languageName: node\n  linkType: hard",
+        );
+        let manifest = json!({"name": "bufferutil", "scripts": {"install": "node-gyp-build"},
+            "dependencies": {"node-gyp-build": "^4.3.0"}});
+        let out = render_pinned_entry(
+            &bufferutil,
+            &Pin {
+                manifest: Some(&manifest),
+                ..pin
+            },
+        );
+        assert_eq!(
+            &out[3..5],
+            ["  dependencies:", "    node-gyp-build: \"npm:^4.3.0\""]
+        );
+        assert!(!has_implicit_node_gyp(&out), "{out:?}");
+
+        // A manifest declaring node-gyp keeps the line; no manifest keeps
+        // the registry entry as is.
+        let declared = json!({"dependencies": {"node-gyp": "latest"}});
+        for manifest in [Some(&declared), None] {
+            let out = render_pinned_entry(
+                &nan,
+                &Pin {
+                    key_line: &key,
+                    resolution: &resolution,
+                    checksum: None,
+                    manifest,
+                },
+            );
+            assert!(has_implicit_node_gyp(&out), "{out:?}");
+        }
+    }
+
+    /// The restore side of #737: yarn's npm resolver adds the dependency
+    /// for any script mentioning node-gyp unless the document declares
+    /// one, and the restored entry gets it back in yarn's place.
+    #[test]
+    fn registry_implicit_node_gyp_round_trips() {
+        assert!(registry_adds_node_gyp(
+            &json!({"scripts": {"install": "node-gyp rebuild"}})
+        ));
+        assert!(registry_adds_node_gyp(
+            &json!({"scripts": {"install": "node-gyp-build"}, "dependencies": {"node-gyp-build": "^4"}})
+        ));
+        assert!(!registry_adds_node_gyp(
+            &json!({"scripts": {"test": "tap"}})
+        ));
+        assert!(!registry_adds_node_gyp(&json!({})));
+        for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
+            assert!(!registry_adds_node_gyp(&json!({
+                "scripts": {"install": "node-gyp rebuild"}, field: {"node-gyp": "^10"}
+            })));
+        }
+
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let bare = lines(
+            "\"nan@npm:2.22.0\":\n  version: 2.22.0\n  resolution: \"nan@npm:2.22.0\"\n  \
+             checksum: 10c0/d5\n  languageName: node\n  linkType: hard",
+        );
+        assert_eq!(
+            with_implicit_node_gyp(&bare).join("\n"),
+            "\"nan@npm:2.22.0\":\n  version: 2.22.0\n  resolution: \"nan@npm:2.22.0\"\n  \
+             dependencies:\n    node-gyp: \"npm:latest\"\n  checksum: 10c0/d5\n  \
+             languageName: node\n  linkType: hard"
+        );
+        let deps = lines(
+            "k:\n  version: 4.0.8\n  dependencies:\n    \"@a/b\": \"npm:1\"\n    \
+             node-gyp-build: \"npm:^4.3.0\"\n  checksum: c",
+        );
+        let out = with_implicit_node_gyp(&deps);
+        assert_eq!(
+            &out[2..6],
+            [
+                "  dependencies:",
+                "    \"@a/b\": \"npm:1\"",
+                "    node-gyp: \"npm:latest\"",
+                "    node-gyp-build: \"npm:^4.3.0\""
+            ]
+        );
+        assert_eq!(with_implicit_node_gyp(&out), out, "already present");
     }
 
     #[test]

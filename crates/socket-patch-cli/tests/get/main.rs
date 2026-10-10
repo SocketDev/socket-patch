@@ -14,6 +14,7 @@ mod cli_get_silent_errors;
 mod coverage_fix_get_double_json;
 mod get_batch_paths_e2e;
 mod get_edge_cases_e2e;
+mod get_envelope_shape;
 mod get_invariants;
 mod get_modes_e2e;
 mod get_nested_apply_api_flags_e2e;

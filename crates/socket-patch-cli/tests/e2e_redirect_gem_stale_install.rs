@@ -230,11 +230,25 @@ fn hosted_scan_json(proj: &Path, api: &str) -> (i32, String, String) {
     )
 }
 
-fn stale_warnings(env: &serde_json::Value) -> Vec<String> {
-    env["redirect"]["warnings"]
+/// How many hosted pins the run wrote (v5.0: the `applied` / `verified`
+/// events with `details.mode: "hosted"`, formerly `redirect.redirected`).
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
         .as_array()
-        .expect("redirect.warnings")
-        .iter()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
+}
+
+fn stale_warnings(env: &serde_json::Value) -> Vec<String> {
+    env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter(|w| w["code"] == "redirect_gem_stale_install")
         .map(|w| w["detail"].as_str().unwrap_or_default().to_string())
         .collect()
@@ -259,7 +273,7 @@ async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
         "hosted scan must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     let gemfile = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
     assert!(
         gemfile.contains("/patch-registry/gem/"),
@@ -356,7 +370,7 @@ async fn gem_hosted_redirect_over_patched_install_stays_quiet() {
         "hosted scan must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     assert!(
         stale_warnings(&env).is_empty(),
         "an already-patched materialization must never trip the stale warning: {env}"
@@ -381,7 +395,7 @@ async fn gem_hosted_redirect_fresh_checkout_stays_quiet() {
         "hosted scan must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     assert!(
         stale_warnings(&env).is_empty(),
         "a fresh checkout must not trip the stale warning: {env}"
@@ -413,13 +427,14 @@ async fn gem_hosted_scan_never_pins_a_version_the_lock_does_not_resolve() {
     let (_code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
     let env = common::parse_json_envelope(&stdout);
     assert_eq!(
-        env["redirect"]["redirected"], 0,
+        hosted_pinned(&env),
+        0,
         "nothing may be redirected: {env}\nstderr:\n{stderr}"
     );
-    let codes: Vec<&str> = env["redirect"]["warnings"]
+    let codes: Vec<&str> = env["warnings"]
         .as_array()
-        .expect("redirect.warnings")
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(|w| w["code"].as_str())
         .collect();
     assert!(
@@ -436,6 +451,53 @@ async fn gem_hosted_scan_never_pins_a_version_the_lock_does_not_resolve() {
         lock,
         "the lock must stay byte-identical"
     );
+}
+
+/// #1125: the same shared-home copy, but the project has no lock at all
+/// (a fresh library clone before `bundle install`). Nothing says which
+/// version the project resolves, so hosted mode must neither rewrite the
+/// user's `~> 2.0` down to the installed 1.0.0 nor append the gem to a
+/// Gemfile that never declared it: it skips with `redirect_gem_no_lockfile`
+/// (whose detail names `bundle lock`) and writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_scan_without_a_lock_pins_nothing() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    for gemfile in [
+        format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"~> 2.0\"\n"),
+        "source \"https://rubygems.org\"\ngem \"tiny-dep\"\n".to_string(),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("Gemfile"), &gemfile).unwrap();
+        materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
+
+        let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+        assert!(
+            common::envelope::hosted_pins(&env).is_empty(),
+            "nothing may be redirected: {env}\nstderr:\n{stderr}"
+        );
+        let hit: Vec<&serde_json::Value> = env["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .filter(|w| w["code"] == "redirect_gem_no_lockfile")
+            .collect();
+        assert_eq!(hit.len(), 1, "the missing lock must be reported: {env}");
+        assert!(
+            hit[0]["detail"].as_str().unwrap().contains("bundle lock"),
+            "the remedy names `bundle lock`: {env}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            gemfile,
+            "the Gemfile must stay byte-identical"
+        );
+        assert!(!proj.join("Gemfile.lock").exists());
+    }
 }
 
 /// TWO gem homes (two ruby versions under vendor/bundle) both stale: one
@@ -500,10 +562,10 @@ async fn gem_hosted_rescan_with_failing_record_fetch_reports_it_and_keeps_the_wi
     let (code, stdout, _) = hosted_scan_json(&proj, &server.uri());
     assert_eq!(code, 0, "{stdout}");
     let env = common::parse_json_envelope(&stdout);
-    let failed = env["redirect"]["warnings"]
+    let failed = env["warnings"]
         .as_array()
-        .expect("warnings")
-        .iter()
+        .into_iter()
+        .flatten()
         .find(|w| w["code"] == "record_fetch_failed")
         .unwrap_or_else(|| panic!("the transient fetch failure is surfaced: {env}"));
     assert_eq!(
@@ -642,7 +704,7 @@ async fn gem_hosted_stale_bundler4_standalone_install_warns_and_is_not_attested(
         &[],
     );
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
     let details = stale_warnings(&env);
     assert_eq!(
         details.len(),
@@ -715,10 +777,7 @@ async fn gem_hosted_stale_dot_bundle_install_warns_and_is_not_attested() {
             &[],
         );
         let env = common::parse_json_envelope(&stdout);
-        assert_eq!(
-            env["redirect"]["redirected"], 1,
-            "{config}: envelope: {env}"
-        );
+        assert_eq!(hosted_pinned(&env), 1, "{config}: envelope: {env}");
         let details = stale_warnings(&env);
         assert_eq!(
             details.len(),
@@ -1022,7 +1081,7 @@ async fn gem_hosted_global_gemfile_setting_is_refused() {
         &[("HOME", home.to_str().unwrap())],
     );
     let envelope = common::parse_json_envelope(&stdout);
-    let warnings: Vec<&serde_json::Value> = envelope["redirect"]["warnings"]
+    let warnings: Vec<&serde_json::Value> = envelope["warnings"]
         .as_array()
         .map(|a| a.iter().collect())
         .unwrap_or_default();
@@ -1038,7 +1097,8 @@ async fn gem_hosted_global_gemfile_setting_is_refused() {
         "the refusal must name the global setting and its remedy: {detail}"
     );
     assert_eq!(
-        envelope["redirect"]["redirected"], 0,
+        hosted_pinned(&envelope),
+        0,
         "nothing redirected: {envelope}"
     );
     assert_eq!(
@@ -1110,7 +1170,7 @@ async fn gem_hosted_empty_gemfile_setting_shadows_global_alternative() {
         );
         assert_eq!(code, 0, "{label}: stdout:\n{stdout}\nstderr:\n{stderr}");
         let envelope = common::parse_json_envelope(&stdout);
-        assert_eq!(envelope["redirect"]["redirected"], 1, "{label}: {envelope}");
+        assert_eq!(hosted_pinned(&envelope), 1, "{label}: {envelope}");
         assert!(
             std::fs::read_to_string(proj.join("Gemfile"))
                 .unwrap()
@@ -1539,5 +1599,283 @@ async fn gem_hosted_default_cwd_keeps_project_local_remedy() {
             detail.contains(&cache_archive.display().to_string()),
             "args={args:?}: the committed cache archive belongs in the delete list: {detail}"
         );
+    }
+}
+
+/// #1109: `deployment` (local config, env or global config) stops Bundler
+/// using system gems without an explicit `path`: it installs into
+/// `vendor/bundle`. On a fresh checkout that store doesn't exist yet, but
+/// `bundle install` still fetches into it and never reuses the `gem env`
+/// copy, so it is not stale: no warning, and the same run's `--vex`
+/// attests the purl.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_deployment_ignores_system_home_copy() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let cases: &[(&str, Option<&str>, &[(&str, &str)])] = &[
+        ("local deployment", Some("BUNDLE_DEPLOYMENT: \"true\""), &[]),
+        ("env deployment", None, &[("BUNDLE_DEPLOYMENT", "true")]),
+        (
+            "global deployment",
+            None,
+            &[("BUNDLE_USER_CONFIG", "../user-bundle-config")],
+        ),
+    ];
+    for (case, local, extra) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        if let Some(line) = local {
+            std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+            std::fs::write(
+                proj.join(".bundle").join("config"),
+                format!("---\n{line}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            tmp.path().join("user-bundle-config"),
+            "---\nBUNDLE_DEPLOYMENT: \"true\"\n",
+        )
+        .unwrap();
+        let bin_dir = tmp.path().join("fake-bin");
+        let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
+
+        let (code, env, stderr, vex_path) =
+            hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, extra);
+        assert!(
+            stale_warnings(&env).is_empty(),
+            "{case}: bundler never reuses {}: {env}",
+            system_copy.display()
+        );
+        assert_eq!(
+            code, 0,
+            "{case}: the run must attest, not fail.\nenvelope: {env}\nstderr:\n{stderr}"
+        );
+        let doc = std::fs::read_to_string(&vex_path).expect("VEX written");
+        assert!(doc.contains(PURL), "{case}: purl not attested:\n{doc}");
+    }
+}
+
+/// #1109 controls: a falsy `deployment`, or a higher tier that decides
+/// the path with system gems on (`path.system`, or a falsy
+/// `disable_shared_gems`), leaves Bundler on the system gems, so the stale
+/// `gem env` copy still warns and stays out of the VEX. So do the
+/// `.bundle`-default flags: Bundler 2.x honors only
+/// `default_install_uses_path` and Bundler 4.x only `simulate_version 5`,
+/// and a scan can't tell which Bundler runs, so it keeps judging the
+/// system home rather than risk skipping a copy Bundler loads.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_system_gems_settings_still_flag_system_home_copy() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let cases: &[(&str, Option<&str>, &[(&str, &str)])] = &[
+        (
+            "local deployment false over env deployment",
+            Some("BUNDLE_DEPLOYMENT: \"false\""),
+            &[("BUNDLE_DEPLOYMENT", "true")],
+        ),
+        (
+            "local path.system over env deployment",
+            Some("BUNDLE_PATH__SYSTEM: \"true\""),
+            &[("BUNDLE_DEPLOYMENT", "true")],
+        ),
+        (
+            "local disable_shared_gems false over env deployment",
+            Some("BUNDLE_DISABLE_SHARED_GEMS: \"false\""),
+            &[("BUNDLE_DEPLOYMENT", "true")],
+        ),
+        (
+            "local simulate_version 5",
+            Some("BUNDLE_SIMULATE_VERSION: \"5\""),
+            &[],
+        ),
+        (
+            "local default_install_uses_path",
+            Some("BUNDLE_DEFAULT_INSTALL_USES_PATH: \"true\""),
+            &[],
+        ),
+    ];
+    for (case, local, extra) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        if let Some(line) = local {
+            std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+            std::fs::write(
+                proj.join(".bundle").join("config"),
+                format!("---\n{line}\n"),
+            )
+            .unwrap();
+        }
+        let bin_dir = tmp.path().join("fake-bin");
+        let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
+
+        let (code, env, stderr, vex_path) =
+            hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, extra);
+        let warnings = stale_warnings(&env);
+        assert_eq!(warnings.len(), 1, "{case}: {env}");
+        assert!(
+            warnings[0].contains(&system_copy.display().to_string()),
+            "{case}: {}",
+            warnings[0]
+        );
+        if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+            assert!(!doc.contains(PURL), "{case}: stale purl attested:\n{doc}");
+        }
+        assert_ne!(code, 0, "{case}: stderr:\n{stderr}");
+    }
+}
+
+/// The lock `bundle install` writes once the hosted pin is installed
+/// (bundler >= 2.2: a separate patch-registry `GEM` section).
+fn converged_lock(api: &str) -> String {
+    let index_url = format!("{api}/patch-registry/gem/{TOKEN}/{UUID}/");
+    format!(
+        "GEM\n  remote: {index_url}\n  specs:\n    {DEP} ({DEP_VERSION})\n\n\
+         GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  {DEP} (= {DEP_VERSION})!\n\n\
+         BUNDLED WITH\n   2.6.9\n"
+    )
+}
+
+/// #1098 (and #1109 for standalone `vex`): when Bundler doesn't use system
+/// gems for the project, standalone `vex` must not judge the unused,
+/// unpatched copy in the `gem env` home. Each case scans, converges the
+/// lock the way `bundle install` would, then runs a manifest-less `vex`
+/// with the same fake `gem` on `PATH`:
+///
+/// - a fresh checkout under an explicit `path` (env, local or global
+///   config) or `deployment`, nothing installed yet: attested from the
+///   lock;
+/// - an installed `BUNDLE_PATH: gems` holding the PATCHED copy: verified.
+///
+/// The control, where Bundler does use system gems, still refuses the
+/// unpatched system copy with `not_applied`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_standalone_vex_ignores_unused_system_home_copy() {
+    use vex_e2e_common::{
+        assert_attested, assert_not_attested, run_vex, strip_ledgers, strip_manifest, Marker,
+        VexRun,
+    };
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let bin = vex_e2e_common::binary();
+    let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2026-4444"])];
+
+    enum Config {
+        None,
+        Local(&'static str),
+        Env(&'static str, &'static str),
+        Global(&'static str),
+    }
+    let cases: &[(&str, Config, bool, bool)] = &[
+        // (case, config, install the patched copy under `gems/`, attests)
+        (
+            "fresh, local path",
+            Config::Local("BUNDLE_PATH: \"vendor/bundle\""),
+            false,
+            true,
+        ),
+        (
+            "fresh, env path",
+            Config::Env("BUNDLE_PATH", "vendor/bundle"),
+            false,
+            true,
+        ),
+        (
+            "fresh, global path",
+            Config::Global("BUNDLE_PATH: \"vendor/bundle\""),
+            false,
+            true,
+        ),
+        (
+            "fresh, local deployment",
+            Config::Local("BUNDLE_DEPLOYMENT: \"true\""),
+            false,
+            true,
+        ),
+        (
+            "installed, local path gems",
+            Config::Local("BUNDLE_PATH: \"gems\""),
+            true,
+            true,
+        ),
+        ("control, system gems", Config::None, false, false),
+    ];
+    for (case, config, install, attests) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let bin_dir = tmp.path().join("fake-bin");
+        stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
+        let global_config = tmp.path().join("user-bundle-config");
+        let mut envs: Vec<(String, std::ffi::OsString)> =
+            vec![("PATH".into(), bin_dir.clone().into_os_string())];
+        match config {
+            Config::None => {}
+            Config::Local(line) => {
+                std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+                std::fs::write(
+                    proj.join(".bundle").join("config"),
+                    format!("---\n{line}\n"),
+                )
+                .unwrap();
+            }
+            Config::Env(k, v) => envs.push(((*k).into(), (*v).into())),
+            Config::Global(line) => {
+                std::fs::write(&global_config, format!("---\n{line}\n")).unwrap();
+                envs.push(("BUNDLE_USER_CONFIG".into(), global_config.clone().into()));
+            }
+        }
+        let scan_env: Vec<(&str, &str)> = envs
+            .iter()
+            .filter(|(k, _)| k != "PATH")
+            .map(|(k, v)| (k.as_str(), v.to_str().unwrap()))
+            .collect();
+        let (code, env, stderr, _) =
+            hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, &scan_env);
+        assert_eq!(
+            code == 0,
+            *attests,
+            "{case}: hosted scan --vex.\nenvelope: {env}\nstderr:\n{stderr}"
+        );
+        strip_manifest(&proj);
+        strip_ledgers(&proj);
+        std::fs::write(proj.join("Gemfile.lock"), converged_lock(&server.uri())).unwrap();
+        if *install {
+            let gem_dir = proj
+                .join("gems")
+                .join("ruby")
+                .join("3.3.0")
+                .join("gems")
+                .join(format!("{DEP}-{DEP_VERSION}"));
+            std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+            std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), PATCHED_LIB).unwrap();
+        }
+
+        let run = VexRun {
+            api_url: Some(server.uri()),
+            api_token: Some("fake".into()),
+            org: Some(ORG.into()),
+            patch_server_url: Some(server.uri()),
+            product: Some("pkg:gem/app@1.0.0".into()),
+            envs,
+            ..VexRun::default()
+        };
+        let out = run_vex(&bin, &proj, &run);
+        if *attests {
+            assert_eq!(out.code, Some(0), "{case}: {out}");
+            assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+        } else {
+            assert_eq!(out.code, Some(1), "{case}: {out}");
+            assert_not_attested(&out.envelope, PURL, "not_applied");
+        }
     }
 }

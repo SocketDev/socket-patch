@@ -343,9 +343,16 @@ async fn paths_never_narrow_the_prune_universe() {
 
     // Envelope gc block agrees with the on-disk outcome.
     let v = parse_envelope(&stdout);
+    let pruned: Vec<&serde_json::Value> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "removed" && e["details"]["manifest"] == true)
+        .map(|e| &e["purl"])
+        .collect();
     assert_eq!(
-        v["gc"]["prunedManifestEntries"],
-        serde_json::json!(["pkg:npm/gone@9.9.9"]),
+        pruned,
+        [&serde_json::json!("pkg:npm/gone@9.9.9")],
         "gc must report exactly the orphan as pruned; got {v}"
     );
     assert_eq!(
@@ -353,6 +360,61 @@ async fn paths_never_narrow_the_prune_universe() {
         "gc must report exactly the orphan's blob removed; got {v}"
     );
     assert_eq!(v["paths"], serde_json::json!(["packages/app"]));
+}
+
+/// `scan --prune` keeps the beforeHash blob of every patch still in the
+/// manifest (#893): it is the only local restore data for an offline
+/// rollback, and `repair` cannot download it again. Only the originals of
+/// pruned patches are collected.
+#[tokio::test]
+async fn prune_keeps_before_blobs_of_active_patches() {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package_at(tmp.path(), "", "root-dep", "1.0.0");
+
+    let active_after = "a".repeat(64);
+    let active_before = "d".repeat(64);
+    let gone_after = "c".repeat(64);
+    let gone_before = "e".repeat(64);
+    let blobs: Vec<PathBuf> = [&active_after, &active_before, &gone_after, &gone_before]
+        .iter()
+        .map(|h| stage_blob(tmp.path(), h))
+        .collect();
+
+    let mut active = manifest_entry("11111111-1111-4111-8111-111111111111", &active_after);
+    active["files"]["package/index.js"]["beforeHash"] = active_before.clone().into();
+    let mut gone = manifest_entry("33333333-3333-4333-8333-333333333333", &gone_after);
+    gone["files"]["package/index.js"]["beforeHash"] = gone_before.clone().into();
+    let manifest = serde_json::json!({
+        "patches": { ROOT_PURL: active, "pkg:npm/gone@9.9.9": gone }
+    });
+    std::fs::write(
+        tmp.path().join(".socket/manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &server.uri(),
+        &["--mode", "agent", "--prune", "--yes"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(blobs[0].exists(), "active patch's afterHash blob survives");
+    assert!(
+        blobs[1].exists(),
+        "active patch's beforeHash blob must survive --prune; stdout={stdout}"
+    );
+    assert!(!blobs[2].exists(), "pruned patch's afterHash blob is swept");
+    assert!(
+        !blobs[3].exists(),
+        "pruned patch's beforeHash blob is swept"
+    );
+    let v = parse_envelope(&stdout);
+    assert_eq!(v["gc"]["removedBlobs"], 2, "got {v}");
 }
 
 // ---------------------------------------------------------------------------
@@ -633,8 +695,8 @@ async fn paths_with_hosted_or_vendored_mode_name_project_directories() {
     assert_usage_error(&stdout, "path_glob_invalid", "invalid path pattern");
 }
 
-/// A `--json` usage error: exactly `{status: "error", error: {code,
-/// message}}` on stdout, the message containing `needle`.
+/// A `--json` usage error: the full envelope (v5.0) with `status:
+/// "error"` and `error: {code, message}`, the message containing `needle`.
 fn assert_usage_error(stdout: &str, code: &str, needle: &str) {
     let v = parse_envelope(stdout);
     assert_eq!(v["status"], "error", "{v}");
@@ -646,7 +708,8 @@ fn assert_usage_error(stdout: &str, code: &str, needle: &str) {
         "{v}"
     );
     assert!(v.get("errorCode").is_none(), "{v}");
-    assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
+    crate::common::envelope::assert_envelope_invariants(&v, "scan");
+    assert_eq!(v["events"], serde_json::json!([]), "{v}");
 }
 
 // ---------------------------------------------------------------------------

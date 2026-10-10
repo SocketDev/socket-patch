@@ -15,6 +15,39 @@ use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// The envelope's events (v5.0: the download phase and the vendor engine
+/// record into the one scan envelope, every event `details.mode:
+/// "vendored"`).
+fn evs(v: &serde_json::Value) -> &Vec<serde_json::Value> {
+    v["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events array: {v}"))
+}
+
+/// The purls of the GC events with `errorCode == code` (`vendor_reverted`,
+/// `vendor_revert_kept`, …), as JSON for one-line asserts.
+fn gc_purls(v: &serde_json::Value, code: &str) -> serde_json::Value {
+    evs(v)
+        .iter()
+        .filter(|e| e["errorCode"] == code)
+        .map(|e| e["purl"].clone())
+        .collect()
+}
+
+/// The purls of the pruned manifest entries (`details.manifest: true`).
+fn pruned_purls(v: &serde_json::Value) -> serde_json::Value {
+    evs(v)
+        .iter()
+        .filter(|e| e["details"]["manifest"] == true)
+        .map(|e| e["purl"].clone())
+        .collect()
+}
+
+/// The events with `action`.
+fn with_action<'a>(v: &'a serde_json::Value, action: &str) -> Vec<&'a serde_json::Value> {
+    evs(v).iter().filter(|e| e["action"] == action).collect()
+}
+
 #[path = "npm_e2e_common/manifestless.rs"]
 mod npm_e2e_common;
 #[path = "vex_e2e_common/mod.rs"]
@@ -247,11 +280,11 @@ async fn scan_vendor_end_to_end_is_manifest_free() {
     assert_eq!(v["status"], "success", "envelope={v}");
 
     // Download phase: the record fetched in memory, nothing written.
-    let dl = v["download"].as_object().expect("download sub-object");
-    assert_eq!(dl["downloaded"], 1, "download={dl:?}");
-    assert_eq!(dl["failed"], 0, "download={dl:?}");
-    assert_eq!(dl["detached"], true, "download={dl:?}");
-    assert_eq!(dl["patches"][0]["action"], "downloaded", "download={dl:?}");
+    assert_eq!(v["command"], "scan", "envelope={v}");
+    assert_eq!(v["summary"]["downloaded"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["failed"], 0, "envelope={v}");
+    let dl = with_action(&v, "downloaded");
+    assert_eq!(dl[0]["details"]["mode"], "vendored", "envelope={v}");
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "vendored mode never writes a manifest"
@@ -264,11 +297,10 @@ async fn scan_vendor_end_to_end_is_manifest_free() {
         "the view is fetched exactly once"
     );
 
-    // Vendor phase: a full vendor Envelope with one applied event.
-    let venv = v["vendor"].as_object().expect("vendor sub-object");
-    assert_eq!(venv["command"], "vendor", "vendor={venv:?}");
-    assert_eq!(venv["status"], "success", "vendor={venv:?}");
-    assert_eq!(venv["summary"]["applied"], 1, "vendor={venv:?}");
+    // Vendor phase: merged into the same envelope, one applied event.
+    assert!(v.get("vendor").is_none(), "no nested vendor envelope: {v}");
+    assert_eq!(v["summary"]["applied"], 1, "envelope={v}");
+    assert_eq!(with_action(&v, "applied")[0]["details"]["mode"], "vendored");
 
     // Disk: tarball at the contract path, ledger entry DETACHED with the
     // embedded record (the verification source), lock rewired to consume
@@ -316,9 +348,9 @@ async fn scan_vendor_end_to_end_is_manifest_free() {
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v2: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v2["status"], "success", "envelope={v2}");
-    assert_eq!(v2["download"]["skipped"], 1, "envelope={v2}");
-    assert_eq!(v2["vendor"]["summary"]["applied"], 0, "envelope={v2}");
-    let events = v2["vendor"]["events"].as_array().expect("events");
+    assert!(with_action(&v2, "downloaded").is_empty(), "reused: {v2}");
+    assert_eq!(v2["summary"]["applied"], 0, "envelope={v2}");
+    let events = evs(&v2);
     assert!(
         events
             .iter()
@@ -414,9 +446,8 @@ async fn scan_vendor_with_empty_discovery_is_a_no_op() {
         assert_eq!(code, 0, "json={json}; stdout={stdout}; stderr={stderr}");
         if json {
             let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-            assert_eq!(v["download"]["found"], 0, "{v}");
-            assert_eq!(v["download"]["detached"], true, "{v}");
-            assert_eq!(v["vendor"]["summary"]["applied"], 0, "{v}");
+            assert_eq!(v["events"], serde_json::json!([]), "{v}");
+            assert_eq!(v["summary"]["applied"], 0, "{v}");
         }
         assert!(
             !tmp.path().join(".socket/vendor").exists(),
@@ -438,7 +469,7 @@ async fn scan_vendor_with_empty_discovery_is_a_no_op() {
 /// NON-detached ledger entry at the same uuid): the next vendored run
 /// migrates it — the ledger entry gains `detached: true` plus the embedded
 /// record, the manifest record moves out (an emptied manifest stays as
-/// `{"patches":{}}`), the run says so in `vendor.warnings[]` — and the run
+/// `{"patches":{}}`), the run says so in `warnings[]` — and the run
 /// after that is a fetch-free `skipped` re-run with nothing left to
 /// migrate.
 #[tokio::test]
@@ -466,9 +497,9 @@ async fn scan_vendor_migrates_legacy_manifest_mode_project() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "{v}");
     // A legacy entry carries no record, so the view is fetched once more…
-    assert_eq!(v["download"]["downloaded"], 1, "{v}");
+    assert_eq!(v["summary"]["downloaded"], 1, "{v}");
     // …and the engine finds artifact + wiring already in sync.
-    let events = v["vendor"]["events"].as_array().expect("events");
+    let events = evs(&v);
     assert!(
         events
             .iter()
@@ -476,7 +507,7 @@ async fn scan_vendor_migrates_legacy_manifest_mode_project() {
         "{v}"
     );
     assert!(
-        v["vendor"]["warnings"]
+        v["warnings"]
             .as_array()
             .is_some_and(|ws| ws.iter().any(|w| {
                 w["code"] == "vendor_manifest_record_migrated"
@@ -509,9 +540,9 @@ async fn scan_vendor_migrates_legacy_manifest_mode_project() {
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v2: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v2["download"]["skipped"], 1, "{v2}");
+    assert!(with_action(&v2, "downloaded").is_empty(), "{v2}");
     assert!(
-        v2["vendor"].get("warnings").is_none(),
+        v2.get("warnings").is_none(),
         "nothing left to migrate: {v2}"
     );
     let after_reqs = mock.received_requests().await.unwrap();
@@ -536,8 +567,7 @@ async fn scan_vendor_writes_no_manifest() {
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "envelope={v}");
-    assert_eq!(v["download"]["detached"], true, "envelope={v}");
-    assert_eq!(v["vendor"]["summary"]["applied"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["applied"], 1, "envelope={v}");
 
     // Embedded VEX works manifest-less: the detached entry's embedded
     // record is the attestation source.
@@ -592,8 +622,8 @@ async fn scan_vendor_writes_no_manifest() {
     let (code, stdout, _) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}");
     let v2: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v2["download"]["skipped"], 1, "envelope={v2}");
-    assert_eq!(v2["download"]["downloaded"], 0, "envelope={v2}");
+    assert_eq!(v2["summary"]["downloaded"], 0, "envelope={v2}");
+    assert!(with_action(&v2, "failed").is_empty(), "envelope={v2}");
     let after_reqs = mock.received_requests().await.unwrap();
     assert!(
         !after_reqs[before_reqs..]
@@ -610,7 +640,7 @@ async fn scan_vendor_writes_no_manifest() {
 #[tokio::test]
 async fn scan_vendor_dry_run_previews_without_touching_disk() {
     // Pre-vendored at UUID; discovery now offers NEW_UUID. The dry run
-    // must classify it as would_revendor (oldUuid = UUID) and write
+    // must preview it as a re-vendor (`verified`, oldUuid = UUID) and write
     // nothing — no view fetch, no lock edit, no vendor tree change.
     let mock = MockServer::start().await;
     mount_patch_api(&mock, NEW_UUID).await;
@@ -640,12 +670,14 @@ async fn scan_vendor_dry_run_previews_without_touching_disk() {
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let patches = v["vendor"]["patches"].as_array().expect("vendor preview");
+    let patches = evs(&v);
     assert_eq!(patches.len(), 1, "envelope={v}");
     assert_eq!(patches[0]["purl"], PURL);
-    assert_eq!(patches[0]["action"], "would_revendor", "envelope={v}");
+    assert_eq!(patches[0]["action"], "verified", "envelope={v}");
+    assert_eq!(patches[0]["details"]["mode"], "vendored", "envelope={v}");
     assert_eq!(patches[0]["oldUuid"], UUID, "envelope={v}");
     assert_eq!(patches[0]["uuid"], NEW_UUID, "envelope={v}");
+    assert_eq!(v["dryRun"], true, "envelope={v}");
 
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
@@ -991,18 +1023,18 @@ async fn scan_vendor_resolves_percent_encoded_scoped_purl() {
         "vendored mode never writes a manifest"
     );
     assert_eq!(
-        v["gc"]["prunedManifestEntries"],
+        pruned_purls(&v),
         serde_json::json!([]),
         "nothing looks prunable: {v}"
     );
     assert_eq!(
-        v["gc"]["revertedVendoredEntries"],
+        gc_purls(&v, "vendor_reverted"),
         serde_json::json!([]),
         "the just-vendored entry is lock-visible and must not be reverted: {v}"
     );
 
     // Vendored: artifact under the DECODED scope dir, lock rewired.
-    assert_eq!(v["vendor"]["summary"]["applied"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["applied"], 1, "envelope={v}");
     let tgz = tmp.path().join(format!(
         ".socket/vendor/npm/{UUID}/@scope/left-pad-1.3.0.tgz"
     ));
@@ -1106,12 +1138,12 @@ async fn scan_prune_reverts_unused_vendored_entry() {
     // 1. Vanished lock entry: reverted in one run.
     let v = run_prune();
     assert_eq!(
-        v["gc"]["revertedVendoredEntries"],
+        gc_purls(&v, "vendor_reverted"),
         serde_json::json!([PURL]),
         "gc must report the reverted entry: {v}"
     );
     assert_eq!(
-        v["gc"]["keptVendoredEntries"],
+        gc_purls(&v, "vendor_revert_kept"),
         serde_json::json!([]),
         "nothing resolves through the artifact, so nothing is kept: {v}"
     );
@@ -1119,8 +1151,8 @@ async fn scan_prune_reverts_unused_vendored_entry() {
     // routine for a prune of an uninstalled dependency, so it is not a
     // gc warning.
     assert!(
-        v["gc"].get("warnings").is_none(),
-        "a routine prune adds no gc warning: {v}"
+        v.get("warnings").is_none(),
+        "a routine prune adds no warning: {v}"
     );
 
     // Ledger empty (an emptied state file is removed outright), artifact
@@ -1151,13 +1183,114 @@ async fn scan_prune_reverts_unused_vendored_entry() {
     // 2. Nothing left to reclaim.
     let v = run_prune();
     assert_eq!(
-        v["gc"]["revertedVendoredEntries"],
+        gc_purls(&v, "vendor_reverted"),
         serde_json::json!([]),
         "{v}"
     );
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock_bytes
+    );
+}
+
+/// #1155: `npm install left-pad@1.3.1` after vendoring 1.3.0 keeps the
+/// `node_modules/left-pad` key but locks the new version from the
+/// registry. The vendored version left the lock graph just as after
+/// `npm uninstall`, so `scan --prune` must revert the entry in one run.
+/// It used to call the moved entry drift and keep it forever, so the
+/// prune remedy `vendor --check` names never converged.
+#[tokio::test]
+async fn scan_prune_reverts_vendored_entry_after_version_upgrade() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}"))
+        .exists());
+
+    // What `npm install left-pad@1.3.1` leaves behind.
+    let lock = serde_json::json!({
+        "name": "scan-vendor-test",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "scan-vendor-test",
+                "version": "0.0.0",
+                "dependencies": { "left-pad": "^1.3.1" }
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded==",
+                "license": "WTFPL"
+            }
+        }
+    });
+    let mut lock_bytes = serde_json::to_vec_pretty(&lock).unwrap();
+    lock_bytes.push(b'\n');
+    std::fs::write(tmp.path().join("package-lock.json"), &lock_bytes).unwrap();
+    std::fs::write(
+        tmp.path().join("node_modules/left-pad/package.json"),
+        br#"{"name":"left-pad","version":"1.3.1"}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(binary())
+        .args([
+            "scan",
+            "--json",
+            "--prune",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    // v5.0: the GC's reverts are `vendor_reverted` events, its drift keeps
+    // `vendor_revert_kept` events.
+    let purls_with = |code: &str| -> Vec<serde_json::Value> {
+        v["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["errorCode"] == code)
+            .map(|e| e["purl"].clone())
+            .collect()
+    };
+    assert_eq!(
+        purls_with("vendor_reverted"),
+        vec![serde_json::json!(PURL)],
+        "gc must revert the upgraded-away entry: {v}"
+    );
+    assert!(
+        purls_with("vendor_revert_kept").is_empty(),
+        "nothing resolves through the artifact, so nothing is kept: {v}"
+    );
+    assert!(
+        !tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
+        "artifact dir removed"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_bytes,
+        "the user's upgraded lock is left exactly as they wrote it"
     );
 }
 
@@ -1297,12 +1430,12 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
     // entry away (nothing resolves through the artifact) it reverts it
     // (#665; see `scan_prune_reverts_unused_vendored_entry`).
     assert_eq!(
-        v["gc"]["revertedVendoredEntries"],
+        gc_purls(&v, "vendor_reverted"),
         serde_json::json!([PURL]),
         "envelope={v}"
     );
     assert_eq!(
-        v["gc"]["keptVendoredEntries"],
+        gc_purls(&v, "vendor_revert_kept"),
         serde_json::json!([]),
         "envelope={v}"
     );
@@ -1316,8 +1449,8 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
 
 /// Interactive (non-JSON) `scan --mode vendored` pre-verifies patch baselines:
 /// installed content matching NEITHER hash is annotated before vendoring
-/// starts, and the run still vendors (auto-force) with the
-/// `vendor_content_mismatch_overwritten` warning on stderr.
+/// starts, and the run still vendors the server's verified artifact (no
+/// mismatch warning: vendoring never reads the installed bytes).
 #[tokio::test]
 async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
     let mock = MockServer::start().await;
@@ -1785,7 +1918,7 @@ async fn scan_vendor_works_on_a_completely_fresh_clone() {
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["lockfileOnlyPackages"], 1, "{v}");
-    assert_eq!(v["vendor"]["summary"]["applied"], 1, "{v}");
+    assert_eq!(v["summary"]["applied"], 1, "{v}");
     assert!(tmp
         .path()
         .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
@@ -1797,7 +1930,7 @@ async fn scan_vendor_works_on_a_completely_fresh_clone() {
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let events = v["vendor"]["events"].as_array().unwrap();
+    let events = evs(&v);
     assert!(
         events.iter().any(|e| e["errorCode"] == "already_vendored"),
         "{v}"
@@ -2041,7 +2174,7 @@ async fn scan_apply_skips_lockfile_only_without_error() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(code, 0, "lockfile-only must not flip the exit code: {v}");
     assert_eq!(v["status"], "success", "{v}");
-    let patches = v["apply"]["patches"].as_array().unwrap();
+    let patches = evs(&v);
     assert!(
         patches
             .iter()
@@ -2103,21 +2236,17 @@ async fn scan_vendored_bun_v1_workspace_refuses_in_download_phase() {
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "partial_failure", "envelope={v}");
-    let dl = &v["download"];
-    assert_eq!(dl["found"], 1, "envelope={v}");
-    assert_eq!(dl["downloaded"], 0, "envelope={v}");
-    assert_eq!(dl["failed"], 1, "envelope={v}");
-    assert_eq!(dl["patches"][0]["purl"], PURL, "envelope={v}");
-    assert_eq!(dl["patches"][0]["action"], "failed", "envelope={v}");
-    assert_eq!(dl["patches"][0]["errorCode"], BUN_WS_CODE, "envelope={v}");
+    assert_eq!(v["status"], "partialFailure", "envelope={v}");
+    assert_eq!(v["summary"]["downloaded"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["failed"], 1, "envelope={v}");
+    let refused = with_action(&v, "failed");
+    assert_eq!(refused[0]["purl"], PURL, "envelope={v}");
+    assert_eq!(refused[0]["errorCode"], BUN_WS_CODE, "envelope={v}");
     assert!(
-        dl["patches"][0]["error"]
-            .as_str()
-            .is_some_and(|d| !d.is_empty()),
-        "the refused record carries the engine's detail: {v}"
+        refused[0]["error"].as_str().is_some_and(|d| !d.is_empty()),
+        "the refused event carries the engine's detail: {v}"
     );
-    assert_eq!(v["vendor"]["summary"]["applied"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["applied"], 0, "envelope={v}");
 
     let reqs = mock.received_requests().await.unwrap();
     assert!(
@@ -2237,10 +2366,10 @@ async fn scan_vendored_vlt_transitive_refuses_in_download_phase() {
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let dl = &v["download"];
-    assert_eq!(dl["failed"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["failed"], 1, "envelope={v}");
     assert_eq!(
-        dl["patches"][0]["errorCode"], VLT_TRANSITIVE_CODE,
+        with_action(&v, "failed")[0]["errorCode"],
+        VLT_TRANSITIVE_CODE,
         "envelope={v}"
     );
     assert_eq!(
@@ -2257,10 +2386,11 @@ async fn scan_vendored_vlt_transitive_refuses_in_download_phase() {
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let text = v.to_string();
     assert!(
-        text.contains("would_refuse") && text.contains(VLT_TRANSITIVE_CODE),
-        "envelope={v}"
+        evs(&v)
+            .iter()
+            .any(|e| e["action"] == "skipped" && e["errorCode"] == VLT_TRANSITIVE_CODE),
+        "the preview names the refusal: {v}"
     );
     assert!(!tmp.path().join(".socket").exists());
 }
@@ -2836,11 +2966,14 @@ snapshots:
         let (_code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
         let v: serde_json::Value = serde_json::from_str(stdout.trim())
             .unwrap_or_else(|e| panic!("valid JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
-        let events = v["vendor"]["events"].as_array().expect("vendor events");
+        // The vendor engine's events (the download phase's are `downloaded`).
+        let events = evs(&v);
         let event_for = |purl: &str| {
             events
                 .iter()
-                .find(|e| e["purl"] == purl && e["action"] != "skipped")
+                .find(|e| {
+                    e["purl"] == purl && e["action"] != "skipped" && e["action"] != "downloaded"
+                })
                 .unwrap_or_else(|| panic!("no vendor event for {purl}: {v}"))
         };
         assert_eq!(event_for(COMPOSER[0].0)["action"], "applied", "{v}");
@@ -2888,8 +3021,14 @@ snapshots:
         let (_code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
         let v: serde_json::Value = serde_json::from_str(stdout.trim())
             .unwrap_or_else(|e| panic!("valid JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
-        let events = v["vendor"]["events"].as_array().expect("vendor events");
-        let event_for = |name: &str| events.iter().find(|e| e["purl"] == purl(name));
+        // The vendor engine's events (the download phase's are `downloaded`
+        // / its refusals `failed`, checked below).
+        let events = evs(&v);
+        let event_for = |name: &str| {
+            events
+                .iter()
+                .find(|e| e["purl"] == purl(name) && e["action"] != "downloaded")
+        };
         assert_eq!(
             event_for("pkg-a").expect("pkg-a event")["action"],
             "applied",
@@ -2900,17 +3039,17 @@ snapshots:
             "applied",
             "{v}"
         );
-        assert!(
-            event_for("pkg-b").is_none(),
-            "refused before the vendor step: {v}"
-        );
-        let refused = v["download"]["patches"]
-            .as_array()
-            .and_then(|p| p.iter().find(|r| r["purl"] == purl("pkg-b")))
-            .unwrap_or_else(|| panic!("no download record for pkg-b: {v}"));
+        // Refused before the vendor step: its one event is the download
+        // phase's `failed`.
+        let b_events: Vec<_> = events
+            .iter()
+            .filter(|e| e["purl"] == purl("pkg-b"))
+            .collect();
+        assert_eq!(b_events.len(), 1, "refused before the vendor step: {v}");
+        let refused = b_events[0];
         assert_eq!(refused["action"], "failed", "{v}");
         assert_eq!(refused["errorCode"], "vendor_lock_entry_unsupported", "{v}");
-        assert_eq!(v["download"]["failed"], 1, "{v}");
+        assert_eq!(v["summary"]["failed"], 1, "{v}");
 
         let mut granted = granted_uuids(&mock).await;
         granted.sort();
@@ -3038,19 +3177,49 @@ snapshots:
         assert!(registry.is_empty(), "no pristine fetch: {registry:?}");
     }
 
-    fn record_for<'a>(records: &'a serde_json::Value, purl: &str) -> &'a serde_json::Value {
-        records
+    /// The download phase's event for `purl`: its first event, a
+    /// `downloaded` or (refused / failed fetch) `failed` one — the download
+    /// phase records before the vendor engine in the one envelope.
+    fn download_event<'a>(v: &'a serde_json::Value, purl: &str) -> Option<&'a serde_json::Value> {
+        v["events"]
             .as_array()
-            .and_then(|p| p.iter().find(|r| r["purl"] == purl))
-            .unwrap_or_else(|| panic!("no record for {purl}: {records}"))
+            .expect("events")
+            .iter()
+            .find(|e| e["purl"] == purl)
+            .filter(|e| e["action"] == "downloaded" || e["action"] == "failed")
     }
 
-    fn events_for<'a>(v: &'a serde_json::Value, purl: &str) -> Vec<(&'a str, &'a str)> {
-        v["vendor"]["events"]
+    fn record_for<'a>(v: &'a serde_json::Value, purl: &str) -> &'a serde_json::Value {
+        download_event(v, purl).unwrap_or_else(|| panic!("no download event for {purl}: {v}"))
+    }
+
+    /// `(downloaded, failed)` counted over the download phase's events.
+    fn download_counts(v: &serde_json::Value) -> (usize, usize) {
+        let purls: std::collections::BTreeSet<&str> = v["events"]
             .as_array()
-            .expect("vendor events")
+            .expect("events")
             .iter()
-            .filter(|e| e["purl"] == purl)
+            .filter_map(|e| e["purl"].as_str())
+            .collect();
+        let records: Vec<&serde_json::Value> =
+            purls.iter().filter_map(|p| download_event(v, p)).collect();
+        (
+            records
+                .iter()
+                .filter(|e| e["action"] == "downloaded")
+                .count(),
+            records.iter().filter(|e| e["action"] == "failed").count(),
+        )
+    }
+
+    /// The vendor engine's events for `purl` (its download event left out).
+    fn events_for<'a>(v: &'a serde_json::Value, purl: &str) -> Vec<(&'a str, &'a str)> {
+        let skip = download_event(v, purl).map(|e| e as *const serde_json::Value);
+        v["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter(|e| e["purl"] == purl && Some(*e as *const serde_json::Value) != skip)
             .map(|e| {
                 (
                     e["action"].as_str().unwrap_or_default(),
@@ -3099,7 +3268,7 @@ snapshots:
             &api_argv(&uri, &["scan", "--mode", "vendored"]),
             &[("SOCKET_NPM_REGISTRY", registry.as_str())],
         );
-        let dl = &v["download"]["patches"];
+        let dl = &v;
         let b = record_for(dl, "pkg:npm/pkg-b@1.0.0");
         assert_eq!(
             (&b["action"], &b["errorCode"]),
@@ -3123,11 +3292,7 @@ snapshots:
             "downloaded",
             "not refused early: {v}"
         );
-        assert_eq!(
-            (&v["download"]["downloaded"], &v["download"]["failed"]),
-            (&serde_json::json!(2), &serde_json::json!(2)),
-            "{v}"
-        );
+        assert_eq!(download_counts(&v), (2, 2), "{v}");
         assert_eq!(
             events_for(&v, "pkg:npm/pkg-z@1.0.0"),
             vec![("failed", "vendor_lock_entry_not_found")],
@@ -3166,11 +3331,11 @@ snapshots:
             &[("SOCKET_NPM_REGISTRY", registry.as_str())],
         );
         assert_eq!(
-            record_for(&v["patches"], "pkg:npm/pkg-z@1.0.0")["action"],
+            record_for(&v, "pkg:npm/pkg-z@1.0.0")["action"],
             "downloaded",
             "{v}"
         );
-        assert_eq!(v["failed"], 0, "{v}");
+        assert_eq!(download_counts(&v).1, 0, "{v}");
         assert_eq!(
             events_for(&v, "pkg:npm/pkg-z@1.0.0"),
             vec![("failed", "vendor_lock_entry_not_found")],
@@ -3184,7 +3349,7 @@ snapshots:
             &api_argv(&uri, &["get", "pkg:npm/pkg-b@1.0.0", "--mode", "vendored"]),
             &[("SOCKET_NPM_REGISTRY", registry.as_str())],
         );
-        let b = record_for(&v["patches"], "pkg:npm/pkg-b@1.0.0");
+        let b = record_for(&v, "pkg:npm/pkg-b@1.0.0");
         assert_eq!(
             (&b["action"], &b["errorCode"]),
             (
@@ -3266,7 +3431,7 @@ snapshots:
             &api_argv(&uri, &["scan", "--mode", "vendored"]),
             &env,
         );
-        let dl = &v["download"]["patches"];
+        let dl = &v;
         let installed = record_for(dl, CARGO_SCOPE[0].0);
         assert_eq!(
             (&installed["action"], &installed["errorCode"]),
@@ -3299,7 +3464,7 @@ snapshots:
             &env,
         );
         assert_eq!(
-            record_for(&v["patches"], CARGO_SCOPE[1].0)["action"],
+            record_for(&v, CARGO_SCOPE[1].0)["action"],
             "downloaded",
             "{v}"
         );
@@ -3313,7 +3478,7 @@ snapshots:
             &api_argv(&uri, &["get", CARGO_SCOPE[0].0, "--mode", "vendored"]),
             &env,
         );
-        let installed = record_for(&v["patches"], CARGO_SCOPE[0].0);
+        let installed = record_for(&v, CARGO_SCOPE[0].0);
         assert_eq!(installed["errorCode"], "locked_version_mismatch", "{v}");
         assert_eq!(
             viewed_uuids(&mock).await,
@@ -3321,5 +3486,128 @@ snapshots:
             "the installed crate's view is never fetched"
         );
         assert_no_registry_request(&mock).await;
+    }
+
+    /// #1197: pnpm 7–11 keep a removed package's `.pnpm/<name>@<version>`
+    /// entry for up to 7 days (pnpm 12 an upgraded-away one until `pnpm
+    /// prune`). Nothing links to it and neither lock has it, so the
+    /// vendored scan skips it instead of failing it
+    /// `vendor_lock_entry_not_found` on every run: the current lockfile
+    /// pnpm writes beside the entries (`.pnpm/lock.yaml`) is the record of
+    /// what is installed.
+    #[tokio::test]
+    async fn vendored_scan_skips_a_pnpm_store_entry_the_install_dropped() {
+        let mock = MockServer::start().await;
+        let scope = [PNPM_SCOPE[0], PNPM_SCOPE[2]];
+        mount_patch_api(&mock, &scope, "package/index.js").await;
+        // The real batch endpoint answers only for the purls it is asked
+        // about: a scan that reports the orphan gets its patch.
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                let packages: Vec<serde_json::Value> = scope
+                    .iter()
+                    .filter(|(purl, _)| body.contains(purl))
+                    .map(|(purl, uuid)| {
+                        serde_json::json!({
+                            "purl": purl,
+                            "patches": [{
+                                "uuid": uuid, "purl": purl, "tier": "free",
+                                "cveIds": ["CVE-2026-0001"], "ghsaIds": [],
+                                "severity": "high", "title": "plan target"
+                            }]
+                        })
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "packages": packages,
+                    "canAccessPaidPatches": false,
+                }))
+            })
+            .with_priority(1)
+            .mount(&mock)
+            .await;
+        let registry = format!("{}/registry", mock.uri());
+        let uri = mock.uri();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "scope-test", "version": "0.0.0", "dependencies": { "pkg-a": "1.0.0" } }"#,
+        )
+        .unwrap();
+        let lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      pkg-a:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  pkg-a@1.0.0:
+    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}
+
+snapshots:
+
+  pkg-a@1.0.0: {}
+";
+        std::fs::write(root.join("pnpm-lock.yaml"), lock).unwrap();
+        let store = root.join("node_modules/.pnpm");
+        for name in ["pkg-a", "pkg-y"] {
+            let pkg = store.join(format!("{name}@1.0.0/node_modules/{name}"));
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            ".pnpm/pkg-a@1.0.0/node_modules/pkg-a",
+            root.join("node_modules/pkg-a"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        {
+            let pkg = root.join("node_modules/pkg-a");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                r#"{"name":"pkg-a","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+        }
+        std::fs::write(store.join("lock.yaml"), lock).unwrap();
+
+        let (code, stdout, stderr) = run_cli_env(
+            root,
+            &api_argv(&uri, &["scan", "--mode", "vendored"]),
+            &[("SOCKET_NPM_REGISTRY", registry.as_str())],
+        );
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("valid JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
+        assert_eq!(code, 0, "{v}");
+        assert_eq!(v["status"], "success", "{v}");
+        assert!(
+            !stdout.contains("vendor_lock_entry_not_found") && !stdout.contains("pkg-y"),
+            "the orphaned entry is not scanned: {v}"
+        );
+        assert_eq!(
+            events_for(&v, "pkg:npm/pkg-a@1.0.0").first(),
+            Some(&("applied", "")),
+            "{v}"
+        );
     }
 }

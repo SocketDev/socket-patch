@@ -53,6 +53,9 @@
 //! release. `#[ignore]`-gated like the vendored twin: the unpinned `test` job
 //! skips it; the e2e job runs it with a pinned toolchain via `--ignored`.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -501,7 +504,7 @@ async fn redirected_project(
             );
         }
         RedirectCli::ScanRedirectVex => {
-            assert_eq!(env["redirect"]["redirected"], 1, "one redirect: {env}");
+            assert_eq!(env["summary"]["applied"], 1, "one redirect: {env}");
             assert_eq!(
                 env["redirect"]["rewrittenFiles"][0], "composer.lock",
                 "{env}"
@@ -512,7 +515,7 @@ async fn redirected_project(
             assert_attested(&doc, &purl, UUID, Marker::Redirected, &[(GHSA, &[CVE])]);
         }
         RedirectCli::GetUuidHosted => {
-            assert_eq!(env["found"], 1, "{env}");
+            assert_eq!(env["command"], "get", "{env}");
             assert!(env.get("vex").is_none(), "get has no --vex: {env}");
         }
     }
@@ -782,7 +785,7 @@ fn assert_rollback_restores_upstream(fx: &Fixture, tag: &str) {
     if fx.major >= 2 {
         assert_eq!(code, 0, "[{tag}] rollback: {env}\n{stderr}");
         assert_eq!(
-            env["hosted"]["reverted"],
+            rollback_json::hosted_reverted(&env),
             serde_json::json!([fx.purl]),
             "[{tag}] {env}"
         );
@@ -795,10 +798,13 @@ fn assert_rollback_restores_upstream(fx: &Fixture, tag: &str) {
         // Composer 1 resolved from an inline `package` repository: not
         // packagist, so the restore refuses rather than guess.
         assert_eq!(code, 1, "[{tag}] rollback: {env}\n{stderr}");
-        assert_eq!(env["hosted"]["failed"][0]["purl"], fx.purl, "[{tag}] {env}");
-        let why = env["hosted"]["failed"][0]["error"]
-            .as_str()
-            .unwrap_or_default();
+        assert_eq!(
+            rollback_json::hosted_failed(&env)[0]["purl"],
+            fx.purl,
+            "[{tag}] {env}"
+        );
+        let why_view = rollback_json::hosted_failed(&env);
+        let why = why_view[0]["error"].as_str().unwrap_or_default();
         assert!(
             why.contains("git checkout -- composer.lock"),
             "[{tag}] the refusal names the remedy: {env}"

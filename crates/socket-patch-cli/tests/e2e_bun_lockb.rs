@@ -10,6 +10,9 @@
 //! SOCKET_PATCH_BUN_LOCKB_WRITER points at the writer when testing a newer
 //! reader against a binary lock from an older release.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -116,13 +119,29 @@ fn cli_code(project: &Path, args: &[&str]) -> (i32, Value) {
     (output.status.code().unwrap_or(-1), envelope)
 }
 
+/// How many hosted pins a `scan --mode hosted --json` run wrote: its
+/// `applied` events with `details.mode: "hosted"` (v5.0's retired
+/// `redirect.redirected`).
+fn hosted_pin_count(env: &Value) -> usize {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "applied")
+        .count()
+}
+
 /// v5 keeps no hosted ledger, so undoing a hosted pin means restoring the
 /// entry's upstream registry form. For a binary `bun.lockb` only a vendor
 /// takeover rebuilds that record (it refuses a workspace-normalized lock), so
 /// `rollback` REFUSES the pin, naming the checkout remedy, and leaves the
 /// lock exactly as found; the test then applies that remedy (`git checkout --
 /// bun.lockb`, here: the original bytes written back).
-fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &MockServer) {
+fn rollback_refuses_binary_hosted_pin_then_checkout(
+    fixture: &Fixture,
+    server: &MockServer,
+    copy_already_original: bool,
+) {
     let hosted_lock = fixture.lock();
     let uri = server.uri();
     let (code, env) = cli_code(
@@ -130,11 +149,30 @@ fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &
         &["rollback", "--yes", "--patch-server-url", &uri],
     );
     assert_eq!(code, 1, "a binary hosted pin cannot be restored: {env}");
-    assert_eq!(env["status"], "partial_failure", "{env}");
-    let failed = env["hosted"]["failed"]
+    // The refused pin counts as a failure (#1066). After a takeover a
+    // manifest record makes the agent leg find the installed copy already
+    // original, so the run is a partial failure; a hosted-only project has
+    // no other outcome, so the run failed as a whole (`rollback_failed`).
+    if copy_already_original {
+        assert_eq!(env["status"], "partialFailure", "{env}");
+        assert_eq!(rollback_json::already_original(&env), 1, "{env}");
+    } else {
+        assert_eq!(env["status"], "error", "{env}");
+        assert_eq!(env["error"]["code"], "rollback_failed", "{env}");
+        assert_eq!(rollback_json::already_original(&env), 0, "{env}");
+    }
+    // `failed` spans every leg (#1066): the refused hosted pin plus any
+    // agent copy that could not be restored (a bundled copy the patch never
+    // touched reports `hash_mismatch`); agent events carry no mode.
+    let agent_failed = env["events"]
         .as_array()
-        .cloned()
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .filter(|e| e["action"] == "failed" && e["details"]["mode"].is_null())
+        .count();
+    assert_eq!(env["summary"]["failed"], 1 + agent_failed, "{env}");
+    let failed_view = rollback_json::hosted_failed(&env);
+    let failed = failed_view.as_array().cloned().unwrap_or_default();
     assert!(
         failed.iter().any(|f| f["purl"] == PURL
             && f["error"]
@@ -384,6 +422,16 @@ impl Fixture {
                 br#"{"name":"adder","version":"1.0.0","dependencies":{"is-number":"7.0.0"}}"#,
             )
             .unwrap();
+        }
+        if shape == "bundled" {
+            // REGRESSION (#1243): a local parent that bundles its own
+            // minimist@1.2.2 beside the root's registry minimist@1.2.2.
+            std::fs::write(
+                project.join("bparent-1.0.0.tgz"),
+                bundling_parent_tgz("minimist", "1.2.2"),
+            )
+            .unwrap();
+            package["dependencies"]["bparent"] = json!("file:./bparent-1.0.0.tgz");
         }
         if shape == "extensions" {
             package["dependencies"]["consumer"] = json!("workspace:*");
@@ -665,6 +713,44 @@ impl Fixture {
     }
 }
 
+/// A `bparent@1.0.0` tarball that declares `bundleDependencies: [name]`
+/// and ships its own `name@version` under `node_modules/`.
+fn bundling_parent_tgz(name: &str, version: &str) -> Vec<u8> {
+    let manifest = json!({"name":"bparent", "version":"1.0.0",
+        "dependencies":{name: version}, "bundleDependencies":[name]});
+    let bundled = json!({"name":name, "version":version, "main":"index.js"});
+    let files = [
+        ("package/package.json".to_string(), manifest.to_string()),
+        (
+            "package/index.js".to_string(),
+            format!("module.exports = require({name:?});\n"),
+        ),
+        (
+            format!("package/node_modules/{name}/package.json"),
+            bundled.to_string(),
+        ),
+        (
+            format!("package/node_modules/{name}/index.js"),
+            "module.exports = 'bundled';\n".to_string(),
+        ),
+    ];
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    for (path, body) in &files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, body.as_bytes())
+            .unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
 fn make_tgz_from_installed(pkg_dir: &Path, replaced_index: &[u8]) -> Vec<u8> {
     let pkg_dir = pkg_dir
         .canonicalize()
@@ -797,7 +883,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     assert_eq!(snapshot(project), before, "hosted dry run: {preview}");
     let hosted = scan(project, &server, "hosted", &[]);
     assert_eq!(
-        hosted["redirect"]["redirected"], 1,
+        hosted["summary"]["applied"], 1,
         "lock-only hosted scan must discover minimist: {hosted}"
     );
     let hosted_lock = fixture.lock();
@@ -805,10 +891,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     fixture.frozen("hosted", &fixture.patched, "minimist");
     fixture.manifestless_vex("hosted", bun_vex::BunMode::Hosted, &server.uri());
     let repeat = scan(project, &server, "hosted", &[]);
-    assert_eq!(
-        repeat["redirect"]["redirected"], 1,
-        "hosted rerun: {repeat}"
-    );
+    assert_eq!(repeat["summary"]["applied"], 1, "hosted rerun: {repeat}");
     assert_eq!(fixture.lock(), hosted_lock);
     assert!(
         !project.join(".socket/vendor/redirect-state.json").exists(),
@@ -1021,14 +1104,120 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     );
     let hosted = scan(project, &server, "hosted", &[]);
     assert_eq!(
-        hosted["redirect"]["redirected"], 1,
+        hosted["summary"]["applied"], 1,
         "vendored -> hosted: {hosted}"
     );
     fixture.frozen("hosted-again", &fixture.patched, "minimist");
     fixture.manifestless_vex("hosted-again", bun_vex::BunMode::Hosted, &server.uri());
-    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
+    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server, true);
     fixture.pristine();
     fixture.frozen("rolled-back", &fixture.original, "minimist");
+}
+
+/// REGRESSION (#1243): Bun 1.2+ keeps ONE `bun.lockb` record for a
+/// version installed both from the registry and bundled inside a parent's
+/// tarball. The hosted scan wires that record for the regular install
+/// (warning that the bundled copy stays unpatched); the pin it wrote must
+/// then be listed and unwound like any other: `list` succeeds, the online
+/// hosted → vendored takeover restores the registry record and vendors over
+/// it, and `vendor --revert` gives back the pre-hosted bytes exactly.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn binary_shared_bundled_record_hosted_pin_is_managed() {
+    let Some(fixture) = Fixture::new("bundled") else {
+        return;
+    };
+    let server = MockServer::start().await;
+    mock_api(&server, &fixture, "minimist").await;
+    let project = &fixture.project;
+    let uri = server.uri();
+
+    let hosted = scan(project, &server, "hosted", &[]);
+    assert_eq!(hosted_pin_count(&hosted), 1, "hosted scan: {hosted}");
+    let text = hosted.to_string();
+    let shared =
+        text.contains("redirect_bun_bundled_instance_skipped") && text.contains("also bundled");
+    if !shared {
+        // Bun < 1.2 records no bundled flag on the regular record; that
+        // shape is the ordinary hosted pin the other tests cover.
+        eprintln!("SKIP #1243 leg: this Bun keeps no shared bundled record: {hosted}");
+        return;
+    }
+    assert_ne!(fixture.lock(), fixture.original_lock);
+
+    // `--patch-server-url`: the mock serves the hosted artifact, so name
+    // it the hosted origin (as the vendor run below does).
+    let (code, listed) = cli_code(project, &["list", "--patch-server-url", &uri]);
+    assert_eq!(
+        code, 0,
+        "list must accept the hosted pin it wrote: {listed}"
+    );
+    assert!(
+        !listed.to_string().contains("hosted_wiring_contested"),
+        "{listed}"
+    );
+    assert!(
+        listed.to_string().contains(PURL),
+        "list names the hosted pin: {listed}"
+    );
+
+    // The npm registry's version document for minimist@1.2.2, served
+    // locally (see native_binary_hosted_vendored_takeover_roundtrip).
+    let integrity = "sha512-rIqbOrKb8GJmx/5bc2M0QchhUouMXSpd1RTclXsB41JdL+VtnojfaJR+h7F9k18/4kHUsBFgk80Uk+q569vjPA==";
+    Mock::given(method("GET"))
+        .and(path("/minimist/1.2.2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"dist": {
+            "tarball": "https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz",
+            "integrity": integrity}})))
+        .mount(&server)
+        .await;
+    fixture.stage();
+    let taken_over = cli_env(
+        project,
+        &[
+            "vendor",
+            "--patch-server-url",
+            &uri,
+            "--vendor-source",
+            "service",
+        ],
+        &[("SOCKET_NPM_REGISTRY", &uri)],
+    );
+    assert_eq!(
+        taken_over["summary"]["applied"], 1,
+        "online vendor over the shared hosted pin: {taken_over}"
+    );
+    assert!(
+        taken_over["events"].as_array().is_some_and(|events| events
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_takeover_reverted_redirect")),
+        "the takeover is reported: {taken_over}"
+    );
+    assert!(
+        !taken_over
+            .to_string()
+            .contains("vendor_lock_entry_not_found"),
+        "{taken_over}"
+    );
+    let vendor_lock = fixture.lock();
+    assert!(
+        !vendor_lock.windows(uri.len()).any(|w| w == uri.as_bytes()),
+        "no hosted URL is left in bun.lockb"
+    );
+
+    let reverted = cli(project, &["vendor", "--revert", "--offline"]);
+    assert_eq!(
+        fixture.lock(),
+        fixture.original_lock,
+        "the revert restores the pre-hosted bytes exactly: {reverted}"
+    );
+
+    // `rollback` of the same pin refuses it as any binary hosted pin is
+    // refused (the checkout remedy), not as contested wiring.
+    let hosted = scan(project, &server, "hosted", &[]);
+    assert_eq!(hosted_pin_count(&hosted), 1, "hosted again: {hosted}");
+    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server, true);
+    assert_eq!(fixture.lock(), fixture.original_lock);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1040,10 +1229,7 @@ async fn native_binary_scan_vendored() {
     let server = MockServer::start().await;
     mock_api(&server, &fixture, "minimist").await;
     let result = scan(&fixture.project, &server, "vendored", &[]);
-    assert_eq!(
-        result["vendor"]["summary"]["applied"], 1,
-        "scan vendored: {result}"
-    );
+    assert_eq!(result["summary"]["applied"], 1, "scan vendored: {result}");
     assert!(
         !fixture.project.join(".socket/manifest.json").exists(),
         "vendored scan must not write a manifest"
@@ -1070,10 +1256,7 @@ async fn binary_vendored_revert_after_bun_remove() {
     let server = MockServer::start().await;
     mock_api(&server, &fixture, "minimist").await;
     let result = scan(&fixture.project, &server, "vendored", &[]);
-    assert_eq!(
-        result["vendor"]["summary"]["applied"], 1,
-        "scan vendored: {result}"
-    );
+    assert_eq!(result["summary"]["applied"], 1, "scan vendored: {result}");
     let mut remove = command(&fixture.reader, &fixture.project);
     remove
         .args(["remove", "minimist", "--ignore-scripts"])
@@ -1127,14 +1310,14 @@ async fn native_binary_alias_and_transitive() {
         let server = MockServer::start().await;
         mock_api(&server, &fixture, target).await;
         let result = scan(&fixture.project, &server, "hosted", &[]);
-        assert_eq!(result["redirect"]["redirected"], 1, "{shape}: {result}");
+        assert_eq!(result["summary"]["applied"], 1, "{shape}: {result}");
         fixture.frozen("shape-hosted", &fixture.patched, target);
         fixture.manifestless_vex(
             &format!("{shape}-hosted"),
             bun_vex::BunMode::Hosted,
             &server.uri(),
         );
-        rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
+        rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server, false);
         fixture.pristine();
         fixture.stage();
         let result = cli(&fixture.project, &["vendor", "--offline"]);
@@ -1205,7 +1388,7 @@ async fn vendored_text_migration_reverts_to_registry() {
         let result = if unwind == ["scan"] {
             // The hosted takeover reverts the vendored wiring first.
             let hosted = scan(project, &server, "hosted", &[]);
-            assert_eq!(hosted["redirect"]["redirected"], 1, "{hosted}");
+            assert_eq!(hosted["summary"]["applied"], 1, "{hosted}");
             hosted
         } else {
             cli(project, unwind)
@@ -1267,7 +1450,7 @@ async fn vendor_then_migrate(fixture: &Fixture) -> Option<(String, MockServer)> 
     let server = MockServer::start().await;
     mock_api(&server, fixture, "minimist").await;
     let vendored = scan(&fixture.project, &server, "vendored", &[]);
-    assert_eq!(vendored["vendor"]["summary"]["applied"], 1, "{vendored}");
+    assert_eq!(vendored["summary"]["applied"], 1, "{vendored}");
     let migrated = migrate_to_text_lock(fixture, &fixture.project, "vendored");
     assert!(
         migrated.contains(&format!("minimist@.socket/vendor/npm/{UUID}/")),
@@ -1517,7 +1700,7 @@ async fn workspace_text_migration_heals_on_rerun() {
     mock_api(&server, &fixture, "minimist").await;
     let project = &fixture.project;
     let hosted = scan(project, &server, "hosted", &[]);
-    assert_eq!(hosted["redirect"]["redirected"], 1, "{hosted}");
+    assert_eq!(hosted["summary"]["applied"], 1, "{hosted}");
 
     // Bun's own migration, as its prompt suggests.
     std::fs::remove_file(project.join("bunfig.toml")).unwrap();
@@ -1539,7 +1722,7 @@ async fn workspace_text_migration_heals_on_rerun() {
     assert!(migrated.contains("/patch/npm/minimist/"), "{migrated}");
 
     let rerun = scan(project, &server, "hosted", &[]);
-    assert_eq!(rerun["redirect"]["redirected"], 1, "{rerun}");
+    assert_eq!(rerun["summary"]["applied"], 1, "{rerun}");
     let healed = std::fs::read_to_string(project.join("bun.lock")).unwrap();
     assert_eq!(
         healed,

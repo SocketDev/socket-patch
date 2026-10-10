@@ -23,8 +23,7 @@
 
 use regex::Regex;
 
-use super::npm::{by_uuid, read_or_refuse, refuse_all_in};
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::patch::redirect::{
     generation, maven_repositories_with_id, maven_tag_inner_range, maven_tag_text_in,
     remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS, MVN_CONFIG, MVN_CONFIG_ARGS,
@@ -78,8 +77,11 @@ fn dep_matches(pom: &str, group: &str, artifact: &str) -> Vec<DepMatch> {
 
 /// Is the block at `start` in the rewriter's insertion position: right
 /// after `<dependencyManagement><dependencies>`, with only authored
-/// Socket-pinned entries between?
-fn after_dm_open(pom: &str, start: usize) -> bool {
+/// Socket-pinned entries between? `masked` is the pom with comments blanked
+/// (offsets kept), so a comment between the two tags — which the rewriter
+/// inserts past — reads as the whitespace it is to Maven.
+fn after_dm_open(masked: &str, start: usize) -> bool {
+    let pom = masked;
     let open = Regex::new(r"(?s)<dependencyManagement>\s*<dependencies>\z")
         .expect("static dependencyManagement-open regex is valid");
     let authored = Regex::new(
@@ -152,17 +154,42 @@ fn restore_pin(
             "pom.xml declares no {group}:{artifact} <version>{suffixed}</version>"
         ));
     }
-    let versioned = matches.iter().filter(|m| m.version.is_some()).count();
+    // The GA's literal versions where Maven reads them for the main jar:
+    // not commented out, outside `<build>` / `<reporting>` / `<profiles>`,
+    // no classifier — the same scope the rewriter decides "transitive" by.
     let sections = dm_sections(&text);
     let managed = |pos: usize| sections.iter().any(|(s, e)| pos >= *s && pos < *e);
-    // A versionless direct declaration with nothing but this pom's own
-    // `<dependencyManagement>` to manage it: that entry is the user's.
-    let entry_is_users = matches
-        .iter()
-        .any(|m| m.version.is_none() && !managed(m.start))
-        && !text.contains("<parent>")
-        && !text.contains("<scope>import</scope>");
+    let scoped = crate::formats::maven::PomScope::new(&text).and_then(|s| s.dependencies());
+    // In the same scope: a versionless direct declaration with nothing but
+    // this pom's own `<dependencyManagement>` to manage it means that entry
+    // is the user's (a commented, plugin, profile or classifier sibling is
+    // not such a declaration).
+    let (versioned, versionless_direct) = match &scoped {
+        Ok(deps) => {
+            let main = || {
+                deps.iter().filter(|d| {
+                    d.group.as_deref() == Some(group)
+                        && d.artifact.as_deref() == Some(artifact)
+                        && !d.in_profile
+                        && d.classifier.is_none()
+                })
+            };
+            (
+                main().filter(|d| d.version_inner.is_some()).count(),
+                main().any(|d| d.version_inner.is_none() && !managed(d.element.start)),
+            )
+        }
+        Err(_) => (
+            matches.iter().filter(|m| m.version.is_some()).count(),
+            matches
+                .iter()
+                .any(|m| m.version.is_none() && !managed(m.start)),
+        ),
+    };
+    let entry_is_users =
+        versionless_direct && !text.contains("<parent>") && !text.contains("<scope>import</scope>");
 
+    let masked = crate::formats::xml::blank_non_markup(&text).unwrap_or_else(|_| text.clone());
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for m in matches
         .iter()
@@ -171,7 +198,7 @@ fn restore_pin(
         let authored = versioned == 1
             && !entry_is_users
             && text[m.start..m.end] == authored_dm_block(group, artifact, &suffixed)
-            && after_dm_open(&text, m.start);
+            && after_dm_open(&masked, m.start);
         if authored {
             edits.push((m.start - DM_ENTRY_LEAD.len(), m.end, String::new()));
         } else {
@@ -186,14 +213,16 @@ fn restore_pin(
         text.replace_range(s..e, &with);
     }
 
-    if text.contains(&suffixed) {
+    // A comment naming the pin (a commented-out earlier wiring) is inert.
+    let live = crate::formats::xml::blank_non_markup(&text).unwrap_or_else(|_| text.clone());
+    if live.contains(&suffixed) {
         return Err(format!(
             "pom.xml still names {suffixed} outside a <dependency> version (a property or \
              plugin configuration socket-patch did not write)"
         ));
     }
     let name = generation::hosted_pin_name(uuid);
-    if text.contains(&name) {
+    if live.contains(&name) {
         return Err(format!("pom.xml still names {name}"));
     }
     Ok(text)
@@ -434,6 +463,129 @@ mod tests {
         match &outcome.pins[0].status {
             PinStatus::Refused(why) => why.clone(),
             PinStatus::Restored => panic!("restored"),
+        }
+    }
+
+    /// The scope-aware rewrites (#259, #262, #342) restore to their input:
+    /// a comment, profile or classifier sibling the rewriter left alone is
+    /// left alone again, and a pin added past a comment inside
+    /// `<dependencyManagement>` is still recognised as the rewriter's own.
+    #[tokio::test]
+    async fn scoped_rewrites_round_trip() {
+        for case in [
+            "comment-dependency",
+            "profile-repositories",
+            "plugin-dependency",
+            "profile-depmgmt",
+            "commented-repositories",
+            "classifier-sources-sibling",
+            "classifier-only-transitive-main",
+            "depmgmt-comment",
+        ] {
+            let (outcome, after) = run(&[("pom.xml", fixture(case, "expected", "pom.xml"))]).await;
+            assert!(
+                matches!(outcome.pins[0].status, PinStatus::Restored),
+                "{case}: {:?}",
+                outcome.pins[0].status
+            );
+            assert_eq!(
+                after["pom.xml"],
+                fixture(case, "input", "pom.xml"),
+                "{case}"
+            );
+        }
+    }
+
+    /// A versionless sibling Maven does not read for the main jar (in a
+    /// comment, a plugin, a profile, or with a classifier) does not make the
+    /// rewriter's own `<dependencyManagement>` pin look user-written: the
+    /// pin is removed, not rewritten to the base version.
+    #[tokio::test]
+    async fn versionless_out_of_scope_siblings_keep_the_pin_authored() {
+        let sibling = "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>";
+        for extra in [
+            format!("<!-- {sibling}</dependency> -->"),
+            format!("{sibling}<classifier>sources</classifier></dependency>"),
+            format!(
+                "<build><plugins><plugin><artifactId>p</artifactId><dependencies>{sibling}</dependency></dependencies></plugin></plugins></build>"
+            ),
+            format!(
+                "<profiles><profile><id>x</id><dependencies>{sibling}</dependency></dependencies></profile></profiles>"
+            ),
+        ] {
+            // Beside the project's own (first) `</dependencies>`: inside it
+            // for a dependency, right after it otherwise.
+            let with = |mut pom: String| {
+                let close = "  </dependencies>\n";
+                let at = pom.find(close).expect("project dependencies");
+                if extra.starts_with("<dependency>") {
+                    pom.insert_str(at, &format!("    {extra}\n"));
+                } else {
+                    pom.insert_str(at + close.len(), &format!("  {extra}\n"));
+                }
+                pom
+            };
+            let input = with(fixture("transitive-depmgmt", "input", "pom.xml"));
+            let expected = with(fixture("transitive-depmgmt", "expected", "pom.xml"));
+            let (outcome, after) = run(&[("pom.xml", expected)]).await;
+            assert!(
+                matches!(outcome.pins[0].status, PinStatus::Restored),
+                "{extra}: {:?}",
+                outcome.pins[0].status
+            );
+            assert_eq!(after["pom.xml"], input, "{extra}");
+        }
+    }
+
+    /// A commented-out twin of the Socket repository (an earlier wiring the
+    /// user commented out) does not block rollback of the live one the
+    /// rewriter wrote beside it, and stays as it is.
+    #[tokio::test]
+    async fn a_commented_repository_twin_does_not_block_restore() {
+        let twin = |pom: String| {
+            pom.replacen(
+                "<id>old-mirror</id>",
+                &format!("<id>socket-patch-{UUID}</id>"),
+                1,
+            )
+        };
+        let (outcome, after) = run(&[(
+            "pom.xml",
+            twin(fixture("commented-repositories", "expected", "pom.xml")),
+        )])
+        .await;
+        assert!(
+            matches!(outcome.pins[0].status, PinStatus::Restored),
+            "{:?}",
+            outcome.pins[0].status
+        );
+        assert_eq!(
+            after["pom.xml"],
+            twin(fixture("commented-repositories", "input", "pom.xml"))
+        );
+    }
+
+    /// An expanded self-closed section restores to an empty (still single)
+    /// section: no Socket markup left, and a pom Maven reads.
+    #[tokio::test]
+    async fn expanded_self_closed_sections_restore_to_one_empty_section() {
+        for (case, tag) in [
+            ("self-closed-repositories", "<repositories>"),
+            ("self-closed-depmgmt", "<dependencyManagement>"),
+        ] {
+            let (outcome, after) = run(&[("pom.xml", fixture(case, "expected", "pom.xml"))]).await;
+            assert!(
+                matches!(outcome.pins[0].status, PinStatus::Restored),
+                "{case}: {:?}",
+                outcome.pins[0].status
+            );
+            let pom = &after["pom.xml"];
+            assert!(
+                !pom.contains("-socket.") && !pom.contains("socket-patch-"),
+                "{case}: {pom}"
+            );
+            assert_eq!(pom.matches(tag).count(), 1, "{case}: {pom}");
+            crate::formats::maven::parse_pom(pom).expect("restored pom reads");
         }
     }
 

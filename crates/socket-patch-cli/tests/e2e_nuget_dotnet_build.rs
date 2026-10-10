@@ -773,37 +773,60 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
     let backend = Backend::start(HOSTED_UUID, &pristine, &patched, Some(&nupkg));
     let uri = backend.uri();
 
-    // `scan --mode hosted --vex`: the real rewriter + the in-run VEX.
-    let embedded = fixture.join("scan.vex.json");
-    let (code, env, stderr) = socket_patch(
-        &fixture,
-        &store_fx,
-        &[
-            "scan",
-            "--mode",
-            "hosted",
-            "--json",
-            "--yes",
-            "--api-url",
-            &uri,
-            "--org",
-            ORG,
-            "--api-token",
-            "fake-token",
-            "--patch-server-url",
-            &uri,
-            "--vex",
-            embedded.to_str().unwrap(),
-            "--vex-product",
-            PRODUCT,
-        ],
-    );
+    // `scan --mode hosted`: the real rewriter. The fixture restore left the
+    // UPSTREAM copy in the global packages folder, which NuGet would restore
+    // instead of asking the Socket source (#352): the run says so, names
+    // the directory to delete, and keeps saying so on re-runs until it is.
+    let hosted_args = [
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake-token",
+        "--patch-server-url",
+        &uri,
+    ];
+    let (code, env, stderr) = socket_patch(&fixture, &store_fx, &hosted_args);
     assert_eq!(
         code,
         Some(0),
         "SDK {sdk} scan --mode hosted: {env:#}\n{stderr}"
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
+    let stale_dir = pkg_dir(&store_fx);
+    let warned = env.to_string();
+    assert!(
+        warned.contains("redirect_nuget_stale_global_package")
+            && warned.contains(&stale_dir.display().to_string()),
+        "SDK {sdk}: the warm global packages folder is reported: {env:#}"
+    );
+    // The prescribed remedy, then the idempotent re-run with the in-run VEX.
+    std::fs::remove_dir_all(&stale_dir).unwrap();
+    let embedded = fixture.join("scan.vex.json");
+    let mut vex_args = hosted_args.to_vec();
+    vex_args.extend([
+        "--vex",
+        embedded.to_str().unwrap(),
+        "--vex-product",
+        PRODUCT,
+    ]);
+    let (code, env, stderr) = socket_patch(&fixture, &store_fx, &vex_args);
+    assert_eq!(
+        code,
+        Some(0),
+        "SDK {sdk} scan --mode hosted --vex: {env:#}\n{stderr}"
+    );
+    assert!(
+        !env.to_string()
+            .contains("redirect_nuget_stale_global_package"),
+        "SDK {sdk}: nothing stale once the copy is gone: {env:#}"
+    );
     let doc: Value = serde_json::from_slice(&std::fs::read(&embedded).unwrap()).unwrap();
     assert_attested(&doc, PURL, HOSTED_UUID, Marker::Redirected, &vulns());
     let config = std::fs::read_to_string(fixture.join("nuget.config")).unwrap();
@@ -916,6 +939,13 @@ fn nuget_vendored_dotnet_restore_then_manifestless_vex() {
         Some(0),
         "SDK {sdk} scan --mode vendored: {env:#}\n{stderr}"
     );
+    // The fixture restore's UPSTREAM copy in the global packages folder
+    // would shadow the vendored feed on this machine (#352): reported.
+    assert!(
+        env.to_string()
+            .contains("vendor_nuget_stale_global_package"),
+        "SDK {sdk}: the warm global packages folder is reported: {env:#}"
+    );
     let doc: Value = serde_json::from_slice(&std::fs::read(&embedded).unwrap()).unwrap();
     assert_attested(&doc, PURL, VENDORED_UUID, Marker::Vendored, &vulns());
     let artifact = fixture.join(format!(".socket/vendor/nuget/{VENDORED_UUID}/{NUPKG_NAME}"));
@@ -966,4 +996,108 @@ fn nuget_vendored_dotnet_restore_then_manifestless_vex() {
         &registry,
         None,
     );
+}
+
+// ── solution layout: member and named locks (#353, #514) ──────────────
+
+/// A solution layout: `nuget.config` at the root, one project under
+/// `src/App/` with its own `packages.lock.json`, and one under `src/Named/`
+/// whose lock is the per-project `packages.named.lock.json`. Vendoring from
+/// the root must pin BOTH locks, so a fresh checkout restores each project
+/// (`--locked-mode`, cold cache) with the patched bytes instead of NU1403.
+#[test]
+#[ignore = "real .NET SDK + nuget.org: run with --ignored (CI e2e matrix pins each SDK major)"]
+fn nuget_vendored_solution_member_and_named_locks_restore() {
+    let sb = Sandbox::new();
+    let Some(dn) = Dotnet::probe("vendored-solution", &sb) else {
+        return;
+    };
+    let sdk = dn.version.clone();
+    let root = sb.dir("solution");
+    let store_fx = sb.dir("store-solution");
+    std::fs::write(root.join("nuget.config"), REGISTRY_CONFIG).unwrap();
+    let projects = [("src/App", "app"), ("src/Named", "named")];
+    for (dir, name) in projects {
+        let d = root.join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("{name}.csproj")), dn.csproj()).unwrap();
+        dn.restore_ok(&sb, &d, &store_fx, &[], "member restore from nuget.org");
+    }
+    // NuGet reads (and writes) the per-project name once it exists.
+    std::fs::rename(
+        root.join("src/Named/packages.lock.json"),
+        root.join("src/Named/packages.named.lock.json"),
+    )
+    .unwrap();
+    assert!(!root.join("packages.lock.json").exists());
+
+    let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
+    let mut patched = pristine.clone();
+    patched.extend_from_slice(MARKER);
+    let upstream = std::fs::read(pkg_dir(&store_fx).join(NUPKG_NAME)).unwrap();
+    let nupkg = patched_nupkg(&upstream, &patched);
+    let backend = Backend::start(VENDORED_UUID, &pristine, &patched, Some(&nupkg));
+    let uri = backend.uri();
+
+    let (code, env, stderr) = socket_patch(
+        &root,
+        &store_fx,
+        &[
+            "scan",
+            "--mode",
+            "vendored",
+            "--vendor-source",
+            "service",
+            "--json",
+            "--yes",
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake-token",
+        ],
+    );
+    assert_eq!(code, Some(0), "SDK {sdk}: {env:#}\n{stderr}");
+    assert!(
+        !env.to_string().contains("vendor_nuget_no_lockfile"),
+        "the member locks were found: {env:#}"
+    );
+    let artifact = root.join(format!(".socket/vendor/nuget/{VENDORED_UUID}/{NUPKG_NAME}"));
+    let pin = content_hash(&std::fs::read(&artifact).unwrap());
+    for lock in [
+        "src/App/packages.lock.json",
+        "src/Named/packages.named.lock.json",
+    ] {
+        let text = std::fs::read_to_string(root.join(lock)).unwrap();
+        assert!(text.contains(&pin), "SDK {sdk}: {lock} re-pinned: {text}");
+    }
+
+    // Fresh checkout of the committable files, cold cache, each project.
+    let checkout = sb.dir("solution-checkout");
+    std::fs::copy(root.join("nuget.config"), checkout.join("nuget.config")).unwrap();
+    copy_tree(&root.join(".socket"), &checkout.join(".socket"));
+    strip_manifest(&checkout);
+    let blobs = checkout.join(".socket/blobs");
+    if blobs.exists() {
+        std::fs::remove_dir_all(blobs).unwrap();
+    }
+    for (dir, name) in projects {
+        let (from, to) = (root.join(dir), checkout.join(dir));
+        std::fs::create_dir_all(&to).unwrap();
+        for entry in std::fs::read_dir(&from).unwrap() {
+            let entry = entry.unwrap();
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if file.ends_with(".csproj") || file.ends_with(".lock.json") {
+                std::fs::copy(entry.path(), to.join(&file)).unwrap();
+            }
+        }
+        let store = sb.dir(&format!("store-checkout-{name}"));
+        dn.restore_ok(&sb, &to, &store, &["--locked-mode"], "member fresh restore");
+        assert_eq!(
+            std::fs::read(pkg_dir(&store).join(FILE_KEY)).unwrap(),
+            patched,
+            "SDK {sdk}: {dir} restored the PATCHED {FILE_KEY}"
+        );
+    }
 }

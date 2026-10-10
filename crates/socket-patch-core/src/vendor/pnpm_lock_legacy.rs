@@ -201,24 +201,21 @@ impl Ctx<'_> {
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_pnpm_legacy<'a>(
     purl: &str,
-    installed_dir: impl Into<PackageSource<'a>>,
+    _installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     super::pnpm_lock::vendor_pnpm_dialect(
         purl,
-        installed_dir.into(),
         project_root,
         record,
-        sources,
         vendored_at,
         dry_run,
-        force,
         service,
         PnpmDialect::Legacy,
     )
@@ -1805,6 +1802,7 @@ packages:
                 created_pnpm_table: true,
                 created_workspace_file: false,
                 created_workspace_overrides: false,
+                created_workspace_packages: false,
             })
         );
         assert_eq!(entry.artifact.path, fx.rel_tgz());

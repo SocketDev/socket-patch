@@ -3,14 +3,17 @@
 //! three packages per run, most severe first, in hosted, agent and vendored
 //! mode; a fourth run changes nothing. Mock API, the built binary.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -36,8 +39,43 @@ const ORDER: [&str; 9] = [
     "roll-e", "roll-b", "roll-g", "roll-c", "roll-d", "roll-h", "roll-a", "roll-i", "roll-f",
 ];
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
+/// The hosted events (`details.mode: "hosted"`) of a scan envelope.
+fn hosted_events(v: &Value) -> Vec<&Value> {
+    v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["details"]["mode"] == "hosted")
+        .collect()
+}
+
+/// A hosted run's decisions, tense-neutral so a dry run (`verified` pins,
+/// "would be written" warning details) compares equal to the wet run it
+/// predicts (`applied` pins): each hosted event as `(action, purl, uuid,
+/// errorCode)`, the rewritten files and the warning codes.
+fn hosted_decisions(v: &Value) -> Value {
+    let events: Vec<Value> = hosted_events(v)
+        .into_iter()
+        .map(|e| {
+            let action = if e["action"] == "verified" {
+                json!("applied")
+            } else {
+                e["action"].clone()
+            };
+            json!([action, e["purl"], e["uuid"], e["errorCode"]])
+        })
+        .collect();
+    let codes: Vec<Value> = v["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|w| w["code"].clone())
+        .collect();
+    json!({
+        "events": events,
+        "rewrittenFiles": v["redirect"]["rewrittenFiles"],
+        "warnings": codes,
+    })
 }
 
 fn uuid(name: &str) -> String {
@@ -62,13 +100,6 @@ fn before(name: &str) -> Vec<u8> {
 
 fn after(name: &str) -> Vec<u8> {
     format!("module.exports = '{name} after';\n").into_bytes()
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -349,26 +380,7 @@ async fn hosted_cap_rolls_nine_packages_forward_three_per_run() {
         let v = run_json(tmp.path(), &mock, &args);
         // The dry run before each wet run predicts it exactly.
         // (Warning details switch tense: "would be written" / "was written".)
-        let decisions = |block: &Value| -> Value {
-            let mut block = block.clone();
-            let obj = block.as_object_mut().unwrap();
-            obj.remove("dryRun");
-            // `patches[]` rows switch tense too: `would_pin` / `pinned`.
-            for row in obj["patches"].as_array_mut().unwrap() {
-                if row["action"] == "would_pin" {
-                    row["action"] = json!("pinned");
-                }
-            }
-            let codes: Vec<Value> = obj["warnings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|w| w["code"].clone())
-                .collect();
-            obj.insert("warnings".into(), Value::Array(codes));
-            block
-        };
-        let (predicted, actual) = (decisions(&dry["redirect"]), decisions(&v["redirect"]));
+        let (predicted, actual) = (hosted_decisions(&dry), hosted_decisions(&v));
         assert_eq!(
             dry["rollout"],
             v["rollout"],
@@ -414,15 +426,14 @@ async fn hosted_cap_rolls_nine_packages_forward_three_per_run() {
             .map(|d| d["rank"].as_u64().unwrap())
             .collect();
         assert_eq!(ranks, (4..4 + ranks.len() as u64).collect::<Vec<_>>());
-        let skipped: Vec<&str> = v["redirect"]["skipped"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s["reason"].as_str().unwrap())
+        let skipped: Vec<&str> = hosted_events(&v)
+            .into_iter()
+            .filter(|e| e["action"] == "skipped")
+            .map(|e| e["errorCode"].as_str().unwrap())
             .collect();
         assert!(skipped.iter().all(|r| *r == "rollout_deferred"));
         assert_eq!(skipped.len() as u64, 6 - done);
-        assert_eq!(v["redirect"]["redirected"], 3 * (run_no as u64 + 1));
+        assert_eq!(v["summary"]["applied"], 3 * (run_no as u64 + 1));
         previous_lock = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
         let mut next_dry = args.to_vec();
         next_dry.push("--dry-run");
@@ -498,11 +509,15 @@ async fn hosted_ineligible_top_ranked_patches_hold_no_slot() {
         v["rollout"]["deferred"][0]["rank"], 3,
         "ranks count eligible rows only"
     );
-    let reasons: Vec<(&str, &str)> = v["redirect"]["skipped"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| (s["purl"].as_str().unwrap(), s["reason"].as_str().unwrap()))
+    let reasons: Vec<(&str, &str)> = hosted_events(&v)
+        .into_iter()
+        .filter(|e| e["action"] == "skipped")
+        .map(|e| {
+            (
+                e["purl"].as_str().unwrap(),
+                e["errorCode"].as_str().unwrap(),
+            )
+        })
         .collect();
     assert!(
         reasons.contains(&("pkg:npm/roll-e@1.0.0", "withdrawn")),
@@ -582,10 +597,11 @@ async fn agent_cap_rolls_forward_and_upgrades_ignore_the_cap() {
         let v = run_json(tmp.path(), &mock, &args);
         if run_no == 1 {
             assert_eq!(dry["rollout"], v["rollout"], "dry run == wet run");
-            let added: Vec<&str> = dry["apply"]["patches"]
+            let added: Vec<&str> = dry["events"]
                 .as_array()
                 .unwrap()
                 .iter()
+                .filter(|e| e["action"] == "verified")
                 .map(|p| p["purl"].as_str().unwrap())
                 .collect();
             assert_eq!(added.len(), 3, "{dry}");
@@ -712,7 +728,7 @@ async fn vendored_cap_rolls_forward_three_per_run() {
         let v = run_json(tmp.path(), &mock, &args);
         if run_no == 1 {
             assert_eq!(dry["rollout"], v["rollout"], "dry run == wet run");
-            assert_eq!(dry["vendor"]["patches"].as_array().unwrap().len(), 3);
+            assert_eq!(dry["summary"]["verified"], 3, "{dry}");
         }
         assert_eq!(vendored(tmp.path()), names(&ORDER[..3 * run_no]), "{v}");
     }
@@ -1263,8 +1279,8 @@ async fn vendored_upgrade_without_a_served_artifact_keeps_the_vendored_patch() {
             assert_eq!(exit, 0, "{status}: stdout={stdout}\nstderr={stderr}");
             let v: Value = serde_json::from_str(stdout.trim()).unwrap();
             assert_eq!(v["status"], "success", "{status}: {v:#}");
-            assert_eq!(v["vendor"]["summary"]["failed"], 0, "{status}: {v:#}");
-            let vendor = v["vendor"].to_string();
+            assert_eq!(v["summary"]["failed"], 0, "{status}: {v:#}");
+            let vendor = v["events"].to_string();
             assert!(
                 vendor.contains(code) && vendor.contains(newer),
                 "{status}: the upgrade is a `{code}` skip: {v:#}"

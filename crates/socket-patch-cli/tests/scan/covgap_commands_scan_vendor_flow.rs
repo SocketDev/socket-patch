@@ -266,10 +266,10 @@ fn seed_stale_manifest(root: &Path) {
 }
 
 /// Shared assertions for the vendor-step error fold: exit 1, a JSON
-/// envelope with `status: "error"`, the given `error.code` and a `download`
-/// sub-object (proof the run got PAST the download phase and died inside
-/// the vendor step). Whether a `vendor` sub-object rides along depends on
-/// WHERE the step died — see [`assert_no_vendor_envelope`] (lock failures)
+/// envelope with `status: "error"`, the given `error.code` and a vendored
+/// `downloaded` event (proof the run got PAST the download phase and died
+/// inside the vendor step). Whether vendor-engine events ride along depends
+/// on WHERE the step died — see [`assert_no_vendor_envelope`] (lock failures)
 /// and [`assert_demoted_empty_vendor_envelope`] (staging failures).
 fn assert_vendor_step_error(
     code: i32,
@@ -283,7 +283,11 @@ fn assert_vendor_step_error(
     assert_eq!(v["status"], "error", "envelope={v}");
     assert_eq!(v["error"]["code"], expect_code, "envelope={v}");
     assert!(
-        v["download"].is_object(),
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "downloaded" && e["details"]["mode"] == "vendored"),
         "the run must reach the vendor step (download phase completed); envelope={v}"
     );
     v
@@ -295,7 +299,15 @@ fn assert_vendor_step_error(
 fn assert_no_vendor_envelope(v: &serde_json::Value) {
     assert!(
         !v.as_object().unwrap().contains_key("vendor"),
-        "a pre-lock failure has no vendor envelope to carry; envelope={v}"
+        "no nested vendor envelope (v5.0); envelope={v}"
+    );
+    assert!(
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["action"] == "downloaded" || e["action"] == "failed"),
+        "a pre-lock failure carries no vendor-engine event; envelope={v}"
     );
 }
 
@@ -317,15 +329,17 @@ async fn scan_vendor_dry_run_reports_already_vendored() {
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["vendor"]["dryRun"], true, "envelope={v}");
-    let patches = v["vendor"]["patches"].as_array().expect("vendor preview");
+    assert_eq!(v["dryRun"], true, "envelope={v}");
+    let patches = v["events"].as_array().expect("vendor preview events");
     assert_eq!(patches.len(), 1, "envelope={v}");
     assert_eq!(patches[0]["purl"], PURL, "envelope={v}");
-    assert_eq!(patches[0]["action"], "already_vendored", "envelope={v}");
+    assert_eq!(patches[0]["action"], "skipped", "envelope={v}");
+    assert_eq!(patches[0]["errorCode"], "already_vendored", "envelope={v}");
+    assert_eq!(patches[0]["details"]["mode"], "vendored", "envelope={v}");
     assert_eq!(patches[0]["uuid"], UUID, "envelope={v}");
     assert!(
         !patches[0].as_object().unwrap().contains_key("oldUuid"),
-        "oldUuid marks would_revendor only; envelope={v}"
+        "oldUuid marks a re-vendor only; envelope={v}"
     );
 
     // Non-mutation: no manifest written, lock untouched, no view fetch.
@@ -347,8 +361,8 @@ async fn scan_vendor_dry_run_reports_already_vendored() {
 
 /// `scan --json --mode vendored --dry-run --prune` (a legal combination —
 /// `--mode vendored` conflicts only with `--mode agent`/`--sync`): the vendor JSON
-/// path's dry-run arm must emit the GC PREVIEW (`prunable*`/`orphan*`
-/// field names, per `to_preview_json`) and mutate nothing on disk.
+/// path's dry-run arm must emit the GC PREVIEW (the one `gc` shape minus
+/// the wet-only keys) and mutate nothing on disk.
 #[tokio::test]
 async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
     let mock = MockServer::start().await;
@@ -363,31 +377,33 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
 
-    // The vendor dry-run preview ran (empty discovery ⇒ empty preview).
-    assert_eq!(v["vendor"]["dryRun"], true, "envelope={v}");
-    assert_eq!(
-        v["vendor"]["patches"],
-        serde_json::json!([]),
+    // The vendor dry-run preview ran (empty discovery ⇒ no vendored
+    // preview events).
+    assert_eq!(v["dryRun"], true, "envelope={v}");
+    assert!(
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["details"]["mode"] != "vendored"),
         "envelope={v}"
     );
 
-    // The GC preview: the stale entry is PRUNABLE (preview vocabulary),
-    // not "pruned" (the mutating pass's vocabulary).
-    let gc = v["gc"]
-        .as_object()
-        .unwrap_or_else(|| panic!("--prune must emit a gc sub-object; envelope={v}"));
+    // The GC preview: the stale entry is a `verified` (would-remove)
+    // manifest event, never `removed`.
     assert_eq!(
-        gc["prunableManifestEntries"],
-        serde_json::json!([STALE_PURL]),
+        v["events"],
+        serde_json::json!([{
+            "action": "verified", "purl": STALE_PURL, "details": {"manifest": true},
+        }]),
         "envelope={v}"
     );
+    let gc = v["gc"]
+        .as_object()
+        .unwrap_or_else(|| panic!("--prune must emit a gc object; envelope={v}"));
     assert!(
-        gc.contains_key("bytesReclaimable") && gc.contains_key("orphanBlobs"),
-        "dry+prune must use the preview field names; gc={gc:?}"
-    );
-    assert!(
-        !gc.contains_key("prunedManifestEntries") && !gc.contains_key("bytesFreed"),
-        "dry+prune must not use the mutating pass's field names; gc={gc:?}"
+        gc.contains_key("bytesFreed") && gc.contains_key("removedBlobs"),
+        "dry+prune uses the one gc shape; gc={gc:?}"
     );
 
     // Nothing mutated: the stale entry survives byte-for-byte.
@@ -415,10 +431,9 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
         run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run", "--prune"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["vendor"]["dryRun"], true, "envelope={v}");
+    assert_eq!(v["dryRun"], true, "envelope={v}");
     assert_eq!(
-        v["gc"]["prunableManifestEntries"],
-        serde_json::json!([STALE_PURL]),
+        v["events"][0]["purl"], STALE_PURL,
         "the lock-free preview lists under a held lock: {v}"
     );
     assert!(
@@ -447,7 +462,7 @@ async fn scan_vendor_lock_held_reports_json_error() {
         v["error"]["message"], "another socket-patch process is operating in this directory",
         "the contention message is contract; envelope={v}"
     );
-    assert_eq!(v["download"]["downloaded"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["downloaded"], 1, "envelope={v}");
     assert!(!tmp.path().join(".socket/vendor").exists());
 }
 
@@ -494,9 +509,9 @@ async fn scan_vendor_corrupt_manifest_is_reported_and_stepped_around() {
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "envelope={v}");
-    assert_eq!(v["vendor"]["summary"]["applied"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["applied"], 1, "envelope={v}");
     assert!(
-        v["vendor"]["warnings"]
+        v["warnings"]
             .as_array()
             .is_some_and(|ws| ws.iter().any(|w| {
                 w["code"] == "vendor_manifest_migration_failed"
@@ -574,7 +589,8 @@ async fn scan_vendor_dry_run_reports_already_vendored_for_vlt() {
         &[],
     );
     assert_eq!(code, 0, "{env:#}\n{stderr}");
-    let rec = &env["vendor"]["patches"][0];
-    assert_eq!(rec["action"], "already_vendored", "{env:#}");
+    let rec = &env["events"][0];
+    assert_eq!(rec["action"], "skipped", "{env:#}");
+    assert_eq!(rec["errorCode"], "already_vendored", "{env:#}");
     assert_eq!(hosted::read(root, "vlt-lock.json"), lock);
 }

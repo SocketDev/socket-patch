@@ -123,7 +123,8 @@ fn write_ghost_npm_manifest(cwd: &Path, purl: &str) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// corrupt manifest → `manifest_unreadable`, exit 2 (read_manifest Err arm)
+// corrupt manifest → `manifest_invalid`, exit 2 (read_manifest Err arm;
+// the shared manifest-load mapping, #931)
 //
 // A PRESENT-but-corrupt `.socket/manifest.json` is the hard exit-2 error
 // (`read_manifest` → Err), distinct from the missing-manifest exit-2
@@ -203,13 +204,13 @@ fn corrupt_manifest_json_envelope_carries_code_and_removes_stale_doc() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "manifest_unreadable is a hard error in --json mode too. stdout:\n{}",
+        "manifest_invalid is a hard error in --json mode too. stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
     let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
     assert_eq!(env["command"], "vex", "{env}");
     assert_eq!(env["status"], "error", "{env}");
-    assert_eq!(env["error"]["code"], "manifest_unreadable", "{env}");
+    assert_eq!(env["error"]["code"], "manifest_invalid", "{env}");
     assert!(
         env["error"]["message"]
             .as_str()
@@ -275,7 +276,7 @@ fn failed_run_does_not_block_on_a_fifo_at_output() {
         String::from_utf8_lossy(&out.stdout)
     );
     let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
-    assert_eq!(env["error"]["code"], "manifest_unreadable", "{env}");
+    assert_eq!(env["error"]["code"], "manifest_invalid", "{env}");
     assert!(
         std::fs::symlink_metadata(&fifo)
             .unwrap()
@@ -748,11 +749,11 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
     let mut state = VendorState::new();
     state.entries.insert(
         purl.to_string(),
-        VendorEntry {
-            ecosystem: "golang".to_string(),
-            base_purl: purl.to_string(),
-            uuid: UUID.to_string(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            "golang".to_string(),
+            purl.to_string(),
+            UUID.to_string(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
@@ -760,7 +761,7 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: vec![WiringRecord {
+            vec![WiringRecord {
                 file: "go.mod".to_string(),
                 kind: "go_replace".to_string(),
                 action: WiringAction::Added,
@@ -768,17 +769,7 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 original: None,
                 new: None,
             }],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
+        ),
     );
     let dir = cwd.join(".socket/vendor");
     std::fs::create_dir_all(&dir).unwrap();

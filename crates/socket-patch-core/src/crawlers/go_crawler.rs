@@ -175,14 +175,14 @@ impl GoCrawler {
     // ------------------------------------------------------------------
 
     /// Get `GOMODCACHE`, falling back to `$GOPATH/pkg/mod/` or `$HOME/go/pkg/mod/`.
+    /// Each setting resolves as go resolves it: the environment, then the
+    /// `go env -w` file ([`crate::utils::go_env`]), so a cache configured
+    /// with `go env -w GOMODCACHE=…` is the one crawled (#344).
     fn get_gomodcache() -> Option<PathBuf> {
-        if let Ok(cache) = std::env::var("GOMODCACHE") {
-            let p = PathBuf::from(cache);
-            if !p.as_os_str().is_empty() {
-                return Some(p);
-            }
+        if let Some(cache) = crate::utils::go_env::go_env("GOMODCACHE") {
+            return Some(PathBuf::from(cache));
         }
-        if let Ok(gopath) = std::env::var("GOPATH") {
+        if let Some(gopath) = crate::utils::go_env::go_env("GOPATH") {
             // GOPATH may list several directories separated by the OS path
             // separator (`:` on Unix, `;` on Windows). Go uses the FIRST
             // entry for the module cache, so split rather than treating the
@@ -314,12 +314,13 @@ fn go_sum_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
 
 /// Whether the go command would build `cwd` in workspace mode: `GOWORK`
 /// names a file, or (`GOWORK` unset or empty) a `go.work` exists in `cwd`
-/// or an ancestor. `GOWORK=off` disables workspaces.
+/// or an ancestor. `GOWORK=off` disables workspaces. `GOWORK` resolves
+/// from the environment, then the `go env -w` file.
 fn workspace_in_effect(cwd: &Path) -> bool {
-    match std::env::var_os("GOWORK") {
+    match crate::utils::go_env::go_env("GOWORK") {
         Some(v) if v == "off" => false,
-        Some(v) if !v.is_empty() => true,
-        _ => go_work_at_or_above(cwd, &std::env::current_dir().unwrap_or_default()),
+        Some(_) => true,
+        None => go_work_at_or_above(cwd, &std::env::current_dir().unwrap_or_default()),
     }
 }
 
@@ -1565,6 +1566,8 @@ mod tests {
         // own project. Twin of `m2_repo_path`'s / `nuget_home`'s guards.
         let gopath_a = tempfile::tempdir().unwrap();
         let home_b = tempfile::tempdir().unwrap();
+        // No `go env -w` file: the developer's own must not leak in.
+        let _goenv = EnvGuard::set("GOENV", "off");
 
         // Case A: empty GOMODCACHE falls through to GOPATH, and the empty
         // FIRST GOPATH entry is skipped in favor of the next non-empty one
@@ -1600,6 +1603,33 @@ mod tests {
             None,
             "all-empty env must yield None, never a CWD-relative path"
         );
+    }
+
+    /// #344: GOMODCACHE / GOPATH written with `go env -w` (the `$GOENV`
+    /// file) locate the cache go itself uses; the environment still wins.
+    #[test]
+    #[serial_test::serial]
+    fn test_get_gomodcache_reads_the_go_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("env");
+        let cache = dir.path().join("custom-cache");
+        let gopath = dir.path().join("gopath");
+        let _gomodcache = EnvGuard::unset("GOMODCACHE");
+        let _gopath = EnvGuard::unset("GOPATH");
+        let _goenv = EnvGuard::set("GOENV", file.to_str().unwrap());
+
+        std::fs::write(&file, format!("GOMODCACHE={}\n", cache.display())).unwrap();
+        assert_eq!(GoCrawler::get_gomodcache(), Some(cache.clone()));
+
+        std::fs::write(&file, format!("GOPATH={}\n", gopath.display())).unwrap();
+        assert_eq!(
+            GoCrawler::get_gomodcache(),
+            Some(gopath.join("pkg").join("mod"))
+        );
+
+        let env_cache = dir.path().join("env-cache");
+        let _env = EnvGuard::set("GOMODCACHE", env_cache.to_str().unwrap());
+        assert_eq!(GoCrawler::get_gomodcache(), Some(env_cache));
     }
 
     #[tokio::test]

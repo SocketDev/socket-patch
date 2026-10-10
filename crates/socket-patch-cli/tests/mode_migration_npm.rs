@@ -22,6 +22,10 @@
 //! the registry is unreachable for the fixture install; all assertions after
 //! that are hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, cache_env, git_sha256, hermetic};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -32,10 +36,6 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
-#[path = "common/hermetic.rs"]
-mod hermetic;
 // yarn legs: release selection (classic) + the manifest-less VEX matrices.
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
@@ -59,10 +59,6 @@ const YARN_BERRY: &str = "yarn@4.12.0";
 
 // ── self-contained helpers (harness patterns shared with the redirect /
 //    vendor yarn capstones) ──────────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Probe corepack from a NEUTRAL temp dir: a `packageManager` field in an
 /// ancestor `package.json` makes corepack refuse to run a different package
@@ -132,10 +128,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
             std::fs::copy(entry.path(), &to).unwrap();
         }
     }
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    compute_git_sha256_from_bytes(content)
 }
 
 /// Write `.socket/manifest.json` + the after-hash blob so `vendor --offline`
@@ -1053,7 +1045,7 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
     let (code, stdout, stderr) = run_hosted_scan(&proj, &server.uri());
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
-    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_eq!(hosted_pinned(&envelope), 1, "{stdout}");
     assert!(
         stdout.contains("redirect_takeover_reverted_vendored"),
         "takeover warning missing: {stdout}"
@@ -1390,7 +1382,7 @@ async fn berry_vendored_then_hosted_takeover_leaves_pure_hosted() {
     let (code, stdout, stderr) = run_hosted_scan(&proj, &server.uri());
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
-    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_eq!(hosted_pinned(&envelope), 1, "{stdout}");
     assert!(
         stdout.contains("redirect_takeover_reverted_vendored"),
         "takeover warning missing: {stdout}"
@@ -1487,4 +1479,19 @@ async fn berry_vendored_then_hosted_takeover_leaves_pure_hosted() {
         pnp_cell: false,
     };
     yarn_berry_common::off_runtime(|| yarn_berry_common::run_manifestless_vex_matrix(&flow));
+}
+
+/// How many hosted pins a `scan --mode hosted --json` run wrote (or would
+/// write, on a dry run): its `applied` / `verified` events with
+/// `details.mode: "hosted"`.
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

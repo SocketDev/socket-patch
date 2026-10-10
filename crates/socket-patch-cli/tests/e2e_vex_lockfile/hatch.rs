@@ -186,7 +186,7 @@ fn vendored_dependency_group_is_refused_and_never_attested() {
         &["--vex", vex_out.to_str().unwrap(), "--vex-product", PRODUCT],
     );
     assert_ne!(code, Some(0), "{env}\n{stderr}");
-    let codes: Vec<&str> = env["vendor"]["events"]
+    let codes: Vec<&str> = env["events"]
         .as_array()
         .into_iter()
         .flatten()

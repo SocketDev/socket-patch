@@ -154,6 +154,35 @@ fn parse_scan_json(stdout: &str) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("scan emitted invalid JSON: {e}\nstdout:\n{stdout}"))
 }
 
+/// The free patches discovery reported (`packages[].patches[]` with
+/// `tier: "free"`; v5.0 dropped the `freePatches` counter).
+fn free_patches(v: &serde_json::Value) -> usize {
+    v["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|p| p["patches"].as_array().into_iter().flatten())
+        .filter(|p| p["tier"] == "free")
+        .count()
+}
+
+/// The envelope's per-patch download events (`downloaded` / `updated` /
+/// `skipped`, the v5.0 replacement for `apply.patches[]`).
+fn patch_events(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    v["events"].as_array().cloned().unwrap_or_default()
+}
+
+/// The manifest entries the GC pruned (`removed` events, `verified` on a
+/// dry run, with `details.manifest: true`; v5.0 replaced
+/// `gc.prunedManifestEntries`).
+fn pruned_entries(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    patch_events(v)
+        .into_iter()
+        .filter(|e| e["details"]["manifest"] == true)
+        .map(|e| e["purl"].clone())
+        .collect()
+}
+
 /// Parse the persisted `.socket/manifest.json`. Panics with a useful
 /// message if it doesn't exist or is malformed.
 fn read_manifest_file(cwd: &Path) -> serde_json::Value {
@@ -233,18 +262,16 @@ fn test_scan_apply_json_adds_new_patch() {
         v["scannedPackages"]
     );
     assert!(
-        v["freePatches"].as_u64().unwrap_or(0) >= 1,
+        free_patches(&v) >= 1,
         "API must have returned at least one free patch; got {}",
-        v["freePatches"]
+        free_patches(&v)
     );
-    let patches = v["apply"]["patches"]
-        .as_array()
-        .expect("apply.patches array");
+    let patches = patch_events(&v);
     let minimist = patches
         .iter()
         .find(|p| p["purl"] == NPM_PURL)
-        .expect("apply.patches should include minimist");
-    assert_eq!(minimist["action"], "added");
+        .expect("events should include minimist");
+    assert_eq!(minimist["action"], "downloaded");
     let reported_uuid = minimist["uuid"].as_str().expect("uuid must be present");
     assert!(!reported_uuid.is_empty(), "uuid must be non-empty");
 
@@ -301,14 +328,13 @@ fn test_scan_apply_json_skips_existing() {
     );
     let v = parse_scan_json(&stdout);
 
-    let patches = v["apply"]["patches"]
-        .as_array()
-        .expect("apply.patches array");
+    let patches = patch_events(&v);
     let minimist = patches
         .iter()
         .find(|p| p["purl"] == NPM_PURL)
-        .expect("apply.patches should include minimist on re-run");
+        .expect("events should include minimist on re-run");
     assert_eq!(minimist["action"], "skipped");
+    assert_eq!(minimist["errorCode"], "already_in_manifest");
     // The re-run is a no-op: the file must be exactly what the first run
     // produced.
     assert_eq!(
@@ -338,13 +364,11 @@ fn test_scan_apply_json_updates_existing() {
     );
     let v = parse_scan_json(&stdout);
 
-    let patches = v["apply"]["patches"]
-        .as_array()
-        .expect("apply.patches array");
+    let patches = patch_events(&v);
     let minimist = patches
         .iter()
         .find(|p| p["purl"] == NPM_PURL)
-        .expect("apply.patches should include minimist");
+        .expect("events should include minimist");
     assert_eq!(minimist["action"], "updated");
     assert_eq!(minimist["oldUuid"], FAKE_OLD_UUID);
     assert!(
@@ -430,9 +454,9 @@ fn test_scan_json_read_only_no_mutation() {
         v["scannedPackages"]
     );
     assert!(
-        v["freePatches"].as_u64().unwrap_or(0) >= 1,
+        free_patches(&v) >= 1,
         "read-only scan must surface at least one free patch; got {}",
-        v["freePatches"]
+        free_patches(&v)
     );
     let packages = v["packages"].as_array().expect("packages array");
     assert!(
@@ -453,8 +477,8 @@ fn test_scan_json_read_only_no_mutation() {
 
 /// When a previously-patched package is uninstalled, passing `--prune`
 /// (or `--sync`) on the next `scan --mode agent --yes` prunes its manifest
-/// entry and sweeps the orphan blobs. JSON output reports it in
-/// `gc.prunedManifestEntries`.
+/// entry and sweeps the orphan blobs. JSON output reports it as a
+/// `removed` event with `details.manifest: true`.
 #[test]
 #[ignore]
 fn test_scan_apply_prune_prunes_uninstalled_package() {
@@ -484,9 +508,7 @@ fn test_scan_apply_prune_prunes_uninstalled_package() {
     );
     let v = parse_scan_json(&stdout);
 
-    let pruned = v["gc"]["prunedManifestEntries"]
-        .as_array()
-        .expect("gc.prunedManifestEntries array");
+    let pruned = pruned_entries(&v);
     assert!(
         pruned.iter().any(|p| p == NPM_PURL),
         "minimist should be pruned from manifest after uninstall; got {pruned:?}"
@@ -537,9 +559,8 @@ fn test_scan_apply_default_keeps_uninstalled_entries() {
         v["scannedPackages"]
     );
     assert!(
-        v["apply"]["patches"].is_array(),
-        "an apply run must emit the apply.patches array; got {}",
-        v["apply"]
+        v["events"].is_array(),
+        "an apply run must emit the events array; got {v}"
     );
 
     assert!(
@@ -638,7 +659,8 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
 
 /// `scan --json --dry-run --sync --yes` previews the full sync action:
 /// `apply.patches[]` is populated with would-be actions and `gc`
-/// reports `prunable*`/`orphan*` counts, but nothing on disk changes.
+/// reports the would-be `pruned*`/`removed*` counts, but nothing on disk
+/// changes.
 #[test]
 #[ignore]
 fn test_scan_dry_run_sync_previews_apply_and_gc() {
@@ -673,24 +695,21 @@ fn test_scan_dry_run_sync_previews_apply_and_gc() {
     let v = parse_scan_json(&stdout);
 
     // Preview output present.
-    let prunable = v["gc"]["prunableManifestEntries"]
-        .as_array()
-        .expect("gc.prunableManifestEntries array");
+    let prunable = pruned_entries(&v);
     assert!(
         prunable.iter().any(|p| p == NPM_PURL),
         "preview should list minimist as prunable; got {prunable:?}"
     );
     assert!(
-        v["gc"]["orphanBlobs"].as_u64().unwrap_or(0) >= 1,
+        v["gc"]["removedBlobs"].as_u64().unwrap_or(0) >= 1,
         "preview should count at least 1 orphan blob"
     );
-    assert_eq!(v["apply"]["dryRun"], true);
-    // The apply preview must still emit the stable `patches[]` shape even
-    // when nothing is selectable, so a bot can parse it unconditionally.
+    assert_eq!(v["dryRun"], true);
+    // The preview still emits the stable `events` array even when nothing
+    // is selectable, so a bot can parse it unconditionally.
     assert!(
-        v["apply"]["patches"].is_array(),
-        "dry-run apply must emit a patches array; got {}",
-        v["apply"]
+        v["events"].is_array(),
+        "dry-run apply must emit an events array; got {v}"
     );
 
     // Verify non-mutation.
@@ -766,20 +785,18 @@ fn test_scan_sync_yes_full_lifecycle() {
         "first --sync apply",
     );
     let v1 = parse_scan_json(&stdout1);
-    let patches = v1["apply"]["patches"]
-        .as_array()
-        .expect("first sync should populate apply.patches");
+    let patches = patch_events(&v1);
     assert!(
         patches
             .iter()
-            .any(|p| p["purl"] == NPM_PURL && p["action"] == "added"),
+            .any(|p| p["purl"] == NPM_PURL && p["action"] == "downloaded"),
         "first sync should add the minimist patch"
     );
     assert_eq!(v1["status"], "success");
-    // gc field should be present (--sync implies --prune). It must be a real GC
-    // result, not the `{"skipped": true}` short-circuit (which `is_object()`
-    // would also accept), and on this first run there is nothing installed-then-
-    // uninstalled, so it must prune nothing.
+    // gc field should be present (--sync implies --prune): a skipped pass
+    // has no `gc` at all (only a `gc_skipped` warning), and on this first
+    // run there is nothing installed-then-uninstalled, so it must prune
+    // nothing.
     let gc1 = v1["gc"]
         .as_object()
         .expect("gc must be emitted under --sync");
@@ -788,9 +805,7 @@ fn test_scan_sync_yes_full_lifecycle() {
         "GC must not be skipped on a --sync run that scanned packages; got {:?}",
         gc1
     );
-    let pruned1 = gc1["prunedManifestEntries"]
-        .as_array()
-        .expect("first-run gc must report prunedManifestEntries");
+    let pruned1 = pruned_entries(&v1);
     assert!(
         pruned1.is_empty(),
         "first --sync run must prune nothing (minimist is still installed); got {pruned1:?}"
@@ -810,9 +825,7 @@ fn test_scan_sync_yes_full_lifecycle() {
         "second --sync after uninstall",
     );
     let v2 = parse_scan_json(&stdout2);
-    let pruned = v2["gc"]["prunedManifestEntries"]
-        .as_array()
-        .expect("gc.prunedManifestEntries array");
+    let pruned = pruned_entries(&v2);
     assert!(
         pruned.iter().any(|p| p == NPM_PURL),
         "minimist should be pruned by --sync after uninstall; got {pruned:?}"

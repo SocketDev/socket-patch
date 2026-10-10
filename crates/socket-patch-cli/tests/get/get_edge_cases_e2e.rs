@@ -132,12 +132,11 @@ async fn get_with_id_flag_selects_specific_patch() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["found"], 1, "exactly one patch fetched; stdout={stdout}");
     assert_eq!(
-        v["downloaded"], 1,
+        v["summary"]["downloaded"], 1,
         "the patch must be downloaded; stdout={stdout}"
     );
-    let patches = v["patches"].as_array().expect("patches array");
+    let patches = v["events"].as_array().expect("patches array");
     assert_eq!(
         patches.len(),
         1,
@@ -153,7 +152,7 @@ async fn get_with_id_flag_selects_specific_patch() {
         patches[0]["uuid"], UUID_A,
         "must not have fallen back to the by-package first match; stdout={stdout}"
     );
-    assert_eq!(patches[0]["action"], "added", "stdout={stdout}");
+    assert_eq!(patches[0]["action"], "downloaded", "stdout={stdout}");
 
     // Prove the route, not just the payload: --id must fetch view/{UUID_B}
     // directly and must NEVER consult the by-package listing (which is mounted
@@ -218,11 +217,11 @@ async fn get_with_no_matching_purl_emits_not_found() {
         "an empty (but successful) lookup is exit 0, not an error"
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "not_found", "stdout={stdout}");
-    assert_eq!(v["found"], 0, "stdout={stdout}");
-    assert_eq!(v["downloaded"], 0, "stdout={stdout}");
+    assert_eq!(v["status"], "notFound", "stdout={stdout}");
+    assert_eq!(v["events"], serde_json::json!([]), "stdout={stdout}");
+    assert_eq!(v["summary"]["downloaded"], 0, "stdout={stdout}");
     assert_eq!(
-        v["patches"].as_array().expect("patches array").len(),
+        v["events"].as_array().expect("patches array").len(),
         0,
         "no patches on not_found; stdout={stdout}"
     );
@@ -284,20 +283,19 @@ async fn get_by_package_with_single_paid_patch_emits_paid_required() {
     // The mock returned exactly one paid patch and canAccessPaidPatches=false,
     // so the deterministic outcome is paid_required — not a vague "anything
     // but success". The patch must NOT have been downloaded.
-    assert_eq!(v["status"], "paid_required", "stdout={stdout}");
-    assert_eq!(v["found"], 1, "the paid patch was found; stdout={stdout}");
+    assert_eq!(v["status"], "paidRequired", "stdout={stdout}");
     assert_eq!(
-        v["downloaded"], 0,
+        v["summary"]["downloaded"], 0,
         "must not download a paid patch; stdout={stdout}"
     );
     assert_eq!(
-        v["applied"], 0,
+        v["summary"]["applied"], 0,
         "must not apply a paid patch; stdout={stdout}"
     );
-    let patches = v["patches"].as_array().expect("patches array");
+    let patches = v["events"].as_array().expect("patches array");
     assert_eq!(patches.len(), 1, "stdout={stdout}");
     assert_eq!(patches[0]["uuid"], UUID_A, "stdout={stdout}");
-    assert_eq!(patches[0]["tier"], "paid", "stdout={stdout}");
+    assert_eq!(patches[0]["details"]["tier"], "paid", "stdout={stdout}");
     // paid_required must be the verdict of a real proxy lookup, and the binary
     // must NOT have attempted to download the paid blob via any view endpoint.
     let paths = received_paths(&mock).await;
@@ -355,9 +353,9 @@ async fn get_with_invalid_search_purl_falls_through() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     // Deterministic outcome: the un-typed identifier fell through to the
     // package search, which found nothing installed.
-    assert_eq!(v["status"], "no_packages", "stdout={stdout}");
+    assert_eq!(v["status"], "noPackages", "stdout={stdout}");
     assert_eq!(
-        v["patches"].as_array().expect("patches array").len(),
+        v["events"].as_array().expect("patches array").len(),
         0,
         "stdout={stdout}"
     );
@@ -426,18 +424,17 @@ async fn get_uuid_returns_paid_patch_with_token_succeeds() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["found"], 1, "stdout={stdout}");
     assert_eq!(
-        v["downloaded"], 1,
+        v["summary"]["downloaded"], 1,
         "authenticated paid fetch must actually download; stdout={stdout}"
     );
-    let patches = v["patches"].as_array().expect("patches array");
+    let patches = v["events"].as_array().expect("patches array");
     assert_eq!(patches.len(), 1, "stdout={stdout}");
     assert_eq!(
         patches[0]["uuid"], UUID_A,
         "must return the requested UUID; stdout={stdout}"
     );
-    assert_eq!(patches[0]["action"], "added", "stdout={stdout}");
+    assert_eq!(patches[0]["action"], "downloaded", "stdout={stdout}");
     // The authenticated path must reach the org-scoped view endpoint directly
     // (bypassing the public proxy), proving the download was a real fetch.
     let paths = received_paths(&mock).await;
@@ -549,13 +546,17 @@ async fn get_on_vendored_purl_warns_about_uuid_drift() {
     assert_eq!(code, 0, "explicit get still succeeds; stdout={stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["patches"][0]["action"], "added", "stdout={stdout}");
+    assert_eq!(v["events"][0]["action"], "downloaded", "stdout={stdout}");
 
     let warnings = v["warnings"]
         .as_array()
         .unwrap_or_else(|| panic!("uuid drift must surface a warning; stdout={stdout}"));
     assert_eq!(warnings.len(), 1, "stdout={stdout}");
-    let w = warnings[0].as_str().expect("warning string");
+    assert_eq!(
+        warnings[0]["code"], "vendored_uuid_drift",
+        "stdout={stdout}"
+    );
+    let w = warnings[0]["detail"].as_str().expect("warning detail");
     assert!(
         w.contains("is vendored at patch") && w.contains(UUID_A) && w.contains(UUID_B),
         "warning must name both uuids; got: {w}"
@@ -639,20 +640,20 @@ async fn get_uuid_replacing_existing_manifest_entry_reports_updated() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout={stdout}");
     assert_eq!(
-        v["downloaded"], 1,
-        "an update is a real download; stdout={stdout}"
+        v["summary"]["updated"], 1,
+        "an update is counted as `updated` (v5.0: not also `downloaded`); stdout={stdout}"
     );
     assert_eq!(
-        v["patches"][0]["action"], "updated",
+        v["events"][0]["action"], "updated",
         "a different uuid at the same purl is `updated`, not `added`; stdout={stdout}"
     );
     assert_eq!(
-        v["patches"][0]["oldUuid"], UUID_A,
+        v["events"][0]["oldUuid"], UUID_A,
         "`updated` must carry the uuid it replaced; stdout={stdout}"
     );
     // Contract: the metadata block rides `added` AND `updated` records.
     assert_eq!(
-        v["patches"][0]["description"], "Newer patch for the same purl",
+        v["events"][0]["details"]["description"], "Newer patch for the same purl",
         "updated records must carry patch metadata; stdout={stdout}"
     );
     // And the manifest really moved to the new uuid.

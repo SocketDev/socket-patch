@@ -24,6 +24,10 @@ struct Case {
     /// nothing for the formats the engine must rewrite).
     expect_redirect: bool,
     dry_run: bool,
+    /// Serve a real tarball for every npm grant, its integrity rewritten
+    /// to match: a yarn classic pin reads the served tarball (#558, #591),
+    /// which the fixtures' placeholder hashes could never verify.
+    serve_npm_tarballs: bool,
 }
 
 fn case(fixture: &'static str) -> Case {
@@ -32,6 +36,47 @@ fn case(fixture: &'static str) -> Case {
         extra: Vec::new(),
         expect_redirect: true,
         dry_run: false,
+        serve_npm_tarballs: false,
+    }
+}
+
+/// For each npm patch: a minimal tarball (`package/package.json` naming
+/// the package) served at its artifact URL, with the grant's sha512 and
+/// sha1 set to that tarball's.
+async fn serve_npm_tarballs(server: &MockServer, patches: &mut [common::Patch]) {
+    use sha1::Digest as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    for patch in patches.iter_mut() {
+        let Some(rest) = patch.purl.strip_prefix("pkg:npm/") else {
+            continue;
+        };
+        let (name, version) = rest.rsplit_once('@').unwrap();
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/package.json", manifest.as_bytes())
+            .unwrap();
+        let tgz = builder.into_inner().unwrap().finish().unwrap();
+        let url = patch.reference["url"].as_str().unwrap().to_string();
+        let artifact = &mut patch.reference["artifacts"][0];
+        artifact["integrity"]["sha512"] = Value::String(format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&tgz))
+        ));
+        artifact["integrity"]["sha1"] = Value::String(hex::encode(sha1::Sha1::digest(&tgz)));
+        Mock::given(method("GET"))
+            .and(path(url.strip_prefix(&server.uri()).unwrap().to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
+            .mount(server)
+            .await;
     }
 }
 
@@ -39,7 +84,10 @@ fn case(fixture: &'static str) -> Case {
 async fn assert_parity(case: Case) -> Value {
     let dir = fixtures_root().join("redirect").join(case.fixture);
     let server = MockServer::start().await;
-    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    let mut patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    if case.serve_npm_tarballs {
+        serve_npm_tarballs(&server, &mut patches).await;
+    }
     mount_api(&server, &patches).await;
     let mut files = fixture_files(&dir.join("input"));
     for (rel, bytes) in &case.extra {
@@ -59,15 +107,15 @@ async fn assert_parity(case: Case) -> Value {
         case.fixture,
         project.error
     );
-    let disk_redirect = disk
-        .envelope
-        .get("redirect")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let disk_redirect = disk.redirect.clone();
     assert_eq!(
-        project.redirect, disk_redirect,
+        sorted_redirect(&project.redirect),
+        disk_redirect,
         "{}: redirect block differs\nmemory: {:#}\ndisk: {:#}\nstderr: {}",
-        case.fixture, project.redirect, disk_redirect, disk.stderr
+        case.fixture,
+        project.redirect,
+        disk_redirect,
+        disk.stderr
     );
     let memory_changed = engine_changed(&memory);
     let expected_changed = if case.dry_run {
@@ -146,7 +194,11 @@ async fn parity_pnpm_existing_workspace() {
 
 #[tokio::test]
 async fn parity_yarn_classic() {
-    assert_parity(case("npm/yarn-classic/basic")).await;
+    assert_parity(Case {
+        serve_npm_tarballs: true,
+        ..case("npm/yarn-classic/basic")
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -260,8 +312,8 @@ async fn assert_native_parity(
     let project = &memory.projects[0];
     assert!(project.error.is_none(), "{:?}", project.error);
     assert_eq!(
-        without_pipenv_advice(&project.redirect),
-        without_pipenv_advice(&disk.envelope["redirect"]),
+        without_pipenv_advice(&sorted_redirect(&project.redirect)),
+        without_pipenv_advice(&disk.redirect),
         "{}",
         disk.stderr
     );
@@ -396,7 +448,7 @@ async fn parity_nested_monorepo_roots_match_their_own_disk_runs() {
     for (root, files) in [("apps/web", &web), ("services/api", &svc)] {
         let disk = run_disk(&server, files, false);
         let project = memory.projects.iter().find(|p| p.root == root).unwrap();
-        assert_eq!(project.redirect, disk.envelope["redirect"], "{root}");
+        assert_eq!(sorted_redirect(&project.redirect), disk.redirect, "{root}");
         let prefixed: BTreeMap<String, Vec<u8>> = changed
             .iter()
             .filter_map(|(k, v)| {
@@ -451,7 +503,8 @@ async fn parity_uv_with_hosted_wheel_metadata() {
     let memory = run_engine(&server, build_input(&files, &[], options(false))).await;
     let project = &memory.projects[0];
     assert_eq!(
-        project.redirect, disk.envelope["redirect"],
+        sorted_redirect(&project.redirect),
+        disk.redirect,
         "{}",
         disk.stderr
     );
@@ -528,7 +581,8 @@ async fn parity_cargo_patch_path_under_vendor_through_selection() {
     let project = &memory.projects[0];
     assert!(project.error.is_none(), "{:?}", project.error);
     assert_eq!(
-        project.redirect, disk.envelope["redirect"],
+        sorted_redirect(&project.redirect),
+        disk.redirect,
         "{}",
         disk.stderr
     );
@@ -607,7 +661,8 @@ async fn parity_cargo_vendor_tree_is_not_fetched() {
     let project = &memory.projects[0];
     assert!(project.error.is_none(), "{:?}", project.error);
     assert_eq!(
-        project.redirect, disk.envelope["redirect"],
+        sorted_redirect(&project.redirect),
+        disk.redirect,
         "{}",
         disk.stderr
     );
@@ -750,7 +805,7 @@ async fn excluded_nested_cargo_project_is_its_own_root_through_selection() {
         .find(|p| p.root == "tools/fuzz")
         .unwrap();
     assert!(fuzz_project.error.is_none(), "{:?}", fuzz_project.error);
-    assert_eq!(fuzz_project.redirect, disk.envelope["redirect"]);
+    assert_eq!(sorted_redirect(&fuzz_project.redirect), disk.redirect);
     let fuzz_changed: BTreeMap<String, Vec<u8>> = changed
         .iter()
         .filter_map(|(k, v)| {
@@ -943,7 +998,7 @@ async fn parity_socket_yml_filters_the_same_roots_and_packages() {
         );
         disk_filtered.extend(filtered_set(&disk.envelope["policy"]));
         if let Some(project) = memory.projects.iter().find(|p| p.root == root) {
-            assert_eq!(project.redirect, disk.envelope["redirect"], "{root}");
+            assert_eq!(sorted_redirect(&project.redirect), disk.redirect, "{root}");
             let prefix = format!("{root}/");
             let memory_changed: BTreeMap<String, Vec<u8>> = engine_changed(&memory)
                 .into_iter()
@@ -996,7 +1051,7 @@ async fn parity_socket_yml_severity_floor() {
     assert!(engine_changed(&memory).is_empty());
     let disk = run_disk_in(&server, &repo, "apps/web", false);
     assert!(disk.changed.is_empty());
-    assert_eq!(disk.envelope["redirect"], web.redirect);
+    assert_eq!(disk.redirect, sorted_redirect(&web.redirect));
     let memory_web: std::collections::BTreeSet<_> = filtered_set(memory.policy.as_ref().unwrap())
         .into_iter()
         .filter(|(project, _, _)| project == "apps/web")
@@ -1252,7 +1307,7 @@ async fn memory_negation_reincludes_a_default_ignored_root() {
     // Disk patches the same root the same way.
     let disk = run_disk_in(&server, &repo, "e2e/tests", false);
     assert_eq!(disk.envelope["status"], "success", "{}", disk.stderr);
-    assert_eq!(memory.projects[0].redirect, disk.envelope["redirect"]);
+    assert_eq!(sorted_redirect(&memory.projects[0].redirect), disk.redirect);
     let memory_changed = engine_changed(&memory);
     assert_eq!(
         memory_changed,
@@ -1355,7 +1410,8 @@ async fn assert_pnpm_workspace_parity_with_roots(
             .unwrap_or_else(|| panic!("{how}: no workspace root project"));
         assert!(project.error.is_none(), "{how}: {:?}", project.error);
         assert_eq!(
-            project.redirect, disk.envelope["redirect"],
+            sorted_redirect(&project.redirect),
+            disk.redirect,
             "{how}: redirect block differs\nstderr: {}",
             disk.stderr
         );
@@ -1371,7 +1427,7 @@ async fn assert_pnpm_workspace_parity_with_roots(
             describe(&disk.changed)
         );
     }
-    (disk.envelope["redirect"].clone(), disk.changed)
+    (disk.redirect.clone(), disk.changed)
 }
 
 /// #492: under `sharedWorkspaceLockfile: false` (or pnpm 7's `.npmrc`

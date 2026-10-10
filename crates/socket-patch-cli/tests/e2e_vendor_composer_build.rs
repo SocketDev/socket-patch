@@ -833,19 +833,16 @@ async fn composer_get_uuid_vendored_fresh_checkout_install() {
     // "applied" (structurally zero — the nested apply never runs).
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["found"], 1, "envelope: {env}");
-    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert_eq!(env["command"], "get", "envelope: {env}");
+    assert_eq!(env["summary"]["downloaded"], 1, "envelope: {env}");
     assert!(
         env.get("applied").is_none(),
         "vendored get must drop 'applied': {env}"
     );
-    assert_eq!(
-        env["vendor"]["summary"]["applied"], 1,
-        "one package vendored: {env}"
-    );
-    assert_eq!(env["vendor"]["summary"]["failed"], 0, "no failures: {env}");
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+    assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
     assert!(
-        env["vendor"]["events"]
+        env["events"]
             .as_array()
             .expect("vendor.events[]")
             .iter()

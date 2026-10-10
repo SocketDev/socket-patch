@@ -13,13 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use super::client::NpmDist;
-use super::{Ctx, FormatResult, HostedPin, View};
+use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::vendor::lock_inventory::{npm_lock_entries, NpmLockEntry};
-
-/// The pins by uuid.
-pub(super) fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
-    pins.iter().map(|p| (p.uuid.as_str(), *p)).collect()
-}
 
 /// Resolve the dist of every `(uuid, name, version)` wanted from the
 /// default registry, concurrently. A failed lookup refuses its pin.
@@ -274,40 +269,6 @@ pub(crate) async fn restore_npm_locks(
     result
 }
 
-/// Read `rel` through the view; a missing or unreadable file refuses every
-/// pin discovery found in it.
-pub(super) async fn read_or_refuse(
-    view: &mut View<'_>,
-    rel: &str,
-    pins: &BTreeMap<&str, &HostedPin>,
-    result: &mut FormatResult,
-) -> Option<String> {
-    match view.read(rel).await {
-        Ok(Some(text)) => Some(text),
-        Ok(None) => {
-            refuse_all_in(pins, rel, result, format!("{rel} no longer exists"));
-            None
-        }
-        Err(e) => {
-            refuse_all_in(pins, rel, result, e);
-            None
-        }
-    }
-}
-
-pub(super) fn refuse_all_in(
-    pins: &BTreeMap<&str, &HostedPin>,
-    rel: &str,
-    result: &mut FormatResult,
-    why: String,
-) {
-    for pin in pins.values() {
-        if pin.files.iter().any(|f| f == rel) {
-            result.refuse(&pin.uuid, why.clone());
-        }
-    }
-}
-
 // ── yarn.lock ────────────────────────────────────────────────────────────────
 
 /// yarn v1's default registry host, used for a classic lock's `resolved`
@@ -519,21 +480,226 @@ fn berry_registry_locator(
 use crate::formats::pnpm::workspace::yaml_top_level_value;
 use crate::formats::text::strip_bom;
 
-/// The registry a berry restore reads `name`'s version document from:
-/// `.yarnrc.yml`'s `npmRegistryServer`. A scoped package may resolve
-/// against an `npmScopes` registry instead, so with such a block present
-/// it keeps the default registry's document.
-fn berry_lookup_registry(yarnrc: Option<&str>, name: &str) -> Option<String> {
-    let text = yarnrc?;
-    // `top_level_key` skips the first line's BOM (`formats::text`).
-    let has_scopes = text
-        .lines()
-        .filter_map(crate::formats::pnpm::workspace::top_level_key)
-        .any(|(key, _)| key == "npmScopes");
-    if has_scopes && name.starts_with('@') {
-        return None;
+/// The registry yarn berry resolves `name` against (`Ok(None)`: yarn's
+/// default registry), read the way yarn merges its settings (#1017):
+///
+/// - a scoped `@scope/name` takes `npmScopes.<scope>.npmRegistryServer`
+///   from the highest-precedence rc file that sets it;
+/// - otherwise (and for a scope without its own server) the
+///   `YARN_NPM_REGISTRY_SERVER` environment variable, then the
+///   highest-precedence rc file's top-level `npmRegistryServer`.
+///
+/// `rcs` are the `.yarnrc.yml` texts yarn reads, highest precedence first
+/// ([`BerryRegistrySettings::read`]): the lock directory's, each parent
+/// directory's up to the filesystem root, then the home directory's. A
+/// value's `${VAR}` / `${VAR:-default}` / `${VAR-default}` references are
+/// expanded through `var` as yarn expands them. `Err` names why the
+/// registry cannot be known: a reference to an unset variable with no
+/// default (yarn refuses to run), or an `npmScopes` this reader cannot
+/// follow (a flow mapping).
+fn berry_lookup_registry(
+    rcs: &[String],
+    env_registry: Option<&str>,
+    name: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, String> {
+    if let Some((scope, _)) = name.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
+        let keys = [scope.to_string(), format!("@{scope}")];
+        for rc in rcs {
+            for key in &keys {
+                if let Some(value) =
+                    yaml_path_value(rc, &["npmScopes", key.as_str(), "npmRegistryServer"])?
+                {
+                    return yarn_expand_env(&value, var).map(Some);
+                }
+            }
+        }
     }
-    yaml_top_level_value(text, "npmRegistryServer")
+    if let Some(env) = env_registry.map(str::trim).filter(|v| !v.is_empty()) {
+        return Ok(Some(env.to_string()));
+    }
+    for rc in rcs {
+        if let Some(value) = yaml_path_value(rc, &["npmRegistryServer"])? {
+            return yarn_expand_env(&value, var).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The scalar at `path` in a YAML settings file of block mappings (the
+/// last occurrence of each key wins, quotes removed). `Ok(None)` when a
+/// key on the path is absent or null; `Err` when a mapping on the path is
+/// written in flow style, which this reader does not follow.
+fn yaml_path_value(text: &str, path: &[&str]) -> Result<Option<String>, String> {
+    // `top_level_key` skips the first line's BOM (one, as yarn's parser).
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+        .collect();
+    yaml_path_in(&lines, path)
+}
+
+fn yaml_path_in(lines: &[String], path: &[&str]) -> Result<Option<String>, String> {
+    use crate::formats::pnpm::workspace::top_level_key;
+    let Some((key, rest)) = path.split_first() else {
+        return Ok(None);
+    };
+    let Some((at, value)) = lines.iter().enumerate().rev().find_map(|(i, line)| {
+        top_level_key(line)
+            .filter(|(k, _)| k == key)
+            .map(|(_, value)| (i, value.to_string()))
+    }) else {
+        return Ok(None);
+    };
+    if matches!(value.as_str(), "~" | "null") {
+        return Ok(None);
+    }
+    if rest.is_empty() {
+        let value = value.trim_matches(['"', '\'']).to_string();
+        return Ok((!value.is_empty()).then_some(value));
+    }
+    if !value.is_empty() {
+        return Err(format!(
+            "`{}` is not written as a block mapping",
+            path.first().copied().unwrap_or_default()
+        ));
+    }
+    let end = lines[at + 1..]
+        .iter()
+        .position(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']))
+        .map_or(lines.len(), |p| at + 1 + p);
+    let children = &lines[at + 1..end];
+    let Some(indent) = children.iter().find_map(|line| {
+        let content = line.trim_start_matches(' ');
+        (!content.trim().is_empty() && !content.starts_with('#'))
+            .then(|| line.len() - content.len())
+    }) else {
+        return Ok(None);
+    };
+    let dedented: Vec<String> = children
+        .iter()
+        .map(|line| match line.get(indent..) {
+            Some(rest) if line[..indent].trim().is_empty() => rest.to_string(),
+            _ => String::new(),
+        })
+        .collect();
+    yaml_path_in(&dedented, rest)
+}
+
+/// A `.yarnrc.yml` registry value with its environment references read as
+/// yarn reads them: `${NAME}`, `${NAME-fallback}` (the fallback when `NAME`
+/// is unset) and `${NAME:-fallback}` (also when it is empty). A reference
+/// to an unset variable with no fallback is the error yarn stops on.
+///
+/// A reference to a variable that IS set is never expanded: the rc file
+/// (possibly a checked-in, lower-trust one) would choose which of this
+/// process's variables — a token, say — lands in a URL the restore
+/// requests and may print. That is `Err` too, so the restore falls back to
+/// the default registry with `upstream_registry_fallback`, as for the Bun
+/// and pnpm settings, which never expand an arbitrary variable either.
+fn yarn_expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let body = &rest[at + 2..];
+        let name_len = body
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(body.len());
+        let name = &body[..name_len];
+        let mut tail = &body[name_len..];
+        let colon = tail.starts_with(':');
+        if colon {
+            tail = &tail[1..];
+        }
+        let fallback = match tail.strip_prefix('-') {
+            Some(after) => match after.find('}') {
+                Some(close) => {
+                    tail = &after[close..];
+                    Some(&after[..close])
+                }
+                None => None,
+            },
+            None => None,
+        };
+        let Some(after) = tail.strip_prefix('}').filter(|_| !name.is_empty()) else {
+            // Not a reference yarn recognizes: kept literally.
+            out.push_str("${");
+            rest = body;
+            continue;
+        };
+        let set = var(name);
+        let expanded = match (set, fallback) {
+            (Some(v), _) if !v.is_empty() => {
+                return Err(format!(
+                    "it references the environment variable {name}, which socket-patch does \
+                     not expand into a registry URL"
+                ))
+            }
+            (Some(v), _) if !colon => v,
+            (_, Some(fallback)) => fallback.to_string(),
+            (_, None) => return Err(format!("the environment variable {name} is not set")),
+        };
+        out.push_str(&expanded);
+        rest = after;
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// The yarn berry settings that decide which registry a package resolves
+/// against: the `.yarnrc.yml` texts yarn reads for a lock, highest
+/// precedence first, and `YARN_NPM_REGISTRY_SERVER`.
+struct BerryRegistrySettings {
+    rcs: Vec<String>,
+    env_registry: Option<String>,
+}
+
+impl BerryRegistrySettings {
+    /// Yarn reads the rc file (`YARN_RC_FILENAME`, default `.yarnrc.yml`)
+    /// of the project directory and of every parent directory up to the
+    /// filesystem root (a closer one wins), then the home directory's,
+    /// below them all.
+    async fn read(view: &View<'_>, dir_prefix: &str) -> Self {
+        let rc_name = std::env::var("YARN_RC_FILENAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| ".yarnrc.yml".to_string());
+        let root = view.root().join(dir_prefix);
+        let root = tokio::fs::canonicalize(&root).await.unwrap_or(root);
+        let mut read: Vec<std::path::PathBuf> =
+            root.ancestors().map(|d| d.join(&rc_name)).collect();
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .filter(|h| !h.is_empty())
+            .map(std::path::PathBuf::from);
+        if let Some(home) = home {
+            let home = tokio::fs::canonicalize(&home).await.unwrap_or(home);
+            let rc = home.join(&rc_name);
+            if !read.contains(&rc) {
+                read.push(rc);
+            }
+        }
+        let mut rcs = Vec::new();
+        for path in read {
+            if let Ok(text) = crate::utils::fs::read_regular_to_string(&path).await {
+                rcs.push(text);
+            }
+        }
+        BerryRegistrySettings {
+            rcs,
+            env_registry: std::env::var("YARN_NPM_REGISTRY_SERVER").ok(),
+        }
+    }
+
+    fn registry(&self, name: &str) -> Result<Option<String>, String> {
+        berry_lookup_registry(
+            &self.rcs,
+            self.env_registry.as_deref(),
+            name,
+            &|key: &str| std::env::var(key).ok(),
+        )
+    }
 }
 
 async fn restore_berry(
@@ -586,6 +752,9 @@ async fn restore_berry(
         version: String,
         key: Option<String>,
         selectors: Vec<String>,
+        /// A tarball-URL pin, whose `bin:` the pin took from the served
+        /// tarball's own manifest (#718), not the registry's.
+        url_pin: bool,
     }
     let mut hits: Vec<Hit> = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
@@ -681,6 +850,7 @@ async fn restore_berry(
             version,
             key: restored_key,
             selectors,
+            url_pin,
         });
     }
     // The registry's `dist.tarball` decides the restored locator: yarn binds
@@ -689,10 +859,30 @@ async fn restore_berry(
         .iter()
         .map(|h| (h.uuid.clone(), h.name.clone(), h.version.clone()))
         .collect();
-    let project_registry = yarnrc
-        .as_deref()
-        .and_then(|text| yaml_top_level_value(text, "npmRegistryServer"));
-    let registry = |name: &str| berry_lookup_registry(yarnrc.as_deref(), name);
+    // The registry yarn resolves each package against, read from every
+    // settings source yarn merges (#1017); one it cannot be known for is
+    // restored from the default registry's document, with a warning.
+    let settings = BerryRegistrySettings::read(view, &dir_prefix).await;
+    let mut registries: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for hit in &hits {
+        if registries.contains_key(&hit.name) {
+            continue;
+        }
+        let registry = settings.registry(&hit.name).unwrap_or_else(|why| {
+            result.warnings.push((
+                "upstream_registry_fallback",
+                format!(
+                    "{}@{}: the registry yarn resolves it against could not be determined \
+                     ({why}), so the entry was restored from the default registry's version \
+                     document; check its tarball URL against the project's registry",
+                    hit.name, hit.version
+                ),
+            ));
+            None
+        });
+        registries.insert(hit.name.clone(), registry);
+    }
+    let registry = |name: &str| registries.get(name).cloned().flatten();
     let dists = fetch_dists_on(&wanted, registry, ctx, result).await;
     let mut changed = false;
     let mut moved: Vec<String> = Vec::new();
@@ -703,6 +893,7 @@ async fn restore_berry(
         version,
         key,
         selectors,
+        url_pin,
     } in hits
     {
         if result.refused.contains_key(&uuid) {
@@ -730,10 +921,13 @@ async fn restore_berry(
         let Some(dist) = dists.get(&(name.clone(), version.clone())).map(|d| &d.dist) else {
             continue;
         };
-        let resolution = format!(
-            "  resolution: \"{}\"",
-            berry_registry_locator(project_registry.as_deref(), &name, &version, &dist.tarball)
+        let locator = berry_registry_locator(
+            registries.get(&name).and_then(Option::as_deref),
+            &name,
+            &version,
+            &dist.tarball,
         );
+        let resolution = format!("  resolution: \"{locator}\"");
         let mut lines = stanza_lines(&blocks[idx]);
         if let Some(pinned) = with_body_field(&lines, "resolution", &resolution) {
             lines = pinned;
@@ -746,6 +940,53 @@ async fn restore_berry(
         if let Some(key) = key {
             lines[0] = format!("{key}:");
             moved.push(key);
+        }
+        // The tarball-URL pin wrote the served tarball's `bin:` (#718);
+        // yarn writes the version document's for the `npm:` entry (#1131).
+        // Only `bin` comes from the version document here: the manifest
+        // declares `node-gyp` so `render_pinned_entry` keeps the entry's
+        // dependencies as they are, and the re-add below decides the
+        // implicit one (#737).
+        if url_pin {
+            use crate::formats::yarn::berry_entry::{render_pinned_entry, Pin};
+            lines = render_pinned_entry(
+                &lines[1..],
+                &Pin {
+                    key_line: &lines[0],
+                    resolution: &locator,
+                    checksum: None,
+                    manifest: Some(&serde_json::json!({
+                        "bin": &dist.bin,
+                        "dependencies": { "node-gyp": "" },
+                    })),
+                },
+            );
+        }
+        // The npm resolver's implicit `node-gyp` dependency, which the pin
+        // dropped (#737), comes back while the lock still holds the entry
+        // it resolves to; without it only `yarn install` can re-resolve
+        // that subtree.
+        if dist.node_gyp && !crate::formats::yarn::berry_entry::has_implicit_node_gyp(&lines) {
+            let resolvable = blocks.iter().any(|b| {
+                stanza_key(b).is_some_and(|k| {
+                    split_berry_key_patterns(k)
+                        .iter()
+                        .any(|p| p == "node-gyp@npm:latest")
+                })
+            });
+            if resolvable {
+                lines = crate::formats::yarn::berry_entry::with_implicit_node_gyp(&lines);
+            } else {
+                result.warnings.push((
+                    "yarn_berry_node_gyp_unresolved",
+                    format!(
+                        "{name}@{version}: yarn gives the restored registry entry an \
+                         implicit `node-gyp` dependency that {rel} no longer resolves; run \
+                         `yarn install` once to add it back (until then a hardened or \
+                         `--refresh-lockfile` install reports the lockfile as modified)"
+                    ),
+                ));
+            }
         }
         blocks[idx] = lines.join("\n");
         if !selectors.is_empty() {
@@ -794,6 +1035,115 @@ async fn restore_berry(
     }
     doc.stanzas = blocks;
     view.write(rel, doc.render(&moved));
+}
+
+/// Retire the leftover hosted `resolutions` selectors of a yarn berry root
+/// `package.json` (#1203): `yarn remove` / `yarn up` deleted the lock entry
+/// a hosted pin keyed by its tarball URL but left its selector, which now
+/// routes nothing. Each in-scope pin's selectors are re-checked against
+/// the sibling `yarn.lock` as the view holds it (the berry restore may
+/// have run first) and dropped with a `hosted_resolution_orphaned`
+/// warning; the lock itself is not touched. A pin with no such selector
+/// left is not handled here, so it is refused like any unrestorable pin.
+pub(crate) async fn retire_stale_selectors(
+    view: &mut View<'_>,
+    pins: &[&HostedPin],
+    files: &[String],
+    ctx: &Ctx<'_>,
+) -> FormatResult {
+    use crate::vendor::lock_inventory::yarn::{berry_entries, berry_selector_routes_nothing};
+
+    let mut result = FormatResult::default();
+    let pins = by_uuid(pins);
+    for rel in files {
+        let Some(text) = read_or_refuse(view, rel, &pins, &mut result).await else {
+            continue;
+        };
+        let dir_prefix = match rel.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/"),
+            None => String::new(),
+        };
+        let lock_rel = format!("{dir_prefix}yarn.lock");
+        let lock = match view.read(&lock_rel).await {
+            Ok(Some(lock)) if crate::formats::yarn::is_berry_lock(strip_bom(&lock)) => {
+                berry_entries(strip_bom(&lock))
+            }
+            _ => {
+                refuse_all_in(
+                    &pins,
+                    rel,
+                    &mut result,
+                    format!("{rel} routes a hosted patch but {lock_rel} is not a yarn berry lock"),
+                );
+                continue;
+            }
+        };
+        let Some(mut pkg) = serde_json::from_str::<Value>(strip_bom(&text))
+            .ok()
+            .filter(Value::is_object)
+        else {
+            refuse_all_in(
+                &pins,
+                rel,
+                &mut result,
+                format!("{rel} is not a JSON object"),
+            );
+            continue;
+        };
+        let Some(table) = pkg.get_mut("resolutions").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let stale: Vec<(String, String, String)> = table
+            .iter()
+            .filter_map(|(selector, value)| {
+                let url = value.as_str()?;
+                let uuid = ctx.hosted_uuid(url)?;
+                (pins.contains_key(uuid.as_str())
+                    && berry_selector_routes_nothing(&lock, selector, url))
+                .then(|| (selector.clone(), url.to_string(), uuid))
+            })
+            .collect();
+        if stale.is_empty() {
+            continue;
+        }
+        for (selector, _, _) in &stale {
+            table.shift_remove(selector);
+        }
+        if table.is_empty() {
+            if let Some(obj) = pkg.as_object_mut() {
+                obj.shift_remove("resolutions");
+            }
+        }
+        match crate::vendor::common::JsonLayout::of(&text)
+            .render(&pkg)
+            .map(String::from_utf8)
+        {
+            Ok(Ok(rendered)) => view.write(rel, rendered),
+            _ => {
+                refuse_all_in(
+                    &pins,
+                    rel,
+                    &mut result,
+                    format!("{rel} could not be re-serialized"),
+                );
+                continue;
+            }
+        }
+        // The detail names the selector, never its URL (which carries the
+        // grant token).
+        for (selector, _url, uuid) in stale {
+            result.warnings.push((
+                "hosted_resolution_orphaned",
+                format!(
+                    "{rel}: removed the hosted `resolutions` entry `{selector}`; no \
+                     {lock_rel} entry installs it any more (the package was removed or moved \
+                     to another version), so it was leftover wiring"
+                ),
+            ));
+            result.handled.insert(uuid);
+        }
+    }
+    result
 }
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
@@ -1525,19 +1875,10 @@ pub(crate) async fn restore_pnpm_locks(
 /// lock (#992): a scoped package's `.npmrc` `@scope:registry`, else its
 /// `bunfig.toml` `[install.scopes]` entry; otherwise `env_registry`
 /// (`BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), the `.npmrc`
-/// `registry`, then `bunfig.toml` `[install] registry` — Bun's own order.
-/// `None` means Bun's default registry, npmjs.
-///
-/// The registry carries the credentials Bun sends it: the bunfig entry's
-/// own `token` (Bearer) or `username` / `password` (Basic), else the
-/// `.npmrc` `//host/path/:_authToken` / `:_auth` / `:username` +
-/// `:_password` whose path covers the registry URL. `$VAR` / `${VAR}` in a
-/// bunfig value and `${VAR}` in an `.npmrc` value read `var`, as Bun
-/// expands them, but only for the [`BUN_EXPANDED_VARS`] token variables:
-/// these files come with the project, and any other reference (say
-/// `$GITHUB_TOKEN`) would hand that secret to a host the project names.
-/// It expands to nothing instead. A private scope registry answers 401
-/// without them.
+/// `registry`, then `bunfig.toml` `[install] registry` — Bun ≤ 1.3's
+/// order. [`bun_lookup_layered`] is the general form, with the user's own
+/// files and Bun ≥ 1.4's order.
+#[cfg(test)]
 fn bun_lookup_registry(
     npmrc: Option<&str>,
     bunfig: Option<&str>,
@@ -1545,23 +1886,122 @@ fn bun_lookup_registry(
     var: &dyn Fn(&str) -> Option<String>,
     name: &str,
 ) -> Option<ProjectRegistry> {
+    let project = |text: Option<&str>| {
+        text.map(|text| BunConfigFile {
+            text: text.to_string(),
+            users: false,
+        })
+        .into_iter()
+        .collect()
+    };
+    let files = BunConfigFiles {
+        npmrc: project(npmrc),
+        bunfig: project(bunfig),
+    };
+    bun_lookup_layered(&files, env_registry, var, name, false)
+}
+
+/// One Bun config file: its text, and whether it is the user's own (the
+/// user `.npmrc` or the global bunfig) rather than the project's.
+pub(super) struct BunConfigFile {
+    text: String,
+    users: bool,
+}
+
+/// The config files Bun reads registries from, each kind highest
+/// precedence first: the project `.npmrc` then the user's, the project
+/// `bunfig.toml` then the global one. A key the project file sets wins
+/// over the user's or global file; any other key still comes from those
+/// (#1276, measured on Bun 1.1.39 – 1.4.2).
+#[derive(Default)]
+pub(super) struct BunConfigFiles {
+    npmrc: Vec<BunConfigFile>,
+    bunfig: Vec<BunConfigFile>,
+}
+
+/// Where Bun reads the user's `.npmrc` and the global bunfig, measured on
+/// Bun 1.1.39 – 1.4.2 (#1276): `$XDG_CONFIG_HOME/.npmrc` when that file
+/// exists, else `~/.npmrc` (Bun ignores `NPM_CONFIG_USERCONFIG`); and
+/// `$XDG_CONFIG_HOME/.bunfig.toml` when `XDG_CONFIG_HOME` is set — Bun
+/// then never looks in `~` — else `~/.bunfig.toml`. The home dir is
+/// `HOME`, or `USERPROFILE` on Windows.
+fn bun_user_config_paths(
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    use std::path::PathBuf;
+    let dir = |key: &str| var(key).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let xdg = dir("XDG_CONFIG_HOME");
+    let home = dir(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let npmrc = xdg
+        .as_ref()
+        .map(|xdg| xdg.join(".npmrc"))
+        .filter(|path| exists(path))
+        .or_else(|| home.as_ref().map(|home| home.join(".npmrc")));
+    let bunfig = match xdg {
+        Some(xdg) => Some(xdg.join(".bunfig.toml")),
+        None => home.map(|home| home.join(".bunfig.toml")),
+    };
+    (npmrc, bunfig)
+}
+
+/// The variables a config file may expand: any for the user's own files,
+/// as Bun does, but only the [`BUN_EXPANDED_VARS`] token variables for the
+/// project's — those files come with the project, and any other reference
+/// (say `$GITHUB_TOKEN`) would hand that secret to a host the project
+/// names. It expands to nothing instead.
+fn bun_file_var<'a>(
+    var: &'a dyn Fn(&str) -> Option<String>,
+    users: bool,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key: &str| {
+        (users || BUN_EXPANDED_VARS.contains(&key))
+            .then(|| var(key))
+            .flatten()
+    }
+}
+
+/// The registry Bun resolves `name` against (#992, #1276), from `files`:
+/// a scoped package's scope registry, else `env_registry`
+/// (`BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), else the configured
+/// default registry. `None` means Bun's default registry, npmjs.
+///
+/// Bun keys every file's settings into one config, so a key comes from the
+/// highest-precedence file that sets it: a project file over the user's or
+/// global one of its kind, and between kinds, any `.npmrc` over any
+/// bunfig on Bun ≤ 1.3 but any bunfig over any `.npmrc` on Bun ≥ 1.4
+/// (`bunfig_first`). A scope's entry with no URL (a bunfig token only)
+/// takes the configured default registry with its own token.
+///
+/// The registry carries the credentials Bun sends it: the bunfig entry's
+/// own `token` (Bearer) or `username` / `password` (Basic), else the
+/// `.npmrc` `//host/path/:_authToken` / `:_auth` / `:username` +
+/// `:_password` whose path covers the registry URL. `$VAR` / `${VAR}` in a
+/// bunfig value and `${VAR}` in an `.npmrc` value read `var`, as Bun
+/// expands them, limited by [`bun_file_var`]. A private scope registry
+/// answers 401 without them.
+fn bun_lookup_layered(
+    files: &BunConfigFiles,
+    env_registry: Option<&str>,
+    var: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+    bunfig_first: bool,
+) -> Option<ProjectRegistry> {
     use super::super::npmrc::npmrc_top_level_value;
 
-    let var = &|key: &str| BUN_EXPANDED_VARS.contains(&key).then(|| var(key)).flatten();
     fn url(value: &str) -> Option<String> {
         let value = value.trim().trim_matches(['"', '\'']);
         (value.starts_with("https://") || value.starts_with("http://")).then(|| value.to_string())
     }
     // A bunfig registry is a URL string or a table carrying `url` and
     // maybe its credentials.
-    let toml_url = |item: Option<&toml_edit::Item>| -> Option<String> {
-        let item = item?;
+    let toml_url = |item: &toml_edit::Item, var: &dyn Fn(&str) -> Option<String>| {
         let value = item
             .as_str()
             .or_else(|| item.get("url").and_then(toml_edit::Item::as_str))?;
         url(&expand_url_env(value, var, true))
     };
-    let toml_auth = |item: &toml_edit::Item| -> Option<String> {
+    let toml_auth = |item: &toml_edit::Item, var: &dyn Fn(&str) -> Option<String>| {
         let field = |key: &str| {
             item.get(key)
                 .and_then(toml_edit::Item::as_str)
@@ -1578,15 +2018,12 @@ fn bun_lookup_registry(
             base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
         ))
     };
+    // An `.npmrc` key from the highest-precedence `.npmrc` that sets it.
     let npmrc_value = |key: &str| {
-        npmrc
-            .and_then(|text| npmrc_top_level_value(text, key))
-            .map(|v| expand_env(&v, var, false))
-    };
-    let npmrc_url = |key: &str| {
-        npmrc
-            .and_then(|text| npmrc_top_level_value(text, key))
-            .and_then(|v| url(&expand_url_env(&v, var, false)))
+        files.npmrc.iter().find_map(|file| {
+            let value = npmrc_top_level_value(&file.text, key)?;
+            Some(expand_env(&value, &bun_file_var(var, file.users), false))
+        })
     };
     // Credentials in the URL itself (`https://user:${TOKEN}@host/`) go on
     // the request only: the base is written into bun.lock and warnings.
@@ -1600,53 +2037,97 @@ fn bun_lookup_registry(
             authorization,
         }
     };
-    let bunfig = bunfig.and_then(|text| text.parse::<toml_edit::DocumentMut>().ok());
-    let install = bunfig.as_ref().and_then(|doc| doc.get("install"));
-    // The configured default registry before the environment applies.
-    let configured = || -> Option<ProjectRegistry> {
-        if let Some(base) = npmrc_url("registry") {
-            return Some(with_npmrc_auth(base, None));
-        }
-        let item = install?.get("registry")?;
-        let base = toml_url(Some(item))?;
-        Some(with_npmrc_auth(base, toml_auth(item)))
+    enum Source<'a> {
+        Npmrc(&'a BunConfigFile),
+        Bunfig(toml_edit::DocumentMut, bool),
+    }
+    let npmrcs = files.npmrc.iter().map(Source::Npmrc);
+    let bunfigs = files.bunfig.iter().filter_map(|file| {
+        let doc = file.text.parse::<toml_edit::DocumentMut>().ok()?;
+        Some(Source::Bunfig(doc, file.users))
+    });
+    let sources: Vec<Source> = if bunfig_first {
+        bunfigs.chain(npmrcs).collect()
+    } else {
+        npmrcs.chain(bunfigs).collect()
+    };
+    // The configured default registry before the environment applies,
+    // and whether the user's own file (not the project's) set it.
+    let configured = || {
+        sources.iter().find_map(|source| match source {
+            Source::Npmrc(file) => {
+                let value = npmrc_top_level_value(&file.text, "registry")?;
+                let base = url(&expand_url_env(
+                    &value,
+                    &bun_file_var(var, file.users),
+                    false,
+                ))?;
+                Some((with_npmrc_auth(base, None), file.users))
+            }
+            Source::Bunfig(doc, users) => {
+                let item = doc.get("install")?.get("registry")?;
+                let var = bun_file_var(var, *users);
+                let base = toml_url(item, &var)?;
+                Some((with_npmrc_auth(base, toml_auth(item, &var)), *users))
+            }
+        })
     };
     if let Some((scope, _)) = name.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
-        if let Some(scoped) = npmrc_url(&format!("@{scope}:registry")) {
-            return Some(with_npmrc_auth(scoped, None));
-        }
-        let entry = install.and_then(|i| i.get("scopes")).and_then(|scopes| {
-            scopes
-                .get(scope)
-                .or_else(|| scopes.get(format!("@{scope}")))
-        });
-        if let Some(entry) = entry {
-            if let Some(scoped) = toml_url(Some(entry)) {
-                return Some(with_npmrc_auth(scoped, toml_auth(entry)));
+        let key = format!("@{scope}:registry");
+        let scoped = sources.iter().find_map(|source| match source {
+            Source::Npmrc(file) => {
+                let value = npmrc_top_level_value(&file.text, &key)?;
+                let base = url(&expand_url_env(
+                    &value,
+                    &bun_file_var(var, file.users),
+                    false,
+                ))?;
+                Some(Some(with_npmrc_auth(base, None)))
             }
-            // A scope entry with no URL (a token only) takes the configured
-            // default registry, never the environment's, with its own
-            // credentials. With no default configured that is npmjs, which
-            // still gets the scope's token: a private npmjs scope 401s
-            // without it.
-            if entry.is_table_like() && entry.get("url").is_none() {
-                let own = toml_auth(entry);
-                return match configured() {
-                    Some(r) => Some(ProjectRegistry {
-                        authorization: own.or(r.authorization),
+            Source::Bunfig(doc, users) => {
+                let scopes = doc.get("install")?.get("scopes")?;
+                let entry = scopes
+                    .get(scope)
+                    .or_else(|| scopes.get(format!("@{scope}")))?;
+                let var = bun_file_var(var, *users);
+                if let Some(base) = toml_url(entry, &var) {
+                    return Some(Some(with_npmrc_auth(base, toml_auth(entry, &var))));
+                }
+                // A scope entry with no URL (a token only) takes the
+                // configured default registry, never the environment's,
+                // with its own credentials. With no default configured
+                // that is npmjs, which still gets the scope's token: a
+                // private npmjs scope 401s without it. A token from the
+                // user's own file never goes to a default registry the
+                // project's file names: the repository would pick the host
+                // that receives the user's credential.
+                if !entry.is_table_like() || entry.get("url").is_some() {
+                    return None;
+                }
+                let own = toml_auth(entry, &var);
+                Some(match configured() {
+                    Some((r, from_users)) => Some(ProjectRegistry {
+                        authorization: if *users && !from_users {
+                            r.authorization
+                        } else {
+                            own.or(r.authorization)
+                        },
                         ..r
                     }),
                     None => own.map(|own| ProjectRegistry {
                         base: format!("{}/", crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY),
                         authorization: Some(own),
                     }),
-                };
+                })
             }
+        });
+        if let Some(scoped) = scoped {
+            return scoped;
         }
     }
     match env_registry.and_then(url) {
         Some(base) => Some(with_npmrc_auth(base, None)),
-        None => configured(),
+        None => configured().map(|(r, _)| r),
     }
 }
 
@@ -1795,52 +2276,93 @@ fn bun_env_registry(var: impl Fn(&str) -> Option<String>) -> Option<String> {
     .find_map(|key| var(key).filter(|v| v.starts_with("https://") || v.starts_with("http://")))
 }
 
-/// The settings beside a Bun lock that decide which registry Bun resolves
-/// each package against, and so which tarball URL it recorded (#992).
+/// Which kind of Bun config file wins a key both kinds set, as far as the
+/// lock tells (#1276, measured on Bun 1.1.39 – 1.4.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BunConfigOrder {
+    /// A lockfileVersion-2 `bun.lock`, which only Bun ≥ 1.4 writes (Bun
+    /// 1.3 ignores it): any bunfig over any `.npmrc`.
+    BunfigFirst,
+    /// A lockfileVersion-0/1 `bun.lock`, which Bun 1.4 keeps as is, or a
+    /// `bun.lockb`: Bun ≤ 1.3 takes any `.npmrc` over any bunfig and Bun
+    /// ≥ 1.4 the other way round, so the lock does not say which.
+    Unknown,
+}
+
+impl BunConfigOrder {
+    /// The order for the `bun.lock` `text`.
+    pub(super) fn of_text_lock(text: &str) -> Self {
+        match crate::vendor::bun_lock_text::lock_version(text) {
+            Some(v) if v >= 2 => Self::BunfigFirst,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The settings that decide which registry Bun resolves each package of a
+/// lock against, and so which tarball URL it recorded (#992): the
+/// `.npmrc` and `bunfig.toml` beside the lock, the user's `.npmrc` and the
+/// global bunfig (#1276), and the registry environment variables.
 pub(super) struct BunRegistrySettings {
-    npmrc: Option<String>,
-    bunfig: Option<String>,
+    files: BunConfigFiles,
     env_registry: Option<String>,
+    order: BunConfigOrder,
 }
 
 impl BunRegistrySettings {
-    pub(super) async fn read(view: &mut View<'_>, rel: &str) -> Self {
+    pub(super) async fn read(view: &mut View<'_>, rel: &str, order: BunConfigOrder) -> Self {
         let dir_prefix = match rel.rsplit_once('/') {
             Some((dir, _)) => format!("{dir}/"),
             None => String::new(),
         };
-        let npmrc = view
-            .read(&format!("{dir_prefix}.npmrc"))
-            .await
-            .ok()
-            .flatten();
-        let bunfig = view
-            .read(&format!("{dir_prefix}bunfig.toml"))
-            .await
-            .ok()
-            .flatten();
-        // Unit tests read no ambient registry: npm exports
+        let mut files = BunConfigFiles::default();
+        for (name, kind) in [
+            (".npmrc", &mut files.npmrc),
+            ("bunfig.toml", &mut files.bunfig),
+        ] {
+            if let Some(text) = view
+                .read(&format!("{dir_prefix}{name}"))
+                .await
+                .ok()
+                .flatten()
+            {
+                kind.push(BunConfigFile { text, users: false });
+            }
+        }
+        // Unit tests read no ambient registry or user config: npm exports
         // `npm_config_registry` to child processes whenever one is
-        // configured, which would otherwise steer the fixtures' restores.
+        // configured, and a developer's `~/.npmrc` would steer the
+        // fixtures' restores the same way.
         let env_registry = if cfg!(test) {
             None
         } else {
+            let (npmrc, bunfig) =
+                bun_user_config_paths(&|key| std::env::var_os(key), &|path| path.is_file());
+            for (path, kind) in [(npmrc, &mut files.npmrc), (bunfig, &mut files.bunfig)] {
+                let Some(path) = path else { continue };
+                if let Ok(text) = crate::utils::fs::read_regular_to_string(&path).await {
+                    kind.push(BunConfigFile { text, users: true });
+                }
+            }
             bun_env_registry(|key| std::env::var(key).ok())
         };
         Self {
-            npmrc,
-            bunfig,
+            files,
             env_registry,
+            order,
         }
     }
 
-    /// The registry Bun resolves `name` against; `None` means npmjs.
-    pub(super) fn registry(&self, name: &str) -> Option<String> {
-        self.registry_with_credentials(name).map(|r| r.base)
+    #[cfg(test)]
+    fn from_files(files: BunConfigFiles, order: BunConfigOrder) -> Self {
+        Self {
+            files,
+            env_registry: None,
+            order,
+        }
     }
 
-    /// [`Self::registry`] with the credentials Bun sends it.
-    pub(super) fn registry_with_credentials(&self, name: &str) -> Option<ProjectRegistry> {
+    fn lookup(&self, name: &str, bunfig_first: bool) -> Option<ProjectRegistry> {
         // Unit tests read no ambient variables, as for `env_registry`.
         let var = |key: &str| {
             if cfg!(test) {
@@ -1849,13 +2371,79 @@ impl BunRegistrySettings {
                 std::env::var(key).ok()
             }
         };
-        bun_lookup_registry(
-            self.npmrc.as_deref(),
-            self.bunfig.as_deref(),
+        bun_lookup_layered(
+            &self.files,
             self.env_registry.as_deref(),
             &var,
             name,
+            bunfig_first,
         )
+    }
+
+    /// The registry Bun resolves `name` against; `None` means npmjs.
+    pub(super) fn registry(&self, name: &str) -> Option<String> {
+        self.registry_with_credentials(name).map(|r| r.base)
+    }
+
+    /// [`Self::registry`] with the credentials Bun sends it. Under
+    /// [`BunConfigOrder::Unknown`] it is Bun ≤ 1.3's answer: call it only
+    /// for a package [`Self::refuse_ambiguous`] kept, where both agree.
+    pub(super) fn registry_with_credentials(&self, name: &str) -> Option<ProjectRegistry> {
+        self.lookup(name, self.order == BunConfigOrder::BunfigFirst)
+    }
+
+    /// Why the registry Bun resolves `name` against can't be told: under
+    /// [`BunConfigOrder::Unknown`], Bun ≤ 1.3 and Bun ≥ 1.4 resolve it
+    /// against different registries (or credentials) because an `.npmrc`
+    /// and a bunfig both set the deciding key.
+    fn ambiguity(&self, rel: &str, name: &str) -> Option<String> {
+        if self.order != BunConfigOrder::Unknown {
+            return None;
+        }
+        let (old, new) = (self.lookup(name, false), self.lookup(name, true));
+        let same = |a: &Option<ProjectRegistry>, b: &Option<ProjectRegistry>| match (a, b) {
+            (Some(a), Some(b)) => a.base == b.base && a.authorization == b.authorization,
+            (None, None) => true,
+            _ => false,
+        };
+        if same(&old, &new) {
+            return None;
+        }
+        // Never a credential: only the bases, which carry no userinfo.
+        let shown = |r: &Option<ProjectRegistry>| match r {
+            Some(r) => r.base.clone(),
+            None => "npmjs".to_string(),
+        };
+        let (old_shown, new_shown) = (shown(&old), shown(&new));
+        let against = if old_shown == new_shown {
+            format!("{old_shown} with different credentials")
+        } else {
+            format!("{old_shown} (an .npmrc setting wins) but Bun 1.4+ against {new_shown} (a bunfig setting wins)")
+        };
+        Some(format!(
+            "Bun ≤ 1.3 resolves {name} against {against}, and {rel} does not say which Bun \
+             installs it"
+        ))
+    }
+
+    /// `wanted` (uuid, name, version) without the packages whose registry
+    /// can't be told ([`Self::ambiguity`]), each refused in `result`.
+    pub(super) fn refuse_ambiguous(
+        &self,
+        rel: &str,
+        wanted: BTreeSet<(String, String, String)>,
+        result: &mut FormatResult,
+    ) -> BTreeSet<(String, String, String)> {
+        wanted
+            .into_iter()
+            .filter(|(uuid, name, version)| match self.ambiguity(rel, name) {
+                Some(why) => {
+                    result.refuse(uuid, format!("{name}@{version}: {why}"));
+                    false
+                }
+                None => true,
+            })
+            .collect()
     }
 }
 
@@ -1975,8 +2563,10 @@ pub(crate) async fn restore_bun_locks(
             .map(|(_, u, n, v, _)| (u.clone(), n.clone(), v.clone()))
             .collect();
         // Bun records the tarball URL of a package from any registry but
-        // npmjs, so the restore reads the project's registry settings.
-        let settings = BunRegistrySettings::read(view, rel).await;
+        // npmjs, so the restore reads the registry settings Bun does.
+        let settings =
+            BunRegistrySettings::read(view, rel, BunConfigOrder::of_text_lock(&text)).await;
+        let wanted = settings.refuse_ambiguous(rel, wanted, &mut result);
         let dists = fetch_dists_on(
             &wanted,
             |n| settings.registry_with_credentials(n),
@@ -2081,8 +2671,15 @@ pub(crate) async fn cleanup_side_config(
     if restored_pnpm && !still_hosted(view, &["pnpm-lock.yaml"], ctx).await {
         const WORKSPACE: &str = "pnpm-workspace.yaml";
         if let Ok(Some(ws)) = view.read(WORKSPACE).await {
-            if ws == "packages:\n  - '.'\ntrustLockfile: true\n" {
+            let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;
+            if ws == format!("{}\n", lines.join("\n")) {
                 view.remove(WORKSPACE);
+            } else if let Some(original) =
+                crate::formats::pnpm::workspace::strip_keyless_splice(&ws, &lines)
+            {
+                // The scaffold hosted mode splices into a file with no keys
+                // (#1096): taking it back out restores the user's file.
+                view.write(WORKSPACE, original);
             } else if ws.lines().any(|l| {
                 crate::formats::pnpm::workspace::top_level_key(l).is_some_and(|(key, value)| {
                     key == "trustLockfile" && value.trim_matches(['\'', '"']) == "true"
@@ -2108,9 +2705,266 @@ mod tests {
         bun_registry_slot, bun_tarball_url, expand_url_env, modules_yaml_pnpm_major,
         non_default_registry, package_json_pnpm_major, pnpm_include_tarball, pnpm_lookup_registry,
         pnpm_tarball_guess_warning, registry_derives_tarball, rush_json_pnpm_major, rush_lock_root,
-        split_userinfo, yaml_top_level_value, PnpmTarballGuess, ProjectDist,
+        split_userinfo, yaml_top_level_value, yarn_expand_env, PnpmTarballGuess, ProjectDist,
     };
     use crate::patch::redirect::upstream::client::NpmDist;
+
+    fn files(npmrc: &[(&str, bool)], bunfig: &[(&str, bool)]) -> super::BunConfigFiles {
+        let layer = |list: &[(&str, bool)]| {
+            list.iter()
+                .map(|(text, users)| super::BunConfigFile {
+                    text: text.to_string(),
+                    users: *users,
+                })
+                .collect()
+        };
+        super::BunConfigFiles {
+            npmrc: layer(npmrc),
+            bunfig: layer(bunfig),
+        }
+    }
+
+    #[test]
+    fn bun_user_config_paths_follow_bun_s_lookup() {
+        use std::ffi::OsString;
+        use std::path::{Path, PathBuf};
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                let key = if key == home_var { "HOME" } else { key };
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        let paths = |pairs: &'static [(&'static str, &'static str)], existing: &[&str]| {
+            let existing: Vec<PathBuf> = existing.iter().map(PathBuf::from).collect();
+            super::bun_user_config_paths(&env(pairs), &|p: &Path| existing.iter().any(|e| e == p))
+        };
+        let some = |p: &str| Some(PathBuf::from(p));
+        // No XDG: both under the home dir.
+        assert_eq!(
+            paths(&[("HOME", "/h")], &[]),
+            (some("/h/.npmrc"), some("/h/.bunfig.toml"))
+        );
+        // XDG set: the XDG `.npmrc` replaces `~/.npmrc` only when it exists,
+        // while the global bunfig is the XDG one whether or not it exists.
+        assert_eq!(
+            paths(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "/x")], &[]),
+            (some("/h/.npmrc"), some("/x/.bunfig.toml"))
+        );
+        assert_eq!(
+            paths(
+                &[("HOME", "/h"), ("XDG_CONFIG_HOME", "/x")],
+                &["/x/.npmrc", "/h/.npmrc"]
+            ),
+            (some("/x/.npmrc"), some("/x/.bunfig.toml"))
+        );
+        // An empty variable counts as unset; no home and no XDG: nothing.
+        assert_eq!(
+            paths(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "")], &[]),
+            (some("/h/.npmrc"), some("/h/.bunfig.toml"))
+        );
+        assert_eq!(paths(&[], &[]), (None, None));
+        // Bun never reads `NPM_CONFIG_USERCONFIG`.
+        assert_eq!(
+            paths(&[("NPM_CONFIG_USERCONFIG", "/u/npmrc")], &[]),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn bun_layers_take_each_key_from_the_highest_file_that_sets_it() {
+        let lookup = |files: &super::BunConfigFiles, name: &str, bunfig_first: bool| {
+            super::bun_lookup_layered(files, None, &|_| None, name, bunfig_first).map(|r| r.base)
+        };
+        let some = |s: &str| Some(s.to_string());
+        // The project `.npmrc` wins its own keys; the user's file still
+        // supplies the rest (a scope, the default registry).
+        let npmrc = files(
+            &[
+                ("@p:registry=https://proj.example/\n", false),
+                (
+                    "@p:registry=https://user-p.example/\n@u:registry=https://user.example/\nregistry=https://ureg.example/\n",
+                    true,
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(lookup(&npmrc, "@p/a", false), some("https://proj.example/"));
+        assert_eq!(lookup(&npmrc, "@u/a", false), some("https://user.example/"));
+        assert_eq!(lookup(&npmrc, "a", false), some("https://ureg.example/"));
+        // The project bunfig wins over the global one, key by key.
+        let bunfig = files(
+            &[],
+            &[
+                ("[install.scopes]\np = \"https://proj.example/\"\n", false),
+                (
+                    "[install]\nregistry = \"https://greg.example/\"\n\n[install.scopes]\np = \"https://glob-p.example/\"\ng = \"https://glob.example/\"\n",
+                    true,
+                ),
+            ],
+        );
+        assert_eq!(
+            lookup(&bunfig, "@p/a", false),
+            some("https://proj.example/")
+        );
+        assert_eq!(
+            lookup(&bunfig, "@g/a", false),
+            some("https://glob.example/")
+        );
+        assert_eq!(lookup(&bunfig, "a", false), some("https://greg.example/"));
+        // Between kinds: Bun ≤ 1.3 takes any `.npmrc` first, Bun ≥ 1.4 any
+        // bunfig — the user `.npmrc` against the project bunfig here.
+        let both = files(
+            &[("@s:registry=https://user-npmrc.example/\n", true)],
+            &[(
+                "[install.scopes]\ns = \"https://proj-bunfig.example/\"\n",
+                false,
+            )],
+        );
+        assert_eq!(
+            lookup(&both, "@s/a", false),
+            some("https://user-npmrc.example/")
+        );
+        assert_eq!(
+            lookup(&both, "@s/a", true),
+            some("https://proj-bunfig.example/")
+        );
+        // A scope beats the default registry wherever each is set.
+        let mixed = files(
+            &[("registry=https://proj-reg.example/\n", false)],
+            &[(
+                "[install.scopes]\ns = \"https://glob-scope.example/\"\n",
+                true,
+            )],
+        );
+        for bunfig_first in [false, true] {
+            assert_eq!(
+                lookup(&mixed, "@s/a", bunfig_first),
+                some("https://glob-scope.example/")
+            );
+        }
+        // A global token-only scope entry takes the user's default registry.
+        let token_only = files(
+            &[("registry=https://ureg.example/\n", true)],
+            &[("[install.scopes]\ns = { token = \"t\" }\n", true)],
+        );
+        let r = super::bun_lookup_layered(&token_only, None, &|_| None, "@s/a", false).unwrap();
+        assert_eq!(
+            (r.base.as_str(), r.authorization.as_deref()),
+            ("https://ureg.example/", Some("Bearer t"))
+        );
+        // It never goes to a default registry the project's file names,
+        // in either order: the repository would pick the host that gets
+        // the user's token.
+        for (npmrc, bunfig) in [
+            (vec![("registry=https://evil.example/\n", false)], vec![]),
+            (
+                vec![],
+                vec![("[install]\nregistry = \"https://evil.example/\"\n", false)],
+            ),
+        ] {
+            let mut bunfig = bunfig;
+            bunfig.push(("[install.scopes]\ns = { token = \"t\" }\n", true));
+            let leaked = files(&npmrc, &bunfig);
+            for bunfig_first in [false, true] {
+                let r = super::bun_lookup_layered(&leaked, None, &|_| None, "@s/a", bunfig_first)
+                    .unwrap();
+                assert_eq!(
+                    (r.base.as_str(), r.authorization.as_deref()),
+                    ("https://evil.example/", None)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bun_user_files_expand_any_variable_project_files_only_token_ones() {
+        let vars = |key: &str| (key == "GITHUB_TOKEN").then(|| "gh".to_string());
+        let auth = |users: bool| {
+            let files = files(
+                &[(
+                    "@s:registry=https://npm.pkg.example/\n//npm.pkg.example/:_authToken=${GITHUB_TOKEN}\n",
+                    users,
+                )],
+                &[],
+            );
+            super::bun_lookup_layered(&files, None, &vars, "@s/a", false)
+                .and_then(|r| r.authorization)
+        };
+        // The user wrote `~/.npmrc`: Bun expands any variable in it.
+        assert_eq!(auth(true), Some("Bearer gh".to_string()));
+        // The project's file can't send `$GITHUB_TOKEN` anywhere.
+        assert_eq!(auth(false), None);
+        // The token key from the user's file covers a project-set scope
+        // registry on the same host, as in Bun.
+        let split = files(
+            &[
+                ("@s:registry=https://npm.pkg.example/\n", false),
+                ("//npm.pkg.example/:_authToken=${GITHUB_TOKEN}\n", true),
+            ],
+            &[],
+        );
+        assert_eq!(
+            super::bun_lookup_layered(&split, None, &vars, "@s/a", false)
+                .and_then(|r| r.authorization),
+            Some("Bearer gh".to_string())
+        );
+    }
+
+    #[test]
+    fn bun_refuses_a_registry_the_lock_s_bun_version_would_decide() {
+        use super::{BunConfigOrder, BunRegistrySettings};
+        assert_eq!(
+            BunConfigOrder::of_text_lock("{\n  \"lockfileVersion\": 2,\n}"),
+            BunConfigOrder::BunfigFirst
+        );
+        for v in ["0", "1"] {
+            assert_eq!(
+                BunConfigOrder::of_text_lock(&format!("{{\n  \"lockfileVersion\": {v},\n}}")),
+                BunConfigOrder::Unknown
+            );
+        }
+        let conflict = || {
+            files(
+                &[("@s:registry=https://n.example/\n", true)],
+                &[("[install.scopes]\ns = \"https://b.example/\"\n", false)],
+            )
+        };
+        let unknown = BunRegistrySettings::from_files(conflict(), BunConfigOrder::Unknown);
+        let why = unknown.ambiguity("bun.lock", "@s/a").expect("ambiguous");
+        assert!(
+            why.contains("https://n.example/")
+                && why.contains("https://b.example/")
+                && why.contains("bun.lock does not say which Bun"),
+            "{why}"
+        );
+        // A package no conflicting key decides is not ambiguous.
+        assert_eq!(unknown.ambiguity("bun.lock", "a"), None);
+        assert_eq!(unknown.ambiguity("bun.lock", "@t/a"), None);
+        // A v2 lock is Bun ≥ 1.4's: the bunfig wins, nothing is refused.
+        let v2 = BunRegistrySettings::from_files(conflict(), BunConfigOrder::BunfigFirst);
+        assert_eq!(v2.ambiguity("bun.lock", "@s/a"), None);
+        assert_eq!(v2.registry("@s/a").as_deref(), Some("https://b.example/"));
+        // Same registry, different credentials: still refused.
+        let creds = files(
+            &[("//r.example/:_authToken=n\n", true)],
+            &[(
+                "[install]\nregistry = { url = \"https://r.example/\", token = \"b\" }\n",
+                false,
+            )],
+        );
+        let mut creds = creds;
+        creds.npmrc[0]
+            .text
+            .insert_str(0, "registry=https://r.example/\n");
+        let creds = BunRegistrySettings::from_files(creds, BunConfigOrder::Unknown);
+        assert!(creds
+            .ambiguity("bun.lock", "a")
+            .is_some_and(|why| why.contains("different credentials") && !why.contains("Bearer")));
+    }
 
     #[test]
     fn bun_reads_the_registry_in_bun_s_own_order() {
@@ -2407,6 +3261,8 @@ mod tests {
                 tarball: tarball.to_string(),
                 integrity: None,
                 shasum: None,
+                bin: Default::default(),
+                node_gyp: false,
             },
             from_project,
         };
@@ -2898,17 +3754,17 @@ mod tests {
     /// content, so the first key is not `npmScopes`.
     #[test]
     fn berry_scopes_probe_reads_past_one_bom_only() {
+        let lookup = |rc: &str, name: &str| {
+            berry_lookup_registry(&[rc.to_string()], None, name, &|_: &str| None).unwrap()
+        };
         let rc = "npmScopes:\n  s:\n    npmRegistryServer: https://s.example\n\
                   npmRegistryServer: https://m.example/\n";
         for bom in ["", "\u{feff}"] {
             let rc = format!("{bom}{rc}");
-            assert_eq!(berry_lookup_registry(Some(&rc), "@s/a"), None);
+            assert_eq!(lookup(&rc, "@s/a").as_deref(), Some("https://s.example"));
         }
         let rc = format!("\u{feff}\u{feff}{rc}");
-        assert_eq!(
-            berry_lookup_registry(Some(&rc), "@s/a").as_deref(),
-            Some("https://m.example/")
-        );
+        assert_eq!(lookup(&rc, "@s/a").as_deref(), Some("https://m.example/"));
         let rc = "npmRegistryServer: https://m.example/\n";
         for bom in ["", "\u{feff}"] {
             assert_eq!(
@@ -2922,24 +3778,135 @@ mod tests {
         );
     }
 
+    /// #1017: yarn resolves a package's registry from every settings
+    /// source it merges, not only the project rc's top-level key.
     #[test]
-    fn berry_reads_the_project_registry_except_for_npm_scopes() {
+    fn berry_reads_the_registry_from_every_yarn_settings_source() {
+        let none = |_: &str| None::<String>;
+        let lookup = |rcs: &[&str], env: Option<&str>, name: &str| {
+            let rcs: Vec<String> = rcs.iter().map(|s| s.to_string()).collect();
+            berry_lookup_registry(&rcs, env, name, &none)
+        };
         let rc = "npmRegistryServer: \"https://m.example/npm/\"\n";
         assert_eq!(
-            berry_lookup_registry(Some(rc), "a").as_deref(),
+            lookup(&[rc], None, "a").unwrap().as_deref(),
             Some("https://m.example/npm/")
         );
         assert_eq!(
-            berry_lookup_registry(Some(rc), "@s/a").as_deref(),
+            lookup(&[rc], None, "@s/a").unwrap().as_deref(),
             Some("https://m.example/npm/")
         );
-        let scoped = format!("{rc}npmScopes:\n  s:\n    npmRegistryServer: https://s.example\n");
+        assert_eq!(lookup(&[], None, "a").unwrap(), None);
+
+        // npmScopes: the scope's own server, else the top-level one.
+        let scoped = format!(
+            "{rc}npmScopes:\n  s:\n    npmAlwaysAuth: true\n    npmRegistryServer: \
+             \"https://s.example\"\n  t:\n    npmAlwaysAuth: true\n"
+        );
         assert_eq!(
-            berry_lookup_registry(Some(&scoped), "a").as_deref(),
+            lookup(&[&scoped], None, "a").unwrap().as_deref(),
             Some("https://m.example/npm/")
         );
-        assert_eq!(berry_lookup_registry(Some(&scoped), "@s/a"), None);
-        assert_eq!(berry_lookup_registry(None, "a"), None);
+        assert_eq!(
+            lookup(&[&scoped], None, "@s/a").unwrap().as_deref(),
+            Some("https://s.example")
+        );
+        assert_eq!(
+            lookup(&[&scoped], None, "@t/a").unwrap().as_deref(),
+            Some("https://m.example/npm/")
+        );
+        assert_eq!(
+            lookup(&[&scoped], None, "@u/a").unwrap().as_deref(),
+            Some("https://m.example/npm/")
+        );
+        // A scope beats the env registry; the env registry beats every rc.
+        let env = Some("https://env.example");
+        assert_eq!(
+            lookup(&[&scoped], env, "@s/a").unwrap().as_deref(),
+            Some("https://s.example")
+        );
+        assert_eq!(
+            lookup(&[&scoped], env, "a").unwrap().as_deref(),
+            Some("https://env.example")
+        );
+        assert_eq!(
+            lookup(&[], env, "a").unwrap().as_deref(),
+            Some("https://env.example")
+        );
+        assert_eq!(
+            lookup(&[rc], Some(" "), "a").unwrap().as_deref(),
+            Some("https://m.example/npm/")
+        );
+
+        // Layers: the closer rc wins per key; a farther one (a parent
+        // directory's, the home one) fills in what the closer one lacks.
+        let parent = "npmRegistryServer: https://parent.example\n";
+        let home = "npmScopes:\n  s:\n    npmRegistryServer: https://home-s.example\n";
+        let project = "nodeLinker: node-modules\n";
+        assert_eq!(
+            lookup(&[project, parent, home], None, "a")
+                .unwrap()
+                .as_deref(),
+            Some("https://parent.example")
+        );
+        assert_eq!(
+            lookup(&[project, parent, home], None, "@s/a")
+                .unwrap()
+                .as_deref(),
+            Some("https://home-s.example")
+        );
+        assert_eq!(
+            lookup(&[rc, parent], None, "a").unwrap().as_deref(),
+            Some("https://m.example/npm/")
+        );
+
+        // A flow-style npmScopes is not guessed at for a scoped name.
+        let flow = "npmScopes: {s: {npmRegistryServer: https://s.example}}\n";
+        assert!(lookup(&[flow], None, "@s/a").is_err());
+        assert_eq!(
+            lookup(&[flow, parent], None, "a").unwrap().as_deref(),
+            Some("https://parent.example")
+        );
+    }
+
+    #[test]
+    fn berry_registry_values_expand_env_references_like_yarn() {
+        let var = |name: &str| match name {
+            "REG" => Some("https://reg.example".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        for (value, want) in [
+            // A set variable is never expanded (the rc file must not pick
+            // which of the process's variables lands in a requested URL).
+            ("${REG}", Err(())),
+            ("${REG:-https://d.example}", Err(())),
+            ("${REG-https://d.example}", Err(())),
+            ("${UNSET:-https://d.example}", Ok("https://d.example")),
+            ("${UNSET-https://d.example}", Ok("https://d.example")),
+            ("${EMPTY:-https://d.example}", Ok("https://d.example")),
+            ("${EMPTY-https://d.example}", Ok("")),
+            ("${EMPTY}", Ok("")),
+            ("https://h/${REG}/x", Err(())),
+            ("https://h/${UNSET:-m}/x", Ok("https://h/m/x")),
+            ("plain $ {REG} ${", Ok("plain $ {REG} ${")),
+            ("${UNSET}", Err(())),
+        ] {
+            assert_eq!(
+                yarn_expand_env(value, &var).map_err(|_| ()),
+                want.map(str::to_string),
+                "{value}"
+            );
+        }
+        let rc = "npmRegistryServer: \"${REG:-http://127.0.0.1:8792}\"\n";
+        assert_eq!(
+            berry_lookup_registry(&[rc.to_string()], None, "a", &|_: &str| None)
+                .unwrap()
+                .as_deref(),
+            Some("http://127.0.0.1:8792")
+        );
+        let rc = "npmRegistryServer: \"${REG}\"\n";
+        assert!(berry_lookup_registry(&[rc.to_string()], None, "a", &|_: &str| None).is_err());
     }
 
     #[test]

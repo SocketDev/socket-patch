@@ -39,6 +39,7 @@ use crate::patch::redirect::{
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
+use crate::utils::redact::url_host;
 use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
@@ -48,10 +49,11 @@ use super::guidance::{
     npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_replace_registry_host_detail,
     plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
     pnpm_lock_version_major, pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
-    pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_not_needed_detail,
-    pnpm_trust_policy_preamble, pnpm_trust_rush_detail, pnpm_trust_workspace_unreadable_detail,
+    pnpm_trust_keyless_members_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
+    pnpm_trust_not_needed_detail, pnpm_trust_policy_preamble, pnpm_trust_rush_detail,
+    pnpm_trust_scaffolded_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    url_host, TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
+    TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
     PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
@@ -632,6 +634,63 @@ pub async fn read_candidate_files(
         }
     }
 
+    // NuGet merges the user config and every parent directory's config
+    // under the project's own: a catch-all mapping the rewriter creates
+    // must name their sources too (#354). Disk only (the in-memory engine
+    // refuses NuGet, and could not see them).
+    if candidates.iter().any(|c| c.dep.ecosystem == "nuget")
+        && !matches!(view, ProjectView::Memory(_))
+    {
+        // The configs live outside the project: read beside the view, then
+        // handed to it as such reads (asking for its raw root would end a
+        // re-scan read cache's recording).
+        if let Some(root) = view.disk_root_reading(std::iter::empty::<&str>()) {
+            let (inherited, touched) =
+                crate::vendor::nuget_config::inherited_source_keys_traced(root).await;
+            view.disk_root_reading(&touched);
+            out.files.insert(
+                crate::patch::redirect::NUGET_INHERITED_SOURCES_KEY.to_string(),
+                inherited.keys.join("\n"),
+            );
+            if inherited.mapped {
+                out.files.insert(
+                    crate::patch::redirect::NUGET_INHERITED_MAPPING_KEY.to_string(),
+                    String::new(),
+                );
+            }
+        }
+    }
+
+    // NuGet: the root config routes every project under the root, so each
+    // project's lock is pinned with it (#353, #514). The walk's answer rides
+    // a synthetic key (the lock paths, an unevaluable NuGetLockFilePath, or
+    // why the tree could not be listed) and every lock is read. The project
+    // files themselves stay out of the candidate texts. NuGet is disk-only
+    // (the in-memory engine refuses it).
+    if candidates.iter().any(|c| c.dep.ecosystem == "nuget")
+        && !matches!(view, ProjectView::Memory(_))
+    {
+        let mut lines: Vec<String> = Vec::new();
+        match crate::vendor::nuget_config::governed_locks_in(view).await {
+            Ok(governed) => {
+                for (project, detail) in &governed.unresolved {
+                    lines.push(format!("unresolved\t{project}\t{detail}"));
+                }
+                for rel in governed.locks {
+                    if !out.files.contains_key(&rel) {
+                        out.read(view, unreadable, &rel).await;
+                    }
+                    lines.push(format!("lock\t{rel}"));
+                }
+            }
+            Err(why) => lines.push(format!("error\t{why}")),
+        }
+        out.files.insert(
+            crate::patch::redirect::NUGET_LOCKS_KEY.to_string(),
+            lines.join("\n"),
+        );
+    }
+
     for path in view.python_lock_paths() {
         if let Some(script) = crate::utils::python_lock::script_of_lock(&path) {
             out.read(view, unreadable, script).await;
@@ -1066,24 +1125,47 @@ pub fn wheel_targets<'a>(
     out
 }
 
+/// `text` about one hosted artifact made safe to show: every URL in it
+/// through [`crate::utils::redact::redact_urls_in`], and then the grant
+/// token of `artifact_url` wherever it is still spelled as a path level.
+/// The second pass is what knowing the artifact adds: its token is the
+/// level before `patch_uuid`, so a URL served under a root the shape-based
+/// redactor does not recognise (a custom `--api-url` server) or with a
+/// non-canonical patch id is still covered.
+pub fn redact_artifact_text(text: &str, artifact_url: &str, patch_uuid: &str) -> String {
+    let text = crate::utils::redact::redact_urls_in(text);
+    match crate::patch::redirect::grant_token_path_segment(artifact_url, patch_uuid) {
+        Some(token) if token != crate::utils::redact::REDACTED => text.replace(
+            &format!("/{token}/"),
+            &format!("/{}/", crate::utils::redact::REDACTED),
+        ),
+        _ => text.into_owned(),
+    }
+}
+
 /// The skip recorded for a pypi dep whose wheel metadata could not be
-/// fetched (the grant token in `detail` is redacted to `<hosted artifact>`).
+/// fetched (`detail` redacted by [`redact_artifact_text`]).
 pub fn wheel_metadata_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
     SkippedPatch {
         purl: format!("pkg:pypi/{}@{}", dep.name, dep.version),
         uuid: dep.patch_uuid.clone(),
         reason: "python_metadata_unavailable".to_string(),
-        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+        detail: Some(redact_artifact_text(
+            detail,
+            &dep.artifact_url,
+            &dep.patch_uuid,
+        )),
     }
 }
 
 /// The npm candidates whose yarn berry pin needs the served tarball's own
 /// `package.json`, in candidate order: yarn builds a tarball entry's `bin:`
 /// from that manifest, not from the registry metadata the locked `npm:`
-/// entry came from, and the two spell bin paths differently (#718). Only an
-/// entry the pin would re-key that carries a `bin:` map needs it (see
-/// `berry_pin_needs_manifest`; a fork alias never counts), so a berry
-/// project without bins fetches nothing.
+/// entry came from, and the two spell bin paths differently (#718); only the
+/// npm resolver adds an implicit `node-gyp` dependency (#737). Only an entry
+/// the pin would re-key that carries a `bin:` map or that dependency needs it
+/// (see `berry_pin_needs_manifest`; a fork alias never counts), so a berry
+/// project with neither fetches nothing.
 pub fn yarn_berry_manifest_targets<'a>(
     candidates: &'a [Candidate],
     files: &BTreeMap<String, String>,
@@ -1108,9 +1190,105 @@ pub fn yarn_berry_manifest_targets<'a>(
         .collect()
 }
 
+/// The npm deps whose yarn classic pin reads the served tarball, one per
+/// distinct artifact URL: the project's `yarn.lock` is a classic lock that
+/// names the package, the grant carries a sha512, and either the grant has
+/// no sha1 for the `resolved` fragment yarn 1 keys its cache slot on
+/// (#558), or the lock doesn't pin this artifact yet, so the tarball's own
+/// dependencies must be checked against the lock (#591).
+/// A lock the project's offline mirror refuses outright (`yarn_outer`: the
+/// mirror settings outside the project files) needs none.
+pub fn yarn_classic_artifact_targets<'a>(
+    candidates: &'a [Candidate],
+    files: &BTreeMap<String, String>,
+    yarn_outer: &OuterYarnMirror,
+) -> Vec<&'a DepOverride> {
+    let Some(lock) = files
+        .get("yarn.lock")
+        .filter(|lock| !crate::formats::yarn::is_berry_lock(lock))
+    else {
+        return Vec::new();
+    };
+    if crate::patch::redirect::yarn_classic_hosted_refused(files, yarn_outer) {
+        return Vec::new();
+    }
+    let mut seen = BTreeSet::new();
+    candidates
+        .iter()
+        .map(|c| &c.dep)
+        .filter(|dep| dep.ecosystem == "npm" && dep.integrity.sha512.is_some())
+        .filter(|dep| {
+            classic_locks_registry_copy(lock, &crate::patch::redirect::full_name(dep), &dep.version)
+        })
+        .filter(|dep| {
+            dep.integrity.sha1.is_none() || !lock.contains(&format!("\"{}#", dep.artifact_url))
+        })
+        .filter(|dep| seen.insert(dep.artifact_url.clone()))
+        .collect()
+}
+
+/// Whether a classic `lock` has a registry block of `name@version`: the
+/// only copy a hosted pin rewrites (a git, `file:`, `link:` or remote
+/// tarball copy is skipped by name, so it needs no served tarball). Read
+/// by the blocks' real names, as the rewriter does, so `lodash` never
+/// matches a `lodash.debounce` block.
+fn classic_locks_registry_copy(lock: &str, name: &str, version: &str) -> bool {
+    use crate::formats::yarn::blocks::{classic_field, scan_blocks};
+    use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
+    use crate::formats::yarn::source::{classic_copy_source, CopySource};
+    if !lock.contains(name) {
+        return false;
+    }
+    scan_blocks(lock).iter().any(|block| {
+        let patterns = split_key_patterns(&block.key);
+        classic_key_real_name(&patterns) == Some(name)
+            && classic_field(&block.lines, "version") == Some(version)
+            && classic_copy_source(&patterns, classic_field(&block.lines, "resolved"))
+                == CopySource::Registry
+    })
+}
+
+/// Record what the served tarball at `url` yielded: its sha1 on every
+/// candidate granted that artifact without one, and its manifest (keyed by
+/// URL) for the rewriter.
+pub fn record_classic_artifact(
+    candidates: &mut [Candidate],
+    manifests: &mut BTreeMap<String, String>,
+    url: &str,
+    artifact: &crate::hosted::npm_manifest::HostedClassicArtifact,
+) {
+    for candidate in candidates
+        .iter_mut()
+        .filter(|c| c.dep.artifact_url == url && c.dep.integrity.sha1.is_none())
+    {
+        candidate.dep.integrity.sha1 = Some(artifact.sha1.clone());
+    }
+    manifests.insert(url.to_string(), artifact.manifest.clone());
+}
+
+/// The skip recorded for an npm dep whose served tarball could not be
+/// fetched, did not match its grant's sha512 or had no readable
+/// package.json, so its yarn classic pin could not be checked (`detail`
+/// redacted by [`redact_artifact_text`]).
+pub fn npm_tarball_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
+    SkippedPatch {
+        purl: format!(
+            "pkg:npm/{}@{}",
+            crate::patch::redirect::full_name(dep),
+            dep.version
+        ),
+        uuid: dep.patch_uuid.clone(),
+        reason: "npm_tarball_unavailable".to_string(),
+        detail: Some(redact_artifact_text(
+            detail,
+            &dep.artifact_url,
+            &dep.patch_uuid,
+        )),
+    }
+}
+
 /// The skip recorded for an npm dep whose served `package.json` could not
-/// be fetched (the grant token in `detail` is redacted to `<hosted
-/// artifact>`).
+/// be fetched (`detail` redacted by [`redact_artifact_text`]).
 pub fn npm_manifest_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
     SkippedPatch {
         purl: format!(
@@ -1120,7 +1298,11 @@ pub fn npm_manifest_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch
         ),
         uuid: dep.patch_uuid.clone(),
         reason: "npm_manifest_unavailable".to_string(),
-        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+        detail: Some(redact_artifact_text(
+            detail,
+            &dep.artifact_url,
+            &dep.patch_uuid,
+        )),
     }
 }
 
@@ -2116,15 +2298,31 @@ fn pnpm_trust(
             original: None,
             new: Some(serde_json::json!("true")),
         };
-        // No workspace file and a project pinned to pnpm 9.0–10.4: creating
-        // one would make it a root-only workspace those releases refuse
-        // `pnpm add` in, for a key they never read (#734).
+        // No workspace file (or one with no keys, which pnpm reads the
+        // same) and a project pinned to pnpm 9.0–10.4: creating one would
+        // make it a root-only workspace those releases refuse `pnpm add`
+        // in, for a key they never read (#734, #1096).
         let pinned_pre_10_5 = match &workspace {
-            Ok(None) if !symlinked => root_only_workspace_breaks_add(view),
+            Ok(text)
+                if !symlinked
+                    && text
+                        .as_deref()
+                        .is_none_or(crate::formats::pnpm::workspace::is_keyless) =>
+            {
+                root_only_workspace_breaks_add(view)
+            }
             _ => None,
         };
+        // A keyless file the lock was installed from as a multi-package
+        // workspace: only pnpm <= 10.4 reads one that way (every nested
+        // package), and the root-only scaffold would drop those members.
+        let keyless_members = pinned_pre_10_5.is_none()
+            && !symlinked
+            && matches!(&workspace, Ok(Some(text)) if crate::formats::pnpm::workspace::is_keyless(text))
+            && lock_lists_members(view);
         match workspace {
-            Ok(None) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
+            Ok(_) if keyless_members => pnpm_trust_keyless_members_detail(&server, options.dry_run),
+            Ok(_) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
                 &server,
                 pinned_pre_10_5.as_deref().unwrap_or_default(),
                 options.dry_run,
@@ -2141,6 +2339,10 @@ fn pnpm_trust(
                 TrustPlan::Append(text) => {
                     trust_config_write = Some((text, trust_edit("added")));
                     pnpm_trust_configured_detail(&server, false, options.dry_run)
+                }
+                TrustPlan::Scaffold(text) => {
+                    trust_config_write = Some((text, trust_edit("added")));
+                    pnpm_trust_scaffolded_detail(&server, options.dry_run)
                 }
                 TrustPlan::AlreadyTrue => {
                     pnpm_rerun_only = spliced_pnpm_locks == 0;
@@ -2259,7 +2461,17 @@ fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
 /// and the installed `node_modules/.modules.yaml`, both advisory: FIFO-safe
 /// on disk, and an in-memory entry that is not text counts as absent.
 fn root_only_workspace_breaks_add(view: &ProjectView<'_>) -> Option<String> {
-    let read = |rel: &str| match view {
+    let read = |rel: &str| read_advisory_text(view, rel);
+    pnpm_root_only_workspace_breaks_add(
+        read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
+        read("node_modules/.modules.yaml").as_deref(),
+    )
+}
+
+/// A project text file read for advice only: FIFO-safe on disk, and an
+/// in-memory entry that is not text (or is a link) counts as absent.
+fn read_advisory_text(view: &ProjectView<'_>, rel: &str) -> Option<String> {
+    match view {
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
             let cwd = view.disk_root().expect("a disk view has a root");
             crate::utils::fs::read_regular_to_string_sync(&cwd.join(rel)).ok()
@@ -2269,11 +2481,20 @@ fn root_only_workspace_breaks_add(view: &ProjectView<'_>) -> Option<String> {
             _ => None,
         },
         ProjectView::Memory(_) => None,
-    };
-    pnpm_root_only_workspace_breaks_add(
-        read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
-        read("node_modules/.modules.yaml").as_deref(),
-    )
+    }
+}
+
+/// Whether the root `pnpm-lock.yaml` lists workspace members besides the
+/// root: with a keyless pnpm-workspace.yaml that marks a pnpm <= 10.4
+/// install (see [`crate::formats::pnpm::workspace::lock_has_member_importers`]).
+fn lock_lists_members(view: &ProjectView<'_>) -> bool {
+    read_advisory_text(view, "pnpm-lock.yaml").is_some_and(|text| {
+        let doc =
+            crate::formats::pnpm::grammar::main_document(crate::formats::text::strip_bom(&text));
+        crate::formats::pnpm::workspace::lock_has_member_importers(
+            &crate::formats::pnpm::lines::split_lines(doc),
+        )
+    })
 }
 
 /// The ancestor `pnpm-workspace.yaml` governing a disk project's pnpm
@@ -2789,8 +3010,93 @@ mod tests {
     use super::*;
     use crate::vendor::lock_inventory::MemoryProject;
 
+    const GRANT: &str = "GRANTTOKEN0123";
+    const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+
+    fn grant_dep(ecosystem: &str, artifact_url: String) -> DepOverride {
+        DepOverride {
+            ecosystem: ecosystem.into(),
+            name: "left-pad".into(),
+            namespace: None,
+            version: "1.3.0".into(),
+            token: GRANT.into(),
+            patch_uuid: PATCH_UUID.into(),
+            artifact_url,
+            registry_override: None,
+            integrity: crate::patch::redirect::Integrity::default(),
+        }
+    }
+
+    /// The hosted skip details reach `--json`: neither the grant token nor
+    /// any userinfo survives, however reqwest re-renders the URL (a
+    /// trailing `/`, a different quoting) and under whatever root the
+    /// server serves it (a custom `--api-url` with no `/patch/` level).
+    #[test]
+    fn hosted_skip_details_never_carry_the_grant_token() {
+        for (url, uuid) in [
+            (
+                format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{GRANT}/{PATCH_UUID}/left-pad-1.3.0.tgz"),
+                PATCH_UUID,
+            ),
+            (
+                format!("https://u:pw@api.corp.example/serve/{GRANT}/{PATCH_UUID}/left-pad-1.3.0.tgz"),
+                PATCH_UUID,
+            ),
+            // A non-canonical patch id: the shape-based redactor cannot
+            // tell its level is a uuid, the dep can.
+            (
+                format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{GRANT}/patch-42/x.tgz"),
+                "patch-42",
+            ),
+        ] {
+            let mut dep = grant_dep("npm", url.clone());
+            dep.patch_uuid = uuid.into();
+            let detail = format!(
+                "error sending request for url ({url}?x=1): connection refused (proxy https://p:pw@proxy:3128)"
+            );
+            for skip in [
+                npm_manifest_unavailable(&dep, &detail),
+                wheel_metadata_unavailable(&dep, &detail),
+            ] {
+                let got = skip.detail.unwrap();
+                assert!(!got.contains(GRANT), "{url}: {got}");
+                assert!(!got.contains("u:pw") && !got.contains("p:pw"), "{got}");
+                assert!(got.contains("connection refused"), "{got}");
+            }
+        }
+        let dep = grant_dep("npm", format!("https://h/serve/{GRANT}/{PATCH_UUID}/a.tgz"));
+        assert_eq!(
+            redact_artifact_text("no url here", &dep.artifact_url, &dep.patch_uuid),
+            "no url here"
+        );
+    }
+
     fn reference(value: serde_json::Value) -> PackageVendorResult {
         serde_json::from_value(value).unwrap()
+    }
+
+    /// #558 review: the served tarball is fetched only for a lock that
+    /// really locks a registry copy of the package, read by block names
+    /// (`lodash` is not `lodash.debounce`) and copy source (a git or
+    /// `file:` copy is never pinned).
+    #[test]
+    fn classic_registry_copy_is_matched_by_block_name_and_source() {
+        let lock = "# yarn lockfile v1\n\n\
+                    lodash.debounce@^4.0.8:\n  version \"4.17.21\"\n  \
+                    resolved \"https://registry.yarnpkg.com/lodash.debounce/-/x.tgz#aa\"\n\n\
+                    left-pad@git+https://github.com/x/left-pad.git:\n  version \"1.3.0\"\n  \
+                    resolved \"git+https://github.com/x/left-pad.git#abc\"\n\n\
+                    is-odd@^3.0.0:\n  version \"3.0.1\"\n  \
+                    resolved \"https://registry.yarnpkg.com/is-odd/-/is-odd-3.0.1.tgz#bb\"\n";
+        assert!(!classic_locks_registry_copy(lock, "lodash", "4.17.21"));
+        assert!(!classic_locks_registry_copy(lock, "left-pad", "1.3.0"));
+        assert!(!classic_locks_registry_copy(lock, "is-odd", "3.0.0"));
+        assert!(classic_locks_registry_copy(lock, "is-odd", "3.0.1"));
+        assert!(classic_locks_registry_copy(
+            lock,
+            "lodash.debounce",
+            "4.17.21"
+        ));
     }
 
     #[test]

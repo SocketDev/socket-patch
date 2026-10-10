@@ -4,6 +4,7 @@
 //! installed packages. Nothing reaches a real registry; network cases hit an
 //! unroutable localhost port.
 
+use crate::common::envelope::{codes_in, events};
 use crate::common::{binary, git_sha256};
 
 use std::path::{Path, PathBuf};
@@ -53,6 +54,14 @@ const MANIFEST_JSON: &str = r#"{
     }
   }
 }"#;
+
+/// The `action` event for `purl`; panics with the envelope when absent.
+fn event_for<'a>(v: &'a serde_json::Value, action: &str, purl: &str) -> &'a serde_json::Value {
+    events(v)
+        .iter()
+        .find(|e| e["action"] == action && e["purl"] == purl)
+        .unwrap_or_else(|| panic!("no `{action}` event for {purl} in:\n{v:#}"))
+}
 
 fn make_socket_dir(root: &Path) -> PathBuf {
     let socket = root.join(".socket");
@@ -104,7 +113,11 @@ fn rollback_with_no_manifest_emits_error() {
     let (code, stdout) = run(tmp.path(), &["--json", "--offline"]);
     assert_eq!(code, 1, "no manifest must exit 1; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["command"], "rollback");
     assert_eq!(v["status"], "error");
+    assert_eq!(v["error"]["code"], "manifest_not_found");
+    assert_eq!(v["events"], serde_json::json!([]), "a full error envelope");
+    assert_eq!(v["summary"]["failed"], 0);
     // Pin the *specific* error so a regression that exits 1 for some other
     // reason (e.g. ambient env steering it elsewhere) can't pass.
     let err = v["error"]["message"]
@@ -126,7 +139,10 @@ fn rollback_unknown_identifier_emits_error() {
     );
     assert_eq!(code, 1, "unknown identifier must exit 1; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["command"], "rollback");
     assert_eq!(v["status"], "error");
+    assert_eq!(v["error"]["code"], "patch_not_found");
+    assert_eq!(v["events"], serde_json::json!([]), "a full error envelope");
     let err = v["error"]["message"]
         .as_str()
         .expect("error message string");
@@ -149,7 +165,7 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     // anything — and the JSON envelope must SAY so. The bail fires before
     // the rollback loop produces any per-package results, so the failures
     // are synthesized — `--json` mutes the stderr explanation, so an
-    // envelope claiming `failed: 0` with empty `results[]` would leave
+    // envelope claiming `summary.failed: 0` with no events would leave
     // machine consumers zero diagnostic. (The package is installed because
     // an entry with no installed package never enters the blob plan — see
     // `rollback_only_not_installed_entry_is_never_blob_gated`.)
@@ -162,45 +178,50 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
         "offline + missing blob must exit 1; stdout=\n{stdout}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert_eq!(v["status"], "partial_failure");
-    assert_eq!(v["rolledBack"], 0);
-    assert_eq!(v["alreadyOriginal"], 0);
+    // Nothing could be rolled back: a total failure (#1066).
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["error"]["code"], "rollback_failed");
+    assert_eq!(v["summary"]["rolledBack"], 0);
+    assert_eq!(v["summary"]["skipped"], 0);
     assert_eq!(v["dryRun"], false, "not a dry-run");
     // The gated package is counted as failed — same per-package counter
-    // semantics as a mid-run failure. A `failed: 0` partial_failure is
-    // self-contradictory.
+    // semantics as a mid-run failure.
     assert_eq!(
-        v["failed"], 1,
+        v["summary"]["failed"], 1,
         "the blob-gated package must be counted as failed; stdout=\n{stdout}"
     );
-    let results = v["results"].as_array().expect("results array");
+    // Nothing was restored, so the GC was skipped (the retry's revert data
+    // must survive) and says so.
+    assert!(v.get("gc").is_none(), "stdout=\n{stdout}");
+    assert!(codes_in(&v["warnings"]).contains(&"gc_skipped".to_string()));
+    let evs = events(&v);
     assert_eq!(
-        results.len(),
+        evs.len(),
         1,
-        "the bail must synthesize one failed result per gated package; stdout=\n{stdout}"
+        "the bail must synthesize one failed event per gated package; stdout=\n{stdout}"
     );
-    let entry = &results[0];
+    let entry = &evs[0];
+    assert_eq!(entry["action"], "failed");
+    assert_eq!(entry["errorCode"], "missing_blob");
     assert_eq!(entry["purl"], "pkg:npm/__rollback_test__@1.0.0");
-    assert_eq!(entry["success"], false);
     assert!(
-        !entry["path"].as_str().expect("path string").is_empty(),
+        !entry["details"]["path"]
+            .as_str()
+            .expect("path string")
+            .is_empty(),
         "a blob-gated package is installed, so its path must be reported; stdout=\n{stdout}"
     );
-    assert_eq!(
-        entry["filesRolledBack"]
-            .as_array()
-            .expect("filesRolledBack array")
-            .len(),
-        0,
+    assert!(
+        entry.get("files").is_none(),
         "nothing was restored on the bail"
     );
     // The error names the remedy; the per-file record names the blob.
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("socket-patch repair"),
-        "error must carry the repair remedy; got: {err}"
+        err.contains("Re-run without --offline") && !err.contains("repair"),
+        "error must carry the re-run remedy (repair cannot fetch originals, #893); got: {err}"
     );
-    let verified = entry["filesVerified"]
+    let verified = entry["details"]["filesVerified"]
         .as_array()
         .expect("filesVerified array");
     let file = verified
@@ -208,8 +229,8 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
         .find(|f| f["file"] == "package/index.js")
         .unwrap_or_else(|| panic!("gated file must appear in filesVerified; stdout=\n{stdout}"));
     assert_eq!(
-        file["status"], "missing_blob",
-        "the engine's missing_blob vocabulary; stdout=\n{stdout}"
+        file["status"], "missingBlob",
+        "the engine's missing_blob vocabulary, camelCased; stdout=\n{stdout}"
     );
     assert_eq!(
         file["targetHash"], MISSING_BEFORE_HASH,
@@ -221,8 +242,8 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
         "message must name the missing hash; got: {msg}"
     );
     assert!(
-        msg.contains("--offline") && msg.contains("socket-patch repair"),
-        "message must name the offline gate and the repair remedy; got: {msg}"
+        msg.contains("--offline") && msg.contains("Re-run without --offline"),
+        "message must name the offline gate and the re-run remedy; got: {msg}"
     );
 }
 
@@ -249,8 +270,8 @@ fn rollback_offline_missing_blob_human_names_package_and_remedy() {
         "stderr must explain the offline gate; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("socket-patch repair"),
-        "stderr must carry the repair remedy; stderr=\n{stderr}"
+        stderr.contains("Re-run without --offline") && !stderr.contains("socket-patch repair"),
+        "stderr must carry the re-run remedy; stderr=\n{stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -293,26 +314,28 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
         "undownloadable blob must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert_eq!(v["status"], "partial_failure");
-    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
-    let results = v["results"].as_array().expect("results array");
-    assert_eq!(results.len(), 1, "stdout=\n{stdout}");
-    let entry = &results[0];
+    // The only patch failed: a total failure (#1066).
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
+    assert_eq!(v["summary"]["failed"], 1, "stdout=\n{stdout}");
+    let evs = events(&v);
+    assert_eq!(evs.len(), 1, "stdout=\n{stdout}");
+    let entry = &evs[0];
+    assert_eq!(entry["action"], "failed");
     assert_eq!(entry["purl"], "pkg:npm/__rollback_test__@1.0.0");
-    assert_eq!(entry["success"], false);
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("socket-patch repair"),
-        "error must carry the repair remedy; got: {err}"
+        err.contains("patch API is reachable") && !err.contains("repair"),
+        "error must carry the re-run remedy; got: {err}"
     );
-    let verified = entry["filesVerified"]
+    let verified = entry["details"]["filesVerified"]
         .as_array()
         .expect("filesVerified array");
     let file = verified
         .iter()
         .find(|f| f["file"] == "package/index.js")
         .unwrap_or_else(|| panic!("gated file must appear in filesVerified; stdout=\n{stdout}"));
-    assert_eq!(file["status"], "missing_blob");
+    assert_eq!(file["status"], "missingBlob");
     assert_eq!(file["targetHash"], MISSING_BEFORE_HASH);
     let msg = file["message"].as_str().expect("message string");
     assert!(
@@ -360,11 +383,9 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
 /// `success`. Apply's job is "make the tree patched", so its all-unmatched
 /// run is a `partialFailure` — the job was NOT done; rollback's job is
 /// "make the tree unpatched", and a not-installed package already
-/// satisfies that end state. Each such entry is surfaced as one skipped
-/// marker appended to `results[]` — `path` null, `skipped:
-/// "package_not_installed"`, no `success`/`error` keys — NEVER as a failed
-/// result: `failed` stays 0 and no result ever carries `path: ""`. There
-/// is no top-level `notInstalled` key.
+/// satisfies that end state. Each such entry is surfaced as one `skipped`
+/// event with `errorCode: "package_not_installed"` — NEVER as a failed
+/// event: `summary.failed` stays 0.
 fn assert_only_not_installed_envelope(code: i32, stdout: &str) {
     assert_eq!(
         code, 0,
@@ -372,43 +393,43 @@ fn assert_only_not_installed_envelope(code: i32, stdout: &str) {
          see the asymmetry contract above); stdout=\n{stdout}"
     );
     let v: serde_json::Value = serde_json::from_str(stdout).expect("valid JSON");
+    assert_eq!(v["command"], "rollback");
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
-    assert_eq!(v["rolledBack"], 0);
-    assert_eq!(v["alreadyOriginal"], 0);
+    assert_eq!(v["summary"]["rolledBack"], 0);
     assert_eq!(
-        v["failed"], 0,
+        v["summary"]["failed"], 0,
         "nothing was attempted, so nothing failed — a not-installed entry \
          is a skip, not a failure; stdout=\n{stdout}"
     );
-    assert!(
-        v.get("notInstalled").is_none(),
-        "the top-level notInstalled key was dropped in favor of per-entry \
-         skipped markers in results[]; stdout=\n{stdout}"
-    );
-    let results = v["results"].as_array().expect("results array");
+    assert_eq!(v["summary"]["skipped"], 1, "stdout=\n{stdout}");
+    let skipped: Vec<&serde_json::Value> = events(&v)
+        .iter()
+        .filter(|e| e["action"] == "skipped")
+        .collect();
     assert_eq!(
-        results.len(),
+        skipped.len(),
         1,
-        "exactly one skipped marker for the one not-installed entry; \
+        "exactly one skipped event for the one not-installed entry; \
          stdout=\n{stdout}"
     );
-    let marker = &results[0];
-    assert_eq!(marker["purl"], "pkg:npm/__rollback_test__@1.0.0");
-    assert!(
-        marker["path"].is_null(),
-        "no installed tree to name — path must be null, never \"\"; \
-         stdout=\n{stdout}"
-    );
+    // The entry still leaves the manifest (the tree is already unpatched).
     assert_eq!(
-        marker["skipped"], "package_not_installed",
+        event_for(&v, "removed", "pkg:npm/__rollback_test__@1.0.0")["details"]["manifest"],
+        true
+    );
+    let marker = skipped[0];
+    assert_eq!(marker["action"], "skipped");
+    assert_eq!(marker["purl"], "pkg:npm/__rollback_test__@1.0.0");
+    assert_eq!(
+        marker["errorCode"], "package_not_installed",
         "stdout=\n{stdout}"
     );
     assert!(
-        marker.get("success").is_none() && marker.get("error").is_none(),
-        "a skipped marker is not a result record; stdout=\n{stdout}"
+        marker.get("details").is_none(),
+        "no installed tree to name; stdout=\n{stdout}"
     );
     assert!(
-        !stdout.contains("missing_blob") && !stdout.contains("Before blob not found"),
+        !stdout.contains("missingBlob") && !stdout.contains("Before blob not found"),
         "a not-installed entry must never surface a blob problem; stdout=\n{stdout}"
     );
 }
@@ -480,8 +501,8 @@ fn rollback_not_installed_entry_triggers_no_blob_download() {
 
 /// Mixed manifest: one entry INSTALLED with its before-blob missing (must
 /// still fail with the pinned missing-blob abort envelope), one entry NOT
-/// installed (must surface as a skipped marker in `results[]`, never as a
-/// failed result, and never with `path: ""`). The failure comes solely
+/// installed (must surface as a `skipped` `package_not_installed` event,
+/// never as a failed one). The failure comes solely
 /// from the installed package; the not-installed entry rides along as a
 /// skip.
 #[test]
@@ -539,74 +560,58 @@ fn rollback_mixed_installed_gated_and_not_installed_entries() {
         "the installed package's missing blob must fail the run; stdout=\n{stdout}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert_eq!(v["status"], "partial_failure");
+    assert_eq!(v["status"], "partialFailure");
     assert_eq!(
-        v["failed"], 1,
+        v["summary"]["failed"], 1,
         "only the installed, blob-gated package counts as failed; stdout=\n{stdout}"
     );
-    let results = v["results"].as_array().expect("results array");
+    assert_eq!(v["summary"]["skipped"], 1, "the ghost; stdout=\n{stdout}");
+    let evs = events(&v);
     assert_eq!(
-        results.len(),
+        evs.len(),
         2,
-        "one failed result for the installed package plus one skipped \
-         marker for the ghost — never a synthesized ghost failure; \
+        "one failed event for the installed package plus one skipped \
+         event for the ghost — never a synthesized ghost failure; \
          stdout=\n{stdout}"
     );
-    let entry = &results[0];
+    let entry = &evs[0];
+    assert_eq!(entry["action"], "failed");
     assert_eq!(entry["purl"], "pkg:npm/installed-target@1.0.0");
-    assert_eq!(entry["success"], false);
     assert!(
-        !entry["path"].as_str().expect("path string").is_empty(),
+        !entry["details"]["path"]
+            .as_str()
+            .expect("path string")
+            .is_empty(),
         "the gated package is installed — path must be reported; stdout=\n{stdout}"
     );
     // The pinned missing-blob abort envelope survives for the installed
-    // package: engine vocabulary + repair remedy.
+    // package: engine vocabulary + re-run remedy.
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("Cannot roll back: ") && err.contains("socket-patch repair"),
+        err.contains("Cannot roll back: ") && err.contains("Re-run without --offline"),
         "pinned abort error shape; got: {err}"
     );
-    let verified = entry["filesVerified"]
+    let verified = entry["details"]["filesVerified"]
         .as_array()
         .expect("filesVerified array");
     assert!(
         verified
             .iter()
-            .any(|f| f["status"] == "missing_blob" && f["targetHash"] == MISSING_BEFORE_HASH),
+            .any(|f| f["status"] == "missingBlob" && f["targetHash"] == MISSING_BEFORE_HASH),
         "the missing blob must be named with the engine's vocabulary; stdout=\n{stdout}"
     );
-    // The ghost entry is a skipped marker appended after the real results
-    // — not a failure — and its (equally missing) before-blob must appear
-    // nowhere in the failure output.
-    let marker = &results[1];
+    // The ghost entry is a skipped event after the real results — not a
+    // failure — and its (equally missing) before-blob must appear nowhere
+    // in the failure output.
+    let marker = &evs[1];
+    assert_eq!(marker["action"], "skipped");
     assert_eq!(
         marker["purl"], "pkg:npm/__ghost__@2.0.0",
         "stdout=\n{stdout}"
     );
-    assert!(
-        marker["path"].is_null(),
-        "no installed tree to name — path must be null, never \"\"; \
-         stdout=\n{stdout}"
-    );
     assert_eq!(
-        marker["skipped"], "package_not_installed",
+        marker["errorCode"], "package_not_installed",
         "stdout=\n{stdout}"
-    );
-    assert!(
-        marker.get("success").is_none() && marker.get("error").is_none(),
-        "a skipped marker is not a result record; stdout=\n{stdout}"
-    );
-    assert!(
-        v.get("notInstalled").is_none(),
-        "the top-level notInstalled key was dropped in favor of per-entry \
-         skipped markers; stdout=\n{stdout}"
-    );
-    assert!(
-        results
-            .iter()
-            .filter(|r| r.get("skipped").is_none())
-            .all(|r| !r["path"].as_str().unwrap_or("").is_empty()),
-        "no result record may carry an empty path; stdout=\n{stdout}"
     );
     assert!(
         !stdout.contains("2222222222222222222222222222222222222222222222222222222222222222"),
@@ -632,51 +637,51 @@ fn rollback_json_shape_has_documented_keys() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     let keys: std::collections::BTreeSet<&str> =
         v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    // These keys are documented in CLI_CONTRACT.md as the rollback shape
-    // (not yet migrated to the unified envelope). Pin them so a future
-    // migration trips this test instead of breaking wrappers silently.
-    // The v5.0 duality rework added the always-present additive keys from
-    // `vendored` onward (vendoredReverted/vendoredPreserved/vendoredKept,
-    // hosted, manifest, gc, paths).
+    // v5.0 (MAJOR): rollback prints the unified envelope. Its own payload
+    // is `hosted.editedFiles` and `paths`; every outcome is an event.
     for key in [
-        "status",
+        "command", "status", "dryRun", "events", "summary", "hosted", "paths",
+    ] {
+        assert!(keys.contains(key), "rollback JSON missing key: {key}");
+    }
+    for gone in [
         "rolledBack",
         "alreadyOriginal",
         "failed",
-        "dryRun",
-        "warnings",
         "results",
         "vendored",
         "vendoredReverted",
         "vendoredPreserved",
         "vendoredKept",
         "vendoredFailed",
-        "hosted",
         "manifest",
-        "gc",
-        "paths",
     ] {
-        assert!(keys.contains(key), "rollback JSON missing key: {key}");
+        assert!(!keys.contains(gone), "legacy key {gone} survived: {v:#}");
     }
-    // The hosted/manifest sub-objects carry their documented keys.
-    assert!(v["hosted"]["reverted"].is_array());
-    assert!(v["hosted"]["failed"].is_array());
-    assert!(v["hosted"]["unsupported"].is_array());
+    assert_eq!(v["command"], "rollback");
     assert!(v["hosted"]["editedFiles"].is_number());
-    assert!(v["manifest"]["removedEntries"].is_array());
-    assert!(v["manifest"]["preserved"].is_boolean());
-    // Not-installed entries surface as per-entry `skipped` markers inside
-    // `results[]` — there is deliberately NO top-level `notInstalled` key.
-    assert!(
-        v.get("notInstalled").is_none(),
-        "notInstalled was dropped in favor of skipped markers in results[]"
-    );
-    // `warnings` is documented as ALWAYS present (empty array when nothing
-    // fired) so consumers can index `.warnings[]` without null-checking.
-    assert!(
-        v["warnings"].is_array(),
-        "warnings must be an array (present even when empty)"
-    );
+    // `warnings` is the shared envelope key: omitted when nothing fired.
+    assert!(v.get("warnings").is_none_or(|w| w.is_array()));
+    // summary == the event counts.
+    for action in [
+        "discovered",
+        "downloaded",
+        "applied",
+        "updated",
+        "skipped",
+        "failed",
+        "removed",
+        "verified",
+        "rebuilt",
+        "rolledBack",
+    ] {
+        let n = events(&v).iter().filter(|e| e["action"] == action).count();
+        assert_eq!(v["summary"][action], n, "summary.{action}: {v:#}");
+    }
+    // The not-installed entry left the manifest: a `removed` event.
+    let removed = event_for(&v, "removed", "pkg:npm/__rollback_test__@1.0.0");
+    assert_eq!(removed["details"]["manifest"], true);
+    assert!(v["gc"].is_object(), "the GC ran: {v:#}");
 }
 
 // ---------------------------------------------------------------------------
@@ -753,26 +758,25 @@ fn rollback_restores_file_to_before_content() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
-    assert_eq!(v["rolledBack"], 1);
+    assert_eq!(v["summary"]["rolledBack"], 1);
     assert_eq!(
-        v["failed"], 0,
+        v["summary"]["failed"], 0,
         "no file should fail to roll back; stdout={stdout}"
     );
-    assert_eq!(v["alreadyOriginal"], 0, "file was patched, not original");
+    assert_eq!(v["summary"]["skipped"], 0, "file was patched, not original");
     assert_eq!(v["dryRun"], false, "live rollback, not dry-run");
-    // The single result must name our package and actually list the restored file.
-    let results = v["results"].as_array().expect("results array");
-    let entry = results
-        .iter()
-        .find(|r| r["purl"] == "pkg:npm/rollback-target@1.0.0")
-        .unwrap_or_else(|| panic!("missing result entry; stdout={stdout}"));
-    assert_eq!(entry["success"], true);
-    let rolled = entry["filesRolledBack"]
-        .as_array()
-        .expect("filesRolledBack array");
+    // The event must name our package and actually list the restored file.
+    let entry = event_for(&v, "rolledBack", "pkg:npm/rollback-target@1.0.0");
+    assert_eq!(entry["uuid"], "11111111-1111-4111-8111-111111111111");
+    let rolled = entry["files"].as_array().expect("files array");
     assert!(
-        rolled.iter().any(|f| f == "package/index.js"),
+        rolled.iter().any(|f| f["path"] == "package/index.js"),
         "index.js must be listed as rolled back; stdout={stdout}"
+    );
+    // ...and the entry left the manifest.
+    assert_eq!(
+        event_for(&v, "removed", "pkg:npm/rollback-target@1.0.0")["details"]["manifest"],
+        true
     );
 
     // The file in node_modules should now contain the BEFORE bytes...
@@ -849,43 +853,24 @@ fn rollback_already_original_skips_work() {
     assert_eq!(code, 0, "rollback must succeed; stdout={stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["alreadyOriginal"], 1);
-    assert_eq!(v["rolledBack"], 0);
+    assert_eq!(v["summary"]["skipped"], 1);
+    assert_eq!(v["summary"]["rolledBack"], 0);
     assert_eq!(
-        v["failed"], 0,
+        v["summary"]["failed"], 0,
         "no-op must not record a failure; stdout={stdout}"
     );
     assert_eq!(v["dryRun"], false);
 
-    // The package must actually be discovered and reported as already-original,
-    // not merely produce a vacuous zero-work success (which would also satisfy
-    // rolledBack==0 / alreadyOriginal would then be 0, but pin the entry too).
-    let results = v["results"].as_array().expect("results array");
-    let entry = results
-        .iter()
-        .find(|r| r["purl"] == "pkg:npm/already-orig@1.0.0")
-        .unwrap_or_else(|| panic!("missing result entry; stdout={stdout}"));
-    assert_eq!(entry["success"], true);
-    // Nothing was rewritten, so filesRolledBack must be empty...
+    // The package must actually be discovered and reported as already
+    // original, not merely produce a vacuous zero-work success.
+    let entry = event_for(&v, "skipped", "pkg:npm/already-orig@1.0.0");
     assert_eq!(
-        entry["filesRolledBack"]
-            .as_array()
-            .expect("filesRolledBack array")
-            .len(),
-        0,
-        "already-original package must roll back zero files; stdout={stdout}"
+        entry["errorCode"], "already_original",
+        "file must verify as already original; stdout={stdout}"
     );
-    // ...and the file must be verified as already at its original state.
-    let verified = entry["filesVerified"]
-        .as_array()
-        .expect("filesVerified array");
-    let file = verified
-        .iter()
-        .find(|f| f["file"] == "package/index.js")
-        .expect("index.js must appear in filesVerified");
-    assert_eq!(
-        file["status"], "already_original",
-        "file must verify as already_original; stdout={stdout}"
+    assert!(
+        entry.get("files").is_none(),
+        "already-original package must roll back zero files; stdout={stdout}"
     );
 
     // File unchanged, and still hashes to the manifest beforeHash (independent
@@ -963,35 +948,42 @@ fn rollback_dry_run_does_not_modify_file() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "dry-run status; stdout={stdout}");
     assert_eq!(v["dryRun"], true, "dry-run must set dryRun=true");
-    // Nothing is actually written in a dry run.
-    assert_eq!(v["rolledBack"], 0, "dry-run must not roll anything back");
-    assert_eq!(v["failed"], 0, "dry-run must not record failures");
-    let results = v["results"].as_array().expect("results array");
-    let entry = results
-        .iter()
-        .find(|r| r["purl"] == "pkg:npm/dry-target@1.0.0")
-        .unwrap_or_else(|| panic!("dry-run must discover the installed package; stdout={stdout}"));
+    // Nothing is actually written in a dry run: previews are `verified`.
     assert_eq!(
-        entry["success"], true,
-        "discovered package entry must be success"
+        v["summary"]["rolledBack"], 0,
+        "dry-run must not roll anything back"
     );
-    let verified = entry["filesVerified"]
-        .as_array()
-        .expect("filesVerified array");
-    let file = verified
-        .iter()
-        .find(|f| f["file"] == "package/index.js")
-        .expect("index.js must appear in filesVerified");
-    // "ready" means the engine confirmed it COULD restore this file (current
-    // hash matches the patched AFTER state, before blob available) — i.e. it
-    // genuinely walked the rollback path, just stopping short of writing.
     assert_eq!(
-        file["status"], "ready",
+        v["summary"]["removed"], 0,
+        "dry-run must not remove anything"
+    );
+    assert_eq!(
+        v["summary"]["failed"], 0,
+        "dry-run must not record failures"
+    );
+    // The would-be restore lists the file the engine confirmed it COULD
+    // restore (current hash matches the patched AFTER state, before blob
+    // available) — it genuinely walked the rollback path, just stopping
+    // short of writing.
+    let entry = events(&v)
+        .iter()
+        .find(|e| {
+            e["action"] == "verified"
+                && e["purl"] == "pkg:npm/dry-target@1.0.0"
+                && e["details"].get("manifest").is_none()
+        })
+        .unwrap_or_else(|| panic!("dry-run must discover the installed package; stdout={stdout}"));
+    let files = entry["files"].as_array().expect("files array");
+    assert!(
+        files.iter().any(|f| f["path"] == "package/index.js"),
         "dry-run must report the file as ready-to-roll-back; stdout={stdout}"
     );
-    assert_eq!(
-        file["targetHash"], before_hash,
-        "dry-run must target the BEFORE hash"
+    // The would-be manifest removal is previewed too.
+    assert!(
+        events(&v).iter().any(|e| e["action"] == "verified"
+            && e["purl"] == "pkg:npm/dry-target@1.0.0"
+            && e["details"]["manifest"] == true),
+        "stdout={stdout}"
     );
 
     // Dry-run must NOT modify the file.
@@ -1040,18 +1032,15 @@ fn rollback_honors_manifest_path_override() {
         "all-not-installed succeeds quietly; stdout={stdout}; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(v["rolledBack"], 0);
-    assert_eq!(v["failed"], 0, "not-installed is a skip, not a failure");
-    assert_eq!(v["alreadyOriginal"], 0);
-    let results = v["results"].as_array().expect("results array");
+    assert_eq!(v["summary"]["rolledBack"], 0);
     assert_eq!(
-        results.len(),
-        1,
-        "the override manifest's entry must be the one reported; stdout={stdout}"
+        v["summary"]["failed"], 0,
+        "not-installed is a skip, not a failure"
     );
     assert_eq!(
-        results[0]["skipped"], "package_not_installed",
-        "stdout={stdout}"
+        event_for(&v, "skipped", "pkg:npm/__rollback_test__@1.0.0")["errorCode"],
+        "package_not_installed",
+        "the override manifest's entry must be the one reported; stdout={stdout}"
     );
 }
 

@@ -98,6 +98,8 @@ RUN set -eu \
 # the image's Central cache from memory, which more lines would bloat past
 # its 2g container.
 ARG SBT_WARM_VERSIONS="0.13.18 1.2.8 1.13.0 2.0.9"
+# CI's blocking slice uses only two sbt lines; nightly/compat keep all tools.
+ARG SBT_WARM_TOOLS=1
 RUN set -eu \
  && for v in ${SBT_WARM_VERSIONS}; do \
       d="/tmp/warm-$v"; mkdir -p "$d/project"; \
@@ -110,7 +112,8 @@ RUN set -eu \
         sbt -batch -no-colors -Dsbt.server.autostart=false $extra update); \
       rm -rf "$d"; \
     done \
- && d=/tmp/warm-mill && mkdir -p "$d/foo/src" && cd "$d" \
+ && if [ "$SBT_WARM_TOOLS" = 1 ]; then \
+      d=/tmp/warm-mill && mkdir -p "$d/foo/src" && cd "$d" \
  && printf '%s\n' '//| mill-version: '"${MILL_1_VERSION}" 'package build' 'import mill.*, scalalib.*' \
       'object foo extends ScalaModule {' '  def scalaVersion = "2.13.16"' \
       '  def mvnDeps = Seq(mvn"org.apache.commons:commons-lang3:3.11")' '}' > build.mill \
@@ -120,4 +123,5 @@ RUN set -eu \
  && printf '%s\n' '//> using scala 3.3.6' '//> using dep org.apache.commons:commons-lang3:3.11' > project.scala \
  && echo '@main def m() = println("warm")' > Main.scala \
  && scala-cli compile . --server=false > /dev/null \
- && cd / && rm -rf "$d"
+ && cd / && rm -rf "$d"; \
+    fi

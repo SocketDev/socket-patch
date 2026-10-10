@@ -46,6 +46,9 @@ pub const SCRIPT_REL: &str = ".socket/gradle/socket-patch.settings.gradle";
 use super::layout::GRADLE_TREE as TREE_ROOT;
 /// The tree root's `.gitattributes`, shared by every Gradle patch.
 pub const GITATTRIBUTES_REL: &str = ".socket/vendor/gradle/.gitattributes";
+/// The tree root's `.gitignore` (`!*`): re-includes the vendored jars
+/// against a user's `*.jar` rule (Java.gitignore), #620 / #1061.
+pub const GITIGNORE_REL: &str = ".socket/vendor/gradle/.gitignore";
 /// `.socket/gradle/`'s `.gitattributes` (`* -text`): the settings scripts
 /// there stay byte-exact on a `core.autocrlf` checkout (#429). Shared with
 /// the hosted script.
@@ -511,6 +514,12 @@ pub fn plan(
     records.push(created_or_adopted(SCRIPT_REL, read(SCRIPT_REL).is_some()));
     writes.push(text_write(SCRIPT_REL, SCRIPT.as_bytes().to_vec()));
     records.push(owned_file(read, GITATTRIBUTES_REL, &mut writes));
+    records.push(super::owned_file_with(
+        read,
+        GITIGNORE_REL,
+        super::coursier_tree::GITIGNORE.as_bytes(),
+        &mut writes,
+    ));
     records.push(owned_file(read, SCRIPT_GITATTRIBUTES_REL, &mut writes));
     records.push(vendor_gitattributes(read, &mut writes));
 
@@ -1071,6 +1080,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         for (rel, expected) in [
             (SCRIPT_REL, SCRIPT),
             (GITATTRIBUTES_REL, super::TREE_GITATTRIBUTES),
+            (GITIGNORE_REL, super::coursier_tree::GITIGNORE),
             (SCRIPT_GITATTRIBUTES_REL, super::TREE_GITATTRIBUTES),
         ] {
             if rel == SCRIPT_GITATTRIBUTES_REL && hosted_left {
@@ -1459,15 +1469,10 @@ pub(crate) fn apply_line(t: &WiringTarget, kotlin: bool, prefix: &str) -> String
 /// DSL, counts (a user who reformatted the line keeps it, and a trailing
 /// comment such as a digest is ignored); one inside a comment does not.
 pub(crate) fn has_apply_line(text: &str, dsl: Dsl, t: &WiringTarget, prefix: &str) -> bool {
-    apply_line_token(text, dsl, t, prefix).is_some()
-}
-
-/// The `apply` token of the first live apply line of `t`'s script.
-fn apply_line_token(text: &str, dsl: Dsl, t: &WiringTarget, prefix: &str) -> Option<usize> {
     let path = format!("{prefix}{}", t.script_rel);
     let toks = dsl::tokens(text, dsl);
     (0..toks.len())
-        .find(|&i| {
+        .any(|i| {
             if !is_ident(toks.get(i), "apply") {
                 return false;
             }
@@ -1479,25 +1484,6 @@ fn apply_line_token(text: &str, dsl: Dsl, t: &WiringTarget, prefix: &str) -> Opt
                 && (is_punct(toks.get(j + 1), b':') || is_punct(toks.get(j + 1), b'='))
                 && matches!(toks.get(j + 2), Some(Token { tok: Tok::Str { value, .. }, .. }) if *value == path)
         })
-        .map(|i| toks[i].start)
-}
-
-/// `text` without the whole line holding the first live apply line of
-/// `t`'s script (whatever follows it on that line, e.g. an older digest).
-#[allow(dead_code)] // The hosted planner's digest rewrite.
-pub(crate) fn remove_apply_line(
-    text: &str,
-    dsl: Dsl,
-    t: &WiringTarget,
-    prefix: &str,
-) -> Option<String> {
-    let at = apply_line_token(text, dsl, t, prefix)?;
-    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
-    if !text[start..at].trim().is_empty() {
-        return None;
-    }
-    let end = text[at..].find('\n').map_or(text.len(), |i| at + i + 1);
-    Some(format!("{}{}", &text[..start], &text[end..]))
 }
 
 fn append_line(text: &str, line: &str) -> String {
@@ -2609,6 +2595,7 @@ mod tests {
                 (".socket/vendor/.gitattributes", false),
                 (".socket/vendor/gradle-index.tsv", false),
                 (".socket/vendor/gradle/.gitattributes", false),
+                (".socket/vendor/gradle/.gitignore", false),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar", true),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/gson-2.10.1.pom", true),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/socket-patch.vendor.json", true),
@@ -2638,6 +2625,7 @@ mod tests {
             text_of(&plan, ".socket/vendor/gradle/.gitattributes"),
             "* -text\n"
         );
+        assert_eq!(text_of(&plan, GITIGNORE_REL), "!*\n");
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
@@ -3873,7 +3861,7 @@ mod tests {
     }
 
     /// The vendored defaults keep the historic line; the hosted target's
-    /// digest comment is ignored by the match and cut with its line.
+    /// digest comment is ignored by the match.
     #[test]
     fn wiring_target_spells_and_finds_apply_lines() {
         let vendored = WiringTarget::vendored();
@@ -3895,10 +3883,6 @@ mod tests {
         let newer = hosted("fedcba9876543210");
         assert!(has_apply_line(&text, Dsl::Kotlin, &newer, ""));
         assert!(!has_apply_line(&text, Dsl::Kotlin, &vendored, ""));
-        assert_eq!(
-            remove_apply_line(&text, Dsl::Kotlin, &newer, "").as_deref(),
-            Some("rootProject.name = \"x\"\r\ninclude(\"a\")\r\n")
-        );
         assert!(newer.owns_repository("socketPatchHosted_abc"));
         assert!(!newer.owns_repository("socketPatchHostedX"));
         assert_eq!(remove_line("a\n  b  \nc\n", "b").as_deref(), Some("a\nc\n"));

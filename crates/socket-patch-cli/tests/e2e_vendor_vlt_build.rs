@@ -1236,11 +1236,16 @@ async fn dependency_left_lock(name: &'static str, step: &'static str) {
     let out = rescan(&["--prune"]);
     assert_eq!(out.code, 0, "{step}: --prune: {out}");
     let doc = out.json();
-    assert_eq!(
-        doc["gc"]["revertedVendoredEntries"],
-        json!([purl]),
-        "{step}: {doc:#}"
-    );
+    // The prune GC's reverts are `removed` / `vendor_reverted` events
+    // (v5.0's `gc.revertedVendoredEntries`).
+    let reverted: Vec<&Value> = doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["errorCode"] == "vendor_reverted")
+        .map(|e| &e["purl"])
+        .collect();
+    assert_eq!(reverted, vec![&json!(purl)], "{step}: {doc:#}");
     assert!(unwired(&doc).is_empty(), "{step}: {doc:#}");
     assert!(
         !uuid_dir(&fx.proj, fx.t()).exists(),

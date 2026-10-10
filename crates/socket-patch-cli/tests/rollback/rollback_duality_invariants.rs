@@ -206,18 +206,19 @@ fn default_rollback_removes_entry_and_sweeps_blobs() {
         "default rollback must succeed; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    crate::rollback_json::assert_rollback_envelope(&v);
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
-    assert_eq!(v["rolledBack"], 1);
-    assert_eq!(v["failed"], 0);
+    assert_eq!(v["summary"]["rolledBack"], 1);
+    assert_eq!(v["summary"]["failed"], 0);
+    assert_eq!(v["summary"]["removed"], 1, "the manifest entry left");
     assert_eq!(v["dryRun"], false);
 
     // Envelope: the entry left the manifest and the GC actually swept.
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        crate::rollback_json::manifest_removed(&v),
         serde_json::json!([fx.purl]),
         "stdout=\n{stdout}"
     );
-    assert_eq!(v["manifest"]["preserved"], false);
     assert_eq!(
         v["gc"]["removedBlobs"], 2,
         "both the before and after blob are orphaned by the removal; stdout=\n{stdout}"
@@ -290,20 +291,22 @@ fn preserve_state_keeps_everything() {
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
-    assert_eq!(v["rolledBack"], 1, "the file restore still happens");
     assert_eq!(
-        v["manifest"]["preserved"], true,
-        "envelope must flag the preserve; stdout=\n{stdout}"
+        v["summary"]["rolledBack"], 1,
+        "the file restore still happens"
     );
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        crate::rollback_json::manifest_removed(&v),
         serde_json::json!([]),
         "nothing leaves the manifest under --preserve-state; stdout=\n{stdout}"
     );
-    assert_eq!(
-        v["gc"],
-        serde_json::json!({ "skipped": true }),
+    assert!(
+        v.get("gc").is_none(),
         "GC is skipped wholesale, not run-with-zero-removals; stdout=\n{stdout}"
+    );
+    assert!(
+        !crate::rollback_json::warning_codes(&v).contains(&"gc_skipped".to_string()),
+        "--preserve-state never requested the GC; stdout=\n{stdout}"
     );
 
     // The system IS restored...
@@ -399,7 +402,7 @@ fn eco_scoped_run_pins_other_ecosystems_revert_data() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        crate::rollback_json::manifest_removed(&v),
         serde_json::json!([npm_purl]),
         "only the in-scope npm entry is removed; stdout=\n{stdout}"
     );
@@ -466,18 +469,18 @@ fn not_installed_entry_is_removed_with_pinned_blobs() {
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
-    assert_eq!(v["failed"], 0);
+    assert_eq!(v["summary"]["failed"], 0);
 
-    // The entry surfaces as the skipped marker, never a failure.
-    let results = v["results"].as_array().expect("results array");
-    assert_eq!(results.len(), 1, "stdout=\n{stdout}");
-    assert_eq!(results[0]["purl"], purl);
-    assert_eq!(results[0]["skipped"], "package_not_installed");
-    assert!(results[0]["path"].is_null());
+    // The entry surfaces as a `package_not_installed` skip, never a failure.
+    assert_eq!(
+        crate::rollback_json::not_installed(&v),
+        serde_json::json!([purl]),
+        "stdout=\n{stdout}"
+    );
 
     // Removed from the manifest...
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        crate::rollback_json::manifest_removed(&v),
         serde_json::json!([purl]),
         "stdout=\n{stdout}"
     );
@@ -643,13 +646,13 @@ fn path_scoped_rollback_selects_by_installed_path() {
         "the envelope echoes the pattern verbatim; stdout=\n{stdout}"
     );
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        crate::rollback_json::manifest_removed(&v),
         serde_json::json!([app_purl]),
         "only the in-scope entry is removed; stdout=\n{stdout}"
     );
     assert_eq!(
-        v["warnings"],
-        serde_json::json!([]),
+        crate::rollback_json::warning_codes(&v),
+        Vec::<String>::new(),
         "the restored copy is inside the pattern — no out_of_scope warning; \
          stdout=\n{stdout}"
     );
@@ -728,18 +731,18 @@ fn dry_run_mutates_nothing() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
     assert_eq!(v["dryRun"], true);
-    assert_eq!(v["rolledBack"], 0, "a dry run mutates nothing");
-    assert_eq!(v["failed"], 0);
+    assert_eq!(v["summary"]["rolledBack"], 0, "a dry run mutates nothing");
+    assert_eq!(v["summary"]["failed"], 0);
 
     // The preview REPORTS the full plan: would-be manifest removal and
     // would-be GC counts...
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        crate::rollback_json::manifest_removed(&v),
         serde_json::json!([fx.purl]),
         "dry-run previews the would-be removal; stdout=\n{stdout}"
     );
     assert!(
-        v["gc"].get("skipped").is_none(),
+        v["gc"].is_object(),
         "dry-run GC is a preview, not a skip; stdout=\n{stdout}"
     );
     assert_eq!(v["gc"]["removedBlobs"], 2, "stdout=\n{stdout}");
@@ -855,7 +858,7 @@ fn uuid_and_purl_targets_still_work() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        crate::rollback_json::manifest_removed(&v),
         serde_json::json!(["pkg:npm/dual-a@1.0.0"]),
         "exactly the uuid's entry is removed; stdout=\n{stdout}"
     );
@@ -894,7 +897,7 @@ fn uuid_and_purl_targets_still_work() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        crate::rollback_json::manifest_removed(&v),
         serde_json::json!(["pkg:npm/dual-b@1.0.0"]),
         "exactly the purl's entry is removed; stdout=\n{stdout}"
     );

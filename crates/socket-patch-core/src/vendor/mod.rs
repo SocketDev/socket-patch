@@ -63,6 +63,7 @@ pub mod cargo_tag;
 pub(crate) mod common;
 pub mod composer_lock;
 pub mod gem;
+pub mod go_consumer_sync;
 pub mod go_mod_edit;
 pub mod go_sum_edit;
 pub mod golang;
@@ -150,11 +151,18 @@ pub struct VendorWarning {
 }
 
 impl VendorWarning {
+    /// Every URL quoted in `detail` is redacted
+    /// ([`crate::utils::redact::redact_urls_in`]): a vendor warning lands in
+    /// `--json` events and CI logs, and the URLs it quotes (service grant
+    /// URLs, GOPROXY / `.npmrc` / private-index registries) carry
+    /// credentials.
     pub fn new(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            code,
-            detail: detail.into(),
-        }
+        let detail = detail.into();
+        let detail = match crate::utils::redact::redact_urls_in(&detail) {
+            std::borrow::Cow::Borrowed(_) => detail,
+            std::borrow::Cow::Owned(redacted) => redacted,
+        };
+        Self { code, detail }
     }
 }
 
@@ -194,6 +202,50 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
          (berry) migrates the lockfile and silently drops them — packages install unpatched \
          from the registry. Pin yarn classic (e.g. \"packageManager\": \"yarn@1.22.22\" in \
          package.json) so every install uses yarn 1.",
+    ))
+}
+
+/// Advisory probe (#691): does this yarn classic workspaces project carry
+/// vendored wiring that installs from a workspace member directory cannot
+/// fetch?
+///
+/// Vendored mode wires `resolved "file:./.socket/vendor/…"`, relative to
+/// the workspace root that holds `yarn.lock`. Yarn 1 resolves a relative
+/// `file:` tarball against the directory it runs in, so on a cold cache
+/// every `yarn install` / `yarn add` run from a member directory (and
+/// `yarn workspace <name> …`, which runs there) fails with "Tarball is not
+/// in network and can not be located in cache", whether or not the member
+/// depends on the patched package. No relative spelling works from both
+/// (measured on yarn 1.7.0, 1.10.1 and 1.22.22). Returns the warning when
+/// `yarn.lock` is classic with such a `file:./` resolution and the root
+/// `package.json` declares workspaces. State-based, like
+/// [`yarn_classic_berry_migration_risk`].
+pub fn yarn_classic_workspace_member_risk(project_root: &Path) -> Option<VendorWarning> {
+    let lock = read_regular_to_string_sync(&project_root.join("yarn.lock")).ok()?;
+    if !lock.contains("# yarn lockfile v1") || !lock.contains("\"file:./.socket/vendor/") {
+        return None;
+    }
+    let manifest = read_regular_to_string_sync(&project_root.join("package.json")).ok()?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(crate::formats::text::strip_bom(&manifest)).ok()?;
+    let workspaces = manifest.get("workspaces")?;
+    let globs = workspaces.as_array().or_else(|| {
+        workspaces
+            .get("packages")
+            .and_then(serde_json::Value::as_array)
+    })?;
+    if globs.is_empty() {
+        return None;
+    }
+    Some(VendorWarning::new(
+        "yarn_classic_workspace_member_install_risk",
+        "yarn.lock is yarn-classic (v1) in a workspaces project and its vendored entries \
+         resolve `file:./.socket/vendor/…` tarballs, which yarn 1 looks up relative to the \
+         directory it runs in: on a cold yarn cache, `yarn install`, `yarn add` or `yarn \
+         workspace <name> …` run from a workspace member directory fails (\"Tarball is not \
+         in network\"). Run `yarn install` from the workspace root (which also warms the \
+         cache for later member-directory commands), or patch this project with `--mode \
+         hosted`.",
     ))
 }
 
@@ -285,9 +337,9 @@ const ARCHIVE_PREFETCH_BYTES: usize = 128 * 1024 * 1024;
 
 impl VendorServiceConfig {
     /// Whether this run may actually attempt a service download right now:
-    /// the mode permits it, we're online, and a client is configured.
+    /// we're online and a client is configured.
     pub fn service_enabled(&self) -> bool {
-        self.source.may_use_service() && !self.offline && self.client.is_some()
+        !self.offline && self.client.is_some()
     }
 
     /// Whether a run through this config would prefetch service downloads
@@ -687,6 +739,12 @@ impl RevertOpts {
 /// time (the dependency was removed). See [`RevertOutcome::lock_entry_removed`].
 pub const LOCK_ENTRY_REMOVED_CODE: &str = "vendor_lock_entry_removed";
 
+/// A PyPI revert restored the wiring it recorded, but another project file
+/// (a `pipenv requirements` / `uv export` / `poetry export` requirements
+/// file, a moved vendor line) still installs from the vendored wheel, so
+/// the artifact and ledger entry are kept until nothing references them.
+pub const RESIDUAL_REFERENCE_CODE: &str = "vendor_revert_residual_reference";
+
 /// The result of one backend `revert_*` call.
 #[derive(Debug)]
 pub struct RevertOutcome {
@@ -760,6 +818,36 @@ impl RevertOutcome {
         self.warnings
             .iter()
             .any(|w| w.code == LOCK_ENTRY_REMOVED_CODE)
+    }
+
+    /// True when the artifact was kept ONLY because another project file
+    /// still references it ([`RESIDUAL_REFERENCE_CODE`]): the recorded
+    /// wiring was restored and nothing drifted, so the way out is to point
+    /// that file back at the registry release, not to undo a drift (#1184).
+    pub fn kept_for_residual_reference(&self) -> bool {
+        self.kept_artifact
+            && !self.drift_skipped()
+            && self
+                .warnings
+                .iter()
+                .any(|w| w.code == RESIDUAL_REFERENCE_CODE)
+    }
+
+    /// [`Self::keep_artifact`] for a residual-reference keep: the wiring
+    /// was restored, but a project file the revert does not own still
+    /// installs from `uuid_dir_rel` (named by the
+    /// [`RESIDUAL_REFERENCE_CODE`] warning).
+    pub fn keep_artifact_for_reference(&mut self, uuid_dir_rel: &str) {
+        self.kept_artifact = true;
+        self.warnings.push(VendorWarning::new(
+            "vendor_artifact_kept",
+            format!(
+                "kept {uuid_dir_rel}: the recorded wiring was restored, but a project file \
+                 still installs from it (see the vendor_revert_residual_reference warning); \
+                 point that file back at the registry release (or re-export it from the \
+                 restored lock) and re-run the revert to finish cleaning up"
+            ),
+        ));
     }
 
     /// Mark the artifact dir as deliberately kept after a drift-skip and
@@ -1916,6 +2004,28 @@ mod harvest_tests {
 }
 
 #[cfg(test)]
+mod vendor_warning_redaction_tests {
+    use super::*;
+
+    /// A vendor warning lands in `--json` events and CI logs: every URL its
+    /// detail quotes is redacted at construction, whoever builds it.
+    #[test]
+    fn a_vendor_warning_never_carries_a_credential() {
+        let w = VendorWarning::new(
+            "vendor_registry_fetch_failed",
+            "GET https://u:p@h.example/patch/npm/a/1.0.0/TOK/7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d/a.tgz: \
+             HTTP 404 (GOPROXY=https://proxy.golang.org,https://bot:ghp_X@goproxy.corp,direct)",
+        );
+        for needle in ["TOK", "u:p", "bot:ghp_X"] {
+            assert!(!w.detail.contains(needle), "{needle}: {}", w.detail);
+        }
+        assert!(w.detail.contains("HTTP 404"), "{}", w.detail);
+        let plain = VendorWarning::new("c", "no url here");
+        assert_eq!(plain.detail, "no url here");
+    }
+}
+
+#[cfg(test)]
 mod berry_migration_risk_tests {
     use super::*;
 
@@ -2030,6 +2140,46 @@ mod berry_migration_risk_tests {
         let fifo = tmp.path().join("package.json");
         super::harvest_tests::mkfifo(&fifo);
         assert!(probe_with_timeout(tmp.path(), &fifo).is_some());
+    }
+
+    /// #691: yarn 1 resolves a relative `file:` tarball in `resolved`
+    /// against the directory it runs in, not the one holding yarn.lock, so
+    /// in a workspaces project every cold-cache install run from a member
+    /// directory fails once vendoring wires one. Measured on yarn 1.7.0,
+    /// 1.10.1 and 1.22.22; no relative spelling installs from both.
+    #[test]
+    fn issue_691_wired_classic_workspaces_warn_about_member_dir_installs() {
+        for workspaces in [r#"["a","b"]"#, r#"{"packages":["packages/*"]}"#] {
+            let pkg = format!(r#"{{"name":"root","private":true,"workspaces":{workspaces}}}"#);
+            let tmp = project(Some(WIRED_V1), Some(&pkg));
+            let w = yarn_classic_workspace_member_risk(tmp.path()).expect("must warn");
+            assert_eq!(w.code, "yarn_classic_workspace_member_install_risk");
+            assert!(
+                w.detail.contains("member directory") && w.detail.contains("workspace root"),
+                "detail names the trap and the remedy: {}",
+                w.detail
+            );
+        }
+        // No workspaces, empty workspaces, an unwired or berry lock, or
+        // no manifest: nothing installs from a member directory through
+        // our wiring.
+        for (lock, pkg) in [
+            (Some(WIRED_V1), Some(r#"{"name":"x"}"#)),
+            (Some(WIRED_V1), Some(r#"{"name":"x","workspaces":[]}"#)),
+            (
+                Some(WIRED_V1),
+                Some(r#"{"name":"x","workspaces":{"packages":[]}}"#),
+            ),
+            (Some(WIRED_V1), None),
+            (Some(UNWIRED_V1), Some(r#"{"name":"x","workspaces":["a"]}"#)),
+            (None, Some(r#"{"name":"x","workspaces":["a"]}"#)),
+        ] {
+            let tmp = project(lock, pkg);
+            assert!(
+                yarn_classic_workspace_member_risk(tmp.path()).is_none(),
+                "{lock:?} {pkg:?}"
+            );
+        }
     }
 
     #[test]

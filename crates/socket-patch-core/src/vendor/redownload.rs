@@ -9,9 +9,7 @@ use crate::utils::purl::{
 
 use super::common::{copy_matches_after_hashes, swap_stage_into_place};
 use super::jvm::layout;
-use super::service_fetch::{
-    fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal, VerifiedArchive,
-};
+use super::service_fetch::{fetch_verified_archive, ServicePolicy, VerifiedArchive};
 use super::state::VendorEntry;
 use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -24,28 +22,19 @@ fn detail(outcome: VendorOutcome) -> String {
     }
 }
 
-fn used<T>(attempt: ServiceAttempt<T>) -> Result<T, String> {
-    match attempt {
-        ServiceAttempt::Used(value) => Ok(value),
-        ServiceAttempt::HardFail(outcome) => Err(detail(*outcome)),
-    }
-}
-
 async fn download_archive(
     service: &VendorServiceConfig,
     record: &PatchRecord,
     noun: &str,
     subject: &str,
-    warnings: &mut Vec<VendorWarning>,
 ) -> Result<VerifiedArchive, String> {
-    ServicePolicy::new(service, ServiceTerminal::Refused)
+    ServicePolicy::Refused
         .settle(
             fetch_verified_archive(service, &record.uuid).await,
             noun,
             subject,
-            warnings,
         )
-        .or_else(used)
+        .map_err(|outcome| detail(*outcome))
 }
 
 // Without the ledger's fingerprint no download can be proven to be the
@@ -139,7 +128,6 @@ pub async fn restore(
             record,
             "archive",
             &format!("archive for {}", entry.base_purl),
-            &mut warnings,
         )
         .await?;
         if entry.artifact.sha256.is_empty()
@@ -191,34 +179,32 @@ pub async fn restore(
             "cargo" => {
                 let (name, version) =
                     parse_cargo_purl(&entry.base_purl).ok_or("invalid cargo coordinates")?;
-                used(
-                    super::cargo::cargo_service_copy(
-                        Some(service),
-                        record,
-                        &name,
-                        &version,
-                        &stage,
-                        uuid_dir,
-                        &mut warnings,
-                    )
-                    .await,
-                )?;
+                super::cargo::cargo_service_copy(
+                    Some(service),
+                    record,
+                    &name,
+                    &version,
+                    &stage,
+                    uuid_dir,
+                    &mut warnings,
+                )
+                .await
+                .map_err(|outcome| detail(*outcome))?;
             }
             "composer" => {
                 let ((namespace, name), _) =
                     parse_composer_purl(&entry.base_purl).ok_or("invalid composer coordinates")?;
                 let package = format!("{namespace}/{name}");
-                used(
-                    super::composer_lock::composer_service_copy(
-                        Some(service),
-                        record,
-                        &package,
-                        &stage,
-                        uuid_dir,
-                        &mut warnings,
-                    )
-                    .await,
-                )?;
+                super::composer_lock::composer_service_copy(
+                    Some(service),
+                    record,
+                    &package,
+                    &stage,
+                    uuid_dir,
+                    &mut warnings,
+                )
+                .await
+                .map_err(|outcome| detail(*outcome))?;
                 super::composer_lock::mirror_filters::neutralize_or_conflict(
                     &stage,
                     record,
@@ -230,7 +216,7 @@ pub async fn restore(
             "gem" => {
                 let (name, _) =
                     parse_gem_purl(&entry.base_purl).ok_or("invalid gem coordinates")?;
-                match super::gem::gem_service_copy(
+                super::gem::gem_service_copy(
                     Some(service),
                     record,
                     &name,
@@ -240,26 +226,22 @@ pub async fn restore(
                     &mut warnings,
                 )
                 .await
-                {
-                    super::gem::GemServiceCopy::Used => {}
-                    super::gem::GemServiceCopy::HardFail(outcome) => return Err(detail(*outcome)),
-                }
+                .map_err(|outcome| detail(*outcome))?;
             }
             "npm" => {
                 let (name, version) = super::npm_common::parse_npm_purl(&entry.base_purl)
                     .ok_or("invalid npm coordinates")?;
-                used(
-                    super::npm_dir::try_service_dir(
-                        &entry.base_purl,
-                        record,
-                        service,
-                        &stage,
-                        &name,
-                        &version,
-                        &mut warnings,
-                    )
-                    .await,
-                )?;
+                super::npm_dir::try_service_dir(
+                    &entry.base_purl,
+                    record,
+                    service,
+                    &stage,
+                    &name,
+                    &version,
+                    &mut warnings,
+                )
+                .await
+                .map_err(|outcome| detail(*outcome))?;
                 super::npm_dir::apply_transforms(&stage, &name, &version)
                     .await
                     .map_err(|outcome| detail(*outcome))?;
@@ -272,7 +254,6 @@ pub async fn restore(
                     record,
                     "module zip",
                     &format!("module zip for {module}"),
-                    &mut warnings,
                 )
                 .await?;
                 let prefix = format!("{module}@{version}/");
@@ -544,7 +525,8 @@ async fn restore_maven_metadata(
 
 /// The owned files a Gradle tree needs beside its directory: the derived
 /// `maven-metadata.xml` (recomputed from the committed index) and the
-/// `.gitattributes` the entry created, rewritten when missing. Needs no
+/// `.gitattributes` / tree-root `.gitignore` the entry created, rewritten
+/// when missing. Needs no
 /// download, so `repair` also runs it for a healthy entry.
 pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result<(), String> {
     use super::jvm::gradle;
@@ -573,6 +555,17 @@ pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result
     for rel in [gradle::GITATTRIBUTES_REL, gradle::SCRIPT_GITATTRIBUTES_REL] {
         if created(rel) {
             wanted.push((rel.to_string(), "* -text\n".to_string()));
+        }
+    }
+    for rel in [
+        gradle::GITIGNORE_REL,
+        super::jvm::maven_reactor::GITIGNORE_REL,
+    ] {
+        if created(rel) {
+            wanted.push((
+                rel.to_string(),
+                super::jvm::coursier_tree::GITIGNORE.to_string(),
+            ));
         }
     }
     if created(gradle::VENDOR_GITATTRIBUTES_REL) {
@@ -641,28 +634,23 @@ mod tests {
 
     fn entry(bytes: &[u8]) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: "pkg:npm/example@1.0.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                path: format!(".socket/vendor/npm/{UUID}/example-1.0.0.tgz"),
-                sha256: hex::encode(Sha256::digest(bytes)),
-                size: Some(bytes.len() as u64),
-                platform_locked: None,
-                file_inventory: None,
-                yarn_berry10c0: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             detached: true,
             record: Some(record()),
             flavor: Some("npm".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                "pkg:npm/example@1.0.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    path: format!(".socket/vendor/npm/{UUID}/example-1.0.0.tgz"),
+                    sha256: hex::encode(Sha256::digest(bytes)),
+                    size: Some(bytes.len() as u64),
+                    platform_locked: None,
+                    file_inventory: None,
+                    yarn_berry10c0: None,
+                },
+                Vec::new(),
+            )
         }
     }
 

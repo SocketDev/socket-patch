@@ -12,11 +12,13 @@ mod listing;
 pub mod maven_crawler;
 #[cfg(test)]
 mod maven_pom_equivalence_tests;
+pub(crate) mod maven_scope;
 pub mod npm_crawler;
 pub mod nuget_crawler;
 #[cfg(test)]
 pub(crate) mod oracle_support;
 pub mod pkg_managers;
+pub(crate) mod pnpm_layout;
 pub mod python_crawler;
 pub mod ruby_crawler;
 pub mod sbt_evidence;

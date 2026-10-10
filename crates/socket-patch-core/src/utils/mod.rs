@@ -1,3 +1,4 @@
+pub mod cargo_build_cache;
 pub mod cargo_workspace;
 pub mod composer_version;
 pub mod concurrent;
@@ -7,6 +8,7 @@ pub(crate) mod durability;
 pub mod env_compat;
 pub mod failpoint;
 pub mod fs;
+pub(crate) mod go_env;
 pub mod group_commit;
 pub(crate) mod http;
 pub(crate) mod line_endings;
@@ -23,6 +25,7 @@ pub mod purl;
 pub mod purl_key;
 pub mod python_lock;
 pub mod python_script;
+pub mod redact;
 pub(crate) mod relpath;
 pub mod repo_root;
 pub(crate) mod requirements;
@@ -32,6 +35,7 @@ pub mod socket_dir;
 pub mod target;
 pub(crate) mod toml_edit_ext;
 pub mod uri;
+pub(crate) mod uv_workspace;
 pub(crate) mod workspace_globs;
 
 pub mod hatch;

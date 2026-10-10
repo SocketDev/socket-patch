@@ -540,7 +540,7 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
     });
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        env["summary"]["applied"], 1,
         "the member's dep must be redirected from a root scan: {env}"
     );
 

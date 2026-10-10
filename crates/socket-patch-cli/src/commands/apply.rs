@@ -1,7 +1,8 @@
 use clap::Args;
-use socket_patch_core::api::blob_fetcher::get_missing_blobs;
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
-use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
+use socket_patch_core::crawlers::ruby_crawler::{
+    config_path_ignored_warning, stale_plugin_registration_warning,
+};
 use socket_patch_core::crawlers::{
     bun_uses_global_store, detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler,
 };
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, is_local_go, GlobalArgs};
-use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome, StagedSources};
+use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
@@ -38,7 +39,7 @@ use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
     RunWarning, Status, VexSummary,
 };
-use crate::ui::{plural, StatusLine};
+use crate::ui::plural;
 
 /// Files whose pre-apply content matched NEITHER hash and were (or would
 /// be) overwritten with the verified patched content — the promoted
@@ -108,260 +109,6 @@ fn mismatch_overwrite_warnings(results: &[ApplyResult], dry_run: bool) -> Vec<Ru
                 })
         })
         .collect()
-}
-
-/// `1 mismatched file` / `2 mismatched files`, with the verb agreeing.
-fn mismatched_files_fail(n: usize) -> String {
-    if n == 1 {
-        "1 mismatched file will fail to apply".to_string()
-    } else {
-        format!("{n} mismatched files will fail to apply")
-    }
-}
-
-/// The default mismatch policy applies the FULL patched content for
-/// mismatched files — and the full content lives in the afterHash blob,
-/// which the default `--download-mode diff` may not have staged. Probe the
-/// in-scope packages for mismatches and fetch the missing afterHash blobs
-/// by hash (online only) so the apply below can fall through diff → blob.
-async fn ensure_blobs_for_mismatches(
-    args: &ApplyArgs,
-    manifest: &PatchManifest,
-    all_packages: &HashMap<String, Vec<PathBuf>>,
-    vendored_purls: &HashSet<PurlKey>,
-    staged: &mut StagedSources,
-    client: &ApiClient,
-) {
-    if args.common.strict && !args.force {
-        return; // strict fails on mismatch — nothing to fetch
-    }
-    let needed = mismatch_blob_gaps(
-        manifest,
-        all_packages,
-        vendored_purls,
-        &staged.blobs,
-        args.force,
-    )
-    .await;
-    if needed.is_empty() {
-        return;
-    }
-    let quiet = args.common.silent || args.common.json;
-    if args.common.offline {
-        if !quiet {
-            eprintln!(
-                "Warning: {} {} the full patched blob, but --offline prevents fetching; {}",
-                plural(
-                    needed.len(),
-                    "mismatched file needs",
-                    "mismatched files need"
-                ),
-                if needed.len() == 1 { "its" } else { "their" },
-                if needed.len() == 1 {
-                    "that file will fail to apply"
-                } else {
-                    "those files will fail to apply"
-                }
-            );
-        }
-        return;
-    }
-    // Apply is read-only against `.socket/`: when the stage step returned
-    // direct `.socket/` paths (everything had a local source), the on-demand
-    // blobs must go to a transient overlay, never `.socket/blobs/`.
-    let Some(blobs_path) = staged.writable_blobs().await else {
-        if !quiet {
-            eprintln!(
-                "Warning: could not stage a transient blob directory; {}",
-                mismatched_files_fail(needed.len())
-            );
-        }
-        return;
-    };
-    let mut status = StatusLine::stderr(args.common.json, args.common.silent);
-    status.set(format!(
-        "Downloading {} for mismatched files...",
-        plural(needed.len(), "full patched blob", "full patched blobs")
-    ));
-    let fetched = socket_patch_core::api::blob_fetcher::fetch_blobs_by_hash(
-        &needed, blobs_path, client, None,
-    )
-    .await;
-    status.finish_with(format_mismatch_fetch_result(
-        fetched.downloaded,
-        needed.len(),
-    ));
-}
-
-/// The result line after fetching full blobs for mismatched files.
-fn format_mismatch_fetch_result(downloaded: usize, needed: usize) -> String {
-    if downloaded == needed {
-        format!(
-            "Downloaded {} for mismatched files",
-            plural(needed, "full patched blob", "full patched blobs")
-        )
-    } else {
-        format!(
-            "Downloaded {downloaded} of {} for mismatched files",
-            plural(needed, "full patched blob", "full patched blobs")
-        )
-    }
-}
-
-/// Probe the crawled packages for `beforeHash` mismatches whose
-/// `afterHash` blob is not already staged, returning the missing blob
-/// hashes [`ensure_blobs_for_mismatches`] should fetch.
-///
-/// The crawler keys `all_packages` by BASE purl, but release-variant
-/// ecosystems (PyPI `?artifact_id=`, RubyGems `?platform=`, Maven
-/// `?classifier=&ext=`) key the manifest by QUALIFIED purls — an
-/// exact-key lookup misses every one of them. Match records by
-/// qualifier-stripped key, and probe only the variants the apply loop
-/// will actually attempt (its representative-file installed-distribution
-/// gate, bypassed by `--force`) so a skipped sibling variant's files
-/// don't trigger spurious fetches or `--offline` warnings. An UNQUALIFIED
-/// singleton base is always attempted (the mismatch-policy fall-through),
-/// so its mismatched files are probed unconditionally; a QUALIFIED
-/// singleton keeps the gate, mirroring the apply loop. Vendor-owned bases
-/// are skipped outright: the apply loop never attempts them (their
-/// results are synthesized up front), so their drifted files must not
-/// queue fetches either.
-///
-/// EVERY physical copy of a purl is probed: npm materializes genuine
-/// duplicates of one `name@version`, the apply loop patches each of them,
-/// and copies drift independently — a pristine (or already-patched) root
-/// copy says nothing about a locally-modified nested duplicate, whose
-/// mismatched files still need their afterHash blobs. The variant gate
-/// mirrors the apply loop's representative check PER COPY for gem and
-/// PyPI (which patch every copy, and two envs can hold different wheels
-/// of one release), and against the FIRST copy otherwise: a variant's
-/// files are probed only on the copies it is attempted on. Maven's Gradle
-/// copies are version dirs whose files sit in hash dirs, so each one is
-/// first expanded into the hash dirs holding the record's files (as
-/// `apply_maven_base` does) and gated and probed per hash dir; probing the
-/// version dir itself would only ever find nothing, and a drifted Gradle
-/// copy would never queue the afterHash blob its write needs.
-///
-/// Only a mismatched file whose afterHash blob is NOT staged can queue a
-/// fetch, so the probe first decides that with metadata probes alone and
-/// hashes only the files that can still matter: the common fully-cached
-/// run hashes nothing here (the apply loop re-verifies everything anyway).
-async fn mismatch_blob_gaps(
-    manifest: &PatchManifest,
-    all_packages: &HashMap<String, Vec<PathBuf>>,
-    vendored_purls: &HashSet<PurlKey>,
-    blobs_path: &Path,
-    force: bool,
-) -> HashSet<String> {
-    let mut needed: HashSet<String> = HashSet::new();
-    let missing = get_missing_blobs(manifest, blobs_path).await;
-    if missing.is_empty() {
-        return needed;
-    }
-    // A record can queue a fetch only through a content-modifying file
-    // (non-empty beforeHash) whose afterHash blob is missing.
-    let can_queue = |record: &PatchRecord| {
-        record
-            .files
-            .values()
-            .any(|f| !f.before_hash.is_empty() && missing.contains(&f.after_hash))
-    };
-    for (purl, pkg_paths) in all_packages {
-        let Some(first_path) = pkg_paths.first() else {
-            continue;
-        };
-        let variant_eco = Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
-        let stripped = strip_purl_qualifiers(purl);
-        let identity = PurlKey::new(purl);
-        let records: Vec<(&String, &PatchRecord)> = manifest
-            .patches
-            .iter()
-            .filter(|(key, _)| *key == purl || PurlKey::new(key) == identity)
-            .collect();
-        if purl_keys_cover(vendored_purls, purl)
-            || records
-                .iter()
-                .any(|(key, _)| purl_keys_cover(vendored_purls, key))
-        {
-            continue;
-        }
-        if !records.iter().any(|(_, record)| can_queue(record)) {
-            continue;
-        }
-        let gated = variant_eco
-            && !force
-            && (records.len() > 1
-                || records
-                    .first()
-                    .is_some_and(|(key, _)| key.as_str() != stripped));
-        let maven = Ecosystem::from_purl(purl) == Some(Ecosystem::Maven);
-        for (_, record) in records {
-            if !can_queue(record) {
-                continue;
-            }
-            // Maven: every Gradle version dir expanded into the hash dirs
-            // holding the record's files.
-            let expanded: Vec<PathBuf> = if maven {
-                pkg_paths
-                    .iter()
-                    .flat_map(|p| {
-                        socket_patch_core::crawlers::gradle_cache::installed_copies(
-                            p,
-                            &record.files,
-                        )
-                        .into_iter()
-                        .map(|(dir, _)| dir)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let pkg_paths: &[PathBuf] = if maven { &expanded } else { pkg_paths };
-            // The copies the apply loop gates per copy: gem and PyPI patch
-            // every copy, each against its own representative check, and
-            // Maven each hash dir; the rest gate on the first.
-            let gate_copies: &[PathBuf] = if matches!(
-                Ecosystem::from_purl(purl),
-                Some(Ecosystem::Gem | Ecosystem::Pypi | Ecosystem::Maven)
-            ) {
-                pkg_paths
-            } else {
-                std::slice::from_ref(first_path)
-            };
-            // Copies this variant is attempted on: a copy whose installed
-            // distribution is another variant (two envs can hold different
-            // wheels of one release) is skipped there by the apply loop.
-            let probe_copies: Vec<&PathBuf> = match representative_file(&record.files) {
-                Some((file_name, file_info)) if gated => {
-                    let mut matched = Vec::new();
-                    for copy in gate_copies {
-                        let status = verify_file_patch(copy, file_name, file_info).await.status;
-                        if variant_matches_installed(Some(&status)) {
-                            matched.push(copy);
-                        }
-                    }
-                    matched
-                }
-                _ => pkg_paths.iter().collect(),
-            };
-            if probe_copies.is_empty() {
-                continue;
-            }
-            for (file_name, info) in &record.files {
-                if info.before_hash.is_empty() || !missing.contains(&info.after_hash) {
-                    continue;
-                }
-                for pkg_path in &probe_copies {
-                    let verify = verify_file_patch(pkg_path, file_name, info).await;
-                    if verify.status == VerifyStatus::HashMismatch {
-                        needed.insert(info.after_hash.clone());
-                        break; // the fetch is per-hash; one drifted copy queues it
-                    }
-                }
-            }
-        }
-    }
-    needed
 }
 
 /// The mismatch policy this run applies with: `--force` ⊃ default
@@ -483,7 +230,6 @@ async fn try_local_go_apply(
             socket_patch_core::vendor::go_mod_edit::GO_PATCHES_DIR,
             &patch.files,
             sources,
-            Some(&patch.uuid),
             common.dry_run,
             policy,
         )
@@ -545,7 +291,16 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         // it vanished since (TOCTOU) → nothing to verify. An `Err` means it exists
         // but is unreadable/corrupt: fail-closed (report drift) rather than
         // silently passing — the guard treats exit 0 as "in sync".
-        Ok(None) => return 0,
+        Ok(None) => {
+            // Same answer as the no-manifest exit in `run`.
+            if args.common.json {
+                let mut env = Envelope::new(Command::Apply);
+                env.status = Status::NoManifest;
+                env.dry_run = args.common.dry_run;
+                println!("{}", env.to_pretty_json());
+            }
+            return 0;
+        }
         Err(e) => {
             let msg = format!(
                 "Patch check could not read the manifest ({e}); \
@@ -553,7 +308,10 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             );
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
-                env.mark_error(EnvelopeError::new("manifest_unreadable", msg));
+                env.dry_run = args.common.dry_run;
+                let mut err = crate::json_envelope::manifest_load_error(manifest_path, &e);
+                err.message = msg;
+                env.mark_error(err);
                 println!("{}", env.to_pretty_json());
             } else {
                 // Errors print even under --silent ("errors only", never
@@ -578,7 +336,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             .flatten()
             .collect();
     let vendored = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await
+        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
     } else {
         Default::default()
     };
@@ -607,6 +365,21 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                     };
                     drifts.push((id, "go_redirect_drift".to_string(), d.to_string()));
                 }
+            }
+            // The redirects can be intact while the project no longer
+            // builds: a committed vendor/modules.txt or the go.mod
+            // requirements out of step with them (#343, #618).
+            for issue in socket_patch_core::vendor::go_consumer_sync::audit(
+                &args.common.cwd,
+                &HashMap::new(),
+            )
+            .await
+            {
+                drifts.push((
+                    issue.module().to_string(),
+                    issue.code().to_string(),
+                    issue.to_string(),
+                ));
             }
         }
     }
@@ -676,7 +449,14 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             for (_, _, detail) in &drifts {
                 eprintln!("  {detail}");
             }
-            eprintln!("Run `socket-patch apply` to regenerate them.");
+            // A go consumer-sync drift names its own go command; apply
+            // cannot regenerate vendor/modules.txt or go.sum.
+            if drifts.iter().any(|(_, code, _)| {
+                code != socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
+                    && code != socket_patch_core::vendor::go_consumer_sync::REQUIREMENTS_CODE
+            }) {
+                eprintln!("{}", check_remedy(&args.common));
+            }
         }
         1
     }
@@ -842,6 +622,15 @@ fn record_check_skips(env: &mut Envelope, in_sync: &[String], not_installed: &[S
             ),
         );
     }
+}
+
+/// The last line of the `apply --check` drift report: the `apply` that heals
+/// it, with the check's own scope (`--cwd`, `--manifest-path`, `-g` /
+/// `--global-prefix`, `--ecosystems`). A bare `socket-patch apply` would
+/// act on another tree, exit 0 and leave the drift in place (#1219).
+fn check_remedy(common: &GlobalArgs) -> String {
+    let command = format!("socket-patch apply{}", crate::ui::scope_args(common));
+    format!("Run `{command}` to regenerate them.")
 }
 
 /// The `apply --check` success line: how many patches were checked, and how
@@ -1054,6 +843,22 @@ fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
 
 pub async fn run(args: ApplyArgs) -> i32 {
     apply_env_toggles(&args.common);
+    // `--vex` attests the manifest's project but this run patches `--cwd`'s
+    // installed copies: refuse a manifest in another project before
+    // anything is read (#745). `--check` never generates a document.
+    if !args.check {
+        if let Some(message) =
+            crate::commands::foreign_manifest_vex_conflict(&args.common, &args.vex, "apply")
+        {
+            return crate::json_envelope::usage_error(
+                Command::Apply,
+                args.common.json,
+                args.common.dry_run,
+                crate::commands::FOREIGN_MANIFEST_PROJECT,
+                &message,
+            );
+        }
+    }
     let manifest_path = args.common.resolved_manifest_path();
 
     // No manifest → nothing to apply: a clean exit-0 no-op (load-bearing
@@ -1271,9 +1076,9 @@ fn collect_apply_failures(
     }
     for purl in unresolved_purls(unmatched, lockfile_only) {
         failures.push(ApplyFailure {
-            purl,
             code: "package_not_installed".to_string(),
-            error: "No installed package matches this PURL".to_string(),
+            error: not_installed_detail(&purl).to_string(),
+            purl,
         });
     }
     failures
@@ -1307,14 +1112,20 @@ pub(crate) async fn run_locked(
         Ok(Some(m)) => m,
         Ok(None) => {
             lock.release();
-            let code = report_apply_failure(&args, "Invalid manifest", &telemetry).await;
-            return ApplyRunReport::run_failure(code, "apply_failed", "Invalid manifest");
+            let err = EnvelopeError::new(
+                "manifest_not_found",
+                format!("Manifest not found at {}", manifest_path.display()),
+            );
+            let code = report_apply_failure(&args, &err, &err.message, &telemetry).await;
+            return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
         Err(e) => {
             lock.release();
-            let error = e.to_string();
-            let code = report_apply_failure(&args, &error, &telemetry).await;
-            return ApplyRunReport::run_failure(code, "apply_failed", error);
+            // One manifest-load mapping for every command (#931):
+            // `manifest_invalid` / `manifest_unreadable`, never `apply_failed`.
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            let code = report_apply_failure(&args, &err, &e.to_string(), &telemetry).await;
+            return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
     };
 
@@ -1418,6 +1229,31 @@ pub(crate) async fn run_locked(
                         detail: format!("{}: {note}", normalize_purl(&r.package_key)),
                     })
             }));
+
+            // Cargo keys a registry / `cargo vendor` crate's compiled
+            // artifacts on its package id, never its source bytes: a
+            // project built before this apply would keep linking the
+            // pre-patch rlib (#387). Invalidate this project's compiled
+            // copies of every crate whose bytes just changed.
+            // The warnings also ride the report, for a nested caller's
+            // envelope (`scan` / `get`).
+            let mut cache_warnings: Vec<RunWarning> = Vec::new();
+            if !args.common.dry_run {
+                let rewritten = results.iter().filter(|r| {
+                    r.success
+                        && !r.files_patched.is_empty()
+                        && r.package_path != VENDOR_OWNED_MARKER
+                });
+                cache_warnings.extend(
+                    socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                        &args.common.cwd,
+                        rewritten.map(|r| r.package_key.as_str()),
+                    )
+                    .into_iter()
+                    .map(|(code, detail)| RunWarning { code, detail }),
+                );
+                run_warnings.extend(cache_warnings.iter().cloned());
+            }
 
             // Run-level advisories + best-effort fallback-home skips on the
             // human path: one gated stderr line each. `--silent` is
@@ -1540,7 +1376,7 @@ pub(crate) async fn run_locked(
                     let detail = if lockfile_only.contains(purl) {
                         LOCKFILE_ONLY_DETAIL
                     } else {
-                        "No installed package matches this PURL"
+                        not_installed_detail(purl)
                     };
                     env.record(
                         PatchEvent::new(PatchAction::Skipped, purl.clone())
@@ -1650,7 +1486,8 @@ pub(crate) async fn run_locked(
 
             // The mismatch overwrites, for a nested caller's envelope (the
             // JSON events above are the standalone apply's copy).
-            let warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
+            let mut warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
+            warnings.extend(cache_warnings);
             // A requested-but-failed VEX flips an otherwise-successful
             // apply to a non-zero exit (fail-the-command contract).
             if success && !vex_failed {
@@ -1700,7 +1537,8 @@ pub(crate) async fn run_locked(
         }
         Err(e) => {
             lock.release();
-            let code = report_apply_failure(&args, &e, &telemetry).await;
+            let err = EnvelopeError::new("apply_failed", e.clone());
+            let code = report_apply_failure(&args, &err, &e, &telemetry).await;
             ApplyRunReport::run_failure(code, "apply_failed", e)
         }
     }
@@ -1710,13 +1548,20 @@ pub(crate) async fn run_locked(
 /// envelope (`--json`) or an `Error:` line that prints even under
 /// `--silent` ("errors only", never "nothing" — exit 1 with no message
 /// would be undiagnosable), exit 1. Shared by the manifest read in `run`
-/// and `apply_patches_inner`'s `Err` arm.
-async fn report_apply_failure(args: &ApplyArgs, error: &str, telemetry: &TelemetryAuth) -> i32 {
+/// and `apply_patches_inner`'s `Err` arm. `err` is the `--json` error
+/// (`apply_failed`, or the manifest-load code); `error` is the plain text
+/// for telemetry and the human line.
+async fn report_apply_failure(
+    args: &ApplyArgs,
+    err: &EnvelopeError,
+    error: &str,
+    telemetry: &TelemetryAuth,
+) -> i32 {
     track_patch_apply_failed(error, args.common.dry_run, telemetry).await;
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;
-        env.mark_error(EnvelopeError::new("apply_failed", error.to_string()));
+        env.mark_error(err.clone());
         println!("{}", env.to_pretty_json());
     } else {
         eprintln!("Error: {}", crate::ui::sentence_case(error));
@@ -2121,8 +1966,7 @@ async fn apply_patches_inner(
         .patches
         .retain(|purl, _| target_manifest_purls.contains(purl));
 
-    let mut staged = match stage_patch_sources(&args.common, &manifest, &socket_dir, client).await?
-    {
+    let staged = match stage_patch_sources(&args.common, &manifest, &socket_dir, client).await? {
         StageOutcome::Ready(s) => s,
         StageOutcome::Unavailable => {
             return Ok(ApplyOutcome {
@@ -2152,8 +1996,7 @@ async fn apply_patches_inner(
         // `postinstall` hook runs `apply` on every install, including fresh
         // projects whose manifest has no matching patches yet. Decided
         // BEFORE the ledger read, gem discovery and the crawl — none of which
-        // can add work to an empty scope — but AFTER the staging above, which
-        // is where `--download-mode` is validated at runtime.
+        // can add work to an empty scope — but AFTER the staging above.
         if !args.common.silent && !args.common.json {
             println!("No patches to apply.");
         }
@@ -2180,7 +2023,7 @@ async fn apply_patches_inner(
     // and patches the global copy even when the cwd project vendors the
     // same purl (see `project_state_in_scope`).
     let vendored_purls = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await
+        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
     } else {
         Default::default()
     };
@@ -2227,7 +2070,18 @@ async fn apply_patches_inner(
             detail,
         });
     }
+    // A Bundler plugin registration v4's `setup` left in this checkout,
+    // pointing at a plugin dir the v5 migration deleted (#1295).
+    if gem_discovery.is_some() {
+        if let Some((code, detail)) = stale_plugin_registration_warning(&args.common.cwd).await {
+            run_warnings.push(RunWarning {
+                code: code.to_string(),
+                detail,
+            });
+        }
+    }
     let mut fallback_skips: Vec<FallbackHomeSkip> = Vec::new();
+    let mut go_pristine_mods: HashMap<String, PathBuf> = HashMap::new();
 
     // Multi-copy aware: npm nests genuine duplicates of one `name@version`
     // (nested dupes, diamonds, `file:` dups), so the resolver returns EVERY
@@ -2282,15 +2136,6 @@ async fn apply_patches_inner(
     }
 
     // Apply patches
-    ensure_blobs_for_mismatches(
-        args,
-        &manifest,
-        &all_packages,
-        &vendored_purls,
-        &mut staged,
-        client,
-    )
-    .await;
     let sources = staged.as_patch_sources();
     let policy = mismatch_policy(args.force, args.common.strict);
     let mut has_errors = false;
@@ -2509,7 +2354,6 @@ async fn apply_patches_inner(
                         pkg_path,
                         &patch.files,
                         &sources,
-                        Some(&patch.uuid),
                         args.common.dry_run,
                         policy,
                     )
@@ -2650,14 +2494,22 @@ async fn apply_patches_inner(
                     match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, policy)
                         .await
                     {
-                        Some(r) => r,
+                        Some(r) => {
+                            // The unpatched go.mod, so the consumer-sync
+                            // audit below can tell requirements the patch
+                            // added from ones upstream always had (#618).
+                            if let Some((module, _)) = parse_golang_purl(purl) {
+                                go_pristine_mods
+                                    .insert(module.into_owned(), pkg_path.join("go.mod"));
+                            }
+                            r
+                        }
                         None => {
                             apply_package_patch(
                                 purl,
                                 pkg_path,
                                 &patch.files,
                                 &sources,
-                                Some(&patch.uuid),
                                 args.common.dry_run,
                                 policy,
                             )
@@ -2722,10 +2574,28 @@ async fn apply_patches_inner(
         for purl in &unresolved {
             eprintln!("  - {}", normalize_purl(purl));
         }
+        if let Some(line) = cargo_fetch_hint(&unresolved) {
+            eprintln!("{line}");
+        }
     }
     print_lockfile_only_note(args, &unmatched, &lockfile_only);
 
     // The human summary is printed by `run`, after the per-package list.
+
+    // A redirect leaves the project building only if its committed
+    // `vendor/modules.txt` and its go.mod requirements still agree with the
+    // `replace` directives (#343, #618): name the regeneration step.
+    if !args.common.dry_run && eco_in_local_scope(&args.common, Ecosystem::Golang) {
+        run_warnings.extend(
+            socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+                &args.common.cwd,
+                &go_pristine_mods,
+            )
+            .await
+            .into_iter()
+            .map(|(code, detail)| RunWarning { code, detail }),
+        );
+    }
 
     // Note: `apply` deliberately does NOT garbage-collect unused blobs in
     // `.socket/`. GC is the responsibility of `socket-patch repair` /
@@ -3086,7 +2956,6 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                     &dir,
                     &files,
                     m.sources,
-                    Some(&patch.uuid),
                     args.common.dry_run,
                     m.policy,
                 )
@@ -3107,7 +2976,6 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                     copy,
                     &absent,
                     m.sources,
-                    Some(&patch.uuid),
                     args.common.dry_run,
                     m.policy,
                 )
@@ -3270,7 +3138,8 @@ const LOCKFILE_ONLY_DETAIL: &str =
 /// `@esbuild/<os>-<cpu>`), a devDependency under `npm ci --omit=dev`. The
 /// tree is in its correct end state, so they are calm skips, as `scan
 /// --mode agent` treats lockfile-only packages. Global runs have no project
-/// lock, so nothing is lockfile-resolved there.
+/// lock, so nothing is lockfile-resolved there, and neither is a Cargo
+/// crate ([`lock_resolution_is_calm`]).
 async fn lockfile_resolved(common: &GlobalArgs, unmatched: &[String]) -> HashSet<String> {
     if unmatched.is_empty() || common.is_global() {
         return HashSet::new();
@@ -3280,10 +3149,35 @@ async fn lockfile_resolved(common: &GlobalArgs, unmatched: &[String]) -> HashSet
     let lock_purls: HashSet<PurlKey> = entries.iter().map(|e| PurlKey::new(&e.purl)).collect();
     unmatched
         .iter()
-        .filter(|p| lock_purls.contains(&PurlKey::new(p)))
+        .filter(|p| lock_resolution_is_calm(p) && lock_purls.contains(&PurlKey::new(p)))
         .cloned()
         .collect()
 }
+
+/// Whether a lock-resolved but uninstalled `purl` can be a calm skip.
+/// Not for Cargo (#616): cargo leaves no locked crate out on purpose —
+/// `cargo fetch` unpacks every `Cargo.lock` entry, target-gated ones
+/// included — so a locked crate missing from `$CARGO_HOME/registry/src`
+/// was just not fetched yet (a cold CI cache, a pruned `registry/src`),
+/// and the next `cargo build` downloads or re-extracts it UNPATCHED.
+fn lock_resolution_is_calm(purl: &str) -> bool {
+    Ecosystem::from_purl(purl) != Some(Ecosystem::Cargo)
+}
+
+/// The `package_not_installed` detail of an unmatched purl the lock does
+/// not calmly account for: Cargo's carries the `cargo fetch` remedy.
+fn not_installed_detail(purl: &str) -> &'static str {
+    if Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo) {
+        CARGO_NOT_FETCHED_DETAIL
+    } else {
+        "No installed package matches this PURL"
+    }
+}
+
+/// [`not_installed_detail`] for a Cargo crate.
+const CARGO_NOT_FETCHED_DETAIL: &str =
+    "No unpacked crate source matches this PURL; run `cargo fetch` first so the crate is in \
+     the Cargo registry cache, then re-run apply";
 
 /// The `unmatched` purls with no lock evidence (sorted input, sorted
 /// output): the ones that can still fail an all-miss run.
@@ -3345,7 +3239,22 @@ fn format_none_installed_error(unmatched: &[String]) -> Vec<String> {
         "Check that the packages are installed and --cwd points to the right directory."
             .to_string(),
     );
+    if let Some(line) = cargo_fetch_hint(unmatched) {
+        lines.push(line.to_string());
+    }
     lines
+}
+
+/// The `cargo fetch` remedy line when any of `unmatched` is a Cargo crate
+/// (#616): cargo unpacks locked crates only when it fetches or builds.
+fn cargo_fetch_hint(unmatched: &[String]) -> Option<&'static str> {
+    unmatched
+        .iter()
+        .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
+        .then_some(
+            "Cargo crates are patched in the registry cache: run `cargo fetch` first so every \
+             locked crate is unpacked there, then re-run apply.",
+        )
 }
 
 #[cfg(test)]
@@ -3372,7 +3281,7 @@ mod tests {
     /// verified file. Used as the base for action-routing tests.
     fn sample_applied(status: VerifyStatus) -> ApplyResult {
         let mut applied_via = HashMap::new();
-        applied_via.insert("package/index.js".to_string(), CoreAppliedVia::Diff);
+        applied_via.insert("package/index.js".to_string(), CoreAppliedVia::Blob);
         ApplyResult {
             package_key: "pkg:npm/minimist@1.2.2".to_string(),
             package_path: "/tmp/node_modules/minimist".to_string(),
@@ -3446,14 +3355,14 @@ mod tests {
         assert_eq!(files[0]["path"], "package/index.js");
         assert_eq!(files[0]["verified"], true);
         // `appliedVia` is camelCase + lowercase tag — contract value.
-        assert_eq!(files[0]["appliedVia"], "diff");
+        assert_eq!(files[0]["appliedVia"], "blob");
     }
 
     #[test]
     fn applied_event_emits_one_file_entry_per_patched_file() {
         let mut applied_via = HashMap::new();
-        applied_via.insert("package/a.js".to_string(), CoreAppliedVia::Diff);
-        applied_via.insert("package/b.js".to_string(), CoreAppliedVia::Diff);
+        applied_via.insert("package/a.js".to_string(), CoreAppliedVia::Blob);
+        applied_via.insert("package/b.js".to_string(), CoreAppliedVia::Blob);
         applied_via.insert("package/c.js".to_string(), CoreAppliedVia::Blob);
         let result = ApplyResult {
             package_key: "pkg:npm/foo@1.0.0".to_string(),
@@ -3479,8 +3388,8 @@ mod tests {
             .iter()
             .map(|f| (f["path"].as_str().unwrap().to_string(), f))
             .collect();
-        assert_eq!(by_path["package/a.js"]["appliedVia"], "diff");
-        assert_eq!(by_path["package/b.js"]["appliedVia"], "diff");
+        assert_eq!(by_path["package/a.js"]["appliedVia"], "blob");
+        assert_eq!(by_path["package/b.js"]["appliedVia"], "blob");
         assert_eq!(by_path["package/c.js"]["appliedVia"], "blob");
     }
 
@@ -3617,573 +3526,6 @@ mod tests {
                  pick selected the new file instead of the discriminating one"
             );
         }
-    }
-
-    /// One-record manifest fixture for the `mismatch_blob_gaps` tests.
-    fn manifest_with_record(key: &str, files: HashMap<String, PatchFileInfo>) -> PatchManifest {
-        let mut manifest = PatchManifest::new();
-        manifest.patches.insert(
-            key.to_string(),
-            PatchRecord {
-                uuid: "11111111-1111-4111-8111-111111111111".to_string(),
-                exported_at: "2024-01-01T00:00:00Z".to_string(),
-                files,
-                vulnerabilities: HashMap::new(),
-                description: "fixture".to_string(),
-                license: "MIT".to_string(),
-                tier: "free".to_string(),
-            },
-        );
-        manifest
-    }
-
-    /// Regression: release-variant ecosystems key the manifest by
-    /// QUALIFIED purl (`?artifact_id=`…) while the crawler keys
-    /// `all_packages` by BASE purl, so the exact-key lookup in the
-    /// mismatch-blob probe missed every PyPI/Gem/Maven record — the
-    /// afterHash blobs that the default (Warn) mismatch policy needs were
-    /// never prefetched, and a locally-modified file in a variant package
-    /// failed to apply under the default diff download mode instead of
-    /// being warn-overwritten.
-    #[tokio::test]
-    async fn mismatch_blob_gaps_matches_qualified_variant_keys() {
-        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-
-        let dir = tempfile::tempdir().unwrap();
-        let pkg = dir.path().join("pkg");
-        tokio::fs::create_dir_all(&pkg).await.unwrap();
-        // Representative file (lex-smallest, non-empty beforeHash) matches
-        // the installed distribution, so the apply loop WILL attempt this
-        // variant...
-        tokio::fs::write(pkg.join("aaa.py"), b"pristine\n")
-            .await
-            .unwrap();
-        // ...but a second file was locally modified: under the default
-        // Warn policy it is overwritten with the full afterHash blob, so
-        // that blob must be prefetched.
-        tokio::fs::write(pkg.join("zzz.py"), b"locally modified\n")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-
-        let mut files = HashMap::new();
-        files.insert(
-            "aaa.py".to_string(),
-            PatchFileInfo {
-                before_hash: compute_git_sha256_from_bytes(b"pristine\n"),
-                after_hash: "1".repeat(64),
-            },
-        );
-        files.insert(
-            "zzz.py".to_string(),
-            PatchFileInfo {
-                before_hash: "2".repeat(64),
-                after_hash: "3".repeat(64),
-            },
-        );
-        let manifest = manifest_with_record(
-            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0-py3-none-any.whl",
-            files,
-        );
-        let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), vec![pkg.clone()]);
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert_eq!(
-            needed,
-            HashSet::from(["3".repeat(64)]),
-            "the qualified variant's mismatched file must have its afterHash blob queued"
-        );
-    }
-
-    /// A Maven GAV in two caches: only the second (Coursier) copy holds the
-    /// classifier jar, with a locally modified sibling file. The variant
-    /// gate runs per copy, as the apply loop attempts it per copy, so the
-    /// sibling's afterHash blob is queued although the first copy lacks the
-    /// classifier.
-    #[tokio::test]
-    async fn mismatch_blob_gaps_gates_each_maven_copy() {
-        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-
-        let dir = tempfile::tempdir().unwrap();
-        let m2 = dir.path().join("m2/g/a/1");
-        let csr = dir.path().join("csr/https/h/g/a/1");
-        for copy in [&m2, &csr] {
-            tokio::fs::create_dir_all(copy).await.unwrap();
-            tokio::fs::write(copy.join("a-1.jar"), b"jar\n")
-                .await
-                .unwrap();
-        }
-        tokio::fs::write(csr.join("a-1-tests.jar"), b"tests\n")
-            .await
-            .unwrap();
-        tokio::fs::write(csr.join("z-tests.txt"), b"locally modified\n")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-        let mut base = HashMap::new();
-        base.insert(
-            "a-1.jar".to_string(),
-            PatchFileInfo {
-                before_hash: compute_git_sha256_from_bytes(b"jar\n"),
-                after_hash: "1".repeat(64),
-            },
-        );
-        let mut manifest = manifest_with_record("pkg:maven/g/a@1", base);
-        let mut tests = HashMap::new();
-        tests.insert(
-            "a-1-tests.jar".to_string(),
-            PatchFileInfo {
-                before_hash: compute_git_sha256_from_bytes(b"tests\n"),
-                after_hash: "2".repeat(64),
-            },
-        );
-        tests.insert(
-            "z-tests.txt".to_string(),
-            PatchFileInfo {
-                before_hash: compute_git_sha256_from_bytes(b"pristine\n"),
-                after_hash: "3".repeat(64),
-            },
-        );
-        manifest.patches.insert(
-            "pkg:maven/g/a@1?classifier=tests".to_string(),
-            PatchRecord {
-                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
-                exported_at: "2024-01-01T00:00:00Z".to_string(),
-                files: tests,
-                vulnerabilities: HashMap::new(),
-                description: "fixture".to_string(),
-                license: "MIT".to_string(),
-                tier: "free".to_string(),
-            },
-        );
-        let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:maven/g/a@1".to_string(), vec![m2.clone(), csr.clone()]);
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert_eq!(needed, HashSet::from(["3".repeat(64)]));
-    }
-
-    /// The counterpart guard: a sibling variant that does NOT describe the
-    /// installed distribution (its representative file mismatches) is
-    /// skipped by the apply loop, so its blobs must not be queued — that
-    /// would mean spurious downloads and spurious `--offline` "will fail
-    /// to apply" warnings on every run. An unqualified singleton is
-    /// always attempted (see the singleton test below), so the group
-    /// carries an installed wheel sibling alongside the non-installed
-    /// sdist. Under `--force` every variant IS attempted, so then its
-    /// blob must be queued.
-    #[tokio::test]
-    async fn mismatch_blob_gaps_skips_non_installed_variant_unless_forced() {
-        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-
-        let dir = tempfile::tempdir().unwrap();
-        let pkg = dir.path().join("pkg");
-        tokio::fs::create_dir_all(&pkg).await.unwrap();
-        tokio::fs::write(pkg.join("aaa.py"), b"pristine\n")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-
-        // Installed wheel variant: representative matches the on-disk
-        // bytes (Ready — no mismatch, so nothing to queue for it).
-        let mut wheel_files = HashMap::new();
-        wheel_files.insert(
-            "aaa.py".to_string(),
-            PatchFileInfo {
-                before_hash: compute_git_sha256_from_bytes(b"pristine\n"),
-                after_hash: "1".repeat(64),
-            },
-        );
-        let mut manifest = manifest_with_record(
-            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0-py3-none-any.whl",
-            wheel_files,
-        );
-        // The sdist sibling's only file has a different base than the
-        // on-disk bytes: representative mismatch → not installed.
-        let mut sdist_files = HashMap::new();
-        sdist_files.insert(
-            "aaa.py".to_string(),
-            PatchFileInfo {
-                before_hash: "4".repeat(64),
-                after_hash: "5".repeat(64),
-            },
-        );
-        manifest.patches.insert(
-            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0.tar.gz".to_string(),
-            PatchRecord {
-                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
-                exported_at: "2024-01-01T00:00:00Z".to_string(),
-                files: sdist_files,
-                vulnerabilities: HashMap::new(),
-                description: "fixture".to_string(),
-                license: "MIT".to_string(),
-                tier: "free".to_string(),
-            },
-        );
-        let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), vec![pkg.clone()]);
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert!(
-            needed.is_empty(),
-            "a non-installed sibling variant is never attempted, so its blobs must not be queued: {needed:?}"
-        );
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, true).await;
-        assert_eq!(
-            needed,
-            HashSet::from(["5".repeat(64)]),
-            "--force attempts every variant, so the mismatch blob is needed"
-        );
-    }
-
-    /// An UNQUALIFIED singleton release-variant base is always attempted
-    /// by the apply loop (the mismatch-policy fall-through: it names no
-    /// distribution, so a mismatch means locally-modified bytes), so its
-    /// mismatched file's afterHash blob must be queued even though the
-    /// representative file mismatches — otherwise the default Warn policy
-    /// has no bytes to overwrite with under `--download-mode diff` and
-    /// the apply fails instead of warn-overwriting.
-    #[tokio::test]
-    async fn mismatch_blob_gaps_singleton_mismatch_queued() {
-        let dir = tempfile::tempdir().unwrap();
-        let pkg = dir.path().join("pkg");
-        tokio::fs::create_dir_all(&pkg).await.unwrap();
-        tokio::fs::write(pkg.join("aaa.rb"), b"locally modified\n")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-
-        let mut files = HashMap::new();
-        files.insert(
-            "aaa.rb".to_string(),
-            PatchFileInfo {
-                before_hash: "4".repeat(64),
-                after_hash: "5".repeat(64),
-            },
-        );
-        let manifest = manifest_with_record("pkg:gem/foo@1.0.0", files);
-        let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), vec![pkg.clone()]);
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert_eq!(
-            needed,
-            HashSet::from(["5".repeat(64)]),
-            "a singleton base falls through to the mismatch policy, so its blob is needed"
-        );
-    }
-
-    /// #646 review: a Gradle copy is a `files-2.1` version dir whose files
-    /// sit one level down in `<sha1>/` hash dirs. A drifted jar there (not
-    /// pristine, not the record's beforeHash) must queue its afterHash
-    /// blob as a drifted `~/.m2` copy does: the default Warn policy
-    /// overwrites it with the full blob.
-    #[tokio::test]
-    async fn mismatch_blob_gaps_probes_gradle_hash_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let version = dir
-            .path()
-            .join(".gradle/caches/modules-2/files-2.1/com.example/victim/1.0");
-        let hash = version.join("0123456789abcdef0123456789abcdef01234567");
-        tokio::fs::create_dir_all(&hash).await.unwrap();
-        tokio::fs::write(hash.join("victim-1.0.jar"), b"older patch bytes")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-        let mut files = HashMap::new();
-        files.insert(
-            "package/victim-1.0.jar".to_string(),
-            PatchFileInfo {
-                before_hash: "4".repeat(64),
-                after_hash: "5".repeat(64),
-            },
-        );
-        let manifest = manifest_with_record("pkg:maven/com.example/victim@1.0", files);
-        let mut all_packages = HashMap::new();
-        all_packages.insert(
-            "pkg:maven/com.example/victim@1.0".to_string(),
-            vec![version.clone()],
-        );
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert_eq!(needed, HashSet::from(["5".repeat(64)]));
-    }
-
-    /// A QUALIFIED singleton (`?platform=`…) keeps the
-    /// installed-distribution gate — it names one specific distribution,
-    /// and the apply loop skips it when the representative file
-    /// mismatches (the crawler drops the gem dir's platform suffix, so
-    /// this hash check is the only platform resolution). Its blobs must
-    /// not be queued: that would mean spurious downloads and spurious
-    /// `--offline` warnings for a variant the loop never attempts. Under
-    /// `--force` it IS attempted, so then the blob is needed.
-    #[tokio::test]
-    async fn mismatch_blob_gaps_qualified_singleton_gated_unless_forced() {
-        let dir = tempfile::tempdir().unwrap();
-        let pkg = dir.path().join("pkg");
-        tokio::fs::create_dir_all(&pkg).await.unwrap();
-        tokio::fs::write(pkg.join("aaa.rb"), b"darwin bytes\n")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-
-        let mut files = HashMap::new();
-        files.insert(
-            "aaa.rb".to_string(),
-            PatchFileInfo {
-                before_hash: "4".repeat(64),
-                after_hash: "5".repeat(64),
-            },
-        );
-        let manifest = manifest_with_record("pkg:gem/foo@1.0.0?platform=x86_64-linux", files);
-        let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), vec![pkg.clone()]);
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert!(
-            needed.is_empty(),
-            "a qualified singleton whose distribution is not on disk is never attempted, \
-             so its blobs must not be queued: {needed:?}"
-        );
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, true).await;
-        assert_eq!(
-            needed,
-            HashSet::from(["5".repeat(64)]),
-            "--force attempts the qualified singleton, so the mismatch blob is needed"
-        );
-    }
-
-    /// A vendor-owned base is unconditionally skipped by the apply loop
-    /// (its result is synthesized up front), so its drifted installed
-    /// files must not queue blobs — that meant a spurious "Downloading N
-    /// full patched blob(s)" fetch online and a spurious "will fail to
-    /// apply" warning under `--offline` for a package apply never
-    /// touches. The same fixture queues without the vendor claim
-    /// (anti-vacuity: the mismatch is real).
-    #[tokio::test]
-    async fn mismatch_blob_gaps_vendored_base_never_queued() {
-        let dir = tempfile::tempdir().unwrap();
-        let pkg = dir.path().join("pkg");
-        tokio::fs::create_dir_all(&pkg).await.unwrap();
-        tokio::fs::write(pkg.join("aaa.rb"), b"drifted\n")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-
-        let mut files = HashMap::new();
-        files.insert(
-            "aaa.rb".to_string(),
-            PatchFileInfo {
-                before_hash: "4".repeat(64),
-                after_hash: "5".repeat(64),
-            },
-        );
-        let manifest = manifest_with_record("pkg:gem/foo@1.0.0", files);
-        let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), vec![pkg.clone()]);
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert_eq!(
-            needed,
-            HashSet::from(["5".repeat(64)]),
-            "without a vendor claim the drifted singleton must queue (fixture sanity)"
-        );
-
-        let vendored = HashSet::from([PurlKey::new("pkg:gem/foo@1.0.0")]);
-        let needed = mismatch_blob_gaps(&manifest, &all_packages, &vendored, &blobs, false).await;
-        assert!(
-            needed.is_empty(),
-            "a vendor-owned base is never attempted, so its blobs must not be queued: {needed:?}"
-        );
-
-        let needed = mismatch_blob_gaps(&manifest, &all_packages, &vendored, &blobs, true).await;
-        assert!(
-            needed.is_empty(),
-            "--force does not override vendor ownership in the apply loop, so nothing is queued: {needed:?}"
-        );
-    }
-
-    /// Exact-key (npm-shaped) probing keeps working: unqualified manifest
-    /// keys match the crawled purl directly, with no installed-variant
-    /// gate (the npm branch always attempts).
-    #[tokio::test]
-    async fn mismatch_blob_gaps_exact_key_still_probed() {
-        let dir = tempfile::tempdir().unwrap();
-        let pkg = dir.path().join("pkg");
-        tokio::fs::create_dir_all(&pkg).await.unwrap();
-        tokio::fs::write(pkg.join("index.js"), b"locally modified\n")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-
-        let mut files = HashMap::new();
-        files.insert(
-            "package/index.js".to_string(),
-            PatchFileInfo {
-                before_hash: "6".repeat(64),
-                after_hash: "7".repeat(64),
-            },
-        );
-        let manifest = manifest_with_record("pkg:npm/foo@1.0.0", files);
-        let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:npm/foo@1.0.0".to_string(), vec![pkg.clone()]);
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert_eq!(needed, HashSet::from(["7".repeat(64)]));
-    }
-
-    /// Regression (multi-copy): npm materializes genuine duplicates of one
-    /// `name@version` and the apply loop patches every copy, so the probe
-    /// must scan every copy too — copies drift independently. Before the
-    /// fix only the FIRST copy was probed: a clean root copy masked a
-    /// locally-modified nested duplicate, its afterHash blob was never
-    /// queued, and the nested copy failed to apply under the default
-    /// warn-and-overwrite policy in diff download mode.
-    #[tokio::test]
-    async fn mismatch_blob_gaps_probes_every_copy() {
-        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-
-        let dir = tempfile::tempdir().unwrap();
-        // First copy: pristine (matches beforeHash — no blob needed).
-        let root_copy = dir.path().join("root");
-        tokio::fs::create_dir_all(&root_copy).await.unwrap();
-        tokio::fs::write(root_copy.join("index.js"), b"pristine\n")
-            .await
-            .unwrap();
-        // Second copy: locally modified (matches neither hash).
-        let nested_copy = dir.path().join("nested");
-        tokio::fs::create_dir_all(&nested_copy).await.unwrap();
-        tokio::fs::write(nested_copy.join("index.js"), b"locally modified\n")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-
-        let mut files = HashMap::new();
-        files.insert(
-            "package/index.js".to_string(),
-            PatchFileInfo {
-                before_hash: compute_git_sha256_from_bytes(b"pristine\n"),
-                after_hash: "8".repeat(64),
-            },
-        );
-        let manifest = manifest_with_record("pkg:npm/foo@1.0.0", files);
-        let mut all_packages = HashMap::new();
-        all_packages.insert(
-            "pkg:npm/foo@1.0.0".to_string(),
-            vec![root_copy.clone(), nested_copy.clone()],
-        );
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert_eq!(
-            needed,
-            HashSet::from(["8".repeat(64)]),
-            "the drifted second copy must queue the blob even though the first copy is clean"
-        );
-    }
-
-    /// Regression (#538 review): two PyPI copies of one release holding
-    /// DIFFERENT wheels. The apply loop gates each variant per copy, so the
-    /// variant installed only in the SECOND copy is attempted there; its
-    /// locally-modified non-representative file needs the full afterHash
-    /// blob. Gating against the first copy alone skipped that variant and
-    /// left the blob unfetched, so warn-and-apply failed on the second copy.
-    #[tokio::test]
-    async fn mismatch_blob_gaps_gates_pypi_variants_per_copy() {
-        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-
-        let dir = tempfile::tempdir().unwrap();
-        // Copy A: the wheel's distribution, pristine.
-        let copy_a = dir.path().join("a");
-        tokio::fs::create_dir_all(&copy_a).await.unwrap();
-        tokio::fs::write(copy_a.join("aaa.py"), b"wheel\n")
-            .await
-            .unwrap();
-        // Copy B: the sdist's distribution, with a locally modified
-        // non-representative file.
-        let copy_b = dir.path().join("b");
-        tokio::fs::create_dir_all(&copy_b).await.unwrap();
-        tokio::fs::write(copy_b.join("aaa.py"), b"sdist\n")
-            .await
-            .unwrap();
-        tokio::fs::write(copy_b.join("zzz.py"), b"locally modified\n")
-            .await
-            .unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-
-        let mut wheel_files = HashMap::new();
-        wheel_files.insert(
-            "aaa.py".to_string(),
-            PatchFileInfo {
-                before_hash: compute_git_sha256_from_bytes(b"wheel\n"),
-                after_hash: "1".repeat(64),
-            },
-        );
-        let mut manifest = manifest_with_record(
-            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0-py3-none-any.whl",
-            wheel_files,
-        );
-        let mut sdist_files = HashMap::new();
-        sdist_files.insert(
-            "aaa.py".to_string(),
-            PatchFileInfo {
-                before_hash: compute_git_sha256_from_bytes(b"sdist\n"),
-                after_hash: "2".repeat(64),
-            },
-        );
-        sdist_files.insert(
-            "zzz.py".to_string(),
-            PatchFileInfo {
-                before_hash: "3".repeat(64),
-                after_hash: "4".repeat(64),
-            },
-        );
-        manifest.patches.insert(
-            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0.tar.gz".to_string(),
-            PatchRecord {
-                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
-                exported_at: "2024-01-01T00:00:00Z".to_string(),
-                files: sdist_files,
-                vulnerabilities: HashMap::new(),
-                description: "fixture".to_string(),
-                license: "MIT".to_string(),
-                tier: "free".to_string(),
-            },
-        );
-        let mut all_packages = HashMap::new();
-        all_packages.insert(
-            "pkg:pypi/foo@1.0.0".to_string(),
-            vec![copy_a.clone(), copy_b.clone()],
-        );
-
-        let needed =
-            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
-        assert_eq!(
-            needed,
-            HashSet::from(["4".repeat(64)]),
-            "the second copy's variant must queue its mismatched file's blob"
-        );
     }
 
     /// A variant with no content-modifying files (only new files) has
@@ -4377,7 +3719,7 @@ mod tests {
             vec![
                 "",
                 "Patched packages:",
-                "  pkg:npm/minimist@1.2.2 (via diff)",
+                "  pkg:npm/minimist@1.2.2 (via blob)",
                 "  pkg:npm/other@2.0.0 (already patched)",
             ]
         );
@@ -4398,8 +3740,8 @@ mod tests {
             vec![
                 "",
                 "Patched packages:",
-                "  pkg:npm/nuxt@4.5.0 (node_modules/nuxt, via diff)",
-                "  pkg:npm/nuxt@4.5.0 (node_modules/vite/node_modules/nuxt, via diff)",
+                "  pkg:npm/nuxt@4.5.0 (node_modules/nuxt, via blob)",
+                "  pkg:npm/nuxt@4.5.0 (node_modules/vite/node_modules/nuxt, via blob)",
             ]
         );
     }
@@ -4407,8 +3749,8 @@ mod tests {
     #[test]
     fn patched_line_shapes() {
         assert_eq!(
-            format_patched_line("pkg:npm/a@1", None, "via blob+diff"),
-            "  pkg:npm/a@1 (via blob+diff)"
+            format_patched_line("pkg:npm/a@1", None, "via blob"),
+            "  pkg:npm/a@1 (via blob)"
         );
         assert_eq!(
             format_patched_line("pkg:npm/a@1", Some("node_modules/a"), "already patched"),
@@ -4435,30 +3777,6 @@ mod tests {
     }
 
     #[test]
-    fn mismatch_fetch_and_fail_counts() {
-        assert_eq!(
-            format_mismatch_fetch_result(1, 1),
-            "Downloaded 1 full patched blob for mismatched files"
-        );
-        assert_eq!(
-            format_mismatch_fetch_result(3, 3),
-            "Downloaded 3 full patched blobs for mismatched files"
-        );
-        assert_eq!(
-            format_mismatch_fetch_result(1, 2),
-            "Downloaded 1 of 2 full patched blobs for mismatched files"
-        );
-        assert_eq!(
-            mismatched_files_fail(1),
-            "1 mismatched file will fail to apply"
-        );
-        assert_eq!(
-            mismatched_files_fail(2),
-            "2 mismatched files will fail to apply"
-        );
-    }
-
-    #[test]
     fn check_in_sync_line() {
         assert_eq!(format_check_in_sync(0, 0), "No patches to check.");
         assert_eq!(
@@ -4474,6 +3792,54 @@ mod tests {
         assert_eq!(
             format_check_in_sync(0, 2),
             "Patches are in sync (0 patches checked; 2 patches not installed, skipped)."
+        );
+    }
+
+    /// #1219: the drift report's remedy keeps the check's scope, so running
+    /// it verbatim heals the tree that was checked.
+    #[test]
+    fn check_remedy_repeats_the_check_scope() {
+        let remedy = |common: GlobalArgs| check_remedy(&common);
+        assert_eq!(
+            remedy(GlobalArgs::default()),
+            "Run `socket-patch apply` to regenerate them."
+        );
+        assert_eq!(
+            remedy(GlobalArgs {
+                cwd: PathBuf::from("app"),
+                ..GlobalArgs::default()
+            }),
+            "Run `socket-patch apply --cwd app` to regenerate them."
+        );
+        assert_eq!(
+            remedy(GlobalArgs {
+                global: true,
+                ..GlobalArgs::default()
+            }),
+            "Run `socket-patch apply -g` to regenerate them."
+        );
+        let quoted = if cfg!(windows) {
+            "\"/opt/my site\""
+        } else {
+            "'/opt/my site'"
+        };
+        assert_eq!(
+            remedy(GlobalArgs {
+                global: true,
+                global_prefix: Some(PathBuf::from("/opt/my site")),
+                ..GlobalArgs::default()
+            }),
+            format!("Run `socket-patch apply --global-prefix {quoted}` to regenerate them.")
+        );
+        assert_eq!(
+            remedy(GlobalArgs {
+                cwd: PathBuf::from("svc"),
+                manifest_path: "../shared/manifest.json".to_string(),
+                ecosystems: Some(vec!["npm".to_string(), "pypi".to_string()]),
+                ..GlobalArgs::default()
+            }),
+            "Run `socket-patch apply --cwd svc --manifest-path ../shared/manifest.json \
+             --ecosystems npm,pypi` to regenerate them."
         );
     }
 

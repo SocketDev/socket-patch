@@ -4,13 +4,10 @@
 //! short form, and default. Changes that flip a default or rename a flag
 //! must break these tests so the regression is caught before release.
 //!
-//! Two defaults are especially load-bearing and explicitly asserted:
-//!
-//! * `--batch-size` has no parse-time default: unset, `scan` picks it per
-//!   endpoint at run time (500 on the authenticated API, 100 on the public
-//!   proxy), so an explicit value must stay distinguishable from none.
-//! * `--download-mode` defaults to `"diff"`. This diverges from `repair`'s
-//!   default and is a silent-regression risk if flipped.
+//! One default is especially load-bearing and explicitly asserted:
+//! `--batch-size` has no parse-time default: unset, `scan` picks it per
+//! endpoint at run time (500 on the authenticated API, 100 on the public
+//! proxy), so an explicit value must stay distinguishable from none.
 
 use clap::Parser;
 use socket_patch_cli::commands::scan::{resolve_mode_flags, ScanArgs, ScanMode};
@@ -20,8 +17,7 @@ use socket_patch_cli::{Cli, Commands};
 /// "SOCKET_*"` binding. clap reads these at parse time whenever the matching
 /// flag is absent, so an ambient value silently overrides the code-level
 /// `default_value`. That defeats the entire purpose of these snapshot tests:
-/// a regression that flips a `default_value` (e.g. `--download-mode` →
-/// `"package"`, or `--batch-size` → `50`) would stay GREEN on any machine
+/// a regression that flips a `default_value` (e.g. `--batch-size` → `50`) would stay GREEN on any machine
 /// whose shell/CI happens to export the old value, and the "default" tests
 /// would be asserting the environment, not the parser. We therefore clear
 /// the whole set before every parse and restore it after, under `#[serial]`
@@ -37,7 +33,6 @@ const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_CWD",
     "SOCKET_SCAN_PACKAGES",
     "SOCKET_DEBUG",
-    "SOCKET_DOWNLOAD_MODE",
     "SOCKET_DRY_RUN",
     "SOCKET_ECOSYSTEMS",
     "SOCKET_GLOBAL",
@@ -120,10 +115,6 @@ fn defaults_match_contract() {
     assert_eq!(
         args.batch_size, None,
         "--batch-size has no parse-time default (resolved per endpoint at run time)"
-    );
-    assert_eq!(
-        args.common.download_mode, "diff",
-        "--download-mode default is \"diff\""
     );
 
     // All other defaults from the scan table.
@@ -351,27 +342,6 @@ fn ecosystems_csv_single() {
 
 #[test]
 #[serial_test::serial]
-fn download_mode_diff() {
-    let args = parse_scan(&["--download-mode", "diff"]);
-    assert_eq!(args.common.download_mode, "diff");
-}
-
-#[test]
-#[serial_test::serial]
-fn download_mode_package() {
-    let args = parse_scan(&["--download-mode", "package"]);
-    assert_eq!(args.common.download_mode, "package");
-}
-
-#[test]
-#[serial_test::serial]
-fn download_mode_file() {
-    let args = parse_scan(&["--download-mode", "file"]);
-    assert_eq!(args.common.download_mode, "file");
-}
-
-#[test]
-#[serial_test::serial]
 fn unknown_flag_fails() {
     let err = match try_parse_scan(&["--not-a-real-flag"]) {
         Ok(_) => panic!("unknown flag should fail to parse"),
@@ -504,13 +474,17 @@ fn scan_json_empty_cwd_emits_updates_key() {
     // object that must NOT appear when neither was requested, since both
     // default to false here).
     let expected = serde_json::json!({
+        "command": "scan",
         "status": "success",
+        "dryRun": false,
+        "events": [],
+        "summary": {
+            "discovered": 0, "downloaded": 0, "applied": 0, "updated": 0,
+            "skipped": 0, "failed": 0, "removed": 0, "verified": 0,
+            "rebuilt": 0, "rolledBack": 0, "bytesFreed": 0
+        },
         "scannedPackages": 0,
         "lockfileOnlyPackages": 0,
-        "packagesWithPatches": 0,
-        "totalPatches": 0,
-        "freePatches": 0,
-        "paidPatches": 0,
         "canAccessPaidPatches": false,
         "packages": [],
         "updates": [],
@@ -522,16 +496,9 @@ fn scan_json_empty_cwd_emits_updates_key() {
             "counts": { "new": 0, "deferred": 0, "upgrade": 0, "already": 0 },
             "deferred": [],
         },
-        // v5: a bare scan runs hosted mode, so its result nests here.
-        "redirect": {
-            "mode": "hosted",
-            "redirected": 0,
-            "rewrittenFiles": [],
-            "skipped": [],
-            "patches": [],
-            "warnings": [],
-            "dryRun": false
-        },
+        // v5: a bare scan runs hosted mode: its payload (events would
+        // carry `details.mode: "hosted"`).
+        "redirect": { "mode": "hosted", "rewrittenFiles": [] },
         // v5: the socket.yml patch policy block rides every successful
         // scan (no file here: the built-in defaults).
         "policy": {

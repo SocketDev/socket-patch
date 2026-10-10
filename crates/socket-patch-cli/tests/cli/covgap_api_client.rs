@@ -158,19 +158,23 @@ async fn get_with_hash_shaped_token_under_json_keeps_warnings_and_envelope() {
     );
     let v = json_stdout(&out);
     assert_eq!(
-        v["status"], "not_found",
+        v["status"], "notFound",
         "404 after failed org resolution maps to not_found, got: {v}"
     );
-    assert_eq!(v["found"], 0, "not_found envelope reports zero found: {v}");
+    assert_eq!(
+        v["events"],
+        serde_json::json!([]),
+        "notFound reports no events: {v}"
+    );
     // The UUID path reports the startup downgrade in `warnings[]` too.
     let warnings = v["warnings"]
         .as_array()
         .unwrap_or_else(|| panic!("no warnings[]: {v}"));
-    let prefix = "(api_auth_fallback) Could not determine your organization";
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().is_some_and(|w| w.starts_with(prefix))),
+        warnings.iter().any(|w| w["code"] == "api_auth_fallback"
+            && w["detail"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("Could not determine your organization"))),
         "api_auth_fallback missing from warnings[]: {v}"
     );
 }
@@ -191,7 +195,7 @@ async fn get_with_hash_shaped_token_under_silent_prints_no_warnings() {
         "--silent must mute the token-shape warning; stderr={stderr}"
     );
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
-    assert_eq!(json_stdout(&out)["status"], "not_found");
+    assert_eq!(json_stdout(&out)["status"], "notFound");
 }
 
 /// #648: the uuid path's agent `--dry-run` preview must report the
@@ -281,11 +285,11 @@ async fn unresolved_org_reaches_get_uuid_dry_run_json_warnings() {
     let warnings = v["warnings"]
         .as_array()
         .unwrap_or_else(|| panic!("no warnings[]: {v}; stderr={stderr}"));
-    let prefix = "(api_auth_fallback) Could not determine your organization";
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().is_some_and(|w| w.starts_with(prefix))),
+        warnings.iter().any(|w| w["code"] == "api_auth_fallback"
+            && w["detail"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("Could not determine your organization"))),
         "api_auth_fallback missing from the dry-run warnings[]: {v}; stderr={stderr}"
     );
 }

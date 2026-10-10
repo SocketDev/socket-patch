@@ -480,13 +480,13 @@ fn write_vendor_ledger(cwd: &Path, flavor: Flavor, rel: &str, rec: PatchRecord) 
         vec![wiring_record("yarn.lock", "yarn_lock_block")]
     };
     let mut state = VendorState::new();
-    state.entries.insert(
-        PURL.to_string(),
-        VendorEntry {
-            ecosystem: "npm".to_string(),
-            base_purl: PURL.to_string(),
-            uuid: rec.uuid.clone(),
-            artifact: VendorArtifact {
+    let mut entry = VendorEntry {
+        flavor: Some(flavor.ledger_flavor().to_string()),
+        ..VendorEntry::new(
+            "npm".to_string(),
+            PURL.to_string(),
+            rec.uuid.clone(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: rel.to_string(),
                 sha256: String::new(),
@@ -495,18 +495,10 @@ fn write_vendor_ledger(cwd: &Path, flavor: Flavor, rel: &str, rec: PatchRecord) 
                 file_inventory: None,
             },
             wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: Some(rec),
-            flavor: Some(flavor.ledger_flavor().to_string()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        },
-    );
+        )
+    };
+    entry.record = Some(rec);
+    state.entries.insert(PURL.to_string(), entry);
     put(
         cwd,
         ".socket/vendor/state.json",

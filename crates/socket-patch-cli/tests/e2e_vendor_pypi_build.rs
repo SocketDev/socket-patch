@@ -1216,6 +1216,24 @@ fn uv_vendor_revert_after_uv_remove() {
     );
 }
 
+/// #1287: six vendored TRANSITIVELY (through `[tool.uv]
+/// override-dependencies` + sources, here beside a user
+/// `constraint-dependencies` pin), then `uv remove python-dateutil` drops
+/// six's `[[package]]` unit but leaves the `[tool.uv]` lines and the lock's
+/// `[manifest]` records socket-patch wrote. `vendor --revert` must read the
+/// vanished unit as removed and unwind the rest, instead of drift-keeping
+/// everything (which left `vendor --check` red with a prune remedy that
+/// changed nothing).
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_after_uv_remove_of_the_transitive_parent() {
+    uv_relock_then_revert(
+        "uv-remove-parent",
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"python-dateutil==2.8.2\", \"attrs>=20\"]\n\n[tool.uv]\nconstraint-dependencies = [\"six==1.16.0\"]\n",
+        &["remove", "-q", "python-dateutil"],
+    );
+}
+
 /// #821: six in a PEP 735 dev group, then `uv add --dev zipp` rewrites the
 /// whole `requires-dev` group line.
 #[test]
@@ -1330,13 +1348,13 @@ async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
     // "applied" (structurally zero — the nested apply never runs).
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["found"], 1, "envelope: {env}");
-    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert_eq!(env["command"], "get", "envelope: {env}");
+    assert_eq!(env["summary"]["downloaded"], 1, "envelope: {env}");
     assert!(
         env.get("applied").is_none(),
         "vendored get must drop 'applied': {env}"
     );
-    assert_vendored_applied(&env["vendor"]);
+    assert_vendored_applied(&env);
 
     // get wrote NO manifest and NO blobs: the ledger's detached entry, keyed
     // by the suite's bare pypi purl, is the record.

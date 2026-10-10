@@ -20,7 +20,7 @@
 //! A block `name@range[, name@range2]:` with `version "X"` and
 //! `resolved "<spec>"`. The package is the REAL name of the key patterns
 //! (`alias@npm:real@range` names `real` —
-//! [`crate::formats::yarn::patterns::pattern_real_name`]); every pattern
+//! [`crate::formats::yarn::patterns::classic_pattern_real_name`]); every pattern
 //! must agree, otherwise a Socket-wired block is diagnosed (the rewriters
 //! refuse mixed keys). `link:` keys are skipped: yarn installs them from the
 //! working tree, never from `resolved`.
@@ -92,8 +92,8 @@ use super::{
 use crate::formats::yarn::blocks::{berry_field, classic_field};
 use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::{
-    classic_key_real_name, pattern_real_name, resolution_selector_target, split_pattern,
-    split_resolved_sha1, BerryLocator,
+    classic_key_real_name, classic_pattern_real_name, resolution_selector_target,
+    split_classic_pattern, split_resolved_sha1, BerryLocator,
 };
 use crate::formats::yarn::source::{
     classic_copy_source, manifest_name, registry_tarball_name, CopySource,
@@ -159,7 +159,7 @@ async fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &m
 fn classic_copy(entry: &YarnEntry, resolved: Option<&str>) -> Option<LockCopy> {
     let version = classic_field(&entry.block.lines, "version")?;
     let file = entry.patterns.iter().find_map(|p| {
-        let (_, range) = split_pattern(p)?;
+        let (_, range) = split_classic_pattern(p)?;
         range.strip_prefix("file:")
     });
     let source = match file {
@@ -259,8 +259,10 @@ fn classic_block(
     let Some(resolved) = resolved else {
         return;
     };
-    let names: std::collections::BTreeSet<Option<&str>> =
-        patterns.iter().map(|p| pattern_real_name(p)).collect();
+    let names: std::collections::BTreeSet<Option<&str>> = patterns
+        .iter()
+        .map(|p| classic_pattern_real_name(p))
+        .collect();
     let names: Vec<Option<&str>> = names.into_iter().collect();
     let Some(wiring) = classify(ctx, resolved, YARN_LOCK, &block.key, out) else {
         // Not Socket's (a rejected Socket spelling was diagnosed instead):
@@ -364,6 +366,72 @@ async fn extract_berry(ctx: &DiscoverCtx<'_>, lock: BerryLock, out: &mut Discove
     record_copies(ctx, copies, out).await;
     confirm_berry_hosted_keyed(ctx, hosted_keyed, out).await;
     confirm_berry_vendored(ctx, vendored, out).await;
+    record_stale_hosted_selectors(ctx, &lock, out).await;
+}
+
+/// Record each hosted `resolutions` selector of the root `package.json`
+/// that the lock no longer installs ([`StaleSelector`], #1203): Socket's
+/// own leftover pin after `yarn remove` / `yarn up`, which the management
+/// commands retire instead of refusing around it as contested wiring. A
+/// selector whose URL does not name its package version's artifact
+/// (`<name>-<version>.tgz`) is left to the contested path.
+///
+/// [`StaleSelector`]: super::StaleSelector
+async fn record_stale_hosted_selectors(
+    ctx: &DiscoverCtx<'_>,
+    lock: &BerryLock,
+    out: &mut Discovery,
+) {
+    use crate::vendor::lock_inventory::yarn::berry_selector_routes_nothing;
+    let Some(bytes) = ctx.read_bytes(PACKAGE_JSON, out).await else {
+        return;
+    };
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    let Ok(doc) = parse_json(PACKAGE_JSON, bytes) else {
+        return;
+    };
+    let Some(res) = doc.get("resolutions").and_then(Value::as_object) else {
+        return;
+    };
+    for (selector, value) in res {
+        let Some(url) = value.as_str() else {
+            continue;
+        };
+        let Some(uuid) = ctx.hosted_uuid(url) else {
+            continue;
+        };
+        let Some(name) = resolution_selector_target(selector) else {
+            continue;
+        };
+        let Some(purl) = hosted_leaf_version(name, url)
+            .and_then(|version| crate::utils::purl::npm_purl(name, version))
+        else {
+            continue;
+        };
+        if !berry_selector_routes_nothing(lock, selector, url) {
+            continue;
+        }
+        out.stale_selectors.push(super::StaleSelector {
+            file: PACKAGE_JSON.into(),
+            selector: selector.clone(),
+            url: url.to_string(),
+            purl: crate::utils::purl_key::canonical_base_purl(&purl),
+            uuid,
+        });
+    }
+}
+
+/// The version a hosted npm artifact URL's leaf `<bare name>-<version>.tgz`
+/// names for package `name`.
+fn hosted_leaf_version<'u>(name: &str, url: &'u str) -> Option<&'u str> {
+    let path = url.split(['?', '#']).next()?;
+    let leaf = path.rsplit('/').next()?;
+    let bare = name.rsplit('/').next()?;
+    let version = leaf
+        .strip_prefix(bare)?
+        .strip_prefix('-')?
+        .strip_suffix(".tgz")?;
+    (!version.is_empty()).then_some(version)
 }
 
 /// Emit each berry hosted entry keyed by its tarball descriptor only when
@@ -840,7 +908,11 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
             }
             CopyRef::Url(url) => (
                 registry_tarball_name(url, &copy.version),
-                format!("installs it from {url:?}"),
+                // Published in the VEX document: never a credential.
+                format!(
+                    "installs it from {:?}",
+                    crate::utils::redact::redact_url(url)
+                ),
             ),
         };
         let Some(name) = name else {
@@ -1009,6 +1081,32 @@ mod tests {
             let out = run(&p).await;
             assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
             assert!(out.diagnostics.is_empty(), "{case}: {:?}", out.diagnostics);
+        }
+    }
+
+    /// #1271: a hosted pin on a block keyed by an empty range
+    /// (`left-pad@:` from `"left-pad": ""`), alone or merged ahead of
+    /// another range, is attributed like any registry key.
+    #[tokio::test]
+    async fn classic_hosted_empty_range_keys() {
+        let lp = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        for key in ["left-pad@", "left-pad@, left-pad@^1.3.0"] {
+            let p = Project::new();
+            p.write(
+                "yarn.lock",
+                classic(&[classic_block(
+                    key,
+                    "1.3.0",
+                    &format!("{lp}#{SHA1}"),
+                    Some(SRI),
+                )]),
+            );
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+            );
+            assert!(out.diagnostics.is_empty(), "{key}: {:?}", out.diagnostics);
         }
     }
 

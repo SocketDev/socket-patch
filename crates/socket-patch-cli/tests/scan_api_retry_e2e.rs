@@ -306,7 +306,7 @@ async fn exhausted_batches_surface_as_json_warnings() {
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     let v = json(&stdout);
     assert_eq!(v["status"], "success");
-    assert_eq!(v["packagesWithPatches"], 4, "{v:#}");
+    assert_eq!(v["packages"].as_array().unwrap().len(), 4, "{v:#}");
     let w = warnings(&v, "api_batch_failed");
     assert_eq!(w.len(), 2, "{v:#}");
     // Chunk order is crawl order (readdir), so match either batch number.
@@ -396,7 +396,7 @@ async fn max_retries_env_zero_disables_retry() {
     );
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     let v = json(&stdout);
-    assert_eq!(v["packagesWithPatches"], 5);
+    assert_eq!(v["packages"].as_array().unwrap().len(), 5);
     let w = warnings(&v, "api_batch_failed");
     assert_eq!(w.len(), 1, "{v:#}");
     assert!(

@@ -165,10 +165,6 @@ async fn get_by_uuid_nested_apply_uses_api_flags_not_env() {
             "agent",
             "--yes",
             "--json",
-            // `file` mode goes straight for the per-file blob endpoint; the
-            // point here is which CLIENT does the fetch, not which artifact.
-            "--download-mode",
-            "file",
             "--api-url",
             &uri,
             "--api-token",
@@ -187,7 +183,7 @@ async fn get_by_uuid_nested_apply_uses_api_flags_not_env() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("valid JSON expected: {e}\nstdout={stdout}"));
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["applied"], 1, "stdout={stdout}");
+    assert_eq!(v["summary"]["applied"], 1, "stdout={stdout}");
 
     let patched = tmp.path().join("node_modules").join(PKG).join("index.js");
     assert_eq!(
@@ -221,8 +217,6 @@ async fn get_by_purl_nested_apply_uses_api_flags_not_env() {
             "agent",
             "--yes",
             "--json",
-            "--download-mode",
-            "file",
             "--api-url",
             &uri,
             "--api-token",
@@ -241,7 +235,7 @@ async fn get_by_purl_nested_apply_uses_api_flags_not_env() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("valid JSON expected: {e}\nstdout={stdout}"));
     assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert_eq!(v["applied"], 1, "stdout={stdout}");
+    assert_eq!(v["summary"]["applied"], 1, "stdout={stdout}");
 
     let patched = tmp.path().join("node_modules").join(PKG).join("index.js");
     assert_eq!(
@@ -303,8 +297,6 @@ async fn get_by_uuid_nested_apply_uses_proxy_url_flag_when_tokenless() {
             "agent",
             "--yes",
             "--json",
-            "--download-mode",
-            "file",
             "--proxy-url",
             &uri,
         ],

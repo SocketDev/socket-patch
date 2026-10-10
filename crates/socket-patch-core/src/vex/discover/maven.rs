@@ -40,7 +40,16 @@
 //! A pin counts only where Maven resolves it: a direct `<dependency>`
 //! literal version wins over `<dependencyManagement>`, so a managed Socket
 //! pin shadowed by a direct plain version (or a GA declared with several
-//! different effective versions) is diagnosed, not a ref. A `${property}`
+//! different effective versions) is diagnosed, not a ref.
+//! A hosted pin in a reactor root (`<modules>` / `<subprojects>`) stays
+//! a ref (rollback / remove find it) but marked unattested: a module's
+//! own literal `<version>` overrides it, and only the root pom is read here
+//! (the rewriter refuses such roots, #261). A `<classifier>` copy of the
+//! GA is its own coordinate, which the classifier-less pin does not
+//! retarget and the grant does not serve: a live executable one (anything
+//! but `sources` / `javadoc`) that resolves any version other than the pin
+//! — its own literal, a classifier-keyed managed entry, or none in this
+//! pom — keeps the ref but marks it unattested. A `${property}`
 //! version is resolved one level from the root `<properties>`.
 //!
 //! Integrity: when the pom sha256 was known the rewriter also writes Maven
@@ -91,7 +100,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     maven_purl, names_vendor_dir, socket_patch_name_uuid, vendor_ref, vendor_uuid_dir, DiscoverCtx,
-    Discovery, PatchedRef, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
+    Discovery, PatchedRef, UnattestedKind, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::maven::{
@@ -146,7 +155,8 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
 
     let gas = group_by_ga(&pom.deps);
-    extract_hosted(ctx, &pom, &gas, &hosted, out).await;
+    let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw);
+    extract_hosted(ctx, &pom, &gas, &hosted, reactor, out).await;
     if !vendored.is_empty() {
         extract_vendored(ctx, &gas, &vendored, out).await;
     }
@@ -159,6 +169,7 @@ async fn extract_hosted(
     pom: &Pom,
     gas: &BTreeMap<(String, String), GaVersions>,
     hosted: &BTreeMap<String, String>,
+    reactor: bool,
     out: &mut Discovery,
 ) {
     // uuid -> the (purl, g, a, suffixed version) pins that tie to it.
@@ -261,6 +272,42 @@ async fn extract_hosted(
                 .await;
         match candidates.as_slice() {
             [uuid] => {
+                // A reactor root's pin stays a ref (rollback, remove and
+                // list must still find it) but is never attested: a
+                // module's own <version>, unread here, overrides it (#261).
+                if reactor {
+                    out.unattested(
+                        &purl,
+                        uuid,
+                        POM,
+                        format!(
+                            "{POM} declares <modules>/<subprojects>, and a module's own \
+                             <version> of {ga} overrides this root pin; hosted mode reads only \
+                             the root pom (re-patch the reactor with `scan --mode vendored`)"
+                        ),
+                        UnattestedKind::MavenReactorRoot,
+                    );
+                }
+                // An executable classifier copy (tests, a native build) is
+                // its own coordinate: the classifier-less pin does not
+                // retarget it and the grant does not serve it, so Maven
+                // fetches it from the next repository — the public release.
+                if let Some((classifier, version)) =
+                    unpatched_executable_classifier(&pom.deps, group, artifact, &pinned)
+                {
+                    out.unattested(
+                        &purl,
+                        uuid,
+                        POM,
+                        format!(
+                            "{POM}: {ga}:{classifier} resolves <version>{}</version>, not the \
+                             patched {pinned}; the Socket patch covers only the main jar, so that \
+                             classifier copy keeps the unpatched code on the classpath",
+                            version.unwrap_or("(none in this pom)")
+                        ),
+                        UnattestedKind::MavenClassifierUnpatched,
+                    );
+                }
                 ties.entry(*uuid).or_default().insert((
                     purl,
                     group.clone(),
@@ -592,7 +639,13 @@ struct GaVersions {
 
 fn group_by_ga(deps: &[PomDep]) -> BTreeMap<(String, String), GaVersions> {
     let mut map: BTreeMap<(String, String), GaVersions> = BTreeMap::new();
-    for dep in deps.iter().filter(|d| !d.in_profile) {
+    // A classifier variant (`sources`, `tests`, a native build) is its own
+    // artifact, managed apart from the main jar: its version neither pins
+    // nor shadows the main jar's.
+    for dep in deps
+        .iter()
+        .filter(|d| !d.in_profile && d.classifier.is_none())
+    {
         let Some(version) = &dep.version else {
             continue;
         };
@@ -606,6 +659,41 @@ fn group_by_ga(deps: &[PomDep]) -> BTreeMap<(String, String), GaVersions> {
         }
     }
     map
+}
+
+/// The classifiers whose jars never run on a classpath. Every other
+/// classifier copy of a pinned GA (tests, a native or JDK-specific build)
+/// executes, so it must resolve the patched release too.
+const NON_EXECUTABLE_CLASSIFIERS: &[&str] = &["sources", "javadoc"];
+
+/// The first live executable classifier copy of `group:artifact` that does
+/// not resolve `pinned`, with the version it resolves (`None` when this pom
+/// gives it none). Its version is its own literal, else a
+/// `<dependencyManagement>` entry with the same classifier — Maven keys
+/// management by classifier, so the classifier-less pin never applies.
+fn unpatched_executable_classifier<'a>(
+    deps: &'a [PomDep],
+    group: &str,
+    artifact: &str,
+    pinned: &str,
+) -> Option<(&'a str, Option<&'a str>)> {
+    let of_ga = |d: &&PomDep| !d.in_profile && d.group == group && d.artifact == artifact;
+    deps.iter()
+        .filter(of_ga)
+        .filter(|d| !d.managed)
+        .filter_map(|d| {
+            let classifier = d.classifier.as_deref()?;
+            (!NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)).then_some((d, classifier))
+        })
+        .find_map(|(d, classifier)| {
+            let version = d.version.as_deref().or_else(|| {
+                deps.iter()
+                    .filter(of_ga)
+                    .find(|m| m.managed && m.classifier.as_deref() == Some(classifier))
+                    .and_then(|m| m.version.as_deref())
+            });
+            (version != Some(pinned)).then_some((classifier, version))
+        })
 }
 
 #[cfg(test)]
@@ -681,6 +769,20 @@ mod tests {
             "transitive-depmgmt",
             "existing-depmgmt",
             "existing-repositories",
+            // The scope-aware rewrites (#259, #262, #342): what the rewriter
+            // reports redirected, VEX attests — a commented-out, profile or
+            // plugin declaration and a classifier sibling left at the base
+            // version neither pin nor shadow the main jar.
+            "comment-dependency",
+            "profile-repositories",
+            "plugin-dependency",
+            "profile-depmgmt",
+            "commented-repositories",
+            "classifier-sources-sibling",
+            "classifier-only-transitive-main",
+            "self-closed-repositories",
+            "depmgmt-comment",
+            "self-closed-depmgmt",
         ] {
             let out = run(&fixture(case)).await;
             assert_refs(&out, &[(FX_PURL, FX_UUID, WiringMode::Hosted)]);
@@ -765,6 +867,122 @@ mod tests {
         p.write("pom.xml", text);
         let out = run(&p).await;
         assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+    }
+
+    /// A hosted pin in a reactor root is not attested (#261): a module that
+    /// declares the GA with its own literal `<version>` overrides the root's
+    /// managed pin, and discovery reads only the root pom. It stays a ref,
+    /// so rollback / remove / list still find a pin an older release wrote,
+    /// but is marked unattested so `vex` never says not_affected for a
+    /// module that still resolves the upstream jar.
+    #[tokio::test]
+    async fn hosted_pin_in_a_reactor_root_is_not_attested() {
+        for reactor in [
+            "<modules>\n<module>child</module>\n</modules>\n",
+            "<subprojects>\n<subproject>child</subproject>\n</subprojects>\n",
+            "<profiles>\n<profile>\n<id>all</id>\n<modules>\n<module>child</module>\n</modules>\n</profile>\n</profiles>\n",
+        ] {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<packaging>pom</packaging>\n{reactor}<dependencyManagement>\n<dependencies>\n{}</dependencies>\n</dependencyManagement>\n<repositories>\n{}</repositories>\n",
+                    dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                    hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A)),
+                )),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.unattested.len(), 1, "{reactor}: {:?}", out.unattested);
+            let u = &out.unattested[0];
+            assert_eq!(u.kind, UnattestedKind::MavenReactorRoot, "{reactor}");
+            assert_eq!((u.purl.as_str(), u.uuid.as_str()), (FX_PURL, UUID_A), "{reactor}");
+            assert!(u.detail.contains("org.slf4j:slf4j-api"), "{}", u.detail);
+        }
+
+        // The single-module control stays attested.
+        let p = Project::new();
+        p.write("pom.xml", hosted_pom(UUID_A));
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+    }
+
+    /// A classifier copy is its own coordinate: the classifier-less pin
+    /// does not retarget it and the grant serves only the main jar. An
+    /// executable one (tests, a native build) left at another version keeps
+    /// the public, unpatched jar on the classpath, so the pin stays a ref
+    /// but is not attested. `sources` / `javadoc` never run and do not.
+    #[tokio::test]
+    async fn executable_classifier_copy_off_the_pin_is_not_attested() {
+        fn classified(c: &str, v: Option<&str>) -> String {
+            let v = v.map_or(String::new(), |v| format!("<version>{v}</version>"));
+            format!(
+                "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>\
+                 {v}<classifier>{c}</classifier></dependency>\n"
+            )
+        }
+        fn project(deps: &str, managed: &str) -> Project {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<dependencyManagement>\n<dependencies>\n{managed}</dependencies>\n\
+                     </dependencyManagement>\n<dependencies>\n{}{deps}</dependencies>\n\
+                     <repositories>\n{}</repositories>\n",
+                    dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                    hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A)),
+                )),
+            );
+            p
+        }
+        let pin = suffixed(UUID_A);
+        let unattested = [
+            // At the base release: the public classifier jar.
+            (classified("tests", Some("1.7.36")), String::new()),
+            (classified("natives-linux", Some("1.7.36")), String::new()),
+            // Another release entirely.
+            (classified("tests", Some("1.7.30")), String::new()),
+            // Versioned by a classifier-keyed managed entry.
+            (
+                classified("tests", None),
+                classified("tests", Some("1.7.36")),
+            ),
+            // No version this pom gives it (a parent's): fail closed.
+            (classified("tests", None), String::new()),
+        ];
+        for (deps, managed) in &unattested {
+            let out = run(&project(deps, managed)).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.unattested.len(), 1, "{deps}: {:?}", out.unattested);
+            let u = &out.unattested[0];
+            assert_eq!(u.kind, UnattestedKind::MavenClassifierUnpatched, "{deps}");
+            assert_eq!(
+                (u.purl.as_str(), u.uuid.as_str()),
+                (FX_PURL, UUID_A),
+                "{deps}"
+            );
+            assert!(u.detail.contains("org.slf4j:slf4j-api:"), "{}", u.detail);
+        }
+
+        let attested = [
+            // Never executed.
+            (classified("sources", Some("1.7.36")), String::new()),
+            (classified("javadoc", Some("1.7.36")), String::new()),
+            // Already on the patched release.
+            (classified("tests", Some(&pin)), String::new()),
+            (classified("tests", None), classified("tests", Some(&pin))),
+            // Managed only, never declared: nothing resolves it.
+            (String::new(), classified("tests", Some("1.7.36"))),
+            // No classifier copy at all.
+            (String::new(), String::new()),
+        ];
+        for (deps, managed) in &attested {
+            let out = run(&project(deps, managed)).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert!(out.unattested.is_empty(), "{deps}: {:?}", out.unattested);
+            assert!(out.refs[0].lockfile_basis_ok(), "{deps}");
+        }
     }
 
     #[tokio::test]

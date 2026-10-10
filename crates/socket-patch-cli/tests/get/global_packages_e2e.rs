@@ -21,14 +21,11 @@
 //! that crashes, swallows the PURL, or silently reports success no
 //! longer slips through.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use crate::cache_env;
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+use crate::common::binary;
 
 /// Build a `socket-patch` `Command` with the ambient `SOCKET_*` env
 /// surface scrubbed (mirrors `common::run_with_env`). The binary binds
@@ -192,9 +189,9 @@ fn assert_apply_applied(stdout: &str, purl: &str) {
 /// none can be reverted, but the run is clean — not a failure).
 ///
 /// A manifest entry with no matching installed package surfaces as an
-/// additive marker record in `results[]` — `{purl, path: null, skipped:
-/// "package_not_installed"}`, no `success`/`error` keys — and never
-/// counts toward `rolledBack`/`failed` or flips the status.
+/// `skipped` event with `errorCode: "package_not_installed"` (plus the
+/// entry's manifest `removed` event) — and never counts toward
+/// `summary.rolledBack`/`failed` or flips the status.
 fn assert_rollback_noop(stdout: &str) {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("rollback --global must emit valid JSON");
@@ -202,22 +199,18 @@ fn assert_rollback_noop(stdout: &str) {
         v["status"], "success",
         "empty rollback must report success; envelope={v}"
     );
-    assert_eq!(v["rolledBack"], 0, "envelope={v}");
-    assert_eq!(v["alreadyOriginal"], 0, "envelope={v}");
-    assert_eq!(v["failed"], 0, "envelope={v}");
+    assert_eq!(v["command"], "rollback", "envelope={v}");
+    assert_eq!(v["summary"]["rolledBack"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["failed"], 0, "envelope={v}");
     assert_eq!(v["dryRun"], false, "envelope={v}");
-    for r in v["results"].as_array().expect("results must be an array") {
+    for e in v["events"].as_array().expect("events must be an array") {
+        if e["action"] == "removed" && e["details"]["manifest"] == true {
+            continue;
+        }
+        assert_eq!(e["action"], "skipped", "envelope={v}");
         assert_eq!(
-            r["skipped"], "package_not_installed",
-            "a no-op rollback may carry only not-installed markers; envelope={v}"
-        );
-        assert!(
-            r["path"].is_null(),
-            "marker path must be null; envelope={v}"
-        );
-        assert!(
-            r.get("success").is_none() && r.get("error").is_none(),
-            "markers carry no success/error keys; envelope={v}"
+            e["errorCode"], "package_not_installed",
+            "a no-op rollback may carry only not-installed skips; envelope={v}"
         );
     }
 }
@@ -378,17 +371,25 @@ fn rollback_global_prefix_uses_explicit_path() {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("rollback must emit valid JSON");
     assert_eq!(v["status"], "success", "envelope={v}");
-    assert_eq!(v["failed"], 0, "envelope={v}");
-    let results = v["results"].as_array().expect("results must be an array");
+    assert_eq!(v["summary"]["failed"], 0, "envelope={v}");
+    // The installed copy's event (the one naming `details.path`).
+    let results: Vec<&serde_json::Value> = v["events"]
+        .as_array()
+        .expect("events must be an array")
+        .iter()
+        .filter(|e| e["details"]["path"].is_string())
+        .collect();
     assert_eq!(
         results.len(),
         1,
         "the seeded package must surface exactly one result; envelope={v}"
     );
-    let r = &results[0];
+    let r = results[0];
     assert_eq!(r["purl"], PREFIX_PURL, "envelope={v}");
-    assert_eq!(r["success"], true, "envelope={v}");
-    let path = r["path"].as_str().expect("result must carry a path");
+    assert_ne!(r["action"], "failed", "envelope={v}");
+    let path = r["details"]["path"]
+        .as_str()
+        .expect("result must carry a path");
     assert!(
         Path::new(path).starts_with(&global_dir),
         "result path must live inside the explicit prefix {}; got {path}; envelope={v}",

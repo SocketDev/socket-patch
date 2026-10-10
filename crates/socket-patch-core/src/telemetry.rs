@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::api::client::ApiRoute;
 use crate::constants::USER_AGENT;
-use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
+use crate::utils::env_compat::{is_offline_env, proxy_url_from_env};
 use crate::utils::fs::home_dir;
 use crate::vex::time::unix_to_ymdhms;
 
@@ -168,9 +168,7 @@ pub fn is_telemetry_disabled() -> bool {
 
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
-    if is_debug_enabled() {
-        eprintln!("[socket-patch telemetry] {message}");
-    }
+    crate::utils::env_compat::debug_log("telemetry", message);
 }
 
 // ---------------------------------------------------------------------------
@@ -189,9 +187,13 @@ fn build_telemetry_context(command: &str) -> PatchTelemetryContext {
 
 /// Sanitize an error message for telemetry.
 ///
-/// Replaces the user's home directory path with `~` to avoid leaking
-/// sensitive file system information.
+/// Every URL in it is redacted ([`crate::utils::redact::redact_urls_in`]:
+/// userinfo, grant tokens, signed query values), and the user's home
+/// directory path is replaced with `~` to avoid leaking sensitive file
+/// system information.
 pub fn sanitize_error_message(message: &str) -> String {
+    let message = crate::utils::redact::redact_urls_in(message);
+    let message = message.as_ref();
     let Some(home) = home_dir() else {
         return message.to_string();
     };
@@ -354,7 +356,7 @@ fn prepare_send(event: PatchTelemetryEvent, auth: &TelemetryAuth) -> PreparedSen
 async fn send_telemetry_event(prepared: PreparedSend) {
     let PreparedSend { event, url, bearer } = prepared;
 
-    let client = match reqwest::Client::builder()
+    let client = match crate::utils::http::client_builder()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -795,14 +797,14 @@ pub fn spawn_patch_scan_failed(
     pending.spawn_prepared(prepare_patch_scan_failed(error, fallback_to_proxy, auth));
 }
 
-/// Track a successful `get`. Reports patch identity + delivery mode and
-/// whether the call was downgraded to the public proxy after an
-/// auth-endpoint 401/403.
+/// Track a successful `get`. Reports patch identity and whether the call
+/// was downgraded to the public proxy after an auth-endpoint 401/403.
+/// `download_mode` is always `"file"`: v5 fetches patch content only as
+/// per-file blobs, and the field stays so the event schema is unchanged.
 pub async fn track_patch_fetched(
     uuid: &str,
     tier: &str,
     ecosystem: &str,
-    download_mode: &str,
     fallback_to_proxy: bool,
     auth: &TelemetryAuth,
 ) {
@@ -813,7 +815,7 @@ pub async fn track_patch_fetched(
             "uuid": uuid,
             "tier": tier,
             "ecosystem": ecosystem,
-            "download_mode": download_mode,
+            "download_mode": "file",
             "fallback_to_proxy": fallback_to_proxy,
         }),
         None::<&str>,
@@ -822,8 +824,21 @@ pub async fn track_patch_fetched(
     .await;
 }
 
+/// The `uuid` a `patch_fetch_failed` event reports: `identifier` when it
+/// is a patch uuid, else empty. `get` passes whatever the user asked for
+/// (a CVE, a GHSA, a purl, a private package name), and only a uuid
+/// belongs in that field.
+fn fetch_failed_uuid(identifier: &str) -> &str {
+    if crate::patch::path_safety::is_canonical_uuid(&identifier.to_ascii_lowercase()) {
+        identifier
+    } else {
+        ""
+    }
+}
+
 /// Track a failed `get`. `uuid` may be empty when the failure occurred
-/// before the patch was resolved (e.g. lookup miss).
+/// before the patch was resolved (e.g. lookup miss); anything that is not
+/// a uuid is reported as empty.
 pub async fn track_patch_fetch_failed(
     uuid: &str,
     error: impl std::fmt::Display,
@@ -833,7 +848,10 @@ pub async fn track_patch_fetch_failed(
     fire(
         PatchTelemetryEventType::PatchFetchFailed,
         "get",
-        serde_json::json!({ "uuid": uuid, "fallback_to_proxy": fallback_to_proxy }),
+        serde_json::json!({
+            "uuid": fetch_failed_uuid(uuid),
+            "fallback_to_proxy": fallback_to_proxy
+        }),
         Some(error),
         auth,
     )
@@ -1264,6 +1282,39 @@ mod tests {
         let sanitized = sanitize_error_message(&msg);
         assert!(sanitized.contains("~/projects/secret/file.txt"));
         assert!(!sanitized.contains(&home));
+    }
+
+    /// B26: an error that quotes a grant URL or a credentialed registry URL
+    /// (reqwest's own text does) reaches telemetry redacted.
+    #[test]
+    fn sanitize_error_message_redacts_urls() {
+        let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        let msg = format!(
+            "artifact not found: https://patch.socket.dev/patch/npm/a/1.0.0/GRANT/{uuid}/a.tgz; \
+             error sending request for url (https://bot:hunter2@goproxy.corp/m/@v/v1.zip)"
+        );
+        let sanitized = sanitize_error_message(&msg);
+        assert!(!sanitized.contains("GRANT"), "{sanitized}");
+        assert!(!sanitized.contains("hunter2"), "{sanitized}");
+        assert!(
+            sanitized.contains(uuid) && sanitized.contains("goproxy.corp"),
+            "{sanitized}"
+        );
+    }
+
+    /// B26: `patch_fetch_failed` reports a uuid only; a CVE, purl or private
+    /// package name the user asked `get` for is not sent.
+    #[test]
+    fn fetch_failed_uuid_only_reports_uuids() {
+        let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        assert_eq!(fetch_failed_uuid(uuid), uuid);
+        assert_eq!(
+            fetch_failed_uuid("7C8D9E0F-1A2B-4A1B-8C2D-3E4F5A6B7C8D"),
+            "7C8D9E0F-1A2B-4A1B-8C2D-3E4F5A6B7C8D"
+        );
+        for identifier in ["@acme/internal-lib", "CVE-2021-44906", "pkg:npm/x@1", ""] {
+            assert_eq!(fetch_failed_uuid(identifier), "", "{identifier}");
+        }
     }
 
     #[test]

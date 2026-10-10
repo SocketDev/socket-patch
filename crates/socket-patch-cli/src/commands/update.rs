@@ -10,7 +10,7 @@
 use clap::Args;
 use socket_patch_core::telemetry::{track_cli_update_failed, track_cli_updated};
 use socket_patch_core::update::{
-    self as core_update, asset_name_for_target, channel_label, current_version, detect_channel,
+    self as core_update, asset_name_for_target, channel_label_for, current_version, detect_channel,
     fetch_latest_version, is_newer, upgrade_hint_for, ChannelEnv, InstallChannel, UpdateEndpoints,
     UpdateError, UpdateRequest, UpdateTimeouts,
 };
@@ -230,7 +230,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                 format!(
                     "this install is managed by {} — its next upgrade will overwrite \
                      the updated binary.",
-                    channel_label(channel)
+                    channel_label_for(channel, &install_path)
                 ),
             );
         } else {
@@ -241,7 +241,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                     "this socket-patch binary ({}) is managed by {}; update it with `{}` \
                      instead, or pass --force to replace it in place",
                     install_path.display(),
-                    channel_label(channel),
+                    channel_label_for(channel, &install_path),
                     hint
                 ),
             )
@@ -409,11 +409,13 @@ pub async fn run(args: UpdateArgs) -> i32 {
     if args.common.json {
         let mut env = Envelope::new(Command::Update);
         env.record(
-            PatchEvent::artifact(PatchAction::Downloaded).with_details(serde_json::json!({
-                "asset": outcome.asset,
-                "bytes": outcome.archive_bytes,
-                "sha256": outcome.archive_sha256,
-            })),
+            PatchEvent::artifact(PatchAction::Downloaded)
+                .with_bytes(outcome.archive_bytes)
+                .with_details(serde_json::json!({
+                    "asset": outcome.asset,
+                    "bytes": outcome.archive_bytes,
+                    "sha256": outcome.archive_sha256,
+                })),
         );
         env.record(
             PatchEvent::artifact(PatchAction::Updated).with_details(serde_json::json!({

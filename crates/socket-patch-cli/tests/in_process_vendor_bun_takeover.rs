@@ -38,10 +38,15 @@
 //!   6. A project with its own registries (bunfig `[install] registry` and
 //!      `[install.scopes]`, #992): `remove <purl>` and the takeover +
 //!      `vendor --revert` chain keep each registry's tarball URL in the
-//!      slot (`in_process_vendor_bun_takeover/registry.rs`).
+//!      slot (`in_process_vendor_bun_takeover/registry.rs`), including
+//!      registries set only in the user's `.npmrc` or global bunfig
+//!      (#1276).
 //!
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
 //! telemetry hard-disabled; each test runs in its own tempdir.
+
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -353,6 +358,12 @@ fn registry_uri() -> &'static str {
 /// (`SOCKET_PATCH_SERVER_URL`) and the registry is the shared mirror
 /// (`SOCKET_NPM_REGISTRY`). Returns `(exit_code, stdout, stderr)`.
 fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    run_cli_env(cwd, args, &[])
+}
+
+/// [`run_cli`] with `env` set last, over the stand-in `HOME` (a test's own
+/// user-level Bun config, #1276).
+fn run_cli_env(cwd: &Path, args: &[&str], env: &[(&str, String)]) -> (i32, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.current_dir(cwd);
     for (key, _) in std::env::vars() {
@@ -362,16 +373,22 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     }
     // A registry exported by npm (`npm_config_registry`) or Bun would
     // steer the Bun restores off the fixtures' registries (#992).
+    // So would a user-level `.npmrc` / bunfig under `XDG_CONFIG_HOME`
+    // (#1276); `HOME` is the stand-in `prepare_command` pins.
     for key in [
         "BUN_CONFIG_REGISTRY",
         "NPM_CONFIG_REGISTRY",
         "npm_config_registry",
+        "XDG_CONFIG_HOME",
     ] {
         cmd.env_remove(key);
     }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_NPM_REGISTRY", registry_uri());
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -382,7 +399,12 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 
 /// `--json` invocation returning the parsed envelope.
 fn run_json(cwd: &Path, args: &[&str]) -> (i32, Value) {
-    let (code, stdout, stderr) = run_cli(cwd, args);
+    run_json_env(cwd, args, &[])
+}
+
+/// [`run_json`] with [`run_cli_env`]'s extra `env`.
+fn run_json_env(cwd: &Path, args: &[&str], env: &[(&str, String)]) -> (i32, Value) {
+    let (code, stdout, stderr) = run_cli_env(cwd, args, env);
     // The child's stderr rides the harness's captured output so a failing
     // assertion downstream shows the CLI's own diagnostics.
     if !stderr.trim().is_empty() {
@@ -517,7 +539,7 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
     // A: hosted redirect — registry 4-tuple → URL 3-tuple; no ledger.
     let (code, env) = scan_mode(root, &server.uri(), "hosted", &[]);
     assert_eq!(code, 0, "scan --mode hosted must succeed: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pin_count(&env), 1, "{env:#}");
     let hosted_lock = read(root, "bun.lock");
     assert_eq!(
         lock_line(&hosted_lock, NAME),
@@ -560,7 +582,7 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
         "scan --mode vendored over the hosted bun project must succeed: {env:#}"
     );
     assert_eq!(env["status"], "success", "{env:#}");
-    let vendor = &env["vendor"];
+    let vendor = &env;
     assert_eq!(vendor["summary"]["applied"], 1, "{env:#}");
     assert_eq!(vendor["summary"]["failed"], 0, "{env:#}");
     find_event(vendor, "skipped", Some("vendor_takeover_reverted_redirect"));
@@ -587,8 +609,8 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
     // C: a re-run is an in-sync no-op with no second takeover.
     let (code, env) = scan_mode(root, &server.uri(), "vendored", &[]);
     assert_eq!(code, 0, "{env:#}");
-    find_event(&env["vendor"], "skipped", Some("already_vendored"));
-    assert_no_event_code(&env["vendor"], "vendor_takeover_reverted_redirect");
+    find_event(&env, "skipped", Some("already_vendored"));
+    assert_no_event_code(&env, "vendor_takeover_reverted_redirect");
 
     // D: `vendor --revert` restores the REGISTRY lock byte-exactly — the
     //    pre-redirect resolution the takeover carried forward, not the
@@ -673,7 +695,7 @@ async fn bun_lockfile_only_scan_vendored_takes_over_the_hosted_pin() {
         env["scannedPackages"], 1,
         "the hosted pin must be seen: {env:#}"
     );
-    let vendor = &env["vendor"];
+    let vendor = &env;
     assert_eq!(vendor["summary"]["applied"], 1, "{env:#}");
     assert_eq!(vendor["summary"]["failed"], 0, "{env:#}");
     find_event(vendor, "skipped", Some("vendor_takeover_reverted_redirect"));
@@ -716,7 +738,7 @@ fn drop_digest_in_lock(root: &Path, key: &str) -> String {
 }
 
 fn redirect_warning_codes(env: &Value) -> Vec<String> {
-    env["redirect"]["warnings"]
+    env["warnings"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -750,7 +772,7 @@ async fn bun_digestless_hosted_line_is_taken_over_by_scan_vendored_and_reverts_t
     let (code, env) = scan_mode(root, &server.uri(), "vendored", &[]);
     assert_eq!(code, 0, "takeover over a digest-less hosted line: {env:#}");
     assert_eq!(env["status"], "success", "{env:#}");
-    let vendor = &env["vendor"];
+    let vendor = &env;
     assert_eq!(vendor["summary"]["applied"], 1, "{env:#}");
     assert_eq!(vendor["summary"]["failed"], 0, "{env:#}");
     find_event(vendor, "skipped", Some("vendor_takeover_reverted_redirect"));
@@ -787,7 +809,7 @@ async fn bun_digestless_vendored_line_is_taken_over_by_scan_hosted_and_rolls_bac
 
     let (code, env) = scan_mode(root, &server.uri(), "vendored", &[]);
     assert_eq!(code, 0, "{env:#}");
-    assert_eq!(env["vendor"]["summary"]["applied"], 1, "{env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
     let digestless = drop_digest_in_lock(root, NAME);
     assert!(
         digestless.contains(&vendored_rel_tgz()),
@@ -802,7 +824,7 @@ async fn bun_digestless_vendored_line_is_taken_over_by_scan_hosted_and_rolls_bac
         "takeover over a digest-less vendored line: {env:#}"
     );
     assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pin_count(&env), 1, "{env:#}");
     let codes = redirect_warning_codes(&env);
     assert!(
         codes
@@ -880,8 +902,12 @@ fn bun_scoped_rollback_and_remove_of_a_digestless_hosted_record_unwind_only_that
             "scoped {verb} over a digest-less hosted line must succeed: {env:#}"
         );
         if verb == "rollback" {
-            assert_eq!(env["hosted"]["reverted"], json!([PURL]), "{env:#}");
-            assert_eq!(env["hosted"]["failed"], json!([]), "{env:#}");
+            assert_eq!(
+                rollback_json::hosted_reverted(&env),
+                json!([PURL]),
+                "{env:#}"
+            );
+            assert_eq!(rollback_json::hosted_failed(&env), json!([]), "{env:#}");
         } else {
             assert!(env["error"].is_null(), "{env:#}");
         }
@@ -1009,8 +1035,12 @@ fn bun_scoped_rollback_of_one_of_two_hosted_records_unwinds_only_that_purl() {
     );
     assert_eq!(code, 0, "scoped rollback must succeed: {env:#}");
     assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(env["hosted"]["reverted"], json!([PURL]), "{env:#}");
-    assert_eq!(env["hosted"]["failed"], json!([]), "{env:#}");
+    assert_eq!(
+        rollback_json::hosted_reverted(&env),
+        json!([PURL]),
+        "{env:#}"
+    );
+    assert_eq!(rollback_json::hosted_failed(&env), json!([]), "{env:#}");
     assert_only_left_pad_unwound(root, &pristine);
 
     // The last pin out: pristine lock, no ledger anywhere.
@@ -1109,8 +1139,8 @@ async fn bun_hosted_refusal_preserves_vendored_v0_workspace() {
     for extra in [&["--dry-run"][..], &[][..]] {
         let (code, env) = scan_mode(root, &server.uri(), "hosted", extra);
         assert_eq!(code, 0, "{env:#}");
-        assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
-        let warnings = env["redirect"]["warnings"].as_array().unwrap();
+        assert_eq!(hosted_pin_count(&env), 0, "{env:#}");
+        let warnings = env["warnings"].as_array().unwrap();
         assert!(
             warnings
                 .iter()
@@ -1454,17 +1484,13 @@ async fn bun_scan_prune_revert_advises_a_forced_reinstall() {
 
     let (code, env) = scan_mode(root, &server.uri(), "vendored", &["--prune"]);
     assert_eq!(code, 0, "{env:#}");
-    assert_eq!(
-        env["gc"]["revertedVendoredEntries"],
-        json!([PURL]),
-        "{env:#}"
-    );
+    assert_eq!(reverted_purls(&env), json!([PURL]), "{env:#}");
     assert_eq!(
         read(root, "bun.lock"),
         pristine,
         "back to the registry line"
     );
-    let advised = env["gc"]["warnings"].as_array().is_some_and(|ws| {
+    let advised = env["warnings"].as_array().is_some_and(|ws| {
         ws.iter().any(|w| {
             w["code"] == "vendor_bun_reinstall_required"
                 && w["detail"].as_str().is_some_and(|d| {
@@ -1473,4 +1499,31 @@ async fn bun_scan_prune_revert_advises_a_forced_reinstall() {
         })
     });
     assert!(advised, "{env:#}");
+}
+
+/// How many hosted pins the run wrote (`applied`) or, on a dry run, would
+/// write (`verified`): the `details.mode: "hosted"` events (v5.0's
+/// `redirect.redirected`).
+fn hosted_pin_count(envelope: &serde_json::Value) -> usize {
+    envelope["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count()
+}
+
+/// The purls the prune GC reverted: its `vendor_reverted` events (v5.0's
+/// `gc.revertedVendoredEntries`).
+fn reverted_purls(envelope: &serde_json::Value) -> serde_json::Value {
+    envelope["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["errorCode"] == "vendor_reverted")
+        .map(|e| e["purl"].clone())
+        .collect()
 }

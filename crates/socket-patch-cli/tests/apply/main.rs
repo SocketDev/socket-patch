@@ -4,6 +4,8 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/rollback_json.rs"]
+mod rollback_json;
 #[path = "../vlt_hosted_common/mod.rs"]
 mod vlt_hosted_common;
 #[path = "../vlt_hosted_common/vendored.rs"]
@@ -16,6 +18,7 @@ mod check_verifies_installed_tree;
 mod cli_gem_variant_mismatch_policy;
 mod covgap_commands_apply;
 mod e2e_safety_advisories;
+mod gem_stale_bundler_plugin;
 mod in_process_gem_config_warning;
 mod in_process_gem_fallback_home;
 mod in_process_gem_multicopy;

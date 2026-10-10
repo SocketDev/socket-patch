@@ -464,6 +464,64 @@ async fn lock_only_pdm_project_redirects_attests_rescans_and_rolls_back() {
     assert_no_ledger(tmp.path());
 }
 
+/// #413: a `static_urls` lock on a project whose `[[tool.pdm.source]]`
+/// named `pypi` replaces PyPI with a private mirror. Rollback cannot know
+/// the mirror's file URLs, and restoring PyPI's would make `pdm sync`
+/// bypass the mirror, so both the dry run and the real rollback refuse
+/// (exit 1) and leave the hosted lock in place.
+#[tokio::test]
+#[serial]
+async fn static_urls_lock_on_a_private_index_is_not_rolled_back_to_pypi() {
+    const MIRROR: &str = "http://127.0.0.1:18780";
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = LOCK
+        .replace(
+            "strategy = [\"inherit_metadata\"]",
+            "strategy = [\"inherit_metadata\", \"static_urls\"]",
+        )
+        .replace("{file = \"", &format!("{{url = \"{MIRROR}/files/"));
+    write_project(tmp.path(), &lock);
+    let pyproject = format!(
+        "{PYPROJECT}\n[[tool.pdm.source]]\nname = \"pypi\"\nurl = \"{MIRROR}/simple\"\nverify_ssl = false\n"
+    );
+    std::fs::write(tmp.path().join("pyproject.toml"), &pyproject).unwrap();
+    let lock_path = tmp.path().join("pdm.lock");
+
+    let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
+    assert_eq!(code, 0, "hosted redirect must succeed");
+    let redirected = read(&lock_path);
+    assert!(redirected.contains(HOSTED_URL), "{redirected}");
+
+    mock_pypi(&server).await;
+    std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()));
+    for dry_run in [true, false] {
+        let code = rollback::run(RollbackArgs {
+            targets: Vec::new(),
+            common: GlobalArgs {
+                patch_server_url: Some(PATCH_SERVER.to_string()),
+                dry_run,
+                ..global(tmp.path(), server.uri())
+            },
+            preserve_state: false,
+        })
+        .await;
+        assert_eq!(code, 1, "dry_run={dry_run}: the restore is refused");
+        let after = read(&lock_path);
+        assert!(
+            !after.contains("files.pythonhosted.org"),
+            "dry_run={dry_run}: PyPI URLs must never replace the mirror's: {after}"
+        );
+        assert_eq!(
+            after, redirected,
+            "dry_run={dry_run}: the lock is untouched"
+        );
+    }
+    std::env::remove_var("SOCKET_PYPI_JSON_API");
+    assert_eq!(read(&tmp.path().join("pyproject.toml")), pyproject);
+}
+
 /// A PDM project whose `pyproject.toml` names `hatchling` as its build
 /// backend is still a PDM project. The hatch rewriter claims every pypi uuid
 /// for such a project and then yields to the lock without confirming any, so
@@ -651,13 +709,11 @@ async fn scan_json(
 }
 
 fn stale_warning(json: &serde_json::Value) -> bool {
-    json["redirect"]["warnings"]
-        .as_array()
-        .is_some_and(|warnings| {
-            warnings
-                .iter()
-                .any(|warning| warning["code"] == "redirect_pypi_stale_install")
-        })
+    json["warnings"].as_array().is_some_and(|warnings| {
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "redirect_pypi_stale_install")
+    })
 }
 
 /// Lay `urllib3 1.26.18` with `bytes` as its `response.py` into `site`.

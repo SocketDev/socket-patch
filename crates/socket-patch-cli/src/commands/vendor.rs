@@ -51,7 +51,7 @@ use crate::commands::apply::{representative_file, result_to_event, variant_match
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{
-    ApplyRequest, RevertedEntry, VendorRevertStep, VendoredBackend,
+    ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
@@ -71,11 +71,11 @@ pub struct VendorArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Tolerate missing patch-target files in the staged copy (skip them
-    /// instead of failing) and bypass the variant probe for multi-release
-    /// ecosystems. Not needed for a beforeHash mismatch: vendoring always
-    /// overwrites mismatched content with the verified patched bytes and
-    /// warns (`vendor_content_mismatch_overwritten`).
+    /// Bypass the installed-variant probe for multi-release ecosystems
+    /// (vendor every recorded release variant, not just the one whose
+    /// bytes match the installed copy). Vendoring never reads the
+    /// installed files' content: it commits the patch server's verified
+    /// artifact, so a missing or locally edited file needs no flag.
     #[arg(
         short = 'f',
         long,
@@ -304,8 +304,7 @@ async fn takeover_dry_refusal(
 
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
 /// installed location (site-packages root for pypi, the package dir
-/// otherwise), or a fetched artifact the backend materialises only if it
-/// reaches a branch that reads it. Returns `None` for purls with no vendor
+/// otherwise), when available. Returns `None` for purls with no vendor
 /// backend in this build.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_vendor_one(
@@ -336,24 +335,22 @@ pub(crate) async fn dispatch_vendor_one(
     const SERVICE_ECOSYSTEMS: &[&str] = &[
         "npm", "pypi", "cargo", "golang", "composer", "gem", "nuget", "maven",
     ];
-    if let Some(cfg) = service {
-        if cfg.source.requires_service() && !SERVICE_ECOSYSTEMS.contains(&eco) {
-            return Some(VendorOutcome::Refused {
-                code: "vendor_service_unsupported_ecosystem",
-                detail: format!(
-                    "--vendor-source=service is not supported for `{eco}` \
+    if service.is_some() && !SERVICE_ECOSYSTEMS.contains(&eco) {
+        return Some(VendorOutcome::Refused {
+            code: "vendor_service_unsupported_ecosystem",
+            detail: format!(
+                "--vendor-source=service is not supported for `{eco}` \
                      (prebuilt downloads cover npm, pypi, cargo, golang, composer, \
                      gem, nuget, and maven)"
-                ),
-            });
-        }
+            ),
+        });
     }
     // Every backend takes the identical 9-argument tuple.
     macro_rules! vend {
-        ($backend:path) => {
+        ($backend:path, $source:expr) => {
             $backend(
                 purl,
-                pkg_path,
+                $source,
                 project_root,
                 record,
                 sources,
@@ -365,35 +362,10 @@ pub(crate) async fn dispatch_vendor_one(
             .await
         };
     }
-    // Maven and NuGet have no registry-fetch rung — `fetch_and_stage` serves
-    // no fetcher for either and `stage_local_artifact` is npm-only — so their
-    // source is the crawler's own directory. A ledger-driven maven re-run on
-    // a cold cache gets a deferred hint instead: the committed tree answers
-    // an in-sync re-run, and anything else refuses for the missing jar.
-    macro_rules! vend_installed {
-        ($backend:path) => {{
-            debug_assert!(
-                eco == "maven" || matches!(pkg_path, PackageSource::Installed(_)),
-                "{eco} has no fetch rung; a pending source would need materialising"
-            );
-            $backend(
-                purl,
-                pkg_path.path(),
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }};
-    }
     Some(match eco {
         // The flavor router probes the project's lockfile (package-lock /
         // yarn / pnpm / bun) and dispatches or refuses per flavor.
-        "npm" => vend!(vendor::npm_flavor::vendor_npm_any),
+        "npm" => vend!(vendor::npm_flavor::vendor_npm_any, pkg_path),
         "pypi" => {
             vendor::pypi::vendor_pypi_with_pipenv_version(
                 purl,
@@ -410,12 +382,12 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
-        "gem" => vend!(vendor::gem::vendor_gem),
-        "cargo" => vend!(vendor::cargo::vendor_cargo_crate),
-        "golang" => vend!(vendor::golang::vendor_go_module),
-        "composer" => vend!(vendor::composer_lock::vendor_composer),
-        "nuget" => vend_installed!(vendor::nuget_feed::vendor_nuget),
-        "maven" => vend_installed!(vendor::maven_repo::vendor_maven),
+        "gem" => vend!(vendor::gem::vendor_gem, pkg_path),
+        "cargo" => vend!(vendor::cargo::vendor_cargo_crate, pkg_path),
+        "golang" => vend!(vendor::golang::vendor_go_module, pkg_path),
+        "composer" => vend!(vendor::composer_lock::vendor_composer, pkg_path),
+        "nuget" => vend!(vendor::nuget_feed::vendor_nuget, pkg_path.path()),
+        "maven" => vend!(vendor::maven_repo::vendor_maven, pkg_path.path()),
         _ => return None,
     })
 }
@@ -893,28 +865,33 @@ fn format_revert_install_hint(cmd: &str) -> String {
     )
 }
 
-/// Run-level advisory shared by the `vendor` command and the scan-driven
+/// Run-level advisories shared by the `vendor` command and the scan-driven
 /// vendor step: warn (once, at the envelope level — not per package) when
 /// the project's classic `yarn.lock` carries vendored wiring that a stray
-/// yarn 2+ install would silently drop. The probe is state-based (it reads
-/// the on-disk lockfile), so callers invoke it unconditionally at
-/// envelope-finalize time — unwired projects and fully-reverted runs stay
-/// silent, and dry runs report the risk that already exists on disk.
+/// yarn 2+ install would silently drop, or that installs run from a
+/// workspace member directory cannot fetch (#691). The probes are
+/// state-based (they read the on-disk lockfile), so callers invoke them
+/// unconditionally at envelope-finalize time — unwired projects and
+/// fully-reverted runs stay silent, and dry runs report the risk that
+/// already exists on disk.
 pub(crate) fn note_classic_migration_risk(
     env: &mut Envelope,
     project_root: &Path,
     common: &GlobalArgs,
 ) {
-    let Some(w) = vendor::yarn_classic_berry_migration_risk(project_root) else {
-        return;
-    };
-    if !common.silent && !common.json {
-        eprintln!("Warning: {}", w.detail);
+    let warnings = [
+        vendor::yarn_classic_berry_migration_risk(project_root),
+        vendor::yarn_classic_workspace_member_risk(project_root),
+    ];
+    for w in warnings.into_iter().flatten() {
+        if !common.silent && !common.json {
+            eprintln!("Warning: {}", w.detail);
+        }
+        env.warnings.push(RunWarning {
+            code: w.code.to_string(),
+            detail: w.detail,
+        });
     }
-    env.warnings.push(RunWarning {
-        code: w.code.to_string(),
-        detail: w.detail,
-    });
 }
 
 /// The usage error for `vendor` under global scope, or `None` for a
@@ -953,6 +930,23 @@ pub async fn run(args: VendorArgs) -> i32 {
     }
     if args.check {
         return run_check(&args).await;
+    }
+    // Every other form rewires (or unwires) `--cwd`'s lockfiles and vendor
+    // ledger: a manifest in another project would split the run (#745).
+    // `--check` above reads the manifest's project throughout.
+    let form = if args.revert {
+        "vendor --revert"
+    } else {
+        "vendor"
+    };
+    if let Some(message) = crate::commands::foreign_manifest_conflict(&args.common, form) {
+        return crate::json_envelope::usage_error(
+            Command::Vendor,
+            args.common.json,
+            args.common.dry_run,
+            crate::commands::FOREIGN_MANIFEST_PROJECT,
+            &message,
+        );
     }
     apply_env_toggles(&args.common);
 
@@ -1221,7 +1215,10 @@ async fn run_check(args: &VendorArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
     let manifest = match read_manifest(&manifest_path).await {
         Ok(m) => m.unwrap_or_default(),
-        Err(e) => return emit_eject_refusal(&args.common, "manifest_unreadable", &e.to_string()),
+        Err(e) => {
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            return emit_eject_refusal(&args.common, &err.code, &err.message);
+        }
     };
     let mut entries: Vec<_> = state.entries.iter().collect();
     entries.sort_by_key(|(key, _)| *key);
@@ -1236,6 +1233,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     } else {
         None
     };
+    let go_sync_issues = tokio::sync::OnceCell::new();
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1266,6 +1264,26 @@ async fn run_check(args: &VendorArgs) -> i32 {
             // `vex`'s `vendor_unwired`.
             if !discovery.vendor_entry_live(root, entry).await {
                 failure = Some(unwired_check_failure(discovery, root, key, entry).await);
+            }
+        }
+        // The committed copy and its `replace` can be intact while the
+        // project no longer builds: vendor/modules.txt or the go.mod
+        // requirements out of step with the `replace` (#343, #618).
+        if failure.is_none() && entry.ecosystem == "golang" {
+            if let Some((module, _)) = socket_patch_core::utils::purl::parse_golang_purl(key) {
+                let issues: Vec<String> = go_sync_issues
+                    .get_or_init(|| async {
+                        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new())
+                            .await
+                    })
+                    .await
+                    .iter()
+                    .filter(|issue| issue.module() == module)
+                    .map(ToString::to_string)
+                    .collect();
+                if !issues.is_empty() {
+                    failure = Some(issues.join("; "));
+                }
             }
         }
         if vendor::jvm::apply::upstream_unverified(entry) {
@@ -1347,7 +1365,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
 
 /// A refused eject: the JSON error envelope (`status: error`) or an
 /// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
-fn emit_eject_refusal(common: &GlobalArgs, code: &'static str, message: &str) -> i32 {
+fn emit_eject_refusal(common: &GlobalArgs, code: &str, message: &str) -> i32 {
     if common.json {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = common.dry_run;
@@ -2130,7 +2148,10 @@ async fn run_vendor(
         Ok(Some(m)) => m,
         Ok(None) => return 0, // vanished since the existence check (TOCTOU)
         Err(e) => {
-            env.mark_error(EnvelopeError::new("invalid_manifest", e.to_string()));
+            // The shared manifest-load mapping (#931): `manifest_invalid`
+            // for unparseable JSON / a schema violation, else
+            // `manifest_unreadable`.
+            env.mark_error(crate::json_envelope::manifest_load_error(manifest_path, &e));
             if !common.json {
                 eprintln!("Error: Could not read manifest: {e}");
             }
@@ -3778,6 +3799,22 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
+    // A vendored Go module builds only if the committed vendor/modules.txt
+    // and the go.mod requirements agree with its `replace` (#343, #618).
+    if !common.dry_run && records.keys().any(|p| p.starts_with("pkg:golang/")) {
+        let warnings = socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+            &common.cwd,
+            &HashMap::new(),
+        )
+        .await;
+        for (code, detail) in warnings {
+            if !common.json && !common.silent {
+                eprintln!("Warning: {detail}");
+            }
+            env.warnings.push(RunWarning { code, detail });
+        }
+    }
+
     // A rolled-back eject's summary would describe a vendoring that was
     // undone: the eject prints it itself once it knows the outcome (#1005).
     match eject {
@@ -3858,7 +3895,11 @@ fn print_vendor_closing(
                 &common.cwd.join("composer.lock"),
             ) {
                 let packages = super::composer_hints::vendored_composer_packages(&lock);
-                extra.extend(super::composer_hints::vendored_reinstall_hints(&packages));
+                let vendor_dir = super::composer_hints::vendor_dir_label(&common.cwd);
+                extra.extend(super::composer_hints::vendored_reinstall_hints(
+                    &packages,
+                    &vendor_dir,
+                ));
             }
         }
         for line in crate::ui::next_steps(&commit, &reinstall, &extra) {
@@ -4105,11 +4146,22 @@ pub(crate) async fn reconcile_dropped(
             // Drift-skip keep: the backend left the drifted lock alone and
             // kept the artifacts, so the ledger entry must survive too — and
             // the genuine outcome is a COUNTED skip, not a removal.
-            VendorRevertStep::Kept => env.record(
+            VendorRevertStep::Kept(KeepCause::Drift) => env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_revert_kept",
                     "patch no longer in manifest, but its lock entries drifted since \
                      vendoring; artifacts and ledger entry kept",
+                ),
+            ),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    format!(
+                        "patch no longer in manifest, but {}; artifacts and ledger entry \
+                         kept — {}",
+                        cause.reason(),
+                        cause.remedy("re-run `vendor`")
+                    ),
                 ),
             ),
             VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
@@ -4208,11 +4260,21 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             // the genuine outcome is a COUNTED skip, not a removal.
             // (`record_warning` above already surfaced the per-record
             // details as uncounted advisory events.)
-            VendorRevertStep::Kept => env.record(
+            VendorRevertStep::Kept(KeepCause::Drift) => env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_revert_kept",
                     "lock entries drifted since vendoring; artifacts and ledger entry kept \
                      — undo the drift and re-run `vendor --revert` to finish",
+                ),
+            ),
+            VendorRevertStep::Kept(cause @ KeepCause::Reference) => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    format!(
+                        "{}; artifacts and ledger entry kept — {}",
+                        cause.reason(),
+                        cause.remedy("re-run `vendor --revert` to finish")
+                    ),
                 ),
             ),
             VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
@@ -4403,8 +4465,10 @@ pub(crate) struct VendorGcSummary {
     pub write_failures: Vec<(&'static str, String)>,
     /// The wet reverts' reinstall advisories (`code`, `detail`): Bun's
     /// `vendor_bun_reinstall_required` (#764) and vlt's
-    /// `vendor_vlt_reinstall_required`. Every other reverting command
-    /// surfaces these, and the GC must not drop them.
+    /// `vendor_vlt_reinstall_required`, and, for a manifest-dropped PyPI
+    /// entry under PDM, uv or Pipenv, `vendor_pypi_reinstall_required`
+    /// (#477). Every other reverting command surfaces these, and the GC
+    /// must not drop them.
     pub advisories: Vec<(&'static str, String)>,
 }
 
@@ -4417,6 +4481,7 @@ pub(crate) struct VendorGcSummary {
 const GC_FORWARDED_ADVISORIES: &[&str] = &[
     socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED,
     socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED,
+    crate::commands::pypi_reinstall::VENDOR_CODE,
 ];
 
 impl VendorGcSummary {
@@ -4495,8 +4560,13 @@ pub(crate) async fn run_vendor_gc(
     manifest_path: &Path,
     dry_run: bool,
 ) -> VendorGcSummary {
+    // The ledger, its artifacts and their wiring are the manifest's
+    // project's (#745): an agent-mode `scan --prune --manifest-path ../b/…`
+    // collects b's vendored state, never `--cwd`'s.
+    let rooted = common.at_project_root();
+    let common: &GlobalArgs = &rooted;
     let mut out = VendorGcSummary::default();
-    let mut state = match load_state(&common.cwd).await {
+    let mut state = match load_state(&common.project_root()).await {
         Ok(s) if !s.entries.is_empty() => s,
         // No ledger (or unreadable): only the orphan sweep could apply, and
         // without a trustworthy ledger it must not delete anything.
@@ -4520,7 +4590,19 @@ pub(crate) async fn run_vendor_gc(
                 continue;
             }
             let entry = state.entries.get(&purl).cloned().expect("listed above");
-            let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            let mut outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            // The patch left the manifest while the package stays locked:
+            // the restored lock pins the version the vendored build is
+            // installed as, which PDM, uv and Pipenv keep (#477).
+            if outcome.success && !outcome.kept_artifact {
+                crate::commands::pypi_reinstall::push_vendor_advisory(
+                    &common.cwd,
+                    &purl,
+                    entry.flavor.as_deref(),
+                    &mut outcome.warnings,
+                )
+                .await;
+            }
             out.take_advisories(&outcome);
             if !outcome.success {
                 out.failed.push(purl);
@@ -4598,7 +4680,7 @@ pub(crate) async fn run_vendor_gc(
         // artifacts; a failed ledger/manifest rewrite leaves records for
         // state that is gone, which must not pass silently.
         if ledger_dirty {
-            if let Err(e) = save_state(&common.cwd, &state).await {
+            if let Err(e) = save_state(&common.project_root(), &state).await {
                 let detail = format!(
                     "reverted vendored entries but could not update \
                      .socket/vendor/state.json: {e}"
@@ -4663,7 +4745,6 @@ mod dispatch_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
         let service = GlobalArgs {
@@ -5047,7 +5128,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5130,7 +5210,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5190,28 +5269,21 @@ mod variant_probe_tests {
     /// A ledger entry recording the wheel variant as vendored at `uuid`.
     fn wheel_entry(uuid: &str) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: BASE.into(),
-            uuid: uuid.into(),
-            artifact: socket_patch_core::vendor::state::VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/pypi/{uuid}/foo-1.0.0-py3-none-any.whl"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("requirements".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "pypi".into(),
+                BASE.into(),
+                uuid.into(),
+                socket_patch_core::vendor::state::VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/pypi/{uuid}/foo-1.0.0-py3-none-any.whl"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 
@@ -5243,7 +5315,6 @@ mod variant_probe_tests {
             let common = dry_run_over(tmp.path(), &site);
             let sources = PatchSources {
                 blobs_path: tmp.path(),
-                diffs_path: None,
                 mem_blobs: None,
             };
             let mut state = VendorState::default();
@@ -5295,7 +5366,6 @@ mod variant_probe_tests {
         let common = dry_run_over(tmp.path(), &site);
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5354,7 +5424,6 @@ mod variant_probe_tests {
         let common = dry_run_over(tmp.path(), &site);
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5452,28 +5521,22 @@ mod gc_tests {
 
     fn entry(detached: bool) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: PURL.into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             detached,
-            record: None,
             flavor: Some("package-lock".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                PURL.into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 
@@ -5799,7 +5862,7 @@ mod gc_tests {
     /// listed exactly once. The wet pass removes it from the ledger in (a)
     /// before (b) runs; the dry-run preview leaves the ledger untouched, so
     /// without excluding (a)-handled purls from (b) the same purl lands in
-    /// both lists and `scan --prune`'s `revertableVendoredEntries` preview
+    /// both lists and `scan --prune --dry-run`'s `revertedVendoredEntries` preview
     /// duplicates it (breaking preview/wet parity).
     #[tokio::test]
     async fn vendor_gc_dry_run_lists_dropped_and_unused_entry_once() {
@@ -6637,11 +6700,11 @@ mod revert_dispatch_tests {
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
     fn entry_for(eco: &str, base_purl: &str) -> VendorEntry {
-        VendorEntry {
-            ecosystem: eco.into(),
-            base_purl: base_purl.into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            eco.into(),
+            base_purl.into(),
+            UUID.into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: format!(".socket/vendor/{eco}/{UUID}/artifact"),
                 sha256: String::new(),
@@ -6649,18 +6712,8 @@ mod revert_dispatch_tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+            Vec::new(),
+        )
     }
 
     /// The nuget and maven revert arms must route to their real backends —
@@ -6748,28 +6801,21 @@ mod persist_tests {
 
     fn npm_entry(base_purl: &str, uuid: &str) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: base_purl.into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/npm/{uuid}/pkg.tgz"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("package-lock".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                base_purl.into(),
+                uuid.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/npm/{uuid}/pkg.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 
@@ -7372,11 +7418,11 @@ mod unused_vendored_manifest_keys_tests {
     /// A ledger entry whose base purl is `base_purl`; only the purl
     /// matters to the manifest-key relation.
     fn entry(ecosystem: &str, base_purl: &str) -> VendorEntry {
-        VendorEntry {
-            ecosystem: ecosystem.into(),
-            base_purl: base_purl.into(),
-            uuid: "11111111-1111-4111-8111-111111111111".into(),
-            artifact: VendorArtifact {
+        VendorEntry::new(
+            ecosystem.into(),
+            base_purl.into(),
+            "11111111-1111-4111-8111-111111111111".into(),
+            VendorArtifact {
                 yarn_berry10c0: None,
                 path: String::new(),
                 sha256: String::new(),
@@ -7384,18 +7430,8 @@ mod unused_vendored_manifest_keys_tests {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: None,
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        }
+            Vec::new(),
+        )
     }
 
     /// The keys an unused ledger entry `key` (base purl = the key) owns.

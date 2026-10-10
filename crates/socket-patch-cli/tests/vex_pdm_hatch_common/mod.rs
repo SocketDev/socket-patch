@@ -1234,7 +1234,12 @@ pub fn embedded_rescan_of_a_manifest_less_checkout(
         match mode {
             Mode::Vendored => {
                 assert_eq!(code, Some(1), "{what}: {env}\n{stderr}");
-                let refusal = env["vendor"]["events"][0]["errorCode"].as_str();
+                // The vendor engine's refusal: the first `failed` event (the
+                // download phase records the fetched patch as `downloaded`).
+                let refusal = env["events"]
+                    .as_array()
+                    .and_then(|e| e.iter().find(|e| e["action"] == "failed"))
+                    .and_then(|e| e["errorCode"].as_str());
                 assert!(
                     refusal == Some("vendor_ledger_entry_missing")
                         || (expect_refusal.is_some() && refusal == expect_refusal),

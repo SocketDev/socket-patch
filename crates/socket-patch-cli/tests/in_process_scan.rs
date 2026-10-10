@@ -74,7 +74,6 @@ fn default_args(cwd: &Path) -> ScanArgs {
             global_prefix: None,
             api_token: Some("fake".to_string()),
             ecosystems: None,
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
@@ -930,10 +929,13 @@ async fn scan_non_json_with_patches_prints_table() {
 
     let code = run_scrubbed(args).await;
     // Non-JSON path: discovery → batch query → render table → fetch
-    // per-package details. We only mount the batch mock, so detail-fetch
-    // 404s and scan exits 1 ("Error: could not fetch patch details"). That exit is
-    // deterministic given these mocks.
-    assert_eq!(code, 1, "missing detail mock → detail fetch fails → exit 1");
+    // per-package details. We only mount the batch mock, so the detail
+    // query 404s, which the client reads as "no records": nothing to
+    // select, a clean exit 0, exactly like the `--json` arm (#1062).
+    assert_eq!(
+        code, 0,
+        "an empty detail result is no patch to apply, not a failure"
+    );
     // Prove the table-rendering path actually ran against real discovered
     // data: the batch endpoint was queried with the package, and the path
     // proceeded to the per-package detail fetch (i.e. it had a row to print).
@@ -1429,9 +1431,16 @@ async fn scan_discovers_maven_and_nuget_in_every_mode() {
 
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
-    // Maven: java-project marker + a local repository the crawler reaches
-    // via MAVEN_REPO_LOCAL (verified by the version dir's `.pom`).
-    std::fs::write(tmp.path().join("pom.xml"), "<project></project>\n").unwrap();
+    // Maven: a pom declaring the artifact (a project-mode crawl keeps only
+    // what the project's poms reach, #265) + a local repository the crawler
+    // reaches via MAVEN_REPO_LOCAL (verified by the version dir's `.pom`).
+    std::fs::write(
+        tmp.path().join("pom.xml"),
+        "<project><dependencies><dependency><groupId>org.example</groupId>\
+         <artifactId>foo</artifactId><version>1.0.0</version></dependency>\
+         </dependencies></project>\n",
+    )
+    .unwrap();
     let artifact_dir = tmp.path().join("m2repo/org/example/foo/1.0.0");
     std::fs::create_dir_all(&artifact_dir).unwrap();
     std::fs::write(artifact_dir.join("foo-1.0.0.pom"), "<project/>").unwrap();

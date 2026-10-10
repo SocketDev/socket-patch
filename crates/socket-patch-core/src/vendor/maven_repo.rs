@@ -31,7 +31,7 @@ use super::common::{
 };
 use super::path::vendor_uuid_dir_rel;
 use super::revert::{self, KeepPolicy};
-use super::service_fetch::{service_archive_copy, ServiceCopy};
+use super::service_fetch::service_archive_copy;
 use super::state::{VendorArtifact, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -163,11 +163,11 @@ fn maven_entry(
     jar_bytes: &[u8],
     wiring: Vec<WiringRecord>,
 ) -> VendorEntry {
-    VendorEntry {
-        ecosystem: "maven".to_string(),
+    VendorEntry::new(
+        "maven".to_string(),
         base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
+        record.uuid.clone(),
+        VendorArtifact {
             yarn_berry10c0: None,
             // A `.jar` is a single verifiable file; record its plain sha256 for
             // tooling (harvest re-derives per-entry git hashes from the zip, so
@@ -179,17 +179,7 @@ fn maven_entry(
             file_inventory: None,
         },
         wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    }
+    )
 }
 
 /// Revert a Maven vendor entry. A JVM entry goes to the planner's revert;
@@ -562,8 +552,29 @@ pub async fn jvm_gate_preflight(
     }
     let shape = detect_shape(project_root);
     super::jvm::sbt_gate::for_shape(shape, project_root, &g, &a, &v)
-        .map(|_| ())
-        .map_err(|stop| stop.code_and_detail(purl))
+        .map_err(|stop| stop.code_and_detail(purl))?;
+    // Checked here too, so a hosted->vendored takeover keeps its pin
+    // instead of restoring upstream and then refusing (#1061).
+    match ignored_tree_root(shape, project_root).await {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// The `vendor_artifact_gitignored` refusal when git ignores a tree root
+/// `shape` writes into. Each tree root owns a `!*` `.gitignore` that
+/// re-includes file rules such as Java.gitignore's `*.jar` (#1061), but a
+/// rule ignoring the root itself (`.socket/`) can't be undone from inside.
+async fn ignored_tree_root(
+    shape: super::jvm::Shape,
+    project_root: &Path,
+) -> Option<(&'static str, String)> {
+    for tree in super::jvm::shape_trees(shape) {
+        if let Some(refusal) = super::npm_dir::ignored_root_refusal(project_root, tree).await {
+            return Some(refusal);
+        }
+    }
+    None
 }
 
 /// The committed tree bytes for `record` (jar, upstream pom, module, and
@@ -696,6 +707,10 @@ async fn jvm_prelude(
     let gate_pass =
         super::jvm::sbt_gate::for_shape(shape, project_root, &group_id, &artifact_id, &version)
             .map_err(|stop| stop.into_outcome(purl))?;
+    // The tree must survive the commit the vendored workflow ends with.
+    if let Some((code, detail)) = ignored_tree_root(shape, project_root).await {
+        return Err(refused(code, detail));
+    }
     Ok(JvmPrelude {
         group_id,
         artifact_id,
@@ -793,11 +808,11 @@ async fn vendor_maven_jvm(
                 match service_archive_copy(service, record, &artifact_id, ".jar", &mut warnings)
                     .await
                 {
-                    ServiceCopy::Used(bytes) => (
+                    Ok(bytes) => (
                         bytes,
                         already_patched_result(purl, &display_path, &record.files),
                     ),
-                    ServiceCopy::HardFail(outcome) => return *outcome,
+                    Err(outcome) => return *outcome,
                 };
             if !result.success {
                 return done(result, None, warnings);
@@ -936,6 +951,17 @@ async fn vendor_maven_jvm(
         // The pin records the gate's digest (every build source).
         Shape::Sbt => {
             super::jvm::sbt::plan_with_digest(&read, &patch, gate_pass.deps_digest.as_deref())
+        }
+        Shape::MavenReactor | Shape::Mixed => {
+            let external = external_maven_poms(&read, &patch, &local, service).await;
+            super::jvm::plan_with_external(
+                shape,
+                &read,
+                &list,
+                &patch,
+                config_enabled,
+                Some(&external),
+            )
         }
         _ => super::jvm::plan_with_config(shape, &read, &list, &patch, config_enabled),
     };
@@ -1310,6 +1336,31 @@ async fn collect_gradle_metadata(
     Ok(model.properties)
 }
 
+/// The poms outside the checkout (external parents, imported BOMs) the
+/// reactor planner weighs a pin against (#488), from the local caches or
+/// the registry like any upstream metadata; one that neither has is
+/// recorded unavailable, and the planner then leaves that root unpinned.
+async fn external_maven_poms(
+    read: super::jvm::ReadFn<'_>,
+    patch: &super::jvm::JvmPatch<'_>,
+    local: &LocalSources,
+    service: Option<&VendorServiceConfig>,
+) -> super::jvm::maven_reactor::ExternalPoms {
+    let mut known = super::jvm::maven_reactor::ExternalPoms::new();
+    loop {
+        let need = super::jvm::maven_reactor::external_poms_needed(read, patch, &known);
+        if need.is_empty() {
+            return known;
+        }
+        for (g, a, v) in need {
+            let bytes = acquire_upstream_metadata(local, &g, &a, &v, "pom", service)
+                .await
+                .ok();
+            known.insert((g, a, v), bytes);
+        }
+    }
+}
+
 /// A parent's or BOM's metadata file: the local caches only (never the
 /// patched GAV's own directory), else the registry.
 async fn acquire_upstream_metadata(
@@ -1373,7 +1424,15 @@ async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
     fetch_registry_bytes(url, MAX_POM_BYTES as u64).await
 }
 
+/// Bounded HTTP GET from a Maven registry. Errors quote the URL redacted
+/// (a mirror's userinfo, reqwest's own error text included).
 pub(crate) async fn fetch_registry_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
+    fetch_registry_bytes_unredacted(url, cap)
+        .await
+        .map_err(|e| crate::utils::redact::redact_urls_in(&e).into_owned())
+}
+
+async fn fetch_registry_bytes_unredacted(url: &str, cap: u64) -> Result<Vec<u8>, String> {
     let client = super::registry_fetch::registry_client_builder(MAVEN_USER_AGENT)
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
@@ -1929,6 +1988,109 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert_eq!(entry.unwrap().ecosystem, layout::LEDGER_ECOSYSTEM);
         assert!(root.join(".socket/vendor/gradle-index.tsv").is_file());
+    }
+
+    /// The JVM shapes #1061 names, each as a fresh project: a single-module
+    /// pom, a multi-module reactor and a Gradle-only build.
+    async fn jvm_shape_fixture(shape: &str) -> (tempfile::TempDir, PathBuf, PathBuf, PatchRecord) {
+        match shape {
+            "pom" => fixture(Some(project_pom()), true, true).await,
+            "reactor" => reactor_fixture(true).await,
+            _ => {
+                let fx = fixture(None, true, true).await;
+                std::fs::write(fx.0.path().join("build.gradle"), "plugins { id 'java' }\n")
+                    .unwrap();
+                fx
+            }
+        }
+    }
+
+    /// Every file under `.socket/` (relative, `/`-separated).
+    fn socket_files(root: &Path) -> Vec<String> {
+        crate::vendor::test_support::tree_snapshot(root)
+            .into_keys()
+            .filter(|rel| rel.starts_with(".socket/"))
+            .collect()
+    }
+
+    /// #1061 (and #620): GitHub's stock Java.gitignore ignores `*.jar`.
+    /// Vendoring a Maven, reactor or Gradle project must still leave every
+    /// written tree file committable (the tree roots re-include them), and
+    /// revert removes the re-include it created.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_jar_ignore_rule_is_overridden_by_the_tree_gitignore() {
+        use crate::vendor::test_support::{git_project, JAVA_GITIGNORE};
+        for shape in ["pom", "reactor", "gradle"] {
+            let (dir, blobs, installed, record) = jvm_shape_fixture(shape).await;
+            let root = dir.path();
+            if git_project(root, JAVA_GITIGNORE).is_none() {
+                return;
+            }
+            let (result, entry, _) =
+                unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+            assert!(result.success, "{shape}: {:?}", result.error);
+            let entry = entry.expect("ledger entry");
+            assert!(entry.artifact.path.ends_with(".jar"), "{shape}");
+            let written = socket_files(root);
+            assert!(
+                written.contains(&entry.artifact.path),
+                "{shape}: {written:?}"
+            );
+            assert_eq!(
+                crate::vendor::npm_dir::gitignored(root, &written).await,
+                None,
+                "{shape}: git commits every vendored file"
+            );
+
+            let reverted = revert_maven(&entry, root, false).await;
+            assert!(reverted.success, "{shape}: {reverted:?}");
+            let left = socket_files(root)
+                .into_iter()
+                .filter(|rel| rel.ends_with(".gitignore"))
+                .collect::<Vec<_>>();
+            assert!(left.is_empty(), "{shape}: revert leaves {left:?}");
+        }
+    }
+
+    /// #1061: a rule that ignores the vendor tree itself (`.socket/`) can't
+    /// be overridden from inside it, so every JVM shape refuses
+    /// `vendor_artifact_gitignored` before writing, dry run included.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_jvm_tree_directory_ignore_rule_refuses_before_any_write() {
+        use crate::vendor::test_support::git_project;
+        for shape in ["pom", "reactor", "gradle"] {
+            for rule in [".socket/", ".socket/vendor/"] {
+                for dry_run in [false, true] {
+                    let (dir, blobs, installed, record) = jvm_shape_fixture(shape).await;
+                    let root = dir.path();
+                    if git_project(root, &format!("{rule}\n")).is_none() {
+                        return;
+                    }
+                    let before = crate::vendor::test_support::tree_snapshot(root);
+                    let (code, detail) = unwrap_refused(
+                        run_vendor(root, &blobs, &installed, &record, dry_run).await,
+                    );
+                    assert_eq!(
+                        code, "vendor_artifact_gitignored",
+                        "{shape} {rule}: {detail}"
+                    );
+                    assert!(detail.contains(rule), "{shape} {rule}: {detail}");
+                    assert_eq!(
+                        crate::vendor::test_support::tree_snapshot(root),
+                        before,
+                        "{shape} {rule}: nothing written"
+                    );
+                    // The takeover gate refuses too, before any restore.
+                    assert_eq!(
+                        jvm_gate_preflight(root, PURL).await.map_err(|(c, _)| c),
+                        Err("vendor_artifact_gitignored"),
+                        "{shape} {rule}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -246,6 +246,16 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_NPM_SHRINKWRAP_ONLY,
             "not attested until a package-lock.json wires it",
         ),
+        UnattestedKind::MavenReactorRoot => (
+            NOTE_MAVEN_REACTOR_ROOT,
+            "not attested while the root declares modules (roll it back and re-patch the \
+             reactor with `scan --mode vendored`)",
+        ),
+        UnattestedKind::MavenClassifierUnpatched => (
+            NOTE_MAVEN_CLASSIFIER_UNPATCHED,
+            "not attested while that classifier copy resolves an unpatched version; the \
+             wiring itself is intact, so re-running `scan` does not change this",
+        ),
     }
 }
 
@@ -253,6 +263,13 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
 /// `npm-shrinkwrap.json` with no `package-lock.json` twin, which npm >= 12
 /// never reads (`vex::Unattested`, #899).
 pub(crate) const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
+/// Omission tag and note: a hosted Maven pin sits in a reactor root, where a
+/// module's own `<version>` may override it (`vex::Unattested`, #261).
+pub(crate) const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
+/// Omission tag and note: a hosted Maven pin's GA also has an executable
+/// classifier copy at another version, which the pin does not reach
+/// (`vex::Unattested`).
+pub(crate) const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
 
 fn note(code: &'static str, detail: String) -> PlanNote {
     PlanNote { code, detail }
@@ -339,7 +356,10 @@ pub(crate) async fn plan(
     assume_live: &[String],
     api_client: &RunApiClient,
 ) -> Plan {
-    let root = common.cwd.as_path();
+    // The ledgers' project (#745): liveness and JVM wiring are judged where
+    // the ledger and the discovery that gates it were read.
+    let root_buf = common.project_root();
+    let root = root_buf.as_path();
     let Sources {
         manifest,
         vendor,
@@ -846,20 +866,6 @@ fn vendored_entry_for(cand: &Cand, vref: &PatchedRef) -> VendorEntry {
     let eco = vendor_ref(wired).map(|v| v.eco).unwrap_or_default();
     let source = vref.source_file.to_string_lossy();
     VendorEntry {
-        ecosystem: eco,
-        base_purl: strip_purl_qualifiers(&cand.key).to_string(),
-        uuid: vref.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: wired.to_string(),
-            sha256: String::new(),
-            size: None,
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring: Vec::new(),
-        lock: None,
-        took_over_go_patches: false,
         // Bun's workspace-mirror integrity check and the vlt package-dir
         // verifier (structure rule, manifest exemption by the local blob,
         // since there is no inventory pin) key off the flavor.
@@ -868,13 +874,21 @@ fn vendored_entry_for(cand: &Cand, vref: &PatchedRef) -> VendorEntry {
             "vlt-lock.json" => Some("vlt".to_string()),
             _ => None,
         },
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
         detached: true,
-        record: None,
+        ..VendorEntry::new(
+            eco,
+            strip_purl_qualifiers(&cand.key).to_string(),
+            vref.uuid.clone(),
+            VendorArtifact {
+                yarn_berry10c0: None,
+                path: wired.to_string(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            Vec::new(),
+        )
     }
 }
 
@@ -1502,28 +1516,22 @@ mod tests {
         vendor.entries.insert(
             key.into(),
             VendorEntry {
-                ecosystem: "npm".into(),
-                base_purl: key.into(),
-                uuid: U1.into(),
-                artifact: VendorArtifact {
-                    yarn_berry10c0: None,
-                    path: format!(".socket/vendor/npm/{U1}/x-1.0.0.tgz"),
-                    sha256: String::new(),
-                    size: None,
-                    platform_locked: None,
-                    file_inventory: None,
-                },
-                wiring: Vec::new(),
-                lock: None,
-                took_over_go_patches: false,
-                flavor: None,
-                uv: None,
-                pnpm: None,
-                poetry: None,
-                pdm: None,
-                pipenv: None,
                 detached: true,
                 record: Some(record(U1)),
+                ..VendorEntry::new(
+                    "npm".into(),
+                    key.into(),
+                    U1.into(),
+                    VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: format!(".socket/vendor/npm/{U1}/x-1.0.0.tgz"),
+                        sha256: String::new(),
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    Vec::new(),
+                )
             },
         );
         let mut redirect = RedirectState::new();
@@ -1582,35 +1590,29 @@ mod tests {
         vendor.entries.insert(
             "pkg:npm/x@1.0.0".into(),
             VendorEntry {
-                ecosystem: "npm".into(),
-                base_purl: "pkg:npm/x@1.0.0".into(),
-                uuid: U1.into(),
-                artifact: VendorArtifact {
-                    yarn_berry10c0: None,
-                    path: rel.clone(),
-                    sha256: String::new(),
-                    size: None,
-                    platform_locked: None,
-                    file_inventory: None,
-                },
-                wiring: vec![WiringRecord {
-                    file: "yarn.lock".into(),
-                    kind: "yarn_lock_entry".into(),
-                    action: WiringAction::Rewritten,
-                    key: None,
-                    original: None,
-                    new: None,
-                }],
-                lock: None,
-                took_over_go_patches: false,
-                flavor: None,
-                uv: None,
-                pnpm: None,
-                poetry: None,
-                pdm: None,
-                pipenv: None,
                 detached: true,
                 record: Some(record(U1)),
+                ..VendorEntry::new(
+                    "npm".into(),
+                    "pkg:npm/x@1.0.0".into(),
+                    U1.into(),
+                    VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: rel.clone(),
+                        sha256: String::new(),
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    vec![WiringRecord {
+                        file: "yarn.lock".into(),
+                        kind: "yarn_lock_entry".into(),
+                        action: WiringAction::Rewritten,
+                        key: None,
+                        original: None,
+                        new: None,
+                    }],
+                )
             },
         );
         let mut redirect = RedirectState::new();

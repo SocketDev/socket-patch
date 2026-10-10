@@ -120,11 +120,11 @@ async fn get_by_uuid_not_found_emits_envelope() {
         "not_found is a clean (non-error) outcome; stderr={stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "not_found");
-    assert_eq!(v["found"], 0);
-    assert_eq!(v["downloaded"], 0);
-    assert_eq!(v["applied"], 0);
-    assert_eq!(v["patches"].as_array().expect("patches array").len(), 0);
+    assert_eq!(v["status"], "notFound");
+    assert_eq!(v["events"], serde_json::json!([]));
+    assert_eq!(v["summary"]["downloaded"], 0);
+    assert_eq!(v["summary"]["applied"], 0);
+    assert_eq!(v["events"].as_array().expect("patches array").len(), 0);
     // A 404 must never leave a manifest behind.
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
@@ -221,18 +221,20 @@ fn assert_blob_written(root: &Path, after_hash: &str, expected: &[u8]) {
 /// downloaded, or a silent auto-apply) from masquerading as success.
 fn assert_single_save_only_success(v: &serde_json::Value, purl: &str, uuid: &str) {
     assert_eq!(v["status"], "success", "expected success envelope; got {v}");
-    assert_eq!(v["found"], 1, "exactly one patch must be found; got {v}");
-    assert_eq!(v["downloaded"], 1, "the patch must be downloaded; got {v}");
     assert_eq!(
-        v["applied"], 0,
+        v["summary"]["downloaded"], 1,
+        "the patch must be downloaded; got {v}"
+    );
+    assert_eq!(
+        v["summary"]["applied"], 0,
         "--save-only must not apply the patch; got {v}"
     );
-    let patches = v["patches"].as_array().expect("patches array");
+    let patches = v["events"].as_array().expect("patches array");
     assert_eq!(patches.len(), 1, "exactly one patch record; got {v}");
     assert_eq!(patches[0]["purl"], purl, "record must echo purl; got {v}");
     assert_eq!(patches[0]["uuid"], uuid, "record must echo uuid; got {v}");
     assert_eq!(
-        patches[0]["action"], "added",
+        patches[0]["action"], "downloaded",
         "a freshly saved patch must be reported as added; got {v}"
     );
 }
@@ -254,8 +256,8 @@ async fn get_by_cve_no_match_emits_not_found() {
     let (code, stdout, stderr) = run_get(tmp.path(), &mock.uri(), cve, &[]);
     assert_eq!(code, 0, "empty CVE search is not an error; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "not_found");
-    assert_eq!(v["found"], 0);
+    assert_eq!(v["status"], "notFound");
+    assert_eq!(v["events"], serde_json::json!([]));
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "empty CVE search must not write a manifest"
@@ -401,7 +403,7 @@ async fn get_multiple_patches_in_json_mode_returns_selection_required() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
-        v["status"], "selection_required",
+        v["status"], "selectionRequired",
         "multi-patch JSON path must emit selection_required, never success/auto-pick; got {v}"
     );
     assert_eq!(v["purl"], purl, "envelope must echo the queried purl");
@@ -487,16 +489,15 @@ async fn get_uuid_paid_patch_via_public_proxy_emits_paid_required_envelope() {
         "paid_required must exit 0; stdout={stdout}; stderr={stderr}"
     );
     assert_eq!(
-        v["status"], "paid_required",
+        v["status"], "paidRequired",
         "UUID-fetched paid patch via public proxy must emit paid_required; got {v}"
     );
-    assert_eq!(v["found"], 1);
-    assert_eq!(v["downloaded"], 0);
-    assert_eq!(v["applied"], 0);
-    let patches = v["patches"].as_array().expect("patches array");
+    assert_eq!(v["summary"]["downloaded"], 0);
+    assert_eq!(v["summary"]["applied"], 0);
+    let patches = v["events"].as_array().expect("patches array");
     assert_eq!(patches.len(), 1);
     assert_eq!(patches[0]["uuid"], UUID);
-    assert_eq!(patches[0]["tier"], "paid");
+    assert_eq!(patches[0]["details"]["tier"], "paid");
     // A paid patch is never downloaded, so no manifest may be written.
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
@@ -561,19 +562,18 @@ async fn get_paid_patch_via_public_proxy_returns_paid_required() {
         "paid_required must exit 0; stdout={stdout}; stderr={stderr}"
     );
     assert_eq!(
-        v["status"], "paid_required",
+        v["status"], "paidRequired",
         "paid patch without token must emit paid_required; got: {v}"
     );
     assert_eq!(
-        v["found"], 1,
-        "the one paid patch must be counted as found; got {v}"
-    );
-    assert_eq!(
-        v["downloaded"], 0,
+        v["summary"]["downloaded"], 0,
         "paid patch must not be downloaded; got {v}"
     );
-    assert_eq!(v["applied"], 0, "paid patch must not be applied; got {v}");
-    let patches = v["patches"].as_array().expect("patches array");
+    assert_eq!(
+        v["summary"]["applied"], 0,
+        "paid patch must not be applied; got {v}"
+    );
+    let patches = v["events"].as_array().expect("patches array");
     assert_eq!(
         patches.len(),
         1,
@@ -582,7 +582,7 @@ async fn get_paid_patch_via_public_proxy_returns_paid_required() {
     assert_eq!(patches[0]["purl"], purl);
     assert_eq!(patches[0]["uuid"], UUID);
     assert_eq!(
-        patches[0]["tier"], "paid",
+        patches[0]["details"]["tier"], "paid",
         "reported patch must be flagged paid; got {v}"
     );
     // Nothing was downloaded, so no manifest may be written.
