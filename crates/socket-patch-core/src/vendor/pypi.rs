@@ -864,6 +864,9 @@ struct PypiPrelude<'p> {
     prior: Option<VendorEntry>,
     expected_pin: Option<(String, String)>,
     reused_wheel: Option<AcquiredWheel>,
+    /// An in-sync Pipenv lock whose exported requirements pin still needs
+    /// wiring once the missing wheel is rebuilt (#612).
+    pipenv_sibling_pending: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1151,9 +1154,9 @@ async fn pypi_prelude<'p>(
         } else {
             uuid_dir_has_wheel(&project_root.join(&uuid_dir_rel)).await
         };
-        if pipenv_sibling_pending && artifact_present {
+        if pipenv_sibling_pending && (artifact_present || dry_run) {
             return Err(wire_in_sync_pipenv_sibling(
-                base,
+                already_patched_result(base, Path::new(""), &record.files),
                 project_root,
                 record,
                 &canon_name,
@@ -1240,16 +1243,18 @@ async fn pypi_prelude<'p>(
         prior,
         expected_pin,
         reused_wheel,
+        pipenv_sibling_pending,
     })
 }
 
 /// #612 for a Pipenv lock already wired to this patch: wire the exported
 /// requirements pin to the same committed wheel and extend the ledger
-/// entry with its records, so the revert restores both files. Without the
-/// ledger entry (whose records the revert replays) the pin is left alone
-/// and named.
+/// entry with its records, so the revert restores both files. `result` is
+/// the run's outcome so far (the in-sync skip, or a rebuilt wheel). Without
+/// a ledger entry (whose records the revert replays), or when the committed
+/// wheel the entry names does not verify, the pin is left alone and named.
 async fn wire_in_sync_pipenv_sibling(
-    base: &str,
+    result: ApplyResult,
     project_root: &Path,
     record: &PatchRecord,
     canon_name: &str,
@@ -1257,23 +1262,26 @@ async fn wire_in_sync_pipenv_sibling(
     dry_run: bool,
     mut warnings: Vec<VendorWarning>,
 ) -> VendorOutcome {
-    let in_sync = || already_patched_result(base, Path::new(""), &record.files);
+    let unwired = |why: &str| {
+        VendorWarning::new(
+            "pypi_multiple_lockfiles",
+            format!(
+                "Pipfile.lock is wired, but {} still pins {canon_name}=={version} from the \
+                 registry and {why}; installs driven by it will still install the UNPATCHED \
+                 registry bytes (re-export it from Pipfile.lock with `pipenv requirements`)",
+                crate::formats::governing_locks::PYPI_REQUIREMENTS
+            ),
+        )
+    };
     let prior = reuse::prior_entry(project_root, "pypi", record, None)
         .await
         .ok()
         .filter(|e| e.flavor.as_deref() == Some("pipenv"));
-    let Some(mut entry) = prior else {
-        warnings.push(VendorWarning::new(
-            "pypi_multiple_lockfiles",
-            format!(
-                "Pipfile.lock is wired, but {} still pins {canon_name}=={version} from the \
-                 registry and the vendor ledger has no entry to record its wiring in; installs \
-                 driven by it will still install the UNPATCHED registry bytes (re-export it \
-                 from Pipfile.lock with `pipenv requirements`)",
-                crate::formats::governing_locks::PYPI_REQUIREMENTS
-            ),
+    let Some(entry) = prior else {
+        warnings.push(unwired(
+            "the vendor ledger has no entry to record its wiring in",
         ));
-        return done(in_sync(), None, warnings);
+        return done(result, None, warnings);
     };
     if dry_run {
         warnings.push(VendorWarning::new(
@@ -1284,13 +1292,26 @@ async fn wire_in_sync_pipenv_sibling(
                 crate::formats::governing_locks::PYPI_REQUIREMENTS
             ),
         ));
-        return done(in_sync(), None, warnings);
+        return done(result, None, warnings);
     }
+    // The ledger is committed and tamper-able: pin only a path that is this
+    // patch's canonical vendored wheel, whose bytes match the ledger sha256
+    // and the patch's afterHashes.
+    let committed = match reuse::verify_committed_artifact(project_root, &entry, record).await {
+        Ok(committed) => committed,
+        Err(miss) => {
+            warnings.push(unwired(&format!(
+                "the committed wheel the vendor ledger names did not verify ({miss:?})"
+            )));
+            return done(result, None, warnings);
+        }
+    };
+    let mut entry = committed.entry;
     match super::pypi_requirements::wire_requirements(
         project_root,
         canon_name,
         version,
-        &entry.artifact.path,
+        &committed.rel_path,
         &entry.artifact.sha256,
     )
     .await
@@ -1304,8 +1325,16 @@ async fn wire_in_sync_pipenv_sibling(
                     crate::formats::governing_locks::PYPI_REQUIREMENTS
                 ),
             ));
+            // A re-export (`pipenv requirements > requirements.txt`) put the
+            // registry pin back: the records of the earlier wiring of that
+            // file are superseded by these, not kept beside them.
+            let files: std::collections::HashSet<&str> =
+                records.iter().map(|r| r.file.as_str()).collect();
+            entry.wiring.retain(|r| {
+                r.kind != super::pypi_requirements::RECORD_KIND || !files.contains(r.file.as_str())
+            });
             entry.wiring.extend(records);
-            done(in_sync(), Some(entry), warnings)
+            done(result, Some(entry), warnings)
         }
         Err((code, detail)) => refused(code, detail),
     }
@@ -1382,6 +1411,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         prior,
         expected_pin,
         reused_wheel,
+        pipenv_sibling_pending,
     } = match pypi_prelude(
         purl,
         project_root,
@@ -1528,6 +1558,18 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         // Restore the informational marker the deleted uuid dir lost.
         let marker = VendorMarker::new("pypi", base, record, vendored_at);
         write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
+        if pipenv_sibling_pending {
+            return wire_in_sync_pipenv_sibling(
+                result,
+                project_root,
+                record,
+                &canon_name,
+                version,
+                dry_run,
+                warnings,
+            )
+            .await;
+        }
         return done(result, None, warnings);
     }
 
@@ -2462,9 +2504,12 @@ fn residual_reference_warning(uuid: &str, clause: &str) -> VendorWarning {
     )
 }
 
-/// Revert a Pipenv entry: its Pipfile.lock records through the Pipenv
-/// backend, and the exported requirements lines wired with them (#612)
-/// through the requirements backend.
+/// Revert a Pipenv entry: the exported requirements lines wired with it
+/// (#612) through the requirements backend, then its Pipfile.lock records
+/// through the Pipenv backend. The export goes first and is put back if the
+/// lock's revert then fails, so a failure on either side leaves both files
+/// wired to the vendored wheel (and the entry kept) instead of half
+/// reverted.
 async fn revert_pipenv_with_sibling(
     entry: &VendorEntry,
     project_root: &Path,
@@ -2478,25 +2523,40 @@ async fn revert_pipenv_with_sibling(
     if lines.is_empty() {
         return super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await;
     }
-    let lock_entry = VendorEntry {
-        wiring: lock,
-        ..entry.clone()
-    };
-    let mut outcome = super::pypi_pipenv::revert_pipenv(&lock_entry, project_root, dry_run).await;
-    if !outcome.success {
-        return outcome;
+    // The exported files as they are now, to put back if the lock fails.
+    let mut snapshot: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    if !dry_run {
+        let mut files: Vec<&str> = lines.iter().map(|r| r.file.as_str()).collect();
+        files.sort_unstable();
+        files.dedup();
+        for file in files {
+            let path = project_root.join(file);
+            if let Ok(bytes) = crate::utils::fs::read_regular_to_bytes(&path).await {
+                snapshot.push((path, bytes));
+            }
+        }
     }
     let lines_entry = VendorEntry {
         wiring: lines,
         ..entry.clone()
     };
     let lines_outcome = revert_requirements(&lines_entry, project_root, dry_run).await;
+    if !lines_outcome.success {
+        return lines_outcome;
+    }
+    let lock_entry = VendorEntry {
+        wiring: lock,
+        ..entry.clone()
+    };
+    let mut outcome = super::pypi_pipenv::revert_pipenv(&lock_entry, project_root, dry_run).await;
+    if !outcome.success {
+        for (path, bytes) in &snapshot {
+            let _ = crate::utils::fs::atomic_write_bytes_preserving_mode(path, bytes).await;
+        }
+        return outcome;
+    }
     outcome.warnings.extend(lines_outcome.warnings);
     outcome.kept_artifact |= lines_outcome.kept_artifact;
-    if !lines_outcome.success {
-        outcome.success = false;
-        outcome.error = lines_outcome.error;
-    }
     outcome
 }
 
@@ -5820,6 +5880,158 @@ wheels = [
         assert_eq!(
             read_json(&fx.root, "Pipfile.lock").await,
             serde_json::from_str::<serde_json::Value>(PIPENV_REGISTRY_LOCK).unwrap()
+        );
+    }
+
+    const SIBLING_EXPORT: &str = "-i https://pypi.org/simple\nsix==1.16.0\n";
+
+    /// Vendor with Pipfile.lock alone and persist the entry: a project
+    /// vendored before #612, whose export is made afterwards.
+    async fn pipenv_vendored_without_export(fx: &E2eFixture) -> VendorEntry {
+        let VendorOutcome::Done {
+            entry: Some(entry), ..
+        } = pipenv_vendor(fx, &fx.record).await
+        else {
+            panic!("vendor did not complete");
+        };
+        save_ledger_entry(&fx.root, &entry).await;
+        entry
+    }
+
+    fn requirement_records(entry: &VendorEntry) -> usize {
+        entry
+            .wiring
+            .iter()
+            .filter(|r| r.kind == super::super::pypi_requirements::RECORD_KIND)
+            .count()
+    }
+
+    async fn requirements_wired(fx: &E2eFixture) -> bool {
+        tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap()
+            .contains(&format!(".socket/vendor/pypi/{UUID}/"))
+    }
+
+    /// #612 on an in-sync re-run: a later export is wired to the committed
+    /// wheel and recorded once; a re-export (the registry pin is back)
+    /// replaces that record instead of adding a duplicate.
+    #[tokio::test]
+    async fn pipenv_in_sync_rerun_wires_a_later_export_once() {
+        let fx = pipenv_e2e_fixture().await;
+        pipenv_vendored_without_export(&fx).await;
+        for _ in 0..2 {
+            touch(&fx.root, "requirements.txt", SIBLING_EXPORT).await;
+            let VendorOutcome::Done {
+                entry: Some(entry), ..
+            } = pipenv_vendor(&fx, &fx.record).await
+            else {
+                panic!("the in-sync re-run must record the export's wiring");
+            };
+            assert!(requirements_wired(&fx).await);
+            assert_eq!(requirement_records(&entry), 1, "{:?}", entry.wiring);
+            save_ledger_entry(&fx.root, &entry).await;
+        }
+    }
+
+    /// #612: the committed wheel is missing on the in-sync re-run: it is
+    /// rebuilt AND the export is wired to it.
+    #[tokio::test]
+    async fn pipenv_in_sync_rebuild_still_wires_the_export() {
+        let fx = pipenv_e2e_fixture().await;
+        pipenv_vendored_without_export(&fx).await;
+        tokio::fs::remove_file(
+            fx.root
+                .join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}")),
+        )
+        .await
+        .unwrap();
+        touch(&fx.root, "requirements.txt", SIBLING_EXPORT).await;
+        let VendorOutcome::Done {
+            entry: Some(entry),
+            warnings,
+            ..
+        } = pipenv_vendor(&fx, &fx.record).await
+        else {
+            panic!("the rebuild must record the export's wiring");
+        };
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{warnings:?}"
+        );
+        assert!(requirements_wired(&fx).await);
+        assert_eq!(requirement_records(&entry), 1, "{:?}", entry.wiring);
+    }
+
+    /// The committed ledger is tamper-able: an artifact path that is not
+    /// this patch's verified wheel (here one smuggling an extra requirement
+    /// line) is never written into the export.
+    #[tokio::test]
+    async fn pipenv_in_sync_sibling_never_pins_an_unverified_ledger_path() {
+        let fx = pipenv_e2e_fixture().await;
+        let mut entry = pipenv_vendored_without_export(&fx).await;
+        entry.artifact.path =
+            format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}\nevil-package==6.6.6");
+        save_ledger_entry(&fx.root, &entry).await;
+        touch(&fx.root, "requirements.txt", SIBLING_EXPORT).await;
+        let VendorOutcome::Done {
+            entry: None,
+            warnings,
+            ..
+        } = pipenv_vendor(&fx, &fx.record).await
+        else {
+            panic!("an unverified ledger entry must not be extended");
+        };
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            SIBLING_EXPORT
+        );
+        assert!(
+            warnings.iter().any(|w| w.code == "pypi_multiple_lockfiles"),
+            "{warnings:?}"
+        );
+    }
+
+    /// A line token that is not one plain path / hex digest is refused.
+    #[test]
+    fn requirements_line_tokens_must_be_single_tokens() {
+        use super::super::pypi_requirements::check_line_tokens;
+        assert!(check_line_tokens(".socket/vendor/pypi/u/six.whl", "ab12").is_ok());
+        assert!(check_line_tokens(".socket/vendor/pypi/u/six.whl", "").is_ok());
+        for (path, sha) in [
+            (".socket/x.whl\nevil==1", "ab"),
+            (".socket/x.whl\r", "ab"),
+            (".socket/x.whl --index-url=http://evil", "ab"),
+            (".socket/x.whl", "ab\nevil==1"),
+            ("", "ab"),
+        ] {
+            assert!(check_line_tokens(path, sha).is_err(), "{path:?} {sha:?}");
+        }
+    }
+
+    /// A Pipfile.lock revert failure must not leave the export reverted on
+    /// its own: both files stay wired to the vendored wheel.
+    #[tokio::test]
+    async fn pipenv_sibling_revert_keeps_both_wired_when_the_lock_fails() {
+        let fx = pipenv_e2e_fixture().await;
+        touch(&fx.root, "requirements.txt", SIBLING_EXPORT).await;
+        let VendorOutcome::Done {
+            entry: Some(entry), ..
+        } = pipenv_vendor(&fx, &fx.record).await
+        else {
+            panic!("vendor did not complete");
+        };
+        touch(&fx.root, "Pipfile.lock", "{ not json").await;
+        let outcome = revert_pypi(&entry, &fx.root, false).await;
+        assert!(
+            !outcome.success,
+            "a corrupt Pipfile.lock cannot be reverted"
+        );
+        assert!(
+            requirements_wired(&fx).await,
+            "the export must not be reverted alone"
         );
     }
 
