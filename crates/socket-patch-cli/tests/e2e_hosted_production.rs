@@ -33,7 +33,7 @@
 //!
 //! | Ecosystem | PURL | Patch UUID | Advisory |
 //! |-----------|------|------------|----------|
-//! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
+//! | npm    | `pkg:npm/minimist@1.2.2`        | `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | GHSA-gm62-xv2j-4w53 &co |
 //! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (six today; the sixth merges three advisories) | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293), GHSA-xr9x-r78c-5hrm (CVE-2026-66066) |
 //!
@@ -123,7 +123,7 @@ const PATCH_HOST: &str = "patch.socket.dev";
 const NPM_PURL: &str = "pkg:npm/minimist@1.2.2";
 const NPM_NAME: &str = "minimist";
 const NPM_VERSION: &str = "1.2.2";
-const NPM_UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+const NPM_UUID: &str = "642d7f02-ebc1-4ab0-99e2-07f5dd8463cb";
 
 const PYPI_PURL: &str = "pkg:pypi/urllib3@1.26.18";
 const PYPI_NAME: &str = "urllib3";

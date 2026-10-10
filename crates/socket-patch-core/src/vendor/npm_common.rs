@@ -1,24 +1,14 @@
-//! Flavor-agnostic npm vendoring pipeline: coordinate guards plus the shared
-//! stage→patch→pack steps.
-//!
-//! Every tarball-artifact npm flavor (package-lock, yarn classic/berry, pnpm
-//! incl. legacy, bun) vendors the same way up to the wiring: validate the
-//! coordinates fail-closed, stage a private copy of the installed package in
-//! a tempdir OUTSIDE the project, prune nested `node_modules`, refuse
-//! bundled-deps packages, run the hardened apply pipeline against the stage,
-//! and pack the result into a deterministic tarball under
-//! `.socket/vendor/npm/<uuid>/`. Only the lockfile wiring differs per flavor,
-//! and it always runs LAST — so a refusal or failure in this pipeline leaves
-//! the project byte-untouched (a dry run stops after verification and
-//! creates nothing on disk). vlt shares the coordinate guards but vendors a
-//! directory artifact instead (see [`super::npm_dir`]).
+//! Shared npm vendoring: validate coordinates, reuse a verified committed
+//! artifact or download one from the patch service, then wire the lockfile.
+//! Wiring runs last; dry runs verify without changing project files.
+//! vlt shares the guards but stores a directory artifact (see [`super::npm_dir`]).
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
+use crate::patch::apply::{normalize_file_path, ApplyResult};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::package::read_archive_to_map;
 use crate::patch::path_safety;
@@ -32,10 +22,7 @@ use super::npm_dir;
 use super::npm_pack::PackedTarball;
 use super::path::vendor_uuid_dir_rel;
 use super::reuse;
-use super::service_fetch::{
-    fetch_verified_archive, ServiceArtifact, ServiceAttempt, ServicePolicy, ServiceTerminal,
-};
-use super::source::PackageSource;
+use super::service_fetch::{fetch_verified_archive, ServiceArtifact, ServicePolicy};
 use super::state::{
     write_marker_or_warn, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringRecord,
 };
@@ -67,6 +54,45 @@ pub(super) struct NpmCoords {
 /// vendor, arbitrary delete on revert) — reject fail-closed before any disk
 /// access. `Err` carries a ready [`VendorOutcome::Refused`] to bubble
 /// verbatim.
+/// True when npm or Bun might fetch a registry package from somewhere other
+/// than the URL its lock records, as far as the project and the process
+/// environment can tell: the project's own `.npmrc` or `bunfig.toml` sets
+/// anything at all (a registry, a scope table, a proxy, TLS settings, ...)
+/// or can't be read, or `NPM_CONFIG_REGISTRY` / `npm_config_registry` /
+/// `BUN_CONFIG_REGISTRY` is set. Deliberately coarse: a revert that would
+/// delete a vendored copy because a version moved "within the same
+/// registry" trusts that move only when this is false (#1155). User- and
+/// machine-level config files (`~/.npmrc`, `~/.bunfig.toml`, the global
+/// npmrc) are not read.
+pub(super) async fn project_may_redirect_registry(project_root: &Path) -> bool {
+    let env_registry = [
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+        "BUN_CONFIG_REGISTRY",
+    ]
+    .iter()
+    .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()));
+    if env_registry {
+        return true;
+    }
+    for name in [".npmrc", "bunfig.toml"] {
+        match crate::utils::fs::read_regular_to_string(&project_root.join(name)).await {
+            Ok(text) => {
+                let configures_something = text.lines().any(|line| {
+                    let line = line.trim();
+                    !line.is_empty() && !line.starts_with('#') && !line.starts_with(';')
+                });
+                if configures_something {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 pub(super) fn guard_coordinates(
     purl: &str,
     record: &PatchRecord,
@@ -204,15 +230,11 @@ pub async fn npm_tarball_gitignore_preflight(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_pack(
     purl: &str,
-    installed_dir: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
     dry_run: bool,
-    force: bool,
     warnings: &mut Vec<VendorWarning>,
     service: Option<&VendorServiceConfig>,
 ) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
@@ -225,18 +247,8 @@ pub(super) async fn stage_patch_pack(
             npm_dir::gitignored_detail(&coords.uuid_dir_rel, &rules),
         )));
     }
-    let (staged, result) = acquire_patch_pack(
-        purl,
-        installed_dir,
-        project_root,
-        record,
-        sources,
-        dry_run,
-        force,
-        warnings,
-        service,
-    )
-    .await?;
+    let (staged, result) =
+        acquire_patch_pack(purl, project_root, record, dry_run, warnings, service).await?;
     if let Some(staged) = &staged {
         keep_pack_committable(purl, project_root, &coords, staged, warnings).await?;
     }
@@ -300,15 +312,11 @@ async fn keep_pack_committable(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn acquire_patch_pack(
     purl: &str,
-    _installed_dir: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
-    _sources: &PatchSources<'_>,
     dry_run: bool,
-    _force: bool,
     warnings: &mut Vec<VendorWarning>,
     service: Option<&VendorServiceConfig>,
 ) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
@@ -324,12 +332,9 @@ async fn acquire_patch_pack(
     }
     if let Some(cfg) = service {
         if cfg.service_enabled() {
-            match try_service_pack(purl, project_root, &coords, record, cfg, dry_run, warnings)
+            return try_service_pack(purl, project_root, &coords, record, cfg, dry_run, warnings)
                 .await
-            {
-                ServicePackDecision::Used(pair) => return Ok(*pair),
-                ServicePackDecision::HardFail(outcome) => return Err(outcome),
-            }
+                .map(|pair| *pair);
         }
     }
 
@@ -406,12 +411,7 @@ async fn reuse_committed_pack(
 
 // ───────────────────────── service-download path ─────────────────────────
 
-/// Outcome of attempting the service-download fast path in [`stage_patch_pack`]
-/// (`Used`: the staged pack + a synthesized success, boxed — the pair is large).
-type ServicePackDecision = ServiceAttempt<Box<(Option<NpmStagedPack>, ApplyResult)>>;
-
-/// Download + verify the prebuilt tarball and turn it into an [`NpmStagedPack`],
-/// mapping each service outcome onto the `auto` / `service` fallback policy.
+/// Download and verify a prebuilt tarball, then stage it for lockfile wiring.
 async fn try_service_pack(
     purl: &str,
     project_root: &Path,
@@ -420,37 +420,30 @@ async fn try_service_pack(
     cfg: &VendorServiceConfig,
     dry_run: bool,
     warnings: &mut Vec<VendorWarning>,
-) -> ServicePackDecision {
-    let policy = ServicePolicy::new(cfg, ServiceTerminal::Failure(purl));
+) -> Result<Box<(Option<NpmStagedPack>, ApplyResult)>, Box<VendorOutcome>> {
+    let policy = ServicePolicy::Failure(purl);
     let archive = match fetch_verified_archive(cfg, &record.uuid).await {
         // This backend's `service` refusal words a request failure differently.
-        ServiceArtifact::Failed(reason) if cfg.source.requires_service() => {
-            return policy.hard(
+        ServiceArtifact::Failed(reason) => {
+            return Err(policy.hard(
                 "vendor_prebuilt_required",
                 format!("patch service request failed: {reason}"),
-            );
+            ));
         }
-        fetched => match policy.settle(fetched, "artifact", "artifact", warnings) {
-            Ok(archive) => archive,
-            Err(attempt) => return attempt,
-        },
+        fetched => policy.settle(fetched, "artifact", "artifact")?,
     };
     // The SRI proves only that the transfer is intact: require the tarball to
     // carry every patched file at its afterHash before reporting the package
     // patched and wiring the lock to it.
     if !tgz_bytes_match_after_hashes(&archive.bytes, record) {
-        return policy.miss(
-            warnings,
-            "vendor_prebuilt_layout_mismatch",
-            format!(
-                "prebuilt tarball for {}@{} does not carry the patched files at their \
+        return Err(policy.miss(format!(
+            "prebuilt tarball for {}@{} does not carry the patched files at their \
                  recorded paths",
-                coords.name, coords.version
-            ),
-        );
+            coords.name, coords.version
+        )));
     }
     if dry_run {
-        return ServicePackDecision::Used(Box::new((
+        return Ok(Box::new((
             None,
             super::common::preview_result(
                 purl,
@@ -459,7 +452,7 @@ async fn try_service_pack(
             ),
         )));
     }
-    match staged_pack_from_service_bytes(
+    let mut staged = staged_pack_from_service_bytes(
         purl,
         project_root,
         coords,
@@ -467,26 +460,14 @@ async fn try_service_pack(
         &archive.bytes,
         &archive.integrity_sri,
     )
-    .await
-    {
-        Ok(mut staged) => {
-            staged.packed.yarn_berry10c0 = archive.yarn_berry10c0;
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored {}@{} from the patch service ({})",
-                    coords.name, coords.version, archive.source_url
-                ),
-            ));
-            // No local apply to verify — every patched file reads as
-            // `AlreadyPatched` (the tarball's members were checked against
-            // their afterHashes above).
-            let result =
-                already_patched_result(purl, &project_root.join(&staged.rel_tgz), &record.files);
-            ServicePackDecision::Used(Box::new((Some(staged), result)))
-        }
-        Err(outcome) => ServicePackDecision::HardFail(outcome),
-    }
+    .await?;
+    warnings.push(archive.downloaded_warning(format_args!("{}@{}", coords.name, coords.version)));
+    staged.packed.yarn_berry10c0 = archive.yarn_berry10c0;
+    // No local apply to verify — every patched file reads as
+    // `AlreadyPatched` (the tarball's members were checked against
+    // their afterHashes above).
+    let result = already_patched_result(purl, &project_root.join(&staged.rel_tgz), &record.files);
+    Ok(Box::new((Some(staged), result)))
 }
 
 async fn staged_pack_from_service_bytes(
@@ -726,12 +707,18 @@ pub(super) async fn done_failure_unstage(
     uuid_dir_rel: &str,
     uuid_dir_preexisted: bool,
 ) -> VendorOutcome {
+    unstage(project_root, uuid_dir_rel, uuid_dir_preexisted).await;
+    done_failure(purl, error)
+}
+
+/// Remove the uuid dir a run staged, unless it existed before the run (a
+/// same-uuid re-vendor's dir may still be referenced by live wiring).
+async fn unstage(project_root: &Path, uuid_dir_rel: &str, uuid_dir_preexisted: bool) {
     if !uuid_dir_preexisted {
         let uuid_dir = project_root.join(uuid_dir_rel);
         let _ = remove_tree(&uuid_dir).await;
         super::common::prune_empty_vendor_levels(&uuid_dir).await;
     }
-    done_failure(purl, error)
 }
 
 /// The vendor ledger tail every npm flavor shares once its wiring is on
@@ -760,16 +747,11 @@ pub(super) async fn finish_vendored(
 /// receives it.
 pub(super) struct NpmVendorRequest<'a> {
     pub purl: &'a str,
-    /// The crawler's `node_modules/<pkg>` dir (or a service-only source);
-    /// read-only — patching happens on a staged copy.
-    pub installed_dir: PackageSource<'a>,
     pub project_root: &'a Path,
     pub record: &'a PatchRecord,
-    pub sources: &'a PatchSources<'a>,
     /// RFC3339 timestamp for the informational marker.
     pub vendored_at: &'a str,
     pub dry_run: bool,
-    pub force: bool,
     pub service: Option<&'a VendorServiceConfig>,
 }
 
@@ -831,6 +813,19 @@ pub(super) trait NpmLockBackend {
         warnings: &mut Vec<VendorWarning>,
     ) -> Result<Option<NpmCommit>, String>;
 
+    /// A refusal for a patch whose rewritten `package.json` (`staged_pkg`)
+    /// the flavor's lock can't follow, checked after staging and before any
+    /// wiring is written (the driver unstages the uuid dir). `None`: wire
+    /// as usual.
+    fn manifest_refusal(
+        &self,
+        _plan: &Self::Plan,
+        _staged_pkg: &Value,
+        _coords: &NpmCoords,
+    ) -> Option<VendorOutcome> {
+        None
+    }
+
     /// The advisory for a patch that rewrites the package's own
     /// `package.json`, whose mirrors the flavor's lock either recomputes or
     /// keeps.
@@ -850,13 +845,10 @@ pub(super) async fn vendor_npm_family<B: NpmLockBackend>(
 ) -> VendorOutcome {
     let NpmVendorRequest {
         purl,
-        installed_dir,
         project_root,
         record,
-        sources,
         vendored_at,
         dry_run,
-        force,
         service,
     } = req;
     let mut warnings: Vec<VendorWarning> = Vec::new();
@@ -875,25 +867,11 @@ pub(super) async fn vendor_npm_family<B: NpmLockBackend>(
         Err(outcome) => return *outcome,
     };
 
-    // Stage → patch → pack: tempdir stage outside the project, nested
-    // node_modules prune, bundled-deps refusal, hardened apply,
-    // deterministic pack.
-    let (staged, result) = match stage_patch_pack(
-        purl,
-        installed_dir,
-        project_root,
-        record,
-        sources,
-        dry_run,
-        force,
-        &mut warnings,
-        service,
-    )
-    .await
-    {
-        Ok(pair) => pair,
-        Err(outcome) => return *outcome,
-    };
+    let (staged, result) =
+        match stage_patch_pack(purl, project_root, record, dry_run, &mut warnings, service).await {
+            Ok(pair) => pair,
+            Err(outcome) => return *outcome,
+        };
     let Some(mut staged) = staged else {
         // Failed patch (wiring is last, so the project is byte-untouched)
         // or a dry run (stops after the verify).
@@ -903,6 +881,20 @@ pub(super) async fn vendor_npm_family<B: NpmLockBackend>(
         (staged.name.as_str(), staged.version.as_str()),
         (coords.name.as_str(), coords.version.as_str())
     );
+
+    if let Some(refusal) = staged
+        .staged_pkg_json
+        .as_ref()
+        .and_then(|pkg| backend.manifest_refusal(&plan, pkg, &coords))
+    {
+        unstage(
+            project_root,
+            &coords.uuid_dir_rel,
+            staged.uuid_dir_preexisted,
+        )
+        .await;
+        return refusal;
+    }
 
     let cx = WireCx {
         project_root,
@@ -1248,21 +1240,8 @@ mod tests {
         record: &PatchRecord,
         service: Option<&VendorServiceConfig>,
     ) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
-        let blobs = root.join(".socket/blobs");
-        let sources = PatchSources::blobs_only(&blobs);
         let mut warnings = Vec::new();
-        stage_patch_pack(
-            LP_PURL,
-            (&root.join("node_modules/left-pad")).into(),
-            root,
-            record,
-            &sources,
-            false,
-            false,
-            &mut warnings,
-            service,
-        )
-        .await
+        stage_patch_pack(LP_PURL, root, record, false, &mut warnings, service).await
     }
 
     async fn build_tgz(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -1494,8 +1473,7 @@ mod tests {
     }
 
     /// A served tarball with an intact SRI whose `index.js` is still the
-    /// ORIGINAL bytes is not the patched package: `service` fails the package
-    /// and writes nothing; `auto` warns and builds locally instead.
+    /// ORIGINAL bytes is not the patched package and must be refused.
     #[tokio::test]
     async fn service_tarball_failing_after_hashes_is_rejected() {
         let tgz = build_tgz(&[("index.js", ORIG_INDEX)]).await;
@@ -1514,23 +1492,10 @@ mod tests {
 
         let (tmp, record) = local_fixture(b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}").await;
         let root = tmp.path();
-        let blobs = root.join(".socket/blobs");
-        let sources = PatchSources::blobs_only(&blobs);
         let mut warnings = Vec::new();
         let cfg = service_cfg(&server.uri(), VendorSource::Service);
         let err = expect_err(
-            stage_patch_pack(
-                LP_PURL,
-                (&root.join("node_modules/left-pad")).into(),
-                root,
-                &record,
-                &sources,
-                false,
-                false,
-                &mut warnings,
-                Some(&cfg),
-            )
-            .await,
+            stage_patch_pack(LP_PURL, root, &record, false, &mut warnings, Some(&cfg)).await,
         );
         expect_done_failure(err, "does not carry the patched files");
         assert!(!root.join(".socket/vendor").exists());
@@ -1655,28 +1620,21 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e:?}"));
         assert!(fresh.verified_bytes.is_none());
         let entry = crate::vendor::state::VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: LP_PURL.into(),
-            uuid: record.uuid.clone(),
-            artifact: crate::vendor::state::VendorArtifact {
-                yarn_berry10c0: None,
-                path: fresh.rel_tgz.clone(),
-                sha256: fresh.packed.sha256_hex.clone(),
-                size: Some(fresh.packed.size),
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             flavor: Some("yarn-berry".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-            detached: false,
-            record: None,
+            ..crate::vendor::state::VendorEntry::new(
+                "npm".into(),
+                LP_PURL.into(),
+                record.uuid.clone(),
+                crate::vendor::state::VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: fresh.rel_tgz.clone(),
+                    sha256: fresh.packed.sha256_hex.clone(),
+                    size: Some(fresh.packed.size),
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         };
         crate::vendor::test_support::persist(tmp.path(), LP_PURL, entry).await;
         let coords = guard_coordinates(LP_PURL, &record).unwrap();
@@ -1795,18 +1753,13 @@ mod tests {
                 }
                 let server = granted_service().await;
                 let cfg = service_cfg(&server.uri(), VendorSource::Service);
-                let blobs = tmp.path().join(".socket/blobs");
-                let sources = PatchSources::blobs_only(&blobs);
                 let mut warnings = Vec::new();
                 let err = expect_err(
                     stage_patch_pack(
                         LP_PURL,
-                        (&tmp.path().join("node_modules/left-pad")).into(),
                         tmp.path(),
                         &patched_index_record(),
-                        &sources,
                         dry_run,
-                        false,
                         &mut warnings,
                         Some(&cfg),
                     )

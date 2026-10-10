@@ -788,28 +788,22 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
 
     fn entry_for(wiring: Vec<WiringRecord>, meta: PoetryMeta) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: REL_WHEEL.into(),
-                sha256: WHEEL_SHA.into(),
-                size: Some(11053),
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("poetry".into()),
-            uv: None,
-            pnpm: None,
             poetry: Some(meta),
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "pypi".into(),
+                "pkg:pypi/six@1.16.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: REL_WHEEL.into(),
+                    sha256: WHEEL_SHA.into(),
+                    size: Some(11053),
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
         }
     }
 

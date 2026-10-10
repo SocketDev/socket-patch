@@ -39,9 +39,7 @@ use super::pypi_uv::{
 };
 use super::pypi_wheel::WheelArtifact;
 use super::reuse;
-use super::service_fetch::{
-    fetch_verified_archive, ServiceArtifact, ServiceAttempt, ServicePolicy, ServiceTerminal,
-};
+use super::service_fetch::{fetch_verified_archive, ServiceArtifact, ServicePolicy};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
@@ -277,6 +275,17 @@ async fn detect_pypi_flavor(
     project_root: &Path,
     target: Option<(&str, &str)>,
 ) -> Result<(PypiFlavor, Vec<VendorWarning>), (&'static str, String)> {
+    // #1138: a uv workspace member installs from the workspace root's
+    // uv.lock, which this run cannot see; routing it by its own files would
+    // rewrite it as a lockless (Hatch) project, or rewrite a lock left in
+    // the member that uv never reads, and leave the root lock stale.
+    if let Some(workspace) = crate::utils::uv_workspace::governing_uv_workspace(project_root).await
+    {
+        return Err((
+            "pypi_uv_workspace_unsupported",
+            crate::utils::uv_workspace::member_detail(project_root, &workspace),
+        ));
+    }
     let exists = |name: &str| {
         let p = project_root.join(name);
         async move { tokio::fs::metadata(&p).await.is_ok() }
@@ -832,7 +841,6 @@ async fn stale_install_sites(
 /// ahead of the vendor loop ([`service_preflight`]).
 struct PypiPrelude<'p> {
     base: &'p str,
-    raw_name: String,
     version: String,
     canon_name: String,
     uuid_dir_rel: String,
@@ -1160,7 +1168,11 @@ async fn pypi_prelude<'p>(
                 ),
             ));
             return Err(done(
-                reuse_preview_result(base, &project_root.join(&acquired.rel_wheel), record),
+                super::common::preview_result(
+                    base,
+                    &project_root.join(&acquired.rel_wheel),
+                    &record.files,
+                ),
                 None,
                 warnings,
             ));
@@ -1177,7 +1189,6 @@ async fn pypi_prelude<'p>(
     }
     Ok(PypiPrelude {
         base,
-        raw_name: raw_name.to_string(),
         version: version.to_string(),
         canon_name,
         uuid_dir_rel,
@@ -1235,25 +1246,23 @@ pub(crate) async fn service_preflight(
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_pypi_with_pipenv_version<'a>(
     purl: &str,
-    site_packages: impl Into<PackageSource<'a>>,
+    _site_packages: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &InstalledSiteListings,
 ) -> VendorOutcome {
-    let site_packages = site_packages.into();
     let hosted_origins: Vec<String> = service
         .and_then(|s| s.patch_server_url.clone())
         .into_iter()
         .collect();
     let PypiPrelude {
         base,
-        raw_name,
         version,
         canon_name,
         uuid_dir_rel,
@@ -1278,12 +1287,9 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         Ok(prelude) => prelude,
         Err(outcome) => return outcome,
     };
-    let (raw_name, version) = (raw_name.as_str(), version.as_str());
+    let version = version.as_str();
     let reused = reused_wheel.is_some();
 
-    // Acquire the patched wheel: prefer the prebuilt service artifact (which
-    // skips needing the package installed), else build it locally. A refusal /
-    // hard fail bubbles as a terminal outcome.
     let AcquiredWheel {
         wheel_name,
         rel_wheel,
@@ -1295,15 +1301,10 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         Some(acquired) => acquired,
         None => match acquire_patched_wheel(
             base,
-            raw_name,
-            version,
-            site_packages,
             &uuid_dir_rel,
             project_root,
             record,
-            sources,
             dry_run,
-            force,
             service,
             expected_pin.as_ref(),
             &mut warnings,
@@ -1594,28 +1595,21 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
     };
 
     let mut entry = VendorEntry {
-        ecosystem: "pypi".to_string(),
-        base_purl: base.to_string(),
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: rel_wheel,
-            sha256: artifact.sha256_hex,
-            size: Some(artifact.size),
-            platform_locked: platform_locked.then_some(true),
-            file_inventory: None,
-        },
-        wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
         flavor: Some(flavor.as_str().to_string()),
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
+        ..VendorEntry::new(
+            "pypi".to_string(),
+            base.to_string(),
+            record.uuid.clone(),
+            VendorArtifact {
+                yarn_berry10c0: None,
+                path: rel_wheel,
+                sha256: artifact.sha256_hex,
+                size: Some(artifact.size),
+                platform_locked: platform_locked.then_some(true),
+                file_inventory: None,
+            },
+            wiring,
+        )
     };
     match meta {
         MetaSlot::Uv(m) => entry.uv = Some(m),
@@ -2544,52 +2538,25 @@ fn reusable_wheel_leaf(leaf: &str, canon_name: &str, version: &str) -> bool {
     super::pypi_distribution::matches(leaf, canon_name, version)
 }
 
-/// The dry-run preview of a Fresh-path reuse: the shape a dry-run local
-/// build reports (every patched file verified, ready to wire) — the CLI
-/// renders it as a verified preview, as it would the build.
-fn reuse_preview_result(base: &str, abs: &Path, record: &PatchRecord) -> ApplyResult {
-    let files_verified = record
-        .files
-        .keys()
-        .map(|f| crate::patch::apply::VerifyResult {
-            file: f.clone(),
-            status: crate::patch::apply::VerifyStatus::Ready,
-            message: None,
-            current_hash: None,
-            expected_hash: None,
-            target_hash: None,
-        })
-        .collect();
-    super::common::synthesized_result(base, abs, files_verified, true, None)
-}
-
 struct AcquiredWheel {
     wheel_name: String,
     rel_wheel: String,
     result: ApplyResult,
-    /// `None` on a dry run or a failed build (the caller short-circuits).
+    /// `None` on a dry run.
     artifact: Option<WheelArtifact>,
     platform_locked: bool,
     /// Tag list for the `vendor_platform_locked` advisory.
     platform_tags_display: String,
 }
 
-/// Acquire the patched wheel: prefer the prebuilt service artifact (which does
-/// not require the package to be installed), else build it locally from the
-/// installed dist. Returns `Err(outcome)` with the terminal `VendorOutcome` to
-/// bubble (a refusal, or a `service`-mode miss).
+/// Acquire a verified prebuilt Python distribution from the patch service.
 #[allow(clippy::too_many_arguments)]
 async fn acquire_patched_wheel(
     base: &str,
-    _raw_name: &str,
-    _version: &str,
-    _site_packages: PackageSource<'_>,
     uuid_dir_rel: &str,
     project_root: &Path,
     record: &PatchRecord,
-    _sources: &PatchSources<'_>,
     dry_run: bool,
-    _force: bool,
     service: Option<&VendorServiceConfig>,
     expected_pin: Option<&(String, String)>,
     warnings: &mut Vec<VendorWarning>,
@@ -2599,7 +2566,7 @@ async fn acquire_patched_wheel(
     }
     if let Some(cfg) = service {
         if cfg.service_enabled() {
-            match try_pypi_service_wheel(
+            return try_pypi_service_wheel(
                 base,
                 uuid_dir_rel,
                 project_root,
@@ -2610,10 +2577,8 @@ async fn acquire_patched_wheel(
                 warnings,
             )
             .await
-            {
-                PypiServiceWheel::Used(acq) => return Ok(*acq),
-                PypiServiceWheel::HardFail(outcome) => return Err(*outcome),
-            }
+            .map(|acq| *acq)
+            .map_err(|outcome| *outcome);
         }
     }
 
@@ -2622,10 +2587,6 @@ async fn acquire_patched_wheel(
         "vendoring requires a prebuilt Python distribution from the patch service".to_string(),
     ))
 }
-
-/// Outcome of attempting a pypi service download (the wheel facts boxed —
-/// they are large).
-type PypiServiceWheel = ServiceAttempt<Box<AcquiredWheel>>;
 
 /// Download and verify the server wheel or sdist for `record.uuid`.
 #[allow(clippy::too_many_arguments)]
@@ -2638,25 +2599,18 @@ async fn try_pypi_service_wheel(
     dry_run: bool,
     expected_pin: Option<&(String, String)>,
     warnings: &mut Vec<VendorWarning>,
-) -> PypiServiceWheel {
-    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+) -> Result<Box<AcquiredWheel>, Box<VendorOutcome>> {
+    let policy = ServicePolicy::Refused;
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
     // The client refused a non-wheel before downloading it.
     if let ServiceArtifact::Unavailable(reason) = &fetched {
         if reason == PYPI_NOT_A_WHEEL {
-            return policy.miss(warnings, "vendor_prebuilt_unavailable", reason.clone());
+            return Err(policy.miss(reason.clone()));
         }
     }
-    let archive = match policy.settle(fetched, "wheel", "wheel", warnings) {
-        Ok(archive) => archive,
-        Err(attempt) => return attempt,
-    };
+    let archive = policy.settle(fetched, "wheel", "wheel")?;
     let Some(wheel_name) = wheel_filename_from_url(&archive.source_url) else {
-        return policy.miss(
-            warnings,
-            "vendor_prebuilt_unavailable",
-            PYPI_NOT_A_WHEEL.to_string(),
-        );
+        return Err(policy.miss(PYPI_NOT_A_WHEEL.to_string()));
     };
     // The SRI proves only that the transfer is intact. A wheel's
     // members are site-packages-relative (the `record.files` keys),
@@ -2666,55 +2620,47 @@ async fn try_pypi_service_wheel(
         .and_then(|members| super::pypi_distribution::verify_members(&members, &wheel_name, record))
         .is_err()
     {
-        return policy.miss(
-            warnings,
-            "vendor_prebuilt_layout_mismatch",
-            format!(
-                "prebuilt wheel for {base} does not carry the patched files at \
+        return Err(policy.miss(format!(
+            "prebuilt wheel for {base} does not carry the patched files at \
                  their recorded paths"
-            ),
-        );
+        )));
     }
     let Some((name, version)) = parse_pypi_purl(base) else {
-        return policy.hard("unsafe_coordinates", base.to_string());
+        return Err(policy.hard("unsafe_coordinates", base.to_string()));
     };
     if !super::pypi_distribution::matches(&wheel_name, &name, &version) {
-        return policy.hard(
+        return Err(policy.hard(
             "vendor_prebuilt_layout_mismatch",
             "Python archive filename does not match the requested package".to_string(),
-        );
+        ));
     }
     let rel_wheel = format!("{uuid_dir_rel}/{wheel_name}");
     // Digested on first ask: pypi is the only backend that pins it.
     let sha256_hex = archive.sha256_hex().to_string();
     if let Some((pin_path, pin_sha)) = expected_pin {
         if !pin_matches(pin_path, pin_sha, &rel_wheel, &sha256_hex) {
-            return policy.miss(
-                warnings,
-                "vendor_prebuilt_pin_mismatch",
-                format!(
-                    "the prebuilt wheel ({rel_wheel}, sha256 {sha256_hex}) does not \
+            return Err(policy.miss(format!(
+                "the prebuilt wheel ({rel_wheel}, sha256 {sha256_hex}) does not \
                      match the wheel the lockfile still pins ({pin_path}, sha256 \
                      {pin_sha})"
-                ),
-            );
+            )));
         }
     }
     let dest = project_root.join(uuid_dir_rel).join(&wheel_name);
     if !dry_run {
         if let Some(parent) = dest.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return policy.hard(
+                return Err(policy.hard(
                     "vendor_prebuilt_write_failed",
                     format!("cannot create {}: {e}", parent.display()),
-                );
+                ));
             }
         }
         if let Err(e) = atomic_write_artifact(&dest, &archive.bytes).await {
-            return policy.hard(
+            return Err(policy.hard(
                 "vendor_prebuilt_write_failed",
                 format!("cannot write the vendored wheel: {e}"),
-            );
+            ));
         }
     }
     let (platform_locked, platform_tags_display) = if wheel_name.ends_with(".whl") {
@@ -2722,14 +2668,8 @@ async fn try_pypi_service_wheel(
     } else {
         (false, String::new())
     };
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored the wheel for {base} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
-    PypiServiceWheel::Used(Box::new(AcquiredWheel {
+    warnings.push(archive.downloaded_warning(format_args!("the wheel for {base}")));
+    Ok(Box::new(AcquiredWheel {
         rel_wheel,
         result: if dry_run {
             super::common::preview_result(base, &dest, &record.files)
@@ -4128,28 +4068,21 @@ wheels = [
     async fn revert_unknown_flavor_fails_closed() {
         let fx = e2e_fixture().await;
         let entry = VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/pypi/{UUID}/x.whl"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: vec![],
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some("mystery".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "pypi".into(),
+                "pkg:pypi/six@1.16.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/pypi/{UUID}/x.whl"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                vec![],
+            )
         };
         let outcome = revert_pypi(&entry, &fx.root, false).await;
         assert!(!outcome.success);
@@ -5024,28 +4957,21 @@ wheels = [
     /// A pypi-flavored [`VendorEntry`] carrying just what revert reads.
     fn revert_entry(flavor: &str, rel_wheel: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
         VendorEntry {
-            ecosystem: "pypi".into(),
-            base_purl: "pkg:pypi/six@1.16.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: rel_wheel.to_string(),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring,
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
             flavor: Some(flavor.into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "pypi".into(),
+                "pkg:pypi/six@1.16.0".into(),
+                UUID.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel_wheel.to_string(),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring,
+            )
         }
     }
 

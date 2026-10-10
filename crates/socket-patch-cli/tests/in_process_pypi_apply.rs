@@ -261,7 +261,6 @@ async fn pypi_install_scan_sync_patches_real_file() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
@@ -336,7 +335,6 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
@@ -379,7 +377,6 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
             ecosystems: Some(vec!["pypi".to_string()]),
             json: true,
             verbose: false,
-            download_mode: "diff".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         force: true,
@@ -444,7 +441,6 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: true,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
@@ -572,7 +568,6 @@ async fn pypi_crawler_finds_real_installed_six() {
             api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
@@ -670,7 +665,6 @@ async fn pypi_scan_sync_patches_egg_info_install() {
                 api_url: Some(server.uri()),
                 api_token: Some("fake".to_string()),
                 ecosystems: Some(vec!["pypi".to_string()]),
-                download_mode: "diff".to_string(),
                 ..socket_patch_cli::args::GlobalArgs::default()
             },
             batch_size: Some(100),

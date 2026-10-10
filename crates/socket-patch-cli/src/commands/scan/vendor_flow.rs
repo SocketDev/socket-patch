@@ -1079,28 +1079,23 @@ mod migration_tests {
 
     fn entry(uuid: &str, detached: bool, record: Option<PatchRecord>) -> VendorEntry {
         VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: PURL.into(),
-            uuid: uuid.into(),
-            artifact: VendorArtifact {
-                yarn_berry10c0: None,
-                path: format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-                file_inventory: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
             detached,
             record,
             flavor: Some("package-lock".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
+            ..VendorEntry::new(
+                "npm".into(),
+                PURL.into(),
+                uuid.into(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            )
         }
     }
 

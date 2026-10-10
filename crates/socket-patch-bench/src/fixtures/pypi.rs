@@ -12,7 +12,7 @@ use std::io::Write as _;
 use serde_json::json;
 
 use super::gen::{self, Rng, Tree};
-use super::{Expect, Fixture, Served, Size, PATCH_HOST};
+use super::{Fixture, Served, Size, PATCH_HOST};
 use crate::mock::PatchSpec;
 
 const SITE: &str = "project/.venv/lib/python3.12/site-packages";
@@ -197,23 +197,14 @@ pub fn patches(ds: &[Dist]) -> (Vec<PatchSpec>, Served) {
 
 fn fixture(ds: &[Dist], rewritten: &[&str], warnings: &[&'static str]) -> Fixture {
     let (patches, files) = patches(ds);
-    Fixture {
-        project: "project",
-        expect: Expect {
-            scanned: ds.len(),
-            lockfile_only: 0,
-            redirected: patches.len(),
-            rewritten: rewritten.iter().map(|s| s.to_string()).collect(),
-            // The venv still holds the unpatched files after a hosted scan
-            // (a reinstall picks the patch up), and the wet run says so.
-            allowed_warnings: [&["redirect_pypi_stale_install"][..], warnings].concat(),
-            ..Expect::default()
-        },
-        patches,
-        files,
-        env_paths: Vec::new(),
-        env: Vec::new(),
-    }
+    let mut fixture = super::fixture(ds.len(), patches, rewritten, warnings);
+    fixture.files = files;
+    // The venv still holds the unpatched files until the next install.
+    fixture
+        .expect
+        .allowed_warnings
+        .insert(0, "redirect_pypi_stale_install");
+    fixture
 }
 
 fn pyproject(ds: &[Dist], extra: &str) -> String {

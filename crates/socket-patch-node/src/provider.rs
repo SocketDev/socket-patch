@@ -174,10 +174,6 @@ fn missing_value(method: &str) -> ApiError {
     ))
 }
 
-fn request_json(value: serde_json::Value) -> String {
-    value.to_string()
-}
-
 impl PatchApi for JsPatchApi {
     fn uses_public_proxy(&self) -> bool {
         false
@@ -192,7 +188,7 @@ impl PatchApi for JsPatchApi {
                 .iter()
                 .map(|purl| serde_json::json!({ "purl": purl }))
                 .collect();
-            let request = request_json(serde_json::json!({ "components": components }));
+            let request = serde_json::json!({ "components": components }).to_string();
             let method = "searchPatchesBatch";
             // Like the HTTP collection-route 404: "no patches" is an empty
             // success, so a miss is a misconfiguration, not zero patches.
@@ -211,7 +207,7 @@ impl PatchApi for JsPatchApi {
     fn search_patches_by_package<'a>(&'a self, purl: &'a str) -> ApiFuture<'a, SearchResponse> {
         Box::pin(async move {
             let method = "searchPatchesByPackage";
-            let request = request_json(serde_json::json!({ "purl": purl }));
+            let request = serde_json::json!({ "purl": purl }).to_string();
             match call_json(method, &self.search_patches_by_package, request).await? {
                 Reply::Value(value) => value.ok_or_else(|| missing_value(method)),
                 Reply::NotFound(_) => Ok(SearchResponse {
@@ -231,7 +227,7 @@ impl PatchApi for JsPatchApi {
                 return Ok(HashMap::new());
             }
             let method = "fetchRegistryReferences";
-            let request = request_json(serde_json::json!({ "uuids": uuids }));
+            let request = serde_json::json!({ "uuids": uuids }).to_string();
             match call_json::<ReferencesBody>(method, &self.fetch_registry_references, request)
                 .await?
             {
@@ -243,7 +239,7 @@ impl PatchApi for JsPatchApi {
 
     fn fetch_patch<'a>(&'a self, uuid: &'a str) -> ApiFuture<'a, Option<PatchResponse>> {
         Box::pin(async move {
-            let request = request_json(serde_json::json!({ "uuid": uuid }));
+            let request = serde_json::json!({ "uuid": uuid }).to_string();
             match call_json("fetchPatch", &self.fetch_patch, request).await? {
                 Reply::Value(value) => Ok(value),
                 Reply::NotFound(_) => Ok(None),
@@ -254,7 +250,7 @@ impl PatchApi for JsPatchApi {
     fn download_artifact<'a>(&'a self, url: &'a str, max_bytes: u64) -> ApiFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let method = "downloadArtifact";
-            let request = request_json(serde_json::json!({ "url": url, "maxBytes": max_bytes }));
+            let request = serde_json::json!({ "url": url, "maxBytes": max_bytes }).to_string();
             let promise = self
                 .download_artifact
                 .call_async_catch(request)
