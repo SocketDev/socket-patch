@@ -161,7 +161,16 @@ fn rollback_refuses_binary_hosted_pin_then_checkout(
         assert_eq!(env["error"]["code"], "rollback_failed", "{env}");
         assert_eq!(rollback_json::already_original(&env), 0, "{env}");
     }
-    assert_eq!(env["summary"]["failed"], 1, "{env}");
+    // `failed` spans every leg (#1066): the refused hosted pin plus any
+    // agent copy that could not be restored (a bundled copy the patch never
+    // touched reports `hash_mismatch`); agent events carry no mode.
+    let agent_failed = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["action"] == "failed" && e["details"]["mode"].is_null())
+        .count();
+    assert_eq!(env["summary"]["failed"], 1 + agent_failed, "{env}");
     let failed_view = rollback_json::hosted_failed(&env);
     let failed = failed_view.as_array().cloned().unwrap_or_default();
     assert!(
