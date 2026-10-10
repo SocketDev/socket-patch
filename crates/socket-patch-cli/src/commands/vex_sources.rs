@@ -251,6 +251,11 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             "not attested while the root declares modules (roll it back and re-patch the \
              reactor with `scan --mode vendored`)",
         ),
+        UnattestedKind::MavenClassifierUnpatched => (
+            NOTE_MAVEN_CLASSIFIER_UNPATCHED,
+            "not attested while that classifier copy resolves an unpatched version; the \
+             wiring itself is intact, so re-running `scan` does not change this",
+        ),
     }
 }
 
@@ -261,6 +266,10 @@ pub(crate) const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
 /// Omission tag and note: a hosted Maven pin sits in a reactor root, where a
 /// module's own `<version>` may override it (`vex::Unattested`, #261).
 pub(crate) const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
+/// Omission tag and note: a hosted Maven pin's GA also has an executable
+/// classifier copy at another version, which the pin does not reach
+/// (`vex::Unattested`).
+pub(crate) const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
 
 fn note(code: &'static str, detail: String) -> PlanNote {
     PlanNote { code, detail }

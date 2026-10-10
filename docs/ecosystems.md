@@ -670,6 +670,21 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   repository whose grant URL changed (a rotated token) is refreshed in place. A suffixed
   literal no hosted repository in the pom minted (a vendored `socket-patch-vendor-<uuid>`
   pin, say) is still a mismatch and is skipped.
+  The rewriter reads the pom the way Maven builds the project: markup inside comments,
+  CDATA, `<build>` / `<reporting>` (plugin classpaths), `<pluginRepositories>`,
+  `<distributionManagement>` and `<profiles>` is never matched or edited, and the
+  repository and `<dependencyManagement>` pin always land in the project's own top-level
+  sections (an existing self-closed `<repositories/>` or `<dependencyManagement/>` is
+  expanded in place, so Maven never sees a duplicated tag). A GA declared only in such
+  markup counts as transitive and gets the top-level pin; a versioned declaration inside
+  `<profiles>` (a literal or a `${property}`) is left as-is and reported
+  (`redirect_maven_profile_dependency_unpatched`), because an active profile's version
+  beats the pin, and when a profile holds the GA's only declaration nothing is pinned.
+  The grant serves the main jar only: a `<classifier>` variant keeps its version
+  (`redirect_maven_classifier_unsupported`), and the literal-or-pin decision is made from
+  the classifier-less declarations. A `sources` / `javadoc` variant at the patched release
+  only warns; any other variant there (tests, a native build) would keep unpatched code on
+  a classpath, so the dep is not redirected.
 * **Multi-module reactors are vendored-only (hosted Maven).** Hosted mode reads only
   the root `pom.xml`, and a module's own literal `<version>` always beats a root
   `<dependencyManagement>` pin, so a root pin would leave that module on the unpatched
