@@ -11,6 +11,7 @@ use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::fs::{
     atomic_write_artifact, atomic_write_bytes_preserving_mode, read_regular_to_string,
 };
+use crate::utils::line_endings::{eol_eq, respell, terminator};
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 
 use super::common::{
@@ -746,6 +747,27 @@ pub async fn revert_nuget_opts(
     };
     let mut warnings = Vec::new();
 
+    // The lock pin may only go back to the upstream contentHash when
+    // nuget.config stops routing the id to the vendored feed. A config that
+    // will be left wired (drift-kept: it still names the feed) with the lock
+    // reverted under it fails every restore NU1403 (#537), so its lock pin
+    // is kept and the package stays consistently vendored. Decided up front
+    // (a read-only preview of the config restore), so the lock still goes
+    // first and a lock failure leaves the config wired for the retry.
+    let mut config_still_routes = false;
+    for w in entry
+        .wiring
+        .iter()
+        .filter(|w| w.kind == CONFIG_SOURCE_WIRING_KIND)
+    {
+        if matches!(
+            revert_config_record(project_root, &uuid_dir_rel, w, true).await,
+            Ok(false)
+        ) && config_references(project_root, &w.file, &uuid_dir_rel).await
+        {
+            config_still_routes = true;
+        }
+    }
     // Reverse application order: lock pin, then the (no-op) mapping audit
     // record, then the authoritative config restore.
     for w in entry.wiring.iter().rev() {
@@ -758,6 +780,22 @@ pub async fn revert_nuget_opts(
                 "refusing revert: unsafe wiring file path {:?}",
                 w.file
             )),
+            LOCK_WIRING_KIND if config_still_routes => {
+                warnings.push(VendorWarning::new(
+                    "vendor_lock_entry_drifted",
+                    format!(
+                        "{} still routes {} to the vendored feed, so its {} pin is kept",
+                        entry
+                            .wiring
+                            .iter()
+                            .find(|c| c.kind == CONFIG_SOURCE_WIRING_KIND)
+                            .map_or("nuget.config", |c| c.file.as_str()),
+                        w.key.as_deref().unwrap_or("<unknown>"),
+                        w.file
+                    ),
+                ));
+                continue;
+            }
             LOCK_WIRING_KIND => revert_lock_record(&project_root.join(&w.file), w, dry_run).await,
             // Audit-only: the whole-file config restore lives on the source
             // record, so there is nothing to undo here.
@@ -1194,17 +1232,28 @@ async fn revert_config_record(
         Err(e) => return Err(format!("unreadable {}: {e}", config_path.display())),
     };
 
-    // (a) Byte-identical to what we wrote → the whole-file restore/delete is
-    //     provably safe (nothing changed since vendoring).
-    let new_matches = matches!(&w.new, Some(Value::String(n)) if *n == live);
+    // (a) What we wrote, up to line endings → the whole-file restore/delete
+    //     is provably safe (nothing changed since vendoring). A
+    //     `core.autocrlf` checkout (Git for Windows' default) hands back
+    //     our LF text as CRLF; that is git's encoding, not an edit (#537).
+    let new_matches =
+        matches!(&w.new, Some(Value::String(n)) if eol_eq(n.as_bytes(), live.as_bytes()));
     if new_matches {
         if dry_run {
             return Ok(true);
         }
         match &w.original {
-            // Pre-existed → restore the verbatim original bytes.
+            // Pre-existed → restore the original, verbatim when the live
+            // file still has the line endings we wrote, else spelled in the
+            // live file's (the checkout converted it).
             Some(Value::String(orig)) => {
-                atomic_write_bytes_preserving_mode(&config_path, orig.as_bytes())
+                let wrote_lf = matches!(&w.new, Some(Value::String(n)) if *n == live);
+                let restored = if wrote_lf {
+                    orig.clone()
+                } else {
+                    respell(orig, terminator(&live))
+                };
+                atomic_write_bytes_preserving_mode(&config_path, restored.as_bytes())
                     .await
                     .map_err(|e| format!("failed to restore {}: {e}", config_path.display()))?;
             }
@@ -1222,8 +1271,22 @@ async fn revert_config_record(
     //     two authored elements. Both are reproduced verbatim from the source
     //     key + uuid dir (the source `<add>`) and matched structurally by our
     //     source key (the mapping `<packageSource>`).
-    let source_add = format!("    <add key=\"{source_key}\" value=\"{uuid_dir_rel}\" />\n");
-    let mapping_block = excise_source_mapping(&live, source_key);
+    // Vendor inserts LF lines, even into a CRLF file (which then has
+    // mixed endings until git converts it), so the LF spelling is tried
+    // first, then the file's own terminator (a `core.autocrlf` checkout).
+    let spelled = |nl: &str| {
+        (
+            format!("    <add key=\"{source_key}\" value=\"{uuid_dir_rel}\" />{nl}"),
+            excise_source_mapping(&live, source_key, nl),
+        )
+    };
+    let lf = spelled("\n");
+    let (source_add, mapping_block) =
+        if live.contains(&lf.0) || lf.1.is_some() || terminator(&live) == "\n" {
+            lf
+        } else {
+            spelled(terminator(&live))
+        };
     if !live.contains(&source_add) && mapping_block.is_none() {
         // (c) Neither authored element is present verbatim → drift, leave alone.
         return Ok(false);
@@ -1246,16 +1309,32 @@ async fn revert_config_record(
     Ok(true)
 }
 
+/// Whether the project-root config `file` (a recorded wiring basename)
+/// still names the vendored feed dir `uuid_dir_rel`. An unsafe or
+/// unreadable file answers yes: when in doubt the lock pin is kept with
+/// the config that may route to it.
+async fn config_references(project_root: &Path, file: &str, uuid_dir_rel: &str) -> bool {
+    if !is_safe_single_segment(file) {
+        return true;
+    }
+    match read_regular_to_string(&project_root.join(file)).await {
+        Ok(text) => text.contains(uuid_dir_rel),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// The exact `<packageSource key="{source_key}"> … </packageSource>\n` block we
 /// authored in the mapping section, if present verbatim in `config`. Anchored on
 /// our source key and closed at the first `</packageSource>` after it, then
 /// extended through the trailing newline so the excision leaves no blank line.
 /// `None` when our mapping block is absent (already reverted, or edited).
-fn excise_source_mapping(config: &str, source_key: &str) -> Option<String> {
-    let open = format!("    <packageSource key=\"{source_key}\">\n");
+/// `nl` is the config's line terminator ([`terminator`]): a `core.autocrlf`
+/// checkout spells our LF block in CRLF.
+fn excise_source_mapping(config: &str, source_key: &str, nl: &str) -> Option<String> {
+    let open = format!("    <packageSource key=\"{source_key}\">{nl}");
     let open_at = config.find(&open)?;
-    let close = "    </packageSource>\n";
-    let rel_close = config[open_at..].find(close)?;
+    let close = format!("    </packageSource>{nl}");
+    let rel_close = config[open_at..].find(&close)?;
     let end = open_at + rel_close + close.len();
     Some(config[open_at..end].to_string())
 }
@@ -2584,6 +2663,172 @@ mod tests {
         assert!(after.contains("key=\"nuget.org\""));
     }
 
+    /// `path` rewritten with CRLF line endings, as a `core.autocrlf=true`
+    /// checkout (Git for Windows' default) hands it back.
+    async fn autocrlf(path: &Path) {
+        let text = tokio::fs::read_to_string(path).await.unwrap();
+        tokio::fs::write(path, text.replace("\r\n", "\n").replace('\n', "\r\n"))
+            .await
+            .unwrap();
+    }
+
+    /// #537: after an autocrlf checkout, revert restores BOTH the
+    /// pre-existing config (in the checkout's CRLF) and the lock, with no
+    /// drift warning and the feed removed.
+    #[tokio::test]
+    async fn revert_on_an_autocrlf_checkout_restores_config_and_lock() {
+        let orig_cfg = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                        <configuration>\n\
+                        \x20 <packageSources>\n\
+                        \x20   <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n\
+                        \x20 </packageSources>\n\
+                        </configuration>\n";
+        let (dir, blobs, installed, record) = fixture(true, Some(orig_cfg)).await;
+        let root = dir.path();
+        let lock_before = tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        autocrlf(&root.join("nuget.config")).await;
+        autocrlf(&root.join(PACKAGES_LOCK)).await;
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            orig_cfg.replace('\n', "\r\n"),
+            "the original config, in the checkout's line endings"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+                .await
+                .unwrap(),
+            lock_before.replace('\n', "\r\n")
+        );
+        assert!(!root.join(format!(".socket/vendor/nuget/{UUID}")).exists());
+    }
+
+    /// #537: a config we created is deleted on an autocrlf checkout too.
+    #[tokio::test]
+    async fn revert_on_an_autocrlf_checkout_deletes_a_created_config() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        autocrlf(&root.join("nuget.config")).await;
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!root.join("nuget.config").exists());
+    }
+
+    /// #537: the fragment excision (a sibling's wiring made the file differ
+    /// from what we wrote) finds our CRLF-spelled elements and keeps the
+    /// file's CRLF.
+    #[tokio::test]
+    async fn revert_excises_our_crlf_fragments_beside_a_sibling() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        let cfg = root.join("nuget.config");
+        let wired = tokio::fs::read_to_string(&cfg).await.unwrap();
+        let sibling = wired.replacen(
+            "</packageSources>",
+            "  <add key=\"corp\" value=\"https://corp.example/v3/index.json\" />\n  </packageSources>",
+            1,
+        );
+        tokio::fs::write(&cfg, &sibling).await.unwrap();
+        autocrlf(&cfg).await;
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let after = tokio::fs::read_to_string(&cfg).await.unwrap();
+        assert!(!after.contains(UUID), "{after}");
+        assert!(after.contains("key=\"corp\""), "{after}");
+        assert!(
+            !after.replace("\r\n", "").contains('\n'),
+            "CRLF kept: {after:?}"
+        );
+    }
+
+    /// #537 review: an existing CRLF config gets our LF lines (mixed until
+    /// git converts it); a CRLF sibling edit sends the revert down the
+    /// excision path, which must still find our LF fragments.
+    #[tokio::test]
+    async fn revert_excises_lf_fragments_from_a_mixed_crlf_config() {
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<configuration>\r\n  <packageSources>\r\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\r\n  </packageSources>\r\n  <packageSourceMapping>\r\n    <packageSource key=\"nuget.org\">\r\n      <package pattern=\"*\" />\r\n    </packageSource>\r\n  </packageSourceMapping>\r\n</configuration>\r\n";
+        let (dir, blobs, installed, record) = fixture(true, Some(orig)).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        let cfg = root.join("nuget.config");
+        let wired = tokio::fs::read_to_string(&cfg).await.unwrap();
+        let sibling = wired.replacen(
+            "  </packageSources>",
+            "    <add key=\"corp\" value=\"https://corp.example/v3/index.json\" />\r\n  </packageSources>",
+            1,
+        );
+        tokio::fs::write(&cfg, &sibling).await.unwrap();
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact);
+        let after = tokio::fs::read_to_string(&cfg).await.unwrap();
+        assert!(!after.contains(UUID), "{after}");
+        assert!(after.contains("key=\"corp\""), "{after}");
+    }
+
+    /// #537: a config left wired (drift-kept, it still routes to the feed)
+    /// keeps its lock pin too, so restore never sees an upstream lock under
+    /// a vendored mapping.
+    #[tokio::test]
+    async fn drift_kept_config_keeps_the_lock_pin() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        let pinned = tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        // Tooling re-serialized the config: our elements no longer match
+        // verbatim, but the source still points at the feed.
+        let cfg = root.join("nuget.config");
+        let wired = tokio::fs::read_to_string(&cfg).await.unwrap();
+        tokio::fs::write(&cfg, wired.replace("    <", "\t\t<"))
+            .await
+            .unwrap();
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+                .await
+                .unwrap(),
+            pinned,
+            "the lock keeps the vendored pin while the config routes to it"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("still routes")),
+            "{:?}",
+            outcome.warnings
+        );
+    }
+
     #[tokio::test]
     async fn revert_warns_when_our_source_key_already_gone() {
         // The user regenerated nuget.config, dropping our source entirely.
@@ -2640,13 +2885,13 @@ mod tests {
                    \x20     <package pattern=\"Newtonsoft.Json\" />\n\
                    \x20   </packageSource>\n\
                    \x20 </packageSourceMapping>\n";
-        let block = excise_source_mapping(cfg, "socket-patch-abc").unwrap();
+        let block = excise_source_mapping(cfg, "socket-patch-abc", "\n").unwrap();
         assert!(block.contains("key=\"socket-patch-abc\""));
         assert!(block.contains("Newtonsoft.Json"));
         // Does not swallow the sibling nuget.org block.
         assert!(!block.contains("nuget.org"));
         // Absent key → None.
-        assert!(excise_source_mapping(cfg, "socket-patch-missing").is_none());
+        assert!(excise_source_mapping(cfg, "socket-patch-missing", "\n").is_none());
     }
 
     #[tokio::test]
