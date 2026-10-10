@@ -1379,8 +1379,15 @@ mod tests {
     }
 
     /// The ```jsonc block under `heading` in CLI_CONTRACT.md.
+    /// CLI_CONTRACT.md with LF line endings: a Windows checkout may carry
+    /// CRLF, which the `"```jsonc\n"` fence match below would miss.
+    fn contract_doc() -> &'static str {
+        static DOC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        DOC.get_or_init(|| include_str!("../CLI_CONTRACT.md").replace("\r\n", "\n"))
+    }
+
     fn contract_block(heading: &str) -> &'static str {
-        let doc = include_str!("../CLI_CONTRACT.md");
+        let doc = contract_doc();
         let at = doc
             .find(heading)
             .unwrap_or_else(|| panic!("{heading} missing"));
@@ -1457,7 +1464,7 @@ mod tests {
             object_keys(value["files"][0].clone()),
             "files[] keys"
         );
-        let doc = include_str!("../CLI_CONTRACT.md");
+        let doc = contract_doc();
         for action in [
             PatchAction::Discovered,
             PatchAction::Downloaded,
