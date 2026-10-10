@@ -245,6 +245,36 @@ pub(crate) async fn persist(root: &Path, key: &str, mut entry: VendorEntry) {
     save_state(root, &state).await.unwrap();
 }
 
+/// Make `root` a git work tree whose `.gitignore` is `rules`. `None` when
+/// git is not installed (the caller skips: no git, nothing to commit).
+pub(crate) fn git_project(root: &Path, rules: &str) -> Option<()> {
+    let git = crate::utils::process::resolve_tool("git")?;
+    let ok = std::process::Command::new(git)
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status()
+        .ok()?
+        .success();
+    assert!(ok, "git init");
+    std::fs::write(root.join(".gitignore"), rules).unwrap();
+    Some(())
+}
+
+/// GitHub's stock `Java.gitignore` (github/gitignore), verbatim.
+pub(crate) const JAVA_GITIGNORE: &str = "# Compiled class file\n*.class\n\n# Log file\n*.log\n\n\
+# BlueJ files\n*.ctxt\n\n# Mobile Tools for Java (J2ME)\n.mtj.tmp/\n\n# Package Files #\n*.jar\n\
+*.war\n*.nar\n*.ear\n*.zip\n*.tar.gz\n*.rar\n\n\
+# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml\n\
+hs_err_pid*\nreplay_pid*\n";
+
+/// The package rules of GitHub's stock `VisualStudio.gitignore`.
+pub(crate) const VISUAL_STUDIO_GITIGNORE: &str = "[Bb]in/\n[Oo]bj/\n[Ll]og/\n\
+# NuGet Packages\n*.nupkg\n# NuGet Symbol Packages\n*.snupkg\n\
+# The packages folder can be ignored because of Package Restore\n**/[Pp]ackages/*\n\
+# except build/, which is used as an MSBuild target.\n!**/[Pp]ackages/build/\n\
+# NuGet v3's project.json files produces more ignorable files\n*.nuget.props\n*.nuget.targets\n";
+
 pub(crate) fn has_warning(warnings: &[VendorWarning], code: &str) -> bool {
     warnings.iter().any(|w| w.code == code)
 }

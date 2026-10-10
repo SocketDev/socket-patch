@@ -163,6 +163,7 @@ pub const CAPTURED_FILES: &[&str] = &[
     super::gradle::SCRIPT_REL,
     super::maven_reactor::GITATTRIBUTES_REL,
     super::gradle::GITATTRIBUTES_REL,
+    super::gradle::GITIGNORE_REL,
     super::gradle::SCRIPT_GITATTRIBUTES_REL,
     super::gradle::VENDOR_GITATTRIBUTES_REL,
     super::coursier_tree::INDEX_REL,
@@ -543,6 +544,7 @@ mod tests {
         under(maven_reactor::GITATTRIBUTES_REL, MAVEN2_TREE);
         under(sbt::TREE_GITIGNORE_REL, MAVEN2_TREE);
         under(gradle::GITATTRIBUTES_REL, GRADLE_TREE);
+        under(gradle::GITIGNORE_REL, GRADLE_TREE);
         under(coursier_tree::GITIGNORE_REL, COURSIER_TREE);
         under(coursier_tree::GITATTRIBUTES_REL, COURSIER_TREE);
         under(scala_cli::GUARD_REL, COURSIER_TREE);
