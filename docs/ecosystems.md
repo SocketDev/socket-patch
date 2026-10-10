@@ -1067,6 +1067,13 @@ crate that means the **shared** `$CARGO_HOME/registry` cache: the patch affects 
 project on the machine, and is silently reset by `cargo clean` or a cache prune. Use
 `--mode vendored` for a project-local, committable patch.
 
+Nothing deletes a crate from the cache when the project stops using it, so the
+manifest record stays the only way to restore that copy: `rollback` (and `remove`)
+also restore it after the crate was moved to vendored mode, and `scan --prune` /
+`--sync` keep the record of a crate the lock no longer resolves while its cache copy
+is still patched (`cargo_cache_patch_kept`; `socket-patch rollback <purl>` restores
+the copy and drops the record).
+
 Cargo never re-checks a registry or `cargo vendor` crate's source files: it reuses the
 crate's compiled artifacts while the package id is unchanged. So after `apply` or
 `rollback` changes a crate's bytes, socket-patch deletes that crate's fingerprints

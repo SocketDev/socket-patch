@@ -235,7 +235,8 @@ pub(super) async fn run_apply_gc(
         Ok(Some(m)) => m,
         _ => return GcSummary::vendor_only(vendor_gc),
     };
-    let prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    let kept = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
@@ -258,8 +259,48 @@ pub(super) async fn run_apply_gc(
     }
     let mut gc = run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ false).await;
     gc.absorb_vendor_gc(vendor_gc);
+    gc.warnings.extend(kept);
     gc.warnings.extend(write_failure);
     gc
+}
+
+/// Drop from `prunable` every Cargo entry whose agent-mode patch is still
+/// on disk in a copy the crawl no longer reports (#1278): the project
+/// crawl is scoped to the crates `Cargo.lock` resolves, but a crate bumped
+/// or dropped from the lock keeps its patched copy in the machine-wide
+/// `$CARGO_HOME/registry/src` cache, which nothing deletes. Its manifest
+/// record holds the only before-blobs that can restore that copy, so it is
+/// kept, with one `cargo_cache_patch_kept` warning per entry naming the
+/// `rollback` that restores the copy and then drops the record.
+async fn keep_patched_cargo_copies(
+    common: &GlobalArgs,
+    manifest: &PatchManifest,
+    socket_dir: &Path,
+    prunable: &mut Vec<String>,
+) -> Vec<(&'static str, String)> {
+    let kept = crate::ecosystem_dispatch::cargo_copies_still_patched(
+        manifest,
+        prunable.iter(),
+        &common.crawler_options(),
+        &socket_dir.join("blobs"),
+        true,
+    )
+    .await;
+    prunable.retain(|p| !kept.contains(p));
+    kept.into_iter()
+        .map(|purl| {
+            (
+                "cargo_cache_patch_kept",
+                format!(
+                    "kept {purl}: the project no longer resolves it, but its copy in the \
+                     shared Cargo registry cache is still patched (or could not be \
+                     read to tell); run `socket-patch rollback {purl}` (with `--global` \
+                     when a `cargo vendor` dir hides the registry cache) to restore \
+                     that copy and drop the entry"
+                ),
+            )
+        })
+        .collect()
 }
 
 /// The vendored-state half of the GC alone, for a `--prune` whose crawl
@@ -334,7 +375,10 @@ async fn preview_apply_gc(
             }
         }
     }
-    let prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    // The wet pass keeps a Cargo entry whose shared-cache copy is still
+    // patched; so does the preview.
+    let _ = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
     // Likewise drop the prunable entries in memory before the sweep: the
     // cleanup helpers derive the referenced set from this manifest.
     for purl in &prunable {
