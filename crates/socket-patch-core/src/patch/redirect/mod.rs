@@ -4798,14 +4798,17 @@ fn rewrite_yarn_berry_with_manifests(
             &fname,
             &dep.version,
             &key_ranges,
-            &folded
-                .iter()
-                .flat_map(|(_, ranges)| ranges.iter().cloned())
-                .collect::<Vec<_>>(),
             current_url.as_deref(),
             &dep.artifact_url,
         ) {
-            Ok(pin) => pin,
+            Ok(mut pin) => {
+                let folded_ranges: Vec<&str> = folded
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().map(String::as_str))
+                    .collect();
+                pin.add_ranges(yarnrc, &fname, &folded_ranges);
+                pin
+            }
             Err(warning) => {
                 result.warnings.push(warning);
                 continue;
@@ -5052,6 +5055,20 @@ struct BerryResolutionsPin {
 }
 
 impl BerryResolutionsPin {
+    /// Route `ranges` too: the registry entries of descriptors added after
+    /// pinning, which the pin folds in (#1082), with their catalog
+    /// selectors.
+    fn add_ranges(&mut self, yarnrc: Option<&str>, name: &str, ranges: &[&str]) {
+        let mut added: Vec<String> = ranges.iter().map(|r| format!("{name}@{r}")).collect();
+        added.extend(berry_catalog_selectors(yarnrc, name, ranges));
+        for selector in added {
+            self.stale.retain(|s| *s != selector);
+            if !self.selectors.contains(&selector) {
+                self.selectors.push(selector);
+            }
+        }
+    }
+
     /// Write the pin into `manifest`: every selector routed to `url`, stale
     /// ones dropped, and an emptied `resolutions` table removed. Returns
     /// `(selector, previous value)` for each selector it added or changed.
@@ -5115,7 +5132,6 @@ fn berry_resolutions_pin(
     name: &str,
     version: &str,
     key_ranges: &[String],
-    folded_ranges: &[String],
     current_url: Option<&str>,
     artifact_url: &str,
 ) -> Result<BerryResolutionsPin, RewriteWarning> {
@@ -5171,13 +5187,6 @@ fn berry_resolutions_pin(
                  the entry and run `yarn install`), then re-run"
             ),
         });
-    }
-    // The registry entries of descriptors added after pinning (#1082).
-    for range in folded_ranges {
-        let selector = format!("{name}@{range}");
-        if !selectors.contains(&selector) {
-            selectors.push(selector);
-        }
     }
     let ranges: Vec<&str> = selectors
         .iter()
