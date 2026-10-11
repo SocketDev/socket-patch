@@ -53,6 +53,7 @@
 #[path = "common/mod.rs"]
 mod common;
 use common::binary;
+use common::hermetic;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -96,32 +97,16 @@ macro_rules! skip {
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-fn scrub_socket_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_CACHE_FOLDER");
-    // An ambient yarn 1 mirror setting, or a redirected rc file, would make
-    // both yarn and the hosted scan see a mirror the leg did not set up.
-    for (k, _) in std::env::vars_os() {
-        let lower = k.to_string_lossy().to_ascii_lowercase();
-        let config = lower.starts_with("yarn_") || lower.starts_with("npm_config_");
-        if config && (lower.contains("offline_mirror") || lower.ends_with("userconfig")) {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("PREFIX");
-}
-
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST (it removes SOCKET_* and YARN_CACHE_FOLDER), then
     // set the hermetic flags so they survive.
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(
+        &mut cmd,
+        &[hermetic::Extra::Venv, hermetic::Extra::YarnClassic],
+    );
     cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
@@ -135,9 +120,12 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 }
 
 fn run_socket_env(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.args(args).current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(
+        &mut cmd,
+        &[hermetic::Extra::Venv, hermetic::Extra::YarnClassic],
+    );
     // The hosted scan reads yarn 1's user rc files, so it must see the same
     // sandboxed HOME the fixture's `yarn install` ran under.
     cache_env::isolate(&mut cmd);

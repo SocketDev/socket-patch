@@ -48,6 +48,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
+use common::hermetic;
 use common::{binary, git_sha256, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
@@ -100,7 +101,11 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     // env), then seed the hermetic flags so they survive (Command: last env
     // call wins). Scrubbing last wiped the caller's private cache override,
     // so the fixture install silently used the developer's global cache.
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(
+        &mut cmd,
+        &[hermetic::Extra::Venv, hermetic::Extra::YarnClassic],
+    );
     cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
@@ -109,24 +114,14 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     cmd.output().expect("failed to run corepack")
 }
 
-/// Remove every ambient `SOCKET_*` var (so a developer's `SOCKET_DRY_RUN=1`
-/// etc. can't flip behavior) and the PM cache var the harness controls.
-fn scrub_socket_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars_os() {
-        let k = k.to_string_lossy();
-        if k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(k.as_ref());
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_CACHE_FOLDER");
-}
-
 /// Run the socket-patch binary with a scrubbed environment.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(
+        &mut cmd,
+        &[hermetic::Extra::Venv, hermetic::Extra::YarnClassic],
+    );
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (

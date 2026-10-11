@@ -25,7 +25,6 @@
 use crate::common::binary;
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -48,32 +47,6 @@ fn write_root_package_json(root: &Path) {
         r#"{ "name": "covgap-ecosystem-dispatch", "version": "0.0.0" }"#,
     )
     .unwrap();
-}
-
-/// Hermeticity scrub (same seed-then-scrub contract as the sibling suite):
-/// hostile values for the vars that would silently change the branch under
-/// test are set first, then the whole `SOCKET_*` prefix is removed — if the
-/// scrub ever stops running, the seeds turn these tests red immediately.
-fn scrub_socket_env(cmd: &mut Command) {
-    const HOSTILE_SEEDS: &[(&str, &str)] = &[
-        ("SOCKET_DRY_RUN", "true"),
-        ("SOCKET_GLOBAL", "true"),
-        ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
-        ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
-    ];
-    for (k, v) in HOSTILE_SEEDS {
-        cmd.env(k, v);
-    }
-    for (k, _) in HOSTILE_SEEDS {
-        cmd.env_remove(k);
-    }
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
 }
 
 /// Write a minimal manifest with one (file-less) patch for the given PURL.
@@ -138,7 +111,7 @@ fn write_rollback_manifest(root: &Path, purl: &str, file_key: &str) {
 /// dir under `cwd` so the local-mode cache probe can never reach the real
 /// user cache (`~/Library/Caches/deno` on macOS).
 fn run_apply_deno(cwd: &Path) -> (i32, Value) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = crate::common::hermetic_command(&binary());
     cmd.args([
         "apply",
         "--offline",
@@ -148,7 +121,6 @@ fn run_apply_deno(cwd: &Path) -> (i32, Value) {
         "--silent",
     ])
     .current_dir(cwd);
-    scrub_socket_env(&mut cmd);
     let deno_dir = cwd.join("deno-cache");
     std::fs::create_dir_all(&deno_dir).unwrap();
     cmd.env("DENO_DIR", &deno_dir);
@@ -232,7 +204,7 @@ fn rollback_dispatch_branch_deno() {
     let purl = "pkg:jsr/@__rollback_dispatch__/pkg@1.0.0";
     write_rollback_manifest(root, purl, "mod.ts");
 
-    let mut cmd = Command::new(binary());
+    let mut cmd = crate::common::hermetic_command(&binary());
     cmd.args([
         "rollback",
         "--offline",
@@ -244,7 +216,6 @@ fn rollback_dispatch_branch_deno() {
         jsr_root.to_str().unwrap(),
     ])
     .current_dir(root);
-    scrub_socket_env(&mut cmd);
     let out = cmd.output().expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let env: Value = serde_json::from_str(stdout.trim())

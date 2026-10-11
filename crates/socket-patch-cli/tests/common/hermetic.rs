@@ -149,6 +149,14 @@ pub enum Extra {
     /// `npm_config_node_linker=pnp` makes pnpm emit a `.pnp.cjs` that
     /// `vendor` refuses. Seeded with that value and then scrubbed.
     Pnpm,
+    /// Yarn 1's ambient config: `YARN_CACHE_FOLDER` (the harness pins its
+    /// own cache through `cache_env::isolate`, so run this first), any
+    /// `yarn_*` / `npm_config_*` (any case) offline-mirror or `userconfig`
+    /// override, and `PREFIX`. An ambient mirror setting or a redirected rc
+    /// file would make both yarn and the hosted scan see a mirror the leg
+    /// did not set up. Kept as narrow as the private scrubs the yarn 1
+    /// suites carried before; [`Extra::Yarn`] is the full `YARN_*` sweep.
+    YarnClassic,
 }
 
 /// Apply each of `extras` to `cmd` (see [`Extra`]). Run it before
@@ -179,6 +187,18 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                     }
                 }
                 cmd.env_remove("npm_config_node_linker");
+            }
+            Extra::YarnClassic => {
+                cmd.env_remove("YARN_CACHE_FOLDER");
+                for (key, _) in std::env::vars_os() {
+                    let lower = key.to_string_lossy().to_ascii_lowercase();
+                    let config = lower.starts_with("yarn_") || lower.starts_with("npm_config_");
+                    if config && (lower.contains("offline_mirror") || lower.ends_with("userconfig"))
+                    {
+                        cmd.env_remove(&key);
+                    }
+                }
+                cmd.env_remove("PREFIX");
             }
         }
     }
