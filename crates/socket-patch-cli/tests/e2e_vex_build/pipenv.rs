@@ -448,6 +448,44 @@ fn pylock_flow(pipenv: &Pipenv, root: &Path) {
         if ok { "pass" } else { "FAIL" },
     );
     assert!(ok, "{what}: the fresh install must carry the PATCHED six");
+
+    // #1368: a PEP 751 installer reading the wired pylock gets the PATCHED
+    // six too, from the committed wheel.
+    let pep751 = root.join("pylock").join("pep751");
+    copy_tree(&proj, &pep751, &[".venv"]);
+    make_venv(
+        &pipenv.uv,
+        python.to_str().unwrap(),
+        &pep751.join(".venv"),
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("{what}: pylock venv: {e}"));
+    let py = venv_bin(&pep751.join(".venv"), "python");
+    let out = tool(
+        &pipenv.uv,
+        &pep751,
+        &[
+            "pip",
+            "install",
+            "--python",
+            py.to_str().unwrap(),
+            "-r",
+            "pylock.toml",
+        ],
+        &[],
+    );
+    assert_ok(&out, &format!("{what}: `uv pip install -r pylock.toml`"));
+    let (_, bytes, is_patched) = six_oracle(&py, &pep751)
+        .unwrap_or_else(|| panic!("{what}: six not importable from the pylock install"));
+    let ok = is_patched && bytes == patched;
+    record(
+        "pipenv",
+        v,
+        "use_pylock/vendored",
+        "pylock-install-patched",
+        if ok { "pass" } else { "FAIL" },
+    );
+    assert!(ok, "{what}: the pylock install must carry the PATCHED six");
 }
 
 #[test]

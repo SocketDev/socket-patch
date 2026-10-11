@@ -186,18 +186,28 @@ pub async fn recover_lock_entry(
             // `pdm_lock_package`, poetry `poetry_lock_package`, pipenv
             // `pipenv_lock_entry`, bare pip `requirements_line`. Accept them all
             // so recovery is not blind to non-uv projects.
-            let fragment = wiring_original(
-                entry,
-                &[
-                    "uv_lock_package",
-                    "python_lock_document",
-                    "pdm_lock_package",
-                    "poetry_lock_package",
-                    "pipenv_lock_entry",
-                    "requirements_line",
-                ],
-            )
-            .ok_or_else(|| "no pre-vendor pypi lock fragment recorded".to_string())?;
+            // A Pipenv entry's own Pipfile.lock fragment first, whatever
+            // order its pylock records (#1368) sit in.
+            let pipenv_fragment = if entry.flavor.as_deref() == Some("pipenv") {
+                wiring_original(entry, &["pipenv_lock_entry"])
+            } else {
+                None
+            };
+            let fragment = pipenv_fragment
+                .or_else(|| {
+                    wiring_original(
+                        entry,
+                        &[
+                            "uv_lock_package",
+                            "python_lock_document",
+                            "pdm_lock_package",
+                            "poetry_lock_package",
+                            "pipenv_lock_entry",
+                            "requirements_line",
+                        ],
+                    )
+                })
+                .ok_or_else(|| "no pre-vendor pypi lock fragment recorded".to_string())?;
             // Only uv.lock and pdm's `static_urls` locks inline the wheel's
             // registry URL (`url = "…", hash = "sha256:…"`), which is all a
             // registry rebuild can fetch from. Default pdm/poetry (`file = …`),

@@ -412,23 +412,23 @@ async fn recover_pypi_urlless_locks_report_no_fetchable_url() {
 
     // #1368: a Pipenv entry also records the pylock wired beside its
     // Pipfile.lock. A pylock entry with no hash-pinned wheel must not hide
-    // the Pipfile.lock fragment's digest set.
+    // the Pipfile.lock fragment's digest set, in either record order.
     let mut with_pylock = entry(
         "pypi",
         "pkg:pypi/six@1.16.0",
         vec![
+            rec(
+                "python_lock_document",
+                serde_json::json!(
+                    "lock-version = \"1.0\"\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n"
+                ),
+            ),
             rec(
                 "pipenv_lock_entry",
                 serde_json::json!({
                     "hashes": [format!("sha256:{}", "a".repeat(64))],
                     "version": "==1.16.0",
                 }),
-            ),
-            rec(
-                "python_lock_document",
-                serde_json::json!(
-                    "lock-version = \"1.0\"\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n"
-                ),
             ),
         ],
     );

@@ -1169,8 +1169,39 @@ async fn pypi_prelude<'p>(
                     });
             // #1368: a pylock `pipenv lock` wrote beside Pipfile.lock
             // (`use_pylock = true`) still pinning the registry release.
-            let registry_pylocks =
-                registry_pipenv_pylocks(project_root, &canon_name, version).await;
+            let pylock_states =
+                super::pypi_lock::pipenv_pylocks(project_root, &canon_name, version).await;
+            let registry_pylocks: Vec<String> = pylock_states
+                .iter()
+                .filter(|(_, state)| *state == super::pypi_lock::PipenvPylock::Registry)
+                .map(|(path, _)| path.clone())
+                .collect();
+            let superseded_pylocks: Vec<String> = superseded.as_ref().map_or(Vec::new(), |prev| {
+                prev.wiring
+                    .iter()
+                    .filter(|r| super::pypi_lock::is_lock_record(r))
+                    .map(|r| r.file.clone())
+                    .collect()
+            });
+            // A pylock already on another patch's wheel that no ledger
+            // entry this run replays: nothing re-wires it, so name it.
+            for (path, state) in &pylock_states {
+                if let super::pypi_lock::PipenvPylock::Vendored(uuid) = state {
+                    if !uuid.eq_ignore_ascii_case(&record.uuid)
+                        && !superseded_pylocks.contains(path)
+                    {
+                        warnings.push(VendorWarning::new(
+                            "pypi_multiple_lockfiles",
+                            format!(
+                                "{path} points {canon_name}=={version} at the vendored wheel of \
+                                 patch {uuid}, which no vendor ledger entry records; this run \
+                                 does not re-wire it, so installs driven by it will not get \
+                                 this patch (re-lock with `pipenv lock` and re-run vendor)"
+                            ),
+                        ));
+                    }
+                }
+            }
             match target {
                 PipenvTarget::InSync => {
                     wired_pin = pipenv_wired_pin(&project.lock, &uuid_dir_rel);
@@ -1181,13 +1212,17 @@ async fn pypi_prelude<'p>(
                     if sibling && dry_run {
                         warnings.push(sibling_dry_run_notice(flavor, &canon_name, version));
                     }
-                    let superseded_pylocks = superseded.as_ref().map_or(Vec::new(), |prev| {
-                        prev.wiring
-                            .iter()
-                            .filter(|r| super::pypi_lock::is_lock_record(r))
-                            .map(|r| r.file.clone())
-                            .collect()
-                    });
+                    // The wet run unwinds the superseded pylock wiring
+                    // first and refuses when it drifted: preview that.
+                    if dry_run {
+                        if let Some(prev) = superseded.as_ref() {
+                            if let Err((code, detail)) =
+                                unwind_superseded_pylocks(project_root, prev, true).await
+                            {
+                                return Err(refused(code, detail));
+                            }
+                        }
+                    }
                     let mut pylocks = registry_pylocks;
                     pylocks.extend(superseded_pylocks);
                     pylocks.sort_unstable();
@@ -2820,6 +2855,49 @@ async fn wire_sibling_requirements(
     }
 }
 
+/// Revert the pylock records of `prev`, the Pipenv entry a superseding
+/// patch replaces (#1368), so its pylocks hold the registry entry again.
+/// A failed or drifted unwind refuses, as a drifted Pipfile.lock does:
+/// the old entry holds the only pre-vendor originals. `dry_run` only
+/// checks.
+async fn unwind_superseded_pylocks(
+    project_root: &Path,
+    prev: &VendorEntry,
+    dry_run: bool,
+) -> Result<(), (&'static str, String)> {
+    let wiring: Vec<_> = prev
+        .wiring
+        .iter()
+        .filter(|r| super::pypi_lock::is_lock_record(r))
+        .cloned()
+        .collect();
+    if wiring.is_empty() {
+        return Ok(());
+    }
+    let pylocks = VendorEntry {
+        wiring,
+        ..prev.clone()
+    };
+    let outcome = super::pypi_lock::revert_python_locks(&pylocks, project_root, dry_run).await;
+    if outcome.success && !outcome.drift_skipped() {
+        return Ok(());
+    }
+    Err((
+        "pypi_lock_changed",
+        format!(
+            "the pylock wiring of patch {} could not be unwound ({}); restore the pylock from \
+             version control, or run vendor --revert before vendoring this patch",
+            prev.uuid,
+            outcome.error.unwrap_or_else(|| outcome
+                .warnings
+                .iter()
+                .map(|w| w.detail.as_str())
+                .collect::<Vec<_>>()
+                .join("; "))
+        ),
+    ))
+}
+
 /// Wire the Pipenv pylocks beside a just-wired Pipfile.lock to the same
 /// wheel (#1368). A superseded entry's pylock wiring is reverted first, so
 /// its files hold the registry entry again and the new records carry the
@@ -2838,35 +2916,7 @@ async fn wire_pipenv_pylocks(
 ) -> Result<Vec<super::state::WiringRecord>, (&'static str, String)> {
     let wired = async {
         if let Some(prev) = superseded {
-            let wiring: Vec<_> = prev
-                .wiring
-                .iter()
-                .filter(|r| super::pypi_lock::is_lock_record(r))
-                .cloned()
-                .collect();
-            if !wiring.is_empty() {
-                let pylocks = VendorEntry {
-                    wiring,
-                    ..prev.clone()
-                };
-                let outcome =
-                    super::pypi_lock::revert_python_locks(&pylocks, project_root, false).await;
-                if !outcome.success || outcome.drift_skipped() {
-                    return Err((
-                        "pypi_lock_changed",
-                        format!(
-                            "the pylock wiring of patch {} could not be unwound: {}",
-                            prev.uuid,
-                            outcome.error.unwrap_or_else(|| outcome
-                                .warnings
-                                .iter()
-                                .map(|w| w.detail.as_str())
-                                .collect::<Vec<_>>()
-                                .join("; "))
-                        ),
-                    ));
-                }
-            }
+            unwind_superseded_pylocks(project_root, prev, false).await?;
         }
         let pylocks = registry_pipenv_pylocks(project_root, canon_name, version).await;
         super::pypi_lock::wire_pipenv_pylocks(
@@ -2968,6 +3018,21 @@ async fn revert_with_sibling(
             let mut detail = pylocks_outcome.error.take().unwrap_or_default();
             restore_snapshot(project_root, &snapshot, &mut detail).await;
             pylocks_outcome.error = Some(detail);
+            return pylocks_outcome;
+        }
+        // A drift-kept pylock keeps the whole entry: put back the files
+        // reverted so far, so the tree still matches it and a re-run
+        // reverts everything once the drift is undone.
+        if pylocks_outcome.drift_skipped() {
+            let mut detail = String::new();
+            restore_snapshot(project_root, &snapshot, &mut detail).await;
+            if !detail.is_empty() {
+                pylocks_outcome.warnings.push(VendorWarning::new(
+                    "vendor_lock_entry_drifted",
+                    format!("the files wired with the drifted pylock stay wired{detail}"),
+                ));
+            }
+            pylocks_outcome.warnings.extend(lines_outcome.warnings);
             return pylocks_outcome;
         }
         lines_outcome.warnings.extend(pylocks_outcome.warnings);
@@ -6767,6 +6832,144 @@ wheels = [
         assert!(
             pylock_wired_to(&fx, UUID).await,
             "the pylock must not be reverted alone"
+        );
+    }
+
+    /// [`PIPENV_PYLOCK`] with its six entry already on patch `uuid`'s wheel.
+    fn pylock_on(uuid: &str) -> String {
+        format!(
+            "lock-version = \"1.0\"\ncreated-by = \"pipenv\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\narchive = {{ path = \".socket/vendor/pypi/{uuid}/{WHEEL_NAME}\", hashes = {{ sha256 = \"{}\" }} }}\n",
+            "c".repeat(64)
+        )
+    }
+
+    /// A pylock already on another patch's wheel that no ledger entry
+    /// records is not re-wired by this run, so it is named, not silently
+    /// treated as wired.
+    #[tokio::test]
+    async fn pipenv_pylock_on_an_unrecorded_patch_is_named() {
+        const OTHER: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let fx = pipenv_e2e_fixture().await;
+        touch(&fx.root, "Pipfile", USE_PYLOCK_PIPFILE).await;
+        let stale = pylock_on(OTHER);
+        touch(&fx.root, "pylock.toml", &stale).await;
+        let VendorOutcome::Done { warnings, .. } = pipenv_vendor(&fx, &fx.record).await else {
+            panic!("vendor did not complete");
+        };
+        assert!(
+            warnings.iter().any(|w| w.code == "pypi_multiple_lockfiles"
+                && w.detail.contains("pylock.toml")
+                && w.detail.contains(OTHER)),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("pylock.toml"))
+                .await
+                .unwrap(),
+            stale
+        );
+    }
+
+    /// The pylock entry hand-edited after vendoring.
+    async fn drift_pylock(fx: &E2eFixture) {
+        let live = tokio::fs::read_to_string(fx.root.join("pylock.toml"))
+            .await
+            .unwrap();
+        let mut doc: toml_edit::DocumentMut = live.parse().unwrap();
+        doc["packages"][0]["archive"]["hashes"]["sha256"] = toml_edit::value("d".repeat(64));
+        touch(&fx.root, "pylock.toml", &doc.to_string()).await;
+    }
+
+    /// A superseding patch whose old pylock wiring drifted refuses, as a
+    /// drifted Pipfile.lock does, and `--dry-run` predicts the refusal.
+    #[tokio::test]
+    async fn pipenv_superseding_uuid_refuses_a_drifted_pylock_in_dry_run_too() {
+        const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let fx = pipenv_pylock_fixture().await;
+        let VendorOutcome::Done {
+            entry: Some(first), ..
+        } = pipenv_vendor(&fx, &fx.record).await
+        else {
+            panic!("first vendor must be Done");
+        };
+        save_ledger_entry(&fx.root, &first).await;
+        drift_pylock(&fx).await;
+        let mut record2 = fx.record.clone();
+        record2.uuid = UUID2.to_string();
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let dry = crate::vendor::test_support::vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &record2,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            true,
+            false,
+            None,
+        )
+        .await;
+        let wet = pipenv_vendor(&fx, &record2).await;
+        for (label, outcome) in [("dry", dry), ("wet", wet)] {
+            let failed = match &outcome {
+                VendorOutcome::Done { result, .. } => result
+                    .error
+                    .as_deref()
+                    .filter(|_| !result.success)
+                    .map(str::to_string),
+                other => Some(format!("{other:?}")),
+            };
+            assert!(
+                failed
+                    .as_deref()
+                    .is_some_and(|e| e.contains("pypi_lock_changed")),
+                "{label}: {outcome:?}"
+            );
+        }
+        let lock = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        assert!(lock.contains(UUID) && !lock.contains(UUID2), "{lock}");
+    }
+
+    /// A drifted pylock keeps the entry: the revert leaves every file wired
+    /// (Pipfile.lock and the export too), not half reverted.
+    #[tokio::test]
+    async fn pipenv_pylock_drift_keeps_every_file_wired() {
+        let fx = pipenv_pylock_fixture().await;
+        touch(&fx.root, "requirements.txt", SIBLING_EXPORT).await;
+        let VendorOutcome::Done {
+            entry: Some(entry), ..
+        } = pipenv_vendor(&fx, &fx.record).await
+        else {
+            panic!("vendor did not complete");
+        };
+        drift_pylock(&fx).await;
+        let outcome = revert_pypi(&entry, &fx.root, false).await;
+        assert!(outcome.drift_skipped(), "{outcome:?}");
+        assert!(outcome.kept_artifact, "{outcome:?}");
+        let lock = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        assert!(lock.contains(UUID), "Pipfile.lock reverted alone:\n{lock}");
+        assert!(requirements_wired(&fx).await, "export reverted alone");
+    }
+
+    /// A pylock Hatch derives for its locked environments is Hatch's own,
+    /// not one `pipenv lock` wrote: the Pipenv wiring leaves it alone.
+    #[tokio::test]
+    async fn pipenv_leaves_a_hatch_locked_env_pylock_alone() {
+        let fx = pipenv_pylock_fixture().await;
+        touch(
+            &fx.root,
+            "pyproject.toml",
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n[tool.hatch.envs.default]\nlocked = true\ninstaller = \"uv\"\n",
+        )
+        .await;
+        assert!(
+            super::super::pypi_lock::pipenv_pylocks(&fx.root, "six", "1.16.0")
+                .await
+                .is_empty()
         );
     }
 
