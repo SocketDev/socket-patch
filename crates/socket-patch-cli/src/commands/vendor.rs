@@ -442,6 +442,9 @@ pub(crate) async fn dispatch_revert_one_opts(
 ///   verdict the prune GC reverts by ([`Discovery::vendor_entry_in_use`])
 ///   says so and no lock resolves the package any more, so `scan --prune`
 ///   is the fix, as `scan`'s own `vendor_ledger_entry_unwired` hint says;
+/// * for PyPI, a project file still names the artifact although nothing
+///   installs from it (a half-unwound uv pair, #1374): name it, and
+///   re-lock before re-vendoring or reverting;
 /// * otherwise a relock dropped the reference while the package stayed.
 async fn unwired_check_failure(
     discovery: &socket_patch_core::vex::discover::Discovery,
@@ -474,6 +477,20 @@ async fn unwired_check_failure(
              --prune` to revert the vendored entry",
             strip_purl_qualifiers(key)
         );
+    }
+    // A half-unwound pair (uv.lock still routing a root requirement through
+    // the wheel after the rest of the wiring is gone, #1374) does reference
+    // the dir: say so instead of claiming nothing does.
+    if entry.ecosystem == "pypi" {
+        if let Some(clause) = vendor::pypi::pypi_reference(root, &entry.uuid).await {
+            return format!(
+                "wiring incomplete: nothing installs the package from {dir} any more, but \
+                 {clause}, so the project files disagree and a fresh install gets the \
+                 unpatched package or fails; re-lock the project (e.g. `uv lock`), then \
+                 re-run `socket-patch vendor` to rewire it or `socket-patch vendor --revert` \
+                 to finish unwinding it"
+            );
+        }
     }
     format!(
         "wiring missing: no lockfile or config references {dir} any more, so a fresh install \

@@ -1360,6 +1360,45 @@ pub(crate) fn respell_lock_specifier(
     }
 }
 
+/// The `specifier` uv writes for `name`'s entry in `array` (with
+/// `marker`) when nothing recorded a prior spelling: the declaration's
+/// one clause, or `None` for a bare name. `Err` when pyproject.toml
+/// doesn't declare the name there, or uv's spelling of the declaration
+/// isn't derivable (unreadable, multi-clause, or ambiguous), so the
+/// caller can fail closed rather than guess.
+pub(crate) fn declared_lock_specifier(
+    pyproject_text: &str,
+    array: LockRequirementArray<'_>,
+    name: &str,
+    marker: Option<&str>,
+) -> Result<Option<String>, String> {
+    let doc = pyproject_text
+        .parse::<DocumentMut>()
+        .map_err(|e| format!("pyproject.toml does not parse: {e}"))?;
+    let meta = Metadata {
+        rel: "pyproject.toml".to_string(),
+        text: String::new(),
+        script: false,
+        doc,
+    };
+    let declared = match array {
+        LockRequirementArray::RequiresDist => Declared::Dist,
+        LockRequirementArray::RequiresDev(group) => Declared::Dev(group),
+        LockRequirementArray::Manifest(key) => Declared::Manifest(key),
+    };
+    match declared_clauses(&meta, declared, name, marker)? {
+        None => Err(format!("pyproject.toml no longer declares {name}")),
+        Some(clauses) => match clauses.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(one.clone())),
+            _ => Err(format!(
+                "pyproject.toml declares {name} with a multi-clause specifier, whose \
+                 spelling in uv.lock is not derivable"
+            )),
+        },
+    }
+}
+
 /// Every lock requirement array with the declarations it mirrors
 /// (read-only twin of [`restore_requirements`]'s walk).
 fn requirement_arrays_ref(doc: &DocumentMut) -> Vec<(Declared<'_>, &toml_edit::Array)> {
