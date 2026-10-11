@@ -228,8 +228,8 @@ fn push_path(out: &mut HashMap<String, Vec<PathBuf>>, purl: String, path: PathBu
     }
 }
 
-/// Default merge for the single-copy ecosystems (cargo / go / composer /
-/// nuget / deno): keep the FIRST path discovered per PURL, matching the
+/// Default merge for the single-copy ecosystems (go / composer / nuget /
+/// deno): keep the FIRST path discovered per PURL, matching the
 /// historical `HashMap<String, PathBuf>` first-wins contract exactly. These
 /// ecosystems resolve one logical install per `name@version`, but the same
 /// install is legitimately reachable from several source roots (e.g. NuGet's
@@ -268,6 +268,26 @@ fn merge_first_wins(
 /// (`~/.m2` and each Gradle cache are distinct installs some build reads;
 /// PyPI keeps its one-install-dir contract — see the apply variant loop).
 fn merge_variant_copies(
+    out: &mut HashMap<String, Vec<PathBuf>>,
+    _purls: &[String],
+    packages: HashMap<String, CrawledPackage>,
+) {
+    for (purl, pkg) in packages {
+        push_path(out, purl, pkg.path);
+    }
+}
+
+/// Cargo merge: keep EVERY distinct copy, one per source root. Each root
+/// of the shared registry cache is one registry index dir
+/// (`index.crates.io-6f17d22bba15001f` for cargo 1.70–1.84,
+/// `index.crates.io-1949cf8c6b5b557f` for cargo ≥ 1.85, the pre-1.70 git
+/// index), and each holds its own extracted copy that a different cargo
+/// builds from. First-wins patched, checked and restored only the copy in
+/// the first dir in listing order, so a project on the other cargo kept
+/// building the unpatched crate while `apply` reported success and `vex`
+/// attested it (#339). A `cargo vendor` tree or `--global-prefix` is a
+/// single root, so it still yields one copy.
+fn merge_cargo_copies(
     out: &mut HashMap<String, Vec<PathBuf>>,
     _purls: &[String],
     packages: HashMap<String, CrawledPackage>,
@@ -430,7 +450,8 @@ async fn dispatch_find(
         using_label = "cargo crate sources",
         err_label = "Cargo crates",
         purls_override = passthrough_purls,
-        on_match = merge_first_wins,
+        // One copy per registry index dir, each built by another cargo.
+        on_match = merge_cargo_copies,
     );
 
     scan_ecosystem!(
@@ -559,7 +580,8 @@ pub async fn find_all_packages_for_purls(
     // (base-PURL keyed) instead of first-wins: the gem crawler surfaces
     // coexisting bundler stores whose copies apply must ALL patch. The
     // rollback variant below gets the same multi-copy carry from
-    // `merge_qualified`'s `push_path`. Single-copy ecosystems keep true
+    // `merge_qualified`'s `push_path`. Cargo keeps every registry index
+    // copy (`merge_cargo_copies`); the single-copy ecosystems keep true
     // first-wins via their own `merge_first_wins` wiring in
     // `dispatch_find`.
     dispatch_find(partitioned, options, silent, merge_variant_copies, None).await
@@ -1280,6 +1302,34 @@ mod tests {
                 PathBuf::from("/nm/parent/node_modules/dup"),
             ]),
             "both physical copies must be carried, root-first"
+        );
+    }
+
+    // ---- merge_cargo_copies ------------------------------------------------
+
+    #[test]
+    fn merge_cargo_copies_keeps_every_registry_index_copy() {
+        // #339: the macro calls on_match once per registry index dir; each
+        // dir's copy is built by a different cargo, so all are carried in
+        // discovery order, and a path re-observed is recorded once.
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for path in [
+            "/src/index-1949cf/cfg-if-1.0.0",
+            "/src/index-6f17d2/cfg-if-1.0.0",
+        ] {
+            merge_cargo_copies(&mut out, &[], packages(&[("pkg:cargo/cfg-if@1.0.0", path)]));
+        }
+        merge_cargo_copies(
+            &mut out,
+            &[],
+            packages(&[("pkg:cargo/cfg-if@1.0.0", "/src/index-6f17d2/cfg-if-1.0.0")]),
+        );
+        assert_eq!(
+            out.get("pkg:cargo/cfg-if@1.0.0"),
+            Some(&vec![
+                PathBuf::from("/src/index-1949cf/cfg-if-1.0.0"),
+                PathBuf::from("/src/index-6f17d2/cfg-if-1.0.0"),
+            ])
         );
     }
 
