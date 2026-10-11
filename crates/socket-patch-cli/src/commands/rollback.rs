@@ -2572,47 +2572,82 @@ pub(crate) async fn rollback_patches_inner(
     // (remove's identifier flow drops the whole group the same way).
     let mut narrowed_out: Vec<String> = Vec::new();
     for (_base, entries) in groups {
-        let to_rollback: Vec<(&String, &PathBuf)> = if entries.len() == 1 {
-            entries
-        } else {
-            // All variants in a group resolve to the same installed path.
-            let pkg_path = entries[0].1;
-            let candidates: Vec<(&str, &HashMap<String, PatchFileInfo>)> = entries
-                .iter()
-                .filter_map(|(purl, _)| {
-                    filtered_manifest
-                        .patches
-                        .get(*purl)
-                        .map(|p| (purl.as_str(), &p.files))
-                })
-                .collect();
-            let matched = select_installed_variants(pkg_path, &candidates).await;
-            if matched.is_empty() {
-                // No variant matches the installed distribution (e.g. a
-                // locally-modified file). Fall back to attempting every
-                // variant so the per-file verification surfaces the
-                // mismatch rather than silently skipping the package.
-                entries
-            } else {
-                let winners: HashSet<String> = matched
-                    .iter()
-                    .map(|&i| candidates[i].0.to_string())
-                    .collect();
-                narrowed_out.extend(
-                    entries
-                        .iter()
-                        .filter(|(p, _)| !winners.contains(*p))
-                        .map(|(p, _)| (*p).clone()),
-                );
+        if entries.len() == 1 {
+            rollback_targets.extend(
                 entries
                     .into_iter()
-                    .filter(|(p, _)| winners.contains(*p))
-                    .collect()
+                    .map(|(purl, path)| CopyTarget::plain(purl, path)),
+            );
+            continue;
+        }
+        // Narrow PER COPY: one gem home can hold several builds of the
+        // version (`x-1.0/` beside `x-1.0-x86_64-linux/`, #1092), each
+        // patched with its own variant, so the first copy's variant says
+        // nothing about the others.
+        let mut purls: Vec<&String> = Vec::new();
+        let mut paths: Vec<&PathBuf> = Vec::new();
+        for (purl, path) in &entries {
+            if !purls.contains(purl) {
+                purls.push(purl);
             }
-        };
+            if !paths.contains(path) {
+                paths.push(path);
+            }
+        }
+        let candidates: Vec<(&str, &HashMap<String, PatchFileInfo>)> = purls
+            .iter()
+            .filter_map(|purl| {
+                filtered_manifest
+                    .patches
+                    .get(*purl)
+                    .map(|p| (purl.as_str(), &p.files))
+            })
+            .collect();
+        let mut chosen: Vec<(&PathBuf, Vec<&str>)> = Vec::new();
+        let mut unmatched: Vec<&PathBuf> = Vec::new();
+        for path in &paths {
+            let matched = select_installed_variants(path, &candidates).await;
+            if matched.is_empty() {
+                unmatched.push(path);
+            } else {
+                chosen.push((path, matched.iter().map(|&i| candidates[i].0).collect()));
+            }
+        }
+        for path in unmatched {
+            // A gem build matching no variant beside a sibling build that
+            // does holds another distribution: nothing of this patch was
+            // ever written there.
+            let sibling_matched = chosen
+                .iter()
+                .any(|(other, _)| *other != path && other.parent() == path.parent());
+            if sibling_matched && purls.iter().all(|p| p.starts_with("pkg:gem/")) {
+                continue;
+            }
+            // No variant matches the installed distribution (e.g. a
+            // locally-modified file). Fall back to attempting every
+            // variant so the per-file verification surfaces the mismatch
+            // rather than silently skipping the package.
+            chosen.push((path, candidates.iter().map(|(purl, _)| *purl).collect()));
+        }
+        let attempted: HashSet<&str> = chosen
+            .iter()
+            .flat_map(|(_, purls)| purls.iter().copied())
+            .collect();
+        // Narrowed-away variants: their distribution is on no copy.
+        narrowed_out.extend(
+            purls
+                .iter()
+                .filter(|p| !attempted.contains(p.as_str()))
+                .map(|p| (*p).clone()),
+        );
         rollback_targets.extend(
-            to_rollback
+            entries
                 .into_iter()
+                .filter(|(purl, path)| {
+                    chosen
+                        .iter()
+                        .any(|(p, purls)| p == path && purls.contains(&purl.as_str()))
+                })
                 .map(|(purl, path)| CopyTarget::plain(purl, path)),
         );
     }

@@ -329,14 +329,10 @@ fn is_crates_io_copy(crate_dir: &std::path::Path) -> bool {
 /// after the first.
 fn merge_npm_copies(
     out: &mut HashMap<String, Vec<PathBuf>>,
-    _purls: &[String],
+    purls: &[String],
     packages: HashMap<String, Vec<CrawledPackage>>,
 ) {
-    for (purl, pkgs) in packages {
-        for pkg in pkgs {
-            push_path(out, purl.clone(), pkg.path);
-        }
-    }
+    merge_each_copy(merge_variant_copies, out, purls, packages);
 }
 
 /// `paths` in order with every path that resolves to an already-listed
@@ -486,7 +482,7 @@ async fn dispatch_find(
         eco = Ecosystem::Gem,
         options = options,
         silent = silent,
-        crawler = RubyCrawler,
+        crawler = GemCopiesCrawler,
         get_paths = get_gem_paths,
         using_label = "ruby gem paths",
         err_label = "Ruby gems",
@@ -494,7 +490,13 @@ async fn dispatch_find(
         // crawler emits the base PURL and the platform is resolved by
         // hashing the installed files, same as PyPI.
         purls_override = dedup_qualified_purls,
-        on_match = variant_merge,
+        // One gem home can hold a version's ruby-platform AND platform
+        // builds; fold every copy in (#1092).
+        on_match = |out: &mut HashMap<String, Vec<PathBuf>>,
+                    purls: &[String],
+                    packages: HashMap<String, Vec<CrawledPackage>>| {
+            merge_each_copy(variant_merge, out, purls, packages)
+        },
     );
 
     scan_ecosystem!(
@@ -717,6 +719,43 @@ impl NpmCrawlSnapshot {
     }
 }
 
+/// [`RubyCrawler`] for [`dispatch_find`], returning every installed copy of
+/// each gem in a gem home (the ruby-platform dir and each platform dir).
+struct GemCopiesCrawler;
+
+impl GemCopiesCrawler {
+    async fn get_gem_paths(
+        &self,
+        options: &CrawlerOptions,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
+        RubyCrawler.get_gem_paths(options).await
+    }
+
+    async fn find_by_purls(
+        &self,
+        gem_path: &std::path::Path,
+        purls: &[String],
+    ) -> Result<HashMap<String, Vec<CrawledPackage>>, std::io::Error> {
+        RubyCrawler.find_all_by_purls(gem_path, purls).await
+    }
+}
+
+/// Feed every copy in `packages` through `merge`, one copy at a time and in
+/// order, so a crawler that returns several copies per PURL reaches the
+/// one-copy [`MergeFn`]s unchanged.
+fn merge_each_copy(
+    merge: MergeFn,
+    out: &mut HashMap<String, Vec<PathBuf>>,
+    purls: &[String],
+    packages: HashMap<String, Vec<CrawledPackage>>,
+) {
+    for (purl, copies) in packages {
+        for pkg in copies {
+            merge(out, purls, HashMap::from([(purl.clone(), pkg)]));
+        }
+    }
+}
+
 /// [`NpmCrawler`] for [`dispatch_find`], answering its root discovery from
 /// an earlier crawl's roots when it has them.
 struct NpmRootsCrawler<'a> {
@@ -879,8 +918,8 @@ pub async fn find_manifest_package_copies_reusing(
             .await;
         let bases = dedup_qualified_purls(gem_purls);
         for store in &stores {
-            if let Ok(found) = RubyCrawler.find_by_purls(store, &bases).await {
-                merge_qualified(&mut copies, gem_purls, found);
+            if let Ok(found) = RubyCrawler.find_all_by_purls(store, &bases).await {
+                merge_each_copy(merge_qualified, &mut copies, gem_purls, found);
             }
         }
     }

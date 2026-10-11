@@ -1029,7 +1029,7 @@ pub(crate) async fn vex_copy_sets(
     } else {
         None
     };
-    copies
+    let mut sets: HashMap<String, Vec<PathBuf>> = copies
         .iter()
         .map(|(purl, paths)| {
             let paths = match scope.as_ref().filter(|_| purl.starts_with("pkg:maven/")) {
@@ -1046,7 +1046,67 @@ pub(crate) async fn vex_copy_sets(
             };
             (purl.clone(), paths)
         })
-        .collect()
+        .collect();
+    narrow_gem_variant_copies(manifest, &mut sets).await;
+    sets
+}
+
+/// RubyGems: give each qualified variant key (`?platform=`…) only the
+/// copies holding its distribution. One gem home can hold several builds of
+/// a version (`x-1.0/` beside `x-1.0-x86_64-linux/`, #1092), each patched
+/// with its own variant, but the dispatch hands every key every copy, so
+/// each key would be judged against the other build's bytes and never
+/// attested. A copy holding no variant stays on every key, so the
+/// statement is withheld while that build is unaccounted for (`apply
+/// --check` reports it as `no_matching_variant`). An unqualified singleton
+/// names no distribution and keeps every copy.
+async fn narrow_gem_variant_copies(
+    manifest: &PatchManifest,
+    sets: &mut HashMap<String, Vec<PathBuf>>,
+) {
+    use socket_patch_core::manifest::schema::PatchFileInfo;
+    use socket_patch_core::patch::apply::select_installed_variants;
+    use socket_patch_core::utils::purl::strip_purl_qualifiers;
+    let mut groups: std::collections::BTreeMap<&str, Vec<&String>> = Default::default();
+    for purl in sets.keys() {
+        if purl.starts_with("pkg:gem/") {
+            groups
+                .entry(strip_purl_qualifiers(purl))
+                .or_default()
+                .push(purl);
+        }
+    }
+    let mut narrowed: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for (base, mut keys) in groups {
+        if keys.len() == 1 && keys[0] == base {
+            continue;
+        }
+        keys.sort();
+        let variants: Vec<(&str, &HashMap<String, PatchFileInfo>)> = keys
+            .iter()
+            .filter_map(|k| manifest.patches.get(*k).map(|r| (k.as_str(), &r.files)))
+            .collect();
+        let mut paths: Vec<&PathBuf> = keys.iter().flat_map(|k| &sets[*k]).collect();
+        paths.sort();
+        paths.dedup();
+        let mut kept: HashMap<&str, Vec<PathBuf>> = HashMap::new();
+        for path in paths {
+            let matched = select_installed_variants(path, &variants).await;
+            if matched.is_empty() {
+                for (key, _) in &variants {
+                    kept.entry(*key).or_default().push(path.clone());
+                }
+            }
+            for idx in matched {
+                kept.entry(variants[idx].0).or_default().push(path.clone());
+            }
+        }
+        for (key, _) in &variants {
+            let paths = kept.remove(*key).unwrap_or_default();
+            narrowed.push((key.to_string(), paths));
+        }
+    }
+    sets.extend(narrowed);
 }
 
 /// Maven / Gradle: withhold the statement of every purl a build may still
