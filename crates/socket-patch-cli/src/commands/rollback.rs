@@ -2640,12 +2640,16 @@ pub(crate) async fn rollback_patches_inner(
                 .filter(|p| !attempted.contains(p.as_str()))
                 .map(|p| (*p).clone()),
         );
-        rollback_targets.extend(entries.into_iter().filter_map(|(purl, path)| {
-            chosen
-                .iter()
-                .any(|(p, purls)| *p == path && purls.contains(&purl.as_str()))
-                .then(|| CopyTarget::plain(purl, path))
-        }));
+        rollback_targets.extend(
+            entries
+                .into_iter()
+                .filter(|(purl, path)| {
+                    chosen
+                        .iter()
+                        .any(|(p, purls)| p == path && purls.contains(&purl.as_str()))
+                })
+                .map(|(purl, path)| CopyTarget::plain(purl, path)),
+        );
     }
     let (maven_targets, maven_narrowed) =
         maven_rollback_targets(&maven_groups, &filtered_manifest).await;
