@@ -405,6 +405,26 @@ pub fn parse_required_versions(content: &str) -> HashMap<String, String> {
     out
 }
 
+/// True when the `go` directive is 1.17 or later, so the module graph is
+/// pruned and `require` lists the selected version of every module that
+/// provides a package to the build. Without the directive go assumes 1.16,
+/// whose `require` set is only a set of lower bounds.
+pub fn prunes_module_graph(content: &str) -> bool {
+    let mut pruned = false;
+    let _ = for_each_directive_body(content, "go", |_, body| {
+        let mut parts = body.split_whitespace().next().unwrap_or("").split('.');
+        let major = parts.next().and_then(|p| p.parse::<u32>().ok());
+        let minor = parts.next().and_then(|p| {
+            let digits: String = p.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u32>().ok()
+        });
+        pruned = matches!((major, minor), (Some(m), _) if m > 1)
+            || matches!((major, minor), (Some(1), Some(n)) if n >= 17);
+        Ok(())
+    });
+    pruned
+}
+
 /// The module path the go.mod `module` directive declares, in its
 /// single-line (`module example.com/m`) or block (`module ( … )`) form,
 /// quoted or bare, with a trailing `//` comment and a leading BOM allowed.

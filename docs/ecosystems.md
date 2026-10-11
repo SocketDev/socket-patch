@@ -1326,6 +1326,16 @@ A replace written before the `go.work` changed is reported as
 leaves the patch out (`go_workspace_override`). To patch the whole workspace,
 apply in one member it uses, or move the Socket `replace` into `go.work`.
 
+A `replace` names an exact module version, so it only works while the build
+selects that version. socket-patch reads which version that is from `go.mod`
+and `go.sum`: the `require` line in a go 1.17+ module, or, in an older module
+(whose `require` lists only lower bounds and leaves out transitive modules),
+the highest of the required version and the versions `go.sum` has a module
+zip line for. `apply` and `scan --mode hosted` refuse to write a replace for
+any other version. After an upgrade such as `go get M@v1.0.1`, `apply --check`
+fails and `vex` leaves the patch out (`go_version_not_selected`) until you
+get a patch for the new version.
+
 Paid hosted Go references are unsupported: embedding credentials in module paths
 would expose them to module proxies and change module identity. Use vendored mode
 for those patches; the CLI reports `redirect_golang_unsupported` when the required

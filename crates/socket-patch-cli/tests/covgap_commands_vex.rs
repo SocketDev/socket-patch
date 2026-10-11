@@ -993,6 +993,86 @@ fn go_patches_synthesis_skips_tampered_and_stale_replaces() {
     );
 }
 
+/// #391 / #392: a go-patches replace pinned to a version the build list no
+/// longer selects is inert — after `go get M@v1.4.3` (go >= 1.17 require),
+/// or in a go 1.16 graph where go.sum shows the build selects another
+/// version — so vex must omit the patch however intact its copy is.
+#[test]
+fn go_patches_replace_for_an_unselected_version_is_not_attested() {
+    let module = "github.com/foo/bar";
+    let version = "v1.4.2";
+    let purl = format!("pkg:golang/{module}@{version}");
+    let replace =
+        format!("replace {module} {version} => ./.socket/go-patches/{module}@{version}\n");
+    let selected_v117 =
+        format!("module example.com/app\n\ngo 1.21\n\nrequire {module} {version}\n\n{replace}");
+    let bumped_v117 =
+        format!("module example.com/app\n\ngo 1.21\n\nrequire {module} v1.4.3\n\n{replace}");
+    let go116 =
+        format!("module example.com/app\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n\n{replace}");
+    let go116_sum = format!(
+        "{module} {version}/go.mod h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+         {module} v1.5.0 h1:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\n"
+    );
+    for (go_mod, go_sum, attests) in [
+        (&selected_v117, None, true),
+        (&bumped_v117, None, false),
+        (&go116, Some(go116_sum.as_str()), false),
+        (&go116, None, true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("go.mod"), go_mod).unwrap();
+        if let Some(sum) = go_sum {
+            std::fs::write(cwd.join("go.sum"), sum).unwrap();
+        }
+        let patched = b"package bar // patched\n";
+        let copy = cwd.join(format!(".socket/go-patches/{module}@{version}"));
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("bar.go"), patched).unwrap();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            purl.clone(),
+            make_record(
+                GOOD_UUID,
+                "bar.go",
+                "a".repeat(64).as_str(),
+                &compute_git_sha256_from_bytes(patched),
+                "GHSA-go-unselected",
+                &["CVE-2026-391"],
+            ),
+        );
+        write_manifest(cwd, &manifest);
+        let empty_cache = cwd.join("empty-gomodcache");
+        std::fs::create_dir_all(&empty_cache).unwrap();
+
+        let out = cli()
+            .env("GOMODCACHE", &empty_cache)
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--product",
+                "pkg:golang/example.com/app@v0.0.1",
+            ])
+            .output()
+            .expect("invoke vex");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if attests {
+            assert!(out.status.success(), "{go_mod}\nstderr:\n{stderr}");
+            assert!(stdout.contains("GHSA-go-unselected"), "{go_mod}\n{stdout}");
+        } else {
+            assert_eq!(out.status.code(), Some(1), "{go_mod}\nstderr:\n{stderr}");
+            assert!(!stdout.contains("not_affected"), "{go_mod}\n{stdout}");
+            assert!(
+                stderr.contains("(go_version_not_selected)"),
+                "{go_mod}\nstderr:\n{stderr}"
+            );
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Corrupt vendor ledger on a MANIFEST-FREE project (the D2 vendored
 // posture): the ledger was the only possible source of records, and it

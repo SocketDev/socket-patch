@@ -8337,6 +8337,7 @@ fn rewrite_golang(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
+    use crate::vendor::go_build_list;
     use crate::vendor::go_mod_edit::{self, HOSTED_GO_MODULE_PREFIX};
     use crate::vendor::go_sum_edit::{self, GoSumEditor};
 
@@ -8473,64 +8474,80 @@ fn rewrite_golang(
         // left in place, its module path keeps confirming the dep as
         // redirected (ledger + VEX attestation) while go links the unpatched
         // version.
-        if let Some(required) = scan.required.as_ref() {
-            if required != &dep.version {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_golang_version_mismatch".into(),
-                    detail: format!(
-                        "{fname}: go.mod requires {required} but the patch targets {} — \
-                         a version-pinned replace would be silently ignored",
-                        dep.version
-                    ),
-                });
-                let stale_hosted =
-                    prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
-                if let Some(stale) = stale_hosted {
-                    if let Ok(Some(new)) = go_mod_edit::remove_replace_entry(
-                        &go_mod,
-                        &fname,
-                        go_mod_edit::ReplaceOwner::Hosted,
-                    ) {
-                        go_mod = new;
-                        mod_changed = true;
+        //
+        // Which version the build selects comes from go.mod and go.sum
+        // (`go_build_list`): `require` for a go >= 1.17 graph; for an older
+        // one, the highest of `require` and go.sum's zip lines, since a
+        // `/go.mod`-only line is written for every version MVS reads, not
+        // only the one it selects (#509).
+        let zips = go_sum.zip_versions(&fname);
+        let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
+        let selection = go_build_list::select(
+            go_mod_edit::prunes_module_graph(&go_mod),
+            scan.required.as_deref(),
+            &zips,
+            &dep.version,
+        );
+        if let Some(selected) = selection.other_version() {
+            let basis = if scan.required.as_deref() == Some(selected) {
+                "go.mod requires"
+            } else {
+                "go.sum shows the build selects"
+            };
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_version_mismatch".into(),
+                detail: format!(
+                    "{fname}: {basis} {selected} but the patch targets {} — \
+                     a version-pinned replace would be silently ignored",
+                    dep.version
+                ),
+            });
+            let stale_hosted = prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
+            if let Some(stale) = stale_hosted {
+                if let Ok(Some(new)) = go_mod_edit::remove_replace_entry(
+                    &go_mod,
+                    &fname,
+                    go_mod_edit::ReplaceOwner::Hosted,
+                ) {
+                    go_mod = new;
+                    mod_changed = true;
+                    result.edits.push(FileEdit {
+                        path: "go.mod".into(),
+                        kind: "redirect_golang_stale_replace_removed".into(),
+                        action: "removed".into(),
+                        key: Some(fname.clone()),
+                        original: prior_text.clone().map(Value::String),
+                        new: None,
+                    });
+                }
+                if let Some(stale_rhs) = stale.rhs_module.as_deref() {
+                    if go_sum.remove_module_prefix_lines(stale_rhs) {
+                        sum_changed = true;
                         result.edits.push(FileEdit {
-                            path: "go.mod".into(),
-                            kind: "redirect_golang_stale_replace_removed".into(),
+                            path: "go.sum".into(),
+                            kind: "redirect_golang_stale_gosum_removed".into(),
                             action: "removed".into(),
-                            key: Some(fname.clone()),
-                            original: prior_text.clone().map(Value::String),
+                            key: Some(stale_rhs.to_string()),
+                            original: None,
                             new: None,
                         });
                     }
-                    if let Some(stale_rhs) = stale.rhs_module.as_deref() {
-                        if go_sum.remove_module_prefix_lines(stale_rhs) {
-                            sum_changed = true;
-                            result.edits.push(FileEdit {
-                                path: "go.sum".into(),
-                                kind: "redirect_golang_stale_gosum_removed".into(),
-                                action: "removed".into(),
-                                key: Some(stale_rhs.to_string()),
-                                original: None,
-                                new: None,
-                            });
-                        }
-                    }
                 }
-                continue;
             }
-        } else if !go_sum.has_module_version(&fname, &dep.version)
+            continue;
+        } else if selection != go_build_list::Selection::Selected
             && prior.is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str()))
         {
-            // Not required, not in go.sum at this version, and not already
-            // redirected by us: the module is outside this project's graph
-            // (local discovery crawls the whole module cache). Its replace
-            // would be inert, and confirming it would attest a patch no
-            // build links.
+            // Not selected by go.mod's require, no go.sum zip line at this
+            // version, and not already redirected by us: the module is
+            // outside this project's graph (local discovery crawls the whole
+            // module cache). Its replace would be inert, and confirming it
+            // would attest a patch no build links.
             result.warnings.push(RewriteWarning {
                 code: "redirect_golang_not_in_module_graph".into(),
                 detail: format!(
-                    "{fname}@{}: not required by go.mod and absent from go.sum — the \
-                     module is not in this project's build graph; nothing redirected",
+                    "{fname}@{}: not required by go.mod and go.sum has no zip line for it — \
+                     the module is not in this project's build graph; nothing redirected",
                     dep.version
                 ),
             });
@@ -21478,6 +21495,48 @@ packages:
                 .collect::<Vec<_>>(),
             ["redirect_golang_not_in_module_graph"]
         );
+    }
+
+    /// #509: in a go 1.16 graph go writes a `/go.mod` line for every version
+    /// MVS reads, so the losing v1.4.2 keeps one while the build selects
+    /// v1.5.0 (the only zip line). That line is not "in the graph": the
+    /// redirect would be inert, so nothing is written.
+    #[test]
+    fn golang_go116_go_mod_only_line_is_not_the_selected_version() {
+        let go_mod = "module example.com/app\n\ngo 1.16\n\nrequire (\n\texample.com/mida v1.0.0\n\texample.com/midb v1.0.0\n)\n";
+        let go_sum = "github.com/foo/bar v1.4.2/go.mod h1:UPSTREAMM=\n\
+                      github.com/foo/bar v1.5.0 h1:NEWER=\n\
+                      github.com/foo/bar v1.5.0/go.mod h1:NEWERM=\n";
+        let mut files = golang_files();
+        files.insert("go.mod".to_string(), go_mod.to_string());
+        files.insert("go.sum".to_string(), go_sum.to_string());
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "nothing written: {:?}", out.files);
+        assert_eq!(
+            out.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_golang_version_mismatch"]
+        );
+        assert!(
+            out.warnings[0]
+                .detail
+                .contains("go.sum shows the build selects v1.5.0"),
+            "{}",
+            out.warnings[0].detail
+        );
+
+        // The selected version still redirects in the same go 1.16 graph.
+        let selected = go_sum.replace("v1.5.0", "v1.4.1");
+        files.insert(
+            "go.sum".to_string(),
+            format!("{selected}github.com/foo/bar v1.4.2 h1:UPSTREAM=\n"),
+        );
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+        assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
     }
 
     /// Hosted confirmation keys off `confirmed_golang_uuids`: set when the

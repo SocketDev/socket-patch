@@ -289,6 +289,18 @@ impl GoSumEditor {
             .any(|l| is_version_line(l, module, version))
     }
 
+    /// The versions of `module` the content carries a zip (`h1:` of the
+    /// module tree) line for, in file order — the versions whose packages
+    /// the build loads, unlike the `/go.mod` lines go writes for every
+    /// version MVS reads.
+    pub(crate) fn zip_versions(&self, module: &str) -> Vec<String> {
+        self.current_lines()
+            .flat_map(go_sum_lines)
+            .filter(|l| !l.go_mod && l.module == module)
+            .map(|l| l.version.to_string())
+            .collect()
+    }
+
     /// Remove the lines for exactly `module@version` (both the zip and
     /// `/go.mod` forms). Used to prune the REPLACED original's lines: once a
     /// version-pinned `replace` covers the resolved version, go never fetches
