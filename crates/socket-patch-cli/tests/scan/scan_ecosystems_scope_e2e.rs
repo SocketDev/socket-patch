@@ -19,10 +19,10 @@
 //! installed (`CARGO_HOME` points at an empty dir, so the cargo crawl finds
 //! nothing — hermetic, and a lockfile-only cargo entry either way).
 
-use crate::common::binary;
+use crate::common::hermetic::{self, Extra};
+use crate::common::{binary, hermetic_command};
 
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -33,23 +33,15 @@ const NPM_LOCK_ONLY: &str = "lock-only-dep";
 const CARGO_LOCK_ONLY: &str = "lockonly-crate";
 const INSTALLED_CRATE: &str = "installed-crate";
 
-/// `scan --json` against `api_url` with the `SOCKET_*` environment
-/// scrubbed (except the workspace-pinned `SOCKET_NO_CONFIG`), `VIRTUAL_ENV`
+/// `scan --json` against `api_url` with the hermetic `SOCKET_*`
+/// environment, `VIRTUAL_ENV`
 /// removed (the python crawler honors it first) and `CARGO_HOME` pinned to
 /// an empty dir under `cwd`.
 fn run_scan(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("scan").current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
+    hermetic::scrub_extra(&mut cmd, &[Extra::Venv]);
     cmd.env("CARGO_HOME", cwd.join(".cargo-home"));
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd
         .args([
             "--json",

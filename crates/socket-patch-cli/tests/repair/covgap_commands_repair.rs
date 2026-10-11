@@ -23,6 +23,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::common::hermetic_command;
+
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -34,20 +36,13 @@ fn binary() -> PathBuf {
 }
 
 /// A `socket-patch` command rooted at `cwd` with every ambient `SOCKET_*`
-/// env var scrubbed (same rationale as `repair_invariants.rs`: an ambient
+/// env var scrubbed by `hermetic_command` (same rationale as `repair_invariants.rs`: an ambient
 /// `SOCKET_OFFLINE`/`SOCKET_JSON`/`SOCKET_SILENT` would flip the very
 /// loud-vs-quiet branches this suite exists to pin). Tests re-seed only
 /// what they deliberately control via `.env()` after this scrub.
 fn socket_cmd(cwd: &Path) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.current_dir(cwd);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("SOCKET_")
-            && name.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(name);
-        }
-    }
     cmd
 }
 
@@ -305,7 +300,7 @@ fn repair_offline_warning_truncates_missing_list_after_five() {
 /// The dry-run preview lists at most 10 missing ids and folds the rest into
 /// "  ... and N more". With 12 missing that's 10 items + 2. (No `--offline`:
 /// the dry-run branch returns before any download I/O, so the run stays
-/// hermetic; telemetry is pinned off explicitly since the run is not
+/// hermetic; `socket_cmd` keeps telemetry off since the run is not
 /// airgapped by flag.)
 #[test]
 fn repair_dry_run_preview_truncates_missing_list_after_ten() {
@@ -314,7 +309,6 @@ fn repair_dry_run_preview_truncates_missing_list_after_ten() {
 
     let out = socket_cmd(tmp.path())
         .args(["repair", "--dry-run"])
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -717,7 +711,6 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str], json: bool) -> (i32, Stri
         "--org",
         ORG_SLUG,
     ]);
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch");
     (
         out.status.code().unwrap_or(-1),

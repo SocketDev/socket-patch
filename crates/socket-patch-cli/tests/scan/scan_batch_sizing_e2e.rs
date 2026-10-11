@@ -6,12 +6,14 @@
 //! mid-run downgrade to the proxy keeps the chunk boundaries the run started
 //! with.
 //!
-//! Subprocess runs scrub the `SOCKET_*` environment (the
-//! `scan_ordered_concurrency_e2e.rs::scrubbed_cli` pattern) so ambient
-//! configuration cannot reroute the branch under test.
+//! Subprocess runs use the hermetic `SOCKET_*` environment
+//! (`common/hermetic.rs`) so ambient configuration cannot reroute the
+//! branch under test.
 
 use std::path::Path;
 use std::process::Command;
+
+use crate::common::hermetic::{self, Extra};
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -23,15 +25,8 @@ const PROXY_BATCH_ROUTE: &str = "/patch/batch";
 const BODY_CAP: usize = 256 * 1024;
 
 fn scrubbed_cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let mut cmd = hermetic::binary_command();
+    hermetic::scrub_extra(&mut cmd, &[Extra::Venv]);
     cmd
 }
 
@@ -48,8 +43,7 @@ fn run_scan(
     let mut cmd = scrubbed_cli();
     cmd.arg("scan")
         .args(["--json", "--cwd", cwd.to_str().unwrap()])
-        .args(args)
-        .env("SOCKET_NO_CONFIG", "1");
+        .args(args);
     if token {
         cmd.args([
             "--api-url",
@@ -243,8 +237,7 @@ async fn a_mid_run_downgrade_keeps_the_500_purl_chunks() {
     cmd.arg("scan")
         .args(["--json", "--cwd", tmp.path().to_str().unwrap()])
         .args(["--api-url", &server.uri(), "--proxy-url", &server.uri()])
-        .args(["--api-token", "fake-token-for-test", "--org", ORG])
-        .env("SOCKET_NO_CONFIG", "1");
+        .args(["--api-token", "fake-token-for-test", "--org", ORG]);
     let out = cmd.output().expect("run socket-patch scan");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);

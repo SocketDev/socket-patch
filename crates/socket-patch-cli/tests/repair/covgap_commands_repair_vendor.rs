@@ -14,7 +14,8 @@
 //! build by hand-migrating the fixture with [`to_legacy_manifest_mode`].
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use crate::common::hermetic_command;
 
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
@@ -368,22 +369,13 @@ fn run_cli_with(
         "--org",
         ORG_SLUG,
     ]);
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(&full).current_dir(root);
-    // Scrub every ambient `SOCKET_*` var (same rationale as
-    // `covgap_commands_repair.rs::socket_cmd`: an ambient
+    // `hermetic_command` scrubs every ambient `SOCKET_*` var: an ambient
     // `SOCKET_JSON`/`SOCKET_SILENT`/`SOCKET_OFFLINE` would flip the very
-    // loud-vs-quiet and online-rebuild branches this suite pins). Tests
+    // loud-vs-quiet and online-rebuild branches this suite pins. Tests
     // re-seed only what they deliberately control via `envs`.
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("SOCKET_")
-            && name.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(name);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_API_CONCURRENCY", "1");
+    cmd.env("SOCKET_API_CONCURRENCY", "1");
     for (k, v) in envs {
         cmd.env(k, v);
     }

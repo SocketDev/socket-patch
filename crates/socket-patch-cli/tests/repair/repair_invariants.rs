@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::common::hermetic_command;
+
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -18,7 +20,7 @@ fn binary() -> PathBuf {
 }
 
 /// A `socket-patch` command rooted at `cwd` with every ambient `SOCKET_*`
-/// env var scrubbed, so every assertion exercises the flag/argv path and
+/// env var scrubbed (`hermetic_command`), so every assertion exercises the flag/argv path and
 /// nothing the ambient environment happened to leak in:
 ///   * an ambient `SOCKET_OFFLINE` would make every `--offline` test pass even
 ///     if the `--offline` *flag* path regressed (the binary would be offline
@@ -37,15 +39,8 @@ fn binary() -> PathBuf {
 /// covers. Tests re-seed (via `.env()`, after this scrub) only the handful
 /// they deliberately control.
 fn socket_cmd(cwd: &Path) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.current_dir(cwd);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("SOCKET_")
-            && name.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(name);
-        }
-    }
     cmd
 }
 
@@ -794,11 +789,6 @@ async fn repair_json_reports_unresolved_org_fallback_in_warnings() {
         .expect(1)
         .mount(&mock)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/patch/telemetry"))
-        .respond_with(ResponseTemplate::new(201))
-        .mount(&mock)
-        .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join(".socket");
@@ -819,7 +809,6 @@ async fn repair_json_reports_unresolved_org_fallback_in_warnings() {
             "--api-token",
             &token,
         ])
-        .env("SOCKET_NO_CONFIG", "1")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -995,7 +984,7 @@ fn repair_honors_manifest_path_override() {
 async fn repair_silent_still_reports_download_failures_on_stderr() {
     // Mock API with NO blob route mounted: every fetch 404s → counted as
     // failed ("Blob not found on server"), with no retries or live egress
-    // (telemetry also resolves to this mock via SOCKET_API_URL).
+    // (`hermetic_command` keeps telemetry off).
     let mock = MockServer::start().await;
 
     let tmp = tempfile::tempdir().expect("tempdir");

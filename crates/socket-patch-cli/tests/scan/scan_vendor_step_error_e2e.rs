@@ -1,9 +1,8 @@
 //! A failed artifact download preserves the vendor envelope and unrelated ledger entries.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -156,20 +155,13 @@ fn seed_unselected_ledger_entry(root: &Path) -> String {
 }
 
 fn run_cli(root: &Path, argv: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(argv).current_dir(root);
-    // Scrub the ambient `SOCKET_*` surface (prefix scrub — fixed lists rot)
-    // so a developer's shell can't steer the child, then force the telemetry
-    // kill-switch: telemetry resolves its endpoint from env only, so an
-    // ambient value would ship this run's events to the LIVE API.
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    // `hermetic_command` scrubs the ambient `SOCKET_*` surface so a
+    // developer's shell can't steer the child, and forces the telemetry
+    // kill-switch on: telemetry resolves its endpoint from env only (and
+    // the scrub keeps `SOCKET_TELEMETRY_*`), so a run with telemetry on
+    // would ship its events to whatever endpoint the shell names.
     let out = cmd.output().expect("run");
     (
         out.status.code().unwrap_or(-1),

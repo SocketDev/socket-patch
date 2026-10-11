@@ -6,10 +6,9 @@
 //! forensic bytes must come back. Gem fixtures modeled on
 //! repair_vendor_e2e's.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -144,23 +143,12 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
         "--org",
         ORG_SLUG,
     ]);
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(&full).current_dir(root);
-    // Scrub every ambient `SOCKET_*` var (same rationale as
-    // `covgap_commands_repair.rs::socket_cmd`: an ambient
+    // `hermetic_command` scrubs every ambient `SOCKET_*` var: an ambient
     // `SOCKET_DRY_RUN`/`SOCKET_OFFLINE`/`SOCKET_ECOSYSTEMS` would flip the
-    // fixture setup and repair legs before the behavior under test runs).
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("SOCKET_")
-            && name.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(name);
-        }
-    }
-    let out = cmd
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .output()
-        .expect("run");
+    // fixture setup and repair legs before the behavior under test runs.
+    let out = cmd.output().expect("run");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
