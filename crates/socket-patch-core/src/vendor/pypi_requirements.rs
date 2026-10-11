@@ -27,8 +27,8 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::terminator;
 use crate::utils::requirements::{
-    expand_env_vars, hash_options, logical_lines, parse_requirement, requires_hashes, shlex_split,
-    split_comment, strip_comment, vendor_tag,
+    expand_env_vars, hash_options, logical_lines, parse_requirement, requirement_name,
+    requires_hashes, shlex_split, split_comment, strip_comment, vendor_tag,
 };
 
 use super::common::refuse_symlinked;
@@ -81,7 +81,14 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
     let mut found_range = false;
     let mut other_branches = false;
     for ll in logical_lines(content) {
-        let Some(req) = parse_requirement(strip_comment(&ll.text)) else {
+        let code = strip_comment(&ll.text);
+        let Some(req) = parse_requirement(code) else {
+            // A line that names the package but is no requirement pip
+            // reads cleanly is never a pin to rewrite (fail closed).
+            if requirement_name(code).is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
+            {
+                found_range = true;
+            }
             continue;
         };
         if canonicalize_pypi_name(req.name) != canon_name {
@@ -103,10 +110,7 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
                 req.marker.map(str::to_string),
                 hashed,
             ));
-        } else if req.marker.is_some()
-            && pinned
-                .is_some_and(|pinned| crate::utils::pep440::is_exact_pin(&format!("=={pinned}")))
-        {
+        } else if req.marker.is_some() && pinned.is_some_and(crate::utils::pep440::is_valid) {
             other_branches = true;
         } else {
             found_range = true;
@@ -122,8 +126,8 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
 /// spec, extras or marker): a file that pins it is an install source of it.
 pub(super) fn names_package(content: &str, canon_name: &str) -> bool {
     logical_lines(content).into_iter().any(|ll| {
-        parse_requirement(strip_comment(&ll.text))
-            .is_some_and(|req| canonicalize_pypi_name(req.name) == canon_name)
+        requirement_name(strip_comment(&ll.text))
+            .is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
     })
 }
 
@@ -1429,6 +1433,19 @@ mod tests {
             if !vendored {
                 assert_eq!(found, PinSearch::Range, "{line}");
             }
+        }
+        // PEP 440 reads an epoch and a `v` prefix; pip installs 1.16.0.
+        for line in ["six==0!1.16.0\n", "six==v1.16.0\n"] {
+            assert!(
+                matches!(find_pin(line, "six", "1.16.0"), PinSearch::Exact { .. }),
+                "{line}"
+            );
+        }
+        // A line that names the package but is no clean requirement is
+        // never treated as absent (fail closed).
+        for line in ["six @ ./six-1.16.0.whl extra\n", "six/x==1.16.0\n"] {
+            assert_eq!(find_pin(line, "six", "1.16.0"), PinSearch::Range, "{line}");
+            assert!(names_package(line, "six"), "{line}");
         }
     }
 

@@ -407,25 +407,43 @@ pub(crate) struct Requirement<'a> {
 
 impl<'a> Requirement<'a> {
     /// The version of an exact `==X` pin, as spelled: one clause, no
-    /// wildcard (`==1.*`), not arbitrary equality (`===`), and a version
-    /// starting with a digit. Callers compare it under PEP 440.
+    /// wildcard (`==1.*`), not arbitrary equality (`===`). Callers compare
+    /// it under PEP 440, which also reads epochs (`0!1.0`) and a `v`
+    /// prefix.
     pub(crate) fn exact_version(&self) -> Option<&'a str> {
-        let version = self.specifier.strip_prefix("==")?.trim_start();
-        (!version.starts_with('=')
-            && !version.contains('*')
-            && version.starts_with(|c: char| c.is_ascii_digit())
-            && !version.contains(|c: char| c.is_whitespace() || "(),;<>!~=".contains(c)))
-        .then_some(version)
+        let version = self.specifier.strip_prefix("==")?;
+        bare_version(version).filter(|version| !version.contains('*'))
     }
 
     /// The version of an arbitrary-equality `===X` pin (a string match),
     /// as spelled.
     pub(crate) fn arbitrary_version(&self) -> Option<&'a str> {
-        let version = self.specifier.strip_prefix("===")?.trim_start();
-        (!version.is_empty()
-            && !version.contains(|c: char| c.is_whitespace() || "(),;<>!~=*".contains(c)))
-        .then_some(version)
+        bare_version(self.specifier.strip_prefix("===")?)
     }
+}
+
+/// The one version token after a specifier's operator: `None` when it is
+/// empty or a second operator or clause follows.
+fn bare_version(text: &str) -> Option<&str> {
+    let version = text.trim_start();
+    (!version.is_empty()
+        && !version.contains(|c: char| c.is_whitespace() || "(),;<>~=".contains(c)))
+    .then_some(version)
+}
+
+/// The PEP 508 name a requirement line starts with, as spelled: it must
+/// start alphanumeric. `None` for option lines and path or URL lines that
+/// start with `.`, `/` or `-`. Readers that must fail closed treat a line
+/// with a name but no valid [`parse_requirement`] as naming the package.
+pub(crate) fn requirement_name(code: &str) -> Option<&str> {
+    let code = code.trim_start();
+    if !code.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let end = code
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .unwrap_or(code.len());
+    Some(&code[..end])
 }
 
 /// Parse one logical line's code part (comment already stripped) as a
@@ -455,15 +473,8 @@ pub(crate) fn parse_requirement(code: &str) -> Option<Requirement<'_>> {
         })
         .map_or(code.len(), |(i, _)| i);
     let (spec, options) = (code[..options_at].trim_end(), code[options_at..].trim());
-    // PEP 508 name: must start alphanumeric.
-    if !spec.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-        return None;
-    }
-    let name_end = spec
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-        .unwrap_or(spec.len());
-    let (name, mut rest) = spec.split_at(name_end);
-    rest = rest.trim_start();
+    let name = requirement_name(spec)?;
+    let mut rest = spec[name.len()..].trim_start();
     let mut extras = None;
     if let Some(open) = rest.strip_prefix('[') {
         let close = open.find(']')?;
@@ -530,7 +541,12 @@ pub(crate) fn parse_requirement(code: &str) -> Option<Requirement<'_>> {
 /// requirements reader shares.
 pub(crate) fn exact_pin(code: &str) -> Option<(&str, &str)> {
     let requirement = parse_requirement(code)?;
-    Some((requirement.name, requirement.exact_version()?))
+    let version = requirement.exact_version()?;
+    // The inventory emits the version into a purl, so it takes only a
+    // plain release spelling.
+    version
+        .starts_with(|c: char| c.is_ascii_digit())
+        .then_some((requirement.name, version))
 }
 
 /// The `(name as spelled, reference)` of a PEP 508 direct reference
@@ -543,10 +559,8 @@ pub(crate) fn exact_pin(code: &str) -> Option<(&str, &str)> {
 /// the name cannot contain an `@`, so the first one is always the separator
 /// and a url's own `user@host` stays inside the reference.
 pub(crate) fn direct_reference(code: &str) -> Option<(&str, &str)> {
-    let (name, rest) = code.split(';').next()?.split_once('@')?;
-    let name = name.split('[').next()?.trim();
-    let reference = rest.split_whitespace().next()?;
-    (!name.is_empty() && !reference.is_empty()).then_some((name, reference))
+    let requirement = parse_requirement(code)?;
+    Some((requirement.name, requirement.direct_reference?))
 }
 
 /// The `(name, version)` of a `socket-patch vendor: <name>==<ver>[ (transitive)]`

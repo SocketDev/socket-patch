@@ -152,15 +152,12 @@ fn archive_version(location: &str, name: &str) -> Option<String> {
     (canonicalize_pypi_name(distribution) == name).then(|| version.to_string())
 }
 
-/// Classify the pin of one requirement (its code part with the marker
-/// removed) through the shared requirements grammar (#1365), with the
-/// hosted policy on top: `===` is arbitrary equality, a direct reference
-/// is socket-patch's own artifact or the user's source, and anything that
-/// is not one exact clause is ambiguous.
-fn requirement_version(specifier: &str, name: &str) -> RequirementVersion {
-    let Some(requirement) = parse_requirement(specifier) else {
-        return RequirementVersion::Ambiguous;
-    };
+/// Classify the pin of one requirement, read through the shared
+/// requirements grammar (#1365), with the hosted policy on top: `===` is
+/// arbitrary equality, a direct reference is socket-patch's own artifact
+/// or the user's source, and anything that is not one exact clause is
+/// ambiguous.
+fn requirement_version(requirement: &Requirement<'_>, name: &str) -> RequirementVersion {
     if let Some(location) = requirement.direct_reference {
         let Some(version) = archive_version(location, name) else {
             return RequirementVersion::Ambiguous;
@@ -185,11 +182,13 @@ fn requirement_version(specifier: &str, name: &str) -> RequirementVersion {
     RequirementVersion::Ambiguous
 }
 
-/// The requirement on one logical line, comment removed.
+/// The requirement on one logical line, comment removed. An unterminated
+/// continuation's trailing `\\` is dropped so the line still names its
+/// package (it is refused as unterminated, never rewritten).
 fn line_requirement(text: &str) -> Option<Requirement<'_>> {
     let text = text.trim();
     let code = unquoted_index(text, '#', true).map_or(text, |index| &text[..index]);
-    parse_requirement(code)
+    parse_requirement(code.trim_end().trim_end_matches('\\'))
 }
 
 pub(super) fn rewrite(
@@ -260,7 +259,7 @@ pub(super) fn rewrite(
                 .map_or((cleaned.as_str(), ""), |index| {
                     (&cleaned[..index], &cleaned[index..])
                 });
-            match requirement_version(specifier, &target) {
+            match requirement_version(&parsed, &target) {
                 // pip resolves `==` under PEP 440 (`==1.16` installs 1.16.0).
                 RequirementVersion::Exact(version)
                     if !crate::utils::pep440::versions_equal(&version, &dep.version) =>
@@ -644,6 +643,8 @@ mod tests {
             ("requests (== 2.28.1)", true),
             ("requests ( == 2.28.1 ) ; python_version >= \"3.8\"", true),
             ("requests===2.28.1", true),
+            ("requests==0!2.28.1", true),
+            ("requests==v2.28.1", true),
         ] {
             let result = rewrite_registry_redirect(&input(&format!("{line}\n")), &[patch()]);
             assert!(result.warnings.is_empty(), "{line}: {:?}", result.warnings);
@@ -659,6 +660,15 @@ mod tests {
             result.warnings[0].code,
             "redirect_requirements_version_ambiguous"
         );
+        // An unterminated continuation still names its package.
+        for source in ["requests \\", "requests==2.28.1 \\"] {
+            let result = rewrite_registry_redirect(&input(source), &[patch()]);
+            assert!(result.files.is_empty(), "{source}");
+            assert_eq!(
+                result.warnings[0].code, "redirect_requirements_continuation",
+                "{source}"
+            );
+        }
         // Not a requirement line at all: the name runs into a non-specifier.
         let result = rewrite_registry_redirect(&input("requests/x==2.28.1\n"), &[patch()]);
         assert!(result.files.is_empty());
