@@ -1703,7 +1703,8 @@ pub(crate) async fn bundler_loaded_manifest_in(
         ProjectView::Snapshot(snap) => {
             // The only files the probe reads: the app config, the global
             // config and `gems.rb` (the environment it also reads is fixed
-            // for the run).
+            // for the run, and the directory identity of a configured
+            // absolute path is not a file the snapshot fingerprints).
             let root = snap.root_reading(bundler_config_files(snap.root_reading::<&Path>([])));
             bundler_loaded_manifest(root).await
         }
@@ -1713,7 +1714,7 @@ pub(crate) async fn bundler_loaded_manifest_in(
             let lockfile = config.as_deref().and_then(manifest::config_lockfile);
             let root = Path::new("/");
             let gems_rb = view.is_file("gems.rb");
-            let loaded = manifest::classify(root, None, gemfile.as_deref(), None);
+            let loaded = manifest::classify_lexical(root, gemfile.as_deref());
             // `/` only stands in for the project root: bundler opens an
             // absolute lockfile as is, never the project's own lock, so
             // it must not compare equal to the pair's lock at `/`.
@@ -1725,7 +1726,7 @@ pub(crate) async fn bundler_loaded_manifest_in(
                     };
                 }
             }
-            loaded.with_lockfile(root, None, lockfile.as_deref(), None, gems_rb)
+            loaded.with_lockfile_lexical(root, lockfile.as_deref(), gems_rb)
         }
     }
 }

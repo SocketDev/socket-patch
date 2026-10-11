@@ -188,6 +188,44 @@ impl LoadedManifest {
         lockfile_global: Option<&str>,
         gems_rb_present: bool,
     ) -> LoadedManifest {
+        self.with_lockfile_by(
+            root,
+            lockfile_env,
+            lockfile_config,
+            lockfile_global,
+            gems_rb_present,
+            same_dir_on_disk,
+        )
+    }
+
+    /// [`LoadedManifest::with_lockfile`] for a `root` that only stands in
+    /// for a project not on this disk (an in-memory view): paths compare
+    /// lexically, never through this host's directories.
+    pub(crate) fn with_lockfile_lexical(
+        self,
+        root: &Path,
+        lockfile_config: Option<&str>,
+        gems_rb_present: bool,
+    ) -> LoadedManifest {
+        self.with_lockfile_by(
+            root,
+            None,
+            lockfile_config,
+            None,
+            gems_rb_present,
+            |a, b| a == b,
+        )
+    }
+
+    fn with_lockfile_by(
+        self,
+        root: &Path,
+        lockfile_env: Option<&OsStr>,
+        lockfile_config: Option<&str>,
+        lockfile_global: Option<&str>,
+        gems_rb_present: bool,
+        same_dir: SameDir,
+    ) -> LoadedManifest {
         let Some((_, lock)) = self.pair(gems_rb_present) else {
             return self;
         };
@@ -206,7 +244,7 @@ impl LoadedManifest {
         let target = resolve_against(root, &value);
         let expected = resolve_against(root, Path::new(lock));
         if let (Some(target), Some(expected)) = (target, expected) {
-            if same_entry(&target, &expected) {
+            if same_entry(&target, &expected, same_dir) {
                 return self;
             }
         }
@@ -259,22 +297,22 @@ fn resolve_against(root: &Path, value: &Path) -> Option<PathBuf> {
         .and_then(|p| normalize_lexically(&p))
 }
 
-/// Whether two resolved directories are the same directory: equal, or both
-/// resolving to the same physical path through symlinks.
-fn same_dir(a: &Path, b: &Path) -> bool {
-    a == b
-        || matches!(
-            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-            (Ok(a), Ok(b)) if a == b
-        )
+/// How two resolved directories are judged the same directory.
+type SameDir = fn(&Path, &Path) -> bool;
+
+/// Whether two resolved directories are the same directory on this disk:
+/// equal, or the same directory by file identity (a symlinked spelling, a
+/// bind mount, a Windows junction).
+fn same_dir_on_disk(a: &Path, b: &Path) -> bool {
+    a == b || same_file::is_same_file(a, b).unwrap_or(false)
 }
 
 /// Whether two resolved paths name the same directory entry: the same file
-/// name in the [`same_dir`] directory. Only the directory is resolved, so a
+/// name in the `same_dir` directory. Only the directory is resolved, so a
 /// root `Gemfile` that is itself a symlink to another manifest stays
 /// distinct from that manifest, as bundler's root follows the spelled
 /// directory.
-fn same_entry(a: &Path, b: &Path) -> bool {
+fn same_entry(a: &Path, b: &Path, same_dir: SameDir) -> bool {
     a == b
         || (a.file_name() == b.file_name()
             && matches!((a.parent(), b.parent()), (Some(a), Some(b)) if same_dir(a, b)))
@@ -291,6 +329,29 @@ pub fn classify(
     gemfile_env: Option<&OsStr>,
     config_value: Option<&str>,
     global_value: Option<&str>,
+) -> LoadedManifest {
+    classify_by(
+        root,
+        gemfile_env,
+        config_value,
+        global_value,
+        same_dir_on_disk,
+    )
+}
+
+/// [`classify`] of an app config value for a `root` that only stands in
+/// for a project not on this disk (an in-memory view): paths compare
+/// lexically, never through this host's directories.
+pub(crate) fn classify_lexical(root: &Path, config_value: Option<&str>) -> LoadedManifest {
+    classify_by(root, None, config_value, None, |a, b| a == b)
+}
+
+fn classify_by(
+    root: &Path,
+    gemfile_env: Option<&OsStr>,
+    config_value: Option<&str>,
+    global_value: Option<&str>,
+    same_dir: SameDir,
 ) -> LoadedManifest {
     let env = gemfile_env.filter(|v| !v.is_empty()).map(PathBuf::from);
     let config = config_value.filter(|v| !v.is_empty()).map(PathBuf::from);
@@ -321,8 +382,11 @@ pub fn classify(
     let target = resolve_against(root, &value);
     let root = resolve_against(root, Path::new(""));
     if let (Some(target), Some(root)) = (target, root) {
-        for manifest in ["Gemfile", "gems.rb"] {
-            if same_entry(&target, &root.join(manifest)) {
+        let manifest = ["Gemfile", "gems.rb"]
+            .into_iter()
+            .find(|m| target.file_name() == Some(OsStr::new(m)));
+        if let Some(manifest) = manifest {
+            if same_entry(&target, &root.join(manifest), same_dir) {
                 return LoadedManifest::Configured { manifest, by };
             }
         }
@@ -700,6 +764,39 @@ mod tests {
                 LoadedManifest::Unsupported { .. }
             ));
         }
+    }
+
+    /// An in-memory view's root only stands in for a project that is not on
+    /// this disk, so its paths never resolve through this host's
+    /// directories: a symlinked spelling stays another manifest there.
+    #[cfg(unix)]
+    #[test]
+    fn the_lexical_variants_never_read_this_hosts_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real/app");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
+        let link = tmp.path().join("link/app");
+        let value = link.join("Gemfile");
+        assert_eq!(
+            classify_lexical(&real, value.to_str()),
+            LoadedManifest::Unsupported {
+                value: value.display().to_string(),
+                by: GemfileSetting::AppConfig
+            }
+        );
+        assert_eq!(
+            classify_lexical(&real, Some("Gemfile")),
+            LoadedManifest::Configured {
+                manifest: "Gemfile",
+                by: GemfileSetting::AppConfig
+            }
+        );
+        let lock = link.join("Gemfile.lock");
+        assert!(matches!(
+            LoadedManifest::Default.with_lockfile_lexical(&real, lock.to_str(), false),
+            LoadedManifest::UnsupportedLockfile { .. }
+        ));
     }
 
     /// Only the DIRECTORY is resolved: a root `Gemfile` that is itself a
