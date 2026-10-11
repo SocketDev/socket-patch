@@ -357,8 +357,10 @@ const PYLOCK_PIPFILE: &str = "[[source]]\nurl = \"https://pypi.org/simple\"\nver
 /// `pipenv lock` writes both `Pipfile.lock` and `pylock.toml`:
 ///
 /// * #1122: vendored wires `Pipfile.lock` (what Pipenv installs from when
-///   both exist), leaves the pylock alone, and a fresh
-///   `pipenv install --deploy` gets the PATCHED six.
+///   both exist), and a fresh `pipenv install --deploy` gets the PATCHED
+///   six.
+/// * #1368: the pylock, which PEP 751 installers (`uv pip install -r
+///   pylock.toml`, pip) read, is wired to the same vendored wheel.
 /// * #912: the pylock-only checkout (no `Pipfile.lock`) is refused in both
 ///   modes — Pipenv would drop the `archive` entry and install the upstream
 ///   release — and the pylock is left byte-identical.
@@ -422,10 +424,10 @@ fn pylock_flow(pipenv: &Pipenv, root: &Path) {
         lock.contains(&format!(".socket/vendor/pypi/{}/", mode.uuid())),
         "{what}: Pipfile.lock must point at the vendored wheel: {lock}"
     );
-    assert_eq!(
-        read(&proj.join("pylock.toml")),
-        pristine_pylock,
-        "{what}: the pylock Pipenv ignores is left alone"
+    let pylock = String::from_utf8(read(&proj.join("pylock.toml"))).unwrap();
+    assert!(
+        pylock.contains(&format!(".socket/vendor/pypi/{}/", mode.uuid())),
+        "{what}: pylock.toml must point at the vendored wheel too: {pylock}"
     );
     let fresh = root.join("pylock").join("fresh");
     copy_tree(&proj, &fresh, &[".venv"]);
