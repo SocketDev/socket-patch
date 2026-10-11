@@ -2,17 +2,11 @@ use socket_patch_cli::{commands, parse_argv_with_shortcuts, Commands};
 use socket_patch_core::utils::env_compat::promote_peer_env_vars;
 use socket_patch_core::utils::socket_cli_config;
 
-/// Restore the default SIGPIPE disposition. The Rust runtime starts every
-/// process with SIGPIPE ignored, so once a pipeline consumer exits
-/// (`socket-patch scan | head -1`) the next `println!` gets `EPIPE` and
-/// *panics* — exit 101 and a "failed printing to stdout: Broken pipe"
-/// crash report instead of the quiet SIGPIPE death every other Unix CLI
-/// has in that position. Network sockets are unaffected: std and socket2
-/// write with `MSG_NOSIGNAL` / `SO_NOSIGPIPE`.
+/// Exit quietly when a pipe consumer closes stdout, instead of panicking on EPIPE.
+/// Network writes still suppress SIGPIPE through std/socket2.
 #[cfg(unix)]
 fn restore_default_sigpipe() {
-    // SAFETY: SIG_DFL is a valid disposition for SIGPIPE, and this runs
-    // first thing in `main`, before any other threads exist.
+    // SAFETY: SIG_DFL is a valid disposition for SIGPIPE.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }

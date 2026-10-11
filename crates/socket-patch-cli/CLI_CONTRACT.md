@@ -64,11 +64,11 @@ uppercase letter settles on its exact-case package among case-distinct ones
 
 `get <name>` searches every installed version of the matched name (within
 `--ecosystems`) and prints `Matched: …` on stderr. With no exact match in a
-nonempty inventory it is `no_match` (exit 0, no patch-search API call) and, in
+nonempty inventory it is `noMatch` (exit 0, no patch-search API call) and, in
 human mode, suggests up to five near names (`Did you mean: …?`) without acting on
-them. An empty inventory is `no_packages` (exit 0). `--ecosystems` also filters
+them. An empty inventory is `noPackages` (exit 0). `--ecosystems` also filters
 advisory/purl search results and UUID selection before any patch is written; a
-UUID outside the selected ecosystems is `not_found` (exit 0).
+UUID outside the selected ecosystems is `notFound` (exit 0).
 
 `remove` / `rollback` accept the same names and versionless purls against manifest
 records, vendor-ledger entries and hosted pins; CVE/GHSA ids match no record
@@ -1264,7 +1264,11 @@ The v3.0 legacy names `SOCKET_PATCH_PROXY_URL`, `SOCKET_PATCH_DEBUG` and `SOCKET
 
 ## JSON output shapes
 
-Every `--json` invocation emits a single JSON object that follows the **unified envelope** below. The envelope was introduced in v3.0; older per-command shapes are deprecated. See `src/json_envelope.rs` for the source of truth; its unit tests pin the serialized names, and each command's e2e tests assert the envelope it emits. The `tests/cli_parse_*.rs` files pin the parsed clap arguments, not this shape (a few, such as `cli_parse_list.rs`, also spot-check `list`'s envelope).
+Every command's `--json` output is a single object using the envelope below.
+v5 removes the older per-command shapes. Argument-parsing errors and invalid
+`--cwd`, `--global-prefix`, or `--manifest-path` values still exit 2 with stderr
+output and no JSON. `src/json_envelope.rs` defines the serialized names; each
+command's integration tests check its output.
 
 **One error shape (v5.0, MAJOR).** On every command, every `--json` failure is a full envelope (`command`, `status: "error"`, `dryRun`, `events`, `summary`) whose top-level `error` is a `{code, message}` object — the envelope's `EnvelopeError`. `code` is a stable snake_case tag (see [Top-level `EnvelopeError` codes](#top-level-envelopeerror-codes)); `message` is for humans. No command prints a top-level `errorCode` any more (it moved into `error.code`). Per-event keys are unchanged: `events[*].error` / `events[*].errorCode` stay strings.
 

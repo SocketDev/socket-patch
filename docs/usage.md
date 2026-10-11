@@ -50,13 +50,10 @@ ambiguity rules, and no-match statuses. `get` defaults to hosted mode; `--save-o
 and global targeting default to agent mode instead. Hosted and vendored `get` do
 not prompt. Agent-mode searches can offer an interactive choice.
 
-For each package version, automatic selection prefers the highest severity among
-downloadable patches, then the most distinct advisories fixed, then the newest
-publication date. Exact ties use tier and UUID. A rerun replaces a recorded patch
-only with one that outranks it by severity, advisory count, or date; tier and UUID
-tie-breaking alone does not cause a replacement. The
-[ranking contract](../crates/socket-patch-cli/CLI_CONTRACT.md#which-patch-gets-selected)
-details selection and upgrades.
+Automatic selection ranks downloadable patches by severity, advisory count, then
+publication date. Reruns upgrade existing patches only when a better-ranked patch
+is available. See the [ranking contract](../crates/socket-patch-cli/CLI_CONTRACT.md#which-patch-gets-selected)
+for tie-breaking and upgrade rules.
 
 ## CI and automation
 
@@ -70,10 +67,11 @@ socket-patch scan --json > scan-result.json
 ```
 
 Check the command's exit status before processing the result. A preview reports
-patch availability; it does not fail merely because patches exist. JSON schemas
-vary by command: use the [output reference](../crates/socket-patch-cli/CLI_CONTRACT.md#json-output-shapes)
-rather than parsing human output. A pipeline that uses `jq` should preserve the
-CLI's exit status, for example with Bash's `set -o pipefail`.
+patch availability; it does not fail merely because patches exist. Commands share
+a JSON envelope with `command`, `status`, `dryRun`, `events`, and `summary`;
+see the [output reference](../crates/socket-patch-cli/CLI_CONTRACT.md#json-output-shapes)
+for command-specific fields. A pipeline that uses `jq` should preserve the CLI's
+exit status, for example with Bash's `set -o pipefail`.
 
 `scan --max-new-patches 5` limits new patches per run; it does not limit updates to
 existing patches. See [gradual rollout](configuration.md#gradual-rollout).
@@ -105,23 +103,14 @@ mirror or package-manager cache, and test a clean offline install before relying
 on an airgapped build. Integrity enforcement and cache behavior differ by package
 manager; see [ecosystem support](ecosystems.md).
 
-Vendoring downloads prebuilt artifacts from the patch service and verifies
-archive integrity and patched file hashes before installation. The service
-owns archive construction, including Yarn Berry cache checksums. Python
-vendoring accepts both wheels and source distributions supplied by the service.
-
-`--vendor-source service` is the default. `auto` remains an alias for the same
-behavior; `build` is rejected. Missing or pending service artifacts, network errors,
-and integrity mismatches do not trigger a local build fallback. Healthy committed
-artifacts can be reused offline.
+Vendoring verifies downloaded archives and patched file hashes. Healthy committed
+artifacts can be reused offline; new artifacts require the patch service. For
+changes to v4's local artifact building, see the [migration guide](migrating-to-v5.md#service-only-vendoring).
 
 `repair` redownloads missing or corrupt artifacts and checks them against the
 existing ledger before replacement. It preserves project wiring and recorded
 integrity; different archive bytes require an explicit new vendoring operation.
 Repair cannot reconstruct a lost vendor ledger. Restore it from version control.
-
-The N-API crate and in-memory patch engine remain available for hosted GitHub
-App workflows. Removing local vendoring builders does not remove those APIs.
 
 ### Maven and Gradle
 
@@ -183,9 +172,7 @@ be configured to consume the resulting file.
 
 Before installation, hosted VEX can describe the pinned dependency state without
 verifying installed bytes. `scan --vex socket.vex.json` also emits hosted VEX before
-installation; rerun standalone `vex` afterward. Impact statements include the patch
-UUID; vendored and hosted statements add `(vendored)` and `(redirected)` respectively.
-Exact strings are in the [provenance contract](../crates/socket-patch-cli/CLI_CONTRACT.md#vex-provenance-markers-contract).
+installation; rerun standalone `vex` afterward.
 
 `vex` reads patch records from local state or fetches them from the API. Without a
 local record, `--offline` omits the patch as `record_unavailable`. Commit the vendor
@@ -197,11 +184,10 @@ The product identifier is inferred from the Git origin or project metadata. Use
 `--product <identifier>` when inference is unavailable or unsuitable. `--json`
 requires `--output` so the document and command result do not share stdout.
 
-`scan`, `apply`, and `vendor` accept `--vex <path>` plus `--vex-product`,
-`--vex-no-verify`, `--vex-doc-id`, and `--vex-compact`. Embedded generation is skipped
-for `--dry-run`; an attestation failure makes the command fail even if patching
+`scan`, `apply`, and `vendor` accept `--vex <path>`. Generation is skipped for
+`--dry-run`; an attestation failure makes the command fail even if patching
 succeeded. See the [VEX contract](../crates/socket-patch-cli/CLI_CONTRACT.md#embedded-vex-apply---vex--scan---vex--vendor---vex)
-for output and empty-project behavior.
+for options, output, and empty-project behavior.
 
 ## Agent mode
 
