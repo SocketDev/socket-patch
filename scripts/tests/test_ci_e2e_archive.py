@@ -128,7 +128,9 @@ class E2eArchive(unittest.TestCase):
             for step_name, step in rows.steps(job):
                 if step_name == "Download the e2e binaries":
                     self.assertIn("uses: ./.github/actions/download-artifact", step)
-                    checks.append(re.search(r"(?m)^          verify: (.+)$", step)[1])
+                    verify = re.search(r"(?m)^          verify: (.+)$", step)
+                    self.assertIsNotNone(verify, "an e2e-bin download has no verify check")
+                    checks.append(verify[1])
         self.assertTrue(checks)
         for check in checks:
             with tempfile.TemporaryDirectory(prefix="e2e-truncated-") as directory:
@@ -147,16 +149,20 @@ class E2eArchive(unittest.TestCase):
 
     def test_download_wrapper_retries_a_failed_check_and_fails_on_the_second(self):
         action = (ROOT / ".github/actions/download-artifact/action.yml").read_text()
-        retry = "steps.first.outcome == 'failure' || steps.first-check.outcome == 'failure'"
+        retry = "${{ !cancelled() && (steps.first.outcome == 'failure' || steps.first-check.outcome == 'failure') }}"
         steps = action.split("    - name: ")[1:]
-        names = [step.split("\n", 1)[0] for step in steps]
-        self.assertEqual(names, ["Download (attempt 1)", "Verify (attempt 1)", "Clear the failed download",
-                                 "Download (attempt 2)", "Verify (attempt 2)"])
-        for step in steps[:2]:
-            self.assertIn("continue-on-error: true", step)
-        for step in steps[2:]:
-            self.assertIn(retry, step)
-            self.assertNotIn("continue-on-error", step)
+        gates = {step.split("\n", 1)[0]: re.search(r"(?m)^      if: (.+)$", step)[1] for step in steps}
+        self.assertEqual(gates, {
+            "Download (attempt 1)": "${{ !cancelled() }}",
+            "Verify (attempt 1)": "${{ !cancelled() && steps.first.outcome == 'success' }}",
+            "Clear the failed download": retry,
+            "Download (attempt 2)": retry,
+            "Verify (attempt 2)": "${{ !cancelled() && steps.second.outcome == 'success' }}",
+        })
+        # Only the first attempt may fail softly; the second must fail the job.
+        for step in steps:
+            name = step.split("\n", 1)[0]
+            self.assertEqual("continue-on-error: true" in step, name.endswith("(attempt 1)"), name)
 
 
 if __name__ == "__main__":
