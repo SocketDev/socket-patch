@@ -217,3 +217,195 @@ fn rollback_restores_every_coexisting_gem_store_copy() {
     }
     assert_ne!(before_hash, after_hash);
 }
+
+/// Lay down a project whose one scoped store holds BOTH the ruby-platform
+/// build `rack-3.1.0/` and the platform build `rack-3.1.0-x86_64-linux/` of
+/// `rack@3.1.0` (#1092: `gem install --platform ruby` beside a platform
+/// install, or a project toggling `force_ruby_platform`). RubyGems loads
+/// the platform build. Returns
+/// `(root, plain_file, platform_file, original, patched)`.
+fn build_platform_variant_project(tmp: &Path) -> (PathBuf, PathBuf, PathBuf, Vec<u8>, Vec<u8>) {
+    let original = b"module Rack\n  VERSION = 'VULNERABLE'\nend\n".to_vec();
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"# SOCKET-PATCHED-GEM-PLATFORM\n");
+    let before_hash = git_sha256(&original);
+    let after_hash = git_sha256(&patched);
+
+    let gems = tmp
+        .join("vendor")
+        .join("bundle")
+        .join("ruby")
+        .join("3.2.0")
+        .join("gems");
+    let plain_file = write_copy(&gems.join("rack-3.1.0"), &original);
+    let platform_file = write_copy(&gems.join("rack-3.1.0-x86_64-linux"), &original);
+
+    stage_manifest_and_blob(tmp, &before_hash, &after_hash, &patched);
+    // A vulnerability, so `vex` has a statement to attest.
+    let manifest = tmp.join(".socket").join("manifest.json");
+    let text = std::fs::read_to_string(&manifest).unwrap().replace(
+        r#""vulnerabilities": {}"#,
+        r#""vulnerabilities": { "GHSA-gplt-gplt-gplt": {
+            "cves": ["CVE-2026-1092"], "summary": "synthetic",
+            "severity": "high", "description": "synthetic"
+        }}"#,
+    );
+    assert!(text.contains("GHSA-gplt-gplt-gplt"));
+    std::fs::write(&manifest, text).unwrap();
+    std::fs::write(
+        tmp.join(".socket").join("blobs").join(&before_hash),
+        &original,
+    )
+    .unwrap();
+
+    (
+        tmp.to_path_buf(),
+        plain_file,
+        platform_file,
+        original,
+        patched,
+    )
+}
+
+/// `run_json` without `--json`, for `vex`, whose stdout is the document.
+fn run_raw(root: &Path, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = Command::new(binary());
+    cmd.args(args)
+        .args(["--offline", "--ecosystems", "gem", "--cwd"])
+        .arg(root);
+    for (key, _) in std::env::vars_os() {
+        let k = key.to_string_lossy();
+        if (k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG") || k.starts_with("BUNDLE_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let out = cmd.output().expect("run socket-patch");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// #1092: `apply` patches the platform build beside the ruby-platform one,
+/// and `rollback` restores both.
+#[test]
+fn apply_and_rollback_cover_every_platform_variant_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, plain_file, platform_file, original, patched) =
+        build_platform_variant_project(tmp.path());
+
+    let (code, v) = run_json(&root, &["apply"]);
+    assert_eq!(code, 0, "apply must succeed; envelope={v}");
+    for (label, f) in [("plain", &plain_file), ("platform", &platform_file)] {
+        assert_eq!(
+            std::fs::read(f).unwrap(),
+            patched,
+            "{label} copy at {f:?} was NOT patched; envelope={v}"
+        );
+    }
+    assert_eq!(
+        v["summary"]["applied"], 2,
+        "summary must count both copies; envelope={v}"
+    );
+
+    let (code, v) = run_json(&root, &["rollback", "--yes"]);
+    assert_eq!(code, 0, "rollback must succeed; envelope={v}");
+    for (label, f) in [("plain", &plain_file), ("platform", &platform_file)] {
+        assert_eq!(
+            std::fs::read(f).unwrap(),
+            original,
+            "{label} copy at {f:?} was NOT restored; envelope={v}"
+        );
+    }
+}
+
+/// #1092: with only the ruby-platform copy patched, `vex` must not attest
+/// `not_affected` and `apply --check` must not report the patch in sync,
+/// because the platform copy RubyGems loads is still vulnerable.
+#[test]
+fn vex_and_check_refuse_an_unpatched_platform_variant_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, plain_file, platform_file, original, patched) =
+        build_platform_variant_project(tmp.path());
+    std::fs::write(&plain_file, &patched).unwrap();
+    assert_eq!(std::fs::read(&platform_file).unwrap(), original);
+
+    let (code, stdout, stderr) = run_raw(&root, &["vex", "--product", "pkg:gem/app@1.0.0"]);
+    assert!(
+        !stdout.contains("not_affected"),
+        "vex must not attest while the platform copy is unpatched (exit {code})\
+         \nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let (code, stdout, stderr) = run_raw(&root, &["apply", "--check"]);
+    assert_ne!(
+        code, 0,
+        "apply --check must flag the unpatched platform copy\
+         \nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Once both copies are patched, both gates pass.
+    std::fs::write(&platform_file, &patched).unwrap();
+    let (code, stdout, stderr) = run_raw(&root, &["vex", "--product", "pkg:gem/app@1.0.0"]);
+    assert_eq!(code, 0, "vex\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("not_affected"), "vex doc:\n{stdout}");
+    let (code, stdout, stderr) = run_raw(&root, &["apply", "--check"]);
+    assert_eq!(
+        code, 0,
+        "apply --check\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// #1092, global mode: `apply -g --global-prefix <gem home>/gems` patches
+/// the platform build too (plain RubyGems activates it, no Bundler needed).
+#[test]
+fn global_apply_covers_every_platform_variant_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, plain_file, platform_file, _original, patched) =
+        build_platform_variant_project(tmp.path());
+    let gems = plain_file
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+
+    let (code, v) = run_json(
+        &root,
+        &["apply", "-g", "--global-prefix", gems.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "apply -g must succeed; envelope={v}");
+    for (label, f) in [("plain", &plain_file), ("platform", &platform_file)] {
+        assert_eq!(
+            std::fs::read(f).unwrap(),
+            patched,
+            "{label} copy at {f:?} was NOT patched; envelope={v}"
+        );
+    }
+}
+
+/// A platform build whose bytes are not the patch's distribution (a native
+/// build that ships a different file) is another distribution, not a
+/// locally modified copy: apply patches the plain copy, never overwrites
+/// the platform one with the plain build's bytes, and fails loudly because
+/// the copy RubyGems loads stays unpatched.
+#[test]
+fn apply_refuses_a_platform_copy_holding_another_distribution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, plain_file, platform_file, _original, patched) =
+        build_platform_variant_project(tmp.path());
+    let native = b"module Rack\n  VERSION = 'NATIVE BUILD'\nend\n".to_vec();
+    std::fs::write(&platform_file, &native).unwrap();
+
+    let (code, v) = run_json(&root, &["apply"]);
+    assert_ne!(code, 0, "apply must flag the unpatched copy; envelope={v}");
+    assert_eq!(std::fs::read(&plain_file).unwrap(), patched, "envelope={v}");
+    assert_eq!(
+        std::fs::read(&platform_file).unwrap(),
+        native,
+        "envelope={v}"
+    );
+}

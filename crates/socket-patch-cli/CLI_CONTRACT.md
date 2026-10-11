@@ -642,7 +642,13 @@ the model is **not uniform** today:
   **coexisting physical copies of one `gem@version`** (bundler-2's scoped store beside bundler-1's
   flat store), `apply`/`rollback` patch/restore **every copy** — one summary event per copy,
   mirroring npm's multi-copy fan-out — while single-representative consumers (`get`, `vendor`,
-  `vex`) use the highest-precedence copy. PyPI follows the same rule: when the crawler resolves
+  `vex`) use the highest-precedence copy. One gem home holding **several builds** of a version
+  (the ruby-platform `x-1.0/` beside `x-1.0-x86_64-linux-gnu/`, after `gem install --platform ruby`
+  or a `force_ruby_platform` toggle) counts as several copies too: the plain dir first, then each
+  platform dir, so `apply`, `rollback`, `apply --check` and `vex` cover the platform build RubyGems
+  loads (#1092). Such a build is not the only candidate, so the default mismatch policy never
+  overwrites it: a build whose bytes match no manifest variant is left untouched and fails the run
+  (`no matching variant found`). PyPI follows the same rule: when the crawler resolves
   one release in several site-packages dirs (a Pipenv WORKON_HOME venv beside an auto-detected
   `./.venv`, or the user site beside a system dir in global scope), agent `apply` patches **every**
   copy, one summary event per copy, because any of them may be the one the interpreter imports.

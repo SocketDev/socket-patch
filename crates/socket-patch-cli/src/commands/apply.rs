@@ -92,6 +92,15 @@ fn mismatch_event_detail(file: &str, dry_run: bool) -> String {
     )
 }
 
+/// Whether another of `copies` sits in the same gem home as `copy`: two
+/// builds of one gem version (`x-1.0/` and `x-1.0-<platform>/`) installed
+/// side by side.
+fn has_build_sibling(copy: &Path, copies: &[PathBuf]) -> bool {
+    copies
+        .iter()
+        .any(|other| other != copy && other.parent() == copy.parent())
+}
+
 /// One `content_mismatch_overwritten` run warning per mismatch-overwritten
 /// file across `results`, in the event detail's words prefixed with the
 /// package purl — what a nested apply hands back to `get` / `scan --mode
@@ -2333,8 +2342,17 @@ async fn apply_patches_inner(
                     // let a lone x86_64-linux record silently overwrite a
                     // darwin install in the Bundler plugin's `--silent`
                     // auto-apply, where the warn half of warn-and-apply is
-                    // invisible.
-                    if !args.force && (variants.len() > 1 || variants[0] != base_purl) {
+                    // invisible. The same holds for a copy with a BUILD
+                    // SIBLING (another copy in the same gem home: the
+                    // ruby-platform `x-1.0/` beside `x-1.0-x86_64-linux/`,
+                    // #1092): it is no longer the only candidate, so a
+                    // mismatch there means another distribution, and the
+                    // copy stays gated rather than overwritten.
+                    if !args.force
+                        && (variants.len() > 1
+                            || variants[0] != base_purl
+                            || has_build_sibling(pkg_path, copy_paths))
+                    {
                         let first_status = match representative_file(&patch.files) {
                             Some((file_name, file_info)) => Some(
                                 verify_file_patch(pkg_path, file_name, file_info)
