@@ -814,6 +814,37 @@ async fn generate_vex(
         );
     }
 
+    // A Go replace that the go.work in effect overrides, ignores, or makes
+    // conflict with another member's (#393, #458, #531) is not what the
+    // build links, however intact its copy or pin: never attest it.
+    if !common.is_global() {
+        use socket_patch_core::utils::purl::{build_golang_purl, strip_purl_qualifiers};
+        for issue in socket_patch_core::vendor::go_consumer_sync::workspace_audit(&common.cwd).await
+        {
+            let socket_patch_core::vendor::go_consumer_sync::GoSyncIssue::Workspace {
+                module,
+                version,
+                ..
+            } = &issue
+            else {
+                continue;
+            };
+            let purl = build_golang_purl(module, version);
+            let before = outcome.applied.len();
+            outcome
+                .applied
+                .retain(|p| strip_purl_qualifiers(p) != purl.as_str());
+            if outcome.applied.len() == before {
+                continue;
+            }
+            note_warning(warnings, common, issue.code(), format!("{purl}: {issue}"));
+            outcome.failed.push(FailedPatch {
+                purl,
+                reason: GO_WORKSPACE_OVERRIDE.to_string(),
+            });
+        }
+    }
+
     // The plan's gate omissions (record_unavailable / record_mismatch /
     // vendor_unwired / redirect_unwired / wiring_conflict) join the omission
     // channel so they surface as per-purl `skipped` events like any
@@ -1504,6 +1535,10 @@ fn join_and(items: &[&str]) -> String {
     }
 }
 
+/// Omission tag for a Go patch whose go.mod replace the `go.work` in effect
+/// overrides, ignores or rejects (#393, #458, #531).
+const GO_WORKSPACE_OVERRIDE: &str = "go_workspace_override";
+
 /// Synthesize go-patches redirect targets for `vex`: for every socket-owned (`.socket/go-patches/`) `replace` in
 /// `go.mod` whose module+version maps to a golang PURL of the record view
 /// (`manifest` — for `vex` the merged manifest + ledger + lockfile view, so
@@ -1633,6 +1668,10 @@ fn omission_phrase(reason: &str) -> &'static str {
         REDIRECT_UNWIRED => {
             "the hosted ledger records it, but no lockfile wires its hosted patch to this \
              package any more"
+        }
+        GO_WORKSPACE_OVERRIDE => {
+            "the go.work in effect overrides, ignores or conflicts with its go.mod replace, \
+             so the build does not link the patched module"
         }
         WIRING_CONFLICT => {
             "the lockfiles wire this package to different patches, so which one the build \
@@ -1816,6 +1855,7 @@ mod tests {
             VENDOR_UNWIRED,
             REDIRECT_UNWIRED,
             WIRING_CONFLICT,
+            GO_WORKSPACE_OVERRIDE,
         ] {
             assert_ne!(
                 omission_phrase(tag),
