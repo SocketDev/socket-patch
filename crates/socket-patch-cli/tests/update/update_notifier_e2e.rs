@@ -500,13 +500,21 @@ async fn guard_opt_out_beats_force() {
 /// Unreachable release host: the carrier is untouched, and the FAILED
 /// check still advances `lastCheckAt` — a broken network is retried at
 /// most once a day, not on every command.
+///
+/// The `lastCheckAt` write happens in the detached check task, so this row
+/// asserts on the task's effect and needs the lifted grace like the others
+/// (under 500 ms a loaded Windows runner could exit before the write and
+/// read back the STALE value). The fetch itself stays capped at 2 s.
 #[tokio::test]
 async fn dead_endpoint_never_fails_the_command() {
     let install = staged_install();
     write_state(&install.state_dir, STALE, Some(CURRENT), None);
 
-    let (code, stdout, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit("http://127.0.0.1:1"));
+    let (code, stdout, stderr) = run_installed(
+        &install,
+        &["apply"],
+        &eligible_kit_await_fetch("http://127.0.0.1:1"),
+    );
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(!stderr.contains("Update available"), "{stderr}");
 
