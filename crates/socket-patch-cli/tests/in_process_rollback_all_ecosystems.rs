@@ -26,7 +26,7 @@
 //! merge functions behave identically, so the test would prove nothing.
 //!
 //! npm / cargo / golang / composer / nuget are NOT release-variant
-//! ecosystems (their crawlers wire `merge_first_wins` in both resolvers), so a
+//! ecosystems (their crawlers wire a fixed merge in both resolvers), so a
 //! qualified PURL there is genuinely unsupported and those fixtures keep
 //! bare PURLs.
 

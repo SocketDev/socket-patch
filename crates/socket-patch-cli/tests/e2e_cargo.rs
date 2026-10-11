@@ -552,3 +552,199 @@ async fn sync_keeps_shared_cache_entry_behind_a_cargo_vendor_dir() {
     );
     assert_eq!(std::fs::read(itoa_old.join("src/lib.rs")).unwrap(), orig);
 }
+
+/// #339: `$CARGO_HOME/registry/src` holds one extracted copy of a crate
+/// per registry index dir (`index.crates.io-6f17d22bba15001f` for cargo
+/// 1.70–1.84, `index.crates.io-1949cf8c6b5b557f` for cargo ≥ 1.85), so
+/// two toolchains sharing a `CARGO_HOME` each build their own copy. Agent
+/// mode must patch, check, attest and restore EVERY copy, not just the
+/// first index dir in listing order: otherwise the project built by the
+/// other cargo compiles the unpatched crate while `apply` reports success
+/// and `vex` attests `not_affected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_mode_covers_every_registry_index_copy() {
+    let server = start_proxy().await;
+    let proxy_url = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cwd = root.to_str().unwrap();
+
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\n\n[dependencies]\ncfg-if = \"=1.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Cargo.lock"),
+        "version = 3\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.0\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+         [[package]]\nname = \"myapp\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n",
+    )
+    .unwrap();
+
+    let orig: &[u8] = b"pub fn cfg() {}\n";
+    let patched: &[u8] = b"pub fn cfg() {}\npub fn socket_patched() {}\n";
+    let src = root.join(".cargo/registry/src");
+    let copies = [
+        fake_registry_crate(
+            &src.join("index.crates.io-1949cf8c6b5b557f"),
+            "cfg-if",
+            "1.0.0",
+            orig,
+        ),
+        fake_registry_crate(
+            &src.join("index.crates.io-6f17d22bba15001f"),
+            "cfg-if",
+            "1.0.0",
+            orig,
+        ),
+    ];
+    // A private registry's crate of the same name@version is another
+    // crate: agent mode must leave it alone.
+    let corp = fake_registry_crate(
+        &src.join("corp.example-0123456789abcdef"),
+        "cfg-if",
+        "1.0.0",
+        b"pub fn corp() {}\n",
+    );
+    let lib = |copy: &PathBuf| std::fs::read(copy.join("src/lib.rs")).unwrap();
+
+    let socket = root.join(".socket");
+    let purl = "pkg:cargo/cfg-if@1.0.0";
+    // vex attests only patches that carry vulnerability metadata.
+    let mut record = manifest_record(
+        &socket,
+        "33900000-0000-4000-8000-000000000001",
+        orig,
+        patched,
+    );
+    record["vulnerabilities"] = serde_json::json!({ "GHSA-xxxx-xxxx-xxxx": {
+        "cves": ["CVE-2024-0001"],
+        "summary": "s",
+        "severity": "high",
+        "description": "d",
+    }});
+    let manifest = serde_json::json!({ "patches": { purl: record } });
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    // apply patches both copies.
+    let out = run(
+        &["apply", "--json", "--offline", "--cwd", cwd],
+        root,
+        &proxy_url,
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "apply must exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for copy in &copies {
+        assert_eq!(
+            lib(copy),
+            patched,
+            "apply left {} unpatched\nstdout:\n{stdout}",
+            copy.display()
+        );
+    }
+    assert_eq!(
+        lib(&corp),
+        b"pub fn corp() {}\n",
+        "apply patched another registry's crate"
+    );
+
+    // Baselines: with every copy patched the check passes and vex attests.
+    let out = run(
+        &["apply", "--check", "--json", "--offline", "--cwd", cwd],
+        root,
+        &proxy_url,
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "apply --check must pass with every copy patched\nstdout:\n{stdout}"
+    );
+    let vex_args = [
+        "vex",
+        "--offline",
+        "--product",
+        "pkg:cargo/myapp@0.1.0",
+        "--cwd",
+        cwd,
+    ];
+    let out = run(&vex_args, root, &proxy_url).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("not_affected"),
+        "vex must attest with every copy patched\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // A copy re-extracted pristine (another cargo fetched it again) must
+    // fail the CI gate instead of reading as in sync.
+    std::fs::write(copies[1].join("src/lib.rs"), orig).unwrap();
+    let out = run(
+        &["apply", "--check", "--json", "--offline", "--cwd", cwd],
+        root,
+        &proxy_url,
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "apply --check must fail while {} is unpatched\nstdout:\n{stdout}",
+        copies[1].display()
+    );
+
+    // ... and must keep vex from attesting the patch.
+    let out = run(&vex_args, root, &proxy_url).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("not_affected"),
+        "vex attested a patch one built copy lacks\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Re-apply fixes the pristine copy; rollback then restores both.
+    let out = run(
+        &["apply", "--json", "--offline", "--cwd", cwd],
+        root,
+        &proxy_url,
+    )
+    .await;
+    assert!(out.status.success(), "re-apply must exit 0");
+    for copy in &copies {
+        assert_eq!(lib(copy), patched, "re-apply left {}", copy.display());
+    }
+    let out = run(
+        &["rollback", purl, "--json", "--offline", "--cwd", cwd],
+        root,
+        &proxy_url,
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "rollback must exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for copy in &copies {
+        assert_eq!(
+            lib(copy),
+            orig,
+            "rollback left {} patched\nstdout:\n{stdout}",
+            copy.display()
+        );
+    }
+    assert_eq!(
+        lib(&corp),
+        b"pub fn corp() {}\n",
+        "rollback touched another registry's crate"
+    );
+}

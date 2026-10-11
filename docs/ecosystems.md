@@ -1099,6 +1099,12 @@ crate that means the **shared** `$CARGO_HOME/registry` cache: the patch affects 
 project on the machine, and is silently reset by `cargo clean` or a cache prune. Use
 `--mode vendored` for a project-local, committable patch.
 
+The cache holds one extracted copy of a crate per registry index directory under
+`registry/src` (cargo 1.70–1.84 and cargo 1.85+ use different ones), so two toolchains
+sharing a `CARGO_HOME` each build their own copy. `apply`, `apply --check`, `vex` and
+`rollback` cover every copy: an unpatched one fails the check and keeps `vex` from
+attesting the patch.
+
 Nothing deletes a crate from the cache when the project stops using it, so the
 manifest record stays the only way to restore that copy: `rollback` (and `remove`)
 also restore it after the crate was moved to vendored mode, and `scan --prune` /
