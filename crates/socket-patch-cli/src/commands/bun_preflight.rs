@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use socket_patch_core::api::types::PatchSearchResult;
+use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::vendor::load_state;
 use socket_patch_core::vendor::state::VendorEntry;
 
@@ -67,7 +68,7 @@ impl BunVendorRefusal {
     /// ecosystem's backend consults `bun.lock`), minus the already-vendored
     /// exemption.
     pub(crate) fn applies_to(&self, purl: &str) -> bool {
-        purl.starts_with("pkg:npm/") && !self.exempt.contains(purl)
+        Ecosystem::from_purl(purl) == Some(Ecosystem::Npm) && !self.exempt.contains(purl)
     }
 }
 
@@ -113,7 +114,10 @@ async fn preflight_pairs(
     pairs: &[(&str, &str)],
     ledger: Option<LedgerLoad<'_>>,
 ) -> Option<BunVendorRefusal> {
-    if !pairs.iter().any(|(purl, _)| purl.starts_with("pkg:npm/")) {
+    if !pairs
+        .iter()
+        .any(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Npm))
+    {
         return None;
     }
     // vlt wins the router (DESIGN D2): a Bun lock beside `vlt-lock.json`
@@ -169,7 +173,7 @@ async fn refusal_with_exemptions(
     let lock_parsed = code == "vendor_bun_workspace_unsupported";
     let mut exempt = HashSet::new();
     for (purl, _) in pairs {
-        if !purl.starts_with("pkg:npm/") {
+        if Ecosystem::from_purl(purl) != Some(Ecosystem::Npm) {
             continue;
         }
         // A preserved ledger can outlive its wiring (rollback --preserve-state).

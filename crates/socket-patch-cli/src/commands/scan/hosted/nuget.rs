@@ -10,7 +10,7 @@
 //! deleted: the remedy is prescribed, and the purl is withheld from the
 //! same-run VEX attestation.
 
-use socket_patch_core::crawlers::NuGetCrawler;
+use socket_patch_core::crawlers::{Ecosystem, NuGetCrawler};
 use socket_patch_core::patch::redirect::DepOverride;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::nuget_feed::{extracted_content_hash, stale_global_package_detail};
@@ -30,7 +30,7 @@ pub(super) async fn stale_install_warnings(
     // (purl, the patched package's NuGet content hash)
     let candidates: Vec<(&String, String)> = confirmed
         .iter()
-        .filter(|(purl, _)| purl.starts_with("pkg:nuget/"))
+        .filter(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Nuget))
         .filter_map(|(purl, uuid)| {
             let sha512 = overrides
                 .iter()

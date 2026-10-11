@@ -489,3 +489,164 @@ mod tests {
         assert!(opts.global_prefix.is_none());
     }
 }
+
+/// One map from purl type to ecosystem (#747): production code asks
+/// [`Ecosystem::from_purl`] instead of spelling `starts_with("pkg:<type>/")`.
+#[cfg(test)]
+mod purl_type_tests {
+    use super::Ecosystem;
+    use std::path::{Path, PathBuf};
+
+    /// Each former inline prefix and the ecosystem its caller now matches.
+    const PREFIXES: [(&str, Ecosystem); 9] = [
+        ("pkg:npm/", Ecosystem::Npm),
+        ("pkg:pypi/", Ecosystem::Pypi),
+        ("pkg:cargo/", Ecosystem::Cargo),
+        ("pkg:gem/", Ecosystem::Gem),
+        ("pkg:golang/", Ecosystem::Golang),
+        ("pkg:maven/", Ecosystem::Maven),
+        ("pkg:composer/", Ecosystem::Composer),
+        ("pkg:nuget/", Ecosystem::Nuget),
+        ("pkg:jsr/", Ecosystem::Deno),
+    ];
+
+    /// `from_purl(p) == Some(eco)` holds exactly when `p` starts with that
+    /// ecosystem's prefix, so every migrated check keeps its answer,
+    /// including on the near misses an inline prefix test also rejects.
+    #[test]
+    fn from_purl_matches_each_former_inline_prefix() {
+        let inputs = [
+            "pkg:npm/lodash@4.17.21",
+            "pkg:npm/@types/node@20.0.0",
+            "pkg:npm/",
+            "pkg:npm",
+            "pkg:NPM/lodash@1.0.0",
+            "pkg:npmx/a@1",
+            "npm/lodash@1",
+            " pkg:npm/a@1",
+            "pkg:pypi/requests@2.31.0?artifact_id=x.whl",
+            "pkg:pypi",
+            "pkg:PyPI/requests@2.31.0",
+            "pkg:cargo/serde@1.0.0",
+            "pkg:gem/rails@7.1.0?platform=x86_64-linux",
+            "pkg:golang/github.com/a/b@v1.0.0",
+            "pkg:golang",
+            "pkg:maven/org.a/b@1.0?classifier=c&ext=jar",
+            "pkg:maven:org.a/b@1.0",
+            "pkg:composer/vendor/pkg@1.0.0",
+            "pkg:nuget/Newtonsoft.Json@13.0.1",
+            "pkg:jsr/@std/path@1.0.0",
+            "pkg:deno/x@1",
+            "pkg:generic/x@1",
+            "",
+        ];
+        for purl in inputs {
+            for (prefix, eco) in PREFIXES {
+                assert_eq!(
+                    Ecosystem::from_purl(purl) == Some(eco),
+                    purl.starts_with(prefix),
+                    "{purl:?} against {prefix:?}"
+                );
+            }
+        }
+    }
+
+    /// Files that still spell a purl-type prefix inline, waiting on #747's
+    /// next slices. The guard is one-sided: it fails
+    /// only on a file outside this list, so a PR that migrates one of
+    /// these can't turn `main` red. Drop the entry when you migrate it.
+    const PENDING_INLINE_PREFIXES: &[&str] = &[
+        "cli/src/commands/agent_download.rs",
+        "cli/src/commands/get.rs",
+        "cli/src/commands/hosted_unwind.rs",
+        "cli/src/commands/rollback.rs",
+        "cli/src/commands/scan/hosted.rs",
+        "cli/src/commands/scan/hosted/python.rs",
+        "cli/src/commands/scan/hosted/takeover.rs",
+        "cli/src/commands/scan/mod.rs",
+        "cli/src/commands/scan/policy.rs",
+        "cli/src/commands/scan/vendor_flow.rs",
+        "cli/src/commands/vendor.rs",
+        "cli/src/commands/vex.rs",
+        "cli/src/ecosystem_dispatch.rs",
+        "core/src/api/client.rs",
+        "core/src/hosted/engine.rs",
+        "core/src/hosted/memory/stages.rs",
+        "core/src/hosted/takeover.rs",
+        "core/src/patch/apply.rs",
+        "core/src/patch/jvm_jar.rs",
+        "core/src/patch/rollback.rs",
+        "core/src/patch/store_copies.rs",
+        "core/src/utils/target.rs",
+    ];
+
+    /// The production part of a source file: everything before its first
+    /// in-file test module (a one-line `#[cfg(test)] mod x;` doesn't count).
+    fn production(text: &str) -> &str {
+        let marker =
+            regex::Regex::new(r"(?m)^#\[cfg\(test\)\]\n(?:pub(?:\(crate\))? )?mod \w+ \{").unwrap();
+        marker.find(text).map_or(text, |m| &text[..m.start()])
+    }
+
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn production_code_classifies_purls_through_from_purl() {
+        let inline = regex::Regex::new(r#"starts_with\("pkg:[A-Za-z0-9.+-]+/"\)"#).unwrap();
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut offenders = Vec::new();
+        for (krate, label) in [("socket-patch-core", "core"), ("socket-patch-cli", "cli")] {
+            let src = crates.join(krate).join("src");
+            // The CLI crate is absent from a packaged core crate.
+            if !src.is_dir() {
+                continue;
+            }
+            let mut files = Vec::new();
+            walk(&src, &mut files);
+            for path in files {
+                let rel = format!(
+                    "{label}/src/{}",
+                    path.strip_prefix(&src)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                );
+                // The type map itself, the purl parsers, and test-only files.
+                if rel == "core/src/crawlers/types.rs"
+                    || rel == "core/src/utils/purl.rs"
+                    || rel.ends_with("tests.rs")
+                    || rel.contains("test_support")
+                    || rel.contains("oracle")
+                {
+                    continue;
+                }
+                // Windows CI checks out with CRLF.
+                let text = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("\r\n", "\n");
+                if inline.is_match(production(&text))
+                    && !PENDING_INLINE_PREFIXES.contains(&rel.as_str())
+                {
+                    offenders.push(rel);
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "these files test a purl type with an inline \
+             `starts_with(\"pkg:<type>/\")`: {offenders:?}. Use \
+             `Ecosystem::from_purl(purl) == Some(Ecosystem::X)` \
+             (crates/socket-patch-core/src/crawlers/types.rs) instead."
+        );
+    }
+}

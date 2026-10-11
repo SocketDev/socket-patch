@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::crawlers::Ecosystem;
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::apply::{verify_file_patch, VerifyStatus};
 use crate::vendor::state::{lookup_entry, VendorEntry};
@@ -193,7 +194,7 @@ pub async fn applied_patches_with_copies(
         } else if let Some(copies) = vendor.and_then(|ctx| ctx.hosted.get(purl)) {
             verify_hosted_copies(purl, copies, record).await
         } else if let Some(paths) = package_copies.get(purl).filter(|p| !p.is_empty()) {
-            if purl.starts_with("pkg:maven/") {
+            if Ecosystem::from_purl(purl) == Some(Ecosystem::Maven) {
                 let mut first_failure = None;
                 for copy in paths {
                     if let Err(reason) = verify_patch_record_for(purl, copy, record).await {
@@ -234,7 +235,7 @@ pub async fn applied_patches_with_copies(
                     // build resolves the GAV from the committed repository
                     // only (exclusiveContent), so the cache copy is a
                     // pristine sibling the build never reads.
-                    let go_cache_copy = purl.starts_with("pkg:golang/");
+                    let go_cache_copy = Ecosystem::from_purl(purl) == Some(Ecosystem::Golang);
                     let installed = package_copies
                         .get(purl)
                         .filter(|_| !go_cache_copy)
