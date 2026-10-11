@@ -59,9 +59,6 @@ const VULNS: &[(&str, &[&str])] = &[(GHSA, &["CVE-2026-5151"])];
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-/// Probe corepack from a NEUTRAL temp dir (a `packageManager` field in an
-/// ancestor package.json — e.g. this monorepo root — otherwise makes corepack
-/// refuse a different manager).
 /// Set by the CI legs that run this suite: a missing corepack pnpm is then
 /// a failure, never a skip. Empty (the value on other legs) = unset. The
 /// tier-2 `RUSH_E2E` opt-in skip is not affected.
@@ -76,6 +73,9 @@ fn skip_missing_toolchain(msg: &str) {
     println!("SKIP {msg}");
 }
 
+/// Probe corepack from a NEUTRAL temp dir (a `packageManager` field in an
+/// ancestor package.json — e.g. this monorepo root — otherwise makes corepack
+/// refuse a different manager).
 fn has_corepack_pm(pm: &str) -> bool {
     let Ok(probe) = tempfile::tempdir() else {
         return false;

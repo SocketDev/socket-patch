@@ -93,10 +93,10 @@ const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 /// Marker prepended to the dep's entry point by the synthetic patch.
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const GHSA: &str = "GHSA-redirect-pnpm";
-/// Pinned pnpm majors via corepack — @10 is the required leg, the others are
-/// opportunistic (the vendor capstone's ladder convention). @7 and @8 are the
-/// legacy-lock legs: they emit lockfileVersion 5.4 / 6.0, proving the v5/v6
-/// rewrite installs for real.
+/// Pinned pnpm majors via corepack. Locally a leg whose major corepack can't
+/// provide skips; under `SOCKET_PATCH_PNPM_E2E_REQUIRED` (the Linux CI row)
+/// every leg is required. @7 and @8 are the legacy-lock legs: they emit
+/// lockfileVersion 5.4 / 6.0, proving the v5/v6 rewrite installs for real.
 const PNPM_PRIMARY: &str = "pnpm@10";
 const PNPM_SECONDARY: &str = "pnpm@9";
 const PNPM_TERTIARY: &str = "pnpm@11";
@@ -1146,7 +1146,7 @@ async fn pnpm_get_uuid_hosted_fresh_checkout_frozen_install() {
     assert_fixture_manifestless_vex(&fx, &fresh, "pnpm10 get-uuid");
 }
 
-/// Opportunistic pnpm@9 leg (the vendor capstone's secondary convention):
+/// pnpm@9 leg (the vendor capstone's secondary convention):
 /// same positive chain, no tamper twin needed — @10 already carries it.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]

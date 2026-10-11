@@ -108,9 +108,10 @@ fn socket_bin() -> PathBuf {
 }
 
 /// Set by the pinned-matrix workflow: a missing toolchain or a failed
-/// fixture install is then a failure, never a skip.
+/// fixture install is then a failure, never a skip. Empty = unset, as in the
+/// sibling suites (ci.yml's shared e2e step passes '' on other legs).
 fn pnpm_required() -> bool {
-    std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some()
+    std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some_and(|v| !v.is_empty())
 }
 
 /// `corepack <pm>`, or — in the pinned matrix — the provisioned pnpm

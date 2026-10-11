@@ -1259,7 +1259,7 @@ jobs:
           # inside the same suite runs in pnpm-compatibility.yml, hence the
           # skip. Node 24 (step below): the
           # corepack pnpm@10/11 legs require it.
-          - {os: ubuntu-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          - {os: ubuntu-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix', pnpm_required: '1'}
           # Real-uv hosted/vendored capstones ending in manifest-less VEX:
           # the oldest and newest line + the 0.5.x boundary (0.5.4 still
           # re-resolves a transitive override / rejects a repointed
@@ -1699,10 +1699,10 @@ jobs:
           # other real-toolchain capstone. All EMPTY on legs that do not set
           # the matching matrix key, which the suites treat as unset.
           SOCKET_PATCH_NPM_E2E_REQUIRED: ${{ matrix.npm_required || '' }}
-          # The pnpm-family suites' rows have no matrix key of their own, so
-          # match them by name. Linux only for now: the Windows and macOS
-          # rows (full tier) have not been checked against this gate yet.
-          SOCKET_PATCH_PNPM_E2E_REQUIRED: ${{ runner.os == 'Linux' && (matrix.suite == 'e2e_redirect_pnpm_build' || matrix.suite == 'e2e_safety_pnpm' || matrix.suite == 'e2e_redirect_rush_sim') && '1' || '' }}
+          # `pnpm_required` does the same for the pnpm-family suites
+          # (corepack pnpm / pnpm on PATH). Set on the Linux rows only; the
+          # Windows and macOS rows have not been checked against it yet.
+          SOCKET_PATCH_PNPM_E2E_REQUIRED: ${{ matrix.pnpm_required || '' }}
           SOCKET_PATCH_CARGO_E2E_REQUIRED: ${{ matrix.suite == 'e2e_safety_cargo_build' && '1' || '' }}
           SOCKET_PATCH_UV_E2E_REQUIRED: ${{ matrix.uv != '' && '1' || '' }}
           SOCKET_PATCH_UV_E2E_VERSION: ${{ matrix.uv }}
@@ -1833,8 +1833,10 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
           - os: ubuntu-latest
             suite: e2e_safety_pnpm
+            pnpm_required: '1'
           - os: ubuntu-latest
             suite: e2e_redirect_rush_sim
+            pnpm_required: '1'
           - os: ubuntu-latest
             suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.1.45'
