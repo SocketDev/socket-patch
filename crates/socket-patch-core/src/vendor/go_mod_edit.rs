@@ -171,7 +171,10 @@ pub async fn read_required_versions(project_root: &Path) -> Option<HashMap<Strin
 /// (the cross-owner case is `vendor` taking over an `apply` redirect). Returns
 /// whether the file changed. Errors (without writing) if `go.mod` is absent,
 /// or if a *user-authored* `replace` already pins the same `module`+`version`
-/// (a duplicate would make `go.mod` invalid).
+/// (a duplicate would make `go.mod` invalid), or if the `go.work` in effect
+/// would override, ignore or reject the replace
+/// ([`go_consumer_sync::workspace_conflict`](crate::vendor::go_consumer_sync::workspace_conflict):
+/// the build would link something other than the patched copy).
 pub async fn ensure_replace_entry(
     project_root: &Path,
     module: &str,
@@ -179,6 +182,22 @@ pub async fn ensure_replace_entry(
     base_rel: &str,
     dry_run: bool,
 ) -> Result<bool, String> {
+    let target = replace_target_path(base_rel, module, version);
+    if let Some(ours) = parse_replace_body(&format!("{module} {version} => {target}")) {
+        if let Some(conflict) = crate::vendor::go_consumer_sync::workspace_conflict(
+            project_root,
+            module,
+            version,
+            &ours,
+        )
+        .await
+        {
+            return Err(format!(
+                "refusing to write `replace {module} {version} => {target}` to go.mod: it {}",
+                conflict.consequence(module, version)
+            ));
+        }
+    }
     edit_go_mod(project_root, dry_run, |c| {
         upsert_replace_entry(c, module, version, base_rel)
     })
@@ -1674,6 +1693,53 @@ replace (
         .await
         .unwrap());
         assert!(read_replace_entries(dir.path()).await.is_empty());
+    }
+
+    /// #393 / #458 / #531: a replace the go.work in effect would override,
+    /// ignore or reject is refused, dry run included, and go.mod is left
+    /// as it was.
+    #[tokio::test]
+    async fn test_ensure_refuses_a_replace_go_work_defeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let root = ws.join("app");
+        let go_mod = "module example.com/app\n\ngo 1.21\n\nrequire example.com/m v1.0.0\n";
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("go.mod"), go_mod).unwrap();
+        std::fs::create_dir_all(ws.join("b")).unwrap();
+        std::fs::write(
+            ws.join("b/go.mod"),
+            "module example.com/b\n\nreplace example.com/m v1.0.0 => ./.socket/go-patches/example.com/m@v1.0.0\n",
+        )
+        .unwrap();
+        for (work, says) in [
+            (
+                "use ./app\n\nreplace example.com/m => ../fork\n",
+                "go.work replaces",
+            ),
+            ("use ./b\n", "does not `use` this module"),
+            ("use (\n\t./app\n\t./b\n)\n", "conflicting replacements"),
+        ] {
+            std::fs::write(ws.join("go.work"), format!("go 1.21\n\n{work}")).unwrap();
+            for dry_run in [true, false] {
+                let err =
+                    ensure_replace_entry(&root, "example.com/m", "v1.0.0", GO_PATCHES_DIR, dry_run)
+                        .await
+                        .expect_err(work);
+                assert!(err.contains(says), "{err}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("go.mod")).unwrap(),
+                go_mod
+            );
+        }
+        // A workspace that uses the module and nothing else in the way.
+        std::fs::write(ws.join("go.work"), "go 1.21\n\nuse ./app\n").unwrap();
+        assert!(
+            ensure_replace_entry(&root, "example.com/m", "v1.0.0", GO_PATCHES_DIR, false)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
