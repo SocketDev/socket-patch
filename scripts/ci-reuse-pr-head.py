@@ -6,6 +6,7 @@ re-tests every entry on top of the latest main before it lands. Merging main
 into a PR branch therefore re-runs the whole PR tier on a diff that already
 passed. This reports `unchanged=true` only when all of these hold:
 
+- the PR targets main, the only branch with a merge queue;
 - the PR head is a two-parent merge commit;
 - the PR's own diff (merge-base with the base branch to head) is the same,
   hunk for hunk, as the diff of its first parent, the previous head;
@@ -22,7 +23,6 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from urllib.parse import quote
 
 # The compare API lists at most 300 files and leaves out the patch of a
 # binary or very large file. Either way the diff cannot be proven unchanged.
@@ -69,28 +69,29 @@ def passed_run(runs, jobs_of, head_sha, head_repository):
 
 
 def reusable_run(env):
-    if env.get("GITHUB_EVENT_NAME") != "pull_request":
+    # Only main has a merge queue to re-test the PR before it lands.
+    if env.get("GITHUB_EVENT_NAME") != "pull_request" or env.get("PR_BASE_REF") != "main":
         return None
     try:
-        repository = env["GITHUB_REPOSITORY"]
-        head, base = env["PR_HEAD_SHA"], env["PR_BASE_REF"]
+        repository, head = env["GITHUB_REPOSITORY"], env["PR_HEAD_SHA"]
         head_repository = env["PR_HEAD_REPOSITORY"]
         parents = api(f"repos/{repository}/commits/{head}")["parents"]
         if len(parents) != 2:
             return None
         previous = parents[0]["sha"]
-        # Three-dot compares diff from the merge-base, which is what the PR
-        # shows. per_page=1 keeps the commit list short; files stay complete.
-        branch = quote(base, safe="")
-        now = diff_signature(api(f"repos/{repository}/compare/{branch}...{head}?per_page=1"))
-        before = diff_signature(api(f"repos/{repository}/compare/{branch}...{previous}?per_page=1"))
-        if now is None or now != before:
-            return None
+        # The cheap evidence first: most merge pushes follow a cancelled run.
         runs = api(f"repos/{repository}/actions/workflows/ci.yml/runs"
                    f"?event=pull_request&head_sha={previous}&per_page=20")
-        return passed_run(runs, lambda run_id: api(
+        run = passed_run(runs, lambda run_id: api(
             f"repos/{repository}/actions/runs/{run_id}/jobs?filter=latest&per_page=100"),
             previous, head_repository)
+        if run is None:
+            return None
+        # Three-dot compares diff from the merge-base, which is what the PR
+        # shows. per_page=1 keeps the commit list short; files stay complete.
+        now = diff_signature(api(f"repos/{repository}/compare/main...{head}?per_page=1"))
+        before = diff_signature(api(f"repos/{repository}/compare/main...{previous}?per_page=1"))
+        return run if now is not None and now == before else None
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError,
             AttributeError, IndexError) as error:
         # Do not print response bodies or stderr, which may contain credentials.

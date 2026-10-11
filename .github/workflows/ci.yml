@@ -75,8 +75,9 @@ concurrency:
 # MERGE-MAIN REUSE: a pull_request push that only merged the base branch,
 # with the PR's own diff unchanged and the previous head green
 # (scripts/ci-reuse-pr-head.py, run by clippy), runs only clippy, the cheap
-# preflight jobs and hosted-e2e. The merge queue re-tests the PR on the
-# latest main before it lands.
+# preflight jobs, test-release and hosted-e2e. The merge queue re-tests the
+# PR on the latest main before it lands; PRs into other branches and the
+# release/v5-prerelease PR never reuse.
 jobs:
   # Required independently of ci-ok so the merge queue sees a compile/lint
   # failure immediately. Expensive jobs also depend on this preflight.
@@ -108,10 +109,12 @@ jobs:
       # A PR push that only merged the base branch, with the PR's own diff
       # unchanged and the previous head green, skips the test jobs: the
       # merge queue re-tests every entry on the latest main anyway (#1373).
-      # This job and hosted-e2e still run.
+      # This job and hosted-e2e still run. Only PRs into main (the only
+      # queue), and never the v5 integration PR, whose full tier the queue
+      # does not run.
       - name: Check for an unchanged PR diff
         id: pr-head
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref != 'release/v5-prerelease'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -508,8 +511,9 @@ jobs:
 
   test-release:
     # Each PR and main push runs the complete release-mode suite. The merge
-    # queue already skips this job because each constituent PR ran it.
-    if: ((github.event.pull_request.draft != true && github.event_name != 'merge_group') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.clippy.outputs.pr_unchanged != 'true'
+    # queue already skips this job because each constituent PR ran it, so
+    # an unchanged merge-main PR push (pr_unchanged) still runs it too.
+    if: (github.event.pull_request.draft != true && github.event_name != 'merge_group') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     strategy:

@@ -96,7 +96,10 @@ class PrHeadReuse(unittest.TestCase):
                 run, _ = self.reuse_with(runs=[dict(self.pr_run, **change)])
                 self.assertIsNone(run)
         with self.subTest("no run"):
-            self.assertIsNone(self.reuse_with(runs=[])[0])
+            run, calls = self.reuse_with(runs=[])
+            self.assertIsNone(run)
+            # No green previous run: the large compare payloads are never fetched.
+            self.assertFalse(any("/compare/" in call for call in calls))
         # A draft run passes with every job skipped; it tested nothing.
         for jobs in ([{"name": "clippy", "conclusion": "skipped"},
                       {"name": "ci-ok", "conclusion": "success"}],
@@ -105,10 +108,14 @@ class PrHeadReuse(unittest.TestCase):
             with self.subTest(jobs=jobs):
                 self.assertIsNone(self.reuse_with(jobs=jobs)[0])
 
-    def test_other_events_never_query_or_skip(self):
-        for event in ("push", "merge_group", "schedule", "workflow_dispatch"):
-            with self.subTest(event=event), patch.object(reuse.subprocess, "run") as call:
-                self.assertIsNone(reuse.reusable_run(dict(self.env, GITHUB_EVENT_NAME=event)))
+    def test_other_events_and_bases_never_query_or_skip(self):
+        # Only main has a merge queue to re-test the PR before it lands.
+        changes = [{"GITHUB_EVENT_NAME": e} for e in
+                   ("push", "merge_group", "schedule", "workflow_dispatch")]
+        changes += [{"PR_BASE_REF": b} for b in ("release/v5-prerelease", "v4", "")]
+        for change in changes:
+            with self.subTest(change=change), patch.object(reuse.subprocess, "run") as call:
+                self.assertIsNone(reuse.reusable_run(dict(self.env, **change)))
                 call.assert_not_called()
 
     def test_api_failure_timeout_and_bad_payload_run_everything(self):
@@ -121,7 +128,8 @@ class PrHeadReuse(unittest.TestCase):
                     subprocess.CompletedProcess([], 0, stdout=text)):
                 self.assertIsNone(reuse.reusable_run(self.env))
         with self.subTest("missing env"), patch.object(reuse.subprocess, "run") as call:
-            self.assertIsNone(reuse.reusable_run({"GITHUB_EVENT_NAME": "pull_request"}))
+            self.assertIsNone(reuse.reusable_run({"GITHUB_EVENT_NAME": "pull_request",
+                                                  "PR_BASE_REF": "main"}))
             call.assert_not_called()
 
     def test_main_writes_the_output(self):
