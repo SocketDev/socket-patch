@@ -7,16 +7,16 @@ in-place application. The [README](../README.md) describes the user workflow; th
 
 ## Build
 
-Use Rust's stable toolchain and Cargo from the repository root:
+Use rustup and Cargo from the repository root. `rust-toolchain.toml` selects the
+required toolchain:
 
 ```sh
 cargo build --locked -p socket-patch-cli
 ./target/debug/socket-patch --help
 ```
 
-`Cargo.toml` is the source of the binary's version. The v5 prerelease branch can
-still carry the previous version until the release bump; use a binary built from
-this checkout when verifying branch behavior.
+`Cargo.toml` defines the binary's version. Use the binary built from this checkout
+when verifying branch behavior.
 
 The workspace's `.cargo/config.toml` disables persisted Socket login and passive
 update checks for Cargo runs. This keeps tests independent of a developer's account.

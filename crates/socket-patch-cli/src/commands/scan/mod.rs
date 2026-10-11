@@ -100,11 +100,6 @@ const DEFAULT_PROXY_BATCH_SIZE: usize = 100;
 /// fits, whichever endpoint the chunks were sized for.
 const BATCH_BODY_BYTE_CAP: usize = 256 * 1024;
 
-/// The chunk size in effect: `--batch-size` / `SOCKET_BATCH_SIZE` when
-/// given (on either endpoint), else [`DEFAULT_BATCH_SIZE`] on the
-/// authenticated API and [`DEFAULT_PROXY_BATCH_SIZE`] on the public proxy.
-/// Floored at 1: `--batch-size 0` is otherwise unvalidated and would make
-/// the chunking below panic, so it degrades to one-package batches.
 /// `purls` plus, for each lockfile-only PyPI purl among them, its other
 /// PEP 440 spellings of the same release (#604), deduplicated in order.
 fn with_pypi_equivalents(purls: &[String], lockfile_only: &HashSet<PurlKey>) -> Vec<String> {
@@ -152,6 +147,7 @@ fn adopt_pypi_equivalents(
     }
 }
 
+/// Use the endpoint's default batch size unless overridden; zero means one.
 fn effective_batch_size(requested: Option<usize>, use_public_proxy: bool) -> usize {
     requested
         .unwrap_or(if use_public_proxy {
@@ -212,8 +208,8 @@ pub enum ScanMode {
     /// hosted patch server: no artifact bytes land in the repo, but
     /// installs must reach the patch server
     Hosted,
-    /// Commit patched artifacts to `.socket/vendor/`: hermetic,
-    /// offline-safe installs at the cost of repo size
+    /// Commit patched artifacts to `.socket/vendor/`; other dependencies
+    /// still need their normal registry or cache
     Vendored,
     /// Record patches in `.socket/manifest.json` plus blobs and re-apply
     /// them in place (e.g. from CI): smallest repo footprint, but every
@@ -298,8 +294,10 @@ fn foreign_mode_conflict(args: &ScanArgs) -> Option<String> {
 
 #[derive(Args, Clone)]
 pub struct ScanArgs {
-    /// Only scan these directories. In hosted and vendored mode each PATH
-    /// (or glob, e.g. `apps/*`) is a project directory, scanned on its own
+    /// Scan these project directories, or installed-package paths in agent mode.
+    ///
+    /// In hosted and vendored mode each PATH (or glob, e.g. `apps/*`) is a
+    /// project directory, scanned on its own
     /// as if it were `--cwd`. In agent mode PATHs are globs over installed
     /// package paths (a bare directory scopes its whole subtree; `--prune`
     /// still considers the whole project, and lockfile-only packages are
@@ -330,9 +328,9 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
-    /// How discovered patches are consumed [default: the mode the
-    /// project's patch state already records, else hosted]. Switching an
-    /// existing vendored or agent-mode project to another mode needs this
+    /// Patch mode [default: the project's existing mode, else hosted].
+    ///
+    /// Switching an existing vendored or agent-mode project needs this
     /// flag. A `--prune` or `--global` scan with no mode only reports
     // `--sync` also selects agent; combining it with a different `--mode`
     // is rejected in `resolve_mode_flags`.
@@ -353,10 +351,10 @@ pub struct ScanArgs {
     )]
     pub all_releases: bool,
 
-    /// Only scan these packages: a name (`lodash`, `@scope/pkg`,
-    /// `requests`), or a purl with or without its version
-    /// (`pkg:npm/lodash`, `pkg:pypi/requests@2.31.0`). Repeat the flag or
-    /// separate with commas
+    /// Select package names or PURLs (repeat or separate with commas).
+    ///
+    /// Accepts names (`lodash`, `@scope/pkg`, `requests`) and PURLs with or
+    /// without a version (`pkg:npm/lodash`, `pkg:pypi/requests@2.31.0`).
     #[arg(long = "package", env = "SOCKET_SCAN_PACKAGES", value_delimiter = ',')]
     pub packages: Vec<String>,
 

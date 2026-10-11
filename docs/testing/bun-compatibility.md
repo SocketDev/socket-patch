@@ -60,7 +60,7 @@ holds an npm purl. A refused project marks every npm result `failed` with the
 vendor code + detail, fetches nothing and records no patch: the `scan` /
 `get <purl>` path writes nothing under `.socket/` (vendored mode is
 manifest-free — a `.socket/manifest.json` seeded for another purl is left
-byte-untouched) and exits `partial_failure` / 1; `get <uuid> --mode vendored`
+byte-untouched) and exits `partialFailure` / 1; `get <uuid> --mode vendored`
 exits 1 with `status: "error"` and `error: {code, message}`, likewise without
 creating `.socket/`. `--silent` keeps the
 code-tagged refusal on stderr; `--dry-run` previews it as the additive
@@ -298,16 +298,12 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   frozen install never writes). The 3-tuple comes back as the 2-tuple
   `["name@<url|path>", {meta}]`, spec and meta intact; 1.3.10, 1.3.14 and
   1.4.2 keep the digest. The CLI recognises that spelling as its own wiring:
-  the repeat hosted run heals it (`redirected: 1`, no
-  `redirect_bun_entry_not_found`), the vendored re-run stays `already_vendored` and re-pins the
+  the repeat hosted run heals it, the vendored re-run stays `already_vendored` and re-pins the
   digest on disk, `repair` rebuilds through it, and `rollback` / scoped
   `rollback` / `remove` / `vendor --revert` / both takeovers accept the
   digest-less spelling of a recorded line and restore the registry original
-  over it. Before the fix every one of those refused after any lock re-save
-  on those releases (`redirect_bun_entry_not_found` beside `redirected: 1`,
-  `rollback` → `partial_failure`, `vendor_lock_entry_not_found` /
-  `vendor_lock_entry_drifted`); the `already-vendored-workspace` matrix
-  shape on 1.2.0–1.3.9 is the regression guard.
+  over it. The `already-vendored-workspace` matrix shape on 1.2.0–1.3.9
+  checks this behavior.
 - **Both lockfiles present.** Modern Bun prefers text `bun.lock` over
   `bun.lockb`. The CLI follows the selected lock format; native binary writes
   never create a sibling text lock.

@@ -72,6 +72,12 @@ concurrency:
 # runs (test-release, e2e-full, yarn-berry-full, cargo-vex-matrix-full) and
 # hosted-e2e still run. API errors, missing evidence and direct pushes run
 # everything.
+# MERGE-MAIN REUSE: a pull_request push that only merged the base branch,
+# with the PR's own diff unchanged and the previous head green
+# (scripts/ci-reuse-pr-head.py, run by clippy), runs only clippy, the cheap
+# preflight jobs, test-release and hosted-e2e. The merge queue re-tests the
+# PR on the latest main before it lands; PRs into other branches and the
+# release/v5-prerelease PR never reuse.
 jobs:
   # Required independently of ci-ok so the merge queue sees a compile/lint
   # failure immediately. Expensive jobs also depend on this preflight.
@@ -84,6 +90,7 @@ jobs:
       actions: read
     outputs:
       reuse: ${{ steps.merge-queue.outputs.reuse }}
+      pr_unchanged: ${{ steps.pr-head.outputs.unchanged }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -98,6 +105,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci-reuse-merge-group.py
+
+      # A PR push that only merged the base branch, with the PR's own diff
+      # unchanged and the previous head green, skips the test jobs: the
+      # merge queue re-tests every entry on the latest main anyway (#1373).
+      # This job and hosted-e2e still run. Only PRs into main (the only
+      # queue), and never the v5 integration PR, whose full tier the queue
+      # does not run.
+      - name: Check for an unchanged PR diff
+        id: pr-head
+        if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref != 'release/v5-prerelease'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: python3 scripts/ci-reuse-pr-head.py
 
       - name: Install Rust
         # rustup is pre-installed on GitHub-hosted runners. `toolchain
@@ -133,7 +156,7 @@ jobs:
   # The napi addon is only ever loaded by Node, so cargo's own tests never
   # exercise its JS loader or the engine/provider boundary.
   node-addon:
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && needs.clippy.outputs.pr_unchanged != 'true'
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
@@ -299,7 +322,7 @@ jobs:
           bash scripts/release-lint.sh --sync-only
 
   test:
-    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.clippy.outputs.pr_unchanged != 'true'
     needs: clippy
     # No ubuntu-latest leg: `coverage` runs this same `cargo test
     # --workspace` (debug, default features, plus Go and vexctl) on ubuntu,
@@ -488,7 +511,8 @@ jobs:
 
   test-release:
     # Each PR and main push runs the complete release-mode suite. The merge
-    # queue already skips this job because each constituent PR ran it.
+    # queue already skips this job because each constituent PR ran it, so
+    # an unchanged merge-main PR push (pr_unchanged) still runs it too.
     if: (github.event.pull_request.draft != true && github.event_name != 'merge_group') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
@@ -535,7 +559,7 @@ jobs:
         run: python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" --locked --profile ci-release
 
   coverage:
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && needs.clippy.outputs.pr_unchanged != 'true'
     needs: clippy
     # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
     # Reports as a markdown table in the job summary and uploads the raw
@@ -662,7 +686,7 @@ jobs:
   # Dockerfile.base compiles the full-LTO release binary inside Docker, with
   # no cache. Build it once per run and hand the image to every docker leg.
   docker-base:
-    if: (github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')
+    if: ((github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')) && needs.clippy.outputs.pr_unchanged != 'true'
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     timeout-minutes: 30
@@ -952,7 +976,7 @@ jobs:
   # test binaries directly from the same checkout path, so `CARGO_BIN_EXE_*`
   # and `CARGO_MANIFEST_DIR` resolve as they did under `cargo test`.
   e2e-build:
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && needs.clippy.outputs.pr_unchanged != 'true'
     needs: clippy
     outputs:
       reuse: ${{ needs.clippy.outputs.reuse }}
@@ -1053,7 +1077,7 @@ jobs:
     # Builds the Windows test binaries for e2e-windows and
     # cargo-vex-matrix-windows. The lean merge queue runs
     # windows-compile-check instead.
-    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.clippy.outputs.pr_unchanged != 'true'
     needs: clippy
     outputs:
       reuse: ${{ needs.clippy.outputs.reuse }}
@@ -1323,11 +1347,13 @@ jobs:
           persist-credentials: false
 
       - name: Download the e2e binaries
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # Re-downloads once if the archive arrives truncated.
+        uses: ./.github/actions/download-artifact
         with:
           pattern: e2e-bin-${{ matrix.os }}*
           merge-multiple: true
           path: target/e2e-archive
+          verify: zstd -q -t target/e2e-archive/e2e-bin.tar.zst
 
       - name: Unpack the e2e binaries
         shell: bash
@@ -2148,7 +2174,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy preflight.
-    if: github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true'
+    if: (github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true') && needs.clippy.outputs.pr_unchanged != 'true'
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 40
@@ -2192,7 +2218,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy preflight.
-    if: github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true'
+    if: (github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true') && needs.clippy.outputs.pr_unchanged != 'true'
     needs: clippy
     strategy:
       fail-fast: false
@@ -2296,11 +2322,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Download the e2e binaries
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # Re-downloads once if the archive arrives truncated.
+        uses: ./.github/actions/download-artifact
         with:
           pattern: e2e-bin-${{ matrix.os }}*
           merge-multiple: true
           path: target/e2e-archive
+          verify: zstd -q -t target/e2e-archive/e2e-bin.tar.zst
       - name: Unpack the e2e binaries
         shell: bash
         # Decompress to a file, not into `| tar -xf -`: a tar that exits at
@@ -2429,7 +2457,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy preflight.
-    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.clippy.outputs.pr_unchanged != 'true'
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30

@@ -105,8 +105,9 @@ class Scheduling(unittest.TestCase):
         self.assertNotIn("upload-artifact", body)
         self.assertNotIn("--no-run", body)
         build = next(line for line in JOBS["e2e-build-windows"] if line.startswith("    if:"))
-        self.assertEqual(build, "    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full'"
-                                " || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')")
+        self.assertEqual(build, "    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full'"
+                                " || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'))"
+                                " && needs.clippy.outputs.pr_unchanged != 'true'")
 
     def test_reused_push_keeps_cache_writers_and_unqueued_jobs(self):
         # A push whose SHA passed the merge queue still compiles (main is the
@@ -140,6 +141,39 @@ class Scheduling(unittest.TestCase):
         self.assertIn("actions: read", clippy)
         self.assertIn("reuse: ${{ steps.merge-queue.outputs.reuse }}", clippy)
         self.assertIn("python3 scripts/ci-reuse-merge-group.py", clippy)
+
+    def test_unchanged_pr_merge_skips_only_what_the_queue_re_tests(self):
+        # A PR push that only merged main keeps clippy and the cheap preflight
+        # jobs; everything that builds or tests skips, directly or through
+        # e2e-build, because the merge queue runs it again on the latest
+        # main. test-release is not in the queue and hosted-e2e is never
+        # scoped, so both still run.
+        gated = {"node-addon", "test", "coverage", "docker-base", "e2e-build",
+                 "e2e-build-windows", "yarn-classic-matrix", "yarn-berry-e2e",
+                 "cargo-old-toolchains"}
+        never_on_pr = "    if: (github.event_name != 'pull_request'"
+        v5_pr_only = ("    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group')"
+                      " || github.head_ref == 'release/v5-prerelease'")
+        for job in JOBS:
+            condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
+            with self.subTest(job=job):
+                self.assertEqual("needs.clippy.outputs.pr_unchanged != 'true'" in condition,
+                                 job in gated)
+                if job in gated:
+                    self.assertTrue(condition.endswith(") && needs.clippy.outputs.pr_unchanged != 'true'"))
+        pr_tier = {job for job in JOBS if "clippy" in ancestors(job)}
+        for job in sorted(pr_tier - gated - {"hosted-e2e", "test-release"}):
+            condition = next(line for line in JOBS[job] if line.startswith("    if:"))
+            with self.subTest(job=job):
+                # Ungated jobs wait on a gated build, never run on a PR, or run
+                # only on the v5 integration PR, which never reuses (below).
+                self.assertTrue(ancestors(job) & gated or condition.startswith(never_on_pr)
+                                and (condition == v5_pr_only or "head_ref" not in condition), job)
+        clippy = "\n".join(JOBS["clippy"])
+        self.assertIn("pr_unchanged: ${{ steps.pr-head.outputs.unchanged }}", clippy)
+        self.assertIn("python3 scripts/ci-reuse-pr-head.py", clippy)
+        self.assertIn("if: github.event_name == 'pull_request' && github.base_ref == 'main'"
+                      " && github.head_ref != 'release/v5-prerelease'", clippy)
 
     def test_row_reader_preserves_both_os_siblings(self):
         jobs = reader.jobs("""jobs:
