@@ -171,10 +171,13 @@ pub async fn recover_lock_entry(
                     }
                 }
             }
-            if entry
-                .wiring
-                .iter()
-                .any(|wiring| wiring.kind == "python_lock_document")
+            // A Pipenv entry's pylock records (#1368) ride beside its own
+            // Pipfile.lock fragment, which the fallback below still reads.
+            if entry.flavor.as_deref() != Some("pipenv")
+                && entry
+                    .wiring
+                    .iter()
+                    .any(|wiring| wiring.kind == "python_lock_document")
             {
                 return Err("the pre-vendor Python lock has no hash-pinned pure wheel for this package; reinstall it before repair".to_string());
             }

@@ -410,6 +410,36 @@ async fn recover_pypi_urlless_locks_report_no_fetchable_url() {
         .unwrap_err();
     assert!(err.contains("no sha256 digests"), "pipenv: {err}");
 
+    // #1368: a Pipenv entry also records the pylock wired beside its
+    // Pipfile.lock. A pylock entry with no hash-pinned wheel must not hide
+    // the Pipfile.lock fragment's digest set.
+    let mut with_pylock = entry(
+        "pypi",
+        "pkg:pypi/six@1.16.0",
+        vec![
+            rec(
+                "pipenv_lock_entry",
+                serde_json::json!({
+                    "hashes": [format!("sha256:{}", "a".repeat(64))],
+                    "version": "==1.16.0",
+                }),
+            ),
+            rec(
+                "python_lock_document",
+                serde_json::json!(
+                    "lock-version = \"1.0\"\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n"
+                ),
+            ),
+        ],
+    );
+    with_pylock.flavor = Some("pipenv".into());
+    let recovered = recover_lock_entry(tmp.path(), &with_pylock).await.unwrap();
+    assert_eq!(
+        recovered.integrity,
+        LockIntegrity::Sha256AnyOf(vec!["a".repeat(64)]),
+        "the Pipfile.lock digest set"
+    );
+
     // A ledger with no pypi fragment at all is still a hard error.
     let bare = entry("pypi", "pkg:pypi/six@1.16.0", vec![]);
     assert!(recover_lock_entry(tmp.path(), &bare).await.is_err());
