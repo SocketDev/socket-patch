@@ -1296,6 +1296,30 @@ them (that needs the go toolchain and the whole module graph); `apply`, `vendor`
 | --- | --- | --- |
 | `go_vendor_modules_txt_out_of_sync` | A committed `vendor/` directory (`go mod vendor`; `go work vendor` for a workspace) whose `vendor/modules.txt` does not record a socket `replace`, or still records one that was removed. go builds with `-mod=vendor` and fails with "inconsistent vendoring" | `go mod vendor` (or `go work vendor`), then commit `vendor/` |
 | `go_requirements_out_of_sync` | The patched module's own `go.mod` requires a dependency at a version above the one the project's `go.mod` lists (agent and vendored modes; `apply` also reports a requirement the patch added). The default `-mod=readonly` build fails with "updates to go.mod needed" or "missing go.sum entry" | `go mod tidy`, then commit `go.mod` and `go.sum` |
+
+### Go workspaces (go.work)
+
+In workspace mode go reads `replace` directives from `go.work` and from the
+`go.mod` of each module it `use`s. socket-patch writes its `replace` into the
+project's own `go.mod`, so it first checks the `go.work` go would use (`GOWORK`,
+else the nearest `go.work` at or above the project). A project `go.mod` replace
+does nothing, or breaks the build, when:
+
+- `go.work` replaces the same module itself (any version). A go.work replace
+  overrides every module's, so the build links the go.work target;
+- `go.work` doesn't `use` the project, so workspace builds ignore its `go.mod`;
+- another `use` member already replaces the same `module@version` with a
+  different target, so go refuses the workspace ("conflicting replacements").
+  A hosted replace names the same Socket module in every member and doesn't
+  conflict.
+
+`apply` and `vendor` refuse to write such a replace and say which case applies.
+A replace written before the `go.work` changed is reported as
+`go_workspace_replace_ineffective` by `apply`, `vendor` and
+`scan --mode hosted`, fails `apply --check` and `vendor --check`, and `vex`
+leaves the patch out (`go_workspace_override`). To patch the whole workspace,
+apply in one member it uses, or move the Socket `replace` into `go.work`.
+
 Paid hosted Go references are unsupported: embedding credentials in module paths
 would expose them to module proxies and change module identity. Use vendored mode
 for those patches; the CLI reports `redirect_golang_unsupported` when the required
