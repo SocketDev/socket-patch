@@ -271,6 +271,42 @@ class GradleRows(unittest.TestCase):
         self.assertIn("gradle-probe", text)
 
 
+class PnpmRequiredGate(unittest.TestCase):
+    """The pnpm-family suites soft-skip when pnpm is missing, and libtest
+    counts a skip as `ok`, so their Linux rows must set the fail-instead-of-
+    skip gate (#1054). The gate matches rows by exact `suite` name."""
+
+    suites = ("e2e_redirect_pnpm_build", "e2e_safety_pnpm", "e2e_redirect_rush_sim")
+    jobs = ("e2e", "e2e-full", "e2e-extended", "e2e-windows", "e2e-macos")
+
+    def test_run_step_gates_every_pnpm_suite_on_linux(self):
+        run = dict(rows_mod.steps(JOBS["e2e"]))["Run e2e tests"]
+        names = " || ".join(f"matrix.suite == '{s}'" for s in self.suites)
+        self.assertIn(f"SOCKET_PATCH_PNPM_E2E_REQUIRED: ${{{{ runner.os == 'Linux' && ({names}) && '1' || '' }}}}",
+                      run)
+
+    def test_every_pnpm_row_is_matched_exactly(self):
+        seen = set()
+        for job in self.jobs:
+            for row in rows(job):
+                listed = set(row["suite"].split()) & set(self.suites)
+                if listed:
+                    with self.subTest(job=job, row=row):
+                        self.assertEqual(row["suite"], next(iter(listed)),
+                                         "a multi-suite row would miss the gate's exact match")
+                    seen |= listed
+        self.assertTrue({"e2e_redirect_pnpm_build"} <= {s for r in rows("e2e") for s in r["suite"].split()},
+                        "the PR tier must keep its gated pnpm row")
+        self.assertEqual(seen, set(self.suites))
+
+    def test_every_gated_suite_honours_the_gate(self):
+        for suite in self.suites:
+            with self.subTest(suite=suite):
+                src = (TESTS / f"{suite}.rs").read_text(encoding="utf-8")
+                # Empty means unset: the step passes '' on every other leg.
+                self.assertIn('var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some_and(|v| !v.is_empty())', src)
+
+
 class PdmCapstone(unittest.TestCase):
     job = rows_mod.jobs(PDM.read_text(encoding="utf-8"))["capstone"]
 

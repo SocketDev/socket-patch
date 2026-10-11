@@ -1699,6 +1699,10 @@ jobs:
           # other real-toolchain capstone. All EMPTY on legs that do not set
           # the matching matrix key, which the suites treat as unset.
           SOCKET_PATCH_NPM_E2E_REQUIRED: ${{ matrix.npm_required || '' }}
+          # The pnpm-family suites' rows have no matrix key of their own, so
+          # match them by name. Linux only for now: the Windows and macOS
+          # rows (full tier) have not been checked against this gate yet.
+          SOCKET_PATCH_PNPM_E2E_REQUIRED: ${{ runner.os == 'Linux' && (matrix.suite == 'e2e_redirect_pnpm_build' || matrix.suite == 'e2e_safety_pnpm' || matrix.suite == 'e2e_redirect_rush_sim') && '1' || '' }}
           SOCKET_PATCH_CARGO_E2E_REQUIRED: ${{ matrix.suite == 'e2e_safety_cargo_build' && '1' || '' }}
           SOCKET_PATCH_UV_E2E_REQUIRED: ${{ matrix.uv != '' && '1' || '' }}
           SOCKET_PATCH_UV_E2E_VERSION: ${{ matrix.uv }}

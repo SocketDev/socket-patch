@@ -130,6 +130,13 @@ fn pnpm_command(pm: &str) -> Command {
     }
 }
 
+/// Set by every CI leg that runs this suite: a missing toolchain or a
+/// failed fixture install is then a failure, never a skip. The workflow
+/// passes an EMPTY value on legs that run other suites, so empty = unset.
+fn pnpm_required() -> bool {
+    std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some_and(|v| !v.is_empty())
+}
+
 fn has_corepack_pm(pm: &str) -> bool {
     let probe = tempfile::tempdir().unwrap();
     let mut cmd = pnpm_command(pm);
@@ -138,13 +145,16 @@ fn has_corepack_pm(pm: &str) -> bool {
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     let output = cmd.output();
     let ok = output.as_ref().is_ok_and(|o| o.status.success());
-    if std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some() {
+    if pnpm_required() {
         assert!(ok, "required pnpm toolchain unavailable: {output:?}");
         if let Ok(output) = output {
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout).trim(),
-                pm.strip_prefix("pnpm@").unwrap(),
-                "matrix must run the pinned version"
+            // An exact pin (the pinned matrix) must match exactly; a bare
+            // major (`pnpm@10`, the e2e legs) must resolve inside it.
+            let got = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let want = pm.strip_prefix("pnpm@").unwrap();
+            assert!(
+                got == want || got.starts_with(&format!("{want}.")),
+                "matrix must run the pinned version: want {want}, got {got}"
             );
         }
     }
@@ -523,7 +533,7 @@ async fn redirect_scanned_pnpm_project(
     );
     if !install.status.success() {
         assert!(
-            std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_none(),
+            !pnpm_required(),
             "required {pm} fixture install failed: {:?}",
             install
         );
