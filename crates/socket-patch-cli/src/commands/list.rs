@@ -346,21 +346,10 @@ pub async fn run(args: ListArgs) -> i32 {
     let manifest = match &loaded.manifest {
         Ok(manifest) => manifest.as_ref(),
         Err(e) => {
-            // `InvalidData` (bad JSON or schema) is the contract's
-            // `manifest_invalid`; everything else is `manifest_unreadable`
-            // (see CLI_CONTRACT.md error-code table). Ledger records never
-            // mask either: a present-but-broken manifest is an error state.
-            let code = if e.kind() == std::io::ErrorKind::InvalidData {
-                "manifest_invalid"
-            } else {
-                "manifest_unreadable"
-            };
-            emit_error(
-                &args,
-                code,
-                crate::ui::manifest_error_message(&manifest_path, e),
-                Vec::new(),
-            );
+            // Ledger records never mask a present-but-broken manifest: it
+            // is an error state.
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, e);
+            emit_error(&args, &err.code, err.message, Vec::new());
             return 1;
         }
     };

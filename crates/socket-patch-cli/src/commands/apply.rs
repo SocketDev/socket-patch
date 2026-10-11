@@ -291,7 +291,16 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         // it vanished since (TOCTOU) → nothing to verify. An `Err` means it exists
         // but is unreadable/corrupt: fail-closed (report drift) rather than
         // silently passing — the guard treats exit 0 as "in sync".
-        Ok(None) => return 0,
+        Ok(None) => {
+            // Same answer as the no-manifest exit in `run`.
+            if args.common.json {
+                let mut env = Envelope::new(Command::Apply);
+                env.status = Status::NoManifest;
+                env.dry_run = args.common.dry_run;
+                println!("{}", env.to_pretty_json());
+            }
+            return 0;
+        }
         Err(e) => {
             let msg = format!(
                 "Patch check could not read the manifest ({e}); \
@@ -299,7 +308,10 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             );
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
-                env.mark_error(EnvelopeError::new("manifest_unreadable", msg));
+                env.dry_run = args.common.dry_run;
+                let mut err = crate::json_envelope::manifest_load_error(manifest_path, &e);
+                err.message = msg;
+                env.mark_error(err);
                 println!("{}", env.to_pretty_json());
             } else {
                 // Errors print even under --silent ("errors only", never
@@ -324,7 +336,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             .flatten()
             .collect();
     let vendored = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await
+        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
     } else {
         Default::default()
     };
@@ -353,6 +365,21 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                     };
                     drifts.push((id, "go_redirect_drift".to_string(), d.to_string()));
                 }
+            }
+            // The redirects can be intact while the project no longer
+            // builds: a committed vendor/modules.txt or the go.mod
+            // requirements out of step with them (#343, #618).
+            for issue in socket_patch_core::vendor::go_consumer_sync::audit(
+                &args.common.cwd,
+                &HashMap::new(),
+            )
+            .await
+            {
+                drifts.push((
+                    issue.module().to_string(),
+                    issue.code().to_string(),
+                    issue.to_string(),
+                ));
             }
         }
     }
@@ -422,7 +449,14 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             for (_, _, detail) in &drifts {
                 eprintln!("  {detail}");
             }
-            eprintln!("{}", check_remedy(&args.common));
+            // A go consumer-sync drift names its own go command; apply
+            // cannot regenerate vendor/modules.txt or go.sum.
+            if drifts.iter().any(|(_, code, _)| {
+                code != socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
+                    && code != socket_patch_core::vendor::go_consumer_sync::REQUIREMENTS_CODE
+            }) {
+                eprintln!("{}", check_remedy(&args.common));
+            }
         }
         1
     }
@@ -809,6 +843,22 @@ fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
 
 pub async fn run(args: ApplyArgs) -> i32 {
     apply_env_toggles(&args.common);
+    // `--vex` attests the manifest's project but this run patches `--cwd`'s
+    // installed copies: refuse a manifest in another project before
+    // anything is read (#745). `--check` never generates a document.
+    if !args.check {
+        if let Some(message) =
+            crate::commands::foreign_manifest_vex_conflict(&args.common, &args.vex, "apply")
+        {
+            return crate::json_envelope::usage_error(
+                Command::Apply,
+                args.common.json,
+                args.common.dry_run,
+                crate::commands::FOREIGN_MANIFEST_PROJECT,
+                &message,
+            );
+        }
+    }
     let manifest_path = args.common.resolved_manifest_path();
 
     // No manifest → nothing to apply: a clean exit-0 no-op (load-bearing
@@ -1062,14 +1112,20 @@ pub(crate) async fn run_locked(
         Ok(Some(m)) => m,
         Ok(None) => {
             lock.release();
-            let code = report_apply_failure(&args, "Invalid manifest", &telemetry).await;
-            return ApplyRunReport::run_failure(code, "apply_failed", "Invalid manifest");
+            let err = EnvelopeError::new(
+                "manifest_not_found",
+                format!("Manifest not found at {}", manifest_path.display()),
+            );
+            let code = report_apply_failure(&args, &err, &err.message, &telemetry).await;
+            return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
         Err(e) => {
             lock.release();
-            let error = e.to_string();
-            let code = report_apply_failure(&args, &error, &telemetry).await;
-            return ApplyRunReport::run_failure(code, "apply_failed", error);
+            // One manifest-load mapping for every command (#931):
+            // `manifest_invalid` / `manifest_unreadable`, never `apply_failed`.
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            let code = report_apply_failure(&args, &err, &e.to_string(), &telemetry).await;
+            return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
     };
 
@@ -1481,7 +1537,8 @@ pub(crate) async fn run_locked(
         }
         Err(e) => {
             lock.release();
-            let code = report_apply_failure(&args, &e, &telemetry).await;
+            let err = EnvelopeError::new("apply_failed", e.clone());
+            let code = report_apply_failure(&args, &err, &e, &telemetry).await;
             ApplyRunReport::run_failure(code, "apply_failed", e)
         }
     }
@@ -1491,13 +1548,20 @@ pub(crate) async fn run_locked(
 /// envelope (`--json`) or an `Error:` line that prints even under
 /// `--silent` ("errors only", never "nothing" — exit 1 with no message
 /// would be undiagnosable), exit 1. Shared by the manifest read in `run`
-/// and `apply_patches_inner`'s `Err` arm.
-async fn report_apply_failure(args: &ApplyArgs, error: &str, telemetry: &TelemetryAuth) -> i32 {
+/// and `apply_patches_inner`'s `Err` arm. `err` is the `--json` error
+/// (`apply_failed`, or the manifest-load code); `error` is the plain text
+/// for telemetry and the human line.
+async fn report_apply_failure(
+    args: &ApplyArgs,
+    err: &EnvelopeError,
+    error: &str,
+    telemetry: &TelemetryAuth,
+) -> i32 {
     track_patch_apply_failed(error, args.common.dry_run, telemetry).await;
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;
-        env.mark_error(EnvelopeError::new("apply_failed", error.to_string()));
+        env.mark_error(err.clone());
         println!("{}", env.to_pretty_json());
     } else {
         eprintln!("Error: {}", crate::ui::sentence_case(error));
@@ -1959,7 +2023,7 @@ async fn apply_patches_inner(
     // and patches the global copy even when the cwd project vendors the
     // same purl (see `project_state_in_scope`).
     let vendored_purls = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await
+        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
     } else {
         Default::default()
     };
@@ -2017,6 +2081,7 @@ async fn apply_patches_inner(
         }
     }
     let mut fallback_skips: Vec<FallbackHomeSkip> = Vec::new();
+    let mut go_pristine_mods: HashMap<String, PathBuf> = HashMap::new();
 
     // Multi-copy aware: npm nests genuine duplicates of one `name@version`
     // (nested dupes, diamonds, `file:` dups), so the resolver returns EVERY
@@ -2429,7 +2494,16 @@ async fn apply_patches_inner(
                     match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, policy)
                         .await
                     {
-                        Some(r) => r,
+                        Some(r) => {
+                            // The unpatched go.mod, so the consumer-sync
+                            // audit below can tell requirements the patch
+                            // added from ones upstream always had (#618).
+                            if let Some((module, _)) = parse_golang_purl(purl) {
+                                go_pristine_mods
+                                    .insert(module.into_owned(), pkg_path.join("go.mod"));
+                            }
+                            r
+                        }
                         None => {
                             apply_package_patch(
                                 purl,
@@ -2507,6 +2581,21 @@ async fn apply_patches_inner(
     print_lockfile_only_note(args, &unmatched, &lockfile_only);
 
     // The human summary is printed by `run`, after the per-package list.
+
+    // A redirect leaves the project building only if its committed
+    // `vendor/modules.txt` and its go.mod requirements still agree with the
+    // `replace` directives (#343, #618): name the regeneration step.
+    if !args.common.dry_run && eco_in_local_scope(&args.common, Ecosystem::Golang) {
+        run_warnings.extend(
+            socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+                &args.common.cwd,
+                &go_pristine_mods,
+            )
+            .await
+            .into_iter()
+            .map(|(code, detail)| RunWarning { code, detail }),
+        );
+    }
 
     // Note: `apply` deliberately does NOT garbage-collect unused blobs in
     // `.socket/`. GC is the responsibility of `socket-patch repair` /

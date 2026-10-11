@@ -137,6 +137,21 @@ const P_ALPHA_MERGED_NEW: Patch = Patch {
     published: "2024-03-01T00:00:00Z",
 };
 
+/// How many hosted pins a run wrote (dry run: would write): its
+/// `applied` / `verified` events with `details.mode: "hosted"` (v5.0's
+/// `redirect.redirected`).
+fn hosted_pinned(doc: &Value) -> u64 {
+    doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
+}
+
 fn catalog() -> Vec<Patch> {
     vec![P_ALPHA, P_BETA, P_LEFTPAD, P_GAMMA, P_DELTA, P_RACK]
 }
@@ -557,7 +572,7 @@ async fn hosted_filters_by_ecosystem_package_and_severity() {
             );
         }
     }
-    assert_eq!(doc["redirect"]["redirected"], 1, "{:#}", doc["redirect"]);
+    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
 }
 
 #[tokio::test]
@@ -577,11 +592,7 @@ async fn hosted_dry_run_makes_the_same_decisions_and_writes_nothing() {
     );
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(repo.snapshot(), before, "a dry run changes no bytes");
-    assert_eq!(
-        doc["redirect"]["redirected"], 2,
-        "alpha and left-pad: {:#}",
-        doc["redirect"]
-    );
+    assert_eq!(hosted_pinned(&doc), 2, "alpha and left-pad: {doc:#}");
     assert_eq!(
         filtered_reason(&doc, "pkg:npm/beta@1.0.0")["reason"],
         "policy_severity"
@@ -722,10 +733,7 @@ async fn severity_flag_and_env_override_the_file() {
         doc["policy"]["minSeverity"],
         json!({"value": null, "source": "flag"})
     );
-    assert_eq!(
-        doc["redirect"]["redirected"], 3,
-        "beta too once the floor is lifted"
-    );
+    assert_eq!(hosted_pinned(&doc), 3, "beta too once the floor is lifted");
 
     let (code, doc) = scan_json(
         &web,
@@ -738,7 +746,7 @@ async fn severity_flag_and_env_override_the_file() {
         doc["policy"]["minSeverity"],
         json!({"value": "critical", "source": "env"})
     );
-    assert_eq!(doc["redirect"]["redirected"], 1);
+    assert_eq!(hosted_pinned(&doc), 1);
 
     // The flag beats the env; an empty env value is unset.
     let (_, doc) = scan_json(
@@ -847,7 +855,7 @@ async fn enabled_false_reports_and_writes_nothing() {
         !reasons.is_empty() && reasons.iter().all(|r| r == "policy_disabled"),
         "{reasons:?}"
     );
-    assert_eq!(doc["redirect"]["redirected"], 0);
+    assert_eq!(hosted_pinned(&doc), 0);
 }
 
 #[tokio::test]
@@ -1034,10 +1042,11 @@ async fn agent_mode_applies_only_admitted_patches() {
     let web = repo.dir("services/web");
     let (code, doc) = scan_json(&web, &server.uri(), &["--mode", "agent", "--dry-run"], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    let planned: Vec<&str> = doc["apply"]["patches"]
+    let planned: Vec<&str> = doc["events"]
         .as_array()
         .unwrap()
         .iter()
+        .filter(|e| e["action"] == "verified")
         .map(|p| p["purl"].as_str().unwrap())
         .collect();
     assert_eq!(planned, ["pkg:npm/alpha@1.0.0"], "{doc:#}");
@@ -1228,10 +1237,11 @@ async fn vendored_dry_run_previews_only_admitted_patches() {
     );
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(repo.snapshot(), before);
-    let previewed: Vec<&str> = doc["vendor"]["patches"]
+    let previewed: Vec<&str> = doc["events"]
         .as_array()
         .unwrap_or_else(|| panic!("{doc:#}"))
         .iter()
+        .filter(|e| e["details"]["mode"] == "vendored")
         .filter_map(|p| p["purl"].as_str())
         .collect();
     assert_eq!(previewed, ["pkg:npm/left-pad@1.0.0"], "{doc:#}");
@@ -1274,16 +1284,11 @@ async fn get_bypasses_the_policy_with_a_warning() {
     let (code, stdout, stderr) = run_cli(&web, &args, &[]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     let doc: Value = serde_json::from_str(&stdout).unwrap();
-    let warnings: Vec<&str> = doc["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.starts_with("(policy_bypassed)") && w.contains("alpha")),
+        doc["warnings"].as_array().unwrap().iter().any(|w| {
+            w["code"] == "policy_bypassed"
+                && w["detail"].as_str().is_some_and(|d| d.contains("alpha"))
+        }),
         "{doc:#}"
     );
 
@@ -1325,7 +1330,7 @@ async fn get_by_uuid_bypasses_the_policy_with_a_warning_in_every_mode() {
         let (code, stdout, stderr) = run_cli(&web, &args, &[]);
         assert_eq!(code, 0, "{mode}: stdout:\n{stdout}\nstderr:\n{stderr}");
         assert!(
-            stdout.contains("(policy_bypassed)") && stdout.contains("alpha"),
+            stdout.contains("\"policy_bypassed\"") && stdout.contains("alpha"),
             "{mode}: the envelope must carry the policy_bypassed warning: {stdout}"
         );
     }

@@ -20,7 +20,7 @@
 //!   crawler at a materialized JSR tree — `DenoCrawler::get_jsr_cache_paths`
 //!   returns the prefix verbatim). The rollback must discover the package
 //!   through `find_packages_for_rollback`'s deno branch, restore the file's
-//!   ORIGINAL bytes on disk, and report `rolledBack == 1` for the exact PURL.
+//!   ORIGINAL bytes on disk, and report `summary.rolledBack == 1` for the exact PURL.
 
 use crate::common::binary;
 
@@ -260,19 +260,23 @@ fn rollback_dispatch_branch_deno() {
         "rollback --ecosystems=deno: expected success; env={env}"
     );
     assert_eq!(
-        env["rolledBack"].as_u64(),
+        env["summary"]["rolledBack"].as_u64(),
         Some(1),
         "rollback --ecosystems=deno: must roll back exactly the one staged jsr package; env={env}"
     );
-    assert_eq!(env["failed"].as_u64(), Some(0), "env={env}");
+    assert_eq!(env["summary"]["failed"].as_u64(), Some(0), "env={env}");
     assert_eq!(
-        env["alreadyOriginal"].as_u64(),
+        env["summary"]["skipped"].as_u64(),
         Some(0),
         "rollback --ecosystems=deno: package was patched, not already-original; env={env}"
     );
-    let results = env["results"]
+    let results: Vec<&Value> = env["events"]
         .as_array()
-        .unwrap_or_else(|| panic!("rollback --ecosystems=deno: results missing; env={env}"));
+        .unwrap_or_else(|| panic!("rollback --ecosystems=deno: events missing; env={env}"))
+        .iter()
+        // The restore events, not the manifest-removal ones.
+        .filter(|e| e["details"]["manifest"] != true)
+        .collect();
     assert_eq!(
         results.len(),
         1,
@@ -284,9 +288,9 @@ fn rollback_dispatch_branch_deno() {
         Value::from(purl),
         "rollback --ecosystems=deno: rolled-back PURL mismatch; env={env}"
     );
-    assert_eq!(results[0]["success"], true, "env={env}");
+    assert_eq!(results[0]["action"], "rolledBack", "env={env}");
     assert!(
-        results[0]["filesRolledBack"]
+        results[0]["files"]
             .as_array()
             .is_some_and(|a| !a.is_empty()),
         "rollback --ecosystems=deno: must list at least one rolled-back file; env={env}"

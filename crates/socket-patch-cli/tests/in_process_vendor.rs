@@ -19,6 +19,9 @@
 //! No test mutates this process's environment, so none of them need
 //! `#[serial]` — each runs in its own tempdir.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -298,6 +301,29 @@ fn events(envelope: &Value) -> &Vec<Value> {
 
 /// The single event matching `action` (+ optional `errorCode`), or panic
 /// with the envelope.
+/// How many hosted pins the run wrote (`applied`) or, on a dry run, would
+/// write (`verified`): the `details.mode: "hosted"` events (v5.0's
+/// `redirect.redirected`).
+fn hosted_pin_count(envelope: &Value) -> usize {
+    events(envelope)
+        .iter()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count()
+}
+
+/// The hosted `skipped` events as `{purl, reason}` rows (v5.0's
+/// `redirect.skipped[]`: the reason is the event's `errorCode`).
+fn hosted_skips(envelope: &Value) -> Vec<Value> {
+    events(envelope)
+        .iter()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "skipped")
+        .map(|e| json!({"purl": e["purl"], "reason": e["errorCode"]}))
+        .collect()
+}
+
 fn find_event<'a>(envelope: &'a Value, action: &str, error_code: Option<&str>) -> &'a Value {
     events(envelope)
         .iter()
@@ -1682,7 +1708,7 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
     stage_berry_project(root, &pkg, &lock);
     let (code, env) = hosted_scan_cli(root, &server.uri());
     assert_eq!(code, 0, "hosted scan: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pin_count(&env), 1, "{env:#}");
     let hosted_lock = std::fs::read_to_string(root.join("yarn.lock")).unwrap();
     assert!(hosted_lock.contains(&encoded), "{hosted_lock:?}");
     assert_crlf(root, "hosted");
@@ -1741,7 +1767,7 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
     .await;
     let (code, env) = hosted_scan_cli(root, &server.uri());
     assert_eq!(code, 0, "hosted scan over the vendored pair: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pin_count(&env), 1, "{env:#}");
     assert!(
         env.to_string()
             .contains("redirect_takeover_reverted_vendored"),
@@ -1945,11 +1971,8 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
                     "{ctx}: no takeover ({announced}): {env:#}"
                 );
             }
-            assert_eq!(env["redirect"]["redirected"], 0, "{ctx}: {env:#}");
-            let skipped = env["redirect"]["skipped"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            assert_eq!(hosted_pin_count(&env), 0, "{ctx}: {env:#}");
+            let skipped = hosted_skips(&env);
             assert!(
                 skipped
                     .iter()
@@ -2004,7 +2027,7 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
             stage_berry_project(root, &pkg, &lock);
             let (exit, env) = hosted_scan_cli_with(root, &server.uri(), &[]);
             assert_eq!(exit, 0, "{ctx}: hosted scan: {env:#}");
-            assert_eq!(env["redirect"]["redirected"], 1, "{ctx}: {env:#}");
+            assert_eq!(hosted_pin_count(&env), 1, "{ctx}: {env:#}");
             breakage(root, rel);
             let before = berry_wiring_snapshot(root);
             let extra: &[&str] = if dry { &["--dry-run"] } else { &[] };
@@ -2077,7 +2100,7 @@ async fn classic_vendored_to_hosted_takeover_refuses_with_offline_mirror() {
                     "{ctx}: no takeover ({announced}): {env:#}"
                 );
             }
-            assert_eq!(env["redirect"]["redirected"], 0, "{ctx}: {env:#}");
+            assert_eq!(hosted_pin_count(&env), 0, "{ctx}: {env:#}");
             assert_eq!(
                 snapshot(),
                 before,
@@ -2125,11 +2148,8 @@ async fn berry_vendored_to_hosted_takeover_keeps_vendored_without_berry_checksum
                 "{ctx}: no takeover ({announced}): {env:#}"
             );
         }
-        assert_eq!(env["redirect"]["redirected"], 0, "{ctx}: {env:#}");
-        let skipped = env["redirect"]["skipped"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        assert_eq!(hosted_pin_count(&env), 0, "{ctx}: {env:#}");
+        let skipped = hosted_skips(&env);
         assert!(
             skipped
                 .iter()
@@ -2204,7 +2224,7 @@ async fn berry_hosted_to_vendored_takeover_runs_package_gates_first() {
             stage_berry_project(root, BERRY_WIN_PKG, &berry_win_lock());
             let (exit, env) = hosted_scan_cli_with(root, &server.uri(), &[]);
             assert_eq!(exit, 0, "{ctx}: hosted scan: {env:#}");
-            assert_eq!(env["redirect"]["redirected"], 1, "{ctx}: {env:#}");
+            assert_eq!(hosted_pin_count(&env), 1, "{ctx}: {env:#}");
             breakage(root);
             let before = berry_wiring_snapshot(root);
             // The hosted pin's origin must count as the patch server, or
@@ -2362,8 +2382,8 @@ async fn vendored_npm_purl_skipped_even_without_installed_tree() {
 // ─────────────────────────────────────────────────────────────────────
 
 /// `rollback` reverts vendor-owned purls (lock restored byte-for-byte,
-/// artifact + ledger entry gone, manifest entry removed), surfaced in
-/// `vendoredReverted`; both the unscoped and identifier-scoped spellings
+/// artifact + ledger entry gone, manifest entry removed), surfaced as a
+/// `rolledBack` event with `details.mode: "vendored"`; both the unscoped and identifier-scoped spellings
 /// act.
 #[tokio::test]
 async fn vendored_purl_excluded_from_rollback() {
@@ -2404,18 +2424,18 @@ async fn vendored_purl_excluded_from_rollback() {
         assert_eq!(code, 0, "vendored rollback exits 0: {out:#}");
         assert_eq!(out["status"], "success", "{out:#}");
         assert_eq!(
-            out["vendored"],
+            rollback_json::skipped_with(&out, "vendored"),
             json!([]),
             "no benign skip remains — the vendored leg acted: {out:#}"
         );
         assert_eq!(
-            out["vendoredReverted"],
+            rollback_json::vendored_reverted(&out),
             json!([PURL]),
             "the revert must be surfaced: {out:#}"
         );
-        assert_eq!(out["failed"], 0, "{out:#}");
+        assert_eq!(out["summary"]["failed"], 0, "{out:#}");
         assert_eq!(
-            out["manifest"]["removedEntries"],
+            rollback_json::manifest_removed(&out),
             json!([PURL]),
             "the manifest entry leaves with the vendored state: {out:#}"
         );
@@ -2472,6 +2492,7 @@ async fn remove_reverts_vendoring() {
     assert_eq!(env["status"], "success");
     let reverted = find_event(&env, "removed", Some("vendor_reverted"));
     assert_eq!(reverted["purl"], PURL);
+    assert_eq!(reverted["details"]["mode"], "vendored", "{env:#}");
     assert_eq!(
         env["summary"]["removed"], 1,
         "summary.removed counts manifest entries only: {env:#}"
@@ -2575,6 +2596,7 @@ async fn remove_detached_only_purl_reverts() {
     assert_eq!(env["status"], "success");
     let reverted = find_event(&env, "removed", Some("vendor_reverted"));
     assert_eq!(reverted["purl"], PURL);
+    assert_eq!(reverted["details"]["mode"], "vendored", "{env:#}");
     assert_eq!(env["summary"]["removed"], 1, "{env:#}");
 
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
@@ -3360,9 +3382,9 @@ async fn scan_vendor_gem_end_to_end_and_reverts() {
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
     assert_eq!(code, 0, "scan --mode vendored must succeed: {env:#}");
     assert_eq!(env["status"], "success", "envelope: {env:#}");
-    assert_eq!(env["download"]["downloaded"], 1, "envelope: {env:#}");
-    assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
-    assert_eq!(env["vendor"]["summary"]["failed"], 0, "envelope: {env:#}");
+    assert_eq!(env["summary"]["downloaded"], 1, "envelope: {env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "envelope: {env:#}");
+    assert_eq!(env["summary"]["failed"], 0, "envelope: {env:#}");
 
     // Artifact: patched bytes + the stub gemspec a path source needs.
     assert_eq!(
@@ -3415,9 +3437,9 @@ async fn scan_vendor_gem_end_to_end_and_reverts() {
     let lock_wired = std::fs::read(fx.lock_path()).unwrap();
     let (code, env2) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
     assert_eq!(code, 0, "re-run must succeed: {env2:#}");
-    assert_eq!(env2["vendor"]["summary"]["applied"], 0, "{env2:#}");
+    assert_eq!(env2["summary"]["applied"], 0, "{env2:#}");
     assert!(
-        env2["vendor"]["events"]
+        env2["events"]
             .as_array()
             .unwrap()
             .iter()
@@ -3529,14 +3551,14 @@ async fn scan_vendor_gem_qualified_platform_ruby_purl_vendors() {
         "scan --mode vendored must succeed on the qualified purl: {env:#}"
     );
     assert_eq!(env["status"], "success", "envelope: {env:#}");
-    assert_eq!(env["download"]["downloaded"], 1, "envelope: {env:#}");
-    assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
-    assert_eq!(env["vendor"]["summary"]["failed"], 0, "envelope: {env:#}");
+    assert_eq!(env["summary"]["downloaded"], 1, "envelope: {env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "envelope: {env:#}");
+    assert_eq!(env["summary"]["failed"], 0, "envelope: {env:#}");
     // Positive assertion — an `applied` event for the qualified purl itself
     // (a `.all(errorCode != platform_gem_unsupported)` check would pass
     // vacuously on an empty event list).
     assert!(
-        env["vendor"]["events"]
+        env["events"]
             .as_array()
             .unwrap()
             .iter()
@@ -3616,7 +3638,7 @@ async fn scan_vendor_gem_detached_qualified_purl_reverts() {
         code, 0,
         "scan --mode vendored must succeed on the qualified purl: {env:#}"
     );
-    assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "envelope: {env:#}");
 
     assert!(
         !fx.root().join(".socket/manifest.json").exists(),
@@ -3663,7 +3685,7 @@ async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
 
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
     assert_eq!(code, 0, "scan --mode vendored must succeed: {env:#}");
-    assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "envelope: {env:#}");
 
     assert!(
         !fx.root().join(".socket/manifest.json").exists(),

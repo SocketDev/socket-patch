@@ -112,7 +112,7 @@ async fn vlt_hosted_round_trip() {
 
         assert_eq!(read(root, "vlt-lock.json"), pristine, "scoped={scoped}");
         assert_eq!(
-            doc["hosted"]["reverted"],
+            crate::rollback_json::hosted_reverted(&doc),
             serde_json::json!([PURL]),
             "{doc:#}"
         );
@@ -458,7 +458,7 @@ async fn vlt_scoped_rollback_of_one_of_two_heals_only_that_package() {
         vlt_lock(Era::V1, &[restored_node(TILDE_ID), other_pinned])
     );
     assert_eq!(
-        doc["hosted"]["reverted"],
+        crate::rollback_json::hosted_reverted(&doc),
         serde_json::json!([PURL]),
         "{doc:#}"
     );
@@ -550,13 +550,17 @@ async fn vlt_heal_follows_the_restored_pin_when_another_pin_refuses() {
     let (code, doc, _) = run_verb_raw(root, &server, "rollback", &[]);
 
     assert_ne!(code, 0, "the refused right-pad pin fails the run");
-    assert_eq!(doc["status"], "partial_failure", "{doc:#}");
+    assert_eq!(doc["status"], "partialFailure", "{doc:#}");
     assert_eq!(
-        doc["hosted"]["reverted"],
+        crate::rollback_json::hosted_reverted(&doc),
         serde_json::json!([PURL]),
         "{doc:#}"
     );
-    assert_eq!(doc["hosted"]["failed"][0]["purl"], OTHER_PURL, "{doc:#}");
+    assert_eq!(
+        crate::rollback_json::hosted_failed(&doc)[0]["purl"],
+        OTHER_PURL,
+        "{doc:#}"
+    );
     assert_eq!(
         read(root, "vlt-lock.json"),
         vlt_lock(Era::V1, &[restored_node(TILDE_ID), other_pinned]),

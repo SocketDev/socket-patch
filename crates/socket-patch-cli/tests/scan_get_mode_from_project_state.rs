@@ -362,12 +362,14 @@ async fn bare_scan_keeps_an_agent_project_out_of_hosted_mode() {
     // fails (exit 1); what matters is which mode ran.
     let (code, env) = run_cmd(root, &server.uri(), "scan", None, &[]);
     assert_ne!(code, 2, "the mode is not ambiguous: {env:#}");
+    // v5.0: agent events carry no `details.mode`; hosted ones say "hosted".
+    let events = env["events"].as_array().cloned().unwrap_or_default();
     assert!(
-        env.get("apply").is_some(),
+        events.iter().any(|e| e["details"]["mode"].is_null()),
         "the agent apply step ran: {env:#}"
     );
     assert!(
-        env.get("redirect").is_none(),
+        env.get("redirect").is_none() && !events.iter().any(|e| e["details"]["mode"] == "hosted"),
         "no hosted step may run: {env:#}"
     );
     assert_eq!(

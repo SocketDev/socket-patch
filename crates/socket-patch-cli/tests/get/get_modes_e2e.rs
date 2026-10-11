@@ -221,10 +221,10 @@ async fn requests_containing(server: &MockServer, fragment: &str) -> usize {
 // (1) hosted envelope
 // ---------------------------------------------------------------------------
 
-/// `get <uuid> --mode hosted --json` emits ONE JSON object: get's base
-/// envelope (`status`/`found`/`patches`, NO `downloaded`/`applied` — nothing
-/// lands in `.socket/`) with scan's `redirect` sub-object nested in. Exact
-/// whole-envelope equality so an additive key can't sneak in unnoticed.
+/// `get <uuid> --mode hosted --json` emits ONE envelope (v5.0): the pin as a
+/// hosted `applied` event, the `redirect: {mode, rewrittenFiles}` payload
+/// and the engine's warnings at the top level — nothing downloaded into
+/// `.socket/`.
 #[tokio::test]
 async fn get_uuid_hosted_json_envelope_nests_redirect() {
     let server = MockServer::start().await;
@@ -251,7 +251,8 @@ async fn get_uuid_hosted_json_envelope_nests_redirect() {
     );
 
     let v = parse_single_json_doc(&stdout);
-    let allow_remote = v["redirect"]["warnings"][0]["detail"]
+    crate::common::envelope::assert_envelope_invariants(&v, "get");
+    let allow_remote = v["warnings"][0]["detail"]
         .as_str()
         .unwrap_or_default()
         .to_string();
@@ -260,33 +261,29 @@ async fn get_uuid_hosted_json_envelope_nests_redirect() {
             && allow_remote.contains("lets npm install ANY url-resolved"),
         "{v}"
     );
-    let expected = serde_json::json!({
-        "status": "success",
-        "found": 1,
-        "patches": [],
-        "redirect": {
-            "mode": "hosted",
-            "redirected": 1,
-            "rewrittenFiles": ["package-lock.json"],
-            "skipped": [],
-            "patches": [{ "purl": PURL1, "uuid": UUID1, "action": "pinned" }],
-            "warnings": [{ "code": "redirect_npm_allow_remote", "detail": allow_remote }],
-            "dryRun": false,
-        },
-    });
+    assert_eq!(v["status"], "success", "{v:#}");
+    assert_eq!(v["dryRun"], false, "{v:#}");
     assert_eq!(
-        v,
-        expected,
-        "hosted get JSON envelope drifted.\nexpected:\n{}\ngot:\n{}",
-        serde_json::to_string_pretty(&expected).unwrap(),
-        serde_json::to_string_pretty(&v).unwrap(),
+        v["events"],
+        serde_json::json!([
+            { "action": "applied", "purl": PURL1, "uuid": UUID1, "details": { "mode": "hosted" } }
+        ]),
+        "{v:#}"
     );
-    // Belt-and-suspenders on the keys the contract calls out by name, in
-    // case the exact-equality pin above is ever loosened in maintenance.
-    assert!(
-        v.get("downloaded").is_none() && v.get("applied").is_none(),
-        "hosted mode downloads/applies nothing into .socket — neither key \
-         may appear at top level; got {v}"
+    assert_eq!(
+        v["redirect"],
+        serde_json::json!({ "mode": "hosted", "rewrittenFiles": ["package-lock.json"] }),
+        "{v:#}"
+    );
+    assert_eq!(
+        v["warnings"],
+        serde_json::json!([{ "code": "redirect_npm_allow_remote", "detail": allow_remote }]),
+        "{v:#}"
+    );
+    assert_eq!(v["summary"]["applied"], 1, "{v:#}");
+    assert_eq!(
+        v["summary"]["downloaded"], 0,
+        "hosted mode downloads nothing into .socket; got {v}"
     );
 
     // The envelope must describe a rewrite that actually happened: the
@@ -305,11 +302,9 @@ async fn get_uuid_hosted_json_envelope_nests_redirect() {
 // ---------------------------------------------------------------------------
 
 /// `get <uuid> --mode vendored --json` (local `--vendor-source build`, so no
-/// vendoring-service mocks): the detached download envelope — the same
-/// vocabulary scan's `download` block uses (`downloaded`, `patches[].action:
-/// "downloaded"`, `detached: true`), no `applied` (nothing is applied in
-/// place) — with scan's full vendor `Envelope` nested under `vendor`
-/// (camelCase keys/statuses).
+/// vendoring-service mocks): one envelope (v5.0) holding the detached
+/// download's `downloaded` event and the vendor engine's events, all tagged
+/// `details.mode: "vendored"` — no nested `vendor` envelope.
 #[tokio::test]
 async fn get_uuid_vendored_json_envelope_nests_vendor() {
     let server = MockServer::start().await;
@@ -340,46 +335,35 @@ async fn get_uuid_vendored_json_envelope_nests_vendor() {
 
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "envelope={v}");
-    assert_eq!(v["found"], 1, "envelope={v}");
-    assert_eq!(v["downloaded"], 1, "envelope={v}");
-    assert_eq!(v["skipped"], 0, "envelope={v}");
-    assert_eq!(v["failed"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["downloaded"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["skipped"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["failed"], 0, "envelope={v}");
     assert_eq!(
-        v["detached"], true,
-        "vendored get is the detached download phase; got {v}"
+        v["events"][0]["details"]["mode"], "vendored",
+        "vendored get's events carry the leg tag; got {v}"
     );
-    assert_eq!(v["patches"][0]["purl"], PURL1, "envelope={v}");
-    assert_eq!(v["patches"][0]["uuid"], UUID1, "envelope={v}");
+    assert_eq!(v["events"][0]["purl"], PURL1, "envelope={v}");
+    assert_eq!(v["events"][0]["uuid"], UUID1, "envelope={v}");
     assert_eq!(
-        v["patches"][0]["action"], "downloaded",
+        v["events"][0]["action"], "downloaded",
         "the detached vocabulary: the record was fetched into memory, not added to a manifest; got {v}"
     );
+    // The vendor engine's events are merged into the one envelope (no
+    // nested `vendor` envelope), tagged `details.mode: "vendored"`.
     assert!(
-        v.get("applied").is_none(),
-        "vendored mode has no top-level `applied` key (nothing is applied in place); got {v}"
+        v.get("vendor").is_none(),
+        "no nested vendor envelope; got {v}"
     );
-
-    // The nested vendor Envelope: the unified `--json` shape the standalone
-    // `vendor` command emits — command tag, camelCase status + dryRun,
-    // events[], pre-aggregated camelCase summary.
-    let venv = v["vendor"]
-        .as_object()
-        .unwrap_or_else(|| panic!("vendored envelope must nest a vendor Envelope; got {v}"));
-    assert_eq!(venv["command"], "vendor", "vendor={venv:?}");
-    assert_eq!(venv["status"], "success", "vendor={venv:?}");
-    assert_eq!(venv["dryRun"], false, "vendor={venv:?}");
     assert_eq!(
-        venv["summary"]["applied"], 1,
-        "summary must count the fresh vendoring (camelCase keys); vendor={venv:?}"
+        v["summary"]["applied"], 1,
+        "summary must count the fresh vendoring; got {v}"
     );
-    let events = venv["events"]
-        .as_array()
-        .unwrap_or_else(|| panic!("vendor Envelope must carry events[]; got {venv:?}"));
+    let events = v["events"].as_array().unwrap();
     assert!(
-        events
-            .iter()
-            .any(|e| e["purl"] == PURL1 && e["action"] == "applied"),
-        "events must record the vendored purl with a camelCase action; got {events:?}"
+        events.iter().any(|e| e["purl"] == PURL1
+            && e["action"] == "applied"
+            && e["details"]["mode"] == "vendored"),
+        "events must record the vendored purl; got {events:?}"
     );
 
     // Anti-vacuity: the envelope reflects the real vendored result —
@@ -425,29 +409,27 @@ async fn get_ghsa_all_uninstalled_emits_not_installed_envelope() {
     );
 
     let v = parse_single_json_doc(&stdout);
-    let expected = serde_json::json!({
-        "status": "not_installed",
-        "found": 2,
-        "downloaded": 0,
-        "applied": 0,
-        "patches": [
-            {
-                "purl": PURL1, "uuid": UUID1,
-                "action": "skipped", "errorCode": "package_not_installed",
-            },
-            {
-                "purl": PURL2, "uuid": UUID2,
-                "action": "skipped", "errorCode": "package_not_installed",
-            },
-        ],
-    });
+    crate::common::envelope::assert_envelope_invariants(&v, "get");
+    assert_eq!(v["status"], "notInstalled", "{v:#}");
     assert_eq!(
-        v,
-        expected,
-        "not_installed envelope drifted.\nexpected:\n{}\ngot:\n{}",
-        serde_json::to_string_pretty(&expected).unwrap(),
-        serde_json::to_string_pretty(&v).unwrap(),
+        crate::common::envelope::event_triples(&v),
+        vec![
+            (
+                PURL1.to_string(),
+                "skipped".to_string(),
+                "package_not_installed".to_string()
+            ),
+            (
+                PURL2.to_string(),
+                "skipped".to_string(),
+                "package_not_installed".to_string()
+            ),
+        ],
+        "{v:#}"
     );
+    assert_eq!(v["events"][0]["uuid"], UUID1, "{v:#}");
+    assert_eq!(v["events"][1]["uuid"], UUID2, "{v:#}");
+    assert_eq!(v["summary"]["skipped"], 2, "{v:#}");
 
     assert_eq!(
         requests_containing(&server, "/patches/view/").await,
@@ -612,7 +594,8 @@ async fn get_hosted_dry_run_json_envelope() {
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
 
     let v = parse_single_json_doc(&stdout);
-    let allow_remote = v["redirect"]["warnings"][0]["detail"]
+    crate::common::envelope::assert_envelope_invariants(&v, "get");
+    let allow_remote = v["warnings"][0]["detail"]
         .as_str()
         .unwrap_or_default()
         .to_string();
@@ -621,26 +604,24 @@ async fn get_hosted_dry_run_json_envelope() {
             && allow_remote.contains("lets npm install ANY url-resolved"),
         "{v}"
     );
-    let expected = serde_json::json!({
-        "status": "success",
-        "found": 1,
-        "patches": [],
-        "redirect": {
-            "mode": "hosted",
-            "redirected": 1,
-            "rewrittenFiles": ["package-lock.json"],
-            "skipped": [],
-            "patches": [{ "purl": PURL1, "uuid": UUID1, "action": "would_pin" }],
-            "warnings": [{ "code": "redirect_npm_allow_remote", "detail": allow_remote }],
-            "dryRun": true,
-        },
-    });
+    assert_eq!(v["status"], "success", "{v:#}");
+    assert_eq!(v["dryRun"], true, "{v:#}");
     assert_eq!(
-        v,
-        expected,
-        "hosted dry-run envelope drifted.\nexpected:\n{}\ngot:\n{}",
-        serde_json::to_string_pretty(&expected).unwrap(),
-        serde_json::to_string_pretty(&v).unwrap(),
+        v["events"],
+        serde_json::json!([
+            { "action": "verified", "purl": PURL1, "uuid": UUID1, "details": { "mode": "hosted" } }
+        ]),
+        "{v:#}"
+    );
+    assert_eq!(
+        v["redirect"],
+        serde_json::json!({ "mode": "hosted", "rewrittenFiles": ["package-lock.json"] }),
+        "{v:#}"
+    );
+    assert_eq!(
+        v["warnings"],
+        serde_json::json!([{ "code": "redirect_npm_allow_remote", "detail": allow_remote }]),
+        "{v:#}"
     );
 
     assert_eq!(
@@ -680,23 +661,19 @@ async fn get_vendored_dry_run_json_envelope() {
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
 
     let v = parse_single_json_doc(&stdout);
-    let expected = serde_json::json!({
-        "status": "success",
-        "found": 1,
-        "patches": [],
-        "vendor": {
-            "dryRun": true,
-            "patches": [
-                { "purl": PURL1, "uuid": UUID1, "action": "would_vendor" },
-            ],
-        },
-    });
+    crate::common::envelope::assert_envelope_invariants(&v, "get");
+    assert_eq!(v["status"], "success", "{v:#}");
+    assert_eq!(v["dryRun"], true, "{v:#}");
     assert_eq!(
-        v,
-        expected,
-        "vendored dry-run envelope drifted.\nexpected:\n{}\ngot:\n{}",
-        serde_json::to_string_pretty(&expected).unwrap(),
-        serde_json::to_string_pretty(&v).unwrap(),
+        v["events"],
+        serde_json::json!([
+            { "action": "verified", "purl": PURL1, "uuid": UUID1, "details": { "mode": "vendored" } }
+        ]),
+        "{v:#}"
+    );
+    assert_eq!(
+        v["summary"]["downloaded"], 0,
+        "the download phase never ran: {v:#}"
     );
 
     assert_eq!(
@@ -768,7 +745,11 @@ async fn get_vendored_then_hosted_takes_over_cleanly() {
     );
     assert_eq!(code, 0, "hosted takeover failed: {stderr}\n{stdout}");
     let envelope = parse_single_json_doc(&stdout);
-    assert_eq!(envelope["redirect"]["redirected"], 1, "got: {envelope}");
+    assert_eq!(
+        crate::common::envelope::hosted_pins(&envelope).len(),
+        1,
+        "got: {envelope}"
+    );
 
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(
@@ -1029,8 +1010,8 @@ async fn get_vendored_refusal_visible_under_silent() {
 }
 
 /// The vendored dry-run preview names what the wet run would refuse:
-/// `would_refuse` + `errorCode` + `error` (additive) instead of
-/// `would_vendor`, on both identifier kinds — exit 0, `status:"success"`,
+/// a `skipped` event carrying the refusal's `errorCode` (and its detail as
+/// `reason`) instead of a `verified` one, on both identifier kinds — exit 0, `status:"success"`,
 /// nothing written, exactly like every other vendored preview.
 #[tokio::test]
 async fn get_vendored_dry_run_reports_bun_refusal() {
@@ -1058,15 +1039,15 @@ async fn get_vendored_dry_run_reports_bun_refusal() {
         assert_eq!(code, 0, "{label}: stdout={stdout}\nstderr={stderr}");
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "success", "{label}: {v}");
-        assert_eq!(v["found"], 1, "{label}: {v}");
-        assert_eq!(v["vendor"]["dryRun"], true, "{label}: {v}");
-        let rec = &v["vendor"]["patches"][0];
+        assert_eq!(v["dryRun"], true, "{label}: {v}");
+        let rec = &v["events"][0];
         assert_eq!(rec["purl"], PURL1, "{label}: {v}");
         assert_eq!(rec["uuid"], UUID1, "{label}: {v}");
-        assert_eq!(rec["action"], "would_refuse", "{label}: {v}");
+        assert_eq!(rec["action"], "skipped", "{label}: {v}");
         assert_eq!(rec["errorCode"], BUN_WS_CODE, "{label}: {v}");
+        assert_eq!(rec["details"]["mode"], "vendored", "{label}: {v}");
         assert!(
-            rec["error"].as_str().is_some_and(|d| !d.is_empty()),
+            rec["reason"].as_str().is_some_and(|d| !d.is_empty()),
             "{label}: {v}"
         );
         assert_eq!(
@@ -1099,8 +1080,8 @@ async fn get_save_only_agent_ignores_bun_preflight() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "{v}");
-    assert_eq!(v["patches"][0]["action"], "added", "{v}");
-    assert!(v["patches"][0].get("errorCode").is_none(), "{v}");
+    assert_eq!(v["events"][0]["action"], "downloaded", "{v}");
+    assert!(v["events"][0].get("errorCode").is_none(), "{v}");
     assert_eq!(requests_containing(&server, "/patches/view/").await, 1);
     let manifest: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
@@ -1202,8 +1183,8 @@ async fn get_vendored_dry_run_reports_vlt_refusal() {
         );
         assert_eq!(code, 0, "{label}: stdout={stdout}\nstderr={stderr}");
         let v = parse_single_json_doc(&stdout);
-        let rec = &v["vendor"]["patches"][0];
-        assert_eq!(rec["action"], "would_refuse", "{label}: {v}");
+        let rec = &v["events"][0];
+        assert_eq!(rec["action"], "skipped", "{label}: {v}");
         assert_eq!(rec["errorCode"], VLT_SYNC_CODE, "{label}: {v}");
         assert!(!tmp.path().join(".socket").exists(), "{label}");
     }
@@ -1220,8 +1201,8 @@ async fn get_save_only_agent_ignores_vlt_preflight() {
         run_get(tmp.path(), &server.uri(), &[PURL1, "--save-only", "--json"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
-    assert_eq!(v["patches"][0]["action"], "added", "{v}");
-    assert!(v["patches"][0].get("errorCode").is_none(), "{v}");
+    assert_eq!(v["events"][0]["action"], "downloaded", "{v}");
+    assert!(v["events"][0].get("errorCode").is_none(), "{v}");
 }
 
 /// Manifest-less VEX over what `get <uuid> --mode hosted` and `get <uuid>

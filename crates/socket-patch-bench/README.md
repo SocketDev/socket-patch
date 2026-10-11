@@ -66,7 +66,8 @@ sample:
 - exit code 0 and one JSON document on stdout, `status: success`;
 - `scannedPackages`, `lockfileOnlyPackages`, `packagesWithPatches` and
   `totalPatches` equal what the generated project contains;
-- hosted runs: `redirect.redirected` is every patch, `rewrittenFiles` is
+- hosted runs: every patch is pinned (`redirect.redirected` before v5, the
+  hosted `applied` events since), `rewrittenFiles` is
   exactly the expected set, nothing is skipped, every warning code is one
   the scenario expects, and each reported file really changed on disk;
 - dry runs: nothing on disk changed;

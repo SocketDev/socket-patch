@@ -654,19 +654,16 @@ async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
     );
     let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["downloaded"], 1, "one record downloaded: {env}");
+    assert_eq!(
+        env["summary"]["downloaded"], 1,
+        "one record downloaded: {env}"
+    );
     assert!(
         env.get("applied").is_none(),
         "vendored get drops `applied` (nothing is applied in place): {env}"
     );
-    assert_eq!(
-        env["vendor"]["status"], "success",
-        "nested vendor envelope: {env}"
-    );
-    assert_eq!(
-        env["vendor"]["summary"]["failed"], 0,
-        "no vendor failures: {env}"
-    );
+    assert_eq!(env["status"], "success", "nested vendor envelope: {env}");
+    assert_eq!(env["summary"]["failed"], 0, "no vendor failures: {env}");
 
     // The record came over the wire — the view endpoint was actually hit.
     let view_hits = server

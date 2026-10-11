@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
-use crate::json_envelope::{Command, Envelope, GcReport, PatchAction, PatchEvent, Status};
+use crate::json_envelope::{
+    Command, Envelope, EnvelopeError, GcReport, PatchAction, PatchEvent, Status,
+};
 use crate::ui::sweep_failure;
 
 #[derive(Args)]
@@ -73,25 +75,27 @@ pub async fn run(args: RepairArgs) -> i32 {
         // bare directory would get. Only cheap existence probes (and the
         // read-only lockfile scans) run before the lock, so a project with
         // nothing to repair never grows `.socket/`.
+        // The vendored phase runs at the manifest's project (#745).
         let state_file = args
             .common
-            .cwd
+            .project_root()
             .join(socket_patch_core::vendor::VENDOR_STATE_REL);
         let mut has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok();
         if !has_vendor_traces {
-            let refs =
-                crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd)
-                    .await;
+            let refs = crate::commands::vendored_backend::repair::scan_vendor_references(
+                &args.common.project_root(),
+            )
+            .await;
             has_vendor_traces = !refs.is_empty();
             vendor_references = Some(refs);
         }
         if !has_vendor_traces {
             let legacy_ledger = args
                 .common
-                .cwd
+                .project_root()
                 .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
             let hosted = tokio::fs::metadata(&legacy_ledger).await.is_ok()
-                || !crate::commands::hosted_inventory(&args.common, &args.common.cwd)
+                || !crate::commands::hosted_inventory(&args.common, &args.common.project_root())
                     .await
                     .is_empty();
             if hosted {
@@ -152,8 +156,10 @@ pub async fn run(args: RepairArgs) -> i32 {
     let vendor_references = match vendor_references {
         Some(refs) => refs,
         None => {
-            crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd)
-                .await
+            crate::commands::vendored_backend::repair::scan_vendor_references(
+                &args.common.project_root(),
+            )
+            .await
         }
     };
 
@@ -225,12 +231,12 @@ pub async fn run(args: RepairArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_repair_failed(&e, &telemetry).await;
+            track_patch_repair_failed(&e.message, &telemetry).await;
             if args.common.json {
-                let env = error_envelope(Command::Repair, args.common.dry_run, "repair_failed", &e);
+                let env = error_envelope(Command::Repair, args.common.dry_run, &e.code, &e.message);
                 println!("{}", env.to_pretty_json());
             } else {
-                eprintln!("Error: {e}");
+                eprintln!("Error: {}", e.message);
             }
             1
         }
@@ -457,12 +463,12 @@ async fn repair_inner(
     client: &mut Option<ApiClient>,
     // `(eco, uuid, rel)` lockfile vendor references, scanned once by `run`.
     vendor_references: Vec<(String, String, String)>,
-) -> Result<(Envelope, RepairCounts), String> {
+) -> Result<(Envelope, RepairCounts), EnvelopeError> {
     // `Ok(None)` = no manifest (vendor-only repair); present-but-invalid
-    // stays a hard error.
+    // stays a hard error, under the shared manifest-load code (#931).
     let manifest = read_manifest(manifest_path)
         .await
-        .map_err(|e| crate::ui::manifest_error_message(manifest_path, &e))?;
+        .map_err(|e| crate::json_envelope::manifest_load_error(manifest_path, &e))?;
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &args.common.cwd);
     let blobs_path = socket_dir.join("blobs");
@@ -498,7 +504,7 @@ async fn repair_inner(
     // result (an unreadable ledger is ITS loud failure), while this scoping
     // degrades to "nothing vendored" — a corrupt ledger must not hide the
     // manifest's own missing sources.
-    let ledger = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+    let ledger = socket_patch_core::vendor::load_state(&args.common.project_root()).await;
     let no_entries = std::collections::HashMap::new();
     let vendor_entries = ledger.as_ref().map(|s| &s.entries).unwrap_or(&no_entries);
     // Lockfile vendor references count as vendored even with no ledger
@@ -558,6 +564,7 @@ async fn repair_inner(
     // ledger entry are reported. Runs under `--download-only` too:
     // restoring artifacts IS repair's download half. The reference scan
     // and ledger load above are handed over, not repeated.
+    let vendored_since = env.events.len();
     let vendor_redownloaded =
         crate::commands::vendored_backend::VendoredBackend::new(&args.common, None)
             .repair(
@@ -570,6 +577,11 @@ async fn repair_inner(
                 &mut env,
             )
             .await;
+    // Vendored-leg events say so (`details.mode`), as in every envelope.
+    crate::commands::vendored_backend::tag_event_mode(
+        &mut env.events[vendored_since..],
+        crate::commands::VENDORED_MODE_LABEL,
+    );
     if !quiet && vendor_redownloaded > 0 {
         stdout_started = true;
         println!(
@@ -677,7 +689,7 @@ async fn repair_inner(
                 "count": count,
                 // Constant since v5 (blobs are the only download); kept so
                 // the event's shape is unchanged.
-                "mode": "file",
+                "downloadMode": "file",
             })),
         );
     }
@@ -819,11 +831,14 @@ mod tests {
     }
 
     /// True when `env` carries the download / would-download artifact event
-    /// (identified by its `details.mode` field, unique to that event).
+    /// (identified by its `details.downloadMode` field, unique to that event).
     fn has_download_event(env: &Envelope) -> bool {
-        env.events
-            .iter()
-            .any(|e| e.details.as_ref().and_then(|d| d.get("mode")).is_some())
+        env.events.iter().any(|e| {
+            e.details
+                .as_ref()
+                .and_then(|d| d.get("downloadMode"))
+                .is_some()
+        })
     }
 
     /// Regression for the offline + dry-run leak: with `--offline` set, the

@@ -1045,7 +1045,7 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
     let (code, stdout, stderr) = run_hosted_scan(&proj, &server.uri());
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
-    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_eq!(hosted_pinned(&envelope), 1, "{stdout}");
     assert!(
         stdout.contains("redirect_takeover_reverted_vendored"),
         "takeover warning missing: {stdout}"
@@ -1382,7 +1382,7 @@ async fn berry_vendored_then_hosted_takeover_leaves_pure_hosted() {
     let (code, stdout, stderr) = run_hosted_scan(&proj, &server.uri());
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
-    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_eq!(hosted_pinned(&envelope), 1, "{stdout}");
     assert!(
         stdout.contains("redirect_takeover_reverted_vendored"),
         "takeover warning missing: {stdout}"
@@ -1479,4 +1479,19 @@ async fn berry_vendored_then_hosted_takeover_leaves_pure_hosted() {
         pnp_cell: false,
     };
     yarn_berry_common::off_runtime(|| yarn_berry_common::run_manifestless_vex_matrix(&flow));
+}
+
+/// How many hosted pins a `scan --mode hosted --json` run wrote (or would
+/// write, on a dry run): its `applied` / `verified` events with
+/// `details.mode: "hosted"`.
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

@@ -321,8 +321,13 @@ impl<'a> ManifestlessVex<'a> {
             let out = run_vex(&binary(), project, &run);
             if missing_ledger {
                 assert_eq!(out.code, Some(1), "{out}");
-                assert_eq!(
-                    out.envelope["vendor"]["events"][0]["errorCode"], "vendor_ledger_entry_missing",
+                // The vendor engine's events join the scan envelope (after
+                // the download events), tagged `details.mode: "vendored"`.
+                assert!(
+                    out.envelope["events"]
+                        .as_array()
+                        .is_some_and(|events| events.iter().any(|e| e["action"] == "failed"
+                            && e["errorCode"] == "vendor_ledger_entry_missing")),
                     "{out}"
                 );
                 assert!(out.doc.is_none(), "failed scan cannot emit VEX: {out}");

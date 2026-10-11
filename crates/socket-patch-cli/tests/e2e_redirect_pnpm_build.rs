@@ -274,7 +274,7 @@ fn parse_envelope(stdout: &str) -> serde_json::Value {
 }
 
 fn warning_codes(env: &serde_json::Value) -> Vec<String> {
-    env["redirect"]["warnings"]
+    env["warnings"]
         .as_array()
         .map(|ws| {
             ws.iter()
@@ -601,7 +601,7 @@ async fn redirect_scanned_pnpm_project(
     let env = parse_envelope(&stdout);
     if pm == "pnpm@1.0.0" {
         assert_eq!(
-            env["redirect"]["redirected"], 0,
+            env["summary"]["applied"], 0,
             "unsafe legacy lock must be refused: {env}"
         );
         assert!(
@@ -634,7 +634,7 @@ async fn redirect_scanned_pnpm_project(
 
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        env["summary"]["applied"], 1,
         "exactly one dep redirected: {env}"
     );
     // The zero-touch trustLockfile auto-config fires only for root v9 locks
@@ -662,7 +662,7 @@ async fn redirect_scanned_pnpm_project(
         warning_codes(&env).contains(&"redirect_pnpm_trust_lockfile".to_string()),
         "a landed pnpm rewrite must warn about pnpm >=11 installs: {env}"
     );
-    let trust_detail = env["redirect"]["warnings"]
+    let trust_detail = env["warnings"]
         .as_array()
         .unwrap()
         .iter()
@@ -762,7 +762,7 @@ async fn redirect_scanned_pnpm_project(
     );
     let env2 = parse_envelope(&stdout);
     assert_eq!(
-        env2["redirect"]["redirected"], 1,
+        env2["summary"]["applied"], 1,
         "an already-redirected dep still counts: {env2}"
     );
     assert_eq!(
@@ -1394,7 +1394,7 @@ async fn pnpm_pinned_matrix_install_verify_revert_and_tamper() {
     // fresh checkout, including the legacy shrinkwrap filename.
     let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &fx.proj, &fx._server.uri(), &[]);
     assert_eq!(code, 0, "lock-only scan failed: {stdout}\n{stderr}");
-    assert_eq!(parse_envelope(&stdout)["redirect"]["redirected"], 1);
+    assert_eq!(parse_envelope(&stdout)["summary"]["applied"], 1);
 
     // Every major must reject a hosted tarball whose bytes disagree with its
     // lockfile pin, even when pnpm >=11 uses trustLockfile.
@@ -1627,7 +1627,7 @@ async fn pnpm_v5_lock_key_rewrite_splices_in_place() {
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        env["summary"]["applied"], 1,
         "the v5 path-style key must be redirectable: {env}"
     );
     assert_eq!(
@@ -1690,7 +1690,7 @@ async fn pnpm_v6_plain_lock_key_rewrite_stays_supported() {
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        env["summary"]["applied"], 1,
         "the plain v6 key must stay redirectable: {env}"
     );
     assert_eq!(
@@ -1712,7 +1712,7 @@ async fn pnpm_v6_plain_lock_key_rewrite_stays_supported() {
         !tmp.path().join("pnpm-workspace.yaml").exists(),
         "a v6-lock scan must not auto-write pnpm-workspace.yaml: {env}"
     );
-    let v6_detail = env["redirect"]["warnings"]
+    let v6_detail = env["warnings"]
         .as_array()
         .unwrap()
         .iter()
@@ -1869,11 +1869,7 @@ async fn pnpm_pinned_matrix_workspace_peer_instances() {
     mount_tarball_route(&server, patched_tarball).await;
     let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
     assert_eq!(code, 0, "workspace redirect: {stdout}\n{stderr}");
-    assert_eq!(
-        parse_envelope(&stdout)["redirect"]["redirected"],
-        1,
-        "{stdout}"
-    );
+    assert_eq!(parse_envelope(&stdout)["summary"]["applied"], 1, "{stdout}");
     let lock_after = std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap();
     // Both peer contexts must be represented before the rewrite; v9 factors
     // their common resolution into packages and keeps contexts in snapshots.

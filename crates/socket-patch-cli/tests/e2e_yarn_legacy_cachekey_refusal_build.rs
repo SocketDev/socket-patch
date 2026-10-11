@@ -22,11 +22,11 @@
 //! and then asserts the FULL refusal contract against the built binary:
 //!
 //!   * `scan --mode hosted`: exit 0, envelope `status: success`,
-//!     `redirect.redirected == 0`, no rewritten files, a per-file warning with
+//!     no `applied` event (`summary.applied == 0`), no rewritten files, a per-file warning with
 //!     code `redirect_yarn_berry_cache_unsupported` (the CODE, not human
 //!     text), and `yarn.lock` + `package.json` byte-identical.
-//!   * `scan --mode vendored`: exit 1, envelope `status: partial_failure`,
-//!     a failed DOWNLOAD record (errorCode
+//!   * `scan --mode vendored`: exit 1, envelope `status: partialFailure`,
+//!     a `failed` download event (errorCode
 //!     `vendor_yarn_berry_cache_unsupported`) produced before any view
 //!     fetch, with no vendor-step event for the package, zero mutations to
 //!     `yarn.lock` / `package.json`, and no `.socket/vendor` artifacts.
@@ -347,7 +347,7 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
     });
     assert_eq!(env["status"], "success", "({tag}) envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 0,
+        env["summary"]["applied"], 0,
         "({tag}) nothing may be redirected on a legacy-cacheKey lock: {env}"
     );
     assert_eq!(
@@ -355,9 +355,9 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
         Some(0),
         "({tag}) no file may be rewritten: {env}"
     );
-    let warnings = env["redirect"]["warnings"]
+    let warnings = env["warnings"]
         .as_array()
-        .unwrap_or_else(|| panic!("({tag}) redirect.warnings must be an array: {env}"));
+        .unwrap_or_else(|| panic!("({tag}) warnings must be an array: {env}"));
     let warning = warnings
         .iter()
         .find(|w| w["code"] == "redirect_yarn_berry_cache_unsupported")
@@ -408,16 +408,20 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("({tag}) scan --mode vendored --json output is not JSON: {e}\nstdout:\n{stdout}")
     });
-    assert_eq!(env["status"], "partial_failure", "({tag}) envelope: {env}");
+    assert_eq!(env["status"], "partialFailure", "({tag}) envelope: {env}");
     assert_eq!(
-        (&env["download"]["downloaded"], &env["download"]["failed"]),
+        (&env["summary"]["downloaded"], &env["summary"]["failed"]),
         (&serde_json::json!(0), &serde_json::json!(1)),
         "({tag}) the lock-text refusal fires before the view fetch: {env}"
     );
-    let failed = env["download"]["patches"]
+    let events_for_purl: Vec<&serde_json::Value> = env["events"]
         .as_array()
-        .and_then(|p| p.iter().find(|r| r["purl"] == PURL))
-        .unwrap_or_else(|| panic!("({tag}) expected a download record for {PURL}: {env}"));
+        .map(|events| events.iter().filter(|e| e["purl"] == PURL).collect())
+        .unwrap_or_default();
+    let failed = *events_for_purl
+        .first()
+        .unwrap_or_else(|| panic!("({tag}) expected a download event for {PURL}: {env}"));
+    assert_eq!(failed["details"]["mode"], "vendored", "({tag}) {failed}");
     assert_eq!(failed["action"], "failed", "({tag}) {failed}");
     assert_eq!(
         failed["errorCode"], "vendor_yarn_berry_cache_unsupported",
@@ -431,21 +435,14 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
         "({tag}) the refusal detail is the backend's own, naming the cacheKey: {failed}"
     );
     assert_eq!(
-        env["vendor"]["summary"]["applied"], 0,
+        env["summary"]["applied"], 0,
         "({tag}) nothing may be vendored: {env}"
     );
-    let vendor_events_for_purl: Vec<&serde_json::Value> = env["vendor"]["events"]
-        .as_array()
-        .map(|events| events.iter().filter(|e| e["purl"] == PURL).collect())
-        .unwrap_or_default();
-    assert!(
-        vendor_events_for_purl.is_empty(),
-        "({tag}) the vendor step must emit nothing for the package refused in the \
-         download phase: {env}"
-    );
     assert_eq!(
-        env["vendor"]["summary"]["failed"], 0,
-        "({tag}) the refusal is not double-counted by the vendor step: {env}"
+        events_for_purl.len(),
+        1,
+        "({tag}) the vendor step must emit nothing for the package refused in the \
+         download phase (the refusal is not double-counted): {env}"
     );
     assert_eq!(
         std::fs::read(&lock_path).unwrap(),
@@ -576,13 +573,11 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
             out.envelope["error"]["code"], "manifest_not_found",
             "({tag}) scan --vex: {out}"
         );
-        assert_eq!(out.envelope["redirect"]["redirected"], 0, "({tag}): {out}");
+        assert_eq!(out.envelope["summary"]["applied"], 0, "({tag}): {out}");
         assert!(
-            out.envelope["redirect"]["warnings"]
-                .as_array()
-                .is_some_and(|w| w
-                    .iter()
-                    .any(|w| w["code"] == "redirect_yarn_berry_cache_unsupported")),
+            out.envelope["warnings"].as_array().is_some_and(|w| w
+                .iter()
+                .any(|w| w["code"] == "redirect_yarn_berry_cache_unsupported")),
             "({tag}) scan --vex: still refused: {out}"
         );
         assert!(out.doc.is_none(), "({tag}) scan --vex: no document: {out}");

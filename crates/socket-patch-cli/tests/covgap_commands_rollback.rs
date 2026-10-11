@@ -24,6 +24,9 @@
 //! rollback restores the upstream registry entry from a mock npm registry
 //! (`SOCKET_NPM_REGISTRY`, see `NpmRegistry`).
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 #[path = "common/pty_io.rs"]
@@ -513,10 +516,11 @@ fn corrupt_manifest_json_errors_in_both_modes() {
     );
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(v["error"]["code"], "manifest_invalid", "stdout=\n{stdout}");
     assert!(
         v["error"]["message"]
             .as_str()
-            .is_some_and(|e| e.contains("Failed to parse manifest JSON")),
+            .is_some_and(|e| e.contains("not valid JSON")),
         "the error must name the parse failure; stdout=\n{stdout}"
     );
 
@@ -577,10 +581,14 @@ fn blobs_path_as_file_yields_legacy_error_envelope() {
             .is_some_and(|e| !e.is_empty()),
         "the envelope carries the io error; stdout=\n{stdout}"
     );
-    assert_eq!(v["rolledBack"], 0, "stdout=\n{stdout}");
-    assert_eq!(v["failed"], 0, "stdout=\n{stdout}");
-    assert_eq!(v["vendored"], json!([]), "stdout=\n{stdout}");
-    assert_eq!(v["results"], json!([]), "stdout=\n{stdout}");
+    assert_eq!(v["summary"]["rolledBack"], 0, "stdout=\n{stdout}");
+    assert_eq!(v["summary"]["failed"], 0, "stdout=\n{stdout}");
+    assert_eq!(v["command"], "rollback", "stdout=\n{stdout}");
+    assert_eq!(
+        v["events"],
+        json!([]),
+        "a full error envelope; stdout=\n{stdout}"
+    );
 
     // ── human: bare Error line ──
     let tmp = build();
@@ -666,7 +674,7 @@ fn path_scope_warns_about_out_of_scope_restored_copies() {
         "the singular grammar must hold; stdout=\n{stdout}"
     );
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        rollback_json::manifest_removed(&v),
         json!([purl]),
         "the fully-restored patch leaves the manifest; stdout=\n{stdout}"
     );
@@ -935,10 +943,9 @@ fn vendored_unknown_ecosystem_fails_leg_in_both_modes() {
     // (#1066), counted in the top-level `failed`.
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
     assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
-    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
-    let failed = v["vendoredFailed"]
-        .as_array()
-        .expect("vendoredFailed array");
+    assert_eq!(v["summary"]["failed"], 1, "stdout=\n{stdout}");
+    let failed_view = rollback_json::vendored_failed(&v);
+    let failed = failed_view.as_array().expect("vendoredFailed array");
     assert_eq!(failed.len(), 1, "stdout=\n{stdout}");
     assert_eq!(failed[0]["purl"], V_PURL, "stdout=\n{stdout}");
     assert!(
@@ -1071,7 +1078,7 @@ fn ecosystems_filter_narrows_vendored_scope() {
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(
-        v["vendoredReverted"],
+        rollback_json::vendored_reverted(&v),
         json!([]),
         "a pypi-scoped run must not revert the npm entry; stdout=\n{stdout}"
     );
@@ -1093,7 +1100,7 @@ fn ecosystems_filter_narrows_vendored_scope() {
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(
-        v["vendoredReverted"],
+        rollback_json::vendored_reverted(&v),
         json!([V_PURL]),
         "the npm-scoped run must revert it; stdout=\n{stdout}"
     );
@@ -1122,18 +1129,21 @@ fn corrupt_vendor_ledger_warns_and_fails_in_both_modes() {
         "a corrupt vendor ledger must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    assert_eq!(v["status"], "partialFailure", "stdout=\n{stdout}");
     assert!(
         warning_codes(&v).contains(&"vendor_state_unreadable".to_string()),
         "the warning must be surfaced; stdout=\n{stdout}"
     );
-    assert_eq!(
-        v["gc"],
-        json!({ "skipped": true }),
+    assert!(
+        v.get("gc").is_none(),
         "GC must be skipped fail-closed; stdout=\n{stdout}"
     );
+    assert!(
+        warning_codes(&v).contains(&"gc_skipped".to_string()),
+        "the skipped GC is warned; stdout=\n{stdout}"
+    );
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        rollback_json::manifest_removed(&v),
         json!([]),
         "manifest cleanup must be skipped fail-closed; stdout=\n{stdout}"
     );
@@ -1181,7 +1191,7 @@ fn path_glob_selects_vendored_entry() {
     );
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(
-        v["vendoredReverted"],
+        rollback_json::vendored_reverted(&v),
         json!([V_PURL]),
         "the path target must select the vendored entry; stdout=\n{stdout}"
     );
@@ -1309,10 +1319,9 @@ fn vendored_ledger_save_failure_fails_closed() {
     // (#1066), counted in the top-level `failed`.
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
     assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
-    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
-    let failed = v["vendoredFailed"]
-        .as_array()
-        .expect("vendoredFailed array");
+    assert_eq!(v["summary"]["failed"], 1, "stdout=\n{stdout}");
+    let failed_view = rollback_json::vendored_failed(&v);
+    let failed = failed_view.as_array().expect("vendoredFailed array");
     assert_eq!(failed.len(), 1, "stdout=\n{stdout}");
     assert_eq!(failed[0]["purl"], V_PURL, "stdout=\n{stdout}");
     assert!(
@@ -1352,12 +1361,12 @@ fn qualified_manifest_purl_removed_after_vendored_revert() {
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(
-        v["vendoredReverted"],
+        rollback_json::vendored_reverted(&v),
         json!([V_PURL]),
         "the ledger revert reports the LEDGER key; stdout=\n{stdout}"
     );
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        rollback_json::manifest_removed(&v),
         json!([QUALIFIED]),
         "the qualified manifest spelling must still be removed; stdout=\n{stdout}"
     );
@@ -1653,8 +1662,9 @@ fn per_purl_revert_failure_lands_in_hosted_failed() {
         "a refused pin must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
-    let failed = v["hosted"]["failed"].as_array().expect("failed array");
+    assert_eq!(v["status"], "partialFailure", "stdout=\n{stdout}");
+    let failed_view = rollback_json::hosted_failed(&v);
+    let failed = failed_view.as_array().expect("failed array");
     assert_eq!(failed.len(), 1, "stdout=\n{stdout}");
     assert_eq!(failed[0]["purl"], LP_PURL, "stdout=\n{stdout}");
     let error = failed[0]["error"].as_str().unwrap_or_default();
@@ -1667,7 +1677,7 @@ fn per_purl_revert_failure_lands_in_hosted_failed() {
          stdout=\n{stdout}"
     );
     assert_eq!(
-        v["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&v),
         json!([IO_PURL]),
         "the other pin restores on its own; stdout=\n{stdout}"
     );
@@ -1809,12 +1819,17 @@ fn legacy_ledger_beside_a_live_pin_is_never_the_revert_source() {
     // hosted pin counts in the top-level `failed`.
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
     assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
-    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
+    assert_eq!(v["summary"]["failed"], 1, "stdout=\n{stdout}");
     assert_eq!(
-        v["hosted"]["failed"][0]["purl"], LP_PURL,
+        rollback_json::hosted_failed(&v)[0]["purl"],
+        LP_PURL,
         "stdout=\n{stdout}"
     );
-    assert_eq!(v["hosted"]["reverted"], json!([]), "stdout=\n{stdout}");
+    assert_eq!(
+        rollback_json::hosted_reverted(&v),
+        json!([]),
+        "stdout=\n{stdout}"
+    );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_redirected_block()),
@@ -1837,7 +1852,7 @@ fn legacy_ledger_beside_a_live_pin_is_never_the_revert_source() {
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
     assert_eq!(
-        v["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&v),
         json!([LP_PURL]),
         "stdout=\n{stdout}"
     );
@@ -1912,7 +1927,7 @@ fn ecosystems_filter_narrows_hosted_scope() {
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(
-        v["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&v),
         json!([]),
         "a pypi-scoped run must not restore the npm pin; stdout=\n{stdout}"
     );
@@ -1930,7 +1945,7 @@ fn ecosystems_filter_narrows_hosted_scope() {
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(
-        v["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&v),
         json!([LP_PURL]),
         "the npm-scoped run must restore it; stdout=\n{stdout}"
     );
@@ -1970,7 +1985,7 @@ fn path_glob_selects_hosted_record() {
     );
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(
-        v["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&v),
         json!([LP_PURL]),
         "the path target must select the hosted pin; stdout=\n{stdout}"
     );
@@ -2011,14 +2026,16 @@ fn hosted_restore_write_failure_lands_in_hosted_failed() {
         "a lockfile write failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
-    let failed = v["hosted"]["failed"].as_array().expect("failed array");
+    assert_eq!(v["status"], "partialFailure", "stdout=\n{stdout}");
+    let failed_view = rollback_json::hosted_failed(&v);
+    let failed = failed_view.as_array().expect("failed array");
     assert!(
-        failed.iter().any(|f| f["purl"] == "files"
+        failed.iter().any(|f| f["purl"].is_null()
+            && f["errorCode"] == "hosted_write_failed"
             && f["error"]
                 .as_str()
                 .is_some_and(|e| e.contains("writing the restored lockfiles failed"))),
-        "the write failure must be reported under the 'files' key; stdout=\n{stdout}"
+        "the write failure must be an artifact-level hosted_write_failed event; stdout=\n{stdout}"
     );
     assert_eq!(
         std::fs::read_to_string(project.join("yarn.lock")).unwrap(),
@@ -2295,7 +2312,7 @@ fn gc_failure_warns_but_run_still_succeeds() {
         "the diffs sweep failure must be warned; stdout=\n{stdout}"
     );
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        rollback_json::manifest_removed(&v),
         json!([purl]),
         "the already-original entry still leaves the manifest; stdout=\n{stdout}"
     );
@@ -2350,13 +2367,13 @@ fn manifest_write_failure_warns_and_exits_one() {
         "a manifest write failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    assert_eq!(v["status"], "partialFailure", "stdout=\n{stdout}");
     assert!(
         warning_codes(&v).contains(&"manifest_write_failed".to_string()),
         "the write failure must be warned; stdout=\n{stdout}"
     );
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        rollback_json::manifest_removed(&v),
         json!([]),
         "nothing may be reported removed when the write failed; stdout=\n{stdout}"
     );
@@ -2526,7 +2543,7 @@ fn vendored_dry_run_json_previews_without_human_print() {
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["dryRun"], json!(true), "stdout=\n{stdout}");
     assert_eq!(
-        v["vendoredReverted"],
+        rollback_json::vendored_reverted(&v),
         json!([V_PURL]),
         "the envelope must preview the revert; stdout=\n{stdout}"
     );
@@ -2549,8 +2566,8 @@ fn vendored_dry_run_json_previews_without_human_print() {
 
 /// The manifest vanishing while another process holds the apply lock: the
 /// pre-lock existence probe saw the file, but the under-lock read finds
-/// it gone — rollback fails closed with the "Invalid manifest" error
-/// (exit 1) rather than silently treating the run as empty.
+/// it gone — rollback fails closed with `manifest_not_found` naming the
+/// path (exit 1) rather than silently treating the run as empty.
 ///
 /// Choreography: hold the lock, let the CLI pass its probe and block,
 /// delete the manifest, release. If the CLI was slow enough to probe
@@ -2558,7 +2575,7 @@ fn vendored_dry_run_json_previews_without_human_print() {
 /// instead — that alternative is detected and retried with a longer
 /// pre-delete grace (bounded; the first attempt lands in practice).
 #[test]
-fn manifest_deleted_under_held_lock_fails_with_invalid_manifest() {
+fn manifest_deleted_under_held_lock_fails_with_manifest_not_found() {
     use fs2::FileExt;
 
     for attempt in 1..=8u64 {
@@ -2610,8 +2627,14 @@ fn manifest_deleted_under_held_lock_fails_with_invalid_manifest() {
         );
         let v = parse_envelope(&stdout, &stderr);
         assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+        // Both interleavings are `manifest_not_found` (v5.0); the read
+        // under the lock names the path, the pre-lock probe does not.
+        assert_eq!(
+            v["error"]["code"], "manifest_not_found",
+            "stdout=\n{stdout}"
+        );
         match v["error"]["message"].as_str() {
-            Some("Invalid manifest") => return, // target interleaving reached
+            Some(m) if m.starts_with("Manifest not found at ") => return, // target interleaving reached
             Some("Manifest not found") => continue, // probed after the delete — retry
             other => panic!(
                 "unexpected error for the vanished manifest: {other:?}\nstdout=\n{stdout}\nstderr=\n{stderr}"
@@ -2883,26 +2906,18 @@ fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
         "the identifier-scoped rollback must succeed; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["rolledBack"], json!(1), "stdout=\n{stdout}");
+    assert_eq!(v["summary"]["rolledBack"], json!(1), "stdout=\n{stdout}");
     assert_eq!(
-        v["results"][0]["purl"],
-        json!(IO_PURL),
+        rollback_json::agent_rolled_back(&v),
+        json!([IO_PURL]),
         "only the named patch may be acted on; stdout=\n{stdout}"
     );
-    for leg in [
-        "vendoredReverted",
-        "vendoredPreserved",
-        "vendoredKept",
-        "vendoredFailed",
-    ] {
-        assert_eq!(
-            v[leg],
-            json!([]),
-            "the identifier must not leak into the vendored leg ({leg}); stdout=\n{stdout}"
-        );
-    }
+    assert!(
+        rollback_json::events_with_mode(&v, "vendored").is_empty(),
+        "the identifier must not leak into the vendored leg; stdout=\n{stdout}"
+    );
     assert_eq!(
-        v["manifest"]["removedEntries"],
+        rollback_json::manifest_removed(&v),
         json!([IO_PURL]),
         "only the named entry leaves the manifest; stdout=\n{stdout}"
     );
@@ -3057,7 +3072,8 @@ fn two_vendored_entries_each_cleanup_via_their_own_revert() {
         "the two-entry revert must succeed; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    let mut reverted: Vec<String> = v["vendoredReverted"]
+    let reverted_view = rollback_json::vendored_reverted(&v);
+    let mut reverted: Vec<String> = reverted_view
         .as_array()
         .expect("vendoredReverted array")
         .iter()
@@ -3069,7 +3085,8 @@ fn two_vendored_entries_each_cleanup_via_their_own_revert() {
         vec![V_PURL.to_string(), RP_PURL.to_string()],
         "both entries must revert; stdout=\n{stdout}"
     );
-    let mut removed: Vec<String> = v["manifest"]["removedEntries"]
+    let removed_view = rollback_json::manifest_removed(&v);
+    let mut removed: Vec<String> = removed_view
         .as_array()
         .expect("removedEntries array")
         .iter()
@@ -3200,8 +3217,13 @@ fn pypi_variant_group_with_no_installed_match_attempts_every_variant() {
     // Both variants failed and nothing was rolled back: a total failure.
     assert_eq!(v["status"], json!("error"), "stdout=\n{stdout}");
     assert_eq!(v["error"]["code"], "rollback_failed", "stdout=\n{stdout}");
-    assert_eq!(v["failed"], json!(2), "stdout=\n{stdout}");
-    let results = v["results"].as_array().expect("results array");
+    assert_eq!(v["summary"]["failed"], json!(2), "stdout=\n{stdout}");
+    let results: Vec<&Value> = v["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["action"] == "failed")
+        .collect();
     let mut result_purls: Vec<&str> = results
         .iter()
         .map(|r| r["purl"].as_str().expect("purl string"))
@@ -3214,10 +3236,10 @@ fn pypi_variant_group_with_no_installed_match_attempts_every_variant() {
          distribution — silent skipping is the bug this guards; stdout=\n{stdout}"
     );
     for r in results {
-        assert_eq!(r["success"], json!(false), "stdout=\n{stdout}");
+        assert_eq!(r["errorCode"], json!("hash_mismatch"), "stdout=\n{stdout}");
         assert_eq!(
-            r["filesVerified"][0]["status"],
-            json!("hash_mismatch"),
+            r["details"]["filesVerified"][0]["status"],
+            json!("hashMismatch"),
             "the per-file verification must surface the drift; stdout=\n{stdout}"
         );
     }
@@ -3328,23 +3350,22 @@ fn discovered_local_go_redirect_drops_wiring_not_cache_copy() {
         "the discovered redirect rollback must succeed; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["rolledBack"], json!(1), "stdout=\n{stdout}");
-    let result = &v["results"][0];
-    assert_eq!(result["purl"], json!(PURL), "stdout=\n{stdout}");
+    assert_eq!(v["summary"]["rolledBack"], json!(1), "stdout=\n{stdout}");
+    let result = rollback_json::agent_event(&v, "rolledBack", PURL);
     // The DISCOVERED route: the result names the module-cache copy — the
     // undiscovered fallback reports the project root instead, so this
     // pins which path ran.
-    let path = result["path"].as_str().expect("path string");
+    let path = result["details"]["path"].as_str().expect("path string");
     assert!(
         path.ends_with("discovered@v1.2.3") && path != root.display().to_string(),
         "the target must be the discovered cache dir; path={path}"
     );
     assert!(
-        result["filesRolledBack"]
+        result["files"]
             .as_array()
-            .expect("filesRolledBack array")
+            .expect("files array")
             .iter()
-            .any(|f| f == "package/discovered.go"),
+            .any(|f| f["path"] == "package/discovered.go"),
         "the redirect teardown reports the patch's files; stdout=\n{stdout}"
     );
     assert!(

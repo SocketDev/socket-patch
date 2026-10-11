@@ -196,7 +196,14 @@ fn global_rollback_leaves_hosted_project_pins() {
         assert_eq!(code, 0, "{args:?}: stdout={stdout}\nstderr={stderr}");
         let v = parse(&stdout, &stderr);
         assert_eq!(v["status"], "success", "{v}");
-        assert_eq!(v["hosted"]["reverted"], json!([]), "{args:?}: {v}");
+        assert!(
+            !v["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .any(|e| e["details"]["mode"] == "hosted"),
+            "{args:?}: {v}"
+        );
         assert_hosted_untouched(tmp.path(), &format!("{args:?}"));
     }
 }
@@ -394,7 +401,14 @@ fn global_rollback_leaves_vendored_project_state() {
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse(&stdout, &stderr);
-    assert_eq!(v["vendoredReverted"], json!([]), "{v}");
+    assert!(
+        !v["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .any(|e| e["details"]["mode"] == "vendored"),
+        "{v}"
+    );
     project.assert_untouched("rollback --global-prefix");
     assert!(
         project.manifest()["patches"].get(V_PURL).is_some(),

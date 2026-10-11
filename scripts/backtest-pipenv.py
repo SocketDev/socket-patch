@@ -148,6 +148,50 @@ def is_legacy(version):
     return major_of(version) < 2018
 
 
+# ---------------------------------------------------- v5 `--json` envelope
+# Every command prints ONE envelope (CLI_CONTRACT.md "`scan` and `get` JSON
+# (v5.0)"): `status` (camelCase), `dryRun`, `events[]` (each `{action, purl,
+# uuid, errorCode, reason, error, details}`; hosted / vendored events carry
+# `details.mode`, agent events none), `summary`, top-level `warnings[{code,
+# detail}]` and `error{code, message}`. No `redirect.redirected`,
+# `vendor.summary`, `apply.*` or legacy rollback arrays any more.
+def leg_events(mode, envelope):
+    """The events of one leg: `details.mode` hosted / vendored; every other
+    mode (agent, agent-oot) reads the mode-less agent events."""
+    leg = mode if mode in ("hosted", "vendored") else None
+    return [e for e in (envelope or {}).get("events") or [] if (e.get("details") or {}).get("mode") == leg]
+
+
+def applied_count(mode, envelope, action=None):
+    """Patches the leg wired: its `applied` events (a hosted re-run still
+    emits `applied` for the pins it re-confirms), or on a `--dry-run` the
+    `verified` previews. `action` counts another action instead."""
+    action = action or ("verified" if (envelope or {}).get("dryRun") else "applied")
+    return sum(1 for e in leg_events(mode, envelope) if e.get("action") == action)
+
+
+def envelope_warnings(envelope):
+    """Every coded record of the run as `{code, detail, action, purl}`: the
+    top-level `error`, each event carrying an `errorCode` (refusals, skips,
+    failures, vendor advisories) and each run-level warning."""
+    env = envelope or {}
+    rows = []
+    if isinstance(env.get("error"), dict) and env["error"].get("code"):
+        rows.append({"code": env["error"]["code"], "detail": env["error"].get("message") or ""})
+    for e in env.get("events") or []:
+        if e.get("errorCode"):
+            rows.append({"code": e["errorCode"], "detail": e.get("reason") or e.get("error") or "", "action": e.get("action"), "purl": e.get("purl")})
+    for w in env.get("warnings") or []:
+        if isinstance(w, dict) and w.get("code"):
+            rows.append({"code": w["code"], "detail": w.get("detail") or ""})
+    return rows
+
+
+def envelope_codes(envelope):
+    """The sorted distinct codes of `envelope_warnings`."""
+    return sorted({w["code"] for w in envelope_warnings(envelope)})
+
+
 def save(path, data):
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
@@ -660,32 +704,6 @@ def main():
             return link, ["--cwd", str(link)]
         raise ValueError(invocation)
 
-    def applied_count(mode, envelope):
-        if mode == "hosted":
-            return envelope.get("redirect", {}).get("redirected", 0)
-        if mode == "vendored":
-            return envelope.get("vendor", {}).get("summary", {}).get("applied", 0)
-        return envelope.get("apply", {}).get("applied", 0)
-
-    def planned_count(mode, envelope):
-        """What a --dry-run envelope says WOULD happen (no summary is written)."""
-        if mode == "hosted":
-            return envelope.get("redirect", {}).get("redirected", 0)
-        if mode == "vendored":
-            v = envelope.get("vendor", {})
-            if v.get("dryRun"):
-                return sum(1 for p in v.get("patches", []) if p.get("action") == "would_vendor")
-            return v.get("summary", {}).get("applied", 0)
-        a = envelope.get("apply", {})
-        return a.get("added", 0) + a.get("updated", 0) if a.get("dryRun") else a.get("applied", 0)
-
-    def envelope_warnings(mode, envelope):
-        if mode == "hosted":
-            return envelope.get("redirect", {}).get("warnings", [])
-        if mode == "vendored":
-            return envelope.get("vendor", {}).get("events", [])
-        return envelope.get("apply", {}).get("patches", [])
-
     def record_hashes(project, mode):
         if mode == "hosted":
             # v5 hosted mode keeps no ledger: the lock pin names the uuid.
@@ -842,7 +860,9 @@ def main():
             e1 = r1.json_or_empty()
             pkgs = e1.get("packages") or []
             u3 = [p for p in pkgs if "urllib3" in (p.get("purl") or "")]
-            found = e1.get("apply", {}).get("found", 0)
+            # Legacy `apply.found`: distinct purls among the agent events of
+            # this dry run (the `verified` previews of the urllib3 selection).
+            found = len({e.get("purl") for e in leg_events("agent", e1) if e.get("purl")})
             # The envelope names packages but not where they live. A crawler that
             # found the out-of-tree venv scans exactly its distributions; the
             # project-marker fallback scans `python3`-on-PATH instead (here the
@@ -920,7 +940,7 @@ def main():
             envelope = r.json()
             save(case / "cli-output.json", envelope)
             applied = applied_count("agent", envelope)
-            check("appliedExactlyOne", applied == 1, {"applied": applied, "status": envelope.get("status"), "patches": envelope_warnings("agent", envelope)[:4]})
+            check("appliedExactlyOne", applied == 1, {"applied": applied, "status": envelope.get("status"), "events": [{k: e.get(k) for k in ("action", "purl", "errorCode")} for e in leg_events("agent", envelope)][:4]})
             if not checks["appliedExactlyOne"]:
                 row["passed"] = False
                 return row
@@ -951,7 +971,7 @@ def main():
             mf = project / ".socket/manifest.json"
             check("rollbackClearsManifest", not mf.exists() or json.loads(mf.read_text()).get("patches") in ({}, None))
             check("rollbackKeepsLock", (project / "Pipfile.lock").read_bytes() == pristine_lock and (project / "Pipfile").read_bytes() == pristine_pipfile)
-            info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed", "hosted", "vendoredReverted", "manifest") if k in erb}
+            info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "summary", "hosted", "error", "warnings") if k in erb}
             row["supported"] = True
             row["passed"] = all(checks.values())
             return row
@@ -963,7 +983,7 @@ def main():
         make_venv(version, tool, venv, project, case / "venv-empty.log")
         r0 = cli_run(penv, "scan", "--mode", mode, log="scan-lockonly.log")
         e0 = r0.json_or_empty()
-        codes0 = sorted({(w.get("code") or w.get("errorCode")) for w in envelope_warnings(mode, e0) if (w.get("code") or w.get("errorCode"))})
+        codes0 = envelope_codes(e0)
         info["lockOnly"] = {"exit": r0.rc, "applied": applied_count(mode, e0), "lockfileOnlyPackages": e0.get("lockfileOnlyPackages"), "codes": codes0}
         check("lockOnlyApplies", applied_count(mode, e0) == 1, info["lockOnly"])
         if applied_count(mode, e0) == 1:
@@ -974,7 +994,7 @@ def main():
             lock1 = (project / "Pipfile.lock").read_bytes()
             r1 = cli_run(penv, "scan", "--mode", mode, log="scan-lockonly-rescan.log")
             e1 = r1.json_or_empty()
-            codes1 = sorted({(w.get("code") or w.get("errorCode")) for w in envelope_warnings(mode, e1) if (w.get("code") or w.get("errorCode"))})
+            codes1 = envelope_codes(e1)
             ok1 = r1.ok() and e1.get("status") == "success" and (project / "Pipfile.lock").read_bytes() == lock1 and "package_not_installed" not in codes1
             check("lockOnlyRescanGreen", ok1, {"exit": r1.rc, "status": e1.get("status"), "codes": codes1})
         shutil.rmtree(project / ".socket", ignore_errors=True)
@@ -989,7 +1009,7 @@ def main():
         # --dry-run first: must report the same count and leave everything untouched.
         rd = cli_run(penv, "scan", "--mode", mode, "--dry-run", log="scan-dryrun.log")
         ed = rd.json_or_empty()
-        dry_applied = planned_count(mode, ed)
+        dry_applied = applied_count(mode, ed)
         dry_clean = (project / "Pipfile.lock").read_bytes() == pristine_lock and (project / "Pipfile").read_bytes() == pristine_pipfile and not (project / ".socket").exists()
         info["dryRun"] = {"exit": rd.rc, "applied": dry_applied, "untouched": dry_clean}
 
@@ -1002,12 +1022,12 @@ def main():
         save(case / "cli-output.json", envelope)
         applied = applied_count(mode, envelope)
         info["applied"] = applied
-        warnings = envelope_warnings(mode, envelope)
+        warnings = envelope_warnings(envelope)
         info["warnings"] = warnings[:8]
         lock_after = (project / "Pipfile.lock").read_bytes()
         check("pipfileUnchanged", (project / "Pipfile").read_bytes() == pristine_pipfile)
         # Hosted --dry-run computes the rewrite; vendored --dry-run is a
-        # ledger-only preview (`would_vendor`) that runs no backend guard, so
+        # ledger-only preview (vendored `verified` events) that runs no backend guard, so
         # its parity is recorded, not required.
         check("dryRunParity", dry_applied == applied and dry_clean, info["dryRun"])
 
@@ -1023,7 +1043,7 @@ def main():
             reason, code = refusal
             row["supported"] = False
             row["expected"] = f"refused: {reason} ({code})"
-            codes = sorted({(w.get("code") or w.get("errorCode")) for w in warnings if (w.get("code") or w.get("errorCode"))})
+            codes = envelope_codes(envelope)
             check("refusedWithCode", applied == 0 and code in codes, {"applied": applied, "codes": codes, "exit": r.rc})
             check("lockUnchanged", lock_after == pristine_lock)
             check("noLedger", not (project / ".socket/vendor/redirect-state.json").exists() and not (project / ".socket/vendor/state.json").exists())
@@ -1040,9 +1060,9 @@ def main():
         # The scan ran against a venv holding the UPSTREAM release: Pipenv will
         # not reinstall it, so the CLI must say so (positive-evidence probe).
         stale_code = "redirect_pypi_stale_install" if mode == "hosted" else "pypi_pipenv_stale_install"
-        stale = [w for w in warnings if (w.get("code") or w.get("errorCode")) == stale_code]
-        stale_text = (stale[0].get("detail") or stale[0].get("reason") or "") if stale else ""
-        check("staleInstallWarned", bool(stale) and "pipenv run pip uninstall" in stale_text, {"codes": sorted({(w.get("code") or w.get("errorCode")) for w in warnings if (w.get("code") or w.get("errorCode"))}), "detail": stale_text[:300] or None})
+        stale = [w for w in warnings if w["code"] == stale_code]
+        stale_text = stale[0]["detail"] if stale else ""
+        check("staleInstallWarned", bool(stale) and "pipenv run pip uninstall" in stale_text, {"codes": envelope_codes(envelope), "detail": stale_text[:300] or None})
         check("lockRewritten", lock_after != pristine_lock)
         if shape == "crlf":
             check("crlfPreserved", b"\n" not in lock_after.replace(b"\r\n", b""))
@@ -1188,10 +1208,10 @@ def main():
                 lock_ok = post == relocked
             if mode == "hosted" and not hybrid:
                 # No pin, no ledger, no manifest: nothing to roll back.
-                retired = rrb.rc == 1 and (erb2.get("error") or {}).get("message") == "Manifest not found"
+                retired = rrb.rc == 1 and (erb2.get("error") or {}).get("code") == "manifest_not_found"
             else:
                 retired = rrb.ok()
-            check("rollbackAfterRelockRetires", retired and cleared and lock_ok, {"exit": rrb.rc, "cleared": cleared, "hybridRelock": hybrid, "lockKeptRelocked": post == relocked, "lockRestoredOriginal": post == pristine_lock, "referenceLeft": marker in post, "envelope": {k: erb2.get(k) for k in ("status", "hosted", "vendoredReverted", "failed") if k in erb2}, "tail": rrb.tail(400) if not rrb.ok() else None})
+            check("rollbackAfterRelockRetires", retired and cleared and lock_ok, {"exit": rrb.rc, "cleared": cleared, "hybridRelock": hybrid, "lockKeptRelocked": post == relocked, "lockRestoredOriginal": post == pristine_lock, "referenceLeft": marker in post, "envelope": {"status": erb2.get("status"), "error": erb2.get("error"), "summary": erb2.get("summary"), "codes": envelope_codes(erb2)}, "tail": rrb.tail(400) if not rrb.ok() else None})
         (project / "Pipfile.lock").write_bytes(lock_after)
         (project / "Pipfile").write_bytes(pristine_pipfile)
 
@@ -1204,7 +1224,9 @@ def main():
         check("rollbackKeepsPipfile", (project / "Pipfile").read_bytes() == pristine_pipfile)
         if mode == "hosted":
             check("rollbackNoRedirectLedger", not (project / ".socket/vendor/redirect-state.json").exists())
-            check("rollbackRestoredUpstream", PURL_BASE in ((erb.get("hosted") or {}).get("reverted") or []), erb.get("hosted"))
+            # v5: a hosted restore is a `rolledBack` event with details.mode hosted.
+            reverted = [e.get("purl") or "" for e in leg_events("hosted", erb) if e.get("action") == "rolledBack"]
+            check("rollbackRestoredUpstream", any(p == PURL_BASE or p.startswith(PURL_BASE + "?") for p in reverted), {"reverted": reverted, "hosted": erb.get("hosted")})
         if mode == "vendored":
             check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists())
             state = project / ".socket/vendor/state.json"
@@ -1212,7 +1234,7 @@ def main():
         # Hosted and vendored runs are manifest-free (v5.0): nothing may have
         # been written to `.socket/manifest.json` at any point.
         check("noManifestWritten", not (project / ".socket/manifest.json").exists())
-        info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed", "hosted", "vendoredReverted", "manifest") if k in erb}
+        info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "summary", "hosted", "error", "warnings") if k in erb}
         # Measured boundaries, recorded rather than required: Pipenv never
         # reinstalls a present release (warmInstallReplacesUpstream — the CLI
         # warns instead, see staleInstallWarned) and the vendored --dry-run

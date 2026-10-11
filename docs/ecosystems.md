@@ -670,6 +670,21 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   repository whose grant URL changed (a rotated token) is refreshed in place. A suffixed
   literal no hosted repository in the pom minted (a vendored `socket-patch-vendor-<uuid>`
   pin, say) is still a mismatch and is skipped.
+  The rewriter reads the pom the way Maven builds the project: markup inside comments,
+  CDATA, `<build>` / `<reporting>` (plugin classpaths), `<pluginRepositories>`,
+  `<distributionManagement>` and `<profiles>` is never matched or edited, and the
+  repository and `<dependencyManagement>` pin always land in the project's own top-level
+  sections (an existing self-closed `<repositories/>` or `<dependencyManagement/>` is
+  expanded in place, so Maven never sees a duplicated tag). A GA declared only in such
+  markup counts as transitive and gets the top-level pin; a versioned declaration inside
+  `<profiles>` (a literal or a `${property}`) is left as-is and reported
+  (`redirect_maven_profile_dependency_unpatched`), because an active profile's version
+  beats the pin, and when a profile holds the GA's only declaration nothing is pinned.
+  The grant serves the main jar only: a `<classifier>` variant keeps its version
+  (`redirect_maven_classifier_unsupported`), and the literal-or-pin decision is made from
+  the classifier-less declarations. A `sources` / `javadoc` variant at the patched release
+  only warns; any other variant there (tests, a native build) would keep unpatched code on
+  a classpath, so the dep is not redirected.
 * **Multi-module reactors are vendored-only (hosted Maven).** Hosted mode reads only
   the root `pom.xml`, and a module's own literal `<version>` always beats a root
   `<dependencyManagement>` pin, so a root pin would leave that module on the unpatched
@@ -702,6 +717,20 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
   *mismatch* fails.
+* **A Maven project's scan is scoped to its dependency graph.** The Maven local
+  repository is shared by every project on the machine, so in project mode (no
+  `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or
+  sbt / Mill / scala-cli build beside it) keeps only the coordinates its poms reach:
+  every reactor declaration (modules and profiles included, any scope), then each
+  artifact's own non-optional `compile` / `runtime` dependencies, read from the poms the
+  repository already holds, with versions from properties, parents, management and
+  imported BOMs (the reactor's management applies to transitives, as in Maven). A
+  version that cannot be determined (an undefined property, a range, a pom not in the
+  repository) admits every cached version of that artifact. Artifacts another project
+  cached are not scanned, so hosted mode never pins them and `vex` never attests them.
+  A project that has never been resolved therefore finds nothing; resolve it once
+  (`mvn -q dependency:resolve`) and scan again. An unreadable root `pom.xml` leaves the
+  crawl unscoped.
 * **Local-repository discovery reads coordinates from the path.** `scan` (and every
   other crawl of `~/.m2/repository`) takes a POM's groupId / artifactId / version from
   its directory when the file sits at the canonical
@@ -1254,6 +1283,19 @@ lines, so `go mod tidy -diff` stays clean after a patch update.
 
 This requires a free, publicly retrievable patch reference carrying a `goproxy`
 override. CLI support does not imply a patch is published for a particular module.
+
+### Files go derives from go.mod
+
+Two files the go command derives from `go.mod` can disagree with a new or removed
+socket `replace`, and go then refuses to build. socket-patch does not regenerate
+them (that needs the go toolchain and the whole module graph); `apply`, `vendor`,
+`rollback` and `scan --mode hosted` warn with the command that does, and
+`apply --check` / `vendor --check` report the disagreement as drift until it is run:
+
+| Warning code | When | Fix |
+| --- | --- | --- |
+| `go_vendor_modules_txt_out_of_sync` | A committed `vendor/` directory (`go mod vendor`; `go work vendor` for a workspace) whose `vendor/modules.txt` does not record a socket `replace`, or still records one that was removed. go builds with `-mod=vendor` and fails with "inconsistent vendoring" | `go mod vendor` (or `go work vendor`), then commit `vendor/` |
+| `go_requirements_out_of_sync` | The patched module's own `go.mod` requires a dependency at a version above the one the project's `go.mod` lists (agent and vendored modes; `apply` also reports a requirement the patch added). The default `-mod=readonly` build fails with "updates to go.mod needed" or "missing go.sum entry" | `go mod tidy`, then commit `go.mod` and `go.sum` |
 Paid hosted Go references are unsupported: embedding credentials in module paths
 would expose them to module proxies and change module identity. Use vendored mode
 for those patches; the CLI reports `redirect_golang_unsupported` when the required

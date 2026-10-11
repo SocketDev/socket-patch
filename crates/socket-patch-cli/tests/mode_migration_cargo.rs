@@ -716,7 +716,7 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
     let (code, stdout, stderr) = run_socket(&proj, &hosted_args, &cargo_home);
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
-    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_eq!(hosted_pinned(&envelope), 1, "{stdout}");
     // The takeover is surfaced, and it really reverted the vendored state.
     assert!(
         stdout.contains("redirect_takeover_reverted_vendored"),
@@ -890,7 +890,7 @@ async fn lockless_vendor_then_first_build_then_hosted_takeover() {
         !stdout.contains("redirect_cargo_lock_pkg_not_found"),
         "the reverted lock names the crate by its version: {stdout}"
     );
-    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_eq!(hosted_pinned(&envelope), 1, "{stdout}");
     assert_lock_version(&proj, &version, "lockless vendor -> hosted");
     let lock_block = package_block(&read(&proj, "Cargo.lock"), DEP).unwrap_or_default();
     assert!(
@@ -1321,6 +1321,21 @@ async fn vendor_over_unrestorable_hosted_pin_is_refused() {
     assert!(!vendor_ledger_claims(&proj, &purl));
 }
 
+/// How many hosted pins a `scan --mode hosted --json` run wrote (or would
+/// write, on a dry run): its `applied` / `verified` events with
+/// `details.mode: "hosted"`.
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
+}
+
 // ── #1020: a takeover the hosted rewriter refuses keeps the vendored patch ──
 // Vendored mode accepts every Cargo.toml spelling of the dependency (it never
 // edits the dependency line); the hosted cargo rewriter refuses some
@@ -1405,7 +1420,7 @@ async fn takeover_over_unrewritable_spelling_keeps_vendored() {
         let (dry_code, dry_out, stderr) = run_socket(&proj, &dry, &cargo_home);
         let dry_env: serde_json::Value = serde_json::from_str(&dry_out)
             .unwrap_or_else(|e| panic!("{tag}: dry-run json ({e}): {dry_out}\n{stderr}"));
-        assert_eq!(dry_env["redirect"]["redirected"], 0, "{tag}: {dry_out}");
+        assert_eq!(hosted_pinned(&dry_env), 0, "{tag}: {dry_out}");
         assert!(
             !dry_out.contains("redirect_would_revert_vendored"),
             "{tag}: the dry run must not preview a takeover the wet run refuses: {dry_out}"
@@ -1422,7 +1437,7 @@ async fn takeover_over_unrewritable_spelling_keeps_vendored() {
             .unwrap_or_else(|e| panic!("{tag}: wet json ({e}): {stdout}\n{stderr}"));
         assert_eq!(code, dry_code, "{tag}: dry run and wet run agree: {stdout}");
         assert_eq!(env["status"], dry_env["status"], "{tag}: {stdout}");
-        assert_eq!(env["redirect"]["redirected"], 0, "{tag}: {stdout}");
+        assert_eq!(hosted_pinned(&env), 0, "{tag}: {stdout}");
         assert!(
             !stdout.contains("redirect_takeover_unpatched")
                 && !stdout.contains("redirect_takeover_reverted_vendored"),

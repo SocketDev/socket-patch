@@ -303,6 +303,18 @@ fn manifest_record(socket: &Path, uuid: &str, before: &[u8], after: &[u8]) -> se
     })
 }
 
+/// The purls a `scan --json --sync` run pruned (or, on `--dry-run`, would
+/// prune) from the manifest: its `details.manifest: true` events.
+fn manifest_pruned(json: &serde_json::Value) -> Vec<serde_json::Value> {
+    json["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["manifest"] == true)
+        .map(|e| e["purl"].clone())
+        .collect()
+}
+
 /// #1278: the project crawl only looks up the crates `Cargo.lock`
 /// resolves, so a patched crate the lock bumped away from is "not
 /// crawled". `scan --sync` must not prune its manifest entry (and GC its
@@ -381,8 +393,8 @@ async fn sync_keeps_entry_whose_shared_cache_copy_is_still_patched() {
     let json: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("scan --dry-run --sync JSON ({e}):\n{stdout}"));
     assert_eq!(
-        json["gc"]["prunedManifestEntries"],
-        serde_json::json!([ryu]),
+        manifest_pruned(&json),
+        vec![serde_json::json!(ryu)],
         "the preview must keep the still-patched cargo entry: {json:#}"
     );
 
@@ -400,14 +412,11 @@ async fn sync_keeps_entry_whose_shared_cache_copy_is_still_patched() {
     );
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
-        json["gc"]["prunedManifestEntries"],
-        serde_json::json!([ryu]),
+        manifest_pruned(&json),
+        vec![serde_json::json!(ryu)],
         "only the pristine dropped crate is pruned: {json:#}"
     );
-    let warnings = json["gc"]["warnings"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let warnings = json["warnings"].as_array().cloned().unwrap_or_default();
     assert!(
         warnings
             .iter()
@@ -507,8 +516,8 @@ async fn sync_keeps_shared_cache_entry_behind_a_cargo_vendor_dir() {
     assert!(out.status.success(), "scan --sync must exit 0:\n{stdout}");
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
-        json["gc"]["prunedManifestEntries"],
-        serde_json::json!([]),
+        manifest_pruned(&json),
+        Vec::<serde_json::Value>::new(),
         "{json:#}"
     );
     let m: serde_json::Value =

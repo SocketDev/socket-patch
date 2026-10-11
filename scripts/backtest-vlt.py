@@ -906,35 +906,49 @@ def parse_envelope(output):
         return None
 
 
-def envelope_codes(value):
-    """Every `code` / `errorCode` / skipped `reason` code anywhere in it."""
-    codes = []
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in ('code', 'errorCode') and isinstance(item, str):
-                codes.append(item)
-            elif key == 'reason' and isinstance(item, str) and re.fullmatch(r'[a-z0-9_]+', item):
-                codes.append(item)
-            else:
-                codes.extend(envelope_codes(item))
-    elif isinstance(value, list):
-        for item in value:
-            codes.extend(envelope_codes(item))
-    return codes
+def envelope_entries(envelope):
+    """`(code, detail)` for every coded entry of a v5 envelope: `error`
+    (`{code, message}`), every event with an `errorCode` (its `reason`, or its
+    `error` for a `failed` event, as the detail), every top-level
+    `warnings[]` `{code, detail}` and, on a `--vex` run, `vex.warnings`."""
+    if not isinstance(envelope, dict):
+        return []
+    entries = []
+    error = envelope.get('error')
+    if isinstance(error, dict) and error.get('code'):
+        entries.append((error['code'], error.get('message')))
+    for event in envelope.get('events') or []:
+        if event.get('errorCode'):
+            entries.append((event['errorCode'], event.get('reason') or event.get('error')))
+    for warning in [*(envelope.get('warnings') or []),
+                    *((envelope.get('vex') or {}).get('warnings') or [])]:
+        if isinstance(warning, dict) and warning.get('code'):
+            entries.append((warning['code'], warning.get('detail')))
+    return entries
 
 
-def envelope_details(value, code):
-    found = []
+def all_codes(value):
+    """Every `code` / `errorCode` string anywhere in a JSON document, depth
+    first (the Rust tests' `all_codes`): for a PUBLISHED release's output,
+    which may predate the v5 envelope."""
     if isinstance(value, dict):
-        if code in (value.get('code'), value.get('errorCode')) and isinstance(
-                value.get('detail'), str):
-            found.append(value['detail'])
-        for item in value.values():
-            found.extend(envelope_details(item, code))
-    elif isinstance(value, list):
-        for item in value:
-            found.extend(envelope_details(item, code))
-    return found
+        return [c for k, v in value.items()
+                for c in ([v] if k in ('code', 'errorCode') and isinstance(v, str) else [])
+                + all_codes(v)]
+    if isinstance(value, list):
+        return [c for item in value for c in all_codes(item)]
+    return []
+
+
+def envelope_codes(envelope):
+    """Every code the envelope reports (see `envelope_entries`)."""
+    return [code for code, _ in envelope_entries(envelope)]
+
+
+def envelope_details(envelope, code):
+    """The detail strings of every `code` entry (see `envelope_entries`)."""
+    return [detail for c, detail in envelope_entries(envelope)
+            if c == code and isinstance(detail, str)]
 
 
 def vex_statements(doc, purl):
@@ -1592,7 +1606,7 @@ def downgrade(args, ctx, vlt):
             code, output, _ = run([published, *command, '--json', '--yes', '--no-telemetry',
                                    '--cwd', project], project, ctx['cli_env'], log)
             row['publishedExitCode'] = code
-            row['publishedCodes'] = sorted(set(envelope_codes(parse_envelope(output))))
+            row['publishedCodes'] = sorted(set(all_codes(parse_envelope(output))))
             now = snapshot(project)
             untouched = now == written
             reverted = {n: b for n, b in now.items() if not n.startswith('.socket/')} == {

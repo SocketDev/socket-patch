@@ -259,7 +259,7 @@ fn rollback_downloads_blob_needed_only_by_nested_duplicate_copy() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("rollback must emit JSON: {e}; stdout={stdout}"));
     assert_eq!(v["status"], "success", "envelope={v}");
-    assert_eq!(v["failed"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["failed"], 0, "envelope={v}");
 }
 
 /// Anti-overshoot guard: when EVERY copy is already original, the absent
@@ -289,7 +289,7 @@ fn rollback_offline_succeeds_when_every_copy_already_original() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("rollback must emit JSON: {e}; stdout={stdout}"));
     assert_eq!(v["status"], "success", "envelope={v}");
-    assert_eq!(v["failed"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["failed"], 0, "envelope={v}");
     assert_eq!(std::fs::read(&index_a).unwrap(), original);
     assert_eq!(std::fs::read(&index_b).unwrap(), original);
 }

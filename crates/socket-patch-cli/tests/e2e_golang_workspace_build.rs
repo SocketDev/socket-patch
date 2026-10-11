@@ -607,7 +607,7 @@ fn go_work_hosted_members_build_patched_and_attest_without_manifest() {
         code, 0,
         "get --mode hosted in a go.work root: {env}\n{stderr}"
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
     assert_eq!(
         env["redirect"]["rewrittenFiles"],
         serde_json::json!(["go.mod", "go.sum"]),

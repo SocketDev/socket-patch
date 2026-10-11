@@ -2,6 +2,9 @@
 //!
 //! One test binary per command: each module was its own binary.
 
+#[path = "../common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "../vex_e2e_common/bun.rs"]
 mod bun_vex;
 #[path = "../common/mod.rs"]

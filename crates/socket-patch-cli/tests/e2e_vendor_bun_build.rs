@@ -1370,20 +1370,17 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
     );
     let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["found"], 1, "envelope: {env}");
-    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert_eq!(env["command"], "get", "envelope: {env}");
+    assert_eq!(env["summary"]["downloaded"], 1, "envelope: {env}");
     assert!(
         env.get("applied").is_none(),
         "vendored get drops the applied key (nothing is applied in place): {env}"
     );
     assert_eq!(
-        env["vendor"]["summary"]["applied"], 1,
+        env["summary"]["applied"], 1,
         "the nested vendor envelope must report the one vendored package: {env}"
     );
-    assert_eq!(
-        env["vendor"]["summary"]["failed"], 0,
-        "no vendor failures: {env}"
-    );
+    assert_eq!(env["summary"]["failed"], 0, "no vendor failures: {env}");
 
     // Anti-vacuity oracle: the record really came from the mocked view
     // endpoint, not from any pre-existing local state.

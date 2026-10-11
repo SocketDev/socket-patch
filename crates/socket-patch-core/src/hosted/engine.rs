@@ -634,6 +634,33 @@ pub async fn read_candidate_files(
         }
     }
 
+    // NuGet merges the user config and every parent directory's config
+    // under the project's own: a catch-all mapping the rewriter creates
+    // must name their sources too (#354). Disk only (the in-memory engine
+    // refuses NuGet, and could not see them).
+    if candidates.iter().any(|c| c.dep.ecosystem == "nuget")
+        && !matches!(view, ProjectView::Memory(_))
+    {
+        // The configs live outside the project: read beside the view, then
+        // handed to it as such reads (asking for its raw root would end a
+        // re-scan read cache's recording).
+        if let Some(root) = view.disk_root_reading(std::iter::empty::<&str>()) {
+            let (inherited, touched) =
+                crate::vendor::nuget_config::inherited_source_keys_traced(root).await;
+            view.disk_root_reading(&touched);
+            out.files.insert(
+                crate::patch::redirect::NUGET_INHERITED_SOURCES_KEY.to_string(),
+                inherited.keys.join("\n"),
+            );
+            if inherited.mapped {
+                out.files.insert(
+                    crate::patch::redirect::NUGET_INHERITED_MAPPING_KEY.to_string(),
+                    String::new(),
+                );
+            }
+        }
+    }
+
     // NuGet: the root config routes every project under the root, so each
     // project's lock is pinned with it (#353, #514). The walk's answer rides
     // a synthetic key (the lock paths, an unevaluable NuGetLockFilePath, or

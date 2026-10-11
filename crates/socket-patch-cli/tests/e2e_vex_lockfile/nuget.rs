@@ -1376,7 +1376,7 @@ fn nuget_scan_hosted_wiring_reattests_without_manifest_or_ledger() {
     let api = serve_hosted_api(golden, NUGET_PURL, NUGET_HOSTED_UUID, nuget_hosted_view());
     let (code, env, stderr) = scan_hosted_vex(&fx, &api);
     assert_eq!(code, Some(0), "scan --mode hosted --vex: {env}\n{stderr}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env}");
+    assert_eq!(hosted_pinned(&env), 1, "{env}");
     // The in-run VEX attests on the fresh pin (`assume_applied`: the
     // restore that consumes it has not run yet), never on the pristine
     // shared-folder copy.
@@ -1488,4 +1488,18 @@ fn nuget_apply_vex_attests_but_agent_mode_needs_the_manifest() {
     // And no lockfile/config wiring appeared from `apply`.
     assert!(!fx.cwd.join("nuget.config").exists());
     assert!(!fx.cwd.join("packages.lock.json").exists());
+}
+
+/// How many hosted pins the run wrote (v5.0: the `applied` / `verified`
+/// events with `details.mode: "hosted"`, formerly `redirect.redirected`).
+fn hosted_pinned(env: &serde_json::Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }

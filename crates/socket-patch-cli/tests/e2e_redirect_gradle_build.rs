@@ -461,7 +461,7 @@ impl Cell {
         let (code, json) = self.scan_in(&self.proj, &[]);
         assert_eq!(code, Some(0), "scan --mode hosted: {json}");
         assert_eq!(json["redirect"]["mode"], "hosted", "{json}");
-        assert_eq!(json["redirect"]["redirected"], 1, "{json}");
+        assert_eq!(json["summary"]["applied"], 1, "{json}");
         json
     }
 
@@ -658,7 +658,7 @@ fn mount_grants(s: &Server, grants: &[Grant<'_>]) {
 /// The warning codes of an envelope's `redirect` block and top level.
 fn codes(json: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
-    for list in [&json["warnings"], &json["redirect"]["warnings"]] {
+    for list in [&json["warnings"], &json["warnings"]] {
         for w in list.as_array().into_iter().flatten() {
             if let Some(c) = w["code"].as_str() {
                 out.push(c.to_string());
@@ -710,7 +710,7 @@ fn gradle_hosted_direct() {
         let (code, again) = c.scan_in(&c.proj, &[]);
         assert_eq!(code, Some(0), "{again}");
         assert_eq!(
-            again["redirect"]["redirected"], 1,
+            again["summary"]["applied"], 1,
             "rescan still confirms: {again}"
         );
         assert_eq!(snapshot(&c.proj), before, "a rescan writes nothing");
@@ -1793,7 +1793,7 @@ fn gradle_hosted_429_autocrlf_clone() {
         let before = snapshot(&clone);
         let (code, json) = c.scan_in(&clone, &[]);
         assert_eq!(code, Some(0), "{json}");
-        assert_eq!(json["redirect"]["redirected"], 1, "{json}");
+        assert_eq!(json["summary"]["applied"], 1, "{json}");
         assert_eq!(
             snapshot(&clone),
             before,
@@ -1824,7 +1824,7 @@ fn gradle_hosted_non_utf8_settings_refused_untouched() {
     c.serve_leaf(&Served::new(true));
     let (code, json) = c.scan_in(&c.proj, &[]);
     assert_eq!(code, Some(0), "{json}");
-    assert_eq!(json["redirect"]["redirected"], 0, "{json}");
+    assert_eq!(json["summary"]["applied"], 0, "{json}");
     assert!(
         has(&json, "redirect_gradle_build_file_unreadable"),
         "{json}"
@@ -1852,7 +1852,7 @@ fn gradle_hosted_pasted_snippet_not_attested() {
     c.serve_leaf(&Served::new(true));
     let (code, json) = c.scan_in(&c.proj, &[]);
     assert_eq!(code, Some(0), "{json}");
-    assert_eq!(json["redirect"]["redirected"], 0, "{json}");
+    assert_eq!(json["summary"]["applied"], 0, "{json}");
     assert!(has(&json, "redirect_gradle_classifier_declared"), "{json}");
     let snippet = snippet_code(&json);
     let build = c.proj.join("build.gradle");
@@ -1866,7 +1866,7 @@ fn gradle_hosted_pasted_snippet_not_attested() {
 
 /// The code of the fallback snippet a refusal printed.
 fn snippet_code(json: &serde_json::Value) -> String {
-    let detail = json["redirect"]["warnings"]
+    let detail = json["warnings"]
         .as_array()
         .into_iter()
         .flatten()
@@ -2208,7 +2208,7 @@ fn gradle_hosted_takeover_refusal_keeps_vendored() {
         "{json}"
     );
     assert!(!has(&json, "redirect_takeover_reverted_vendored"), "{json}");
-    assert_eq!(json["redirect"]["redirected"], 0, "{json}");
+    assert_eq!(json["summary"]["applied"], 0, "{json}");
     assert_eq!(snapshot(&c.proj), before, "nothing was reverted or written");
     let out = c.build(&[]);
     let (jar, _) = c.victim_on(&out, "still vendored");

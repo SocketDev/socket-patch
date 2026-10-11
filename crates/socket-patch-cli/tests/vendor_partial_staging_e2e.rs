@@ -383,7 +383,7 @@ async fn scan_vendor_uses_contentless_views_and_downloaded_archives() {
     std::fs::remove_file(root.join(".socket/manifest.json")).unwrap();
     let (code, env, stderr) = scan_vendored_cli(root, &server.uri());
     assert_eq!(code, 0, "{env:#}\n{stderr}");
-    assert_eq!(env["vendor"]["summary"]["applied"], 2);
+    assert_eq!(env["summary"]["applied"], 2);
     assert!(!root.join(".socket/manifest.json").exists());
     assert!(!root.join(".socket/blobs").exists());
 }

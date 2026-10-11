@@ -47,6 +47,7 @@ pub mod golang_local;
 mod group_equivalence_tests;
 #[cfg(test)]
 mod lock_index_equivalence_tests;
+mod maven_index;
 pub mod npmrc;
 mod pdm;
 mod pipenv;
@@ -5973,6 +5974,8 @@ const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 fn add_nuget_source(
     config: &str,
     parsed: &crate::formats::nuget::NugetConfig,
+    inherited: Option<&[String]>,
+    inherited_mapped: bool,
     reg: &str,
     index_url: &str,
     pkg_id: &str,
@@ -5980,11 +5983,34 @@ fn add_nuget_source(
     // The same source identities restore and VEX read, before Socket is added.
     let mut pre_existing_keys: Vec<&str> =
         parsed.sources.iter().map(|(key, _)| key.as_str()).collect();
+    let own_sources = !pre_existing_keys.is_empty();
+    // The sources NuGet merges in from the configs below this one (#354):
+    // once a mapping exists every source no pattern names is dropped, so a
+    // created catch-all must name them too — unless this file `<clear />`s
+    // them. `None` (the in-memory engine, which cannot see them) keeps the
+    // file-only reading.
+    let inherited: &[String] = match inherited {
+        Some(keys) if !parsed.sources_cleared => keys,
+        _ => &[],
+    };
+    for key in inherited {
+        if !pre_existing_keys.contains(&key.as_str()) {
+            pre_existing_keys.push(key);
+        }
+    }
     let creating_mapping = parsed
         .source_mapping
         .as_ref()
         .is_none_or(|section| section.close_start.is_none());
-    let seed_nuget_org = creating_mapping && pre_existing_keys.is_empty();
+    // nuget.org is only seeded when the inherited configs have it (or
+    // nothing): a parent that cleared it for a mirror keeps that choice.
+    // An inherited mapping already routes everything else (NuGet merges
+    // mappings too): no catch-all, which would widen a source it restricts.
+    let seed_nuget_org = creating_mapping
+        && !own_sources
+        && !inherited_mapped
+        && (inherited.is_empty() || inherited.iter().any(|k| k == NUGET_ORG_KEY));
+    let creating_mapping = creating_mapping && !inherited_mapped;
     let reg = nuget_xml_attribute(reg);
     let mut source_lines = format!(
         "    <add key=\"{reg}\" value=\"{}\" />",
@@ -5996,7 +6022,9 @@ fn add_nuget_source(
         source_lines.push_str(&format!(
             "\n    <add key=\"{NUGET_ORG_KEY}\" value=\"{NUGET_ORG_URL}\" />"
         ));
-        pre_existing_keys.push(NUGET_ORG_KEY);
+        if !pre_existing_keys.contains(&NUGET_ORG_KEY) {
+            pre_existing_keys.push(NUGET_ORG_KEY);
+        }
     }
     let out = if let Some(section) = &parsed.package_sources {
         insert_nuget_children(config, section, "packageSources", &source_lines)
@@ -6077,6 +6105,20 @@ fn nuget_xml_attribute(value: &str) -> String {
         .replace('\r', "&#xD;")
 }
 
+/// The synthetic candidate key carrying the package source keys the configs
+/// below the project's own NuGet merges in (the user config, parent
+/// directories), one per line ([`crate::vendor::nuget_config::inherited_source_keys`]).
+/// Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
+pub const NUGET_INHERITED_SOURCES_KEY: &str = "<socket-patch:nuget-inherited-sources>";
+
+/// The synthetic candidate key present when one of those configs maps
+/// packages already (`packageSourceMapping`, which NuGet merges too).
+pub const NUGET_INHERITED_MAPPING_KEY: &str = "<socket-patch:nuget-inherited-mapping>";
+
+/// A config with no sources, the base of a fresh one when the inherited
+/// configs dropped nuget.org.
+const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
+
 /// The synthetic candidate key carrying the locks the engine found every
 /// project under the root restoring into (#353, #514), one per line:
 /// `lock\t<rel>`, `unresolved\t<project>\t<why>` for a `NuGetLockFilePath`
@@ -6103,10 +6145,21 @@ fn rewrite_nuget(
         .into_iter()
         .find(|name| files.contains_key(*name))
         .unwrap_or(NUGET_CONFIG_FILE_NAMES[0]);
-    let mut config = files
-        .get(config_path)
-        .cloned()
-        .unwrap_or_else(default_nuget_config);
+    // The source keys the configs below this one define (the engine reads
+    // them from disk; absent in memory).
+    let inherited: Option<Vec<String>> = files
+        .get(NUGET_INHERITED_SOURCES_KEY)
+        .map(|keys| keys.lines().map(str::to_string).collect());
+    let mut config = files.get(config_path).cloned().unwrap_or_else(|| {
+        match &inherited {
+            // A parent cleared nuget.org (a mirror instead): a fresh config
+            // must not add it back (#354).
+            Some(keys) if !keys.is_empty() && !keys.iter().any(|k| k == NUGET_ORG_KEY) => {
+                EMPTY_NUGET_CONFIG.to_string()
+            }
+            _ => default_nuget_config(),
+        }
+    });
     // A config this run authors from scratch records its source edits as
     // `added` — the spelling every other rewriter uses for a created file.
     let source_action = if files.contains_key(config_path) {
@@ -6182,6 +6235,24 @@ fn rewrite_nuget(
     }
 
     for dep in &nuget {
+        // The uuid lands in the source key, the mapping and the set-aside
+        // comment: one carrying markup (`-->`, a quote, `<`) could write live
+        // nuget.config elements. Only ASCII alphanumerics and single hyphens
+        // pass (every canonical uuid does).
+        let uuid = &dep.patch_uuid;
+        if uuid.is_empty()
+            || uuid.contains("--")
+            || !uuid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_invalid_uuid".into(),
+                detail: format!(
+                    "{} has a malformed patch uuid; dependency skipped",
+                    dep.name
+                ),
+            });
+            continue;
+        }
         let Some(ov) = registry_override_of_kind(dep, "nuget-v3") else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_nuget_missing_override".into(),
@@ -6258,19 +6329,66 @@ fn rewrite_nuget(
             result.warnings.push(unwritable());
             continue;
         };
-        if !parsed.sources.iter().any(|(key, _)| key == &reg) {
+        let wired = parsed.sources.iter().any(|(key, _)| key == &reg);
+        let base = if wired {
+            config.clone()
+        } else {
             // A failed insert skips the WHOLE dep (no edit record, no lock
             // re-pin): a mapping without its source routes the patched id to
             // a source that was never defined, and a lock pinned at the
             // patched contentHash over an upstream fetch fails NU1403 — both
             // while the ledger would claim the redirect landed.
-            let Some(updated) = add_nuget_source(&config, &parsed, &reg, &ov.index_url, &dep.name)
-            else {
+            let Some(updated) = add_nuget_source(
+                &config,
+                &parsed,
+                inherited.as_deref(),
+                files.contains_key(NUGET_INHERITED_MAPPING_KEY),
+                &reg,
+                &ov.index_url,
+                &dep.name,
+            ) else {
                 result.warnings.push(unwritable());
                 continue;
             };
-            config = updated;
+            updated
+        };
+        // Another source naming the id exactly ties with ours, and NuGet
+        // takes the package from whichever answers first (#462): set that
+        // pattern aside while the patch is wired (the upstream restore puts
+        // it back), or skip the dep when it cannot be.
+        let Some(based) = crate::formats::nuget::parse_config(&base) else {
+            result.warnings.push(unwritable());
+            continue;
+        };
+        let (aside, moved) = match crate::formats::nuget::set_aside_competing_patterns(
+            &base, &based, &reg, &dep.name,
+        ) {
+            Ok(done) => done,
+            Err(why) => {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_nuget_mapping_conflict".into(),
+                    detail: format!("{why}; {} not redirected", dep.name),
+                });
+                continue;
+            }
+        };
+        if !moved.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_mapping_set_aside".into(),
+                detail: format!(
+                    "{config_path} also mapped {} to {}; that pattern is commented out while the \
+                     patch is wired, so the Socket source alone serves it (remove / rollback \
+                     restore it)",
+                    dep.name,
+                    moved.join(", ")
+                ),
+            });
+        }
+        if aside != config {
+            config = aside;
             config_changed = true;
+        }
+        if !wired {
             result.edits.push(FileEdit {
                 path: config_path.into(),
                 kind: "redirect_nuget_source".into(),
@@ -7374,12 +7492,16 @@ pub(crate) fn bare_sha256_hex(hash: &str) -> String {
 
 /// A `<dependency>` block matched by groupId:artifactId, with the byte offsets
 /// of its literal `<version>` inner text (None when the dep carries no literal
-/// version — inherited/managed) and its trimmed version/type text. Mirrors the
-/// TS `MavenDependencyMatch`.
+/// version — inherited/managed) and its trimmed version/type/classifier text.
+/// Mirrors the TS `MavenDependencyMatch`.
 struct MavenDependencyMatch {
+    /// The dependency's index in the [`maven_index::PomIndex`].
+    idx: usize,
     version_inner: Option<(usize, usize)>,
     version_text: Option<String>,
     type_text: Option<String>,
+    classifier: Option<String>,
+    in_profile: bool,
 }
 
 /// Inner-text byte range of the first `<tag>…</tag>` inside `pom[from, to)`, or
@@ -7405,35 +7527,38 @@ fn maven_tag_text_in(pom: &str, tag: &str, from: usize, to: usize) -> Option<Str
     maven_tag_inner_range(pom, tag, from, to).map(|(s, e)| pom[s..e].trim().to_string())
 }
 
-/// Every `<dependency>` block whose `<groupId>` + `<artifactId>` match, with
-/// its literal `<version>` range/text and `<type>` text (twin of the TS
-/// `findDependencyMatches`). A `<dependency>` inside `<dependencyManagement>`
-/// is matched the same way as a direct one — the suffixing path tells "managed
-/// in an unseen parent" (no literal version → depMgmt pin) from "pinned here"
-/// (rewrite the literal) purely by whether ANY match carries a literal
-/// `<version>`. Returns ALL matches so a managed base-version entry gets
-/// rewritten even when a direct dependency declares no version.
+/// Every `<dependency>` whose `<groupId>` + `<artifactId>` match, with its
+/// literal `<version>` range/text, `<type>` and `<classifier>` (twin of the TS
+/// `findDependencyMatches`). Read through `PomScope` (see
+/// [`maven_index`]): markup inside comments, CDATA, `<build>` / `<reporting>`
+/// (plugin classpaths, which the project's `<dependencyManagement>` does not
+/// reach and the Socket repository — not a `<pluginRepository>` — cannot
+/// serve) is no declaration. A match inside `<profiles>` is returned flagged:
+/// Maven reads it only while that profile is active. A `<dependency>` inside
+/// `<dependencyManagement>` is matched the same way as a direct one — the
+/// suffixing path tells "managed in an unseen parent" (no literal version →
+/// depMgmt pin) from "pinned here" (rewrite the literal) purely by whether
+/// ANY match carries a literal `<version>`.
 fn find_maven_dependency_matches(
-    pom: &str,
+    index: &maven_index::PomIndex,
     group_id: &str,
     artifact_id: &str,
 ) -> Vec<MavenDependencyMatch> {
-    let mut matches = vec![];
-    for m in MAVEN_DEPENDENCY_BLOCK_RE.find_iter(pom) {
-        let (dep_open, dep_close) = (m.start(), m.end());
-        let g = maven_tag_text_in(pom, "groupId", dep_open, dep_close);
-        let a = maven_tag_text_in(pom, "artifactId", dep_open, dep_close);
-        if g.as_deref() != Some(group_id) || a.as_deref() != Some(artifact_id) {
-            continue;
-        }
-        let version_inner = maven_tag_inner_range(pom, "version", dep_open, dep_close);
-        matches.push(MavenDependencyMatch {
-            version_text: version_inner.map(|(s, e)| pom[s..e].trim().to_string()),
-            version_inner,
-            type_text: maven_tag_text_in(pom, "type", dep_open, dep_close),
-        });
-    }
-    matches
+    index
+        .matches(group_id, artifact_id)
+        .into_iter()
+        .map(|idx| {
+            let d = index.dep(idx);
+            MavenDependencyMatch {
+                idx,
+                version_inner: d.version_inner,
+                version_text: d.version_text.clone(),
+                type_text: d.type_text.clone(),
+                classifier: d.classifier.clone(),
+                in_profile: d.in_profile,
+            }
+        })
+        .collect()
 }
 
 fn rewrite_maven_pom(
@@ -7489,10 +7614,14 @@ fn rewrite_maven_pom(
     // One pass over the pom's repositories: `(id, url)` of each, which also
     // answers the per-dep URL-refresh check below while the pom is still
     // unchanged (a no-op rescan then never re-scans the pom per dep).
-    let original_repos: Vec<(String, Option<String>)> = pom
-        .as_deref()
-        .map(maven_repository_ids_and_urls)
-        .unwrap_or_default();
+    // The hosted rewriter's view of the pom, read once (through `PomScope`)
+    // and kept in step with every edit below.
+    let mut index: Option<Result<maven_index::PomIndex, String>> =
+        pom.as_deref().map(maven_index::PomIndex::build);
+    let original_repos: Vec<(String, Option<String>)> = match (&index, pom.as_deref()) {
+        (Some(Ok(index)), Some(pom)) => index.repository_ids_and_urls(pom),
+        _ => Vec::new(),
+    };
     let hosted_repo_generations: std::collections::BTreeSet<String> = original_repos
         .iter()
         .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
@@ -7550,6 +7679,94 @@ fn rewrite_maven_pom(
         };
         // Unique-per-patch repository id (valid chars: alnum, `-`, `_`, `.`).
         let repo_id = generation::hosted_pin_name(&dep.patch_uuid);
+        // Every match and anchor is read through the pom's live scope; a pom
+        // that is not readable as one is never edited (fail-closed).
+        let idx = match index.as_mut().expect("a pom has an index") {
+            Ok(idx) => idx,
+            Err(e) => {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_maven_pom_unreadable".into(),
+                    detail: format!(
+                        "pom.xml is not readable as a Maven pom ({e}); {group_id}:{artifact_id} skipped"
+                    ),
+                });
+                continue;
+            }
+        };
+        let all_matches = find_maven_dependency_matches(idx, &group_id, &artifact_id);
+        // Only the GA's main jar is granted: the served maven2 tail holds
+        // `<a>-<suffixed>.jar/.pom` and nothing else. A classifier variant
+        // (sources, tests, a native build) is its own artifact — managed and
+        // resolved apart from the main jar — so it is left alone, and the
+        // main jar's literal-vs-depMgmt decision is made without it.
+        let (variants, live): (Vec<_>, Vec<_>) = all_matches
+            .into_iter()
+            .partition(|m| m.classifier.is_some());
+        // A variant that carries code onto a classpath (tests, a native
+        // build, a JDK-specific jar) at the patched release would keep the
+        // unpatched bytes there while the GA counts as redirected and VEX
+        // attests it: the dep is skipped. `sources` / `javadoc` jars are
+        // never executed, so they only warn.
+        let mut executable_variant = false;
+        for variant in &variants {
+            let Some(v) = variant.version_text.as_deref() else {
+                continue;
+            };
+            let names_release = v == dep.version
+                || crate::formats::maven::split_socket_version(v)
+                    .is_some_and(|(base, _)| base == dep.version);
+            if names_release {
+                let classifier = variant.classifier.as_deref().unwrap_or_default();
+                let executable = !matches!(classifier, "sources" | "javadoc");
+                executable_variant |= executable;
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_maven_classifier_unsupported".into(),
+                    detail: format!(
+                        "{group_id}:{artifact_id}:{classifier} <version>{v}</version> is a \
+                         classifier variant; the Socket patch covers only the main jar, so it \
+                         is left as-is{}",
+                        if executable {
+                            " and the dep is not redirected (that variant would keep the \
+                             unpatched code on the classpath)"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+            }
+        }
+        if executable_variant {
+            continue;
+        }
+        // A `<profiles>` declaration is read only while its profile is
+        // active, and then its own `<version>` (a literal or a `${property}`)
+        // beats the top-level pin: it is never edited, and is reported as
+        // unpatched. When versioned profile declarations are the GA's only
+        // ones, nothing this pom always reads uses it, and a top-level pin
+        // would be inert exactly when the profile pulls it in: the dep is
+        // skipped rather than reported redirected. A versionless profile
+        // declaration takes the managed version, so the pin covers it.
+        let (profiled, matches): (Vec<_>, Vec<_>) = live.into_iter().partition(|m| m.in_profile);
+        let profile_version = profiled.iter().find_map(|m| m.version_text.as_deref());
+        if let Some(profile_version) = profile_version {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_profile_dependency_unpatched".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id} <version>{profile_version}</version> inside <profiles> \
+                     is not edited; while that profile is active it resolves that version, not \
+                     the patched artifact{}",
+                    if matches.is_empty() {
+                        " (no declaration outside <profiles>, so nothing is pinned)"
+                    } else {
+                        ""
+                    }
+                ),
+            });
+            if matches.is_empty() {
+                continue;
+            }
+        }
+        let has_live_repo = idx.has_repository(&repo_id);
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
         // served under its original GAV. Add the repository (transport checksum
@@ -7557,7 +7774,6 @@ fn rewrite_maven_pom(
         let Some(suffixed_version) = suffixed_version else {
             // Verify-only inspection: warn when the redirect can't take effect.
             // Only the FIRST match matters here (legacy behavior).
-            let matches = find_maven_dependency_matches(pom_text, &group_id, &artifact_id);
             match matches.first() {
                 None => {
                     result.warnings.push(RewriteWarning {
@@ -7608,10 +7824,10 @@ fn rewrite_maven_pom(
                     "{group_id}:{artifact_id} is patched at its original GAV; a Socket-repo failure falls back to the unpatched artifact — not fail-closed. The backend will serve suffixed versions once the upstream pom is available."
                 ),
             });
-            if pom_text.contains(&format!("<id>{repo_id}</id>")) {
+            if has_live_repo {
                 continue;
             }
-            *pom_text = insert_maven_repository(pom_text, &repo_id, &ov.index_url);
+            idx.insert_repository(pom_text, &repo_id, &ov.index_url);
             pom_changed = true;
             result.edits.push(FileEdit {
                 path: "pom.xml".into(),
@@ -7627,7 +7843,6 @@ fn rewrite_maven_pom(
         // FAIL-CLOSED: pin the suffixed version explicitly. Scan every matching
         // <dependency>, tracking depMgmt containment via the version presence
         // so we can tell a literal pin here from a version managed elsewhere.
-        let matches = find_maven_dependency_matches(pom_text, &group_id, &artifact_id);
 
         // An unsupported <type> on any match: the single-jar repo can't serve
         // it — skip the whole dep (no version edit, no repo, no checksum).
@@ -7663,13 +7878,13 @@ fn rewrite_maven_pom(
         }
 
         let mut pin_landed = false;
-        // Literal versions among the matches, with their inner ranges.
+        // Literal versions among the matches: (index, inner start, text).
         let versioned: Vec<(usize, usize, String)> = matches
             .iter()
             .filter_map(|m| {
                 m.version_inner
                     .zip(m.version_text.clone())
-                    .map(|((s, e), v)| (s, e, v))
+                    .map(|((s, _), v)| (m.idx, s, v))
             })
             .collect();
         // A `<base>-socket.<hex8>` literal for this release that is not the
@@ -7685,17 +7900,17 @@ fn rewrite_maven_pom(
                             .any(|uuid| uuid.starts_with(hex8))
                 })
         };
-        // Rewrite base (or a prior generation) → suffixed. Descending offset
-        // order so earlier edits don't shift later matches' offsets.
+        // Rewrite base (or a prior generation) → suffixed, in descending
+        // offset order (the index keeps every other offset in step).
         let mut to_rewrite: Vec<(usize, usize, String)> = versioned
             .iter()
             .filter(|(_, _, v)| *v == dep.version || prior_generation(v))
-            .map(|(s, e, v)| (*s, *e, v.clone()))
+            .cloned()
             .collect();
-        to_rewrite.sort_by(|a, b| b.0.cmp(&a.0));
+        to_rewrite.sort_by(|a, b| b.1.cmp(&a.1));
         let mut superseded_versions: Vec<String> = vec![];
-        for (start, end, was) in &to_rewrite {
-            pom_text.replace_range(*start..*end, &suffixed_version);
+        for (i, _, was) in &to_rewrite {
+            idx.set_version(pom_text, *i, &suffixed_version);
             pom_changed = true;
             pin_landed = true;
             if *was != dep.version && !superseded_versions.contains(was) {
@@ -7732,12 +7947,7 @@ fn rewrite_maven_pom(
         // as a versioned match, so `versioned` is non-empty and this branch is
         // skipped (idempotent).
         if versioned.is_empty() {
-            *pom_text = insert_maven_dependency_management(
-                pom_text,
-                &group_id,
-                &artifact_id,
-                &suffixed_version,
-            );
+            idx.insert_dependency_management(pom_text, &group_id, &artifact_id, &suffixed_version);
             pom_changed = true;
             pin_landed = true;
             result.edits.push(FileEdit {
@@ -7789,8 +7999,7 @@ fn rewrite_maven_pom(
                     continue;
                 }
                 let old_id = generation::hosted_pin_name(&old_uuid);
-                if let Some(next) = remove_maven_repository(pom_text, &old_id) {
-                    *pom_text = next;
+                if idx.remove_repository(pom_text, &old_id) {
                     pom_changed = true;
                     result.edits.push(FileEdit {
                         path: "pom.xml".into(),
@@ -7816,31 +8025,18 @@ fn rewrite_maven_pom(
         // A rotated grant token keeps the uuid but changes the repository
         // URL: refresh the existing `socket-patch-<uuid>` repository in place
         // so the pin keeps resolving through the current grant.
-        // While the pom is unchanged, `original_repos` already says whether
-        // the refresh would change anything (exactly one such repository,
-        // with a `<url>` that differs); skip the scan when it would not.
-        let refresh_may_apply = pom_changed || {
-            let mut ours = original_repos.iter().filter(|(id, _)| *id == repo_id);
-            match (ours.next(), ours.next()) {
-                (Some((_, Some(url))), None) => *url != ov.index_url,
-                _ => false,
-            }
-        };
-        if refresh_may_apply
-            && (pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version))
+        if (pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version))
+            && idx.refresh_repository_url(pom_text, &repo_id, &ov.index_url)
         {
-            if let Some(next) = refresh_maven_repository_url(pom_text, &repo_id, &ov.index_url) {
-                *pom_text = next;
-                pom_changed = true;
-                result.edits.push(FileEdit {
-                    path: "pom.xml".into(),
-                    kind: "redirect_maven_repository".into(),
-                    action: "rewritten".into(),
-                    key: Some(repo_id.clone()),
-                    original: None,
-                    new: Some(json!({ "id": repo_id, "url": ov.index_url })),
-                });
-            }
+            pom_changed = true;
+            result.edits.push(FileEdit {
+                path: "pom.xml".into(),
+                kind: "redirect_maven_repository".into(),
+                action: "rewritten".into(),
+                key: Some(repo_id.clone()),
+                original: None,
+                new: Some(json!({ "id": repo_id, "url": ov.index_url })),
+            });
         }
 
         // A pin landed this run: inject the repository (idempotent via the <id>
@@ -7850,8 +8046,8 @@ fn rewrite_maven_pom(
         if !pin_landed {
             continue;
         }
-        if !pom_text.contains(&format!("<id>{repo_id}</id>")) {
-            *pom_text = insert_maven_repository(pom_text, &repo_id, &ov.index_url);
+        if !idx.has_repository(&repo_id) {
+            idx.insert_repository(pom_text, &repo_id, &ov.index_url);
             pom_changed = true;
             result.edits.push(FileEdit {
                 path: "pom.xml".into(),
@@ -7994,26 +8190,14 @@ static MAVEN_REPOSITORY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)<repository>.*?</repository>").expect("static repository regex is valid")
 });
 
-/// The trimmed `<id>` and `<url>` texts of every `<repository>` element of
-/// `pom` that has an `<id>`, in document order: the same elements, ids and
-/// URLs [`maven_repositories_with_id`] and [`refresh_maven_repository_url`]
-/// read, in one pass.
-fn maven_repository_ids_and_urls(pom: &str) -> Vec<(String, Option<String>)> {
-    MAVEN_REPOSITORY_RE
-        .find_iter(pom)
-        .filter_map(|m| {
-            let id = maven_tag_text_in(pom, "id", m.start(), m.end())?;
-            let url = maven_tag_text_in(pom, "url", m.start(), m.end());
-            Some((id, url))
-        })
-        .collect()
-}
-
 /// The `<repository>` elements of `pom` whose `<id>` is `id`, as byte spans.
+/// A commented-out twin is not one: the rewriter writes a live repository
+/// beside it, and rollback must still find exactly that one.
 pub(crate) fn maven_repositories_with_id(pom: &str, id: &str) -> Vec<(usize, usize)> {
+    let masked = crate::formats::xml::blank_non_markup(pom).unwrap_or_else(|_| pom.to_string());
     MAVEN_REPOSITORY_RE
-        .find_iter(pom)
-        .filter(|m| maven_tag_text_in(pom, "id", m.start(), m.end()).as_deref() == Some(id))
+        .find_iter(&masked)
+        .filter(|m| maven_tag_text_in(&masked, "id", m.start(), m.end()).as_deref() == Some(id))
         .map(|m| (m.start(), m.end()))
         .collect()
 }
@@ -8023,6 +8207,12 @@ pub(crate) fn maven_repositories_with_id(pom: &str, id: &str) -> Vec<(usize, usi
 /// one such element sits on lines of its own (anything else is not the
 /// rewriter's insertion, and stays).
 pub(crate) fn remove_maven_repository(pom: &str, id: &str) -> Option<String> {
+    let (cut, end) = maven_repository_removal(pom, id)?;
+    Some(format!("{}{}", &pom[..cut], &pom[end..]))
+}
+
+/// The byte range [`remove_maven_repository`] removes.
+pub(crate) fn maven_repository_removal(pom: &str, id: &str) -> Option<(usize, usize)> {
     let [(start, end)] = maven_repositories_with_id(pom, id)[..] else {
         return None;
     };
@@ -8037,68 +8227,7 @@ pub(crate) fn remove_maven_repository(pom: &str, id: &str) -> Option<String> {
     } else {
         line_start
     };
-    Some(format!("{}{}", &pom[..cut], &pom[end..]))
-}
-
-/// `pom` with the `<url>` of its one `<repository>` whose `<id>` is `id` set
-/// to `url`; `None` when there is no such single element or it already
-/// points there.
-fn refresh_maven_repository_url(pom: &str, id: &str, url: &str) -> Option<String> {
-    let [(start, end)] = maven_repositories_with_id(pom, id)[..] else {
-        return None;
-    };
-    let (s, e) = maven_tag_inner_range(pom, "url", start, end)?;
-    if pom[s..e].trim() == url {
-        return None;
-    }
-    let mut out = pom.to_string();
-    out.replace_range(s..e, url);
-    Some(out)
-}
-
-/// Insert the socket-patch `<repository>` block: releases enabled with
-/// `<checksumPolicy>fail</checksumPolicy>` (the transport-level check against
-/// the served `.jar.sha1`); snapshots disabled (patched artifacts are always
-/// released versions). Prefer an existing `<repositories>` element (single
-/// replace, inserted first so it's consulted before the project's other
-/// repositories); otherwise author a full `<repositories>` section immediately
-/// before the closing `</project>`. `<repositories>` is matched exactly so it
-/// never collides with `<pluginRepositories>`.
-fn insert_maven_repository(pom: &str, id: &str, url: &str) -> String {
-    let block = format!(
-        "    <repository>\n      <id>{id}</id>\n      <url>{url}</url>\n      <releases>\n        <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      </snapshots>\n    </repository>"
-    );
-    if pom.contains("<repositories>") {
-        return pom.replacen("<repositories>", &format!("<repositories>\n{block}"), 1);
-    }
-    let section = format!("  <repositories>\n{block}\n  </repositories>");
-    pom.replacen("</project>", &format!("{section}\n</project>"), 1)
-}
-
-/// Add a `<dependencyManagement>` version pin. Prefer extending an existing
-/// `<dependencyManagement><dependencies>` element (insert right after the
-/// opening `<dependencies>` tag); otherwise author a full
-/// `<dependencyManagement>` section before `</project>`. Mirrors the TS
-/// `insertDependencyManagement`.
-fn insert_maven_dependency_management(
-    pom: &str,
-    group_id: &str,
-    artifact_id: &str,
-    version: &str,
-) -> String {
-    let block = format!(
-        "      <dependency>\n        <groupId>{group_id}</groupId>\n        <artifactId>{artifact_id}</artifactId>\n        <version>{version}</version>\n      </dependency>"
-    );
-    let dm_re = Regex::new(r"(?s)<dependencyManagement>\s*<dependencies>")
-        .expect("static dependencyManagement regex is valid");
-    if let Some(m) = dm_re.find(pom) {
-        let matched = m.as_str();
-        return pom.replacen(matched, &format!("{matched}\n{block}"), 1);
-    }
-    let section = format!(
-        "  <dependencyManagement>\n    <dependencies>\n{block}\n    </dependencies>\n  </dependencyManagement>"
-    );
-    pom.replacen("</project>", &format!("{section}\n</project>"), 1)
+    Some((cut, end))
 }
 
 /// Merge trusted-checksums resolver args into `.mvn/maven.config` (one arg per
@@ -8757,6 +8886,80 @@ mod tests {
         r.warnings.iter().map(|w| w.code.as_str()).collect()
     }
 
+    /// A profile's own `<version>` (a property or any literal) beats the
+    /// top-level pin while the profile is active: when the profile holds the
+    /// GA's only versioned declaration nothing is pinned, and beside a
+    /// top-level declaration it is reported unpatched.
+    #[test]
+    fn maven_versioned_profile_declarations_are_never_pinned_over() {
+        let profile = |version: &str| {
+            format!(
+                "  <profiles>\n    <profile>\n      <id>p</id>\n      <dependencies>\n        <dependency>\n          <groupId>org.slf4j</groupId>\n          <artifactId>slf4j-api</artifactId>\n          <version>{version}</version>\n        </dependency>\n      </dependencies>\n    </profile>\n  </profiles>\n</project>\n"
+            )
+        };
+        for version in ["${slf4j.version}", "1.7.30", "1.7.36"] {
+            let only = pom_with_dep("", "")
+                .replace(
+                    "  <dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n    </dependency>\n  </dependencies>\n",
+                    "",
+                )
+                .replace("</project>\n", &profile(version));
+            assert!(!only.contains("<dependencies>\n    <dependency>"), "{only}");
+            let files = BTreeMap::from([("pom.xml".to_string(), only)]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(r.files.is_empty(), "{version}: {:?}", r.files);
+            assert!(
+                warning_codes(&r).contains(&"redirect_maven_profile_dependency_unpatched"),
+                "{version}: {:?}",
+                r.warnings
+            );
+
+            let both = pom_with_dep("\n      <version>1.7.36</version>", "")
+                .replace("</project>\n", &profile(version));
+            let files = BTreeMap::from([("pom.xml".to_string(), both)]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let out = r.files.get("pom.xml").expect("top-level pinned");
+            assert!(
+                out.contains(&format!("<version>{version}</version>")),
+                "{out}"
+            );
+            assert!(
+                warning_codes(&r).contains(&"redirect_maven_profile_dependency_unpatched"),
+                "{version}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// A classifier variant at the patched release that carries code
+    /// (`tests`, a native build) keeps the unpatched bytes on a classpath,
+    /// so the dep is not redirected; a `sources` / `javadoc` jar only warns.
+    #[test]
+    fn maven_executable_classifier_variant_blocks_the_redirect() {
+        let variant = |classifier: &str| {
+            pom_with_dep("\n      <version>1.7.36</version>", "").replace(
+                "  </dependencies>",
+                &format!("    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n      <classifier>{classifier}</classifier>\n    </dependency>\n  </dependencies>"),
+            )
+        };
+        for classifier in ["tests", "linux-x86_64"] {
+            let files = BTreeMap::from([("pom.xml".to_string(), variant(classifier))]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(r.files.is_empty(), "{classifier}: {:?}", r.files);
+            assert!(warning_codes(&r).contains(&"redirect_maven_classifier_unsupported"));
+        }
+        for classifier in ["sources", "javadoc"] {
+            let files = BTreeMap::from([("pom.xml".to_string(), variant(classifier))]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let out = r.files.get("pom.xml").expect("main jar pinned");
+            assert!(
+                out.contains(&format!("<version>{MAVEN_SUFFIXED}</version>")),
+                "{out}"
+            );
+            assert!(warning_codes(&r).contains(&"redirect_maven_classifier_unsupported"));
+        }
+    }
+
     /// Fail-closed literal pin: the `<version>` is rewritten to the suffixed
     /// value, the repository + trusted-checksum files are emitted, and a re-run
     /// over the fully-pinned output records nothing (idempotent).
@@ -9252,6 +9455,30 @@ mod tests {
                 sha512: Some("sha512-PATCHED==".into()),
                 ..Default::default()
             },
+        }
+    }
+
+    #[test]
+    fn nuget_markup_in_the_patch_uuid_is_refused() {
+        let config = "<configuration>\n  <packageSources>\n    \
+                      <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+                      </packageSources>\n  <packageSourceMapping>\n    \
+                      <packageSource key=\"nuget.org\"><package pattern=\"Newtonsoft.Json\" /></packageSource>\n  \
+                      </packageSourceMapping>\n</configuration>\n";
+        let files = BTreeMap::from([("nuget.config".into(), config.to_string())]);
+        for uuid in [
+            "x --> <packageSources><clear /></packageSources> <!--",
+            "a\"b",
+            "",
+        ] {
+            let mut dep = nuget_override();
+            dep.patch_uuid = uuid.into();
+            let r = rewrite_registry_redirect(&files, &[dep]);
+            assert!(r.files.is_empty(), "{uuid}: {:?}", r.files);
+            assert!(r
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_nuget_invalid_uuid"));
         }
     }
 
@@ -23539,6 +23766,93 @@ packages:
             r.edits[0]
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// #462: the issue's config (an exact `Newtonsoft.Json` pattern under
+    /// nuget.org beside `*`): hosted sets that pattern aside so the Socket
+    /// source alone routes the id, and says so.
+    #[test]
+    fn nuget_competing_exact_pattern_is_set_aside() {
+        let config = "<configuration>\n  <packageSources>\n    <clear />\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n      <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n";
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), config.to_string());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert_eq!(warning_codes(&r), vec!["redirect_nuget_mapping_set_aside"]);
+        let out = &r.files["nuget.config"];
+        let parsed = crate::formats::nuget::parse_config(out).unwrap();
+        let exact: Vec<&str> = parsed
+            .mappings
+            .iter()
+            .filter(|(_, p)| p.iter().any(|p| p.eq_ignore_ascii_case("newtonsoft.json")))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(exact, ["socket-patch-uuid"], "{out}");
+        // The re-run over its own output is a no-op.
+        let mut again = BTreeMap::new();
+        again.insert("nuget.config".to_string(), out.clone());
+        let r = rewrite_registry_redirect(&again, &[nuget_override()]);
+        assert!(
+            r.files.is_empty() && r.warnings.is_empty(),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    fn nuget_catch_all(config: &str) -> Vec<String> {
+        crate::formats::nuget::parse_config(config)
+            .unwrap()
+            .mappings
+            .into_iter()
+            .filter(|(_, p)| p == &["*"])
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    /// #354: on disk the engine hands the rewriter the source keys NuGet
+    /// inherits; a created catch-all names them too, and a fresh config
+    /// does not re-add nuget.org a parent cleared.
+    #[test]
+    fn nuget_created_catch_all_names_inherited_sources() {
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "nuget.org\ncorp".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            nuget_catch_all(&r.files["nuget.config"]),
+            ["nuget.org", "corp"]
+        );
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "mirror".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let config = &r.files["nuget.config"];
+        assert_eq!(nuget_catch_all(config), ["mirror"], "{config}");
+        assert!(!config.contains("nuget.org"), "{config}");
+
+        // An inherited mapping already routes everything else: only the
+        // Socket pattern is written (#354 review).
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "nuget.org\ncorp".to_string(),
+        );
+        files.insert(NUGET_INHERITED_MAPPING_KEY.to_string(), String::new());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(nuget_catch_all(&r.files["nuget.config"]).is_empty());
+
+        // Without the key (the in-memory engine) the file alone decides.
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert_eq!(nuget_catch_all(&r.files["nuget.config"]), ["nuget.org"]);
     }
 
     /// A PRESENT but unparseable packages.lock.json refuses the whole nuget

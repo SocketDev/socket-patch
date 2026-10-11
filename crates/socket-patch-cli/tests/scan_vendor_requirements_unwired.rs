@@ -169,7 +169,7 @@ async fn assert_unwired_and_pruned(edited: &str) {
     let (code, v) = run_scan_vendored(root, &mock.uri(), &["--prune"]);
     assert_eq!(code, 0, "edited={edited:?}: {v}");
     assert_eq!(
-        v["gc"]["revertedVendoredEntries"],
+        reverted_purls(&v),
         serde_json::json!([PURL]),
         "edited={edited:?}: {v}"
     );
@@ -220,6 +220,18 @@ async fn wired_vendored_pin_stays_discoverable() {
         std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap(),
         wired
     );
+}
+
+/// The purls the prune GC reverted: its `vendor_reverted` events (v5.0's
+/// `gc.revertedVendoredEntries`).
+fn reverted_purls(envelope: &serde_json::Value) -> serde_json::Value {
+    envelope["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["errorCode"] == "vendor_reverted")
+        .map(|e| e["purl"].clone())
+        .collect()
 }
 
 /// #1127: the human `--prune` run reverts an unwired entry too, when the

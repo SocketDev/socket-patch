@@ -897,10 +897,15 @@ fn scan_pnp_mode_case(mode: &str) {
     if mode == "hosted" {
         assert_eq!(
             env.get("redirect")
-                .and_then(|r| r.get("redirected"))
-                .and_then(|v| v.as_u64()),
+                .and_then(|r| r.get("rewrittenFiles"))
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
             Some(0),
             "mode {mode}: hosted envelope keeps its (empty) redirect block.\nenvelope: {env}"
+        );
+        assert_eq!(
+            env["summary"]["applied"], 0,
+            "mode {mode}: nothing pinned: {env}"
         );
     }
     assert!(

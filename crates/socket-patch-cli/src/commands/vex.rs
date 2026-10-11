@@ -376,8 +376,14 @@ pub async fn run(args: VexArgs) -> i32 {
         api_client: RunApiClient::new(),
     };
 
-    let manifest_path = args.common.resolved_manifest_path();
-    match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
+    // One project for the whole document (#745): the ledgers and the
+    // wiring discovery are the manifest's project's, so product detection,
+    // the installed-copy crawl and the pnpm / PnP guards run there too
+    // (`cwd` moved to it; a no-op in the default layout). Mixing them would
+    // let another project's wiring vouch for this one's packages.
+    let common = args.common.at_project_root();
+    let manifest_path = common.resolved_manifest_path();
+    match generate_vex_from_manifest_path(&common, &params, &manifest_path).await {
         Ok(mut summary) => {
             run_warnings.append(&mut summary.warnings);
             summary.warnings = run_warnings;
@@ -1299,14 +1305,17 @@ async fn generate_vex_from_manifest_path_inner(
         manifest,
         vendor,
         redirect,
-    } = socket_patch_core::ledgers::LoadedLedgers::load(&common.cwd, manifest_path).await;
+    } = socket_patch_core::ledgers::LoadedLedgers::load(&common.project_root(), manifest_path)
+        .await;
     let manifest_file = match manifest {
         Ok(m) => m,
         Err(e) => {
             // Core's text ("Failed to parse manifest JSON: ...") does not
             // say which file; in a workspace that matters.
+            // The shared manifest-load mapping (#931); exit 2 stays vex's.
             let message = format!("{e} (in {})", manifest_path.display());
-            return Err(fail(common, params, "manifest_unreadable", message).await);
+            let code = crate::json_envelope::manifest_load_error_code(&e);
+            return Err(fail(common, params, code, message).await);
         }
     };
     let had_manifest_file = manifest_file.is_some();
@@ -1346,11 +1355,12 @@ async fn generate_vex_from_manifest_path_inner(
             return Err(fail(common, params, "vendor_ledger_corrupt", message).await);
         }
     };
-    // Rooted where the ledgers are (`--cwd`), and run under `--global` /
-    // `--global-prefix` too: discovery is what gates the ledgers (core
-    // discover rule 11); without it the raw-text fallbacks would decide a
-    // uuid a lockfile mentions, attesting a commented-out or rejected pin.
-    let discovery = crate::commands::discover_wiring(common, &common.cwd).await;
+    // Rooted where the ledgers are (the manifest's project, `--cwd` for the
+    // default layout; #745), and run under `--global` / `--global-prefix`
+    // too: discovery is what gates the ledgers (core discover rule 11);
+    // without it the raw-text fallbacks would decide a uuid a lockfile
+    // mentions, attesting a commented-out or rejected pin.
+    let discovery = crate::commands::discover_wiring(common, &common.project_root()).await;
     for diag in &discovery.diagnostics {
         note_warning(warnings, common, diag.code, diag.detail.clone());
     }

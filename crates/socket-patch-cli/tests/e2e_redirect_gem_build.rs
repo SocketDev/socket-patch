@@ -1224,7 +1224,7 @@ async fn redirect_scanned_project(
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["redirect"]["mode"], "hosted", "envelope: {env}");
     assert_eq!(
-        env["redirect"]["redirected"], 1,
+        env["summary"]["applied"], 1,
         "exactly one dep redirected: {env}"
     );
     let rewritten: Vec<&str> = env["redirect"]["rewrittenFiles"]
@@ -1237,10 +1237,11 @@ async fn redirect_scanned_project(
         rewritten.contains(&gemfile_name),
         "the {gemfile_name} rewrite must be reported: {env}"
     );
-    let warning_codes: Vec<&str> = env["redirect"]["warnings"]
+    // `warnings` is omitted when the run has none.
+    let warning_codes: Vec<&str> = env["warnings"]
         .as_array()
-        .expect("warnings")
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(|w| w["code"].as_str())
         .collect();
     if checksums_lock {
@@ -1276,8 +1277,10 @@ async fn redirect_scanned_project(
         | Driver::ScanVexSourceBlock
         | Driver::ScanVexTrailingSemicolonDeclaration => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
-            assert_eq!(
-                env["vex"]["verified"], false,
+            assert!(
+                env["vex"]["warnings"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|w| w["code"] == "vex_hosted_unverified")),
                 "in-run hosted VEX is attested from this run's fetched record, not hash-verified: {env}"
             );
         }
@@ -1302,19 +1305,18 @@ async fn redirect_scanned_project(
             unreachable!("asserted and returned above")
         }
         Driver::GetUuid => {
-            // get's hosted envelope (CLI_CONTRACT.md "get --mode and
-            // installed narrowing"): `found` counts the resolved patch;
-            // `downloaded`/`applied` are ABSENT — nothing lands in
-            // `.socket/`, the lockfile IS the persistence — and no
-            // `vex` key (get has no --vex).
-            assert_eq!(env["found"], 1, "envelope: {env}");
-            assert!(
-                env.get("downloaded").is_none(),
-                "hosted get downloads nothing into .socket/: {env}"
+            // get's hosted envelope: the resolved patch's hosted pin is its
+            // one event; nothing is downloaded into `.socket/` (the
+            // lockfile IS the persistence) and no `vex` key (get has no
+            // --vex).
+            assert_eq!(
+                env["events"].as_array().map(Vec::len),
+                Some(1),
+                "envelope: {env}"
             );
-            assert!(
-                env.get("applied").is_none(),
-                "hosted get applies nothing in place: {env}"
+            assert_eq!(
+                env["summary"]["downloaded"], 0,
+                "hosted get downloads nothing into .socket/: {env}"
             );
             assert!(env.get("vex").is_none(), "get has no --vex: {env}");
         }
@@ -1411,7 +1413,7 @@ fn assert_custom_lockfile_redirects_nothing(
 ) {
     let env: serde_json::Value = serde_json::from_str(stdout)
         .unwrap_or_else(|e| panic!("not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
-    let warning_codes: Vec<&str> = env["redirect"]["warnings"]
+    let warning_codes: Vec<&str> = env["warnings"]
         .as_array()
         .map(|a| a.iter().filter_map(|w| w["code"].as_str()).collect())
         .unwrap_or_default();
@@ -1420,10 +1422,7 @@ fn assert_custom_lockfile_redirects_nothing(
         "the {refusal} refusal must be reported: {env}"
     );
     assert_ne!(code, 0, "nothing was patched or attested: {env}");
-    assert_eq!(
-        env["redirect"]["redirected"], 0,
-        "nothing redirected: {env}"
-    );
+    assert_eq!(env["summary"]["applied"], 0, "nothing redirected: {env}");
     assert!(
         env["vex"]["statements"].as_u64().unwrap_or(0) == 0,
         "no in-run attestation for a lock that was never pinned: {env}"
@@ -1458,7 +1457,7 @@ fn assert_dual_boot_redirects_nothing(
     pristine_gemfile: &[u8],
     pristine_lock: &[u8],
 ) {
-    let warning_codes: Vec<&str> = env["redirect"]["warnings"]
+    let warning_codes: Vec<&str> = env["warnings"]
         .as_array()
         .map(|a| a.iter().filter_map(|w| w["code"].as_str()).collect())
         .unwrap_or_default();
@@ -1470,10 +1469,7 @@ fn assert_dual_boot_redirects_nothing(
         !warning_codes.contains(&"redirect_gem_no_gemfile"),
         "the refusal names its real cause, not a missing Gemfile: {env}"
     );
-    assert_eq!(
-        env["redirect"]["redirected"], 0,
-        "nothing redirected: {env}"
-    );
+    assert_eq!(env["summary"]["applied"], 0, "nothing redirected: {env}");
     assert!(
         env["vex"]["statements"].as_u64().unwrap_or(0) == 0,
         "no in-run attestation for a gem bundler installs unpatched: {env}"
@@ -2484,15 +2480,19 @@ fn vendor_takeover_keeps_the_hosted_group_pin(
     let env: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("{label}: not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
     if dry_run {
-        // The ledger-classification preview: the refusal is a
-        // `would_refuse` row (which never flips the exit code), never
-        // `would_vendor`.
+        // The ledger-classification preview: the refusal is a `skipped`
+        // event carrying the refusal's code (which never flips the exit
+        // code), never a `verified` would-vendor event.
         assert_eq!(code, 0, "{label}: {env}");
-        let row = &env["vendor"]["patches"][0];
-        assert_eq!(row["action"], "would_refuse", "{label}: {env}");
+        let row = &env["events"][0];
+        assert_eq!(row["action"], "skipped", "{label}: {env}");
         assert_eq!(
             row["errorCode"], "gemfile_declaration_not_editable",
             "{label}: {env}"
+        );
+        assert_eq!(
+            env["summary"]["verified"], 0,
+            "{label}: nothing to vendor: {env}"
         );
     } else {
         assert_eq!(code, 1, "{label} must refuse: {env}\nstderr:\n{stderr}");
@@ -2938,7 +2938,7 @@ async fn gem_hosted_mirror_rescan_requires_verified_installed_bytes() {
                 stdout.contains("redirect_gem_mirror_overrides_source"),
                 "{env}"
             );
-            assert_eq!(env["redirect"]["redirected"], 0, "{env}");
+            assert_eq!(env["summary"]["applied"], 0, "{env}");
             if installed && !no_verify {
                 assert_eq!(code, 0, "{env}\n{stderr}");
                 assert_eq!(
@@ -3159,7 +3159,7 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
         "same-grant re-scan failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).expect("re-scan envelope JSON");
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(env["summary"]["applied"], 1, "envelope: {env}");
     assert_eq!(
         std::fs::read_to_string(fx.proj.join("Gemfile"))
             .expect("read Gemfile after same-grant re-scan"),
@@ -3180,7 +3180,7 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
         "rotated-grant re-scan failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).expect("rotation envelope JSON");
-    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(env["summary"]["applied"], 1, "envelope: {env}");
     let gemfile = std::fs::read_to_string(fx.proj.join("Gemfile"))
         .expect("read Gemfile after rotated-grant re-scan");
     assert_eq!(

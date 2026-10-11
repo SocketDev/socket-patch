@@ -43,8 +43,10 @@ class BunTransportRetryTests(unittest.TestCase):
                 calls.append(True)
                 row = dict(passed=len(calls) > 1, checks={'repeatStableLock': len(calls) > 1})
                 if len(calls) == 1:
-                    row['repeat'] = {'vendor': {'events': [{'reason':
-                        'Network error: error sending request for url (https://patch.socket.dev/example)'}]}}
+                    row['repeat'] = {'status': 'partialFailure', 'events': [{
+                        'action': 'failed', 'purl': bun.PURL, 'errorCode': 'download_failed',
+                        'details': {'mode': 'vendored'}, 'error':
+                        'Network error: error sending request for url (https://patch.socket.dev/example)'}]}
                 bun.save(case / 'result.json', row)
                 return row
 
@@ -145,8 +147,9 @@ class BunInformationalCodeTests(unittest.TestCase):
         for code in ('vendor_bun_reinstall_required', 'redirect_bun_reinstall_required'):
             self.assertIn(code, bun.INFORMATIONAL)
             self.assertIn(code, bun.BUN_REINSTALL_ADVISORIES)
-        envelope = {'status': 'success', 'redirect': {'redirected': 1, 'warnings': [
-            {'code': 'redirect_bun_reinstall_required'}]}}
+        envelope = {'status': 'success',
+                    'events': [{'action': 'applied', 'purl': bun.PURL, 'details': {'mode': 'hosted'}}],
+                    'warnings': [{'code': 'redirect_bun_reinstall_required', 'detail': 'bun install --force'}]}
         self.assertTrue(bun.rerun_clean(0, envelope, 'hosted'))
 
     def test_misclassification_codes_stay_refusals(self):
@@ -468,8 +471,8 @@ class PdmTransportRetryTests(unittest.TestCase):
     def test_zero_exit_cli_transport_warning_is_retried_from_a_fresh_case(self):
         # The CLI exits 0 and reports the exhausted patch API fetch in its
         # envelope; `Run`'s exit-code retry never sees it.
-        envelope = json.dumps({"status": "partial_failure", "warnings": [{"code": "patch_details_failed",
-                               "message": "API request failed with status 503: service unavailable"}]})
+        envelope = json.dumps({"status": "partialFailure", "events": [], "warnings": [{"code": "patch_details_failed",
+                               "detail": "API request failed with status 503: service unavailable"}]})
         blip = self.operation(0, envelope)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -538,6 +541,67 @@ class PdmTransportRetryTests(unittest.TestCase):
         row = {"checks": {"appliedExactlyOne": False, "lockRewritten": True, "lockUnchanged": False},
                "info": {"appliedExactlyOne": {"applied": 0}, "lockRewritten": {"x": 1}}}
         self.assertEqual(pdm.failure_details(row), ['  appliedExactlyOne: {"applied": 0}'])
+
+
+class PythonHarnessEnvelopeTests(unittest.TestCase):
+    """pdm / pipenv / poetry read the v5 envelope through the same small
+    accessors: per-leg `applied` (or dry-run `verified`) event counts and the
+    codes of `error`, every event `errorCode` and every `warnings[]` entry."""
+
+    PURL = "pkg:pypi/urllib3@1.26.18"
+
+    def event(self, action, mode=None, code=None, reason=None):
+        e = {"action": action, "purl": self.PURL, "uuid": "u"}
+        if mode:
+            e["details"] = {"mode": mode}
+        if code:
+            e["errorCode"] = code
+        if reason:
+            e["reason"] = reason
+        return e
+
+    def test_applied_count_reads_one_leg(self):
+        env = {"status": "success", "dryRun": False, "events": [
+            self.event("applied", "hosted"), self.event("applied", "vendored"),
+            self.event("downloaded"), self.event("applied"),
+            self.event("skipped", "hosted", "redirect_unconfirmed")]}
+        for script in (pdm, pipenv, poetry):
+            with self.subTest(script=script.__name__):
+                self.assertEqual([script.applied_count(m, env) for m in ("hosted", "vendored", "agent")], [1, 1, 1])
+                self.assertEqual(script.applied_count("agent-oot", env), 1)
+
+    def test_dry_run_counts_verified_previews(self):
+        env = {"status": "success", "dryRun": True, "events": [
+            self.event("verified", "hosted"), self.event("verified"), self.event("verified")]}
+        for script in (pdm, pipenv, poetry):
+            with self.subTest(script=script.__name__):
+                self.assertEqual((script.applied_count("hosted", env), script.applied_count("vendored", env),
+                                  script.applied_count("agent", env)), (1, 0, 2))
+
+    def test_codes_read_error_events_and_warnings(self):
+        env = {"status": "error", "error": {"code": "pypi_pdm_lock_unsupported", "message": "lock_version 3.0"},
+               "events": [self.event("skipped", "vendored", "vendor_artifact_reused", "re-wired"),
+                          self.event("failed", None, "package_not_installed")],
+               "warnings": [{"code": "redirect_pypi_stale_install", "detail": "pipenv run pip uninstall urllib3"}]}
+        for script in (pdm, pipenv, poetry):
+            with self.subTest(script=script.__name__):
+                self.assertEqual(script.envelope_codes(env), [
+                    "package_not_installed", "pypi_pdm_lock_unsupported",
+                    "redirect_pypi_stale_install", "vendor_artifact_reused"])
+                details = {w["code"]: w["detail"] for w in script.envelope_warnings(env)}
+                self.assertEqual(details["redirect_pypi_stale_install"], "pipenv run pip uninstall urllib3")
+                self.assertEqual(details["vendor_artifact_reused"], "re-wired")
+                self.assertEqual(details["pypi_pdm_lock_unsupported"], "lock_version 3.0")
+                self.assertEqual(script.envelope_codes({}), [])
+
+    def test_rollback_restores_are_leg_events(self):
+        env = {"command": "rollback", "status": "partialFailure", "events": [
+            self.event("rolledBack", "hosted"), self.event("failed", "vendored", "vendor_revert_kept")]}
+        for script in (pdm, pipenv, poetry):
+            with self.subTest(script=script.__name__):
+                self.assertEqual([e["action"] for e in script.leg_events("hosted", env)], ["rolledBack"])
+                self.assertEqual([e["errorCode"] for e in script.leg_events("vendored", env)], ["vendor_revert_kept"])
+                self.assertEqual(script.leg_events("agent", env), [])
 
 
 class PipenvShimTests(unittest.TestCase):
@@ -1102,8 +1166,8 @@ class VltRetryTests(unittest.TestCase):
             row = dict(cell=cell.name, expectedVerdict='patched', passed=False, checks={},
                        safeRefusal=True)
             detail = 'vlt would fail to verify https://h/a.tgz: http 503; nothing was written for x'
-            envelope = {'status': 'success', 'redirect': {'warnings': [
-                {'code': 'redirect_vlt_artifact_unverifiable', 'detail': detail}]}}
+            envelope = {'status': 'success', 'events': [], 'warnings': [
+                {'code': 'redirect_vlt_artifact_unverifiable', 'detail': detail}]}
             with patch.object(vlt, 'run', return_value=(0, json.dumps(envelope), '')):
                 cell.patch_run('hosted')
             with patch('sys.stdout'):
@@ -1156,8 +1220,8 @@ class VltBlockedRefusalTests(unittest.TestCase):
                     codes=[], checks={'serveEncodingIdentity': False})
 
     def envelope(self, detail=DETAIL):
-        return {'redirect': {'warnings': [{'code': 'redirect_vlt_artifact_unverifiable',
-                                           'detail': detail}]}}
+        return {'status': 'success', 'events': [],
+                'warnings': [{'code': 'redirect_vlt_artifact_unverifiable', 'detail': detail}]}
 
     def test_a_clean_refusal_of_an_encoded_artifact_is_blocked(self):
         row = self.row()
@@ -1196,8 +1260,9 @@ class VltBlockedRefusalTests(unittest.TestCase):
         for envelope in (self.envelope('vlt would fail to verify x: sha512 mismatch; '
                                        'nothing was written'),
                          self.envelope('content-encoding gzip'),
-                         {'redirect': {'warnings': [{'code': 'redirect_vlt_lock_unsupported',
-                                                     'detail': self.DETAIL}]}}):
+                         {'status': 'success', 'events': [],
+                          'warnings': [{'code': 'redirect_vlt_lock_unsupported',
+                                        'detail': self.DETAIL}]}):
             with self.subTest(envelope=envelope):
                 row = self.row()
                 self.assertFalse(self.cell.blocked_refusal(row, [envelope], self.reference))
@@ -1231,11 +1296,14 @@ class VltProbeTests(unittest.TestCase):
                 vlt.select_tarball(broken)
 
     def test_envelope_codes_read_every_channel(self):
-        envelope = {'redirect': {'warnings': [{'code': 'a'}],
-                                 'skipped': [{'reason': 'redirect_vlt_artifact_unverifiable'}]},
-                    'vendor': {'events': [{'errorCode': 'b', 'reason': 'prose with spaces'}]}}
+        envelope = {'status': 'error', 'error': {'code': 'c', 'message': 'm'},
+                    'warnings': [{'code': 'a', 'detail': ''}],
+                    'events': [{'action': 'skipped', 'errorCode': 'redirect_vlt_artifact_unverifiable',
+                                'details': {'mode': 'hosted'}},
+                               {'action': 'skipped', 'errorCode': 'b', 'reason': 'prose with spaces',
+                                'details': {'mode': 'vendored'}}]}
         self.assertEqual(sorted(vlt.envelope_codes(envelope)),
-                         ['a', 'b', 'redirect_vlt_artifact_unverifiable'])
+                         ['a', 'b', 'c', 'redirect_vlt_artifact_unverifiable'])
 
 
 if __name__ == "__main__":

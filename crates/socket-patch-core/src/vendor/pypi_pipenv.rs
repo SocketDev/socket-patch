@@ -19,7 +19,7 @@ use super::state::{PipenvMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
 /// The only file this backend ever writes (and the revert allowlist).
-const LOCK_FILE: &str = "Pipfile.lock";
+pub(super) const LOCK_FILE: &str = "Pipfile.lock";
 
 /// The `WiringRecord.kind` discriminator this backend owns.
 const KIND_LOCK_ENTRY: &str = "pipenv_lock_entry";

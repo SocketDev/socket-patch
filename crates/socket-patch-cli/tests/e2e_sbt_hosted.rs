@@ -268,7 +268,7 @@ fn hosted_mixed_root_confirms_the_pom_pin_when_sbt_refuses() {
     );
     let pom = std::fs::read_to_string(project.join("pom.xml")).unwrap();
     assert!(pom.contains(SV), "{pom}");
-    assert_eq!(json["redirect"]["redirected"], 1, "{json}");
+    assert_eq!(json["summary"]["applied"], 1, "{json}");
 }
 
 #[test]
@@ -290,7 +290,7 @@ fn hosted_grant_writes_the_owned_file_and_reruns_idempotently() {
         "hosted writes only socket-patch.sbt (sbt downloads at load)"
     );
     let redirect = &json["redirect"];
-    assert_eq!(redirect["redirected"], 1, "{json}");
+    assert_eq!(json["summary"]["applied"], 1, "{json}");
     assert!(
         redirect["rewrittenFiles"]
             .as_array()
@@ -312,7 +312,7 @@ fn hosted_grant_writes_the_owned_file_and_reruns_idempotently() {
         std::fs::read_to_string(project.join(HOSTED_FILE)).unwrap(),
         written
     );
-    assert_eq!(again["redirect"]["redirected"], 1, "{again}");
+    assert_eq!(again["summary"]["applied"], 1, "{again}");
 }
 
 /// A `socket-patch.sbt` on disk that is not UTF-8 is not absent: the run
@@ -370,7 +370,7 @@ fn hosted_version_conflict_is_refused() {
         "{json}"
     );
     assert!(!project.join(HOSTED_FILE).exists());
-    assert_eq!(json["redirect"]["redirected"], 0, "{json}");
+    assert_eq!(json["summary"]["applied"], 0, "{json}");
 }
 
 /// A committed `socket-patch.sbt` pinning gson, no evidence of it.
@@ -481,7 +481,7 @@ fn hosted_rerun_checks_the_pin_by_content_not_location() {
     post_update_evidence(&project, &jar);
 
     let (_, json) = get_hosted(&home, &project, &api, UUID);
-    assert_eq!(json["redirect"]["redirected"], 1, "{json}");
+    assert_eq!(json["summary"]["applied"], 1, "{json}");
     assert!(
         !all_codes(&json)
             .iter()

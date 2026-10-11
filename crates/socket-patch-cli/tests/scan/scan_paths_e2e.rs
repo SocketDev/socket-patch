@@ -343,9 +343,16 @@ async fn paths_never_narrow_the_prune_universe() {
 
     // Envelope gc block agrees with the on-disk outcome.
     let v = parse_envelope(&stdout);
+    let pruned: Vec<&serde_json::Value> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "removed" && e["details"]["manifest"] == true)
+        .map(|e| &e["purl"])
+        .collect();
     assert_eq!(
-        v["gc"]["prunedManifestEntries"],
-        serde_json::json!(["pkg:npm/gone@9.9.9"]),
+        pruned,
+        [&serde_json::json!("pkg:npm/gone@9.9.9")],
         "gc must report exactly the orphan as pruned; got {v}"
     );
     assert_eq!(
@@ -688,8 +695,8 @@ async fn paths_with_hosted_or_vendored_mode_name_project_directories() {
     assert_usage_error(&stdout, "path_glob_invalid", "invalid path pattern");
 }
 
-/// A `--json` usage error: exactly `{status: "error", error: {code,
-/// message}}` on stdout, the message containing `needle`.
+/// A `--json` usage error: the full envelope (v5.0) with `status:
+/// "error"` and `error: {code, message}`, the message containing `needle`.
 fn assert_usage_error(stdout: &str, code: &str, needle: &str) {
     let v = parse_envelope(stdout);
     assert_eq!(v["status"], "error", "{v}");
@@ -701,7 +708,8 @@ fn assert_usage_error(stdout: &str, code: &str, needle: &str) {
         "{v}"
     );
     assert!(v.get("errorCode").is_none(), "{v}");
-    assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
+    crate::common::envelope::assert_envelope_invariants(&v, "scan");
+    assert_eq!(v["events"], serde_json::json!([]), "{v}");
 }
 
 // ---------------------------------------------------------------------------

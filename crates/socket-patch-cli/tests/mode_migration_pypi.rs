@@ -104,6 +104,38 @@ fn run_cli(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, Value) {
     (code, env)
 }
 
+/// How many hosted pins a `scan --mode hosted --json` run wrote (or would
+/// write, on a dry run): its `applied` / `verified` hosted events.
+fn hosted_pinned(env: &Value) -> u64 {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
+}
+
+/// A hosted run's skips as `{purl, uuid, reason, detail}` rows: its
+/// `skipped` hosted events (`reason` = the `errorCode`, `detail` = the
+/// event's `reason`).
+fn hosted_skipped(env: &Value) -> Vec<Value> {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "skipped")
+        .map(|e| {
+            serde_json::json!({
+                "purl": e["purl"], "uuid": e["uuid"],
+                "reason": e["errorCode"], "detail": e["reason"],
+            })
+        })
+        .collect()
+}
+
 /// [`run_cli`] without `--json`: `(exit code, stdout, stderr)`.
 fn run_raw(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, String) {
     let venv = root.join("../empty-venv");
@@ -257,7 +289,7 @@ async fn assert_vendored_to_hosted(root: &Path, files: &[&str]) {
     let hosted_url = mount_hosted_api(&server, true).await;
     let (code, env) = hosted_scan(root, &server);
     assert_eq!(code, 0, "hosted scan over the vendored project: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     assert!(
         env.to_string()
             .contains("redirect_takeover_reverted_vendored"),
@@ -425,7 +457,7 @@ async fn assert_all_hosted_requirements_unwind(pristine: &str) {
         std::fs::write(root.join("requirements.txt"), pristine).unwrap();
         let (code, env) = hosted_scan(&root, &server);
         assert_eq!(code, 0, "hosted scan: {env:#}");
-        assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+        assert_eq!(hosted_pinned(&env), 1, "{env:#}");
         let wired = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
         assert!(wired.contains(&hosted_url), "hosted first:\n{wired}");
 
@@ -566,7 +598,7 @@ async fn pipenv_takeover_beside_an_unreached_include_is_never_stranded() {
         !env.to_string().contains("redirect_takeover_unpatched"),
         "{env:#}"
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
     assert!(
         lock.contains(&hosted_url),
@@ -574,15 +606,15 @@ async fn pipenv_takeover_beside_an_unreached_include_is_never_stranded() {
     );
     assert!(!lock.contains(".socket/vendor/"), "{lock}");
     assert_eq!(
-        (dry_code, &dry_env["redirect"]["redirected"]),
-        (code, &env["redirect"]["redirected"]),
+        (dry_code, hosted_pinned(&dry_env)),
+        (code, hosted_pinned(&env)),
         "the dry run predicts the wet run: {dry_env:#}"
     );
 }
 
 /// #567 without a takeover: the Pipfile.lock pin the hosted rewriter would
 /// land is contested by an `-r` include it does not reach, so the patch is
-/// left out — reported in `redirect.skipped[]` as `redirect_unattributable`
+/// left out — reported as a hosted `skipped` event with `errorCode` `redirect_unattributable`
 /// with discovery's finding — nothing is written and the exit code is 0.
 #[tokio::test]
 async fn pipenv_redirect_beside_an_unreached_include_is_skipped_unattributable() {
@@ -600,8 +632,8 @@ async fn pipenv_redirect_beside_an_unreached_include_is_skipped_unattributable()
         code, 0,
         "an unattributable pin is a skip, not a failure: {env:#}"
     );
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
-    let skipped = env["redirect"]["skipped"].as_array().expect("skipped[]");
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
+    let skipped = hosted_skipped(&env);
     assert_eq!(skipped.len(), 1, "{env:#}");
     assert_eq!(skipped[0]["purl"], PURL, "{env:#}");
     assert_eq!(skipped[0]["reason"], "redirect_unattributable", "{env:#}");
@@ -1236,7 +1268,7 @@ async fn uv_takeover_without_wheel_metadata_keeps_the_package_vendored() {
         let (code, env) = run_cli(&root, &args, &[]);
         let ctx = format!("dry_run={dry_run}: {env:#}");
         assert_eq!(code, 0, "a retracted takeover is not a failure: {ctx}");
-        assert_eq!(env["redirect"]["redirected"], 0, "{ctx}");
+        assert_eq!(hosted_pinned(&env), 0, "{ctx}");
         let text = env.to_string();
         assert!(!text.contains("redirect_takeover_unpatched"), "{ctx}");
         assert!(
@@ -1246,9 +1278,7 @@ async fn uv_takeover_without_wheel_metadata_keeps_the_package_vendored() {
         );
         assert!(text.contains("redirect_takeover_kept_vendored"), "{ctx}");
         assert!(
-            env["redirect"]["skipped"]
-                .as_array()
-                .is_some_and(|s| s.iter().any(|s| s["uuid"] == UUID)),
+            hosted_skipped(&env).iter().any(|s| s["uuid"] == UUID),
             "the purl is skipped with its cause: {ctx}"
         );
         assert_eq!(
@@ -1417,7 +1447,7 @@ async fn drifted_vendored_line_refuses_takeover() {
         "no takeover is announced over drifted wiring: {env:#}"
     );
     assert!(text.contains("redirect_vendored_revert_failed"), "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
     assert_eq!(
         code, 0,
         "a refused takeover keeps the package vendored: {env:#}"
@@ -1460,7 +1490,7 @@ async fn dry_run_predicts_drifted_takeover_refusal() {
         "no takeover is previewed over drifted wiring: {env:#}"
     );
     assert!(text.contains("redirect_vendored_revert_failed"), "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
     assert_eq!(
         std::fs::read_to_string(&reqs).unwrap(),
         drifted,
@@ -1714,7 +1744,7 @@ async fn assert_takeover_refused_serving(
         "the package is never stranded: {env:#}"
     );
     assert!(text.contains(code_name), "the refusal is named: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
     assert_eq!(
         code, 0,
         "a refused takeover keeps the package vendored: {env:#}"
@@ -1800,7 +1830,7 @@ async fn dry_run_previews_root_pin_takeover() {
         env.to_string().contains("redirect_would_revert_vendored"),
         "{env:#}"
     );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
 }
 
 /// uv.lock resolving `six` 1.17.0, either as a direct `six>=1.15` or
@@ -2022,12 +2052,11 @@ async fn platform_wheel_takeover_is_refused_before_revert() {
 
 /// #612: a Pipenv project with a `requirements.txt` exported beside its
 /// lock (`pipenv requirements`). Hosted mode pins both; the hosted →
-/// vendored takeover (`vendor` over the hosted project) wires only the
-/// governing `Pipfile.lock` and restores the requirements pin to upstream,
-/// so the run must name `requirements.txt` among the install sources left
-/// UNPATCHED instead of passing in silence.
+/// vendored takeover (`vendor` over the hosted project) must leave both
+/// patched too: `Pipfile.lock` and the export's pin both refer to the
+/// vendored wheel, and no install source is left UNPATCHED.
 #[tokio::test]
-async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
+async fn pipenv_hosted_to_vendored_keeps_the_requirements_patched() {
     let (_tmp, root) = project();
     stage_pipenv(&root);
     std::fs::write(
@@ -2062,13 +2091,127 @@ async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
         lock.contains(&format!(".socket/vendor/pypi/{UUID}/")),
         "Pipfile.lock is wired to the vendored wheel:\n{lock}\n{env:#}"
     );
-    let rendered = env.to_string();
+    let reqs = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
     assert!(
-        rendered.contains("\"pypi_multiple_lockfiles\"")
-            && rendered.contains("wiring `Pipfile.lock`")
-            && rendered.contains("requirements.txt will still install the UNPATCHED"),
-        "the takeover names requirements.txt as an unpatched install source: {env:#}"
+        reqs.contains(&format!(".socket/vendor/pypi/{UUID}/")) && !reqs.contains(&hosted_url),
+        "requirements.txt is wired to the vendored wheel too:\n{reqs}\n{env:#}"
     );
+    assert!(
+        !env.to_string().contains("UNPATCHED"),
+        "no install source is left unpatched: {env:#}"
+    );
+}
+
+/// The `pipenv requirements > requirements.txt` export of [`stage_pipenv`]'s
+/// lock: the file Docker / plain-pip installs read.
+const PIPENV_EXPORT: &str = "-i https://pypi.org/simple\nsix==1.16.0 ; python_version >= '2.7' and python_version not in '3.0, 3.1, 3.2'\n";
+
+/// #612: vendored mode in a Pipenv project with an exported
+/// requirements.txt must keep that install path patched too, the way
+/// hosted mode rewrites both files: `vendor` wires Pipfile.lock AND the
+/// export's pin, `vendor --check` is green, and the revert restores both.
+/// The same holds when the export is added after a first vendor (a re-run
+/// wires it instead of answering `already_vendored`), and for the hosted
+/// → vendored takeover, which used to turn the export's hosted pin back
+/// into a plain PyPI pin.
+#[tokio::test]
+async fn pipenv_vendor_wires_the_exported_requirements_too() {
+    let wheel_dir = format!(".socket/vendor/pypi/{UUID}/");
+    let assert_both_vendored = |root: &Path, label: &str| {
+        for f in ["Pipfile.lock", "requirements.txt"] {
+            let text = std::fs::read_to_string(root.join(f)).unwrap();
+            assert!(
+                text.contains(&wheel_dir),
+                "{label}: {f} is vendored:\n{text}"
+            );
+        }
+        let (code, env) = run_cli(root, &["vendor", "--check"], &[]);
+        assert_eq!(code, 0, "{label}: vendor --check is green: {env:#}");
+    };
+    let assert_reverts = |root: &Path, pipfile_lock: &str, label: &str| {
+        let (code, env) = run_cli(root, &["vendor", "--revert"], &[]);
+        assert_eq!(code, 0, "{label}: revert: {env:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+            PIPENV_EXPORT,
+            "{label}: the export is restored byte for byte"
+        );
+        let lock = |t: &str| serde_json::from_str::<Value>(t).unwrap();
+        assert_eq!(
+            lock(&std::fs::read_to_string(root.join("Pipfile.lock")).unwrap()),
+            lock(pipfile_lock),
+            "{label}: Pipfile.lock is restored"
+        );
+        assert!(
+            !root.join(&wheel_dir).exists(),
+            "{label}: the wheel is reclaimed"
+        );
+    };
+
+    // Fresh vendor.
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    let pristine = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    std::fs::write(root.join("requirements.txt"), PIPENV_EXPORT).unwrap();
+    stage_manifest(&root);
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "vendor: {env:#}");
+    assert!(
+        !env.to_string().contains("UNPATCHED"),
+        "no install path is left unpatched: {env:#}"
+    );
+    assert_both_vendored(&root, "fresh");
+    assert_reverts(&root, &pristine, "fresh");
+
+    // The export reached through an in-root `-r` include is wired too.
+    let (_tmp, root) = project();
+    let files = stage_pipenv(&root);
+    std::fs::write(root.join("requirements.txt"), "-r req/base.txt\n").unwrap();
+    std::fs::create_dir_all(root.join("req")).unwrap();
+    std::fs::write(root.join("req/base.txt"), PIPENV_EXPORT).unwrap();
+    vendor_project(&root, files);
+    let base = std::fs::read_to_string(root.join("req/base.txt")).unwrap();
+    assert!(
+        base.contains(&wheel_dir),
+        "the included export is vendored:\n{base}"
+    );
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 0, "include: vendor --check is green: {env:#}");
+    let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+    assert_eq!(code, 0, "include: revert: {env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("req/base.txt")).unwrap(),
+        PIPENV_EXPORT
+    );
+
+    // The export appears after a first vendor: the re-run wires it.
+    let (_tmp, root) = project();
+    let files = stage_pipenv(&root);
+    vendor_project(&root, files);
+    std::fs::write(root.join("requirements.txt"), PIPENV_EXPORT).unwrap();
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "re-run: {env:#}");
+    assert_both_vendored(&root, "re-run");
+    assert_reverts(&root, &pristine, "re-run");
+
+    // Hosted → vendored takeover keeps both files patched.
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    std::fs::write(root.join("requirements.txt"), PIPENV_EXPORT).unwrap();
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "hosted scan: {env:#}");
+    for f in ["Pipfile.lock", "requirements.txt"] {
+        let text = std::fs::read_to_string(root.join(f)).unwrap();
+        assert!(text.contains(&hosted_url), "hosted first: {f}:\n{text}");
+    }
+    stage_manifest(&root);
+    prebuilt_common::mount_project(&server, &root).await;
+    let (code, env) = run_cli(&root, &["vendor", "--patch-server-url", uri.as_str()], &[]);
+    assert_eq!(code, 0, "takeover: {env:#}");
+    assert_both_vendored(&root, "takeover");
 }
 
 const PDM_LOCK: &str = r#"# This file is @generated by PDM.
@@ -2203,7 +2346,7 @@ async fn pypi_unwinds_name_the_reinstall_a_plain_sync_skips() {
             hosted_stage(&root);
             let (code, env) = hosted_scan(&root, &server);
             assert_eq!(code, 0, "{tool}: hosted scan: {env:#}");
-            assert_eq!(env["redirect"]["redirected"], 1, "{tool}: {env:#}");
+            assert_eq!(hosted_pinned(&env), 1, "{tool}: {env:#}");
             let mut args = unwind.clone();
             args.extend(["--patch-server-url", uri.as_str()]);
             let (code, env) = run_cli(&root, &args, &env_vars);
@@ -2317,7 +2460,7 @@ async fn hatch_locked_env_pylock_wires_pyproject() {
     std::fs::write(root.join("pylock.toml"), &pylock).unwrap();
     let (code, env) = hosted_scan(&root, &server);
     assert_eq!(code, 0, "hosted: {env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     let pyproject = std::fs::read_to_string(root.join("pyproject.toml")).unwrap();
     assert!(
         pyproject.contains(&format!("six @ {hosted_url}")),
@@ -2391,7 +2534,7 @@ async fn lock_only_pep440_equivalent_pin_is_patched() {
         .unwrap();
         let (code, env) = hosted_scan(&root, &server);
         assert_eq!(code, 0, "{pin}: {env:#}");
-        assert_eq!(env["redirect"]["redirected"], 1, "{pin}: {env:#}");
+        assert_eq!(hosted_pinned(&env), 1, "{pin}: {env:#}");
         assert_eq!(env["packages"][0]["purl"], PURL, "{pin}: {env:#}");
         assert_eq!(env["packages"][0]["notInstalled"], true, "{pin}: {env:#}");
         let requirements = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
@@ -2610,8 +2753,8 @@ async fn pipenv_residual_export_takeover_refusal_names_the_export() {
     mount_hosted_api(&server, true).await;
     let (code, env) = hosted_scan(&root, &server);
     assert_eq!(code, 0, "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
-    let detail = env["redirect"]["warnings"]
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
+    let detail = env["warnings"]
         .as_array()
         .unwrap()
         .iter()
@@ -2642,7 +2785,7 @@ async fn pipenv_residual_export_takeover_refusal_names_the_export() {
     .unwrap();
     let (code, env) = hosted_scan(&root, &server);
     assert_eq!(code, 0, "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
     assert!(
         !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
         "the takeover reclaims the vendored wheel: {env:#}"

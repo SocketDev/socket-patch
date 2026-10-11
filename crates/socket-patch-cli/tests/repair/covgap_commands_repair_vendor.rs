@@ -749,6 +749,13 @@ async fn repair_recovers_record_by_uuid_without_manifest_then_fails_offline() {
             .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
         "envelope={v}"
     );
+    // Vendored-phase events say so, as in every envelope.
+    assert!(
+        events_of(&v)
+            .iter()
+            .all(|e| e["details"]["mode"] == "vendored"),
+        "envelope={v}"
+    );
     assert_eq!(
         std::fs::read(&tgz).unwrap(),
         tgz_bytes,

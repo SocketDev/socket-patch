@@ -429,10 +429,11 @@ fn envelope(out: &std::process::Output) -> serde_json::Value {
 }
 
 fn stale_warning(value: &serde_json::Value) -> bool {
-    value["redirect"]["warnings"]
+    // Top-level `warnings` is omitted when empty.
+    value["warnings"]
         .as_array()
-        .unwrap()
-        .iter()
+        .into_iter()
+        .flatten()
         .any(|warning| warning["code"] == "redirect_pypi_stale_install")
 }
 
@@ -449,7 +450,7 @@ async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
         let out = scan_output(tmp.path(), &server, &["--json"]).await;
         let json = envelope(&out);
         assert!(out.status.success(), "{json}");
-        assert_eq!(json["redirect"]["redirected"], 1, "{json}");
+        assert_eq!(hosted_pin_count(&json), 1, "{json}");
         assert!(stale_warning(&json), "{json}");
         let redirected = read(&tmp.path().join("poetry.lock"));
         let vex = tmp.path().join("out.vex.json");
@@ -705,4 +706,19 @@ fn manifestless_vex_after_hosted_redirect() {
     let out = manifestless_vex(root, &api, true, &[]);
     assert_eq!(out.code, Some(0), "{out}");
     drop(server);
+}
+
+/// How many hosted pins the run wrote (would write, on a dry run): the
+/// envelope's `applied` / `verified` events tagged `details.mode: "hosted"`
+/// (v5.0: replaces `redirect.redirected`).
+fn hosted_pin_count(doc: &serde_json::Value) -> u64 {
+    doc["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events: {doc:#}"))
+        .iter()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .count() as u64
 }
