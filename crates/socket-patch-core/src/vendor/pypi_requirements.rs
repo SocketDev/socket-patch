@@ -1580,6 +1580,28 @@ mod tests {
         );
     }
 
+    /// #1365: the legacy parenthesised pin is the exact pin pip reads, so
+    /// vendor wires it (it used to refuse with a false "not pinned"), and
+    /// the revert restores the line as spelled.
+    #[tokio::test]
+    async fn wires_and_reverts_a_parenthesised_pin() {
+        for pin in ["six (==1.16.0)", "six (== 1.16.0)", "six ( ==1.16 )"] {
+            let original = format!("requests==2.31.0\n{pin}\n");
+            let tmp = write_root(&original).await;
+            let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap_or_else(|err| panic!("{pin}: {err:?}"));
+            assert_eq!(
+                read_root(tmp.path()).await,
+                format!("requests==2.31.0\n{}\n", expected_unhashed_line()),
+                "{pin}"
+            );
+            let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+            assert!(outcome.success, "{pin}");
+            assert_eq!(read_root(tmp.path()).await, original, "{pin}");
+        }
+    }
+
     #[tokio::test]
     async fn rewrites_hash_pinned_continuation_and_preserves_crlf() {
         // A hash-pinned requirement spanning two physical lines, CRLF file.
