@@ -887,6 +887,9 @@ async fn restore_berry(
     let mut changed = false;
     let mut moved: Vec<String> = Vec::new();
     let mut restored: Vec<usize> = Vec::new();
+    // `(block index, warning)`: kept only for an entry that is not merged
+    // into a sibling below, whose own body yarn wrote.
+    let mut node_gyp_unresolved: Vec<(usize, String)> = Vec::new();
     for Hit {
         idx,
         uuid,
@@ -978,8 +981,8 @@ async fn restore_berry(
             if resolvable {
                 lines = crate::formats::yarn::berry_entry::with_implicit_node_gyp(&lines);
             } else {
-                result.warnings.push((
-                    "yarn_berry_node_gyp_unresolved",
+                node_gyp_unresolved.push((
+                    idx,
                     format!(
                         "{name}@{version}: yarn gives the restored registry entry an \
                          implicit `node-gyp` dependency that {rel} no longer resolves; run \
@@ -1010,7 +1013,15 @@ async fn restore_berry(
     if !changed {
         return;
     }
-    crate::formats::yarn::stanzas::merge_same_resolution(&mut blocks, &restored, &mut moved);
+    let merged =
+        crate::formats::yarn::stanzas::merge_same_resolution(&mut blocks, &restored, &mut moved);
+    for (idx, warning) in node_gyp_unresolved {
+        if !merged.contains(&idx) {
+            result
+                .warnings
+                .push(("yarn_berry_node_gyp_unresolved", warning));
+        }
+    }
     if pkg_changed {
         if let (Some(text), Some(value)) = (pkg_text.as_deref(), pkg.as_mut()) {
             if let Some(obj) = value.as_object_mut() {

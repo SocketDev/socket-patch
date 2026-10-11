@@ -764,7 +764,7 @@ pub async fn revert_yarn_berry_opts(
                 let mut changed = false;
                 let restored_entries: Vec<String> = lock_recs
                     .iter()
-                    .filter(|rec| rec.kind == KIND_LOCK_ENTRY)
+                    .filter(|rec| rec.kind == KIND_LOCK_ENTRY || rec.kind == KIND_LOCK_ENTRY_PRUNED)
                     .filter_map(|rec| rec.original.as_ref())
                     .filter_map(super::yarn_classic_lock::json_to_lines)
                     .map(|lines| lines.join("\n"))
@@ -792,11 +792,13 @@ pub async fn revert_yarn_berry_opts(
                         .filter(|&i| restored_entries.contains(&doc.stanzas[i]))
                         .collect();
                     let mut moved = Vec::new();
-                    if crate::formats::yarn::stanzas::merge_same_resolution(
+                    if !crate::formats::yarn::stanzas::merge_same_resolution(
                         &mut doc.stanzas,
                         &restored,
                         &mut moved,
-                    ) {
+                    )
+                    .is_empty()
+                    {
                         text = doc.render(&moved);
                     }
                     forget_block_scans();

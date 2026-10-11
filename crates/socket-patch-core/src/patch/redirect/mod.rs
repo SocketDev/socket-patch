@@ -4806,7 +4806,9 @@ fn rewrite_yarn_berry_with_manifests(
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().map(String::as_str))
                     .collect();
-                pin.add_ranges(yarnrc, &fname, &folded_ranges);
+                if !folded_ranges.is_empty() {
+                    pin.add_ranges(yarnrc, &fname, &folded_ranges);
+                }
                 pin
             }
             Err(warning) => {

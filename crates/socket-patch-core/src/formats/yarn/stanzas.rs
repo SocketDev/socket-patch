@@ -90,12 +90,13 @@ pub(crate) fn stanza_lines(stanza: &str) -> Vec<String> {
 /// keyed by every descriptor, sorted, and `--immutable` rejects a lock
 /// that keeps them apart (YN0028). The entry yarn wrote keeps its body;
 /// the restored one only adds its keys. The merged key goes to `moved`,
-/// for [`BerryStanzas::render`] to sort.
+/// for [`BerryStanzas::render`] to sort. Returns the indices (before the
+/// call) of the restored stanzas merged away.
 pub(crate) fn merge_same_resolution(
     stanzas: &mut Vec<String>,
     restored: &[usize],
     moved: &mut Vec<String>,
-) -> bool {
+) -> Vec<usize> {
     use super::blocks::berry_field;
     use super::patterns::split_berry_key_patterns;
 
@@ -120,8 +121,10 @@ pub(crate) fn merge_same_resolution(
             .collect();
         patterns.sort();
         patterns.dedup();
-        let old_key = stanza_key(&stanzas[idx]).unwrap_or("").to_string();
-        moved.retain(|k| *k != old_key);
+        for old in [idx, sibling] {
+            let old_key = stanza_key(&stanzas[old]).unwrap_or("").to_string();
+            moved.retain(|k| *k != old_key);
+        }
         let key = format!("\"{}\"", patterns.join(", "));
         let mut lines = stanza_lines(&stanzas[sibling]);
         lines[0] = format!("{key}:");
@@ -129,11 +132,12 @@ pub(crate) fn merge_same_resolution(
         moved.push(key);
         dropped.push(idx);
     }
-    dropped.sort_unstable_by(|a, b| b.cmp(a));
-    for idx in &dropped {
-        stanzas.remove(*idx);
+    let mut descending = dropped.clone();
+    descending.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in descending {
+        stanzas.remove(idx);
     }
-    !dropped.is_empty()
+    dropped
 }
 
 /// A stanza's sort key: its unquoted key, or `None` for header comment
@@ -197,6 +201,28 @@ mod tests {
         ] {
             assert_eq!(BerryStanzas::parse(raw).render(&[]), raw, "{raw:?}");
         }
+    }
+
+    /// #1082: a restored entry joins the entry yarn wrote for the same
+    /// resolution (sorted union of keys, yarn's body); one with no such
+    /// sibling, and an entry of another resolution, are left alone.
+    #[test]
+    fn restored_entries_merge_into_a_sibling_with_their_resolution() {
+        let raw = "__metadata:\n  version: 8\n\n\
+                   \"a@npm:^1.0.0\":\n  version: 1.0.0\n  resolution: \"a@npm:1.0.0\"\n  restored: x\n\n\
+                   \"b@npm:^2\":\n  version: 2.0.0\n  resolution: \"b@npm:2.0.0\"\n\n\
+                   \"c@npm:a@1.0.0\":\n  version: 1.0.0\n  resolution: \"a@npm:1.0.0\"\n  yarn: y\n";
+        let mut doc = BerryStanzas::parse(raw);
+        let mut moved = vec!["\"a@npm:^1.0.0\"".to_string()];
+        let merged = merge_same_resolution(&mut doc.stanzas, &[1, 2], &mut moved);
+        assert_eq!(merged, vec![1]);
+        assert_eq!(moved, vec!["\"a@npm:^1.0.0, c@npm:a@1.0.0\"".to_string()]);
+        assert_eq!(
+            doc.render(&moved),
+            "__metadata:\n  version: 8\n\n\
+             \"a@npm:^1.0.0, c@npm:a@1.0.0\":\n  version: 1.0.0\n  resolution: \"a@npm:1.0.0\"\n  yarn: y\n\n\
+             \"b@npm:^2\":\n  version: 2.0.0\n  resolution: \"b@npm:2.0.0\"\n"
+        );
     }
 
     #[test]
