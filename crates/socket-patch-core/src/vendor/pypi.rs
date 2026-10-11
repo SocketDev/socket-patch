@@ -2293,7 +2293,11 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
             continue;
         };
         let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
-        if !is_lock && !is_export_name(&name) {
+        // A root `*.py` too: a PEP 723 script's `[tool.uv.sources]` path
+        // resolves from the script's own directory, so a vendored script
+        // the user renamed (`git mv job.py tool.py`) still installs from
+        // the wheel although no lock pairs with its new name.
+        if !is_lock && !is_export_name(&name) && !name.ends_with(".py") {
             continue;
         }
         // lstat only: a regular file or ANY symlink is probed (the read

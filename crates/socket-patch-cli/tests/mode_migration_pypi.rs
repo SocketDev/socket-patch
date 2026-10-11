@@ -1205,6 +1205,43 @@ async fn multi_script_unwinds_after_one_script_changes() {
     }
 }
 
+/// A vendored PEP 723 script the user renamed (`git mv job.py tool.py`)
+/// still installs from the vendored wheel through its own
+/// `[tool.uv.sources]`. The revert skips the missing `job.py` record
+/// (`vendor_lockfile_missing`, #890), but must keep the wheel `tool.py`
+/// still names instead of deleting it out from under `uv run tool.py`.
+#[tokio::test]
+async fn renamed_vendored_script_keeps_its_wheel() {
+    for unwind in [
+        vec!["vendor", "--revert"],
+        vec!["remove", PURL, "--yes", "--offline"],
+        vec!["rollback", "--yes", "--offline"],
+    ] {
+        let (_tmp, root) = project();
+        let files = stage_script_lock(&root);
+        vendor_project(&root, files);
+        std::fs::rename(root.join("job.py"), root.join("tool.py")).unwrap();
+        let renamed = std::fs::read_to_string(root.join("tool.py")).unwrap();
+        assert!(renamed.contains(UUID), "{renamed}");
+
+        let (_, env) = run_cli(&root, &unwind, &[]);
+        let rendered = env.to_string();
+        assert!(
+            rendered.contains("tool.py still resolves through it"),
+            "{unwind:?}: the renamed script is named: {env:#}"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+            "{unwind:?}: the wheel tool.py installs from is kept"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("tool.py")).unwrap(),
+            renamed,
+            "{unwind:?}: the user's script is left alone"
+        );
+    }
+}
+
 /// #742 / #650 / #1136: a vendored uv project, uv script lock, Hatch
 /// project and Poetry project (LF and CRLF) pick up a superseding patch. The manifest moves `six` from patch A to patch B
 /// (different patched bytes); the next `vendor` must wire B's wheel, remove
