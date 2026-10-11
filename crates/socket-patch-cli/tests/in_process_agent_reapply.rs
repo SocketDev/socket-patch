@@ -11,7 +11,6 @@
 use std::path::Path;
 
 use serial_test::serial;
-use sha2::{Digest, Sha256};
 use socket_patch_cli::commands::get::{run as get_run, GetArgs};
 use socket_patch_cli::commands::scan::{run as scan_run, ScanArgs, ScanMode};
 use wiremock::matchers::{method, path, path_regex};
@@ -25,12 +24,9 @@ const UUID: &str = "45445445-4544-4544-8544-454454454454";
 const ORIGINAL: &[u8] = b"module.exports = 'original';\n";
 const PATCHED: &[u8] = b"module.exports = 'patched';\n";
 
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
 
 fn common(cwd: &Path, server: &MockServer) -> socket_patch_cli::args::GlobalArgs {
     socket_patch_cli::args::GlobalArgs {

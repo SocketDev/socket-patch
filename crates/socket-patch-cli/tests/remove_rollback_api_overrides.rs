@@ -18,15 +18,12 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use sha2::{Digest, Sha256};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
 
 /// Every `SOCKET_*` env var `GlobalArgs` reads as a flag fallback — scrubbed
 /// so behavior is driven only by the explicit flags under test (an ambient
@@ -73,15 +70,6 @@ fn env_scrub_covers_every_global_arg_env_var() {
             "{var} is bound by GlobalArgs but missing from SOCKET_ENV_VARS — the scrub won't strip it",
         );
     }
-}
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Minimal HTTP stub playing the authenticated API: serves `blob` bytes at

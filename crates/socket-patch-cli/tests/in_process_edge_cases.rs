@@ -8,17 +8,12 @@
 use std::path::Path;
 
 use serial_test::serial;
-use sha2::{Digest, Sha256};
 use socket_patch_cli::commands::apply::{run as apply_run, ApplyArgs};
 use socket_patch_cli::commands::rollback::{run as rollback_run, RollbackArgs};
 
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
 
 /// Identity fingerprint of a file that survives a byte-identical rewrite check.
 ///
