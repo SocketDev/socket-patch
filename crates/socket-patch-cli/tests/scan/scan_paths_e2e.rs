@@ -20,6 +20,7 @@
 //!   under `--json` or `--vex`, or an unparseable glob is a usage error
 //!   (exit 2).
 
+use crate::common::hermetic::{self, Extra};
 use crate::common::{binary, hermetic_command};
 
 use std::path::{Path, PathBuf};
@@ -42,7 +43,7 @@ const APP_PURL: &str = "pkg:npm/app-dep@1.0.0";
 fn scan_cmd(cwd: &Path) -> Command {
     let mut cmd = hermetic_command(&binary());
     cmd.arg("scan").current_dir(cwd);
-    cmd.env_remove("VIRTUAL_ENV");
+    hermetic::scrub_extra(&mut cmd, &[Extra::Venv]);
     cmd
 }
 

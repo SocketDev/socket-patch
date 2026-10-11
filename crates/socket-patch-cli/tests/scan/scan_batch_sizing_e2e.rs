@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::common::hermetic;
+use crate::common::hermetic::{self, Extra};
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -26,7 +26,7 @@ const BODY_CAP: usize = 256 * 1024;
 
 fn scrubbed_cli() -> Command {
     let mut cmd = hermetic::binary_command();
-    cmd.env_remove("VIRTUAL_ENV");
+    hermetic::scrub_extra(&mut cmd, &[Extra::Venv]);
     cmd
 }
 
@@ -43,8 +43,7 @@ fn run_scan(
     let mut cmd = scrubbed_cli();
     cmd.arg("scan")
         .args(["--json", "--cwd", cwd.to_str().unwrap()])
-        .args(args)
-        .env("SOCKET_NO_CONFIG", "1");
+        .args(args);
     if token {
         cmd.args([
             "--api-url",
@@ -238,8 +237,7 @@ async fn a_mid_run_downgrade_keeps_the_500_purl_chunks() {
     cmd.arg("scan")
         .args(["--json", "--cwd", tmp.path().to_str().unwrap()])
         .args(["--api-url", &server.uri(), "--proxy-url", &server.uri()])
-        .args(["--api-token", "fake-token-for-test", "--org", ORG])
-        .env("SOCKET_NO_CONFIG", "1");
+        .args(["--api-token", "fake-token-for-test", "--org", ORG]);
     let out = cmd.output().expect("run socket-patch scan");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);

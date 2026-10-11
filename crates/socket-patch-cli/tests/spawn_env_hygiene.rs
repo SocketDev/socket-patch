@@ -379,6 +379,7 @@ fn command_never_leaks_its_hostile_seeds() {
         "SOCKET_GLOBAL",
         "SOCKET_GLOBAL_PREFIX",
         "SOCKET_DRY_RUN",
+        "SOCKET_ECOSYSTEMS",
         "SOCKET_MANIFEST_PATH",
         "SOCKET_JSON",
         "SOCKET_SILENT",

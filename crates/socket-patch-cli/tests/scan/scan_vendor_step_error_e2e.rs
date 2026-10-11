@@ -159,8 +159,9 @@ fn run_cli(root: &Path, argv: &[&str]) -> (i32, String, String) {
     cmd.args(argv).current_dir(root);
     // `hermetic_command` scrubs the ambient `SOCKET_*` surface so a
     // developer's shell can't steer the child, and forces the telemetry
-    // kill-switch: telemetry resolves its endpoint from env only, so an
-    // ambient value would ship this run's events to the LIVE API.
+    // kill-switch on: telemetry resolves its endpoint from env only (and
+    // the scrub keeps `SOCKET_TELEMETRY_*`), so a run with telemetry on
+    // would ship its events to whatever endpoint the shell names.
     let out = cmd.output().expect("run");
     (
         out.status.code().unwrap_or(-1),

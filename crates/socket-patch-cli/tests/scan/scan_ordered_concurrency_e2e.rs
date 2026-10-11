@@ -16,9 +16,9 @@
 
 use std::path::Path;
 use std::process::Command;
-
-use crate::common::hermetic;
 use std::time::Duration;
+
+use crate::common::hermetic::{self, Extra};
 
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -58,7 +58,7 @@ fn encode_purl(purl: &str) -> String {
 
 fn scrubbed_cli() -> Command {
     let mut cmd = hermetic::binary_command();
-    cmd.env_remove("VIRTUAL_ENV");
+    hermetic::scrub_extra(&mut cmd, &[Extra::Venv]);
     cmd
 }
 
@@ -505,8 +505,7 @@ fn run_scan_anonymous(
             proxy,
         ])
         .args(args)
-        .env("SOCKET_NO_API_TOKEN", "1")
-        .env("SOCKET_NO_CONFIG", "1");
+        .env("SOCKET_NO_API_TOKEN", "1");
     for (key, value) in extra {
         cmd.env(key, value);
     }

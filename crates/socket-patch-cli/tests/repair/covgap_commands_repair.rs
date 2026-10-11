@@ -300,7 +300,7 @@ fn repair_offline_warning_truncates_missing_list_after_five() {
 /// The dry-run preview lists at most 10 missing ids and folds the rest into
 /// "  ... and N more". With 12 missing that's 10 items + 2. (No `--offline`:
 /// the dry-run branch returns before any download I/O, so the run stays
-/// hermetic; telemetry is pinned off explicitly since the run is not
+/// hermetic; `socket_cmd` keeps telemetry off since the run is not
 /// airgapped by flag.)
 #[test]
 fn repair_dry_run_preview_truncates_missing_list_after_ten() {
@@ -309,7 +309,6 @@ fn repair_dry_run_preview_truncates_missing_list_after_ten() {
 
     let out = socket_cmd(tmp.path())
         .args(["repair", "--dry-run"])
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -712,7 +711,6 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str], json: bool) -> (i32, Stri
         "--org",
         ORG_SLUG,
     ]);
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch");
     (
         out.status.code().unwrap_or(-1),

@@ -19,6 +19,7 @@
 //! installed (`CARGO_HOME` points at an empty dir, so the cargo crawl finds
 //! nothing — hermetic, and a lockfile-only cargo entry either way).
 
+use crate::common::hermetic::{self, Extra};
 use crate::common::{binary, hermetic_command};
 
 use std::path::Path;
@@ -39,7 +40,7 @@ const INSTALLED_CRATE: &str = "installed-crate";
 fn run_scan(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
     cmd.arg("scan").current_dir(cwd);
-    cmd.env_remove("VIRTUAL_ENV");
+    hermetic::scrub_extra(&mut cmd, &[Extra::Venv]);
     cmd.env("CARGO_HOME", cwd.join(".cargo-home"));
     let out = cmd
         .args([

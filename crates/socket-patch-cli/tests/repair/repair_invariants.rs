@@ -789,11 +789,6 @@ async fn repair_json_reports_unresolved_org_fallback_in_warnings() {
         .expect(1)
         .mount(&mock)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/patch/telemetry"))
-        .respond_with(ResponseTemplate::new(201))
-        .mount(&mock)
-        .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join(".socket");
@@ -814,7 +809,6 @@ async fn repair_json_reports_unresolved_org_fallback_in_warnings() {
             "--api-token",
             &token,
         ])
-        .env("SOCKET_NO_CONFIG", "1")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -990,7 +984,7 @@ fn repair_honors_manifest_path_override() {
 async fn repair_silent_still_reports_download_failures_on_stderr() {
     // Mock API with NO blob route mounted: every fetch 404s → counted as
     // failed ("Blob not found on server"), with no retries or live egress
-    // (telemetry also resolves to this mock via SOCKET_API_URL).
+    // (`hermetic_command` keeps telemetry off).
     let mock = MockServer::start().await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
