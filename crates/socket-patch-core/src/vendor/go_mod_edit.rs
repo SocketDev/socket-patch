@@ -173,7 +173,7 @@ pub async fn read_required_versions(project_root: &Path) -> Option<HashMap<Strin
 /// or if a *user-authored* `replace` already pins the same `module`+`version`
 /// (a duplicate would make `go.mod` invalid), or if the `go.work` in effect
 /// would override, ignore or reject the replace
-/// ([`go_consumer_sync::workspace_conflict`](crate::vendor::go_consumer_sync::workspace_conflict):
+/// ([`go_consumer_sync::replace_refusal`](crate::vendor::go_consumer_sync::replace_refusal):
 /// the build would link something other than the patched copy).
 pub async fn ensure_replace_entry(
     project_root: &Path,
@@ -182,21 +182,11 @@ pub async fn ensure_replace_entry(
     base_rel: &str,
     dry_run: bool,
 ) -> Result<bool, String> {
-    let target = replace_target_path(base_rel, module, version);
-    if let Some(ours) = parse_replace_body(&format!("{module} {version} => {target}")) {
-        if let Some(conflict) = crate::vendor::go_consumer_sync::workspace_conflict(
-            project_root,
-            module,
-            version,
-            &ours,
-        )
-        .await
-        {
-            return Err(format!(
-                "refusing to write `replace {module} {version} => {target}` to go.mod: it {}",
-                conflict.consequence(module, version)
-            ));
-        }
+    if let Some(refusal) =
+        crate::vendor::go_consumer_sync::replace_refusal(project_root, module, version, base_rel)
+            .await
+    {
+        return Err(refusal);
     }
     edit_go_mod(project_root, dry_run, |c| {
         upsert_replace_entry(c, module, version, base_rel)

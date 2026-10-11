@@ -810,6 +810,26 @@ fn go_work_replace_overrides_the_socket_replace() {
     assert!(go_out(&consumer, &env).contains("OUT: FORK"));
 
     write_patch(&consumer);
+    // The dry run predicts the refusal.
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "apply",
+            "--offline",
+            "--dry-run",
+            "--ecosystems",
+            "golang",
+            "--json",
+            "--cwd",
+            consumer.to_str().unwrap(),
+        ],
+        &modcache,
+    );
+    assert_ne!(
+        code, 0,
+        "apply --dry-run must predict the refusal:\n{so}\n{se}"
+    );
+    assert!(so.contains("go.work replaces"), "{so}");
     let (code, so, se) = apply_json(&consumer, &modcache);
     assert_ne!(
         code, 0,
@@ -817,6 +837,10 @@ fn go_work_replace_overrides_the_socket_replace() {
     );
     assert!(so.contains("go.work replaces"), "{so}");
     assert!(replace_lines(&consumer.join("go.mod")).is_empty());
+    assert!(
+        !consumer.join(".socket/go-patches").exists(),
+        "a refused apply leaves no copy behind"
+    );
     assert!(go_out(&consumer, &env).contains("OUT: FORK"));
 
     // Applied before the go.work replace existed: the replace is inert.
@@ -825,6 +849,9 @@ fn go_work_replace_overrides_the_socket_replace() {
     assert_eq!(code, 0, "apply without go.work:\n{so}\n{se}");
     std::fs::write(consumer.join("go.work"), &go_work).unwrap();
     assert!(go_out(&consumer, &env).contains("OUT: FORK"));
+    // A re-run doesn't call the inert replace in sync.
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_ne!(code, 0, "re-run apply must refuse:\n{so}\n{se}");
     let (code, so, se) = check(&consumer, &modcache);
     assert_eq!(
         code, 1,
