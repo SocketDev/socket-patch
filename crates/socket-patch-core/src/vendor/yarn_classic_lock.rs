@@ -30,7 +30,9 @@ use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::blocks::{
     block_eol, classic_field, repin_classic_block, replace_block, scan_blocks, LockBlock,
 };
-use crate::formats::yarn::classic_deps::{unlocked_descriptors, with_manifest_dep_maps};
+use crate::formats::yarn::classic_deps::{
+    unlocked_block_descriptors, unlocked_descriptors, with_manifest_dep_maps,
+};
 use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::manifest::schema::PatchRecord;
@@ -41,8 +43,8 @@ use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::refused;
 use super::npm_common::{
-    guard_revert_uuid_dir, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend, NpmStagedPack,
-    NpmVendorRequest, WireCx,
+    guard_revert_uuid_dir, parse_npm_purl, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend,
+    NpmStagedPack, NpmVendorRequest, WireCx,
 };
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
@@ -536,6 +538,48 @@ pub(crate) async fn preflight_packages(
         }
     }
     gated
+}
+
+/// `vendor --check` and `repair` for a yarn-classic entry (#1379): the
+/// detail naming every dependency descriptor a block wired to `entry`
+/// lists in its sub-maps but no block of `yarn.lock` resolves, or `None`
+/// when there is none. Since #591 the writers refuse before leaving such
+/// a block, but a lock an older release vendored can still carry one:
+/// yarn 1 then installs the dependency unpinned and `--offline` installs
+/// fail. A missing, unreadable or berry lock is `None` — that is the
+/// liveness rule's and the flavor router's to report.
+pub async fn dangling_descriptors(entry: &VendorEntry, project_root: &Path) -> Option<String> {
+    let text = read_regular_to_string(&project_root.join(YARN_LOCK))
+        .await
+        .ok()?;
+    if crate::formats::yarn::is_berry_lock(&text) {
+        return None;
+    }
+    let blocks = scan_blocks_shared(&text);
+    let mut missing: Vec<String> = blocks
+        .iter()
+        .filter(|b| {
+            classic_field(&b.lines, "resolved")
+                .and_then(parse_vendor_path)
+                .is_some_and(|p| p.eco == "npm" && p.uuid == entry.uuid)
+        })
+        .flat_map(|b| unlocked_block_descriptors(&blocks, &b.lines))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    missing.sort();
+    missing.dedup();
+    let pkg = parse_npm_purl(&entry.base_purl)
+        .map(|(name, version)| format!("{name}@{version}"))
+        .unwrap_or_else(|| entry.base_purl.clone());
+    Some(format!(
+        "{YARN_LOCK} wires {pkg} to depend on {}, which no {YARN_LOCK} block locks (a \
+         socket-patch release before v5 wrote it this way); yarn 1 installs them unpinned \
+         and `--offline` installs fail. Run `yarn install` (without \
+         `--frozen-lockfile`) to lock them, then commit {YARN_LOCK}",
+        missing.join(", ")
+    ))
 }
 
 /// Undo one yarn-classic vendored package: restore the recorded lock blocks
@@ -1530,6 +1574,55 @@ wow@^1.0.0:
         assert!(
             text.contains("  dependencies:\n    is-number \"^7.0.0\"\n"),
             "{text}"
+        );
+    }
+
+    /// #1379: a lock a pre-v5 release vendored with a dependency it never
+    /// locked. The vendor run refuses that now (#591), so the test vendors
+    /// a locked range and then drops its block, as the old writer left it.
+    /// `vendor --check`'s audit and repair's both name the dangling
+    /// descriptor; the sound lock passes.
+    #[tokio::test]
+    async fn issue_1379_check_flags_a_dangling_descriptor_an_old_release_wrote() {
+        let seven = "is-number@^7.0.0:\n  version \"7.0.0\"\n";
+        let lock = format!("{Y2_BEFORE}\n{seven}");
+        let mut fx = fixture_with_lock(&lock).await;
+        patch_manifest(
+            &mut fx,
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"is-number":"^7.0.0"}}"#,
+        )
+        .await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("wired");
+        assert_eq!(dangling_descriptors(&entry, fx.root()).await, None);
+        assert_eq!(
+            crate::vendor::npm_flavor::check_npm_wiring(&entry, fx.root()).await,
+            Ok(())
+        );
+
+        let text = fx.lock_text().await;
+        assert!(text.contains(seven), "{text}");
+        tokio::fs::write(fx.lock_path(), text.replace(seven, ""))
+            .await
+            .unwrap();
+        forget_block_scans();
+        let detail = dangling_descriptors(&entry, fx.root())
+            .await
+            .expect("the dangling descriptor is reported");
+        assert!(
+            detail.contains("left-pad@1.3.0")
+                && detail.contains("is-number@^7.0.0")
+                && detail.contains("yarn install"),
+            "{detail}"
+        );
+        assert_eq!(
+            crate::vendor::npm_flavor::check_npm_wiring(&entry, fx.root()).await,
+            Err(detail.clone())
+        );
+        assert_eq!(
+            crate::vendor::npm_flavor::dangling_lock_dependencies(&entry, fx.root()).await,
+            Some(detail)
         );
     }
 

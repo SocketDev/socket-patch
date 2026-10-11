@@ -53,19 +53,87 @@ pub(crate) fn with_manifest_dep_maps(lines: &[String], pkg: &Value) -> Vec<Strin
 /// block of `blocks` is keyed by, sorted and deduplicated: the ones a lock
 /// rewritten to the patched manifest would leave unresolved.
 pub(crate) fn unlocked_descriptors(blocks: &[LockBlock], pkg: &Value) -> Vec<String> {
+    unresolved(
+        blocks,
+        manifest_dep_maps(pkg)
+            .into_iter()
+            .flat_map(|(_, deps)| deps)
+            .map(|(name, range)| format!("{name}@{range}")),
+    )
+}
+
+/// Every descriptor the dependency sub-maps of `lines` (one block) name
+/// that no block of `blocks` is keyed by, sorted and deduplicated (#1379).
+/// The writers refuse before leaving such a block; this is how a reader
+/// finds one a release before that refusal already wrote.
+pub(crate) fn unlocked_block_descriptors(blocks: &[LockBlock], lines: &[String]) -> Vec<String> {
+    unresolved(
+        blocks,
+        block_dep_entries(lines)
+            .into_iter()
+            .map(|(name, range)| format!("{name}@{range}")),
+    )
+}
+
+fn unresolved(blocks: &[LockBlock], descriptors: impl Iterator<Item = String>) -> Vec<String> {
     let locked: std::collections::BTreeSet<String> = blocks
         .iter()
         .flat_map(|b| split_key_patterns(&b.key))
         .collect();
-    let mut missing: Vec<String> = manifest_dep_maps(pkg)
-        .into_iter()
-        .flat_map(|(_, deps)| deps)
-        .map(|(name, range)| format!("{name}@{range}"))
+    let mut missing: Vec<String> = descriptors
         .filter(|descriptor| !locked.contains(descriptor))
         .collect();
     missing.sort();
     missing.dedup();
     missing
+}
+
+/// The `(name, range)` entries of a block's `dependencies:` /
+/// `optionalDependencies:` sub-maps, read back from yarn 1's writing:
+/// a 4-space-indented `name range` pair, either side quoted when yarn
+/// had to (`"@scope/x" "^1.0.0"`, `left-pad latest`).
+fn block_dep_entries(lines: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut in_map = false;
+    for line in lines.iter().skip(1) {
+        if let Some(rest) = body_field_line(line) {
+            in_map = is_dep_map_header(rest);
+            continue;
+        }
+        if !in_map {
+            continue;
+        }
+        let (name, rest) = yarn_token(line.trim_start());
+        let (range, _) = yarn_token(rest.trim_start());
+        if !name.is_empty() && !range.is_empty() {
+            out.push((name, range));
+        }
+    }
+    out
+}
+
+/// One classic-grammar token from the front of `s` — a `"`-quoted string
+/// (with `\"` / `\\` escapes) or a bare run up to whitespace — and the
+/// rest of `s`.
+fn yarn_token(s: &str) -> (String, &str) {
+    let Some(quoted) = s.strip_prefix('"') else {
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        return (s[..end].to_string(), &s[end..]);
+    };
+    let mut token = String::new();
+    let mut chars = quoted.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return (token, &quoted[i + 1..]),
+            '\\' => {
+                if let Some((_, next)) = chars.next() {
+                    token.push(next);
+                }
+            }
+            c => token.push(c),
+        }
+    }
+    (token, "")
 }
 
 /// Whether the sub-maps `lines` carries already are exactly the ones `pkg`
@@ -143,6 +211,36 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
         let unchanged = serde_json::json!({"dependencies": {"is-number": "^6.0.0"}});
         assert!(unlocked_descriptors(&blocks, &unchanged).is_empty());
         assert!(unlocked_descriptors(&blocks, &serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn unlocked_block_descriptors_reads_the_blocks_own_sub_maps() {
+        // #1379: a block a pre-v5 vendor rewrote to a patched manifest
+        // without locking the new range.
+        let lock = format!(
+            "{LOCK}\nleft-pad@^1.3.0:\n  version \"1.3.0\"\n  dependencies:\n    \
+             is-number \"^7.0.0\"\n    tag latest\n  optionalDependencies:\n    \
+             \"@scope/opt\" \"^2.0.0\"\n  integrity sha512-X==\n"
+        );
+        let blocks = scan_blocks(&lock);
+        let pad = blocks.iter().find(|b| b.key == "left-pad@^1.3.0").unwrap();
+        assert_eq!(
+            unlocked_block_descriptors(&blocks, &pad.lines),
+            vec!["is-number@^7.0.0", "tag@latest"]
+        );
+        let odd = blocks.iter().find(|b| b.key == "is-odd@3.0.1").unwrap();
+        assert!(unlocked_block_descriptors(&blocks, &odd.lines).is_empty());
+    }
+
+    #[test]
+    fn yarn_token_reads_quoted_and_bare_tokens() {
+        assert_eq!(
+            yarn_token("left-pad \"^1\""),
+            ("left-pad".into(), " \"^1\"")
+        );
+        assert_eq!(yarn_token("\"@s/x\" y"), ("@s/x".into(), " y"));
+        assert_eq!(yarn_token("\"a\\\"b\""), ("a\"b".into(), ""));
+        assert_eq!(yarn_token(""), (String::new(), ""));
     }
 
     #[test]

@@ -474,6 +474,24 @@ impl VendoredBackend<'_> {
             }
             match health {
                 ArtifactHealth::Healthy => {
+                    // A yarn classic block a pre-v5 vendor left naming a
+                    // dependency with no lock block (#1379): the artifact
+                    // is fine, but repair can't resolve the descriptor.
+                    if entry.ecosystem == "npm" {
+                        if let Some(detail) =
+                            vendor::npm_flavor::dangling_lock_dependencies(&entry, &common.cwd)
+                                .await
+                        {
+                            fail(
+                                env,
+                                common.json,
+                                purl,
+                                "vendor_dep_manifest_unlocked",
+                                detail,
+                            );
+                            continue;
+                        }
+                    }
                     // vlt's `<uuid>/.gitignore` and `.gitattributes` are not
                     // part of the artifact: a missing or edited one is
                     // simply rewritten.
