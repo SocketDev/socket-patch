@@ -47,8 +47,8 @@
 
 #[path = "common/mod.rs"]
 mod common;
+use common::git_sha256;
 use common::hermetic;
-use common::{binary, git_sha256};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -125,7 +125,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = hermetic::command(&binary());
+    let mut cmd = hermetic::binary_command();
     cmd.current_dir(cwd);
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);

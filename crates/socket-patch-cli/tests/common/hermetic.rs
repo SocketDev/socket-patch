@@ -149,13 +149,15 @@ pub enum Extra {
     /// `npm_config_node_linker=pnp` makes pnpm emit a `.pnp.cjs` that
     /// `vendor` refuses. Seeded with that value and then scrubbed.
     Pnpm,
-    /// Yarn 1's ambient config: `YARN_CACHE_FOLDER` (the harness pins its
-    /// own cache through `cache_env::isolate`, so run this first), any
-    /// `yarn_*` / `npm_config_*` (any case) offline-mirror or `userconfig`
-    /// override, and `PREFIX`. An ambient mirror setting or a redirected rc
-    /// file would make both yarn and the hosted scan see a mirror the leg
-    /// did not set up. Kept as narrow as the private scrubs the yarn 1
-    /// suites carried before; [`Extra::Yarn`] is the full `YARN_*` sweep.
+    /// Yarn 1's ambient config: the cache folder in any spelling
+    /// (`YARN_CACHE_FOLDER`, `yarn_cache_folder`, `npm_config_cache_folder`;
+    /// the harness pins its own through `cache_env::isolate`, so run this
+    /// first), any `yarn_*` / `npm_config_*` (any case) offline-mirror or
+    /// `userconfig` override, and `PREFIX`. An ambient mirror setting or a
+    /// redirected rc file would make both yarn and the hosted scan see a
+    /// mirror the leg did not set up. This is the redirect-classic suite's
+    /// old private scrub plus the cache-folder spellings; [`Extra::Yarn`] is
+    /// the full `YARN_*` sweep.
     YarnClassic,
 }
 
@@ -193,7 +195,10 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                 for (key, _) in std::env::vars_os() {
                     let lower = key.to_string_lossy().to_ascii_lowercase();
                     let config = lower.starts_with("yarn_") || lower.starts_with("npm_config_");
-                    if config && (lower.contains("offline_mirror") || lower.ends_with("userconfig"))
+                    if config
+                        && (lower.contains("offline_mirror")
+                            || lower.ends_with("userconfig")
+                            || lower.ends_with("cache_folder"))
                     {
                         cmd.env_remove(&key);
                     }

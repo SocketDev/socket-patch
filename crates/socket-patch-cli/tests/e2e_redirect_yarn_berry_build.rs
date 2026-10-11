@@ -47,7 +47,6 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
 use common::hermetic;
 
 use std::path::{Path, PathBuf};
@@ -149,7 +148,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = hermetic::command(&binary());
+    let mut cmd = hermetic::binary_command();
     cmd.args(args).current_dir(cwd);
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     let out = cmd.output().expect("failed to run socket-patch binary");

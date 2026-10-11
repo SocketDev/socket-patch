@@ -49,7 +49,7 @@
 #[path = "common/mod.rs"]
 mod common;
 use common::hermetic;
-use common::{binary, git_sha256, parse_json_envelope};
+use common::{git_sha256, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -93,7 +93,8 @@ macro_rules! skip {
 // ── self-contained helpers ────────────────────────────────────────────
 
 /// Run `corepack <pm> <args>` in `cwd` with the given extra env, the download
-/// prompt disabled, and every `SOCKET_*` var scrubbed.
+/// prompt disabled, and the ambient `SOCKET_*` vars scrubbed (the
+/// `hermetic::scrub_socket_vars` opt-outs survive).
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
@@ -116,7 +117,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 
 /// Run the socket-patch binary with a scrubbed environment.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = hermetic::command(&binary());
+    let mut cmd = hermetic::binary_command();
     cmd.current_dir(cwd);
     hermetic::scrub_extra(
         &mut cmd,

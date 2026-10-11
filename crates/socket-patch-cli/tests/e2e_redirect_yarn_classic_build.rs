@@ -52,7 +52,6 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
 use common::hermetic;
 
 use std::path::{Path, PathBuf};
@@ -120,7 +119,7 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 }
 
 fn run_socket_env(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = hermetic::command(&binary());
+    let mut cmd = hermetic::binary_command();
     cmd.args(args).current_dir(cwd);
     hermetic::scrub_extra(
         &mut cmd,

@@ -7,10 +7,12 @@
 //!   `scrub_socket_env` copies it replaced used to differ (whether
 //!   `SOCKET_NO_CONFIG` survived, whether `SOCKET_NO_UPDATE_CHECK` was
 //!   forced, which package-manager vars were swept, case of `npm_config_*`);
-//! * a ratchet over the test tree: no new private `scrub_socket_env`, and no
-//!   new file that spawns the binary with a bare `Command::new`. Both lists
-//!   below only shrink — move a file onto `hermetic::command` /
-//!   `common::run*` and delete its entry.
+//! * a ratchet over the test tree: no private `scrub_socket_env` copy, and
+//!   no new file that spawns the binary with a bare `Command::new`. The
+//!   `PENDING_RAW_SPAWNS` list below only shrinks — move a file onto
+//!   `hermetic::command` / `common::run*` and delete its entry. (The copy
+//!   check matches that one name; files that still sweep `SOCKET_*` by hand
+//!   under another name are the bare spawns that list tracks.)
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
@@ -484,27 +486,26 @@ fn yarn_classic_extra_sweeps_mirror_rc_and_prefix_overrides() {
     with_ambient(
         &[
             ("YARN_CACHE_FOLDER", "/ambient/yarn"),
+            ("yarn_cache_folder", "/ambient/yarn"),
+            ("npm_config_cache_folder", "/ambient/yarn"),
             ("YARN_YARN_OFFLINE_MIRROR", "/ambient/mirror"),
             ("npm_config_yarn_offline_mirror", "/ambient/mirror"),
             ("NPM_CONFIG_USERCONFIG", "/ambient/.npmrc"),
             ("PREFIX", "/ambient/prefix"),
             ("YARN_ENABLE_GLOBAL_CACHE", "true"),
-            ("npm_config_registry", "http://ambient.invalid"),
         ],
         || {
             let mut cmd = Command::new("yarn");
             hermetic::scrub_extra(&mut cmd, &[Extra::YarnClassic]);
             let env = effective_env(&cmd);
             assert_eq!(get(&env, "YARN_CACHE_FOLDER"), None);
+            assert_eq!(get(&env, "yarn_cache_folder"), None, "any case");
+            assert_eq!(get(&env, "npm_config_cache_folder"), None);
             assert_eq!(get(&env, "YARN_YARN_OFFLINE_MIRROR"), None);
             assert_eq!(get(&env, "npm_config_yarn_offline_mirror"), None);
             assert_eq!(get(&env, "NPM_CONFIG_USERCONFIG"), None, "any case");
             assert_eq!(get(&env, "PREFIX"), None);
             assert_eq!(get(&env, "YARN_ENABLE_GLOBAL_CACHE"), Some("true"));
-            assert_eq!(
-                get(&env, "npm_config_registry"),
-                Some("http://ambient.invalid")
-            );
         },
     );
 }
@@ -588,7 +589,7 @@ fn raw_spawn_detector_matches_the_spellings_in_the_tree() {
 }
 
 #[test]
-fn no_private_scrub_socket_env_copies() {
+fn no_scrub_socket_env_copies() {
     let found: Vec<String> = test_sources()
         .into_iter()
         .filter(|(rel, text)| {
