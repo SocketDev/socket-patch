@@ -42,16 +42,20 @@ pub(super) struct PythonLocks {
 /// vendoring of the whole project. Whether a linked file may be WRITTEN is a separate question,
 /// answered by [`refuse_symlinked`] right before the writers run.
 async fn read_file(path: &Path) -> Result<String, Failure> {
-    read_regular_to_string(path).await.map_err(|error| {
-        (
-            "pypi_lock_read_failed",
-            if error.kind() == std::io::ErrorKind::InvalidInput {
-                error.to_string()
-            } else {
-                format!("cannot read {}: {error}", path.display())
-            },
-        )
-    })
+    read_regular_to_string(path)
+        .await
+        .map_err(|error| read_failure(path, error))
+}
+
+fn read_failure(path: &Path, error: std::io::Error) -> Failure {
+    (
+        "pypi_lock_read_failed",
+        if error.kind() == std::io::ErrorKind::InvalidInput {
+            error.to_string()
+        } else {
+            format!("cannot read {}: {error}", path.display())
+        },
+    )
 }
 
 /// The run's PEP 751 / script-lock parses. Both readers below would
@@ -704,11 +708,14 @@ pub(crate) fn restore_document(
     ))
 }
 
-/// [`read_file`], with a file that does not exist read as `None`.
+/// [`read_file`], with a file that does not exist read as `None`. Judged by
+/// the same overlay-aware read, so a file an open `GroupCommit` removed is
+/// missing too.
 async fn read_existing(path: &Path) -> Result<Option<String>, Failure> {
-    match tokio::fs::symlink_metadata(path).await {
+    match read_regular_to_string(path).await {
+        Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        _ => read_file(path).await.map(Some),
+        Err(error) => Err(read_failure(path, error)),
     }
 }
 
@@ -2189,6 +2196,32 @@ mod tests {
             LOCK
         );
         assert!(!root.join("pylock.dev.toml").exists());
+    }
+
+    /// The hosted takeover reverts inside a `GroupCommit`, whose overlay is
+    /// what the revert must judge: a wired file the run already removed
+    /// there (still on disk) is missing, not a failed read.
+    #[tokio::test]
+    async fn missing_is_judged_through_the_group_commit_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entry = vendor_two_scripts(root).await;
+        let group = crate::utils::group_commit::GroupCommit::begin(root);
+        crate::utils::fs::remove_file(&root.join("b.py.lock"))
+            .await
+            .unwrap();
+        assert!(root.join("b.py.lock").exists(), "captured, not unlinked");
+        let outcome = revert_python_locks(&entry, root, true).await;
+        drop(group);
+        assert!(outcome.success, "{outcome:?}");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lockfile_missing" && w.detail.starts_with("b.py.lock ")),
+            "{:?}",
+            outcome.warnings
+        );
     }
 
     /// Only a MISSING file is skipped: any other read failure (here a
