@@ -7,10 +7,12 @@
 //!   `scrub_socket_env` copies it replaced used to differ (whether
 //!   `SOCKET_NO_CONFIG` survived, whether `SOCKET_NO_UPDATE_CHECK` was
 //!   forced, which package-manager vars were swept, case of `npm_config_*`);
-//! * a ratchet over the test tree: no new private `scrub_socket_env`, and no
-//!   new file that spawns the binary with a bare `Command::new`. Both lists
-//!   below only shrink — move a file onto `hermetic::command` /
-//!   `common::run*` and delete its entry.
+//! * a ratchet over the test tree: no private `scrub_socket_env` copy, and
+//!   no new file that spawns the binary with a bare `Command::new`. The
+//!   `PENDING_RAW_SPAWNS` list below only shrinks — move a file onto
+//!   `hermetic::command` / `common::run*` and delete its entry. (The copy
+//!   check matches that one name; files that still sweep `SOCKET_*` by hand
+//!   under another name are the bare spawns that list tracks.)
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
@@ -22,18 +24,6 @@ use std::process::Command;
 
 use hermetic::Extra;
 use serial_test::serial;
-
-/// Files that still carry a private `scrub_socket_env`. Each one is changed
-/// by an open fix PR; migrate it once that lands.
-const PENDING_SCRUB_COPIES: &[&str] = &[
-    "e2e_redirect_yarn_berry_build.rs",
-    "e2e_redirect_yarn_classic_build.rs",
-    "e2e_vendor_yarn_berry_build.rs",
-    "e2e_vendor_yarn_classic_build.rs",
-    "e2e_yarn4_pnpm_linker_build.rs",
-    "e2e_yarn4_workspaces_build.rs",
-    "scan/covgap_ecosystem_dispatch.rs",
-];
 
 /// Files that still spawn the binary with a bare `Command::new`, so their
 /// children see whatever `SOCKET_*` the ambient shell exports unless the file
@@ -90,8 +80,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "e2e_redirect_gem_build.rs",
     "e2e_redirect_maven_build.rs",
     "e2e_redirect_npm_build.rs",
-    "e2e_redirect_yarn_berry_build.rs",
-    "e2e_redirect_yarn_classic_build.rs",
     "e2e_scan.rs",
     "e2e_socket_yml_policy.rs",
     "e2e_vendor_bun_build.rs",
@@ -104,8 +92,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "e2e_vendor_maven_build.rs",
     "e2e_vendor_npm_build.rs",
     "e2e_vendor_pypi_build.rs",
-    "e2e_vendor_yarn_berry_build.rs",
-    "e2e_vendor_yarn_classic_build.rs",
     "e2e_vendored_production.rs",
     "e2e_vex.rs",
     "e2e_vex_build/deno.rs",
@@ -123,8 +109,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "e2e_vex_lockfile/yarn.rs",
     "e2e_vex_redirect.rs",
     "e2e_vex_vendor.rs",
-    "e2e_yarn4_pnpm_linker_build.rs",
-    "e2e_yarn4_workspaces_build.rs",
     "get/get_edge_cases_e2e.rs",
     "get/global_packages_e2e.rs",
     "hosted_memory_common/mod.rs",
@@ -155,7 +139,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "scan/coverage_fix_scan_discovery_corrupt_ledger.rs",
     "scan/covgap_commands_fetch_stage.rs",
     "scan/covgap_commands_scan_vendor_flow.rs",
-    "scan/covgap_ecosystem_dispatch.rs",
     "scan/hosted_management_refusals.rs",
     "scan/scan_batch_sizing_e2e.rs",
     "scan/scan_ecosystems_scope_e2e.rs",
@@ -499,6 +482,36 @@ fn extra_scrubs_sweep_each_tools_ambient_config() {
 
 #[test]
 #[serial]
+fn yarn_classic_extra_sweeps_mirror_rc_and_prefix_overrides() {
+    with_ambient(
+        &[
+            ("YARN_CACHE_FOLDER", "/ambient/yarn"),
+            ("yarn_cache_folder", "/ambient/yarn"),
+            ("npm_config_cache_folder", "/ambient/yarn"),
+            ("YARN_YARN_OFFLINE_MIRROR", "/ambient/mirror"),
+            ("npm_config_yarn_offline_mirror", "/ambient/mirror"),
+            ("NPM_CONFIG_USERCONFIG", "/ambient/.npmrc"),
+            ("PREFIX", "/ambient/prefix"),
+            ("YARN_ENABLE_GLOBAL_CACHE", "true"),
+        ],
+        || {
+            let mut cmd = Command::new("yarn");
+            hermetic::scrub_extra(&mut cmd, &[Extra::YarnClassic]);
+            let env = effective_env(&cmd);
+            assert_eq!(get(&env, "YARN_CACHE_FOLDER"), None);
+            assert_eq!(get(&env, "yarn_cache_folder"), None, "any case");
+            assert_eq!(get(&env, "npm_config_cache_folder"), None);
+            assert_eq!(get(&env, "YARN_YARN_OFFLINE_MIRROR"), None);
+            assert_eq!(get(&env, "npm_config_yarn_offline_mirror"), None);
+            assert_eq!(get(&env, "NPM_CONFIG_USERCONFIG"), None, "any case");
+            assert_eq!(get(&env, "PREFIX"), None);
+            assert_eq!(get(&env, "YARN_ENABLE_GLOBAL_CACHE"), Some("true"));
+        },
+    );
+}
+
+#[test]
+#[serial]
 fn extra_seeds_are_scrubbed_whatever_the_ambient_value() {
     let mut cmd = Command::new("tool");
     hermetic::scrub_extra(&mut cmd, &[Extra::Yarn, Extra::Pnpm]);
@@ -576,7 +589,7 @@ fn raw_spawn_detector_matches_the_spellings_in_the_tree() {
 }
 
 #[test]
-fn no_new_private_scrub_socket_env_copies() {
+fn no_scrub_socket_env_copies() {
     let found: Vec<String> = test_sources()
         .into_iter()
         .filter(|(rel, text)| {
@@ -584,27 +597,12 @@ fn no_new_private_scrub_socket_env_copies() {
         })
         .map(|(rel, _)| rel)
         .collect();
-    let unexpected: Vec<&String> = found
-        .iter()
-        .filter(|f| !PENDING_SCRUB_COPIES.contains(&f.as_str()))
-        .collect();
     assert!(
-        unexpected.is_empty(),
-        "these test files define a private scrub_socket_env: {unexpected:?}. \
+        found.is_empty(),
+        "these test files define a private scrub_socket_env: {found:?}. \
          Spawn through `tests/common/hermetic.rs` instead (hermetic::command \
          for the binary, scrub_socket_vars + scrub_extra for package-manager \
-         children). Do not add them to PENDING_SCRUB_COPIES."
-    );
-    let stale: Vec<&&str> = PENDING_SCRUB_COPIES
-        .iter()
-        .filter(|f| !found.iter().any(|g| g == *f))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "these files no longer carry a scrub_socket_env copy: {stale:?}. Delete \
-         them from PENDING_SCRUB_COPIES in \
-         crates/socket-patch-cli/tests/spawn_env_hygiene.rs (another PR may \
-         have migrated them; rebase and drop the entries)."
+         children; add an `Extra` variant for a new tool's config)."
     );
 }
 

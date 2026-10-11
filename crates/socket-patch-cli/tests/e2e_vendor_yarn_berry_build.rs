@@ -47,7 +47,8 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::git_sha256;
+use common::hermetic;
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -112,7 +113,8 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
     // seed the hermetic flags so they survive (Command: last env call wins).
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     cache_env::isolate(&mut cmd);
     yarn_berry_common::pin_berry_ci_defaults(&mut cmd, pm);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
@@ -122,32 +124,10 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     yarn_berry_common::berry_spawn_output(&mut cmd).expect("failed to run corepack")
 }
 
-/// Remove ambient `SOCKET_*` and `YARN_*` vars (so a developer's settings
-/// can't leak into the child).
-fn scrub_socket_env(cmd: &mut Command) {
-    // Seed-then-scrub (mirrors e2e_redirect_yarn_berry_build.rs): yarn berry
-    // lets EVERY `.yarnrc.yml` setting be overridden by a `YARN_*` env var
-    // (env outranks the project yarnrc), so an ambient `YARN_NODE_LINKER=pnp`
-    // was verified to turn this test red — the fixture install builds a PnP
-    // tree and node_modules/left-pad never exists. The explicit env_remove
-    // below clears the seed too, but if the scrub is ever dropped the seed
-    // (rather than a developer's ambient shell, which this suite can't rely
-    // on) turns the test red immediately.
-    cmd.env("YARN_NODE_LINKER", "pnp");
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy();
-        if (key.starts_with("SOCKET_") || key.starts_with("YARN_")) && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
-}
-
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::binary_command();
     cmd.current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (

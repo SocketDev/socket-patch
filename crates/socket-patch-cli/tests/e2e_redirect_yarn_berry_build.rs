@@ -47,7 +47,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::hermetic;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -126,32 +126,13 @@ fn has_command(cmd: &str) -> bool {
         .is_ok()
 }
 
-fn scrub_socket_env(cmd: &mut Command) {
-    // Seed-then-scrub (mirrors e2e_golang_redirect.rs): yarn berry lets EVERY
-    // `.yarnrc.yml` setting be overridden by a `YARN_*` env var (env outranks
-    // the project yarnrc), so an ambient `YARN_NODE_LINKER=pnp` was verified
-    // to turn both tests red — the fixture install builds a PnP tree and
-    // node_modules/left-pad never exists. The explicit env_remove below
-    // clears the seed too, but if the scrub is ever dropped the seed (rather
-    // than a developer's ambient shell, which this suite can't rely on) turns
-    // the tests red immediately.
-    cmd.env("YARN_NODE_LINKER", "pnp");
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy();
-        if (key.starts_with("SOCKET_") || key.starts_with("YARN_")) && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
-}
-
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = yarn_berry_common::corepack_command();
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
     // set the hermetic flags so they survive.
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     cache_env::isolate(&mut cmd);
     yarn_berry_common::pin_berry_ci_defaults(&mut cmd, pm);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
@@ -167,9 +148,9 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::binary_command();
     cmd.args(args).current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
