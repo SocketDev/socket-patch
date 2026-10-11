@@ -283,14 +283,10 @@ fn merge_variant_copies(
 /// after the first.
 fn merge_npm_copies(
     out: &mut HashMap<String, Vec<PathBuf>>,
-    _purls: &[String],
+    purls: &[String],
     packages: HashMap<String, Vec<CrawledPackage>>,
 ) {
-    for (purl, pkgs) in packages {
-        for pkg in pkgs {
-            push_path(out, purl.clone(), pkg.path);
-        }
-    }
+    merge_each_copy(merge_variant_copies, out, purls, packages);
 }
 
 /// `paths` in order with every path that resolves to an already-listed

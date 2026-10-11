@@ -182,7 +182,7 @@ impl RubyCrawler {
     /// Find specific packages by PURL inside a single gem directory.
     ///
     /// Gem directories follow the `<name>-<version>` pattern. Each PURL
-    /// maps to its highest-precedence copy (see [`Self::locate_gem_dirs`]);
+    /// maps to its highest-precedence copy (see `locate_gem_dirs_sync`);
     /// [`Self::find_all_by_purls`] returns every copy.
     pub async fn find_by_purls(
         &self,
@@ -209,10 +209,17 @@ impl RubyCrawler {
         gem_path: &Path,
         purls: &[String],
     ) -> Result<HashMap<String, Vec<CrawledPackage>>, std::io::Error> {
-        let mut result: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
-
-        for purl in purls {
-            if let Some((name, version)) = crate::utils::purl::parse_gem_purl(purl) {
+        let gem_path = gem_path.to_path_buf();
+        let purls = purls.to_vec();
+        Ok(crate::utils::fs::run_blocking(move || {
+            // `gem_path`'s entry names, listed at most once per call (on the
+            // first PURL whose platform dirs are looked for).
+            let mut names: Option<Vec<String>> = None;
+            let mut result: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
+            for purl in &purls {
+                let Some((name, version)) = crate::utils::purl::parse_gem_purl(purl) else {
+                    continue;
+                };
                 let (name, version) = (name.as_ref(), version.as_ref());
                 // SECURITY: name/version come straight from the (untrusted)
                 // manifest PURL and are formatted into a `<name>-<version>`
@@ -228,25 +235,24 @@ impl RubyCrawler {
                 // The purl is the base PURL (qualifiers stripped upstream).
                 // Resolve it to every installed gem dir, plain or carrying
                 // a `-<platform>` suffix.
-                let copies: Vec<CrawledPackage> = self
-                    .locate_gem_dirs(gem_path, name, version)
-                    .await
-                    .into_iter()
-                    .map(|gem_dir| CrawledPackage {
-                        name: name.to_string(),
-                        version: version.to_string(),
-                        namespace: None,
-                        purl: purl.clone(),
-                        path: gem_dir,
-                    })
-                    .collect();
+                let copies: Vec<CrawledPackage> =
+                    locate_gem_dirs_sync(&gem_path, name, version, &mut names)
+                        .into_iter()
+                        .map(|gem_dir| CrawledPackage {
+                            name: name.to_string(),
+                            version: version.to_string(),
+                            namespace: None,
+                            purl: purl.clone(),
+                            path: gem_dir,
+                        })
+                        .collect();
                 if !copies.is_empty() {
                     result.insert(purl.clone(), copies);
                 }
             }
-        }
-
-        Ok(result)
+            result
+        })
+        .await)
     }
 
     // ------------------------------------------------------------------
@@ -1082,48 +1088,21 @@ impl RubyCrawler {
         }
         Some((name.to_string(), version.to_string()))
     }
-
-    /// Every installed gem directory for a base `name`/`version`.
-    ///
-    /// Plain (ruby-platform) gems live in `<name>-<version>/`; platform
-    /// gems append a `-<platform>` suffix
-    /// (`<name>-<version>-x86_64-linux/`). A gem home can hold several of
-    /// them at once, so every verifying one is returned: the plain dir
-    /// first, then the platform dirs in name order.
-    async fn locate_gem_dirs(&self, gem_path: &Path, name: &str, version: &str) -> Vec<PathBuf> {
-        let mut dirs = Vec::new();
-        let exact = gem_path.join(format!("{name}-{version}"));
-        if self.verify_gem_at_path(&exact).await {
-            dirs.push(exact);
-        }
-        let mut siblings: Vec<String> = list_dir_entries(gem_path)
-            .await
-            .into_iter()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|dir_name| is_platform_dir_of(dir_name, name, version))
-            .collect();
-        siblings.sort();
-        for dir_name in siblings {
-            let dir = gem_path.join(dir_name);
-            if self.verify_gem_at_path(&dir).await {
-                dirs.push(dir);
-            }
-        }
-        dirs
-    }
 }
 
 /// Whether `dir_name` is a `<name>-<version>-<platform>` gem dir of exactly
-/// `name`/`version`. The prefix alone is not enough: `foo-1.0-2.0/` starts
-/// with `foo-1.0-` but is the gem `foo-1.0` at version `2.0`.
+/// `name`/`version`. A RubyGems platform starts with a letter (`x86_64-…`,
+/// `arm64-…`, `java`, `universal-java-1.8`), so a digit after the prefix
+/// means another gem: `foo-1.0-2.0/` is the gem `foo-1.0` at `2.0`, not a
+/// build of `foo` `1.0`.
 fn is_platform_dir_of(dir_name: &str, name: &str, version: &str) -> bool {
     dir_name
         .strip_prefix(name)
         .and_then(|rest| rest.strip_prefix('-'))
         .and_then(|rest| rest.strip_prefix(version))
-        .is_some_and(|rest| rest.len() > 1 && rest.starts_with('-'))
-        && RubyCrawler::parse_dir_name_version(dir_name)
-            .is_some_and(|(n, v)| n == name && v == version)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|platform| platform.chars().next())
+        .is_some_and(|c| c.is_ascii_alphabetic())
 }
 
 impl Default for RubyCrawler {
@@ -1158,7 +1137,9 @@ impl RubyCrawler {
                     if !path_safety::is_safe_name_version(name, version) {
                         return None;
                     }
-                    let gem_dir = locate_gem_dir_sync(&gem_path, name, version, &mut names)?;
+                    let gem_dir = locate_gem_dirs_sync(&gem_path, name, version, &mut names)
+                        .into_iter()
+                        .next()?;
                     Some(CrawledPackage {
                         name: name.to_string(),
                         version: version.to_string(),
@@ -1173,17 +1154,23 @@ impl RubyCrawler {
     }
 }
 
-/// One installed dir for `name`/`version`, blocking, over a lazily listed,
-/// reused `gem_path` listing: the first of `RubyCrawler::locate_gem_dirs`.
-fn locate_gem_dir_sync(
+/// Every installed gem directory for a base `name`/`version` in
+/// `gem_path`, over a lazily listed, reused `gem_path` listing.
+///
+/// Plain (ruby-platform) gems live in `<name>-<version>/`; platform gems
+/// append a `-<platform>` suffix (`<name>-<version>-x86_64-linux/`). A gem
+/// home can hold several of them at once, so every verifying one is
+/// returned: the plain dir first, then the platform dirs in name order.
+fn locate_gem_dirs_sync(
     gem_path: &Path,
     name: &str,
     version: &str,
     names: &mut Option<Vec<String>>,
-) -> Option<PathBuf> {
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
     let exact = gem_path.join(format!("{name}-{version}"));
     if verify_gem_at_path_sync(&exact) {
-        return Some(exact);
+        dirs.push(exact);
     }
     let names = super::listing::names_memoized(gem_path, names);
     let mut siblings: Vec<&String> = names
@@ -1191,10 +1178,13 @@ fn locate_gem_dir_sync(
         .filter(|dir_name| is_platform_dir_of(dir_name, name, version))
         .collect();
     siblings.sort();
-    siblings
-        .into_iter()
-        .map(|dir_name| gem_path.join(dir_name))
-        .find(|dir| verify_gem_at_path_sync(dir))
+    dirs.extend(
+        siblings
+            .into_iter()
+            .map(|dir_name| gem_path.join(dir_name))
+            .filter(|dir| verify_gem_at_path_sync(dir)),
+    );
+    dirs
 }
 
 /// Blocking twin of `RubyCrawler::verify_gem_at_path`: a directory holding
@@ -5104,7 +5094,7 @@ mod tests {
 
     /// `find_by_purls` must resolve a base PURL to a platform gem dir
     /// that carries a `-<platform>` suffix on disk. Exercises the
-    /// `locate_gem_dirs` platform-dir scan, which the original
+    /// `locate_gem_dirs_sync` platform-dir scan, which the original
     /// suite only covered for the exact (plain-platform) case.
     #[tokio::test]
     async fn find_by_purls_resolves_platform_suffixed_dir() {
@@ -5231,6 +5221,11 @@ mod tests {
         assert!(is_platform_dir_of("foo-1.0-x86_64-linux", "foo", "1.0"));
         assert!(is_platform_dir_of("foo-1.0-x86_64-darwin-21", "foo", "1.0"));
         assert!(is_platform_dir_of("foo-1.0-java", "foo", "1.0"));
+        assert!(is_platform_dir_of(
+            "json-1.8.6-universal-java-1.8",
+            "json",
+            "1.8.6"
+        ));
         assert!(!is_platform_dir_of("foo-1.0-2.0", "foo", "1.0"));
         assert!(!is_platform_dir_of("foo-1.0", "foo", "1.0"));
         assert!(!is_platform_dir_of("foo-1.0-", "foo", "1.0"));
@@ -5458,7 +5453,7 @@ mod tests {
         );
     }
 
-    /// The exact-match arm of `locate_gem_dirs` must *verify gem content*,
+    /// The exact-match arm of `locate_gem_dirs_sync` must *verify gem content*,
     /// not merely accept that `<name>-<version>/` exists on disk. When the
     /// exact dir is present but empty (no `lib/`, no `.gemspec` — a
     /// malformed/partial install), resolution must fall through to a valid
@@ -5525,7 +5520,7 @@ mod tests {
     // ── PURL coordinate traversal (untrusted manifest input) ──────
 
     /// A tampered manifest PURL whose name carries `..` must not resolve
-    /// to a directory outside the gem root. `locate_gem_dirs` joins
+    /// to a directory outside the gem root. `locate_gem_dirs_sync` joins
     /// `<name>-<version>` straight onto `gem_path`, and
     /// `verify_gem_at_path` only checks for `lib/`/`.gemspec`, so without
     /// a coordinate gate `pkg:gem/../outside@1.0.0` escapes the gem store
@@ -5744,7 +5739,7 @@ mod tests {
         assert!(!crawler.verify_gem_at_path(&gem_dir).await);
     }
 
-    /// `locate_gem_dirs`' platform-dir scan must skip a `<name>-<version>-*` dir
+    /// `locate_gem_dirs_sync`' platform-dir scan must skip a `<name>-<version>-*` dir
     /// that matches the prefix but fails gem verification (a hollow
     /// platform dir — no `lib/`, no `.gemspec`): alone it resolves
     /// nothing, and beside a valid platform sibling the sibling wins.

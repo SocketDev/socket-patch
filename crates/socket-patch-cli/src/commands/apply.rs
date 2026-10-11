@@ -92,10 +92,10 @@ fn mismatch_event_detail(file: &str, dry_run: bool) -> String {
     )
 }
 
-/// Whether another of `copies` sits in the same gem home as `copy`: two
-/// builds of one gem version (`x-1.0/` and `x-1.0-<platform>/`) installed
-/// side by side.
-fn has_build_sibling(copy: &Path, copies: &[PathBuf]) -> bool {
+/// Whether another of a gem's `copies` sits in the same gem home as `copy`:
+/// two builds of one gem version (`x-1.0/` and `x-1.0-<platform>/`)
+/// installed side by side.
+pub(crate) fn has_build_sibling(copy: &Path, copies: &[PathBuf]) -> bool {
     copies
         .iter()
         .any(|other| other != copy && other.parent() == copy.parent())
@@ -2351,7 +2351,8 @@ async fn apply_patches_inner(
                     if !args.force
                         && (variants.len() > 1
                             || variants[0] != base_purl
-                            || has_build_sibling(pkg_path, copy_paths))
+                            || (Ecosystem::from_purl(purl) == Some(Ecosystem::Gem)
+                                && has_build_sibling(pkg_path, copy_paths)))
                     {
                         let first_status = match representative_file(&patch.files) {
                             Some((file_name, file_info)) => Some(

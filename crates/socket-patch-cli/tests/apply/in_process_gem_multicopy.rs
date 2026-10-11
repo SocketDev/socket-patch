@@ -409,3 +409,137 @@ fn apply_refuses_a_platform_copy_holding_another_distribution() {
         "envelope={v}"
     );
 }
+
+/// One gem home holding BOTH builds, each a different distribution with its
+/// own qualified manifest record (`?platform=ruby` for `rack-3.1.0/`,
+/// `?platform=x86_64-linux` for `rack-3.1.0-x86_64-linux/`). Returns
+/// `(root, [(plain_file, original, patched), (platform_file, original, patched)])`.
+#[allow(clippy::type_complexity)]
+fn build_two_variant_project(tmp: &Path) -> (PathBuf, [(PathBuf, Vec<u8>, Vec<u8>); 2]) {
+    let gems = tmp
+        .join("vendor")
+        .join("bundle")
+        .join("ruby")
+        .join("3.2.0")
+        .join("gems");
+    let socket = tmp.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let mut records = Vec::new();
+    let mut copies = Vec::new();
+    for (dir, platform, uuid) in [
+        ("rack-3.1.0", "ruby", "67656d6d-756c-4469-8370-72756279302e"),
+        (
+            "rack-3.1.0-x86_64-linux",
+            "x86_64-linux",
+            "67656d6d-756c-4469-8370-6c696e7578ff",
+        ),
+    ] {
+        let original = format!("module Rack\n  BUILD = '{platform}'\nend\n").into_bytes();
+        let mut patched = original.clone();
+        patched.extend_from_slice(format!("# PATCHED-{platform}\n").as_bytes());
+        let (before, after) = (git_sha256(&original), git_sha256(&patched));
+        std::fs::write(socket.join("blobs").join(&before), &original).unwrap();
+        std::fs::write(socket.join("blobs").join(&after), &patched).unwrap();
+        records.push(format!(
+            r#""{PURL}?platform={platform}": {{
+                "uuid": "{uuid}",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {{ "lib/rack.rb": {{
+                    "beforeHash": "{before}", "afterHash": "{after}"
+                }}}},
+                "vulnerabilities": {{ "GHSA-gplt-gplt-gplt": {{
+                    "cves": ["CVE-2026-1092"], "summary": "synthetic",
+                    "severity": "high", "description": "synthetic"
+                }}}},
+                "description": "gem platform fixture", "license": "MIT", "tier": "free"
+            }}"#
+        ));
+        copies.push((write_copy(&gems.join(dir), &original), original, patched));
+    }
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(r#"{{ "patches": {{ {} }} }}"#, records.join(",")),
+    )
+    .unwrap();
+    let [a, b]: [(PathBuf, Vec<u8>, Vec<u8>); 2] = copies.try_into().unwrap();
+    (tmp.to_path_buf(), [a, b])
+}
+
+/// Each build is patched, attested and rolled back with ITS OWN variant,
+/// never judged against the other build's bytes.
+#[test]
+fn each_platform_build_uses_its_own_variant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, copies) = build_two_variant_project(tmp.path());
+
+    let (code, v) = run_json(&root, &["apply"]);
+    assert_eq!(code, 0, "apply must succeed; envelope={v}");
+    for (f, _, patched) in &copies {
+        assert_eq!(&std::fs::read(f).unwrap(), patched, "{f:?}; envelope={v}");
+    }
+
+    let (code, stdout, stderr) = run_raw(&root, &["apply", "--check"]);
+    assert_eq!(
+        code, 0,
+        "apply --check\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let (code, stdout, stderr) = run_raw(&root, &["vex", "--product", "pkg:gem/app@1.0.0"]);
+    assert_eq!(code, 0, "vex\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let products: Vec<String> = doc["statements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["status"] == "not_affected")
+        .flat_map(|s| s["products"].as_array().unwrap().clone())
+        .flat_map(|p| {
+            p["subcomponents"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| c["@id"].as_str().unwrap_or_default().to_string())
+        })
+        .collect();
+    for platform in ["ruby", "x86_64-linux"] {
+        assert!(
+            products
+                .iter()
+                .any(|p| p.ends_with(&format!("platform={platform}"))),
+            "the {platform} build must be attested; vex doc:\n{stdout}"
+        );
+    }
+
+    let (code, v) = run_json(&root, &["rollback", "--yes"]);
+    assert_eq!(code, 0, "rollback must succeed; envelope={v}");
+    for (f, original, _) in &copies {
+        assert_eq!(&std::fs::read(f).unwrap(), original, "{f:?}; envelope={v}");
+    }
+}
+
+/// After apply refused a build holding another distribution (left
+/// untouched), rollback restores the patched build and skips that one.
+#[test]
+fn rollback_skips_a_platform_copy_holding_another_distribution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, plain_file, platform_file, original, _patched) =
+        build_platform_variant_project(tmp.path());
+    let native = b"module Rack\n  VERSION = 'NATIVE BUILD'\nend\n".to_vec();
+    std::fs::write(&platform_file, &native).unwrap();
+    let (code, v) = run_json(&root, &["apply"]);
+    assert_ne!(code, 0, "precondition: apply flags the native build; {v}");
+
+    let (code, v) = run_json(&root, &["rollback", "--yes"]);
+    assert_eq!(code, 0, "rollback must succeed; envelope={v}");
+    assert_eq!(
+        std::fs::read(&plain_file).unwrap(),
+        original,
+        "envelope={v}"
+    );
+    assert_eq!(
+        std::fs::read(&platform_file).unwrap(),
+        native,
+        "envelope={v}"
+    );
+}
