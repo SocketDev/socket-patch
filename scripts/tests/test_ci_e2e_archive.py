@@ -119,6 +119,45 @@ class E2eArchive(unittest.TestCase):
                 (archive_dir / "e2e-bin.tar.zst").write_bytes(b"not a zstd archive")
                 self.assertNotEqual(run(consumer, work).returncode, 0)
 
+    def test_download_retries_when_the_archive_arrives_truncated(self):
+        # download-artifact v4 once left a truncated e2e-bin.tar.zst and
+        # still passed (run 38059192473): each consumer's verify check must
+        # reject that file so the wrapper downloads it again.
+        checks = []
+        for job in JOBS.values():
+            for step_name, step in rows.steps(job):
+                if step_name == "Download the e2e binaries":
+                    self.assertIn("uses: ./.github/actions/download-artifact", step)
+                    checks.append(re.search(r"(?m)^          verify: (.+)$", step)[1])
+        self.assertTrue(checks)
+        for check in checks:
+            with tempfile.TemporaryDirectory(prefix="e2e-truncated-") as directory:
+                work = Path(directory)
+                archive_dir = work / "target/e2e-archive"
+                archive_dir.mkdir(parents=True)
+                archive = archive_dir / "e2e-bin.tar.zst"
+                payload = work / "payload"
+                payload.write_bytes(os.urandom(1 << 20))
+                subprocess.run(["zstd", "-q", str(payload), "-o", str(archive)], check=True)
+                self.assertEqual(run(check, work).returncode, 0, check)
+                archive.write_bytes(archive.read_bytes()[: archive.stat().st_size // 2])
+                self.assertNotEqual(run(check, work).returncode, 0, check)
+                archive.unlink()
+                self.assertNotEqual(run(check, work).returncode, 0, "a missing archive passed " + check)
+
+    def test_download_wrapper_retries_a_failed_check_and_fails_on_the_second(self):
+        action = (ROOT / ".github/actions/download-artifact/action.yml").read_text()
+        retry = "steps.first.outcome == 'failure' || steps.first-check.outcome == 'failure'"
+        steps = action.split("    - name: ")[1:]
+        names = [step.split("\n", 1)[0] for step in steps]
+        self.assertEqual(names, ["Download (attempt 1)", "Verify (attempt 1)", "Clear the failed download",
+                                 "Download (attempt 2)", "Verify (attempt 2)"])
+        for step in steps[:2]:
+            self.assertIn("continue-on-error: true", step)
+        for step in steps[2:]:
+            self.assertIn(retry, step)
+            self.assertNotIn("continue-on-error", step)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,71 @@
+name: Download artifact with a verified retry
+description: Re-download once when the download fails or leaves files that fail a check
+inputs:
+  pattern:
+    description: Glob of artifact names to download
+    required: true
+  path:
+    description: Directory to download into (cleared before the retry)
+    required: true
+  merge-multiple:
+    description: Extract every matching artifact into the same directory
+    default: 'false'
+  verify:
+    description: >-
+      Bash script, run from the workspace, that exits non-zero when the
+      downloaded files are incomplete or corrupt (e.g. `zstd -t <file>`)
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    # download-artifact v4 can finish "successfully" with a truncated file:
+    # run 38059192473 attempt 1 logged "Starting download" and nothing more,
+    # then `zstd -d` failed with "Read error (39) : premature end" in the
+    # next step and the leg went red. A merge-queue leg that does that
+    # evicts the entry, so check the files and fetch them once more.
+    - name: Download (attempt 1)
+      id: first
+      if: ${{ !cancelled() }}
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      continue-on-error: true
+      with:
+        pattern: ${{ inputs.pattern }}
+        merge-multiple: ${{ inputs.merge-multiple }}
+        path: ${{ inputs.path }}
+
+    - name: Verify (attempt 1)
+      id: first-check
+      if: ${{ !cancelled() && steps.first.outcome == 'success' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        VERIFY: ${{ inputs.verify }}
+      run: bash --noprofile --norc -euo pipefail -c "$VERIFY"
+
+    - name: Clear the failed download
+      if: ${{ !cancelled() && (steps.first.outcome == 'failure' || steps.first-check.outcome == 'failure') }}
+      shell: bash
+      env:
+        DOWNLOAD_PATH: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        echo "::warning::Artifact download or check failed; downloading again"
+        rm -rf -- "$DOWNLOAD_PATH"
+        sleep 10
+
+    # Neither step below continues on error: a second bad download is not
+    # a blip, and the job must fail rather than test corrupt files.
+    - name: Download (attempt 2)
+      if: ${{ !cancelled() && (steps.first.outcome == 'failure' || steps.first-check.outcome == 'failure') }}
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        pattern: ${{ inputs.pattern }}
+        merge-multiple: ${{ inputs.merge-multiple }}
+        path: ${{ inputs.path }}
+
+    - name: Verify (attempt 2)
+      if: ${{ !cancelled() && (steps.first.outcome == 'failure' || steps.first-check.outcome == 'failure') }}
+      shell: bash
+      env:
+        VERIFY: ${{ inputs.verify }}
+      run: bash --noprofile --norc -euo pipefail -c "$VERIFY"
