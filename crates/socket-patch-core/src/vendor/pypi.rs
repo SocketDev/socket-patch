@@ -2567,12 +2567,19 @@ fn residual_reference_warning(uuid: &str, clause: &str) -> VendorWarning {
 }
 
 /// The current bytes of each of `files` (`None` when absent), to put back
-/// with [`restore_snapshot`].
+/// with [`restore_snapshot`]. A file that exists but can't be read as a
+/// regular file (a symlink, a FIFO, EACCES) is left out, so the restore
+/// leaves it alone instead of deleting it as absent.
 async fn snapshot_files(project_root: &Path, files: &[&str]) -> Snapshot {
     let mut snapshot = Snapshot::new();
     for file in files {
-        let bytes = read_regular_to_bytes(&project_root.join(file)).await.ok();
-        snapshot.push((file.to_string(), bytes));
+        match read_regular_to_bytes(&project_root.join(file)).await {
+            Ok(bytes) => snapshot.push((file.to_string(), Some(bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                snapshot.push((file.to_string(), None))
+            }
+            Err(_) => {}
+        }
     }
     snapshot
 }
@@ -2691,6 +2698,23 @@ async fn revert_with_sibling(
         restore_snapshot(project_root, &snapshot, &mut detail).await;
         outcome.error = Some(detail);
         return outcome;
+    }
+    // A drift-kept lock (uv's pair gate writes neither file) makes the
+    // caller keep the artifact and the whole ledger entry, export lines
+    // included. Put the export back on the wheel too, so the tree matches
+    // that entry and a re-run reverts both once the drift is undone.
+    if outcome.drift_skipped() {
+        let mut detail = String::new();
+        restore_snapshot(project_root, &snapshot, &mut detail).await;
+        if !detail.is_empty() {
+            outcome.warnings.push(VendorWarning::new(
+                "vendor_lock_entry_drifted",
+                format!(
+                    "{} kept wired with the drifted lock{detail}",
+                    crate::formats::governing_locks::PYPI_REQUIREMENTS
+                ),
+            ));
+        }
     }
     outcome.warnings.extend(lines_outcome.warnings);
     outcome.kept_artifact |= lines_outcome.kept_artifact;
@@ -7986,6 +8010,52 @@ wheels = [
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert_uv_export_restored(&fx).await;
+    }
+
+    /// #1368: when uv.lock drifted since vendoring, the pair gate keeps
+    /// the lock wired and the entry kept; the export must stay wired with
+    /// it, not be reverted alone.
+    #[tokio::test]
+    async fn uv_drifted_lock_keeps_the_export_wired() {
+        let fx = uv_export_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done {
+            entry: Some(entry), ..
+        } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("uv vendor must record its entry");
+        };
+        let lock = tokio::fs::read_to_string(fx.root.join("uv.lock"))
+            .await
+            .unwrap();
+        let drifted = lock.replacen(&format!("{UUID}/"), &format!("{UUID}//"), 1);
+        assert_ne!(lock, drifted);
+        touch(&fx.root, "uv.lock", &drifted).await;
+        let wired_export = read_requirements(&fx).await;
+
+        let outcome = revert_pypi(&entry, &fx.root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert_eq!(read_requirements(&fx).await, wired_export);
+        assert!(uv_export_wired_to(&fx, UUID).await);
+    }
+
+    /// An export that can't be read as a regular file is left out of the
+    /// rollback snapshot, so the restore never deletes it as absent.
+    #[tokio::test]
+    async fn snapshot_skips_unreadable_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("real.txt"), "x").await.unwrap();
+        tokio::fs::create_dir(root.join("dir.txt")).await.unwrap();
+        let snapshot = snapshot_files(root, &["real.txt", "dir.txt", "gone.txt"]).await;
+        assert_eq!(
+            snapshot,
+            vec![
+                ("real.txt".to_string(), Some(b"x".to_vec())),
+                ("gone.txt".to_string(), None),
+            ]
+        );
     }
 
     /// #1368 on an in-sync re-run: an export made after uv.lock was
