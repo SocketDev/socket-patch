@@ -64,8 +64,7 @@ pub fn selection(go_mod: &str, go_sum: Option<&str>, module: &str, version: &str
     let zips: Vec<&str> = go_sum
         .map(|text| {
             go_sum_lines(text)
-                .filter(|l| !l.go_mod && l.module == module)
-                .map(|l| l.version)
+                .filter_map(|l| l.zip_version_of(module))
                 .collect()
         })
         .unwrap_or_default();
@@ -98,6 +97,10 @@ pub fn select(pruned: bool, required: Option<&str>, zips: &[&str], version: &str
         Some(h) if go_semver_cmp(h, version) == Ordering::Greater => {
             Selection::Other(h.to_string())
         }
+        // Everything is below the patched version. A zip line there shows
+        // that lower version is the one built (go records no zip line for
+        // the patched version only once a directory replace covers it).
+        Some(h) if zips.contains(&h) => Selection::Other(h.to_string()),
         _ => Selection::Unknown,
     }
 }
@@ -184,6 +187,12 @@ mod tests {
         assert_eq!(selection(&m, Some(""), UP, "v1.0.0"), Selection::Selected);
         // Only a lower bound below the patched version: can't tell.
         assert_eq!(selection(&m, None, UP, "v1.2.0"), Selection::Unknown);
+        // A zip line below it shows the lower version is built.
+        let s = sum(&[&format!("{UP} v1.0.0")]);
+        assert_eq!(
+            selection(&m, Some(&s), UP, "v1.2.0"),
+            Selection::Other("v1.0.0".into())
+        );
     }
 
     #[test]

@@ -242,6 +242,14 @@ pub async fn vendor_go_module<'a>(
         {
             return refused("vendor_go_workspace_conflict", refusal);
         }
+        // A replace for a version the build list doesn't select is ignored
+        // by go (#392): refuse before fetching or wiring anything.
+        if let Some(refusal) =
+            crate::patch::redirect::golang_local::selection_refusal(project_root, module, version)
+                .await
+        {
+            return refused("vendor_go_version_not_selected", refusal);
+        }
     }
 
     let mut warnings: Vec<VendorWarning> = Vec::new();

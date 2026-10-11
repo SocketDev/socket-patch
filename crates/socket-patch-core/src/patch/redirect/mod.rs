@@ -8546,8 +8546,9 @@ fn rewrite_golang(
             result.warnings.push(RewriteWarning {
                 code: "redirect_golang_not_in_module_graph".into(),
                 detail: format!(
-                    "{fname}@{}: not required by go.mod and go.sum has no zip line for it — \
-                     the module is not in this project's build graph; nothing redirected",
+                    "{fname}@{}: neither go.mod's require nor a go.sum zip line shows the \
+                     build selecting this version — it is not in this project's build graph; \
+                     nothing redirected",
                     dep.version
                 ),
             });

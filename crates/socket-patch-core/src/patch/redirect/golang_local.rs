@@ -600,7 +600,11 @@ pub async fn verify_go_redirect_state(
 
 /// Why apply must not write a `replace` for `module@version`, when go.mod
 /// and go.sum prove the build list does not select that version.
-async fn selection_refusal(project_root: &Path, module: &str, version: &str) -> Option<String> {
+pub(crate) async fn selection_refusal(
+    project_root: &Path,
+    module: &str,
+    version: &str,
+) -> Option<String> {
     match go_build_list::project_selection(project_root, module, version).await? {
         Selection::Other(selected) => Some(format!(
             "the build selects {module} {selected}, not the patched {version}: a replace \
