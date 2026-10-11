@@ -6,7 +6,7 @@ use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::formats::text::{split_bom, strip_bom};
 use crate::utils::purl::percent_decode_purl_component;
-use crate::utils::requirements::{parse_requirement, Requirement};
+use crate::utils::requirements::{parse_requirement, requirement_name, Requirement};
 use crate::vendor::state::{VendorEntry, WiringAction};
 
 pub(super) struct LogicalRequirement {
@@ -201,11 +201,13 @@ pub(super) fn rewrite(
     };
     let mut requirements = logical_requirements(content);
     let mut row_counts = BTreeMap::<String, usize>::new();
+    // Every line that names a package counts, parseable or not, so a
+    // stray second line keeps an unpinned entry ambiguous (fail closed).
     for requirement in &requirements {
-        if let Some(parsed) = line_requirement(&requirement.text) {
-            *row_counts
-                .entry(canonicalize_pypi_name(parsed.name))
-                .or_default() += 1;
+        let text = requirement.text.trim();
+        let code = unquoted_index(text, '#', true).map_or(text, |index| &text[..index]);
+        if let Some(name) = requirement_name(code) {
+            *row_counts.entry(canonicalize_pypi_name(name)).or_default() += 1;
         }
     }
     let mut override_versions = BTreeMap::<String, BTreeSet<&str>>::new();
@@ -669,6 +671,17 @@ mod tests {
                 "{source}"
             );
         }
+        // A second, unparseable line naming the package keeps an unpinned
+        // entry ambiguous.
+        let result = rewrite_registry_redirect(
+            &input("requests\nrequests @ https://h/x.whl junk\n"),
+            &[patch()],
+        );
+        assert!(result.files.is_empty());
+        assert_eq!(
+            result.warnings[0].code,
+            "redirect_requirements_version_ambiguous"
+        );
         // Not a requirement line at all: the name runs into a non-specifier.
         let result = rewrite_registry_redirect(&input("requests/x==2.28.1\n"), &[patch()]);
         assert!(result.files.is_empty());

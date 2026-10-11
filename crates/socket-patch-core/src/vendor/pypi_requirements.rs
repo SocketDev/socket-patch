@@ -103,6 +103,17 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
         // vendored rewrite replaces only an exact registry pin.
         let pinned = req.exact_version();
         let hashed = req.options.contains("--hash");
+        // The rewritten wheel line carries only `--hash`: a pin with any
+        // other per-requirement option (`--config-settings`, …) would lose
+        // it, so it is refused rather than rewritten.
+        let other_options = req
+            .options
+            .split_whitespace()
+            .any(|token| token.starts_with("--") && !token.starts_with("--hash"));
+        if other_options {
+            found_range = true;
+            continue;
+        }
         if pinned.is_some_and(|pinned| crate::utils::pep440::versions_equal(pinned, version)) {
             exact.push((
                 ll.start,
@@ -1441,6 +1452,15 @@ mod tests {
                 "{line}"
             );
         }
+        // A pin whose other options the rewrite would drop is refused.
+        assert_eq!(
+            find_pin(
+                "six==1.16.0 --config-settings x=y --hash=sha256:ab\n",
+                "six",
+                "1.16.0"
+            ),
+            PinSearch::Range
+        );
         // A line that names the package but is no clean requirement is
         // never treated as absent (fail closed).
         for line in ["six @ ./six-1.16.0.whl extra\n", "six/x==1.16.0\n"] {
