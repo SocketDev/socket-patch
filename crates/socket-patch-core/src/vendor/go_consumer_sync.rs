@@ -280,59 +280,22 @@ fn modules_txt_location(project_root: &Path) -> (PathBuf, &'static str) {
     )
 }
 
-/// The `go.work` go would use for `project_root`: `GOWORK` (from the
-/// environment, else the go env file `go env -w` writes) when it names a
+/// The `go.work` go would use for `project_root`: `GOWORK` (resolved as go
+/// resolves it: the environment, else the `go env -w` file) when it names a
 /// file (`off` disables workspaces), else the nearest `go.work` at or above
 /// the project.
 fn workspace_file(project_root: &Path) -> Option<PathBuf> {
     let base = std::env::current_dir()
         .unwrap_or_default()
         .join(project_root);
-    let gowork = match std::env::var("GOWORK") {
-        Ok(v) => Some(v),
-        Err(_) => go_env_file_value("GOWORK"),
-    };
-    match gowork.as_deref() {
+    match crate::utils::go_env::go_env("GOWORK").as_deref() {
         Some("off") => return None,
-        Some(v) if !v.is_empty() && v != "auto" => return Some(base.join(v)),
+        Some(v) if v != "auto" => return Some(base.join(v)),
         _ => {}
     }
     base.ancestors()
         .map(|dir| dir.join("go.work"))
         .find(|file| file.is_file())
-}
-
-/// `key` from the go env file (`go env -w KEY=value`): `$GOENV`, else
-/// `go/env` under the user config directory (`os.UserConfigDir`). `None`
-/// when unset, unreadable or disabled (`GOENV=off`).
-fn go_env_file_value(key: &str) -> Option<String> {
-    let file = match std::env::var_os("GOENV") {
-        Some(v) if v == "off" => return None,
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => user_config_dir()?.join("go").join("env"),
-    };
-    let text = std::fs::read_to_string(file).ok()?;
-    text.lines()
-        .rev()
-        .filter_map(|line| line.trim().split_once('='))
-        .find(|(k, _)| k.trim() == key)
-        .map(|(_, v)| v.trim().to_string())
-}
-
-/// go's `os.UserConfigDir`.
-fn user_config_dir() -> Option<PathBuf> {
-    let var = |k: &str| {
-        std::env::var_os(k)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    if cfg!(windows) {
-        var("AppData")
-    } else if cfg!(target_os = "macos") {
-        var("HOME").map(|h| h.join("Library").join("Application Support"))
-    } else {
-        var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|h| h.join(".config")))
-    }
 }
 
 /// The `go.work` in effect, read once: its own replaces and each `use`
