@@ -372,9 +372,10 @@ jobs:
           shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build
-        run: cargo build --workspace
-
+      # No separate `cargo build --workspace` step: `Run tests` (or the
+      # warm step below) builds every workspace target the tests need,
+      # the CLI binary included. The extra build cost ~2 min per leg
+      # (#1173); `coverage` runs the same selection on Linux without one.
       - name: Warm the test cache after merge-queue validation
         if: needs.clippy.outputs.reuse == 'true'
         run: cargo test --locked --workspace --no-run
