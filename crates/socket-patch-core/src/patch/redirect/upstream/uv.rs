@@ -1360,6 +1360,33 @@ pub(crate) fn respell_lock_specifier(
     }
 }
 
+/// Whether `pyproject_text` declares `name` in the declarations `array`
+/// mirrors. An unparseable pyproject declares nothing.
+pub(crate) fn lock_requirement_declared(
+    pyproject_text: &str,
+    array: LockRequirementArray<'_>,
+    name: &str,
+) -> bool {
+    let Ok(doc) = pyproject_text.parse::<DocumentMut>() else {
+        return false;
+    };
+    let meta = Metadata {
+        rel: "pyproject.toml".to_string(),
+        text: String::new(),
+        script: false,
+        doc,
+    };
+    let declared = match array {
+        LockRequirementArray::RequiresDist => Declared::Dist,
+        LockRequirementArray::RequiresDev(group) => Declared::Dev(group),
+        LockRequirementArray::Manifest(key) => Declared::Manifest(key),
+    };
+    let canon = canonicalize_pypi_name(name);
+    declarations(&meta, declared)
+        .iter()
+        .any(|d| canonicalize_pypi_name(pep508_name(d.spec)) == canon)
+}
+
 /// Every lock requirement array with the declarations it mirrors
 /// (read-only twin of [`restore_requirements`]'s walk).
 fn requirement_arrays_ref(doc: &DocumentMut) -> Vec<(Declared<'_>, &toml_edit::Array)> {

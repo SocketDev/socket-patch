@@ -475,6 +475,20 @@ async fn unwired_check_failure(
             strip_purl_qualifiers(key)
         );
     }
+    // A half-unwound pair (uv.lock still routing a root requirement through
+    // the wheel after the rest of the wiring is gone, #1374) does reference
+    // the dir: name the file instead of claiming nothing does.
+    if entry.ecosystem == "pypi" {
+        if let Some(file) = vendor::pypi::pypi_referencing_file(root, &entry.uuid).await {
+            return format!(
+                "wiring incomplete: {file} still references {dir}, but nothing installs the \
+                 package from it any more, so the project files disagree and a fresh install \
+                 gets the unpatched package or fails; re-lock the project (e.g. `uv lock`), \
+                 then re-run `socket-patch vendor` to rewire it or `socket-patch vendor \
+                 --revert` to finish unwinding it"
+            );
+        }
+    }
     format!(
         "wiring missing: no lockfile or config references {dir} any more, so a fresh install \
          gets the unpatched package; re-run `socket-patch vendor` to rewire it"

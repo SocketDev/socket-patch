@@ -1234,6 +1234,22 @@ fn uv_vendor_revert_after_uv_remove_of_the_transitive_parent() {
     );
 }
 
+/// #1374: six vendored TRANSITIVELY, then promoted to a direct dependency
+/// with `uv add six==1.16.0`. uv writes a root `requires-dist` element
+/// routed through the socket-written source, which no wiring record
+/// covers. `vendor --revert` must put it back on the registry too, instead
+/// of writing a pair whose lock still names the wheel (`uv sync --locked`
+/// failed while revert exited 0).
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_after_promoting_the_transitive_to_direct() {
+    uv_relock_then_revert(
+        "uv-promote-transitive",
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"python-dateutil==2.9.0.post0\", \"attrs>=20\"]\n\n[tool.uv]\nconstraint-dependencies = [\"six==1.16.0\"]\n",
+        &["add", "-q", "six==1.16.0"],
+    );
+}
+
 /// #821: six in a PEP 735 dev group, then `uv add --dev zipp` rewrites the
 /// whole `requires-dev` group line.
 #[test]

@@ -30,9 +30,12 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 // revert) forever in an `open(2)` that waits for a writer — the
 // flavor-routing probes ahead of the load are metadata-only, so these are
 // the first opens.
-use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
+use crate::patch::redirect::upstream::{
+    lock_requirement_declared, respell_lock_specifier, LockRequirementArray,
+};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::terminator;
+use crate::utils::purl::purl_name_version;
 use crate::utils::python_lock::preserve_line_endings;
 
 use super::common::{
@@ -869,6 +872,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     // touches them). Those are this entry's own references, which the loop
     // below reverts, not the user's: they are set aside before probing.
     let uuid_lower = entry.uuid.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
     let in_pyproject = |kind: &str| matches!(kind, "uv_sources_entry" | "uv_override");
     let own_fragments_removed = |text: &str, pyproject: bool| {
         let mut residual = text.to_string();
@@ -1121,9 +1125,43 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     // wired and the other not, which `uv sync --locked` rejects (#806,
     // #821). Write neither; the drift warning keeps the artifact and ledger
     // entry so a re-run can finish once the drift is undone.
-    let drift_kept = warnings
-        .iter()
-        .any(|w| w.code == "vendor_lock_entry_drifted");
+    let drift_kept = |warnings: &[VendorWarning]| {
+        warnings
+            .iter()
+            .any(|w| w.code == "vendor_lock_entry_drifted")
+    };
+    if !drift_kept(&warnings) {
+        // A root element uv wrote through our source after vendoring (a
+        // transitive package promoted by `uv add`, #1374) has no record.
+        let canon = purl_name_version(&entry.base_purl)
+            .map(|(name, _)| canonicalize_pypi_name(name))
+            .unwrap_or_default();
+        match respell_unrecorded_path_entries(&lock_text, &canon, &needle_lower, &pyproject_text) {
+            Ok(t) => lock_text = t,
+            Err(reason) => warnings.push(VendorWarning::new(
+                "vendor_lock_entry_drifted",
+                format!("uv.lock entry for {canon:?} can't be restored ({reason}); left untouched"),
+            )),
+        }
+    }
+    // Never write a half-reverted pair: a lock that still routes through
+    // the uuid dir after pyproject.toml stopped declaring any route to it
+    // is what `uv sync --locked` rejects. Keep both files instead, so a
+    // `uv lock` and a re-run converge.
+    if !drift_kept(&warnings)
+        && lock_text.to_ascii_lowercase().contains(&needle_lower)
+        && !pyproject_text.to_ascii_lowercase().contains(&needle_lower)
+    {
+        warnings.push(VendorWarning::new(
+            "vendor_lock_entry_drifted",
+            format!(
+                "uv.lock still references {needle} in an entry the vendor ledger did not \
+                 record, while pyproject.toml no longer does; left both files untouched \
+                 (run `uv lock`, then revert again)"
+            ),
+        ));
+    }
+    let drift_kept = drift_kept(&warnings);
     if !dry_run && !drift_kept {
         // Reverse of the wire order: the lock first, then the pyproject.
         let write = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await;
@@ -1220,6 +1258,102 @@ fn root_requires_dist(lock_text: &str) -> Option<&str> {
     let open = dist_scan.find("requires-dist = [")? + "requires-dist = ".len();
     let end = balanced_span(unit_text, open)?;
     Some(&unit_text[open..end])
+}
+
+/// `lock_text` with every root `requires-dist` / `requires-dev` element for
+/// `canon` that routes through `needle` (this entry's uuid dir, lower-case)
+/// put back on the registry, spelled the way pyproject.toml declares it
+/// now (#840).
+///
+/// These elements are the ones no wiring record covers: a package vendored
+/// as TRANSITIVE has no root element, and when the user later promotes it
+/// to a direct dependency (`uv add six==1.16.0`), uv writes one routed
+/// through the source vendor wrote (#1374). Reverting every record without
+/// it leaves a lock that routes through a path pyproject.toml no longer
+/// declares, which `uv sync --locked` rejects. `Err` when pyproject.toml no
+/// longer declares the package or uv's spelling of the declaration isn't
+/// derivable: the caller then keeps both files.
+fn respell_unrecorded_path_entries(
+    lock_text: &str,
+    canon: &str,
+    needle: &str,
+    pyproject_text: &str,
+) -> Result<String, String> {
+    let Some(unit) = find_unit_span(lock_text, unit_is_root) else {
+        return Ok(lock_text.to_string());
+    };
+    let unit_text = &lock_text[unit.clone()];
+    let routes_here = |element: &str| {
+        entry_value(element, "name").is_some_and(|n| canonicalize_pypi_name(n) == canon)
+            && entry_value(element, "path").is_some_and(|p| {
+                let p = p.to_ascii_lowercase();
+                p == needle || p.starts_with(&format!("{needle}/"))
+            })
+    };
+    // Every root requirement array: (offset of its `[`, dev group name;
+    // `None` is requires-dist, which sits in [package.metadata], ahead of
+    // the requires-dev sub-table).
+    let dev_hdr = unit_text.find("[package.metadata.requires-dev]");
+    let mut arrays: Vec<(usize, Option<&str>)> = Vec::new();
+    if let Some(at) = unit_text[..dev_hdr.unwrap_or(unit_text.len())].find("requires-dist = [") {
+        arrays.push((at + "requires-dist = ".len(), None));
+    }
+    if let Some(hdr) = dev_hdr {
+        let sect_start = hdr + "[package.metadata.requires-dev]".len();
+        let sect_end = unit_text[sect_start..]
+            .find("\n[")
+            .map_or(unit_text.len(), |i| sect_start + i + 1);
+        let mut cursor = sect_start;
+        while let Some(open_rel) = unit_text[cursor..sect_end].find('[') {
+            let arr_open = cursor + open_rel;
+            let key_start = unit_text[..arr_open].rfind('\n').map_or(0, |i| i + 1);
+            let group = unit_text[key_start..arr_open]
+                .trim()
+                .trim_end_matches('=')
+                .trim()
+                .trim_matches('"');
+            arrays.push((arr_open, Some(group)));
+            cursor = balanced_span(unit_text, arr_open)
+                .ok_or_else(|| "uv.lock root requires-dev array is unbalanced".to_string())?;
+        }
+    }
+    let mut edits: Vec<(Range<usize>, LockRequirementArray<'_>)> = Vec::new();
+    for (arr_open, group) in arrays {
+        let arr_end = balanced_span(unit_text, arr_open)
+            .ok_or_else(|| "uv.lock root requirement array is unbalanced".to_string())?;
+        let array = group.map_or(LockRequirementArray::RequiresDist, |g| {
+            LockRequirementArray::RequiresDev(g)
+        });
+        let at = unit.start + arr_open;
+        for (s, e) in top_level_brace_groups(&unit_text[arr_open..arr_end]) {
+            if routes_here(&lock_text[at + s..at + e]) {
+                edits.push(((at + s)..(at + e), array));
+            }
+        }
+    }
+    // Back-to-front so the earlier spans stay valid.
+    edits.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+    let mut out = lock_text.to_string();
+    for (span, array) in edits {
+        let element = &lock_text[span.clone()];
+        if !lock_requirement_declared(pyproject_text, array, canon) {
+            return Err(format!(
+                "uv.lock routes {canon} through the vendored wheel but pyproject.toml no \
+                 longer declares it"
+            ));
+        }
+        let marker = entry_value(element, "marker");
+        let spec = respell_lock_specifier(pyproject_text, array, canon, None, marker)?;
+        let inner = element.trim().trim_start_matches('{').trim_end_matches('}');
+        let kept: Vec<&str> = split_top_level_commas(inner)
+            .into_iter()
+            .map(str::trim)
+            .filter(|part| !part.is_empty() && !part.starts_with("path ="))
+            .collect();
+        let base = format!("{{ {} }}", kept.join(", "));
+        out.replace_range(span, &with_specifier(&base, spec.flatten().as_deref()));
+    }
+    Ok(out)
 }
 
 /// The string value of `key` in a one-line `{ k = "v", … }` lock entry.
@@ -3131,6 +3265,178 @@ wheels = [
             lock, TRANSITIVE_REGISTRY_LOCK,
             "[manifest] removed when created by vendor"
         );
+    }
+
+    // ── a vendored transitive package promoted to direct (#1374) ───────
+
+    const ROOT_DATEUTIL_ONLY: &str = "dependencies = [\n    { name = \"python-dateutil\" },\n]\n\n\
+        [package.metadata]\nrequires-dist = [{ name = \"python-dateutil\", specifier = \"==2.8.2\" }]\n";
+
+    /// The root unit's dependencies and requires-dist with `six` added as
+    /// uv 0.12 writes them, `six_entry` being its requires-dist element.
+    fn root_with_six(six_entry: &str) -> String {
+        format!(
+            "dependencies = [\n    {{ name = \"python-dateutil\" }},\n    {{ name = \"six\" }},\n]\n\n\
+             [package.metadata]\nrequires-dist = [\n    \
+             {{ name = \"python-dateutil\", specifier = \"==2.8.2\" }},\n    {six_entry},\n]\n"
+        )
+    }
+
+    /// Vendor `six` as a transitive override, then apply `promote` to the
+    /// wired (pyproject, lock) pair the way a later `uv add` rewrites it.
+    async fn wire_transitive_then(
+        promote: impl Fn(&str, &str) -> (String, String),
+    ) -> (tempfile::TempDir, VendorEntry, String, String) {
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let entry = entry_for(wiring, meta);
+        let (wired_pyproject, wired_lock) = read_pair(tmp.path()).await;
+        let (pyproject, lock) = promote(&wired_pyproject, &wired_lock);
+        assert_ne!((&pyproject, &lock), (&wired_pyproject, &wired_lock));
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &pyproject)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &lock)
+            .await
+            .unwrap();
+        (tmp, entry, pyproject, lock)
+    }
+
+    /// `uv add six==1.16.0` on a project that vendored six as transitive
+    /// writes a root requires-dist element routed through our source, with
+    /// no wiring record. The revert puts it back on the registry with the
+    /// declared specifier, so the pair is what uv writes without vendoring.
+    #[tokio::test]
+    async fn revert_after_promoting_a_transitive_to_direct_respells_the_root_entry() {
+        let declare = |text: &str| {
+            text.replace(
+                "dependencies = [\"python-dateutil==2.8.2\"]",
+                "dependencies = [\"python-dateutil==2.8.2\", \"six==1.16.0\"]",
+            )
+        };
+        let (tmp, entry, _, _) = wire_transitive_then(|pyproject, lock| {
+            let path_entry = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+            (
+                declare(pyproject),
+                lock.replace(ROOT_DATEUTIL_ONLY, &root_with_six(&path_entry)),
+            )
+        })
+        .await;
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, declare(TRANSITIVE_REGISTRY_PYPROJECT));
+        assert_eq!(
+            lock,
+            TRANSITIVE_REGISTRY_LOCK.replace(
+                ROOT_DATEUTIL_ONLY,
+                &root_with_six("{ name = \"six\", specifier = \"==1.16.0\" }")
+            )
+        );
+    }
+
+    /// The same promotion into a dependency group (`uv add --dev`) lands
+    /// in the root's requires-dev, which is respelled the same way.
+    #[tokio::test]
+    async fn revert_after_promoting_a_transitive_to_a_dev_group_respells_it() {
+        let declare =
+            |text: &str| format!("{text}\n[dependency-groups]\ndev = [\"six==1.16.0\"]\n");
+        let dev_lock = |text: &str, entry: &str| {
+            text.replace(
+                ROOT_DATEUTIL_ONLY,
+                &format!(
+                    "dependencies = [\n    {{ name = \"python-dateutil\" }},\n]\n\n\
+                     [package.dev-dependencies]\ndev = [\n    {{ name = \"six\" }},\n]\n\n\
+                     [package.metadata]\nrequires-dist = [{{ name = \"python-dateutil\", \
+                     specifier = \"==2.8.2\" }}]\n\n[package.metadata.requires-dev]\n\
+                     dev = [{entry}]\n"
+                ),
+            )
+        };
+        let (tmp, entry, _, _) = wire_transitive_then(|pyproject, lock| {
+            (
+                declare(pyproject),
+                dev_lock(
+                    lock,
+                    &format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}"),
+                ),
+            )
+        })
+        .await;
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, declare(TRANSITIVE_REGISTRY_PYPROJECT));
+        assert_eq!(
+            lock,
+            dev_lock(
+                TRANSITIVE_REGISTRY_LOCK,
+                "{ name = \"six\", specifier = \"==1.16.0\" }"
+            )
+        );
+    }
+
+    /// When the unrecorded element can't be respelled (a multi-clause
+    /// declaration uv's spelling of isn't derivable, or no declaration at
+    /// all), or the lock routes another name through the uuid dir, the
+    /// revert writes neither file instead of a half-reverted
+    /// pair `uv sync --locked` rejects.
+    #[tokio::test]
+    async fn revert_keeps_both_files_when_an_unrecorded_reference_survives() {
+        let path_entry = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+        let cases: [(&str, Box<dyn Fn(&str, &str) -> (String, String)>); 3] = [
+            (
+                "multi-clause declaration",
+                Box::new(|pyproject: &str, lock: &str| {
+                    (
+                        pyproject.replace(
+                            "dependencies = [\"python-dateutil==2.8.2\"]",
+                            "dependencies = [\"python-dateutil==2.8.2\", \"six>=1.16,<2\"]",
+                        ),
+                        lock.replace(ROOT_DATEUTIL_ONLY, &root_with_six(&path_entry)),
+                    )
+                }),
+            ),
+            (
+                "undeclared",
+                Box::new(|pyproject: &str, lock: &str| {
+                    (
+                        format!("{pyproject}# promoted\n"),
+                        lock.replace(ROOT_DATEUTIL_ONLY, &root_with_six(&path_entry)),
+                    )
+                }),
+            ),
+            (
+                "another name routed through the wheel",
+                Box::new(|pyproject: &str, lock: &str| {
+                    let other = format!("{{ name = \"six-fork\", path = \"{REL_WHEEL}\" }}");
+                    (
+                        format!("{pyproject}# promoted\n"),
+                        lock.replace(ROOT_DATEUTIL_ONLY, &root_with_six(&other)),
+                    )
+                }),
+            ),
+        ];
+        for (name, promote) in cases {
+            let (tmp, entry, pyproject, lock) = wire_transitive_then(promote).await;
+            let outcome = revert_uv(&entry, tmp.path(), false).await;
+            assert!(outcome.drift_skipped(), "{name}: {:?}", outcome.warnings);
+            assert_eq!(read_pair(tmp.path()).await, (pyproject, lock), "{name}");
+        }
     }
 
     // ── two packages sharing a created [tool.uv.sources] (#670) ────────

@@ -1985,7 +1985,9 @@ wiring: an entry whose lockfile or config no longer references its
 version from elsewhere (`wiring contested`, naming both locks; delete the one
 the project does not install from), or, for npm and PyPI, a dependency no lock
 resolves any more (`dependency removed`; `scan --mode vendored --prune` reverts
-the entry). For a package-lock entry, drift also includes a
+the entry), or, for PyPI, a project file that still names the artifact while
+nothing installs from it (`wiring incomplete`, naming the file; re-lock, then
+re-vendor or revert, #1374). For a package-lock entry, drift also includes a
 `package-lock.json` / `npm-shrinkwrap.json` entry for the vendored `name@version`
 that `vendor` would rewire but that does not resolve to the vendored artifact
 (#588); the reason names that entry. It also includes any entry for that

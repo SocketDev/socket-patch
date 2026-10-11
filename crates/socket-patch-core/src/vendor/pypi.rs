@@ -2223,6 +2223,19 @@ async fn guard_unwired_pypi_revert(
     })
 }
 
+/// The project file that still names `.socket/vendor/pypi/<uuid>/`
+/// (`uv.lock`, `requirements.txt`, …), probed the way a revert's
+/// residual-reference guard probes ([`pypi_reference_clause`]). `None`
+/// when no readable file references it. `vendor --check` names it for an
+/// entry nothing installs from any more, so the verdict doesn't claim no
+/// file references a dir one still does (#1374).
+pub async fn pypi_referencing_file(project_root: &Path, uuid: &str) -> Option<String> {
+    pypi_reference_clause(project_root, uuid, &[])
+        .await?
+        .strip_suffix(" still resolves through it")
+        .map(str::to_string)
+}
+
 /// The in-use probe behind [`guard_unwired_pypi_revert`] and the
 /// post-restore keep in [`revert_pypi_opts`]: `None` when every Python
 /// project file was read and none mentions the uuid dir; otherwise the human
