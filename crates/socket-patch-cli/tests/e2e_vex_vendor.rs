@@ -39,9 +39,9 @@ use socket_patch_core::vendor::state::{
 /// the uuid path level, so fixtures must use the real shape.
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
 
 /// CLI invocation with the ambient `SOCKET_*` environment scrubbed (same
 /// rationale as `e2e_vex.rs`: explicit flags must be the sole source of

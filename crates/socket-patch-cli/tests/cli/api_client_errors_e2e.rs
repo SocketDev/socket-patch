@@ -5,14 +5,12 @@
 //! (`status`/`error`) on stdout, so a regression that turns a real API
 //! failure into a fake success fails loudly.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+use crate::common::binary;
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";

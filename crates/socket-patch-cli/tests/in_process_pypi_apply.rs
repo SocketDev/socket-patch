@@ -13,7 +13,6 @@ use std::process::Command;
 
 use base64::Engine;
 use serial_test::serial;
-use sha2::{Digest, Sha256};
 use socket_patch_cli::commands::apply::{run as apply_run, ApplyArgs};
 use socket_patch_cli::commands::scan::{run as scan_run, ScanArgs};
 use wiremock::matchers::{method, path, path_regex};
@@ -24,13 +23,9 @@ const UUID: &str = "12121212-1212-4121-8121-121212121212";
 const PYPI_PACKAGE: &str = "six";
 const PYPI_VERSION: &str = "1.16.0";
 
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
 
 /// Resolve an available Python executable. Tries `python3` (Unix
 /// convention) first, then `python` (the canonical Windows name —

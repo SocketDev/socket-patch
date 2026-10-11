@@ -27,7 +27,6 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use serial_test::serial;
-use sha2::{Digest, Sha256};
 use socket_patch_cli::commands::remove::{run as remove_run, RemoveArgs};
 use socket_patch_cli::commands::rollback::{run as rollback_run, RollbackArgs};
 use socket_patch_cli::commands::scan::{run as scan_run, ScanArgs};
@@ -69,13 +68,9 @@ fn darwin_after_bytes() -> Vec<u8> {
     p
 }
 
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
 
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)

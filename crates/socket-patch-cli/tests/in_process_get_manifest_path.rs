@@ -30,7 +30,6 @@
 use std::path::Path;
 
 use serial_test::serial;
-use sha2::{Digest, Sha256};
 use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::commands::get::{run, GetArgs};
 use wiremock::matchers::{method, path, path_regex};
@@ -46,14 +45,9 @@ const PATCHED: &[u8] = b"patched\n";
 const PATCHED_B64: &str = "cGF0Y2hlZAo=";
 const ORIGINAL_B64: &str = "b3JpZ2luYWwK";
 
-/// Git-blob-style sha256 — the hash shape apply verifies against.
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
 
 /// Mount the patch-view endpoint for `UUID`/`PURL` with real (git-blob)
 /// hashes so the nested apply can verify and patch. Returns `after_hash`.
