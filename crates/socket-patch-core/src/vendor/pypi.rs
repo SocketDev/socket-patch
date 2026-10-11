@@ -958,6 +958,9 @@ async fn pypi_prelude<'p>(
                         version,
                     )
                     .await;
+                    if sibling && dry_run {
+                        warnings.push(sibling_dry_run_notice(flavor, &canon_name, version));
+                    }
                     WiringPlan::Uv(Box::new(project), sibling)
                 }
                 Err(refusal) => {
@@ -1148,6 +1151,9 @@ async fn pypi_prelude<'p>(
                     WiringPlan::InSync
                 }
                 PipenvTarget::Fresh => {
+                    if sibling && dry_run {
+                        warnings.push(sibling_dry_run_notice(flavor, &canon_name, version));
+                    }
                     WiringPlan::Pipenv(Box::new(project), superseded.map(Box::new), sibling)
                 }
             }
@@ -1265,6 +1271,34 @@ async fn pypi_prelude<'p>(
     })
 }
 
+/// The lock an exported requirements pin is wired with, and the command
+/// that exports it, for the flavors that co-wire one (#612, #1368).
+fn sibling_lock(flavor: PypiFlavor) -> Option<(&'static str, &'static str)> {
+    match flavor {
+        PypiFlavor::Pipenv => Some((super::pypi_pipenv::LOCK_FILE, "pipenv requirements")),
+        PypiFlavor::UvProject => Some(("uv.lock", "uv export --frozen -o requirements.txt")),
+        PypiFlavor::PythonLocks
+        | PypiFlavor::Poetry
+        | PypiFlavor::Pdm
+        | PypiFlavor::Requirements
+        | PypiFlavor::Hatch => None,
+    }
+}
+
+/// The dry-run preview of a fresh vendor that wires the exported
+/// requirements pin together with `flavor`'s lock.
+fn sibling_dry_run_notice(flavor: PypiFlavor, canon_name: &str, version: &str) -> VendorWarning {
+    let lock = sibling_lock(flavor).map_or("the lock", |(lock, _)| lock);
+    VendorWarning::new(
+        "pypi_requirements_sibling_wired",
+        format!(
+            "would wire the exported {} pin of {canon_name}=={version} to the vendored wheel \
+             together with {lock}",
+            crate::formats::governing_locks::PYPI_REQUIREMENTS
+        ),
+    )
+}
+
 /// #612 / #1368 for a Pipenv or uv lock already wired to this patch: wire
 /// the exported requirements pin to the same committed wheel and extend
 /// the ledger entry with its records, so the revert restores both files.
@@ -1283,9 +1317,8 @@ async fn wire_in_sync_sibling(
     dry_run: bool,
     mut warnings: Vec<VendorWarning>,
 ) -> VendorOutcome {
-    let (lock, export) = match flavor {
-        PypiFlavor::UvProject => ("uv.lock", "uv export --frozen -o requirements.txt"),
-        _ => (super::pypi_pipenv::LOCK_FILE, "pipenv requirements"),
+    let Some((lock, export)) = sibling_lock(flavor) else {
+        return done(result, None, warnings);
     };
     let unwired = |why: &str| {
         VendorWarning::new(
@@ -1647,8 +1680,19 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
     };
     let wired: Result<(Vec<_>, MetaSlot), (&'static str, String)> = match plan {
         WiringPlan::Uv(project, sibling) => {
-            let lock_before = if sibling {
-                snapshot_files(project_root, &super::pypi_uv::UV_PAIR).await
+            // The pair as `wire_uv` checks it still is, to put back if the
+            // export then refuses.
+            let lock_before: Snapshot = if sibling {
+                vec![
+                    (
+                        "pyproject.toml".into(),
+                        Some(project.pyproject_text.clone().into_bytes()),
+                    ),
+                    (
+                        "uv.lock".into(),
+                        Some(project.lock_text.clone().into_bytes()),
+                    ),
+                ]
             } else {
                 Vec::new()
             };
@@ -2522,23 +2566,15 @@ fn residual_reference_warning(uuid: &str, clause: &str) -> VendorWarning {
     )
 }
 
-/// The bytes of each of `files` that is a regular file now, to put back
-/// with [`restore_files`].
-async fn snapshot_files(project_root: &Path, files: &[&str]) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-    let mut snapshot = Vec::new();
+/// The current bytes of each of `files` (`None` when absent), to put back
+/// with [`restore_snapshot`].
+async fn snapshot_files(project_root: &Path, files: &[&str]) -> Snapshot {
+    let mut snapshot = Snapshot::new();
     for file in files {
-        let path = project_root.join(file);
-        if let Ok(bytes) = read_regular_to_bytes(&path).await {
-            snapshot.push((path, bytes));
-        }
+        let bytes = read_regular_to_bytes(&project_root.join(file)).await.ok();
+        snapshot.push((file.to_string(), bytes));
     }
     snapshot
-}
-
-async fn restore_files(snapshot: &[(std::path::PathBuf, Vec<u8>)]) {
-    for (path, bytes) in snapshot {
-        let _ = crate::utils::fs::atomic_write_bytes_preserving_mode(path, bytes).await;
-    }
 }
 
 /// Wire the exported requirements pin beside a just-wired Pipenv or uv lock
@@ -2549,7 +2585,7 @@ async fn restore_files(snapshot: &[(std::path::PathBuf, Vec<u8>)]) {
 #[allow(clippy::too_many_arguments)]
 async fn wire_sibling_requirements(
     project_root: &Path,
-    lock_before: &[(std::path::PathBuf, Vec<u8>)],
+    lock_before: &Snapshot,
     superseded: Option<&VendorEntry>,
     canon_name: &str,
     version: &str,
@@ -2582,10 +2618,13 @@ async fn wire_sibling_requirements(
         }
         None => wire_requirements(project_root, canon_name, version, rel_wheel, sha256_hex).await,
     };
-    if lines.is_err() {
-        restore_files(lock_before).await;
+    match lines {
+        Ok(lines) => Ok(lines),
+        Err((code, mut detail)) => {
+            restore_snapshot(project_root, lock_before, &mut detail).await;
+            Err((code, detail))
+        }
     }
-    lines
 }
 
 /// Revert a Pipenv or uv entry: the exported requirements lines wired with
@@ -2608,7 +2647,13 @@ async fn revert_with_sibling(
     ) -> RevertOutcome {
         match flavor {
             PypiFlavor::UvProject => revert_uv(entry, project_root, dry_run).await,
-            _ => super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await,
+            PypiFlavor::Pipenv => {
+                super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await
+            }
+            other => RevertOutcome::failed(format!(
+                "no exported-requirements revert for the {} flavor",
+                other.as_str()
+            )),
         }
     }
     let (lines, lock): (Vec<_>, Vec<_>) = entry
@@ -2642,7 +2687,9 @@ async fn revert_with_sibling(
     };
     let mut outcome = revert_lock(flavor, &lock_entry, project_root, dry_run).await;
     if !outcome.success {
-        restore_files(&snapshot).await;
+        let mut detail = outcome.error.take().unwrap_or_default();
+        restore_snapshot(project_root, &snapshot, &mut detail).await;
+        outcome.error = Some(detail);
         return outcome;
     }
     outcome.warnings.extend(lines_outcome.warnings);
@@ -7962,6 +8009,64 @@ wheels = [
             assert_eq!(requirement_records(&entry), 1, "{:?}", entry.wiring);
             save_ledger_entry(&fx.root, &entry).await;
         }
+    }
+
+    /// #1368: a symlinked export cannot be rewritten in place (the rename
+    /// would replace the link), so it stays a named loser and uv.lock is
+    /// still vendored, instead of failing the whole run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uv_symlinked_export_stays_a_loser() {
+        let fx = uv_export_fixture().await;
+        tokio::fs::remove_file(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        touch(&fx.root, "exported.txt", UV_EXPORT).await;
+        std::os::unix::fs::symlink("exported.txt", fx.root.join("requirements.txt")).unwrap();
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done {
+            result, warnings, ..
+        } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("uv vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            warnings.iter().any(|w| w.code == "pypi_multiple_lockfiles"),
+            "{warnings:?}"
+        );
+        assert!(tokio::fs::read_to_string(fx.root.join("uv.lock"))
+            .await
+            .unwrap()
+            .contains(UUID));
+        assert_eq!(read_requirements(&fx).await, UV_EXPORT);
+        assert!(std::fs::symlink_metadata(fx.root.join("requirements.txt"))
+            .unwrap()
+            .is_symlink());
+    }
+
+    /// #1368: the dry run of a fresh uv vendor previews the export wiring
+    /// and writes nothing.
+    #[tokio::test]
+    async fn uv_dry_run_previews_the_export_wiring() {
+        let fx = uv_export_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { warnings, .. } =
+            vendor_six_as_opts(&fx, &sources, UUID, true).await
+        else {
+            panic!("the dry run must be Done");
+        };
+        assert!(
+            warnings.iter().any(
+                |w| w.code == "pypi_requirements_sibling_wired" && w.detail.contains("uv.lock")
+            ),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
+            "{warnings:?}"
+        );
+        assert_uv_export_restored(&fx).await;
     }
 
     /// #1368: a superseding patch uuid re-wires both uv.lock and the export
