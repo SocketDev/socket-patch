@@ -163,6 +163,17 @@ pub(super) async fn load_python_locks(
 ) -> Result<PythonLocks, Failure> {
     let paths =
         python_lock_paths(root).map_err(|error| ("pypi_lock_read_failed", error.to_string()))?;
+    load_listed_locks(root, paths, name, version, uuid).await
+}
+
+/// [`load_python_locks`] over `paths` only.
+async fn load_listed_locks(
+    root: &Path,
+    paths: Vec<String>,
+    name: &str,
+    version: &str,
+    uuid: &str,
+) -> Result<PythonLocks, Failure> {
     let directory = format!(".socket/vendor/pypi/{uuid}/");
     let placeholder = format!("{directory}{name}-{version}-py3-none-any.whl");
     let mut files = Vec::new();
@@ -263,6 +274,122 @@ pub(super) async fn load_python_locks(
         in_sync,
         pin,
     })
+}
+
+/// #1368: the PEP 751 locks `pipenv lock` writes beside `Pipfile.lock`
+/// under `[pipenv] use_pylock = true` (a `Pipfile` sits beside them).
+/// Pipenv installs from `Pipfile.lock`, but `uv pip install -r
+/// pylock.toml` and pip read the pylock, so it is wired with the lock.
+/// A pylock Hatch derives from pyproject (locked environments) is Hatch's
+/// own, regenerated on its next sync, so it is left out (#479).
+async fn pipenv_pylock_paths(root: &Path) -> Vec<String> {
+    if !root.join("Pipfile").is_file() {
+        return Vec::new();
+    }
+    let mut hatch_files = std::collections::BTreeMap::new();
+    for file in crate::utils::hatch::HATCH_FILES {
+        if let Ok(text) = read_regular_to_string(&root.join(file)).await {
+            hatch_files.insert(file.to_string(), text);
+        }
+    }
+    python_lock_paths(root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| crate::utils::python_lock::is_pep751_lock_name(path))
+        .filter(|path| !crate::utils::hatch::is_hatch_lock(&hatch_files, path))
+        .collect()
+}
+
+/// How a Pipenv pylock holds the target `name==version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PipenvPylock {
+    /// From the registry, in a regular file the wiring can rewrite.
+    Registry,
+    /// From a vendored wheel under `.socket/vendor/pypi/<uuid>/`; holds
+    /// that uuid.
+    Vendored(String),
+    /// In a file the wiring can't rewrite in place: a symlink (the writer
+    /// would replace the link), or an entry `rewrite_python_lock` refuses.
+    Unwirable,
+}
+
+/// Each Pipenv pylock ([`pipenv_pylock_paths`]) that holds
+/// `name==version`, and how it holds it. A pylock that does not hold it
+/// is left out; one that can't be read or parsed is [`Unwirable`].
+///
+/// [`Unwirable`]: PipenvPylock::Unwirable
+pub(super) async fn pipenv_pylocks(
+    root: &Path,
+    name: &str,
+    version: &str,
+) -> Vec<(String, PipenvPylock)> {
+    let mut found = Vec::new();
+    for path in pipenv_pylock_paths(root).await {
+        let Ok(text) = read_file(&root.join(&path)).await else {
+            found.push((path, PipenvPylock::Unwirable));
+            continue;
+        };
+        let Ok(document) = lock_document(&text) else {
+            found.push((path, PipenvPylock::Unwirable));
+            continue;
+        };
+        let Some(package) = package(&document, name, version) else {
+            continue;
+        };
+        let state = if let Some(source) = source_path(package) {
+            match source
+                .trim_start_matches("./")
+                .strip_prefix(".socket/vendor/pypi/")
+                .and_then(|rest| rest.split_once('/'))
+            {
+                Some((uuid, _)) => PipenvPylock::Vendored(uuid.to_string()),
+                None => PipenvPylock::Unwirable,
+            }
+        } else if tokio::fs::symlink_metadata(root.join(&path))
+            .await
+            .map_or(true, |meta| meta.file_type().is_symlink())
+        {
+            PipenvPylock::Unwirable
+        } else {
+            match rewrite_python_lock(
+                &text,
+                name,
+                version,
+                ArtifactSource::Path(".socket/vendor/pypi/x/placeholder.whl"),
+                &"0".repeat(64),
+            ) {
+                Ok(Some(_)) => PipenvPylock::Registry,
+                _ => PipenvPylock::Unwirable,
+            }
+        };
+        found.push((path, state));
+    }
+    found
+}
+
+/// Wire the registry entries of the Pipenv pylocks `paths` to `wheel`
+/// (#1368), recording each rewritten file as a python-lock document so the
+/// revert restores it.
+pub(super) async fn wire_pipenv_pylocks(
+    root: &Path,
+    paths: Vec<String>,
+    name: &str,
+    version: &str,
+    uuid: &str,
+    wheel: &str,
+    sha: &str,
+) -> Result<Vec<WiringRecord>, Failure> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let project = load_listed_locks(root, paths, name, version, uuid).await?;
+    wire_python_locks(&project, root, name, version, wheel, sha).await
+}
+
+/// Whether `record` is one the python-lock revert replays: a pylock wired
+/// beside a Pipenv lock (#1368) is recorded this way.
+pub(super) fn is_lock_record(record: &WiringRecord) -> bool {
+    record.kind == KIND
 }
 
 pub(super) async fn wire_python_locks(
