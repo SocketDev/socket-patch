@@ -294,13 +294,14 @@ fn wired_pin_in(content: &str, canon_name: &str, record_uuid: &str) -> Option<(S
     })
 }
 
-/// Whether the requirements set beside a Pipenv lock (`pipenv requirements
-/// > requirements.txt`, the Docker / plain-pip install path) pins
-/// `canon_name==version` exactly from the registry in a shape the wiring
-/// rewrites in place, with no vendor line for the package yet (#612).
-/// Vendored Pipenv wires such a pin together with `Pipfile.lock`, as hosted
-/// mode rewrites both; anything else (no pin, a range, extras, an include
-/// outside the root, an existing vendor line) is left to the
+/// Whether the requirements set beside a Pipenv or uv lock (`pipenv
+/// requirements > requirements.txt`, `uv export -o requirements.txt`: the
+/// Docker / plain-pip install path) pins `canon_name==version` exactly from
+/// the registry in a shape the wiring rewrites in place, with no vendor line
+/// for the package yet (#612, #1368). Vendored Pipenv and uv wire such a pin
+/// together with their lock, as hosted mode rewrites both; anything else (no
+/// pin, a range, extras, an include outside the root, an existing vendor
+/// line, a symlinked file the rewrite would replace) is left to the
 /// `pypi_multiple_lockfiles` warning.
 pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: &str) -> bool {
     let Ok(files) = collect_requirements_files(root).await else {
@@ -312,19 +313,20 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
     {
         return false;
     }
-    plan_requirements(root, canon_name, version, "", "")
-        .await
-        .is_ok_and(|plan| {
-            !plan.is_empty()
-                && plan
-                    .iter()
-                    .flat_map(|f| f.records.iter())
-                    .all(|r| r.action == WiringAction::Rewritten)
-        })
+    let Ok(plan) = plan_requirements(root, canon_name, version, "", "").await else {
+        return false;
+    };
+    let rels: Vec<&str> = plan.iter().map(|f| f.rel.as_str()).collect();
+    !plan.is_empty()
+        && plan
+            .iter()
+            .flat_map(|f| f.records.iter())
+            .all(|r| r.action == WiringAction::Rewritten)
+        && refuse_symlinked(root, &rels).await.is_ok()
 }
 
-/// The `requirements_line` records of a mixed entry (a Pipenv entry that
-/// also wired its exported requirements file, #612).
+/// The `requirements_line` records of a mixed entry (a Pipenv or uv entry
+/// that also wired its exported requirements file, #612 / #1368).
 pub(super) const RECORD_KIND: &str = "requirements_line";
 
 /// Refuse a wheel path or digest that cannot sit on one requirements line

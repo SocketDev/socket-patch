@@ -28,12 +28,38 @@ pub async fn preflight_pypi_takeover(
     if entry.ecosystem != "pypi" {
         return Ok(());
     }
+    preflight_sibling_requirements_takeover(entry)?;
     match entry.flavor.as_deref() {
         Some("requirements") => preflight_requirements_takeover(entry),
         Some("uv") => preflight_uv_takeover(entry),
         Some("poetry") => preflight_poetry_takeover(root, entry).await,
         _ => Ok(()),
     }
+}
+
+/// A Pipenv or uv entry also carries the `requirements_line` records of
+/// the exported requirements pin wired with its lock (#612, #1368). After
+/// the revert, the hosted requirements rewriter re-pins only the root
+/// requirements.txt, so a line wired in a `-r` include is refused exactly
+/// as for a requirements-flavor entry.
+fn preflight_sibling_requirements_takeover(entry: &VendorEntry) -> Result<(), RewriteWarning> {
+    if !matches!(entry.flavor.as_deref(), Some("uv" | "pipenv")) {
+        return Ok(());
+    }
+    let lines: Vec<_> = entry
+        .wiring
+        .iter()
+        .filter(|r| r.kind == "requirements_line")
+        .cloned()
+        .collect();
+    if lines.is_empty() {
+        return Ok(());
+    }
+    preflight_requirements_takeover(&VendorEntry {
+        flavor: Some("requirements".into()),
+        wiring: lines,
+        ..entry.clone()
+    })
 }
 
 /// Vendored uv pins the lock's `[[package]]` unit to the patch's version
@@ -176,6 +202,46 @@ mod tests {
         let relock = detail.find("re-lock").expect(detail);
         assert!(revert < relock, "{detail}");
         assert!(detail.contains("EVERY vendored package"), "{detail}");
+    }
+
+    fn requirements_line(file: &str) -> WiringRecord {
+        WiringRecord {
+            file: file.into(),
+            kind: "requirements_line".into(),
+            action: WiringAction::Rewritten,
+            key: Some(format!("{file}:1")),
+            original: None,
+            new: None,
+        }
+    }
+
+    /// #1368 / #612: the exported pin wired with a uv or Pipenv lock is
+    /// re-pinned by the hosted requirements rewriter, which reaches only
+    /// the root requirements.txt; one wired in a `-r` include is refused
+    /// before the revert, a root one is admitted.
+    #[tokio::test]
+    async fn sibling_export_in_an_include_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        for (flavor, lock) in [
+            ("uv", uv_package("1.16.0")),
+            ("pipenv", uv_package("1.16.0")),
+        ] {
+            let e = entry(
+                flavor,
+                vec![lock.clone(), requirements_line("requirements.txt")],
+            );
+            assert!(
+                preflight_pypi_takeover(root.path(), &e).await.is_ok(),
+                "{flavor}"
+            );
+            let e = entry(flavor, vec![lock, requirements_line("req/base.txt")]);
+            let err = preflight_pypi_takeover(root.path(), &e).await.unwrap_err();
+            assert_eq!(
+                err.code, "redirect_requirements_takeover_unreachable",
+                "{flavor}"
+            );
+            assert!(err.detail.contains("req/base.txt"), "{}", err.detail);
+        }
     }
 
     #[test]

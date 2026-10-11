@@ -1667,15 +1667,71 @@ async fn vendor_check_fails_after_hatch_dependency_reset() {
     assert_check_catches_relock(&root, files);
 }
 
-/// #1120: a `requirements.txt` exported beside `uv.lock` pins the
-/// package from PyPI, so the uv-only wiring leaves installs from it
-/// unpatched. `uv export > requirements.txt` in Windows PowerShell 5.1
-/// writes it as UTF-16 with a byte-order mark, which pip and uv read like
-/// its UTF-8 twin, so `vendor` must name it (`pypi_multiple_lockfiles`)
-/// and `vendor --check` must fail on the contested wiring in every
-/// encoding, not pass as if the file were absent.
+/// #1368: a `uv export` requirements.txt beside `uv.lock` is an install
+/// source of its own (Docker / plain pip). `vendor` wires its exact pin to
+/// the same committed wheel as uv.lock, `vendor --check` passes with no
+/// contest, a re-run is settled, and `vendor --revert` restores all three
+/// files byte for byte.
 #[tokio::test]
-async fn uv_requirements_export_contests_the_wiring_in_any_encoding() {
+async fn uv_requirements_export_is_wired_with_the_lock() {
+    let export = "six==1.16.0 \\\n    --hash=sha256:WHEEL_SHA\n".replace("WHEEL_SHA", WHEEL_SHA);
+    let (_tmp, root) = project();
+    let files = stage_uv(&root);
+    std::fs::write(root.join("requirements.txt"), &export).unwrap();
+    let originals: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .chain(&["requirements.txt"])
+        .map(|f| (*f, std::fs::read(root.join(f)).unwrap()))
+        .collect();
+    stage_manifest(&root);
+    let needle = format!(".socket/vendor/pypi/{UUID}/");
+
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    for file in ["uv.lock", "requirements.txt"] {
+        assert!(
+            std::fs::read_to_string(root.join(file))
+                .unwrap()
+                .contains(&needle),
+            "{file} is wired: {env:#}"
+        );
+    }
+    assert!(
+        !env.to_string().contains("pypi_multiple_lockfiles"),
+        "the export is wired, not an unpatched loser: {env:#}"
+    );
+
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 0, "both install sources are wired: {env:#}");
+
+    // Re-running is settled: nothing rewritten.
+    let wired = std::fs::read(root.join("requirements.txt")).unwrap();
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(std::fs::read(root.join("requirements.txt")).unwrap(), wired);
+
+    let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    for (file, bytes) in &originals {
+        assert_eq!(
+            &std::fs::read(root.join(file)).unwrap(),
+            bytes,
+            "{file} is restored"
+        );
+    }
+    assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+}
+
+/// #1120: a `requirements.txt` exported beside `uv.lock` pins the
+/// package from PyPI. `uv export > requirements.txt` in Windows
+/// PowerShell 5.1 writes it as UTF-16 with a byte-order mark, which pip
+/// and uv read like its UTF-8 twin but the requirements wiring refuses to
+/// rewrite, so the uv-only wiring leaves installs from it unpatched:
+/// `vendor` must name it (`pypi_multiple_lockfiles`) and `vendor --check`
+/// must fail on the contested wiring, not pass as if the file were absent.
+/// (Its UTF-8 twin is wired with the lock, #1368.)
+#[tokio::test]
+async fn uv_requirements_export_contests_the_wiring_in_utf16() {
     let text = "six==1.16.0\r\n";
     let le: Vec<u8> = [0xFF, 0xFE]
         .into_iter()
@@ -1685,11 +1741,7 @@ async fn uv_requirements_export_contests_the_wiring_in_any_encoding() {
         .into_iter()
         .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
         .collect();
-    for (case, bytes) in [
-        ("utf-8", text.as_bytes().to_vec()),
-        ("utf-16 le", le),
-        ("utf-16 be", be),
-    ] {
+    for (case, bytes) in [("utf-16 le", le), ("utf-16 be", be)] {
         let (_tmp, root) = project();
         stage_uv(&root);
         std::fs::write(root.join("requirements.txt"), &bytes).unwrap();
