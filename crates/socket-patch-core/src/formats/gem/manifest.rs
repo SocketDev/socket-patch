@@ -43,8 +43,13 @@
 //! nothing on disk says which bundler runs: callers refuse it with
 //! [`twin_manifest_refusal`] (#751).
 //!
-//! The model is pure:
-//! the disk and environment reads live in
+//! A configured path names a root file when its file name matches and its
+//! directory is the root's, compared lexically and, failing that, by the
+//! directories' resolved identity: bundler expands the setting lexically
+//! and opens it through the OS, so a symlinked spelling of the project
+//! directory (macOS `/tmp` → `/private/tmp`) names the same file (#896).
+//! That directory lookup is the model's only disk read; the other disk and
+//! environment reads live in
 //! [`crate::crawlers::ruby_crawler::bundler_loaded_manifest`].
 
 use std::ffi::OsStr;
@@ -183,6 +188,44 @@ impl LoadedManifest {
         lockfile_global: Option<&str>,
         gems_rb_present: bool,
     ) -> LoadedManifest {
+        self.with_lockfile_by(
+            root,
+            lockfile_env,
+            lockfile_config,
+            lockfile_global,
+            gems_rb_present,
+            same_dir_on_disk,
+        )
+    }
+
+    /// [`LoadedManifest::with_lockfile`] for a `root` that only stands in
+    /// for a project not on this disk (an in-memory view): paths compare
+    /// lexically, never through this host's directories.
+    pub(crate) fn with_lockfile_lexical(
+        self,
+        root: &Path,
+        lockfile_config: Option<&str>,
+        gems_rb_present: bool,
+    ) -> LoadedManifest {
+        self.with_lockfile_by(
+            root,
+            None,
+            lockfile_config,
+            None,
+            gems_rb_present,
+            |a, b| a == b,
+        )
+    }
+
+    fn with_lockfile_by(
+        self,
+        root: &Path,
+        lockfile_env: Option<&OsStr>,
+        lockfile_config: Option<&str>,
+        lockfile_global: Option<&str>,
+        gems_rb_present: bool,
+        same_dir: SameDir,
+    ) -> LoadedManifest {
         let Some((_, lock)) = self.pair(gems_rb_present) else {
             return self;
         };
@@ -200,8 +243,10 @@ impl LoadedManifest {
         }
         let target = resolve_against(root, &value);
         let expected = resolve_against(root, Path::new(lock));
-        if target.is_some() && target == expected {
-            return self;
+        if let (Some(target), Some(expected)) = (target, expected) {
+            if same_entry(&target, &expected, same_dir) {
+                return self;
+            }
         }
         LoadedManifest::UnsupportedLockfile {
             value: value.display().to_string(),
@@ -252,6 +297,27 @@ fn resolve_against(root: &Path, value: &Path) -> Option<PathBuf> {
         .and_then(|p| normalize_lexically(&p))
 }
 
+/// How two resolved directories are judged the same directory.
+type SameDir = fn(&Path, &Path) -> bool;
+
+/// Whether two resolved directories are the same directory on this disk:
+/// equal, or the same directory by file identity (a symlinked spelling, a
+/// bind mount, a Windows junction).
+fn same_dir_on_disk(a: &Path, b: &Path) -> bool {
+    a == b || same_file::is_same_file(a, b).unwrap_or(false)
+}
+
+/// Whether two resolved paths name the same directory entry: the same file
+/// name in the `same_dir` directory. Only the directory is resolved, so a
+/// root `Gemfile` that is itself a symlink to another manifest stays
+/// distinct from that manifest, as bundler's root follows the spelled
+/// directory.
+fn same_entry(a: &Path, b: &Path, same_dir: SameDir) -> bool {
+    a == b
+        || (a.file_name() == b.file_name()
+            && matches!((a.parent(), b.parent()), (Some(a), Some(b)) if same_dir(a, b)))
+}
+
 /// Classify the configured `BUNDLE_GEMFILE` against `root`, which also
 /// anchors a relative value: the app config value first, then the
 /// environment — unless the environment names a manifest outside `root`,
@@ -264,12 +330,38 @@ pub fn classify(
     config_value: Option<&str>,
     global_value: Option<&str>,
 ) -> LoadedManifest {
+    classify_by(
+        root,
+        gemfile_env,
+        config_value,
+        global_value,
+        same_dir_on_disk,
+    )
+}
+
+/// [`classify`] of an app config value for a `root` that only stands in
+/// for a project not on this disk (an in-memory view): paths compare
+/// lexically, never through this host's directories.
+pub(crate) fn classify_lexical(root: &Path, config_value: Option<&str>) -> LoadedManifest {
+    classify_by(root, None, config_value, None, |a, b| a == b)
+}
+
+fn classify_by(
+    root: &Path,
+    gemfile_env: Option<&OsStr>,
+    config_value: Option<&str>,
+    global_value: Option<&str>,
+    same_dir: SameDir,
+) -> LoadedManifest {
     let env = gemfile_env.filter(|v| !v.is_empty()).map(PathBuf::from);
     let config = config_value.filter(|v| !v.is_empty()).map(PathBuf::from);
     let global = global_value.filter(|v| !v.is_empty()).map(PathBuf::from);
     let env_keeps_root = |env: &Path| {
         let dir = resolve_against(root, env).and_then(|p| p.parent().map(Path::to_path_buf));
-        dir.is_some() && dir == resolve_against(root, Path::new(""))
+        match (dir, resolve_against(root, Path::new(""))) {
+            (Some(dir), Some(root)) => same_dir(&dir, &root),
+            _ => false,
+        }
     };
     let (value, by) = match (env, config) {
         (Some(env), Some(config)) if env_keeps_root(&env) => (config, GemfileSetting::AppConfig),
@@ -290,8 +382,11 @@ pub fn classify(
     let target = resolve_against(root, &value);
     let root = resolve_against(root, Path::new(""));
     if let (Some(target), Some(root)) = (target, root) {
-        for manifest in ["Gemfile", "gems.rb"] {
-            if target == root.join(manifest) {
+        let manifest = ["Gemfile", "gems.rb"]
+            .into_iter()
+            .find(|m| target.file_name() == Some(OsStr::new(m)));
+        if let Some(manifest) = manifest {
+            if same_entry(&target, &root.join(manifest), same_dir) {
                 return LoadedManifest::Configured { manifest, by };
             }
         }
@@ -607,6 +702,125 @@ mod tests {
             );
             assert_eq!(cleared, LoadedManifest::Default, "{env:?} {config:?}");
         }
+    }
+
+    /// A project directory reached through a symlink (macOS `/tmp` →
+    /// `/private/tmp`, a symlinked workspace): bundler expands
+    /// `BUNDLE_GEMFILE` lexically and opens it through the OS, so a value
+    /// spelling the root's own `Gemfile` through the link is that Gemfile,
+    /// whichever side (the setting or `--cwd`) uses the link (#896).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_spelling_of_the_root_is_the_roots_own_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real/app");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("Gemfile"), "").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
+        let link = tmp.path().join("link/app");
+        let configured = |by| LoadedManifest::Configured {
+            manifest: "Gemfile",
+            by,
+        };
+        for (root, spelled) in [(&real, &link), (&link, &real)] {
+            let value = spelled.join("Gemfile");
+            // `BUNDLE_GEMFILE=$PWD/Gemfile` with a logical `$PWD`.
+            assert_eq!(
+                classify(root, Some(value.as_os_str()), None, None),
+                configured(GemfileSetting::Env),
+                "{root:?} {value:?}"
+            );
+            // `bundle config set --local gemfile "$PWD/Gemfile"`.
+            assert_eq!(
+                classify(root, None, value.to_str(), None),
+                configured(GemfileSetting::AppConfig)
+            );
+            assert_eq!(
+                classify(root, None, None, value.to_str()),
+                configured(GemfileSetting::GlobalConfig)
+            );
+            // The env value keeps bundler's root (same directory), so the
+            // app config still wins over it.
+            let next = spelled.join("Gemfile.next");
+            assert_eq!(
+                classify(root, Some(next.as_os_str()), Some("Gemfile"), None),
+                configured(GemfileSetting::AppConfig)
+            );
+            // `BUNDLE_LOCKFILE` naming the pair's own lock the same way.
+            let lock = spelled.join("Gemfile.lock");
+            assert_eq!(
+                classify(root, None, None, None).with_lockfile(
+                    root,
+                    Some(lock.as_os_str()),
+                    None,
+                    None,
+                    false
+                ),
+                LoadedManifest::Default
+            );
+            // Another file in the same directory is still another manifest.
+            assert!(matches!(
+                classify(root, Some(next.as_os_str()), None, None),
+                LoadedManifest::Unsupported { .. }
+            ));
+        }
+    }
+
+    /// An in-memory view's root only stands in for a project that is not on
+    /// this disk, so its paths never resolve through this host's
+    /// directories: a symlinked spelling stays another manifest there.
+    #[cfg(unix)]
+    #[test]
+    fn the_lexical_variants_never_read_this_hosts_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real/app");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
+        let link = tmp.path().join("link/app");
+        let value = link.join("Gemfile");
+        assert_eq!(
+            classify_lexical(&real, value.to_str()),
+            LoadedManifest::Unsupported {
+                value: value.display().to_string(),
+                by: GemfileSetting::AppConfig
+            }
+        );
+        assert_eq!(
+            classify_lexical(&real, Some("Gemfile")),
+            LoadedManifest::Configured {
+                manifest: "Gemfile",
+                by: GemfileSetting::AppConfig
+            }
+        );
+        let lock = link.join("Gemfile.lock");
+        assert!(matches!(
+            LoadedManifest::Default.with_lockfile_lexical(&real, lock.to_str(), false),
+            LoadedManifest::UnsupportedLockfile { .. }
+        ));
+    }
+
+    /// Only the DIRECTORY is resolved: a root `Gemfile` that is itself a
+    /// symlink to a manifest elsewhere does not make that manifest the
+    /// project's, since bundler's root (and its lock) follow the spelled
+    /// directory, not the link target.
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_the_roots_gemfile_links_to_is_still_another_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("Gemfile"), "").unwrap();
+        std::os::unix::fs::symlink(other.join("Gemfile"), root.join("Gemfile")).unwrap();
+        let value = other.join("Gemfile");
+        assert_eq!(
+            classify(&root, Some(value.as_os_str()), None, None),
+            LoadedManifest::Unsupported {
+                value: value.display().to_string(),
+                by: GemfileSetting::Env
+            }
+        );
     }
 
     #[test]

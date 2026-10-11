@@ -1703,7 +1703,8 @@ pub(crate) async fn bundler_loaded_manifest_in(
         ProjectView::Snapshot(snap) => {
             // The only files the probe reads: the app config, the global
             // config and `gems.rb` (the environment it also reads is fixed
-            // for the run).
+            // for the run, and the directory identity of a configured
+            // absolute path is not a file the snapshot fingerprints).
             let root = snap.root_reading(bundler_config_files(snap.root_reading::<&Path>([])));
             bundler_loaded_manifest(root).await
         }
@@ -1713,7 +1714,7 @@ pub(crate) async fn bundler_loaded_manifest_in(
             let lockfile = config.as_deref().and_then(manifest::config_lockfile);
             let root = Path::new("/");
             let gems_rb = view.is_file("gems.rb");
-            let loaded = manifest::classify(root, None, gemfile.as_deref(), None);
+            let loaded = manifest::classify_lexical(root, gemfile.as_deref());
             // `/` only stands in for the project root: bundler opens an
             // absolute lockfile as is, never the project's own lock, so
             // it must not compare equal to the pair's lock at `/`.
@@ -1725,7 +1726,7 @@ pub(crate) async fn bundler_loaded_manifest_in(
                     };
                 }
             }
-            loaded.with_lockfile(root, None, lockfile.as_deref(), None, gems_rb)
+            loaded.with_lockfile_lexical(root, lockfile.as_deref(), gems_rb)
         }
     }
 }
@@ -3740,6 +3741,41 @@ mod tests {
             bundler_app_cache_dir_with_env(&root, None, None, false, Some(&missing)).await,
             root.join("vendor").join("cache")
         );
+    }
+
+    /// #896: a project reached through a symlinked directory, with
+    /// `bundle config set --local gemfile "$PWD/Gemfile"` written through the
+    /// link (or the physical path with `--cwd` through the link): bundler
+    /// loads the project's own Gemfile, so the app config is followed, not
+    /// refused as another manifest.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loaded_manifest_follows_a_symlinked_spelling_of_the_project() {
+        use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real/app");
+        std::fs::create_dir_all(real.join(".bundle")).unwrap();
+        std::fs::write(real.join("Gemfile"), "").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let link = dir.path().join("link/app");
+        for (root, spelled) in [(&real, &link), (&link, &real)] {
+            std::fs::write(
+                real.join(".bundle/config"),
+                format!(
+                    "---\nBUNDLE_GEMFILE: \"{}\"\n",
+                    spelled.join("Gemfile").display()
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                bundler_loaded_manifest_with_env(root, BundlerEnv::default()).await,
+                LoadedManifest::Configured {
+                    manifest: "Gemfile",
+                    by: GemfileSetting::AppConfig
+                },
+                "{root:?}"
+            );
+        }
     }
 
     /// #577: a global `gemfile` setting is the third tier: below the local
