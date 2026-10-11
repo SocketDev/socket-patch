@@ -271,6 +271,42 @@ class GradleRows(unittest.TestCase):
         self.assertIn("gradle-probe", text)
 
 
+class PnpmRequiredGate(unittest.TestCase):
+    """The pnpm-family suites soft-skip when pnpm is missing, and libtest
+    counts a skip as `ok`, so their Linux rows must set the fail-instead-of-
+    skip gate (#1054)."""
+
+    suites = {"e2e_redirect_pnpm_build", "e2e_safety_pnpm", "e2e_redirect_rush_sim"}
+    jobs = ("e2e", "e2e-full", "e2e-extended", "e2e-windows", "e2e-macos")
+
+    def test_run_step_reads_the_row_key(self):
+        run = dict(rows_mod.steps(JOBS["e2e"]))["Run e2e tests"]
+        self.assertIn("SOCKET_PATCH_PNPM_E2E_REQUIRED: ${{ matrix.pnpm_required || '' }}", run)
+
+    def test_every_linux_pnpm_row_sets_the_gate(self):
+        gated = set()
+        for job in self.jobs:
+            for row in rows(job):
+                if self.suites & set(row["suite"].split()) and row["os"].startswith("ubuntu"):
+                    with self.subTest(job=job, row=row):
+                        self.assertEqual(row.get("pnpm_required"), "1")
+                    gated |= self.suites & set(row["suite"].split())
+                elif "pnpm_required" in row:
+                    self.fail(f"{job} row outside the checked set sets pnpm_required: {row}")
+        self.assertEqual(gated, self.suites)
+        self.assertIn("e2e_redirect_pnpm_build", {r["suite"] for r in rows("e2e") if r.get("pnpm_required")},
+                      "the PR tier must keep its gated pnpm row")
+
+    def test_every_gated_suite_honours_the_gate(self):
+        for suite in sorted(self.suites):
+            with self.subTest(suite=suite):
+                src = (TESTS / f"{suite}.rs").read_text(encoding="utf-8")
+                # Empty means unset: the step passes '' on every other leg.
+                self.assertIn('var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some_and(|v| !v.is_empty())', src)
+                # ...and every skip path goes through it.
+                self.assertGreater(len(re.findall(r"pnpm_required\(\)", src)), 1, "gate defined but never read")
+
+
 class PdmCapstone(unittest.TestCase):
     job = rows_mod.jobs(PDM.read_text(encoding="utf-8"))["capstone"]
 

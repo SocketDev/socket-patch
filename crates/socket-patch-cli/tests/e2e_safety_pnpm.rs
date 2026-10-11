@@ -39,6 +39,21 @@ const PATCH_UUID: &str = "00000000-0000-4000-8000-00000000e2e5";
 /// Pinned: published npm tarballs are immutable.
 const BEFORE_HASH: &str = "311f1e893e6eac502693fad8617dcf5353a043ccc0f7b4ba9fe385e838b67a10";
 
+/// Set by the CI legs that run this suite: pnpm missing from PATH is then a
+/// failure, never a skip. Empty (the value on other legs) = unset.
+fn pnpm_required() -> bool {
+    std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some_and(|v| !v.is_empty())
+}
+
+/// Print the SKIP line for a missing pnpm, or panic under [`pnpm_required`].
+fn skip_missing_pnpm() {
+    assert!(
+        !pnpm_required(),
+        "required toolchain unavailable: pnpm not on PATH"
+    );
+    eprintln!("SKIP: pnpm not on PATH");
+}
+
 /// Appended to the pristine `index.js` to form the patched bytes.
 const PATCH_MARKER: &[u8] = b"\n// socket-patch e2e_safety_pnpm synthetic patch\n";
 
@@ -235,7 +250,7 @@ fn file_identity(path: &Path) -> (u64, u64) {
 #[ignore]
 fn pnpm_install_produces_symlinked_layout() {
     if !has_command("pnpm") {
-        eprintln!("SKIP: pnpm not on PATH");
+        skip_missing_pnpm();
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -299,7 +314,7 @@ fn pnpm_install_produces_symlinked_layout() {
 #[ignore]
 fn apply_in_a_does_not_mutate_b_or_store() {
     if !has_command("pnpm") {
-        eprintln!("SKIP: pnpm not on PATH");
+        skip_missing_pnpm();
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -403,7 +418,7 @@ fn apply_in_a_does_not_mutate_b_or_store() {
 #[ignore]
 fn pnpm_install_in_b_does_not_revert_a() {
     if !has_command("pnpm") {
-        eprintln!("SKIP: pnpm not on PATH");
+        skip_missing_pnpm();
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -518,7 +533,7 @@ fn pnpm_install_in_b_does_not_revert_a() {
 #[ignore]
 fn apply_in_pnpm_project_emits_layout_note() {
     if !has_command("pnpm") {
-        eprintln!("SKIP: pnpm not on PATH");
+        skip_missing_pnpm();
         return;
     }
     let root = tempfile::tempdir().unwrap();

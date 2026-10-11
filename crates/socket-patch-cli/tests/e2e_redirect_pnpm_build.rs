@@ -93,10 +93,10 @@ const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 /// Marker prepended to the dep's entry point by the synthetic patch.
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const GHSA: &str = "GHSA-redirect-pnpm";
-/// Pinned pnpm majors via corepack — @10 is the required leg, the others are
-/// opportunistic (the vendor capstone's ladder convention). @7 and @8 are the
-/// legacy-lock legs: they emit lockfileVersion 5.4 / 6.0, proving the v5/v6
-/// rewrite installs for real.
+/// Pinned pnpm majors via corepack. Locally a leg whose major corepack can't
+/// provide skips; under `SOCKET_PATCH_PNPM_E2E_REQUIRED` (the Linux CI row)
+/// every leg is required. @7 and @8 are the legacy-lock legs: they emit
+/// lockfileVersion 5.4 / 6.0, proving the v5/v6 rewrite installs for real.
 const PNPM_PRIMARY: &str = "pnpm@10";
 const PNPM_SECONDARY: &str = "pnpm@9";
 const PNPM_TERTIARY: &str = "pnpm@11";
@@ -130,6 +130,13 @@ fn pnpm_command(pm: &str) -> Command {
     }
 }
 
+/// Set by every CI leg that runs this suite: a missing toolchain or a
+/// failed fixture install is then a failure, never a skip. The workflow
+/// passes an EMPTY value on legs that run other suites, so empty = unset.
+fn pnpm_required() -> bool {
+    std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some_and(|v| !v.is_empty())
+}
+
 fn has_corepack_pm(pm: &str) -> bool {
     let probe = tempfile::tempdir().unwrap();
     let mut cmd = pnpm_command(pm);
@@ -138,13 +145,16 @@ fn has_corepack_pm(pm: &str) -> bool {
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     let output = cmd.output();
     let ok = output.as_ref().is_ok_and(|o| o.status.success());
-    if std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some() {
+    if pnpm_required() {
         assert!(ok, "required pnpm toolchain unavailable: {output:?}");
         if let Ok(output) = output {
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout).trim(),
-                pm.strip_prefix("pnpm@").unwrap(),
-                "matrix must run the pinned version"
+            // An exact pin (the pinned matrix) must match exactly; a bare
+            // major (`pnpm@10`, the e2e legs) must resolve inside it.
+            let got = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let want = pm.strip_prefix("pnpm@").unwrap();
+            assert!(
+                got == want || got.starts_with(&format!("{want}.")),
+                "matrix must run the pinned version: want {want}, got {got}"
             );
         }
     }
@@ -523,7 +533,7 @@ async fn redirect_scanned_pnpm_project(
     );
     if !install.status.success() {
         assert!(
-            std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_none(),
+            !pnpm_required(),
             "required {pm} fixture install failed: {:?}",
             install
         );
@@ -1136,7 +1146,7 @@ async fn pnpm_get_uuid_hosted_fresh_checkout_frozen_install() {
     assert_fixture_manifestless_vex(&fx, &fresh, "pnpm10 get-uuid");
 }
 
-/// Opportunistic pnpm@9 leg (the vendor capstone's secondary convention):
+/// pnpm@9 leg (the vendor capstone's secondary convention):
 /// same positive chain, no tamper twin needed — @10 already carries it.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]

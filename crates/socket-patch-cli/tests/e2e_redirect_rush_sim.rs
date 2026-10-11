@@ -59,6 +59,20 @@ const VULNS: &[(&str, &[&str])] = &[(GHSA, &["CVE-2026-5151"])];
 
 // ── self-contained helpers ────────────────────────────────────────────
 
+/// Set by the CI legs that run this suite: a missing corepack pnpm is then
+/// a failure, never a skip. Empty (the value on other legs) = unset. The
+/// tier-2 `RUSH_E2E` opt-in skip is not affected.
+fn pnpm_required() -> bool {
+    std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some_and(|v| !v.is_empty())
+}
+
+/// Print the SKIP line for a missing toolchain, or panic under
+/// [`pnpm_required`].
+fn skip_missing_toolchain(msg: &str) {
+    assert!(!pnpm_required(), "required toolchain unavailable: {msg}");
+    println!("SKIP {msg}");
+}
+
 /// Probe corepack from a NEUTRAL temp dir (a `packageManager` field in an
 /// ancestor package.json — e.g. this monorepo root — otherwise makes corepack
 /// refuse a different manager).
@@ -400,7 +414,7 @@ fn assert_rush_manifestless_vex(root: &Path, patch_server: &str, patched: &[u8],
 #[ignore = "wall-bound real-rush/pnpm install (~70s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn rush_hosted_scan_then_simulated_pnpm_install_lands_patched_bytes() {
     if !has_corepack_pm("pnpm@9") {
-        println!("SKIP e2e_redirect_rush_sim: `corepack pnpm@9` unavailable");
+        skip_missing_toolchain("e2e_redirect_rush_sim: `corepack pnpm@9` unavailable");
         return;
     }
 
@@ -516,7 +530,7 @@ fn assert_rush_stale_store_not_attested(
 #[ignore = "wall-bound real-rush/pnpm install (~70s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn rush_hosted_tampered_tarball_fails_simulated_install() {
     if !has_corepack_pm("pnpm@9") {
-        println!("SKIP e2e_redirect_rush_sim (tampered): `corepack pnpm@9` unavailable");
+        skip_missing_toolchain("e2e_redirect_rush_sim (tampered): `corepack pnpm@9` unavailable");
         return;
     }
 
@@ -581,7 +595,7 @@ async fn rush_hosted_real_rush_update_install() {
         return;
     }
     if !has_command("npm") || !has_corepack_pm("pnpm@9") {
-        println!("SKIP e2e_redirect_rush_sim (tier2): npm / corepack pnpm@9 unavailable");
+        skip_missing_toolchain("e2e_redirect_rush_sim (tier2): npm / corepack pnpm@9 unavailable");
         return;
     }
 
