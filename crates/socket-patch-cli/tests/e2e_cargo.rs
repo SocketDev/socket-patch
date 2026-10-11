@@ -599,13 +599,32 @@ async fn agent_mode_covers_every_registry_index_copy() {
             orig,
         ),
     ];
+    // A private registry's crate of the same name@version is another
+    // crate: agent mode must leave it alone.
+    let corp = fake_registry_crate(
+        &src.join("corp.example-0123456789abcdef"),
+        "cfg-if",
+        "1.0.0",
+        b"pub fn corp() {}\n",
+    );
     let lib = |copy: &PathBuf| std::fs::read(copy.join("src/lib.rs")).unwrap();
 
     let socket = root.join(".socket");
     let purl = "pkg:cargo/cfg-if@1.0.0";
-    let manifest = serde_json::json!({ "patches": {
-        purl: manifest_record(&socket, "33900000-0000-4000-8000-000000000001", orig, patched),
+    // vex attests only patches that carry vulnerability metadata.
+    let mut record = manifest_record(
+        &socket,
+        "33900000-0000-4000-8000-000000000001",
+        orig,
+        patched,
+    );
+    record["vulnerabilities"] = serde_json::json!({ "GHSA-xxxx-xxxx-xxxx": {
+        "cves": ["CVE-2024-0001"],
+        "summary": "s",
+        "severity": "high",
+        "description": "d",
     }});
+    let manifest = serde_json::json!({ "patches": { purl: record } });
     std::fs::write(
         socket.join("manifest.json"),
         serde_json::to_string_pretty(&manifest).unwrap(),
@@ -633,6 +652,39 @@ async fn agent_mode_covers_every_registry_index_copy() {
             copy.display()
         );
     }
+    assert_eq!(
+        lib(&corp),
+        b"pub fn corp() {}\n",
+        "apply patched another registry's crate"
+    );
+
+    // Baselines: with every copy patched the check passes and vex attests.
+    let out = run(
+        &["apply", "--check", "--json", "--offline", "--cwd", cwd],
+        root,
+        &proxy_url,
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "apply --check must pass with every copy patched\nstdout:\n{stdout}"
+    );
+    let vex_args = [
+        "vex",
+        "--offline",
+        "--product",
+        "pkg:cargo/myapp@0.1.0",
+        "--cwd",
+        cwd,
+    ];
+    let out = run(&vex_args, root, &proxy_url).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("not_affected"),
+        "vex must attest with every copy patched\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
     // A copy re-extracted pristine (another cargo fetched it again) must
     // fail the CI gate instead of reading as in sync.
@@ -651,19 +703,7 @@ async fn agent_mode_covers_every_registry_index_copy() {
     );
 
     // ... and must keep vex from attesting the patch.
-    let out = run(
-        &[
-            "vex",
-            "--offline",
-            "--product",
-            "pkg:cargo/myapp@0.1.0",
-            "--cwd",
-            cwd,
-        ],
-        root,
-        &proxy_url,
-    )
-    .await;
+    let out = run(&vex_args, root, &proxy_url).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -702,4 +742,9 @@ async fn agent_mode_covers_every_registry_index_copy() {
             copy.display()
         );
     }
+    assert_eq!(
+        lib(&corp),
+        b"pub fn corp() {}\n",
+        "rollback touched another registry's crate"
+    );
 }

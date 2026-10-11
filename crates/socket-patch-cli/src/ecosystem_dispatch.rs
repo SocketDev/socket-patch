@@ -142,8 +142,8 @@ pub fn partition_purls(
 
 /// Standard scan-one-ecosystem pattern: discover source paths, run
 /// `find_by_purls` on each, and merge results into `$out` keyed by PURL
-/// (first wins). Used by every ecosystem except pypi (which dedups
-/// PURLs and, on rollback, remaps base PURLs back to qualified ones).
+/// with the ecosystem's `$on_match` merge (first-wins, or every copy for
+/// npm, cargo and the release-variant ecosystems).
 ///
 /// `$using_label` is the noun in "Using <X> at: <path>" for global
 /// scans; pass `""` to suppress that line. The banner is progress chrome
@@ -209,7 +209,8 @@ macro_rules! scan_ecosystem {
     }};
 }
 
-/// Signature shared by `merge_first_wins` and `merge_qualified`.
+/// Signature shared by the `dispatch_find` merges (`merge_first_wins`,
+/// `merge_cargo_copies`, `merge_variant_copies`, `merge_qualified`).
 /// `dispatch_find` swaps between them so the rollback path can fan one
 /// crawler result back out to every caller-supplied qualified PURL. The
 /// output map holds a `Vec` of paths per PURL: most ecosystems install one
@@ -237,9 +238,9 @@ fn push_path(out: &mut HashMap<String, Vec<PathBuf>>, purl: String, path: PathBu
 /// would re-apply to what is effectively the same package — a scope-expanding
 /// behavior change that is out of scope for the npm multi-copy fix and would,
 /// for a shared global cache, mutate state other projects rely on. Fanning out
-/// to genuinely-distinct installs is npm-only (`merge_npm_copies`); if a
-/// per-root fan-out is ever wanted for these ecosystems it must be an explicit,
-/// separately-tested decision.
+/// to genuinely-distinct installs is an explicit, separately-tested decision
+/// per ecosystem: npm (`merge_npm_copies`) and cargo's registry index dirs
+/// (`merge_cargo_copies`).
 fn merge_first_wins(
     out: &mut HashMap<String, Vec<PathBuf>>,
     _purls: &[String],
@@ -277,24 +278,49 @@ fn merge_variant_copies(
     }
 }
 
-/// Cargo merge: keep EVERY distinct copy, one per source root. Each root
-/// of the shared registry cache is one registry index dir
+/// Cargo merge: keep EVERY crates.io copy, one per registry index dir.
+/// The shared registry cache extracts a crate once per index dir
 /// (`index.crates.io-6f17d22bba15001f` for cargo 1.70–1.84,
 /// `index.crates.io-1949cf8c6b5b557f` for cargo ≥ 1.85, the pre-1.70 git
-/// index), and each holds its own extracted copy that a different cargo
-/// builds from. First-wins patched, checked and restored only the copy in
-/// the first dir in listing order, so a project on the other cargo kept
-/// building the unpatched crate while `apply` reported success and `vex`
-/// attested it (#339). A `cargo vendor` tree or `--global-prefix` is a
-/// single root, so it still yields one copy.
+/// index), and each cargo builds from its own. First-wins patched, checked
+/// and restored only the copy in the first dir in listing order, so a
+/// project on the other cargo kept building the unpatched crate while
+/// `apply` reported success and `vex` attested it (#339).
+///
+/// A `pkg:cargo` PURL names a crates.io crate, so a same-`name@version`
+/// copy in another registry's dir (a private registry, a hosted Socket
+/// patch registry) is a different crate: it is kept only when no crates.io
+/// copy exists, as the single first-found copy it always was. A
+/// `cargo vendor` tree or `--global-prefix` is one root, so one copy.
 fn merge_cargo_copies(
     out: &mut HashMap<String, Vec<PathBuf>>,
     _purls: &[String],
     packages: HashMap<String, CrawledPackage>,
 ) {
     for (purl, pkg) in packages {
-        push_path(out, purl, pkg.path);
+        let paths = out.entry(purl).or_default();
+        if paths.is_empty() {
+            paths.push(pkg.path);
+        } else if is_crates_io_copy(&pkg.path) && !paths.contains(&pkg.path) {
+            if paths.iter().all(|p| is_crates_io_copy(p)) {
+                paths.push(pkg.path);
+            } else {
+                // The first-found copy belongs to another registry.
+                *paths = vec![pkg.path];
+            }
+        }
     }
+}
+
+/// Whether `crate_dir` sits in a crates.io index dir of the registry
+/// cache: `index.crates.io-<hash>` (sparse, cargo ≥ 1.70) or the git
+/// index's `github.com-1ecc6299db9ec823` (cargo < 1.70).
+fn is_crates_io_copy(crate_dir: &std::path::Path) -> bool {
+    crate_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("index.crates.io-") || n == "github.com-1ecc6299db9ec823")
 }
 
 /// npm merge: the npm crawler returns EVERY physical copy of each PURL
@@ -392,8 +418,8 @@ fn passthrough_purls(purls: &[String]) -> Vec<String> {
 /// into one `purl -> path` map.
 ///
 /// `variant_merge` lets the rollback variant fan a single crawler result
-/// out to every caller-supplied qualified PURL; everything else just
-/// inserts the crawler-returned PURL with first-wins semantics. It is
+/// out to every caller-supplied qualified PURL; every other ecosystem
+/// inserts the crawler-returned PURL with its own fixed merge. It is
 /// applied to the release-variant ecosystems (PyPI / RubyGems / Maven),
 /// which are also queried with deduped base PURLs.
 ///
@@ -1194,7 +1220,7 @@ mod tests {
         // keeps ONLY the first — matching the historical first-wins contract.
         // Fanning out to every root re-patches what is effectively one install
         // (the docker_e2e_nuget `already_patched` regression); genuine
-        // multi-copy fan-out is npm-only via `merge_npm_copies`.
+        // multi-copy fan-out is opt-in per ecosystem (npm, cargo).
         let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/first")]));
         merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/second")]));
@@ -1308,27 +1334,52 @@ mod tests {
     // ---- merge_cargo_copies ------------------------------------------------
 
     #[test]
+    fn merge_cargo_copies_prefers_crates_io_over_another_registry() {
+        // A same-name@version crate from a private registry is another
+        // crate: never patched beside crates.io copies, whichever order the
+        // index dirs list in, but still the copy when it is the only one.
+        let purl = "pkg:cargo/foo@1.0.0";
+        let corp = "/src/corp.example-0123456789abcdef/foo-1.0.0";
+        let new = "/src/index.crates.io-1949cf8c6b5b557f/foo-1.0.0";
+        let git = "/src/github.com-1ecc6299db9ec823/foo-1.0.0";
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for path in [corp, new, corp, git] {
+            merge_cargo_copies(&mut out, &[], packages(&[(purl, path)]));
+        }
+        assert_eq!(
+            out.get(purl),
+            Some(&vec![PathBuf::from(new), PathBuf::from(git)])
+        );
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        merge_cargo_copies(&mut out, &[], packages(&[(purl, corp)]));
+        assert_eq!(out.get(purl), Some(&vec![PathBuf::from(corp)]));
+    }
+
+    #[test]
     fn merge_cargo_copies_keeps_every_registry_index_copy() {
         // #339: the macro calls on_match once per registry index dir; each
         // dir's copy is built by a different cargo, so all are carried in
         // discovery order, and a path re-observed is recorded once.
         let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for path in [
-            "/src/index-1949cf/cfg-if-1.0.0",
-            "/src/index-6f17d2/cfg-if-1.0.0",
+            "/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.0",
+            "/src/index.crates.io-6f17d22bba15001f/cfg-if-1.0.0",
         ] {
             merge_cargo_copies(&mut out, &[], packages(&[("pkg:cargo/cfg-if@1.0.0", path)]));
         }
         merge_cargo_copies(
             &mut out,
             &[],
-            packages(&[("pkg:cargo/cfg-if@1.0.0", "/src/index-6f17d2/cfg-if-1.0.0")]),
+            packages(&[(
+                "pkg:cargo/cfg-if@1.0.0",
+                "/src/index.crates.io-6f17d22bba15001f/cfg-if-1.0.0",
+            )]),
         );
         assert_eq!(
             out.get("pkg:cargo/cfg-if@1.0.0"),
             Some(&vec![
-                PathBuf::from("/src/index-1949cf/cfg-if-1.0.0"),
-                PathBuf::from("/src/index-6f17d2/cfg-if-1.0.0"),
+                PathBuf::from("/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.0"),
+                PathBuf::from("/src/index.crates.io-6f17d22bba15001f/cfg-if-1.0.0"),
             ])
         );
     }
