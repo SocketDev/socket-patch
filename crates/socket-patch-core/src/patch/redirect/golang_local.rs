@@ -2083,6 +2083,13 @@ mod tests {
         let (module, version) = parse_golang_purl(encoded_purl).unwrap();
         // After parsing, version is `v2.0.0+incompatible` (decoded).
         assert_eq!(version, "v2.0.0+incompatible");
+        // The build must select the patched version for apply to wire it.
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v2.0.0+incompatible\n",
+        )
+        .await
+        .unwrap();
 
         let result = apply_go_redirect(
             encoded_purl,
