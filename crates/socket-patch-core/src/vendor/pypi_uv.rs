@@ -31,7 +31,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 // flavor-routing probes ahead of the load are metadata-only, so these are
 // the first opens.
 use crate::patch::redirect::upstream::{
-    lock_requirement_declared, respell_lock_specifier, LockRequirementArray,
+    declared_lock_specifier, respell_lock_specifier, LockRequirementArray,
 };
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::terminator;
@@ -1125,12 +1125,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     // wired and the other not, which `uv sync --locked` rejects (#806,
     // #821). Write neither; the drift warning keeps the artifact and ledger
     // entry so a re-run can finish once the drift is undone.
-    let drift_kept = |warnings: &[VendorWarning]| {
-        warnings
-            .iter()
-            .any(|w| w.code == "vendor_lock_entry_drifted")
-    };
-    if !drift_kept(&warnings) {
+    let mut drift_kept = warnings
+        .iter()
+        .any(|w| w.code == "vendor_lock_entry_drifted");
+    if !drift_kept {
         // A root element uv wrote through our source after vendoring (a
         // transitive package promoted by `uv add`, #1374) has no record.
         let canon = purl_name_version(&entry.base_purl)
@@ -1138,30 +1136,37 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             .unwrap_or_default();
         match respell_unrecorded_path_entries(&lock_text, &canon, &needle_lower, &pyproject_text) {
             Ok(t) => lock_text = t,
-            Err(reason) => warnings.push(VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!("uv.lock entry for {canon:?} can't be restored ({reason}); left untouched"),
-            )),
+            Err(reason) => {
+                drift_kept = true;
+                warnings.push(VendorWarning::new(
+                    "vendor_lock_entry_drifted",
+                    format!(
+                        "uv.lock entry for {canon:?} that `uv add` routed through {needle} \
+                         can't be put back on the registry ({reason}); left both files \
+                         untouched (pin it with `==` in pyproject.toml or remove it, then \
+                         revert again)"
+                    ),
+                ));
+            }
         }
     }
     // Never write a half-reverted pair: a lock that still routes through
     // the uuid dir after pyproject.toml stopped declaring any route to it
-    // is what `uv sync --locked` rejects. Keep both files instead, so a
-    // `uv lock` and a re-run converge.
-    if !drift_kept(&warnings)
+    // is what `uv sync --locked` rejects. Keep both files instead.
+    if !drift_kept
         && lock_text.to_ascii_lowercase().contains(&needle_lower)
         && !pyproject_text.to_ascii_lowercase().contains(&needle_lower)
     {
+        drift_kept = true;
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
             format!(
                 "uv.lock still references {needle} in an entry the vendor ledger did not \
-                 record, while pyproject.toml no longer does; left both files untouched \
-                 (run `uv lock`, then revert again)"
+                 record, while the reverted pyproject.toml would not; left both files \
+                 untouched (remove that reference, then revert again)"
             ),
         ));
     }
-    let drift_kept = drift_kept(&warnings);
     if !dry_run && !drift_kept {
         // Reverse of the wire order: the lock first, then the pyproject.
         let write = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await;
@@ -1336,14 +1341,8 @@ fn respell_unrecorded_path_entries(
     let mut out = lock_text.to_string();
     for (span, array) in edits {
         let element = &lock_text[span.clone()];
-        if !lock_requirement_declared(pyproject_text, array, canon) {
-            return Err(format!(
-                "uv.lock routes {canon} through the vendored wheel but pyproject.toml no \
-                 longer declares it"
-            ));
-        }
         let marker = entry_value(element, "marker");
-        let spec = respell_lock_specifier(pyproject_text, array, canon, None, marker)?;
+        let spec = declared_lock_specifier(pyproject_text, array, canon, marker)?;
         let inner = element.trim().trim_start_matches('{').trim_end_matches('}');
         let kept: Vec<&str> = split_top_level_commas(inner)
             .into_iter()
@@ -1351,7 +1350,7 @@ fn respell_unrecorded_path_entries(
             .filter(|part| !part.is_empty() && !part.starts_with("path ="))
             .collect();
         let base = format!("{{ {} }}", kept.join(", "));
-        out.replace_range(span, &with_specifier(&base, spec.flatten().as_deref()));
+        out.replace_range(span, &with_specifier(&base, spec.as_deref()));
     }
     Ok(out)
 }
@@ -3390,15 +3389,27 @@ wheels = [
         );
     }
 
-    /// When the unrecorded element can't be respelled (a multi-clause
-    /// declaration uv's spelling of isn't derivable, or no declaration at
-    /// all), or the lock routes another name through the uuid dir, the
+    /// When the unrecorded element can't be respelled (a multi-clause or
+    /// `===` declaration uv's spelling of isn't derivable, or no declaration
+    /// at all), or the lock routes another name through the uuid dir, the
     /// revert writes neither file instead of a half-reverted
     /// pair `uv sync --locked` rejects.
     #[tokio::test]
     async fn revert_keeps_both_files_when_an_unrecorded_reference_survives() {
         let path_entry = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
-        let cases: [(&str, Box<dyn Fn(&str, &str) -> (String, String)>); 3] = [
+        let cases: [(&str, Box<dyn Fn(&str, &str) -> (String, String)>); 4] = [
+            (
+                "arbitrary-equality declaration",
+                Box::new(|pyproject: &str, lock: &str| {
+                    (
+                        pyproject.replace(
+                            "dependencies = [\"python-dateutil==2.8.2\"]",
+                            "dependencies = [\"python-dateutil==2.8.2\", \"six===1.16.0\"]",
+                        ),
+                        lock.replace(ROOT_DATEUTIL_ONLY, &root_with_six(&path_entry)),
+                    )
+                }),
+            ),
             (
                 "multi-clause declaration",
                 Box::new(|pyproject: &str, lock: &str| {

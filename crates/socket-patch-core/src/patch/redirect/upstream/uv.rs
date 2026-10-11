@@ -1360,16 +1360,21 @@ pub(crate) fn respell_lock_specifier(
     }
 }
 
-/// Whether `pyproject_text` declares `name` in the declarations `array`
-/// mirrors. An unparseable pyproject declares nothing.
-pub(crate) fn lock_requirement_declared(
+/// The `specifier` uv writes for `name`'s entry in `array` (with
+/// `marker`) when nothing recorded a prior spelling: the declaration's
+/// one clause, or `None` for a bare name. `Err` when pyproject.toml
+/// doesn't declare the name there, or uv's spelling of the declaration
+/// isn't derivable (unreadable, multi-clause, or ambiguous), so the
+/// caller can fail closed rather than guess.
+pub(crate) fn declared_lock_specifier(
     pyproject_text: &str,
     array: LockRequirementArray<'_>,
     name: &str,
-) -> bool {
-    let Ok(doc) = pyproject_text.parse::<DocumentMut>() else {
-        return false;
-    };
+    marker: Option<&str>,
+) -> Result<Option<String>, String> {
+    let doc = pyproject_text
+        .parse::<DocumentMut>()
+        .map_err(|e| format!("pyproject.toml does not parse: {e}"))?;
     let meta = Metadata {
         rel: "pyproject.toml".to_string(),
         text: String::new(),
@@ -1381,10 +1386,17 @@ pub(crate) fn lock_requirement_declared(
         LockRequirementArray::RequiresDev(group) => Declared::Dev(group),
         LockRequirementArray::Manifest(key) => Declared::Manifest(key),
     };
-    let canon = canonicalize_pypi_name(name);
-    declarations(&meta, declared)
-        .iter()
-        .any(|d| canonicalize_pypi_name(pep508_name(d.spec)) == canon)
+    match declared_clauses(&meta, declared, name, marker)? {
+        None => Err(format!("pyproject.toml no longer declares {name}")),
+        Some(clauses) => match clauses.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(one.clone())),
+            _ => Err(format!(
+                "pyproject.toml declares {name} with a multi-clause specifier, whose \
+                 spelling in uv.lock is not derivable"
+            )),
+        },
+    }
 }
 
 /// Every lock requirement array with the declarations it mirrors

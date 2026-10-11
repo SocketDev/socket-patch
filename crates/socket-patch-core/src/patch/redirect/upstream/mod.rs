@@ -43,7 +43,7 @@ mod uv;
 mod vlt;
 
 pub(crate) use client::UpstreamClient;
-pub(crate) use uv::{lock_requirement_declared, respell_lock_specifier, LockRequirementArray};
+pub(crate) use uv::{declared_lock_specifier, respell_lock_specifier, LockRequirementArray};
 
 use super::staged::{flush_staged, read_rel, Staged, StagedBytes};
 

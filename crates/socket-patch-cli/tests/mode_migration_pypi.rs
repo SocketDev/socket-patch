@@ -1618,6 +1618,48 @@ async fn vendor_check_fails_after_uv_relock() {
     assert_check_catches_relock(&root, files);
 }
 
+/// #1374: a half-unwound uv pair (pyproject.toml and the six unit back on
+/// PyPI, but the root requires-dist still routing through the wheel, as a
+/// revert left it once `uv add` had promoted a vendored transitive) fails
+/// `vendor --check`, and the reason names uv.lock instead of claiming no
+/// file references the artifact.
+#[tokio::test]
+async fn vendor_check_names_the_file_of_a_half_unwound_uv_pair() {
+    let (_tmp, root) = project();
+    let files = stage_uv(&root);
+    let pristine_pyproject = std::fs::read_to_string(root.join("pyproject.toml")).unwrap();
+    let pristine_lock = std::fs::read_to_string(root.join("uv.lock")).unwrap();
+    vendor_project(&root, files);
+    let wired_lock = std::fs::read_to_string(root.join("uv.lock")).unwrap();
+    let wired_element = wired_lock
+        .lines()
+        .find(|l| l.starts_with("requires-dist = ") && l.contains(".socket/vendor/pypi/"))
+        .expect("the wired root requires-dist element");
+    std::fs::write(root.join("pyproject.toml"), &pristine_pyproject).unwrap();
+    std::fs::write(
+        root.join("uv.lock"),
+        pristine_lock.replace(
+            "requires-dist = [{ name = \"six\", specifier = \"==1.16.0\" }]",
+            wired_element,
+        ),
+    )
+    .unwrap();
+
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 1, "{env:#}");
+    let event = &env["events"][0];
+    assert_eq!(event["errorCode"], "vendor_check_failed", "{env:#}");
+    let reason = event["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("wiring incomplete") && reason.contains("uv.lock still resolves"),
+        "{env:#}"
+    );
+    assert!(
+        !reason.contains("no lockfile or config references"),
+        "{env:#}"
+    );
+}
+
 #[tokio::test]
 async fn vendor_check_fails_after_hatch_dependency_reset() {
     let (_tmp, root) = project();
