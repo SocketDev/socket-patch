@@ -1163,9 +1163,7 @@ async fn multi_script_unwinds_after_one_script_changes() {
                     && !rendered.contains("cannot read"),
                 "{label} / {unwind:?}: {env:#}"
             );
-            // The takeover reports only `redirect_takeover_reverted_vendored`
-            // for a clean revert; the unwinds name each missing file.
-            for file in deleted.iter().filter(|_| !hosted) {
+            for file in deleted {
                 assert!(
                     rendered.contains(&format!("{file} no longer exists")),
                     "{label} / {unwind:?}: the missing {file} is named: {env:#}"

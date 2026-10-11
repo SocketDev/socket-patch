@@ -58,7 +58,7 @@ struct Staged {
     uuid: String,
     entry: VendorEntry,
     /// The revert's own advisories that outlive the takeover (vlt's
-    /// reinstall notice).
+    /// reinstall notice, a deleted wiring file).
     advisories: Vec<serde_json::Value>,
 }
 
@@ -278,7 +278,10 @@ impl Takeover {
             let advisories = outcome
                 .warnings
                 .iter()
-                .filter(|w| w.code == socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED)
+                .filter(|w| {
+                    w.code == socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED
+                        || w.code == "vendor_lockfile_missing"
+                })
                 .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail }))
                 .collect();
             self.staged.push(Staged {

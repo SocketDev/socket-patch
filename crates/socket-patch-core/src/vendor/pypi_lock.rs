@@ -715,9 +715,7 @@ async fn read_existing(path: &Path) -> Result<Option<String>, Failure> {
 /// The pair a wired file belongs to: a `.py.lock` goes with its script, and
 /// every other file (a script, a PEP 751 lock) names its own pair.
 fn pair_of(file: &str) -> &str {
-    file.strip_suffix(".lock")
-        .filter(|script| script.ends_with(".py"))
-        .unwrap_or(file)
+    script_of_lock(file).unwrap_or(file)
 }
 
 fn allowed_file(file: &str, kind: &str) -> bool {
@@ -821,29 +819,36 @@ pub(super) async fn revert_python_locks(
     // script that still routes through the wheel must not turn another
     // script's removal into drift. A wired file that no longer exists has
     // nothing to restore either (#890): it warns `vendor_lockfile_missing`
-    // instead of failing every other pair's unwind on the read. Probed once,
-    // before any record is reverted, so only the user's own edits count.
+    // instead of failing every other pair's unwind on the read. Every wired
+    // file is read once, before any record is reverted, so only the user's
+    // own edits count and the records below judge the same text.
     let uuid_lower = entry.uuid.to_ascii_lowercase();
-    let mut referenced = BTreeSet::new();
-    let mut missing = BTreeSet::new();
+    let mut live_texts = std::collections::BTreeMap::new();
     for file in entry
         .wiring
         .iter()
         .filter(|record| allowed_file(&record.file, &record.kind))
         .map(|record| record.file.as_str())
-        .collect::<BTreeSet<_>>()
     {
+        if live_texts.contains_key(file) {
+            continue;
+        }
         match read_existing(&root.join(file)).await {
-            Ok(Some(live)) if live.to_ascii_lowercase().contains(&uuid_lower) => {
-                referenced.insert(pair_of(file));
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                missing.insert(file);
+            Ok(live) => {
+                live_texts.insert(file, live);
             }
             Err((_, error)) => return RevertOutcome::failed(error),
         }
     }
+    let referenced: BTreeSet<&str> = live_texts
+        .iter()
+        .filter(|(_, live)| {
+            live.as_ref()
+                .is_some_and(|live| live.to_ascii_lowercase().contains(&uuid_lower))
+        })
+        .map(|(file, _)| pair_of(file))
+        .collect();
+    let mut missing_warned = BTreeSet::new();
     // The vendored package's PEP 503 name, and each script lock's live
     // script (read once, before any record is reverted).
     let package_name = entry
@@ -853,12 +858,12 @@ pub(super) async fn revert_python_locks(
         .map(|(name, _)| canonicalize_pypi_name(name));
     let mut script_texts = std::collections::BTreeMap::new();
     for record in entry.wiring.iter().filter(|r| r.kind == KIND) {
-        if let Some(script) = record
-            .file
-            .strip_suffix(".lock")
-            .filter(|s| s.ends_with(".py"))
-        {
-            if let Ok(text) = read_file(&root.join(script)).await {
+        if let Some(script) = script_of_lock(&record.file) {
+            let text = match live_texts.get(script) {
+                Some(live) => live.clone(),
+                None => read_file(&root.join(script)).await.ok(),
+            };
+            if let Some(text) = text {
                 script_texts.insert(record.file.as_str(), text);
             }
         }
@@ -884,17 +889,18 @@ pub(super) async fn revert_python_locks(
             ));
             continue;
         };
-        if missing.contains(record.file.as_str()) {
-            warnings.push(VendorWarning::new(
-                "vendor_lockfile_missing",
-                format!(
-                    "{} no longer exists, so its wiring cannot be restored; the rest of the \
-                     entry is reverted",
-                    record.file
-                ),
-            ));
+        let Some(Some(live)) = live_texts.get(record.file.as_str()) else {
+            if missing_warned.insert(record.file.as_str()) {
+                warnings.push(VendorWarning::new(
+                    "vendor_lockfile_missing",
+                    format!(
+                        "{} no longer exists, so it has no wiring left to restore",
+                        record.file
+                    ),
+                ));
+            }
             continue;
-        }
+        };
         if !referenced.contains(pair_of(&record.file))
             && new.to_ascii_lowercase().contains(&uuid_lower)
         {
@@ -908,10 +914,7 @@ pub(super) async fn revert_python_locks(
             ));
             continue;
         }
-        let live = match read_file(&root.join(&record.file)).await {
-            Ok(live) => live,
-            Err((_, error)) => return RevertOutcome::failed(error),
-        };
+        let live = live.clone();
         // #1287: the vendored package's own unit is gone from the lock along
         // with every dependent (`uv remove` of the parent of a transitive
         // package), while the overrides it was wired through survive. That
