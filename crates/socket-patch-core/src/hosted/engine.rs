@@ -2607,16 +2607,16 @@ fn npm_allow_remote(
     // so every install 404s. The setting is the user's, so it is reported
     // (from whichever layer sets it), never overridden.
     let project = npmrc.as_ref().ok().and_then(|t| t.as_deref());
-    if let Some((value, source)) = effective_replace_registry_host(project, &outer) {
+    if let Some(setting) = effective_replace_registry_host(project, &outer) {
         let blocked: Vec<&str> = npm_hosts
             .iter()
             .copied()
-            .filter(|host| replace_registry_host_rewrites(&value, host))
+            .filter(|host| replace_registry_host_rewrites(&setting.value, host))
             .collect();
         if !blocked.is_empty() {
             npm_warnings.push(warning(
                 NPM_REPLACE_REGISTRY_HOST_CODE,
-                npm_replace_registry_host_detail(&blocked, &value, &source),
+                npm_replace_registry_host_detail(&blocked, &setting),
             ));
         }
     }

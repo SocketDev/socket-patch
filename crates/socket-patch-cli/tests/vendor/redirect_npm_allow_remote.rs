@@ -912,7 +912,8 @@ async fn replace_registry_host_rewriting_the_pin_is_warned() {
 /// #1233: npm env-replaces every config value, so
 /// `replace-registry-host=${RRH}` with `RRH=always` rewrites every hosted
 /// pin exactly like `=always`. The scan read the literal `${RRH}`, matched
-/// no host and stayed silent; it now warns in the project and user layers.
+/// no host and stayed silent; it now warns in the project and user layers,
+/// naming the spelling the user wrote and what npm expands it to.
 #[tokio::test]
 async fn replace_registry_host_via_env_interpolation_is_warned() {
     let server = MockServer::start().await;
@@ -927,7 +928,9 @@ async fn replace_registry_host_via_env_interpolation_is_warned() {
     assert_eq!(code, 0, "{doc:#}");
     let detail = replace_host_warning(&doc).unwrap_or_else(|| panic!("no {REPLACE_HOST}: {doc:#}"));
     assert!(
-        detail.contains("the project .npmrc sets `replace-registry-host=always`"),
+        detail.contains(
+            "the project .npmrc sets `replace-registry-host=${RRH}` (npm expands it to `always`)"
+        ),
         "{detail}"
     );
 
@@ -951,7 +954,9 @@ async fn replace_registry_host_via_env_interpolation_is_warned() {
     assert_eq!(code, 0, "{doc:#}");
     let detail = replace_host_warning(&doc).unwrap_or_else(|| panic!("no {REPLACE_HOST}: {doc:#}"));
     assert!(
-        detail.contains("the user npm config") && detail.contains(user_s),
+        detail.contains("the user npm config")
+            && detail.contains(user_s)
+            && detail.contains("(npm expands it to `always`)"),
         "{detail}"
     );
 

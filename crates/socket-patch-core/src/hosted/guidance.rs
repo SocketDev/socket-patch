@@ -560,11 +560,21 @@ pub const NPM_REPLACE_REGISTRY_HOST_CODE: &str = "redirect_npm_replace_registry_
 /// user's — so the warning names where it is set and both remedies.
 pub fn npm_replace_registry_host_detail(
     hosts: &[&str],
-    value: &str,
-    source: &crate::patch::redirect::npmrc::SettingSource,
+    setting: &crate::patch::redirect::npmrc::EffectiveSetting,
 ) -> String {
     use crate::patch::redirect::npmrc::SettingSource;
-    let (where_, fix) = match source {
+    // Name the spelling the user can find (`${RRH}`), and what npm makes
+    // of it.
+    let value = if setting.raw.trim() == setting.value {
+        format!("`replace-registry-host={}`", setting.value)
+    } else {
+        format!(
+            "`replace-registry-host={}` (npm expands it to `{}`)",
+            setting.raw.trim(),
+            setting.value
+        )
+    };
+    let (where_, fix) = match &setting.source {
         SettingSource::Env(var) => (
             format!("the environment variable {var} sets"),
             format!(
@@ -586,7 +596,7 @@ pub fn npm_replace_registry_host_detail(
     };
     format!(
         "the npm lockfile now resolves patched dependencies from the hosted patch server ({}), \
-         but {where_} `replace-registry-host={value}`, which makes npm >=8 rewrite those \
+         but {where_} {value}, which makes npm >=8 rewrite those \
          `resolved` URLs to the configured registry: every `npm ci` / `npm install` then \
          fails E404 (a warm npm cache can hide this locally; a fresh checkout or CI runner \
          fails). To install the hosted patches, {fix}; or switch this project to vendored \

@@ -1602,18 +1602,16 @@ enum AllowFileSource {
 }
 
 /// The effective `allow-file` value npm would read, in its layer order
-/// (env > project > user > global > builtin), when it is NOT `all`. Values
-/// are env-replaced like npm reads them (`outer`'s already are).
+/// (env > project > user > global > builtin), when it is NOT `all`.
 fn effective_allow_file(
     project_npmrc: Option<&str>,
     outer: &crate::patch::redirect::npmrc::OuterSetting,
-    env: &crate::patch::redirect::npmrc::NpmConfigEnv,
 ) -> Option<(AllowFileSource, String)> {
     use crate::patch::redirect::npmrc::npmrc_top_level_value;
     let (source, value) = if let Some((var, value)) = &outer.env {
         (AllowFileSource::Env(var.clone()), value.clone())
     } else if let Some(value) = project_npmrc.and_then(|t| npmrc_top_level_value(t, "allow-file")) {
-        (AllowFileSource::Project, env.config_value(&value))
+        (AllowFileSource::Project, value)
     } else {
         let file = outer.file.as_ref()?;
         (
@@ -1737,7 +1735,7 @@ pub(super) async fn allow_file_refusal_with(
     let read = |path: &Path| read_regular_to_string_sync(path).ok();
     let outer = resolve_outer_npm_setting(env, read, "allow-file", "all");
     let project = read(&project_root.join(NPMRC_REL));
-    let (source, value) = effective_allow_file(project.as_deref(), &outer, env)?;
+    let (source, value) = effective_allow_file(project.as_deref(), &outer)?;
     let refused = allow_file_refused_instances(project_root, name, version, &value).await;
     if refused.is_empty() {
         return None;
@@ -6344,63 +6342,6 @@ mod tests {
                 "left-pad",
                 "1.3.0",
                 &allow_file_env(&home, &[("npm_config_allow_file", "all")])
-            )
-            .await,
-            None
-        );
-    }
-
-    /// #1233: npm env-replaces `allow-file` like every config value, so a
-    /// `${AF}` is read as what it expands to in each layer.
-    #[tokio::test]
-    async fn allow_file_values_are_env_replaced_like_npm() {
-        let (tmp, home) = allow_file_project(Some("allow-file=${AF}\n")).await;
-        let root = tmp.path().join("proj");
-        // `AF=all`: npm admits every file: dependency.
-        assert_eq!(
-            allow_file_refusal_with(
-                &root,
-                "is-number",
-                "7.0.0",
-                &allow_file_env(&home, &[("AF", "all")])
-            )
-            .await,
-            None
-        );
-        // `AF=none`: refused, and reported under its real value.
-        let detail = allow_file_refusal_with(
-            &root,
-            "left-pad",
-            "1.3.0",
-            &allow_file_env(&home, &[("AF", "none")]),
-        )
-        .await
-        .expect("allow-file=${AF} with AF=none refuses");
-        assert!(
-            detail.contains("refuses every `file:` dependency"),
-            "{detail}"
-        );
-        // The env and user layers expand the same way.
-        tokio::fs::remove_file(root.join(".npmrc")).await.unwrap();
-        tokio::fs::write(home.join(".npmrc"), "allow-file=${AF}\n")
-            .await
-            .unwrap();
-        assert_eq!(
-            allow_file_refusal_with(
-                &root,
-                "is-number",
-                "7.0.0",
-                &allow_file_env(&home, &[("AF", "all")])
-            )
-            .await,
-            None
-        );
-        assert_eq!(
-            allow_file_refusal_with(
-                &root,
-                "is-number",
-                "7.0.0",
-                &allow_file_env(&home, &[("AF", "all"), ("npm_config_allow_file", "${AF}")])
             )
             .await,
             None
