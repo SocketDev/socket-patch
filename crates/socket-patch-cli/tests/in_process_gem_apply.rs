@@ -13,9 +13,6 @@ use socket_patch_cli::commands::scan::{run as scan_run, ScanArgs};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
-
 const ORG: &str = "test-org";
 const UUID: &str = "13131313-1313-4131-8131-131313131313";
 const GEM_NAME: &str = "colorize";
@@ -23,7 +20,7 @@ const GEM_VERSION: &str = "1.1.0";
 
 #[path = "common/mod.rs"]
 mod common;
-use common::git_sha256;
+use common::{cache_env, git_sha256};
 
 fn has_gem() -> bool {
     Command::new("gem")

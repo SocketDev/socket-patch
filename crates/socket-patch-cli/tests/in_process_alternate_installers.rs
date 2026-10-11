@@ -11,12 +11,9 @@ use std::process::Command;
 use serial_test::serial;
 use socket_patch_cli::commands::apply::{run as apply_run, ApplyArgs};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
-
 #[path = "common/mod.rs"]
 mod common;
-use common::git_sha256;
+use common::{cache_env, git_sha256};
 
 /// Strong oracle: the file at `path` must now contain EXACTLY the expected
 /// patched bytes, its git-sha256 must equal the manifest's afterHash, and
