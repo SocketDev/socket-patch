@@ -1014,15 +1014,18 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  # Lean merge queue only: type-check the CLI and every CLI test target on
-  # Windows. Lean pull_request runs skip Windows, and a cfg(unix) slip only
-  # shows up here (#1324). A check, not a build: nothing in lean scope runs
-  # the Windows binaries, and linking ~60 test binaries made this the
-  # queue's critical path (#1385). No `needs: clippy`, so it starts at once;
-  # merge-queue fail-fast cancels it if clippy fails. Full scope, nightly
-  # and dispatch build and run everything in e2e-build-windows instead.
+  # Lean merge queue: type-check the CLI (lib and bin, as shipped) and every
+  # CLI test target on Windows. Lean pull_request runs skip Windows, and a
+  # cfg(unix) slip only shows up here (#1324). A check, not a build: nothing
+  # in lean scope runs the Windows binaries, and linking ~60 test binaries
+  # made this the queue's critical path (#1385). No `needs: clippy`, so it
+  # starts at once; merge-queue fail-fast cancels it if clippy fails. Full
+  # scope, nightly and dispatch build and run everything in
+  # e2e-build-windows. The nightly run also runs this job, only to save its
+  # check-mode cache on main: queue refs can't share a saved cache, and a
+  # build-mode cache doesn't satisfy `cargo check`.
   windows-compile-check:
-    if: github.event_name == 'merge_group' && vars.CI_SCOPE != 'full'
+    if: (github.event_name == 'merge_group' && vars.CI_SCOPE != 'full') || github.event_name == 'schedule'
     runs-on: windows-latest
     timeout-minutes: 30
     env: *e2e-build-env
@@ -1036,18 +1039,15 @@ jobs:
         shell: bash
         run: scripts/rustup-retry.sh toolchain install
 
-      # Restore-only: the nightly e2e-build-windows cache (same key and env)
-      # supplies the registry, build scripts and proc macros. Merge-queue
-      # refs can't share a saved cache, so this job never saves one.
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: e2e-windows-latest
-          save-if: false
+          shared-key: check-windows-latest
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Type-check the CLI and every CLI test target
         shell: bash
-        run: cargo check --locked -p socket-patch-cli --all-features --tests
+        run: cargo check --locked -p socket-patch-cli --all-features --lib --bins --tests
 
   e2e-build-windows:
     # Builds the Windows test binaries for e2e-windows and

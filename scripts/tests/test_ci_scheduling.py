@@ -40,14 +40,15 @@ class Scheduling(unittest.TestCase):
             ancestors(job)  # All dependencies exist and the graph is acyclic.
 
     def test_expensive_jobs_cannot_start_after_a_failed_preflight(self):
+        cheap = {"clippy", "lint-ecosystems", "release-readiness", "dispatch-tests", "ci-ok"}
         # windows-compile-check is the lean queue's only Windows job and sits
         # on its critical path, so it starts in parallel with clippy;
         # merge-queue fail-fast cancels it when clippy fails.
-        cheap = {"clippy", "lint-ecosystems", "release-readiness", "dispatch-tests", "ci-ok",
-                 "windows-compile-check"}
+        parallel = {"windows-compile-check"}
         for job in set(JOBS) - cheap:
             with self.subTest(job=job):
-                self.assertIn("clippy", ancestors(job))
+                if job not in parallel:
+                    self.assertIn("clippy", ancestors(job))
                 # Job-level always() would defeat failure/skip propagation.
                 self.assertFalse(any(line.startswith("    if:") and "always()" in line
                                      for line in JOBS[job]))
@@ -86,19 +87,21 @@ class Scheduling(unittest.TestCase):
                                                " || github.event_name == 'workflow_dispatch')"), condition)
 
     def test_lean_queue_type_checks_windows_and_full_scope_builds_it(self):
-        # Exactly one Windows compile per event: the lean merge queue
-        # type-checks every CLI test target (#1324) without linking (#1385);
-        # full scope, nightly and dispatch build the binaries their
-        # consumers download. Lean PR and push runs do neither.
+        # The lean merge queue type-checks the CLI and every CLI test target
+        # on Windows (#1324) without linking (#1385); full scope, nightly and
+        # dispatch build the binaries their consumers download. Lean PR and
+        # push runs do neither. The nightly also runs the check, only so main
+        # saves the check-mode cache the queue restores.
         check = JOBS["windows-compile-check"]
-        self.assertIn("    if: github.event_name == 'merge_group' && vars.CI_SCOPE != 'full'", check)
+        self.assertIn("    if: (github.event_name == 'merge_group' && vars.CI_SCOPE != 'full')"
+                      " || github.event_name == 'schedule'", check)
         self.assertIn("    runs-on: windows-latest", check)
         self.assertEqual(dependencies("windows-compile-check"), set())
         body = "\n".join(check)
-        self.assertIn("cargo check --locked -p socket-patch-cli --all-features --tests", body)
+        self.assertIn("cargo check --locked -p socket-patch-cli --all-features --lib --bins --tests", body)
         self.assertIn("    env: *e2e-build-env", check)
-        self.assertIn("shared-key: e2e-windows-latest", body)
-        self.assertIn("save-if: false", body)
+        self.assertIn("shared-key: check-windows-latest", body)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", body)
         self.assertNotIn("upload-artifact", body)
         self.assertNotIn("--no-run", body)
         build = next(line for line in JOBS["e2e-build-windows"] if line.startswith("    if:"))
