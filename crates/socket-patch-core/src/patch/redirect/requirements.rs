@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use regex::Regex;
 use serde_json::Value;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::formats::text::{split_bom, strip_bom};
 use crate::utils::purl::percent_decode_purl_component;
+use crate::utils::requirements::{parse_requirement, Requirement};
 use crate::vendor::state::{VendorEntry, WiringAction};
 
 pub(super) struct LogicalRequirement {
@@ -152,28 +152,16 @@ fn archive_version(location: &str, name: &str) -> Option<String> {
     (canonicalize_pypi_name(distribution) == name).then(|| version.to_string())
 }
 
-fn requirement_version(specifier: &str, name_re: &Regex, name: &str) -> RequirementVersion {
-    let Some(captures) = name_re.captures(specifier.trim()) else {
+/// Classify the pin of one requirement (its code part with the marker
+/// removed) through the shared requirements grammar (#1365), with the
+/// hosted policy on top: `===` is arbitrary equality, a direct reference
+/// is socket-patch's own artifact or the user's source, and anything that
+/// is not one exact clause is ambiguous.
+fn requirement_version(specifier: &str, name: &str) -> RequirementVersion {
+    let Some(requirement) = parse_requirement(specifier) else {
         return RequirementVersion::Ambiguous;
     };
-    let end = captures.get(2).or_else(|| captures.get(1)).unwrap().end();
-    let tail = &specifier.trim()[end..];
-    let tail = requirement_tokens(tail)
-        .into_iter()
-        .take_while(|token| !token.starts_with("--"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let tail = tail.trim();
-    let tail = tail
-        .strip_prefix('(')
-        .and_then(|value| value.strip_suffix(')'))
-        .unwrap_or(tail)
-        .trim();
-    if tail.is_empty() {
-        return RequirementVersion::Unpinned;
-    }
-    if let Some(location) = tail.strip_prefix('@') {
-        let location = location.trim();
+    if let Some(location) = requirement.direct_reference {
         let Some(version) = archive_version(location, name) else {
             return RequirementVersion::Ambiguous;
         };
@@ -185,24 +173,23 @@ fn requirement_version(specifier: &str, name_re: &Regex, name: &str) -> Requirem
         }
         return RequirementVersion::Exact(version);
     }
-    let (arbitrary, version) = match tail.strip_prefix("===") {
-        Some(version) => (true, Some(version)),
-        None => (false, tail.strip_prefix("==")),
-    };
-    if let Some(version) = version.map(str::trim) {
-        if !version.is_empty()
-            && !version
-                .chars()
-                .any(|character| character.is_whitespace() || ",*<>=~".contains(character))
-        {
-            return if arbitrary {
-                RequirementVersion::Arbitrary(version.to_string())
-            } else {
-                RequirementVersion::Exact(version.to_string())
-            };
-        }
+    if requirement.specifier.is_empty() {
+        return RequirementVersion::Unpinned;
+    }
+    if let Some(version) = requirement.exact_version() {
+        return RequirementVersion::Exact(version.to_string());
+    }
+    if let Some(version) = requirement.arbitrary_version() {
+        return RequirementVersion::Arbitrary(version.to_string());
     }
     RequirementVersion::Ambiguous
+}
+
+/// The requirement on one logical line, comment removed.
+fn line_requirement(text: &str) -> Option<Requirement<'_>> {
+    let text = text.trim();
+    let code = unquoted_index(text, '#', true).map_or(text, |index| &text[..index]);
+    parse_requirement(code)
 }
 
 pub(super) fn rewrite(
@@ -213,16 +200,12 @@ pub(super) fn rewrite(
     let Some(content) = files.get("requirements.txt") else {
         return;
     };
-    let name_re = Regex::new(
-        r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\s*\[[^\]\r\n]*\])?\s*(?:[=<>~!]=?|@|;|\(|\s|$)",
-    )
-    .expect("static requirements-name regex is valid");
     let mut requirements = logical_requirements(content);
     let mut row_counts = BTreeMap::<String, usize>::new();
     for requirement in &requirements {
-        if let Some(captures) = name_re.captures(requirement.text.trim()) {
+        if let Some(parsed) = line_requirement(&requirement.text) {
             *row_counts
-                .entry(canonicalize_pypi_name(&captures[1]))
+                .entry(canonicalize_pypi_name(parsed.name))
                 .or_default() += 1;
         }
     }
@@ -250,12 +233,15 @@ pub(super) fn rewrite(
         let mut matched = false;
         for requirement in &mut requirements {
             let text = requirement.text.trim();
-            let Some(captures) = name_re.captures(text) else {
+            let Some(parsed) = line_requirement(text) else {
                 continue;
             };
-            if canonicalize_pypi_name(&captures[1]) != target {
+            if canonicalize_pypi_name(parsed.name) != target {
                 continue;
             }
+            let extras = parsed
+                .extras
+                .map_or(String::new(), |extras| format!("[{extras}]"));
             if requirement.unterminated {
                 matched = true;
                 result.warnings.push(RewriteWarning {
@@ -274,7 +260,7 @@ pub(super) fn rewrite(
                 .map_or((cleaned.as_str(), ""), |index| {
                     (&cleaned[..index], &cleaned[index..])
                 });
-            match requirement_version(specifier, &name_re, &target) {
+            match requirement_version(specifier, &target) {
                 // pip resolves `==` under PEP 440 (`==1.16` installs 1.16.0).
                 RequirementVersion::Exact(version)
                     if !crate::utils::pep440::versions_equal(&version, &dep.version) =>
@@ -326,9 +312,6 @@ pub(super) fn rewrite(
                 .skip_while(|token| !token.starts_with("--"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let extras = captures
-                .get(2)
-                .map_or("", |capture| capture.as_str().trim());
             let (bom, prefix_body) = split_bom(&requirement.original);
             let indent = &prefix_body
                 [..prefix_body.len() - prefix_body.trim_start_matches([' ', '\t']).len()];
@@ -642,6 +625,42 @@ mod tests {
         }
         // A different release is still not this patch's entry.
         let result = rewrite_registry_redirect(&input("requests==2.28.1.1\n"), &[patch()]);
+        assert!(result.files.is_empty());
+        assert_eq!(
+            result.warnings[0].code,
+            "redirect_requirements_entry_not_found"
+        );
+    }
+
+    /// #1365: the hosted rewriter reads a requirements line with the same
+    /// grammar as the lock inventory and the vendored planner. It keeps its
+    /// own policy on top: `===` is rewritten as arbitrary equality, and a
+    /// pin with a second clause is ambiguous.
+    #[test]
+    fn hosted_reads_pins_with_the_shared_requirements_grammar() {
+        for (line, rewritten) in [
+            ("requests==2.28.1", true),
+            ("requests (==2.28.1)", true),
+            ("requests (== 2.28.1)", true),
+            ("requests ( == 2.28.1 ) ; python_version >= \"3.8\"", true),
+            ("requests===2.28.1", true),
+        ] {
+            let result = rewrite_registry_redirect(&input(&format!("{line}\n")), &[patch()]);
+            assert!(result.warnings.is_empty(), "{line}: {:?}", result.warnings);
+            assert_eq!(
+                result.files["requirements.txt"].starts_with(&format!("requests @ {URL}")),
+                rewritten,
+                "{line}"
+            );
+        }
+        let result = rewrite_registry_redirect(&input("requests==2.28.1,!=2.0\n"), &[patch()]);
+        assert!(result.files.is_empty());
+        assert_eq!(
+            result.warnings[0].code,
+            "redirect_requirements_version_ambiguous"
+        );
+        // Not a requirement line at all: the name runs into a non-specifier.
+        let result = rewrite_registry_redirect(&input("requests/x==2.28.1\n"), &[patch()]);
         assert!(result.files.is_empty());
         assert_eq!(
             result.warnings[0].code,

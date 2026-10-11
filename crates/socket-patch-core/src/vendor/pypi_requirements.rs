@@ -27,8 +27,8 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::terminator;
 use crate::utils::requirements::{
-    expand_env_vars, hash_options, logical_lines, requires_hashes, shlex_split, split_comment,
-    strip_comment, vendor_tag,
+    expand_env_vars, hash_options, logical_lines, parse_requirement, requires_hashes, shlex_split,
+    split_comment, strip_comment, vendor_tag,
 };
 
 use super::common::refuse_symlinked;
@@ -81,25 +81,32 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
     let mut found_range = false;
     let mut other_branches = false;
     for ll in logical_lines(content) {
-        let Some(req) = parse_requirement_line(&ll.text) else {
+        let Some(req) = parse_requirement(strip_comment(&ll.text)) else {
             continue;
         };
-        if canonicalize_pypi_name(&req.name) != canon_name {
+        if canonicalize_pypi_name(req.name) != canon_name {
             continue;
         }
         if req.extras.is_some() {
             found_extras = true;
             continue;
         }
-        let spec_no_ws: String = req
-            .specifier
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
         // pip resolves `==` under PEP 440 (`==1.16` installs 1.16.0).
-        if crate::utils::pep440::is_exact_pin_of(&spec_no_ws, version) {
-            exact.push((ll.start, ll.physical.len(), req.marker, req.hashed));
-        } else if req.marker.is_some() && crate::utils::pep440::is_exact_pin(&spec_no_ws) {
+        // Arbitrary equality (`===`) stays a refusal here by policy: the
+        // vendored rewrite replaces only an exact registry pin.
+        let pinned = req.exact_version();
+        let hashed = req.options.contains("--hash");
+        if pinned.is_some_and(|pinned| crate::utils::pep440::versions_equal(pinned, version)) {
+            exact.push((
+                ll.start,
+                ll.physical.len(),
+                req.marker.map(str::to_string),
+                hashed,
+            ));
+        } else if req.marker.is_some()
+            && pinned
+                .is_some_and(|pinned| crate::utils::pep440::is_exact_pin(&format!("=={pinned}")))
+        {
             other_branches = true;
         } else {
             found_range = true;
@@ -115,8 +122,8 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
 /// spec, extras or marker): a file that pins it is an install source of it.
 pub(super) fn names_package(content: &str, canon_name: &str) -> bool {
     logical_lines(content).into_iter().any(|ll| {
-        parse_requirement_line(&ll.text)
-            .is_some_and(|req| canonicalize_pypi_name(&req.name) == canon_name)
+        parse_requirement(strip_comment(&ll.text))
+            .is_some_and(|req| canonicalize_pypi_name(req.name) == canon_name)
     })
 }
 
@@ -1195,61 +1202,6 @@ fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Opti
 // The logical-line lexer lives in `utils::requirements` (shared with the
 // lockfile inventory and lockfile discovery).
 
-struct ParsedRequirement {
-    name: String,
-    extras: Option<String>,
-    specifier: String,
-    marker: Option<String>,
-    hashed: bool,
-}
-
-/// Parse one logical line as a requirement; `None` for blank lines, option
-/// lines (`-r`, `--index-url`, …) and path/URL lines (no leading name).
-fn parse_requirement_line(text: &str) -> Option<ParsedRequirement> {
-    let code = strip_comment(text).trim();
-    if code.is_empty() || code.starts_with('-') {
-        return None;
-    }
-    // Per-line `--hash` options come after the requirement (and marker).
-    let (req_part, hashed) = match code.find(" --hash") {
-        Some(i) => (code[..i].trim_end(), true),
-        None => (code, false),
-    };
-    // The environment marker is everything after the first `;` (specifiers
-    // and names cannot contain one), carried VERBATIM for the rewrite.
-    let (req_part, marker) = match req_part.find(';') {
-        Some(i) => (
-            req_part[..i].trim_end(),
-            Some(req_part[i + 1..].trim().to_string()).filter(|m| !m.is_empty()),
-        ),
-        None => (req_part, None),
-    };
-    // PEP 508 name: must start alphanumeric.
-    let name_end = req_part
-        .char_indices()
-        .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
-        .map(|(i, _)| i)
-        .unwrap_or(req_part.len());
-    if name_end == 0 || !req_part.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-        return None;
-    }
-    let name = req_part[..name_end].to_string();
-    let mut rest = req_part[name_end..].trim_start();
-    let mut extras = None;
-    if let Some(stripped) = rest.strip_prefix('[') {
-        let close = stripped.find(']')?;
-        extras = Some(stripped[..close].trim().to_string());
-        rest = stripped[close + 1..].trim_start();
-    }
-    Some(ParsedRequirement {
-        name,
-        extras,
-        specifier: rest.trim().to_string(),
-        marker,
-        hashed,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1446,6 +1398,37 @@ mod tests {
                 },
                 wiring,
             )
+        }
+    }
+
+    /// #1365: the vendored planner reads a requirements line with the same
+    /// grammar as the lock inventory (`exact_pin`), so a pin scan offers is
+    /// one vendor wires. pip reads the legacy parenthesised `six (==1.16.0)`
+    /// as the exact pin `==1.16.0`. Arbitrary equality stays a refusal
+    /// here by policy, although the inventory and hosted mode differ on it.
+    #[test]
+    fn find_pin_agrees_with_the_inventory_exact_pin() {
+        for (line, inventory, vendored) in [
+            ("six==1.16.0", true, true),
+            ("six (==1.16.0)", true, true),
+            ("six (== 1.16.0)", true, true),
+            ("six===1.16.0", false, false),
+            ("six==1.16.0,!=1.15", false, false),
+        ] {
+            assert_eq!(
+                crate::utils::requirements::exact_pin(line) == Some(("six", "1.16.0")),
+                inventory,
+                "inventory: {line}"
+            );
+            let found = find_pin(&format!("{line}\n"), "six", "1.16.0");
+            assert_eq!(
+                matches!(found, PinSearch::Exact { .. }),
+                vendored,
+                "vendored: {line} -> {found:?}"
+            );
+            if !vendored {
+                assert_eq!(found, PinSearch::Range, "{line}");
+            }
         }
     }
 
@@ -2842,10 +2825,10 @@ mod tests {
     /// pin during a later scan.
     #[test]
     fn parse_requirement_line_ignores_path_and_nonname_lines() {
-        assert!(parse_requirement_line(&expected_line()).is_none());
-        assert!(parse_requirement_line("./local/wheel.whl --hash=sha256:abc").is_none());
-        assert!(parse_requirement_line("=six==1.0").is_none());
-        assert!(parse_requirement_line("[section]").is_none());
+        assert!(parse_requirement(strip_comment(&expected_line())).is_none());
+        assert!(parse_requirement(strip_comment("./local/wheel.whl --hash=sha256:abc")).is_none());
+        assert!(parse_requirement(strip_comment("=six==1.0")).is_none());
+        assert!(parse_requirement(strip_comment("[section]")).is_none());
         // A stray path line neither matches nor shifts the classification of
         // the real pin below it.
         assert_eq!(

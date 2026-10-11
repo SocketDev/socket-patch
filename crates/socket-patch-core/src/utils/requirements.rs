@@ -381,48 +381,156 @@ pub(crate) fn shlex_split(text: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// One requirements.txt requirement, read from a logical line's code part
+/// (comment already stripped) the way pip reads it. The ONE requirements
+/// grammar: the lock inventory, lockfile discovery, the hosted rewriter and
+/// the vendored planner all read pins through it (#1365), and each keeps
+/// its own policy on top.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Requirement<'a> {
+    /// The PEP 508 name as spelled.
+    pub(crate) name: &'a str,
+    /// The text between `[` and `]`, as spelled.
+    pub(crate) extras: Option<&'a str>,
+    /// The version specifier, trimmed, with the legacy `( … )` wrapper
+    /// removed (`six (==1.0)` is `==1.0`). Empty for an unpinned name or
+    /// a direct reference.
+    pub(crate) specifier: &'a str,
+    /// The `name @ <url-or-path>` location.
+    pub(crate) direct_reference: Option<&'a str>,
+    /// The environment marker after `;`, trimmed; `None` when absent or
+    /// empty.
+    pub(crate) marker: Option<&'a str>,
+    /// The per-requirement options (`--hash=…`) after the requirement.
+    pub(crate) options: &'a str,
+}
+
+impl<'a> Requirement<'a> {
+    /// The version of an exact `==X` pin, as spelled: one clause, no
+    /// wildcard (`==1.*`), not arbitrary equality (`===`), and a version
+    /// starting with a digit. Callers compare it under PEP 440.
+    pub(crate) fn exact_version(&self) -> Option<&'a str> {
+        let version = self.specifier.strip_prefix("==")?.trim_start();
+        (!version.starts_with('=')
+            && !version.contains('*')
+            && version.starts_with(|c: char| c.is_ascii_digit())
+            && !version.contains(|c: char| c.is_whitespace() || "(),;<>!~=".contains(c)))
+        .then_some(version)
+    }
+
+    /// The version of an arbitrary-equality `===X` pin (a string match),
+    /// as spelled.
+    pub(crate) fn arbitrary_version(&self) -> Option<&'a str> {
+        let version = self.specifier.strip_prefix("===")?.trim_start();
+        (!version.is_empty()
+            && !version.contains(|c: char| c.is_whitespace() || "(),;<>!~=*".contains(c)))
+        .then_some(version)
+    }
+}
+
+/// Parse one logical line's code part (comment already stripped) as a
+/// requirement. `None` for blank lines, option lines (`-r`, `-e`,
+/// `--index-url`, …), path and URL lines (no leading name), and a name
+/// that runs into something that is not a specifier (`six/x`).
+pub(crate) fn parse_requirement(code: &str) -> Option<Requirement<'_>> {
+    let code = code.trim();
+    if code.is_empty() || code.starts_with('-') {
+        return None;
+    }
+    // Per-requirement options start at the first whitespace-preceded `--`
+    // outside a quoted marker string.
+    let mut quote = None;
+    let options_at = code
+        .char_indices()
+        .find(|&(i, c)| {
+            match quote {
+                Some(open) if c == open => quote = None,
+                Some(_) => {}
+                None if c == '\'' || c == '"' => quote = Some(c),
+                None => {
+                    return code[i..].starts_with("--") && code[..i].ends_with(char::is_whitespace)
+                }
+            }
+            false
+        })
+        .map_or(code.len(), |(i, _)| i);
+    let (spec, options) = (code[..options_at].trim_end(), code[options_at..].trim());
+    // PEP 508 name: must start alphanumeric.
+    if !spec.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let name_end = spec
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .unwrap_or(spec.len());
+    let (name, mut rest) = spec.split_at(name_end);
+    rest = rest.trim_start();
+    let mut extras = None;
+    if let Some(open) = rest.strip_prefix('[') {
+        let close = open.find(']')?;
+        extras = Some(&open[..close]);
+        rest = open[close + 1..].trim_start();
+    }
+    fn marker_of(text: &str) -> Option<&str> {
+        Some(text.trim()).filter(|marker| !marker.is_empty())
+    }
+    if let Some(location) = rest.strip_prefix('@') {
+        // A url may itself contain `;`: the reference is one token, and a
+        // marker after it needs whitespace before its `;` (PEP 508).
+        let location = location.trim_start();
+        let end = location.find(char::is_whitespace).unwrap_or(location.len());
+        let (reference, tail) = location.split_at(end);
+        if reference.is_empty() {
+            return None;
+        }
+        let tail = tail.trim_start();
+        let marker = match tail.strip_prefix(';') {
+            Some(marker) => marker_of(marker),
+            None if tail.is_empty() => None,
+            None => return None,
+        };
+        return Some(Requirement {
+            name,
+            extras,
+            specifier: "",
+            direct_reference: Some(reference),
+            marker,
+            options,
+        });
+    }
+    // Names and specifiers cannot contain `;`: the marker is everything
+    // after the first one.
+    let (specifier, marker) = match rest.split_once(';') {
+        Some((specifier, marker)) => (specifier.trim_end(), marker_of(marker)),
+        None => (rest, None),
+    };
+    if !(specifier.is_empty() || specifier.starts_with(['=', '<', '>', '~', '!', '('])) {
+        return None;
+    }
+    let specifier = specifier
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .map_or(specifier, str::trim);
+    Some(Requirement {
+        name,
+        extras,
+        specifier,
+        direct_reference: None,
+        marker,
+        options,
+    })
+}
+
 /// The `(name as spelled, version)` of an exact `name[extras]==X` registry
 /// requirement (a logical line's code part; an optional `; marker` and
 /// options may follow), `None` for anything else — ranges, `===`, wildcards
 /// (`==1.*`), a version not starting with a digit. Spelled as pip reads it:
 /// whitespace may surround the extras and the `==` (`six == 1.0`,
 /// `six[x] ==1.0`), and the legacy parenthesised form `six (==1.0)` is the
-/// same pin. The ONE exact-pin rule the lock inventory and lockfile
-/// discovery read requirements with.
+/// same pin. Read through [`parse_requirement`], the grammar every
+/// requirements reader shares.
 pub(crate) fn exact_pin(code: &str) -> Option<(&str, &str)> {
-    let spec = code.split(';').next()?.trim_start();
-    let name_end = spec
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-        .unwrap_or(spec.len());
-    let (name, mut rest) = spec.split_at(name_end);
-    rest = rest.trim_start();
-    if rest.starts_with('[') {
-        rest = rest[rest.find(']')? + 1..].trim_start();
-    }
-    let parenthesised = rest.starts_with('(');
-    if parenthesised {
-        rest = rest[1..].trim_start();
-    }
-    rest = rest.strip_prefix("==")?.trim_start();
-    let version_end = rest
-        .find(|c: char| c.is_whitespace() || matches!(c, ')' | ','))
-        .unwrap_or(rest.len());
-    let (version, mut rest) = rest.split_at(version_end);
-    rest = rest.trim_start();
-    if parenthesised {
-        rest = rest.strip_prefix(')')?.trim_start();
-    }
-    // Only options (`--hash=…`) may follow the specifier; anything else
-    // (`,<2`, a stray `)`, a second token) is not one exact pin.
-    if name.is_empty()
-        || !(rest.is_empty() || rest.starts_with("--"))
-        || version.starts_with('=')
-        || version.contains('*')
-        || !version.starts_with(|c: char| c.is_ascii_digit())
-    {
-        return None;
-    }
-    Some((name, version))
+    let requirement = parse_requirement(code)?;
+    Some((requirement.name, requirement.exact_version()?))
 }
 
 /// The `(name as spelled, reference)` of a PEP 508 direct reference
