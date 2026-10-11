@@ -158,6 +158,15 @@ fn archive_version(location: &str, name: &str) -> Option<String> {
 /// or the user's source, and anything that is not one exact clause is
 /// ambiguous.
 fn requirement_version(requirement: &Requirement<'_>, name: &str) -> RequirementVersion {
+    // The rewrite carries long `--` options over, but a short one (`-C`,
+    // pip's `--config-settings`) would be dropped: refuse, as before.
+    if requirement
+        .options
+        .split_whitespace()
+        .any(|token| token.starts_with('-') && !token.starts_with("--"))
+    {
+        return RequirementVersion::Ambiguous;
+    }
     if let Some(location) = requirement.direct_reference {
         let Some(version) = archive_version(location, name) else {
             return RequirementVersion::Ambiguous;
@@ -662,6 +671,18 @@ mod tests {
             result.warnings[0].code,
             "redirect_requirements_version_ambiguous"
         );
+        // A short option the rewrite would drop keeps the line ambiguous.
+        for source in [
+            "requests==2.28.1 --hash=sha256:aa -C x=y\n",
+            "requests==2.28.1 --hash sha256:aa -Cx=y\n",
+        ] {
+            let result = rewrite_registry_redirect(&input(source), &[patch()]);
+            assert!(result.files.is_empty(), "{source}");
+            assert_eq!(
+                result.warnings[0].code, "redirect_requirements_version_ambiguous",
+                "{source}"
+            );
+        }
         // An unterminated continuation still names its package.
         for source in ["requests \\", "requests==2.28.1 \\"] {
             let result = rewrite_registry_redirect(&input(source), &[patch()]);
