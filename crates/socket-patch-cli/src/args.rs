@@ -1,15 +1,6 @@
-//! Shared CLI arguments flattened into every subcommand.
-//!
-//! `GlobalArgs` defines the flags that apply uniformly across every
-//! `socket-patch` subcommand. Each subcommand `#[command(flatten)]`s this
-//! struct into its own `Args` struct so the surface stays consistent.
-//!
-//! Subcommands that don't actually use a given global flag still accept it
-//! silently (no-op). See `CLI_CONTRACT.md` for the full contract.
-//!
-//! Precedence for every flag: CLI arg > env var > default.
-//!
-//! All env-var names use the `SOCKET_*` prefix.
+//! Shared CLI flags and their `SOCKET_*` environment bindings.
+//! Commands accept unused flags as no-ops. See `CLI_CONTRACT.md` for their scope
+//! and configuration precedence.
 
 use std::path::{Path, PathBuf};
 
@@ -23,14 +14,7 @@ use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::telemetry::TelemetryAuth;
 use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 
-/// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
-///
-/// Rejects any name that is not a supported ecosystem, so typos fail
-/// loudly instead of silently matching nothing.
-///
-/// Without this, an unsupported name parsed fine and was then silently
-/// dropped by `partition_purls`/`crawl_ecosystems`, so the user got a
-/// "0 patches" result with no hint that the ecosystem name was the cause.
+/// Reject unknown ecosystems before they can produce a misleading empty scan.
 fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
     if Ecosystem::all().iter().any(|e| e.cli_name() == s) {
         Ok(s.to_string())
@@ -55,27 +39,12 @@ fn unsupported_ecosystem_message(token: &str, supported: &str) -> String {
     }
 }
 
-/// clap value-parser for `--vendor-source` / `SOCKET_VENDOR_SOURCE`.
-///
-/// Validates the token against [`VendorSource`] (`service` or its `auto` alias,
-/// case-insensitive; `build` is rejected) at parse time so a typo fails immediately
-/// rather than at vendor time, and normalizes it to the canonical lowercase
-/// tag. Mirrors [`parse_supported_ecosystem`]'s fail-loud-on-typo posture.
+/// Validate the service source and normalize its compatibility alias at parse time.
 fn parse_vendor_source(s: &str) -> Result<String, String> {
     VendorSource::parse(s).map(|v| v.as_tag().to_string())
 }
 
-/// clap value-parser for boolean flags backed by an env var.
-///
-/// Identical to clap's stock `BoolishValueParser` (case-insensitive
-/// `true/false`, `yes/no`, `on/off`, `1/0`) **except** that an empty string is
-/// treated as `false` rather than rejected.
-///
-/// Without this, an exported-but-empty env var — e.g. `SOCKET_OFFLINE=` or
-/// `SOCKET_JSON=`, which shells and CI routinely set to mean "unset" — made
-/// clap abort the whole command with `invalid value '' for '--offline': value
-/// was not a boolean`. Every bool flag here reads such an env var, so a single
-/// stray empty var crashed every subcommand before it could do any work.
+/// Parse boolish environment values, treating an exported empty value as false.
 pub(crate) fn parse_bool_flag(s: &str) -> Result<bool, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "" | "n" | "no" | "f" | "false" | "off" | "0" => Ok(false),
@@ -128,7 +97,12 @@ pub struct GlobalArgs {
     pub api_url: Option<String>,
 
     /// Socket API token. Absence selects the public patch proxy.
-    #[arg(help_heading = GLOBAL_OPTIONS, long = "api-token", env = "SOCKET_API_TOKEN")]
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "api-token",
+        env = "SOCKET_API_TOKEN",
+        hide_env_values = true
+    )]
     pub api_token: Option<String>,
 
     /// Organization slug. Auto-resolved when omitted and a token is set.
@@ -143,8 +117,7 @@ pub struct GlobalArgs {
     #[arg(help_heading = GLOBAL_OPTIONS, long = "proxy-url", env = "SOCKET_PROXY_URL")]
     pub proxy_url: Option<String>,
 
-    /// Restrict to these ecosystems (comma-separated). Names that are not
-    /// supported ecosystems are rejected.
+    /// Restrict to these ecosystems (comma-separated).
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "ecosystems",
@@ -197,8 +170,7 @@ pub struct GlobalArgs {
     )]
     pub patch_server_url: Option<String>,
 
-    /// Strict airgap: never contact the network. Operations that need remote
-    /// data fail loudly when this is set.
+    /// Disable network access; fail if remote data is needed.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long,

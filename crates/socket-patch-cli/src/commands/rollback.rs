@@ -41,8 +41,9 @@ use crate::ui::{plural, StatusLine};
 
 #[derive(Args)]
 pub struct RollbackArgs {
-    /// What to roll back: a package PURL, a patch UUID, or a path glob
-    /// (e.g. `packages/foo`, `apps/**`) selecting the patches whose
+    /// Package names, PURLs, UUIDs, or paths; omit to restore all patches.
+    ///
+    /// Paths and globs (e.g. `packages/foo`, `apps/**`) select patches whose
     /// installed copies live under matching paths. Multiple targets union.
     /// Omit to roll back ALL patch state — in-place patches, vendored
     /// patches, and hosted lockfile redirects.
@@ -60,12 +61,13 @@ pub struct RollbackArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Restore the system (files and lockfiles) but PRESERVE the local
+    /// Keep local patch records and artifacts for later reuse.
+    ///
+    /// Restore the system (files and lockfiles) but preserve the local
     /// patch state for a later re-apply: manifest entries are kept,
     /// vendored artifacts and their ledger entries are kept (only the
     /// lockfile wiring is reverted), and no blob/archive cleanup runs.
-    /// Hosted redirects have no preservable local state — their ledger
-    /// records describe live wiring and are dropped with it either way.
+    /// Hosted references have no local state to preserve.
     #[arg(
         long = "preserve-state",
         env = "SOCKET_PRESERVE_STATE",

@@ -91,10 +91,10 @@ as `v2` alone do not select modules; use the full module path or PURL.
 
 `get --ecosystems` now scopes package-name discovery and filters every search
 result and UUID selection before any patch is written, in every mode. A UUID
-outside the selected ecosystems returns `status: "not_found"` with exit 0. A
-name absent from a nonempty package inventory returns `status: "no_match"` with
+outside the selected ecosystems returns `status: "notFound"` with exit 0. A
+name absent from a nonempty package inventory returns `status: "noMatch"` with
 exit 0, without searching for or applying a suggested package. An empty inventory
-returns `status: "no_packages"`. Scripts should inspect these statuses instead of
+returns `status: "noPackages"`. Scripts should inspect these statuses instead of
 assuming exit 0 means a patch was selected.
 
 `rollback` also accepts path globs. An npm scoped name such as `@babel/core` is
@@ -132,29 +132,32 @@ access. See [vendoring and offline installs](usage.md#vendoring-and-offline-inst
 
 ## JSON output
 
-Every `--json` failure now reports its top-level `error` as an object,
-`{"code": "...", "message": "..."}`, on every command. `apply`, `list`, `remove`,
-`repair`, `vendor` and `vex` already did; `scan`, `get` and `rollback` change:
+All public commands now use one JSON envelope: `command`, `status`, `dryRun`,
+`events`, and `summary`, with command-specific fields alongside them. Update
+scripts that read the old `scan`, `get`, or `rollback` shapes:
 
-- Read `.error.message` where you read `.error`, and route on `.error.code`.
-- The top-level `errorCode` key is gone. Read `.error.code` instead. This affects
-  `get`'s and hosted `scan`'s `lock_held` / `lock_io`, hosted `scan` refusals,
-  `scan`'s socket.yml refusals (`socket_yml_invalid`, `socket_yml_ambiguous`) and
-  the nested-apply error `get` and `scan --mode agent` report.
-- Per-record keys do not change: `patches[*].error`, `patches[*].errorCode` and
-  rollback's `results[*].error` stay strings.
-- Usage errors (exit 2) that `scan`, `remove` and `rollback` enforce themselves
-  now print the coded error on stdout under `--json`, as `get`, `repair`,
-  `vendor` and `vex` do. Clap's own parse errors, and the check that a
-  `--cwd`, `--global-prefix` or `--manifest-path` names something, still print
-  nothing on stdout.
+| Previous output | v5 replacement |
+| --- | --- |
+| `patches[]`, nested apply/vendor results, or rollback's `results[]` | `events[]` with an `action` per outcome |
+| Top-level action counters such as `applied` or `rolledBack` | `summary.applied`, `summary.rolledBack`, and the other event counters |
+| String `error` or top-level `errorCode` | `error.message` and `error.code` |
+| Snake-case statuses such as `partial_failure`, `not_found`, or `no_match` | `partialFailure`, `notFound`, or `noMatch` |
+
+Per-event `error` and `errorCode` remain strings; diagnostic codes remain
+snake_case. Run-level advisories use `warnings[]` entries with `code` and `detail`.
+Dry runs use the same envelope with `dryRun: true`.
+
+Argument-parsing errors and invalid `--cwd`, `--global-prefix`, or
+`--manifest-path` values still exit 2 with stderr output and no JSON. Check the
+exit status before processing stdout. For example, in Bash:
 
 ```bash
+set -o pipefail
 socket-patch scan --json | jq -r 'select(.status == "error") | .error.code'
 ```
 
-The codes are listed in the
-[CLI contract](../crates/socket-patch-cli/CLI_CONTRACT.md#top-level-envelopeerror-codes).
+See the [JSON contract](../crates/socket-patch-cli/CLI_CONTRACT.md#json-output-shapes)
+for event fields, status values, and removed keys.
 
 ## Installation channels
 
