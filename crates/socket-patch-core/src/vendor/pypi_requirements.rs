@@ -104,12 +104,13 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
         let pinned = req.exact_version();
         let hashed = req.options.contains("--hash");
         // The rewritten wheel line carries only `--hash`: a pin with any
-        // other per-requirement option (`--config-settings`, …) would lose
+        // other per-requirement option (`--config-settings`, its short
+        // `-C`, …; a `--hash` value never starts with `-`) would lose
         // it, so it is refused rather than rewritten.
         let other_options = req
             .options
             .split_whitespace()
-            .any(|token| token.starts_with("--") && !token.starts_with("--hash"));
+            .any(|token| token.starts_with('-') && !token.starts_with("--hash"));
         if other_options {
             found_range = true;
             continue;
@@ -1453,14 +1454,21 @@ mod tests {
             );
         }
         // A pin whose other options the rewrite would drop is refused.
-        assert_eq!(
+        for line in [
+            "six==1.16.0 --config-settings x=y --hash=sha256:ab\n",
+            "six==1.16.0 --hash=sha256:ab -C x=y\n",
+            "six==1.16.0 --hash sha256:ab -Cx=y\n",
+        ] {
+            assert_eq!(find_pin(line, "six", "1.16.0"), PinSearch::Range, "{line}");
+        }
+        assert!(matches!(
             find_pin(
-                "six==1.16.0 --config-settings x=y --hash=sha256:ab\n",
+                "six==1.16.0 --hash sha256:ab --hash=sha256:cd\n",
                 "six",
                 "1.16.0"
             ),
-            PinSearch::Range
-        );
+            PinSearch::Exact { hashed: true, .. }
+        ));
         // A line that names the package but is no clean requirement is
         // never treated as absent (fail closed).
         for line in ["six @ ./six-1.16.0.whl extra\n", "six/x==1.16.0\n"] {
