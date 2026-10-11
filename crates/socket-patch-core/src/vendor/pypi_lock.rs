@@ -704,6 +704,22 @@ pub(crate) fn restore_document(
     ))
 }
 
+/// [`read_file`], with a file that does not exist read as `None`.
+async fn read_existing(path: &Path) -> Result<Option<String>, Failure> {
+    match tokio::fs::symlink_metadata(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => read_file(path).await.map(Some),
+    }
+}
+
+/// The pair a wired file belongs to: a `.py.lock` goes with its script, and
+/// every other file (a script, a PEP 751 lock) names its own pair.
+fn pair_of(file: &str) -> &str {
+    file.strip_suffix(".lock")
+        .filter(|script| script.ends_with(".py"))
+        .unwrap_or(file)
+}
+
 fn allowed_file(file: &str, kind: &str) -> bool {
     Path::new(file).file_name().and_then(|name| name.to_str()) == Some(file)
         && ((kind == KIND && is_python_lock_name(file) && file != "uv.lock")
@@ -797,13 +813,19 @@ pub(super) async fn revert_python_locks(
     let mut edits = Vec::new();
     // REMOVED, not drift (#1214, the script-lock twin of #1140): `uv remove
     // --script` drops the dependency together with every fragment that
-    // routed through the wheel. When no wired file names this entry's uuid
-    // any more, a record whose written text carried it has nothing left to
+    // routed through the wheel. When no file of a record's pair (a script
+    // and its `.py.lock`, or one PEP 751 lock) names this entry's uuid any
+    // more, a record whose written text carried it has nothing left to
     // restore; it warns `vendor_lock_entry_removed` so the revert converges.
-    // Probed once, before any record is reverted, so only the user's own
-    // edits count.
+    // Decided per pair (#1285): one entry can wire several scripts, and a
+    // script that still routes through the wheel must not turn another
+    // script's removal into drift. A wired file that no longer exists has
+    // nothing to restore either (#890): it warns `vendor_lockfile_missing`
+    // instead of failing every other pair's unwind on the read. Probed once,
+    // before any record is reverted, so only the user's own edits count.
     let uuid_lower = entry.uuid.to_ascii_lowercase();
-    let mut unreferenced = true;
+    let mut referenced = BTreeSet::new();
+    let mut missing = BTreeSet::new();
     for file in entry
         .wiring
         .iter()
@@ -811,12 +833,14 @@ pub(super) async fn revert_python_locks(
         .map(|record| record.file.as_str())
         .collect::<BTreeSet<_>>()
     {
-        match read_file(&root.join(file)).await {
-            Ok(live) if live.to_ascii_lowercase().contains(&uuid_lower) => {
-                unreferenced = false;
-                break;
+        match read_existing(&root.join(file)).await {
+            Ok(Some(live)) if live.to_ascii_lowercase().contains(&uuid_lower) => {
+                referenced.insert(pair_of(file));
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                missing.insert(file);
+            }
             Err((_, error)) => return RevertOutcome::failed(error),
         }
     }
@@ -860,7 +884,20 @@ pub(super) async fn revert_python_locks(
             ));
             continue;
         };
-        if unreferenced && new.to_ascii_lowercase().contains(&uuid_lower) {
+        if missing.contains(record.file.as_str()) {
+            warnings.push(VendorWarning::new(
+                "vendor_lockfile_missing",
+                format!(
+                    "{} no longer exists, so its wiring cannot be restored; the rest of the \
+                     entry is reverted",
+                    record.file
+                ),
+            ));
+            continue;
+        }
+        if !referenced.contains(pair_of(&record.file))
+            && new.to_ascii_lowercase().contains(&uuid_lower)
+        {
             warnings.push(VendorWarning::new(
                 super::LOCK_ENTRY_REMOVED_CODE,
                 format!(
@@ -1955,6 +1992,220 @@ mod tests {
             std::fs::read_to_string(root.join("job.py")).unwrap(),
             wired_script,
             "drift writes nothing"
+        );
+    }
+
+    const SCRIPT_LOCK: &str = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"one\", specifier = \"==1\"}]\n\n[[package]]\nname = \"one\"\nversion = \"1\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+    const SCRIPT: &str = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"one==1\", \"attrs>=20\"]\n# ///\nimport one\n";
+
+    /// Vendor `one==1` into every file of `files` at once (PEP 723 scripts
+    /// with their `.py.lock`s, or PEP 751 locks): one ledger entry whose
+    /// wiring spans several independent pairs.
+    async fn vendor_files(root: &Path, files: &[(&str, &str)]) -> VendorEntry {
+        for (name, text) in files {
+            tokio::fs::write(root.join(name), text).await.unwrap();
+        }
+        let project = load_python_locks(root, "one", "1", UUID).await.unwrap();
+        let wheel =
+            ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/one-1-py3-none-any.whl";
+        let records = wire_python_locks(&project, root, "one", "1", wheel, &"a".repeat(64))
+            .await
+            .unwrap();
+        for (name, _) in files {
+            let wired = std::fs::read_to_string(root.join(name)).unwrap();
+            assert!(wired.contains(UUID), "{name} is wired:\n{wired}");
+        }
+        serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/one@1",
+            "uuid": UUID,
+            "artifact": { "path": wheel, "sha256": "a".repeat(64) },
+            "wiring": serde_json::to_value(&records).unwrap(),
+            "flavor": "python-lock",
+        }))
+        .unwrap()
+    }
+
+    /// Two vendored PEP 723 scripts, `a.py` and `b.py`, sharing one entry.
+    async fn vendor_two_scripts(root: &Path) -> VendorEntry {
+        vendor_files(
+            root,
+            &[
+                ("a.py", SCRIPT),
+                ("a.py.lock", SCRIPT_LOCK),
+                ("b.py", SCRIPT),
+                ("b.py.lock", SCRIPT_LOCK),
+            ],
+        )
+        .await
+    }
+
+    fn assert_a_restored(root: &Path) {
+        assert_eq!(std::fs::read_to_string(root.join("a.py")).unwrap(), SCRIPT);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.py.lock")).unwrap(),
+            SCRIPT_LOCK
+        );
+    }
+
+    /// #1285: `uv remove --script b.py one` drops the dependency from ONE of
+    /// two vendored scripts. b.py's pair no longer names the uuid, so its
+    /// records are removed, not drift, although a.py still names it; a.py,
+    /// which the user never touched, is restored, and the revert finishes.
+    #[tokio::test]
+    async fn uv_remove_from_one_of_two_scripts_reverts_the_other() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entry = vendor_two_scripts(root).await;
+        let script = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"attrs>=20\"]\n# ///\nimport one\n";
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"attrs\", specifier = \">=20\"}]\n";
+        tokio::fs::write(root.join("b.py"), script).await.unwrap();
+        write_pylock(root, "b.py.lock", lock).await;
+
+        let dry = revert_python_locks(&entry, root, true).await;
+        assert!(dry.success && !dry.drift_skipped(), "{dry:?}");
+        let outcome = revert_python_locks(&entry, root, false).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|w| w.detail.starts_with("b.py")),
+            "only b.py's pair is removed: {:?}",
+            outcome.warnings
+        );
+        assert_a_restored(root);
+        assert_eq!(std::fs::read_to_string(root.join("b.py")).unwrap(), script);
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.py.lock")).unwrap(),
+            lock
+        );
+    }
+
+    /// #1285's control: a hand edit inside the pair that still routes
+    /// through the wheel stays drift, even with another pair removed.
+    #[tokio::test]
+    async fn drift_in_a_still_wired_pair_keeps_the_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entry = vendor_two_scripts(root).await;
+        // b.py's dependency is gone from the lock by hand, but b.py still
+        // routes through the wheel.
+        write_pylock(
+            root,
+            "b.py.lock",
+            "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n",
+        )
+        .await;
+        let outcome = revert_python_locks(&entry, root, false).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(
+            std::fs::read_to_string(root.join("a.py"))
+                .unwrap()
+                .contains(UUID),
+            "drift writes nothing"
+        );
+    }
+
+    /// #890: the user deletes one of two vendored scripts (both files, only
+    /// its `.py.lock`, or only the script). A record whose file is gone has
+    /// nothing to restore: it warns `vendor_lockfile_missing` naming the
+    /// file, and the files that still exist are restored instead of the
+    /// whole unwind failing on the read.
+    #[tokio::test]
+    async fn deleted_script_or_lock_does_not_block_the_other_scripts() {
+        for deleted in [&["b.py", "b.py.lock"][..], &["b.py.lock"], &["b.py"]] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let entry = vendor_two_scripts(root).await;
+            for file in deleted {
+                tokio::fs::remove_file(root.join(file)).await.unwrap();
+            }
+            for dry_run in [true, false] {
+                let outcome = revert_python_locks(&entry, root, dry_run).await;
+                assert!(outcome.success, "{deleted:?}: {outcome:?}");
+                assert!(
+                    !outcome.drift_skipped(),
+                    "{deleted:?}: {:?}",
+                    outcome.warnings
+                );
+                for file in deleted {
+                    assert!(
+                        outcome
+                            .warnings
+                            .iter()
+                            .any(|w| w.code == "vendor_lockfile_missing"
+                                && w.detail.starts_with(&format!("{file} "))),
+                        "{deleted:?}: {file} is named: {:?}",
+                        outcome.warnings
+                    );
+                }
+            }
+            assert_a_restored(root);
+            for (file, upstream) in [("b.py", SCRIPT), ("b.py.lock", SCRIPT_LOCK)] {
+                if !deleted.contains(&file) {
+                    assert_eq!(
+                        std::fs::read_to_string(root.join(file)).unwrap(),
+                        upstream,
+                        "{deleted:?}: the surviving half is restored"
+                    );
+                } else {
+                    assert!(!root.join(file).exists(), "{deleted:?}: not recreated");
+                }
+            }
+        }
+    }
+
+    /// #890's PEP 751 lane: `pylock.toml` and `pylock.dev.toml` vendored,
+    /// then `pylock.dev.toml` deleted.
+    #[tokio::test]
+    async fn deleted_pylock_does_not_block_the_other_pylock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entry = vendor_files(root, &[("pylock.toml", LOCK), ("pylock.dev.toml", LOCK)]).await;
+        tokio::fs::remove_file(root.join("pylock.dev.toml"))
+            .await
+            .unwrap();
+        let outcome = revert_python_locks(&entry, root, false).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lockfile_missing"
+                    && w.detail.starts_with("pylock.dev.toml ")),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pylock.toml")).unwrap(),
+            LOCK
+        );
+        assert!(!root.join("pylock.dev.toml").exists());
+    }
+
+    /// Only a MISSING file is skipped: any other read failure (here a
+    /// directory where the lock was) still fails the revert closed.
+    #[tokio::test]
+    async fn unreadable_wired_file_still_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let entry = vendor_two_scripts(root).await;
+        tokio::fs::remove_file(root.join("b.py.lock"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(root.join("b.py.lock")).await.unwrap();
+        let outcome = revert_python_locks(&entry, root, false).await;
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            std::fs::read_to_string(root.join("a.py"))
+                .unwrap()
+                .contains(UUID),
+            "nothing is written"
         );
     }
 }

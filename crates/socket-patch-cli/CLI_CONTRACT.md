@@ -892,7 +892,11 @@ worse, lets a warm cache silently serve unpatched bytes):
   script locks the same holds after `uv remove` of the package, and after `uv remove` of the parent
   of a TRANSITIVE vendored package, whose `[tool.uv]` override + source and `[manifest]` records
   uv leaves in place: those are socket-patch's own records, which the revert restores, so only a
-  reference outside them counts as drift, #1287), removes the artifacts, prunes the
+  reference outside them counts as drift, #1287; with several PEP 723 scripts or PEP 751 locks
+  in one entry this is judged per pair — a script with its `.py.lock`, or one `pylock*.toml` — so
+  `uv remove --script` of one script still restores the others, #1285, and a wired script, script
+  lock or PEP 751 lock the user deleted warns `vendor_lockfile_missing` naming it while the files
+  that still exist are restored, #890), removes the artifacts, prunes the
   ledger, sweeps orphan uuid dirs, and (v5.0) prunes the now-empty `.socket/vendor/<eco>/` and
   `.socket/vendor/` levels — `.socket/` itself is removed by the lock guard when nothing else is
   left. It works without a manifest: with no manifest and no ledger it is a clean exit-0 no-op.

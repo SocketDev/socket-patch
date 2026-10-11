@@ -1031,6 +1031,182 @@ async fn assert_script_lock_unwinds(stage: StageFn, remove: fn(&Path)) {
     }
 }
 
+/// Two uv PEP 723 scripts, `a.py` and `b.py`, each with its `.py.lock`,
+/// vendored into one ledger entry; returns its wiring files.
+fn stage_two_script_locks(root: &Path) -> &'static [&'static str] {
+    stage_script_lock(root);
+    for file in ["job.py", "job.py.lock"] {
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        std::fs::remove_file(root.join(file)).unwrap();
+        for script in ["a", "b"] {
+            std::fs::write(root.join(file.replacen("job", script, 1)), &text).unwrap();
+        }
+    }
+    &["a.py", "a.py.lock", "b.py", "b.py.lock"]
+}
+
+/// Two PEP 751 locks, `pylock.toml` and `pylock.dev.toml`, both locking
+/// six; returns its wiring files.
+fn stage_two_pylocks(root: &Path) -> &'static [&'static str] {
+    let lock = format!(
+        "lock-version = \"1.0\"\ncreated-by = \"uv\"\nrequires-python = \">=3.9\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\nindex = \"https://pypi.org/simple\"\nwheels = [{{ url = \"https://files.pythonhosted.org/six-1.16.0-py2.py3-none-any.whl\", hashes = {{ sha256 = \"{WHEEL_SHA}\" }} }}]\n"
+    );
+    for file in ["pylock.toml", "pylock.dev.toml"] {
+        std::fs::write(root.join(file), &lock).unwrap();
+    }
+    &["pylock.toml", "pylock.dev.toml"]
+}
+
+/// `uv remove --script b.py six` on [`stage_two_script_locks`].
+fn uv_remove_six_from_b(root: &Path) {
+    std::fs::write(
+        root.join("b.py"),
+        "# /// script\n# requires-python = \">=3.9\"\n# dependencies = []\n# ///\nimport six\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.py.lock"),
+        "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n",
+    )
+    .unwrap();
+}
+
+/// #1285 / #890: one vendored entry wires several scripts (or PEP 751
+/// locks), and the user changes just one of them: `uv remove --script
+/// b.py six` (#1285), or deletes `b.py` and/or `b.py.lock`, or
+/// `pylock.dev.toml` (#890). Every unwind must still restore the files the
+/// user left alone and retire the entry. Before the fix #1285's shape was
+/// drift-kept as a whole (`vendor_lock_entry_drifted`, a.py stayed wired;
+/// `remove` / `rollback` exit 1) and #890's failed every unwind with
+/// "cannot read ./b.py.lock".
+#[tokio::test]
+async fn multi_script_unwinds_after_one_script_changes() {
+    type Change = (&'static str, StageFn, fn(&Path), &'static [&'static str]);
+    let changes: [Change; 5] = [
+        (
+            "uv remove b",
+            stage_two_script_locks,
+            uv_remove_six_from_b,
+            &[],
+        ),
+        (
+            "rm b.py b.py.lock",
+            stage_two_script_locks,
+            |root| {
+                std::fs::remove_file(root.join("b.py")).unwrap();
+                std::fs::remove_file(root.join("b.py.lock")).unwrap();
+            },
+            &["b.py", "b.py.lock"],
+        ),
+        (
+            "rm b.py.lock",
+            stage_two_script_locks,
+            |root| std::fs::remove_file(root.join("b.py.lock")).unwrap(),
+            &["b.py.lock"],
+        ),
+        (
+            "rm b.py",
+            stage_two_script_locks,
+            |root| std::fs::remove_file(root.join("b.py")).unwrap(),
+            &["b.py"],
+        ),
+        (
+            "rm pylock.dev.toml",
+            stage_two_pylocks,
+            |root| std::fs::remove_file(root.join("pylock.dev.toml")).unwrap(),
+            &["pylock.dev.toml"],
+        ),
+    ];
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    for (label, stage, change, deleted) in changes {
+        for unwind in [
+            vec!["vendor", "--revert"],
+            vec!["remove", PURL, "--yes", "--offline"],
+            vec!["rollback", "--yes", "--offline"],
+            hosted_scan_args(&uri),
+        ] {
+            let (_tmp, root) = project();
+            let files = stage(&root);
+            let originals: Vec<String> = files
+                .iter()
+                .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+                .collect();
+            vendor_project(&root, files);
+            change(&root);
+            let changed: Vec<Option<String>> = files
+                .iter()
+                .map(|f| std::fs::read_to_string(root.join(f)).ok())
+                .collect();
+
+            let (code, env) = run_cli(&root, &unwind, &[]);
+            assert_eq!(code, 0, "{label} / {unwind:?}: {env:#}");
+            let rendered = env.to_string();
+            let hosted = unwind.contains(&"hosted");
+            if hosted && deleted == ["b.py"] {
+                // Hosted mode refuses an orphan `.py.lock` whatever the
+                // vendored state, so the takeover keeps the project vendored
+                // (untouched) and names the hosted refusal, not a revert
+                // failure.
+                assert!(
+                    rendered.contains("redirect_uv_script_missing")
+                        && rendered.contains("redirect_takeover_kept_vendored")
+                        && !rendered.contains("redirect_vendored_revert_failed"),
+                    "{label} / {unwind:?}: {env:#}"
+                );
+                continue;
+            }
+            assert!(
+                !rendered.contains("vendor_lock_entry_drifted")
+                    && !rendered.contains("vendor_artifact_kept")
+                    && !rendered.contains("cannot read"),
+                "{label} / {unwind:?}: {env:#}"
+            );
+            // The takeover reports only `redirect_takeover_reverted_vendored`
+            // for a clean revert; the unwinds name each missing file.
+            for file in deleted.iter().filter(|_| !hosted) {
+                assert!(
+                    rendered.contains(&format!("{file} no longer exists")),
+                    "{label} / {unwind:?}: the missing {file} is named: {env:#}"
+                );
+            }
+            if hosted {
+                assert!(
+                    rendered.contains("redirect_takeover_reverted_vendored"),
+                    "{label} / {unwind:?}: {env:#}"
+                );
+            }
+            assert!(
+                !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+                "{label} / {unwind:?}: the vendored wheel is reclaimed"
+            );
+            for ((f, original), changed) in files.iter().zip(&originals).zip(&changed) {
+                let after = std::fs::read_to_string(root.join(f)).ok();
+                let Some(after) = after else {
+                    assert!(changed.is_none(), "{label} / {unwind:?}: {f} is gone");
+                    continue;
+                };
+                assert!(
+                    !after.contains(".socket/vendor/"),
+                    "{label} / {unwind:?}: {f} is unwired:\n{after}"
+                );
+                let untouched = changed.as_deref().is_some_and(|c| c.contains(UUID));
+                if hosted && untouched && after.contains(&hosted_url) {
+                    // The takeover re-pins what it restored, hosted.
+                    continue;
+                }
+                let expected = if untouched {
+                    original.as_str()
+                } else {
+                    changed.as_deref().unwrap()
+                };
+                assert_eq!(after, expected, "{label} / {unwind:?}: {f}");
+            }
+        }
+    }
+}
+
 /// #742 / #650 / #1136: a vendored uv project, uv script lock, Hatch
 /// project and Poetry project (LF and CRLF) pick up a superseding patch. The manifest moves `six` from patch A to patch B
 /// (different patched bytes); the next `vendor` must wire B's wheel, remove
