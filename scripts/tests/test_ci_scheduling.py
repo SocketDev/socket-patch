@@ -114,6 +114,30 @@ class Scheduling(unittest.TestCase):
         self.assertIn("reuse: ${{ steps.merge-queue.outputs.reuse }}", clippy)
         self.assertIn("python3 scripts/ci-reuse-merge-group.py", clippy)
 
+    def test_unchanged_pr_merge_skips_every_test_job_but_hosted_e2e(self):
+        # A PR push that only merged main keeps clippy and the cheap preflight
+        # jobs; everything that builds or tests skips, directly or through
+        # e2e-build. hosted-e2e is never scoped.
+        gated = {"node-addon", "test", "test-release", "coverage", "docker-base", "e2e-build",
+                 "e2e-build-windows", "yarn-classic-matrix", "yarn-berry-e2e", "cargo-old-toolchains"}
+        for job in JOBS:
+            condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
+            with self.subTest(job=job):
+                self.assertEqual("needs.clippy.outputs.pr_unchanged != 'true'" in condition,
+                                 job in gated)
+                if job in gated:
+                    self.assertTrue(condition.endswith(") && needs.clippy.outputs.pr_unchanged != 'true'"))
+        pr_tier = {job for job in JOBS if "clippy" in ancestors(job)} - {"hosted-e2e"}
+        for job in sorted(pr_tier - gated):
+            with self.subTest(job=job):
+                # Ungated jobs either never run on a lean PR or wait on a gated build.
+                self.assertTrue(ancestors(job) & gated or "pull_request" in
+                                next(line for line in JOBS[job] if line.startswith("    if:")), job)
+        clippy = "\n".join(JOBS["clippy"])
+        self.assertIn("pr_unchanged: ${{ steps.pr-head.outputs.unchanged }}", clippy)
+        self.assertIn("python3 scripts/ci-reuse-pr-head.py", clippy)
+        self.assertIn("if: github.event_name == 'pull_request'", clippy)
+
     def test_row_reader_preserves_both_os_siblings(self):
         jobs = reader.jobs("""jobs:
   example:
