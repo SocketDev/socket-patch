@@ -53,7 +53,7 @@ pub(crate) fn with_manifest_dep_maps(lines: &[String], pkg: &Value) -> Vec<Strin
 /// block of `blocks` is keyed by, sorted and deduplicated: the ones a lock
 /// rewritten to the patched manifest would leave unresolved.
 pub(crate) fn unlocked_descriptors(blocks: &[LockBlock], pkg: &Value) -> Vec<String> {
-    unresolved(
+    unlocked_among(
         blocks,
         manifest_dep_maps(pkg)
             .into_iter()
@@ -62,20 +62,12 @@ pub(crate) fn unlocked_descriptors(blocks: &[LockBlock], pkg: &Value) -> Vec<Str
     )
 }
 
-/// Every descriptor the dependency sub-maps of `lines` (one block) name
-/// that no block of `blocks` is keyed by, sorted and deduplicated (#1379).
-/// The writers refuse before leaving such a block; this is how a reader
-/// finds one a release before that refusal already wrote.
-pub(crate) fn unlocked_block_descriptors(blocks: &[LockBlock], lines: &[String]) -> Vec<String> {
-    unresolved(
-        blocks,
-        block_dep_entries(lines)
-            .into_iter()
-            .map(|(name, range)| format!("{name}@{range}")),
-    )
-}
-
-fn unresolved(blocks: &[LockBlock], descriptors: impl Iterator<Item = String>) -> Vec<String> {
+/// Every descriptor of `descriptors` no block of `blocks` is keyed by,
+/// sorted and deduplicated.
+pub(crate) fn unlocked_among(
+    blocks: &[LockBlock],
+    descriptors: impl Iterator<Item = String>,
+) -> Vec<String> {
     let locked: std::collections::BTreeSet<String> = blocks
         .iter()
         .flat_map(|b| split_key_patterns(&b.key))
@@ -86,6 +78,15 @@ fn unresolved(blocks: &[LockBlock], descriptors: impl Iterator<Item = String>) -
     missing.sort();
     missing.dedup();
     missing
+}
+
+/// The descriptors (`name@range`) the dependency sub-maps of `lines` (one
+/// block) name: what yarn 1 resolves through other blocks of the lock.
+pub(crate) fn block_dep_descriptors(lines: &[String]) -> Vec<String> {
+    block_dep_entries(lines)
+        .into_iter()
+        .map(|(name, range)| format!("{name}@{range}"))
+        .collect()
 }
 
 /// The `(name, range)` entries of a block's `dependencies:` /
@@ -113,27 +114,26 @@ fn block_dep_entries(lines: &[String]) -> Vec<(String, String)> {
 }
 
 /// One classic-grammar token from the front of `s` — a `"`-quoted string
-/// (with `\"` / `\\` escapes) or a bare run up to whitespace — and the
-/// rest of `s`.
+/// or a bare run up to whitespace — and the rest of `s`. Quotes are
+/// dropped and a `\\`-escape is kept verbatim (only skipped over when
+/// finding the closing quote), as [`split_key_patterns`] reads a block
+/// key, so the two compare alike.
 fn yarn_token(s: &str) -> (String, &str) {
     let Some(quoted) = s.strip_prefix('"') else {
         let end = s.find(char::is_whitespace).unwrap_or(s.len());
         return (s[..end].to_string(), &s[end..]);
     };
-    let mut token = String::new();
     let mut chars = quoted.char_indices();
     while let Some((i, c)) = chars.next() {
         match c {
-            '"' => return (token, &quoted[i + 1..]),
+            '"' => return (quoted[..i].to_string(), &quoted[i + 1..]),
             '\\' => {
-                if let Some((_, next)) = chars.next() {
-                    token.push(next);
-                }
+                chars.next();
             }
-            c => token.push(c),
+            _ => {}
         }
     }
-    (token, "")
+    (quoted.to_string(), "")
 }
 
 /// Whether the sub-maps `lines` carries already are exactly the ones `pkg`
@@ -214,7 +214,7 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
     }
 
     #[test]
-    fn unlocked_block_descriptors_reads_the_blocks_own_sub_maps() {
+    fn block_dep_descriptors_reads_the_blocks_own_sub_maps() {
         // #1379: a block a pre-v5 vendor rewrote to a patched manifest
         // without locking the new range.
         let lock = format!(
@@ -225,11 +225,15 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
         let blocks = scan_blocks(&lock);
         let pad = blocks.iter().find(|b| b.key == "left-pad@^1.3.0").unwrap();
         assert_eq!(
-            unlocked_block_descriptors(&blocks, &pad.lines),
+            block_dep_descriptors(&pad.lines),
+            vec!["is-number@^7.0.0", "tag@latest", "@scope/opt@^2.0.0"]
+        );
+        assert_eq!(
+            unlocked_among(&blocks, block_dep_descriptors(&pad.lines).into_iter()),
             vec!["is-number@^7.0.0", "tag@latest"]
         );
         let odd = blocks.iter().find(|b| b.key == "is-odd@3.0.1").unwrap();
-        assert!(unlocked_block_descriptors(&blocks, &odd.lines).is_empty());
+        assert!(unlocked_among(&blocks, block_dep_descriptors(&odd.lines).into_iter()).is_empty());
     }
 
     #[test]
@@ -239,7 +243,7 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
             ("left-pad".into(), " \"^1\"")
         );
         assert_eq!(yarn_token("\"@s/x\" y"), ("@s/x".into(), " y"));
-        assert_eq!(yarn_token("\"a\\\"b\""), ("a\"b".into(), ""));
+        assert_eq!(yarn_token("\"a\\\"b\" c"), ("a\\\"b".into(), " c"));
         assert_eq!(yarn_token(""), (String::new(), ""));
     }
 

@@ -828,13 +828,10 @@ pub async fn check_npm_wiring(entry: &VendorEntry, project_root: &Path) -> Resul
                 None => Ok(()),
             }
         }
-        Some(NpmLockFlavor::YarnClassic) => {
-            match dangling_lock_dependencies(entry, project_root).await {
-                Some(detail) => Err(detail),
-                None => Ok(()),
-            }
-        }
-        _ => Ok(()),
+        _ => match dangling_lock_dependencies(entry, project_root).await {
+            Some(detail) => Err(detail),
+            None => Ok(()),
+        },
     }
 }
 
