@@ -762,6 +762,13 @@ pub async fn revert_yarn_berry_opts(
         match read_regular_to_string(&lock_path).await {
             Ok(mut text) => {
                 let mut changed = false;
+                let restored_entries: Vec<String> = lock_recs
+                    .iter()
+                    .filter(|rec| rec.kind == KIND_LOCK_ENTRY)
+                    .filter_map(|rec| rec.original.as_ref())
+                    .filter_map(super::yarn_classic_lock::json_to_lines)
+                    .map(|lines| lines.join("\n"))
+                    .collect();
                 for rec in lock_recs {
                     if rec.kind == KIND_LOCK_ENTRY_PRUNED {
                         changed |= restore_pruned_entry(&mut text, rec, &mut outcome.warnings);
@@ -778,6 +785,20 @@ pub async fn revert_yarn_berry_opts(
                     );
                 }
                 if changed {
+                    // The restored entries rejoin any registry entry added
+                    // since with the same resolution (#1082).
+                    let mut doc = BerryStanzas::parse(&text);
+                    let restored: Vec<usize> = (0..doc.stanzas.len())
+                        .filter(|&i| restored_entries.contains(&doc.stanzas[i]))
+                        .collect();
+                    let mut moved = Vec::new();
+                    if crate::formats::yarn::stanzas::merge_same_resolution(
+                        &mut doc.stanzas,
+                        &restored,
+                        &mut moved,
+                    ) {
+                        text = doc.render(&moved);
+                    }
                     forget_block_scans();
                     if let Err(e) =
                         atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await
@@ -2523,6 +2544,43 @@ __metadata:
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// #1082: an `npm:` alias of the vendored package added after
+    /// vendoring keeps its own registry entry. The revert puts the
+    /// pre-vendor entry back, which resolves to the same locator, so it is
+    /// merged into the alias entry the way yarn writes them; two entries
+    /// with one `resolution:` fail every `yarn install --immutable`.
+    #[tokio::test]
+    async fn revert_merges_into_an_alias_entry_added_after_vendoring() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let checksum = "3fb59c76e281a2f5c810ad71dbbb8eba8b10c6cf94733dc7f27b8c516a5376cacea53543e76f6ae477d866c8954b27f1e15ca349424c2542474eb5bb1d2b6955";
+        let alias = format!(
+            "\"lp@npm:left-pad@1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  \
+             checksum: 10c0/{checksum}\n  languageName: node\n  linkType: hard\n\n"
+        );
+        let vendored = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        let with_alias = vendored.replacen(
+            "\"vendor-spike@workspace:.\":",
+            &format!("{alias}\"vendor-spike@workspace:.\":"),
+            1,
+        );
+        assert_ne!(with_alias, vendored);
+        tokio::fs::write(fx.lock_path(), &with_alias).await.unwrap();
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            B3_BEFORE_LOCK.replace(
+                "\"left-pad@npm:1.3.0\":",
+                "\"left-pad@npm:1.3.0, lp@npm:left-pad@1.3.0\":"
+            ),
+            "the restored entry and the alias entry are one entry"
+        );
+        assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), fx.pkg_bytes);
     }
 
     #[tokio::test]

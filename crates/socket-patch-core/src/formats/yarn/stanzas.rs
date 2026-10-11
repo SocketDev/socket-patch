@@ -82,6 +82,60 @@ pub(crate) fn stanza_lines(stanza: &str) -> Vec<String> {
     stanza.lines().map(str::to_string).collect()
 }
 
+/// Fold each `restored` stanza into another stanza with the same
+/// `resolution:` (#1082), and say whether any was. A descriptor added
+/// while a pin or vendored wiring routed the package elsewhere (a
+/// workspace member's range, an `npm:` alias) got its own registry entry;
+/// once the original entry is back, yarn writes the two as one entry
+/// keyed by every descriptor, sorted, and `--immutable` rejects a lock
+/// that keeps them apart (YN0028). The entry yarn wrote keeps its body;
+/// the restored one only adds its keys. The merged key goes to `moved`,
+/// for [`BerryStanzas::render`] to sort.
+pub(crate) fn merge_same_resolution(
+    stanzas: &mut Vec<String>,
+    restored: &[usize],
+    moved: &mut Vec<String>,
+) -> bool {
+    use super::blocks::berry_field;
+    use super::patterns::split_berry_key_patterns;
+
+    let resolution_of =
+        |stanza: &str| berry_field(&stanza_lines(stanza), "resolution").map(str::to_string);
+    let mut dropped: Vec<usize> = Vec::new();
+    for &idx in restored {
+        let Some(resolution) = resolution_of(&stanzas[idx]) else {
+            continue;
+        };
+        let Some(sibling) = (0..stanzas.len()).find(|&j| {
+            j != idx
+                && !dropped.contains(&j)
+                && sort_key(&stanzas[j]).is_some()
+                && resolution_of(&stanzas[j]).as_deref() == Some(resolution.as_str())
+        }) else {
+            continue;
+        };
+        let mut patterns: Vec<String> = [&stanzas[sibling], &stanzas[idx]]
+            .iter()
+            .flat_map(|s| split_berry_key_patterns(stanza_key(s).unwrap_or("")))
+            .collect();
+        patterns.sort();
+        patterns.dedup();
+        let old_key = stanza_key(&stanzas[idx]).unwrap_or("").to_string();
+        moved.retain(|k| *k != old_key);
+        let key = format!("\"{}\"", patterns.join(", "));
+        let mut lines = stanza_lines(&stanzas[sibling]);
+        lines[0] = format!("{key}:");
+        stanzas[sibling] = lines.join("\n");
+        moved.push(key);
+        dropped.push(idx);
+    }
+    dropped.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in &dropped {
+        stanzas.remove(*idx);
+    }
+    !dropped.is_empty()
+}
+
 /// A stanza's sort key: its unquoted key, or `None` for header comment
 /// runs and `__metadata`.
 fn sort_key(stanza: &str) -> Option<&str> {
