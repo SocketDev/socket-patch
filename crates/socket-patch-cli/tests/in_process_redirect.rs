@@ -5325,6 +5325,89 @@ async fn yarn_berry_rollback_keeps_a_bare_locator_for_conventional_urls() {
     assert!(!restored.contains("__archiveUrl"), "{restored}");
 }
 
+/// #1082: a descriptor added after pinning (a workspace member's plain
+/// `NAME: VERSION`, or an `npm:` alias) gets its own registry entry beside
+/// the hosted one. `rollback` and `remove` restore the hosted entry into
+/// that entry, the way yarn merges two entries with one resolution, so a
+/// fresh `yarn install --immutable` accepts the lock; two blocks sharing a
+/// `resolution:` fail it with YN0028.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_unwind_merges_into_a_registry_entry_added_after_pinning() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    mock_reference_with_berry_url(&server, &hosted_url).await;
+    mock_view(&server).await;
+    mock_npm_registry_advertising(
+        &server,
+        &vlt_hosted_common::sha512_sri(&upstream_tarball()),
+        &format!(
+            "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+            server.uri()
+        ),
+    )
+    .await;
+    let checksum = socket_patch_core::vendor::test_support::service_fixture::berry_checksum(
+        &upstream_tarball(),
+        NAME,
+    )
+    .unwrap();
+    let block = |key: &str| {
+        format!(
+            "\n{key}:\n  version: {VERSION}\n  resolution: \"{NAME}@npm:{VERSION}\"\n  \
+             checksum: {checksum}\n  languageName: node\n  linkType: hard\n"
+        )
+    };
+    let plain = format!("\"{NAME}@npm:{VERSION}\"");
+    let alias = format!("\"lp@npm:{NAME}@{VERSION}\"");
+    for (added, merged) in [
+        (
+            plain.clone(),
+            format!("\"{NAME}@npm:{VERSION}, {NAME}@npm:^{VERSION}\":"),
+        ),
+        (
+            alias.clone(),
+            format!("\"{NAME}@npm:^{VERSION}, lp@npm:{NAME}@{VERSION}\":"),
+        ),
+    ] {
+        for command in ["rollback", "remove"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_berry_project(tmp.path());
+            let env = run_redirect_subprocess_with(
+                tmp.path(),
+                &server.uri(),
+                &["--patch-server-url", &server.uri()],
+            );
+            assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
+            let lock_path = tmp.path().join("yarn.lock");
+            let pinned = std::fs::read_to_string(&lock_path).unwrap();
+            std::fs::write(&lock_path, format!("{pinned}{}", block(&added))).unwrap();
+
+            let args: &[&str] = if command == "rollback" {
+                &["rollback"]
+            } else {
+                &["remove", PURL]
+            };
+            let (code, env) = hosted_unwind_json(tmp.path(), &server, &server.uri(), args);
+            assert_eq!(code, Some(0), "{command} {added}: {env:#}");
+            let restored = std::fs::read_to_string(&lock_path).unwrap();
+            assert_eq!(
+                restored
+                    .matches(&format!("resolution: \"{NAME}@npm:{VERSION}\""))
+                    .count(),
+                1,
+                "{command} {added}: one entry per resolution:\n{restored}"
+            );
+            assert_eq!(restored.matches(&merged).count(), 1, "{restored}");
+            assert!(!restored.contains(&format!("\n{added}:")), "{restored}");
+            assert!(!restored.contains(&hosted_url), "{restored}");
+            let pkg = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
+            assert!(!pkg.contains("resolutions"), "{pkg}");
+        }
+    }
+}
+
 /// #908: the restore reads `dist.tarball` from the registry the project
 /// resolves against (`.yarnrc.yml` `npmRegistryServer`), not from the
 /// default registry. A mirror whose tarball URLs are off the conventional

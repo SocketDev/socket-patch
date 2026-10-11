@@ -886,6 +886,7 @@ async fn restore_berry(
     let dists = fetch_dists_on(&wanted, registry, ctx, result).await;
     let mut changed = false;
     let mut moved: Vec<String> = Vec::new();
+    let mut restored: Vec<usize> = Vec::new();
     for Hit {
         idx,
         uuid,
@@ -1003,11 +1004,13 @@ async fn restore_berry(
             }
         }
         result.handled.insert(uuid);
+        restored.push(idx);
         changed = true;
     }
     if !changed {
         return;
     }
+    merge_same_resolution(&mut blocks, &restored, &mut moved);
     if pkg_changed {
         if let (Some(text), Some(value)) = (pkg_text.as_deref(), pkg.as_mut()) {
             if let Some(obj) = value.as_object_mut() {
@@ -1035,6 +1038,54 @@ async fn restore_berry(
     }
     doc.stanzas = blocks;
     view.write(rel, doc.render(&moved));
+}
+
+/// Fold each restored berry entry into another entry of `blocks` with the
+/// same `resolution:` (#1082). A descriptor added after the hosted pin (a
+/// workspace member's range, an `npm:` alias) got its own registry entry,
+/// because no selector routed it to the tarball; once the pin is gone,
+/// yarn writes the two as one entry keyed by every descriptor, sorted,
+/// and `--immutable` rejects a lock that keeps them apart (YN0028). The
+/// entry yarn wrote keeps its body; the restored one only adds its keys.
+fn merge_same_resolution(blocks: &mut Vec<String>, restored: &[usize], moved: &mut Vec<String>) {
+    use crate::formats::yarn::blocks::berry_field;
+    use crate::formats::yarn::patterns::split_berry_key_patterns;
+    use crate::formats::yarn::stanzas::{stanza_key, stanza_lines};
+
+    let resolution_of =
+        |block: &str| berry_field(&stanza_lines(block), "resolution").map(str::to_string);
+    let mut dropped: Vec<usize> = Vec::new();
+    for &idx in restored {
+        let Some(resolution) = resolution_of(&blocks[idx]) else {
+            continue;
+        };
+        let Some(sibling) = (0..blocks.len()).find(|&j| {
+            j != idx
+                && !dropped.contains(&j)
+                && stanza_key(&blocks[j]).is_some_and(|k| k != "__metadata")
+                && resolution_of(&blocks[j]).as_deref() == Some(resolution.as_str())
+        }) else {
+            continue;
+        };
+        let mut patterns: Vec<String> = [&blocks[sibling], &blocks[idx]]
+            .iter()
+            .flat_map(|b| split_berry_key_patterns(stanza_key(b).unwrap_or("")))
+            .collect();
+        patterns.sort();
+        patterns.dedup();
+        let old_key = stanza_key(&blocks[idx]).unwrap_or("").to_string();
+        moved.retain(|k| *k != old_key);
+        let key = format!("\"{}\"", patterns.join(", "));
+        let mut lines = stanza_lines(&blocks[sibling]);
+        lines[0] = format!("{key}:");
+        blocks[sibling] = lines.join("\n");
+        moved.push(key);
+        dropped.push(idx);
+    }
+    dropped.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in dropped {
+        blocks.remove(idx);
+    }
 }
 
 /// Retire the leftover hosted `resolutions` selectors of a yarn berry root
