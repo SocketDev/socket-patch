@@ -8,10 +8,9 @@
 //! Modeled on `scan_vendor_e2e.rs` (mock API + real fixture through the
 //! built binary).
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -81,19 +80,11 @@ fn seed_vendored_cargo_with_corrupt_ledger(root: &Path) {
     std::fs::write(socket.join("vendor/state.json"), b"{\"entries\": {").unwrap();
 }
 
-/// Spawn the built binary in `root` with the ambient `SOCKET_*` surface
-/// scrubbed and telemetry killed (same posture as `scan_vendor_e2e.rs`).
+/// Spawn the built binary in `root` with the hermetic `SOCKET_*`
+/// environment (ambient vars scrubbed, telemetry killed).
 fn run_cli(root: &Path, argv: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(argv).current_dir(root);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run");
     (
         out.status.code().unwrap_or(-1),

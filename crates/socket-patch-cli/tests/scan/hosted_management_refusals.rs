@@ -10,6 +10,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::common::hermetic;
+
 use serde_json::Value;
 use wiremock::MockServer;
 
@@ -17,14 +19,7 @@ const PATCH: &str = "11111111-1111-4111-8111-111111111111";
 const GRANT: &str = "22222222-2222-4222-8222-222222222222";
 
 fn cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
-    cmd
+    hermetic::binary_command()
 }
 
 fn lock(resolved: &str, integrity: &str) -> String {

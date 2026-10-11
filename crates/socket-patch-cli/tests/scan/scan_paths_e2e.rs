@@ -2,9 +2,9 @@
 //! a local `wiremock` server.
 //!
 //! Spawns the real `socket-patch` binary (same recipe as
-//! `scan_invariants.rs`, with `rollback_invariants.rs`'s SOCKET_* env
-//! scrub) and pins the CONTRACT of path-scoped scans (the scoping bullets
-//! describe agent mode, where PATHS are installed-path globs):
+//! `scan_invariants.rs`, with the hermetic `SOCKET_*` environment) and
+//! pins the CONTRACT of path-scoped scans (the scoping bullets describe
+//! agent mode, where PATHS are installed-path globs):
 //!
 //! * scoping narrows the API QUERY (batch-POST body oracle) and the
 //!   envelope counters, echoing the patterns in an always-present `paths`
@@ -20,7 +20,7 @@
 //!   under `--json` or `--vex`, or an unparseable glob is a usage error
 //!   (exit 2).
 
-use crate::common::binary;
+use crate::common::{binary, hermetic_command};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,26 +32,17 @@ const ORG: &str = "test-org";
 const ROOT_PURL: &str = "pkg:npm/root-dep@1.0.0";
 const APP_PURL: &str = "pkg:npm/app-dep@1.0.0";
 
-/// A `scan` command with the full `SOCKET_*` environment scrubbed (except
-/// the workspace-pinned `SOCKET_NO_CONFIG`) and the working directory
-/// pinned — the `rollback_invariants.rs` recipe, so no test can be
-/// satisfied (or broken) by ambient environment instead of its flags.
+/// A `scan` command with the hermetic `SOCKET_*` environment and the
+/// working directory pinned, so no test can be satisfied (or broken) by
+/// ambient environment instead of its flags.
 /// `VIRTUAL_ENV` is scrubbed too: the python crawler honors it FIRST, so
 /// an activated venv would inject its site-packages into every scan and
 /// break the exact-batch-body oracles (see `in_process_scan.rs`).
 /// Telemetry is disabled so the request log holds ONLY patch-API traffic.
 fn scan_cmd(cwd: &Path) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("scan").current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
     cmd.env_remove("VIRTUAL_ENV");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     cmd
 }
 

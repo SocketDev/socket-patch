@@ -6,12 +6,14 @@
 //! mid-run downgrade to the proxy keeps the chunk boundaries the run started
 //! with.
 //!
-//! Subprocess runs scrub the `SOCKET_*` environment (the
-//! `scan_ordered_concurrency_e2e.rs::scrubbed_cli` pattern) so ambient
-//! configuration cannot reroute the branch under test.
+//! Subprocess runs use the hermetic `SOCKET_*` environment
+//! (`common/hermetic.rs`) so ambient configuration cannot reroute the
+//! branch under test.
 
 use std::path::Path;
 use std::process::Command;
+
+use crate::common::hermetic;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -23,15 +25,8 @@ const PROXY_BATCH_ROUTE: &str = "/patch/batch";
 const BODY_CAP: usize = 256 * 1024;
 
 fn scrubbed_cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&key);
-        }
-    }
+    let mut cmd = hermetic::binary_command();
     cmd.env_remove("VIRTUAL_ENV");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     cmd
 }
 

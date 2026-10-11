@@ -7,10 +7,9 @@
 //! depending on the live Socket API. The real-API end-to-end suite
 //! lives in `e2e_scan.rs` (gated behind `#[ignore]`).
 
-use crate::common::binary;
+use crate::common::{binary, hermetic_command};
 
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -48,7 +47,7 @@ fn run_scan(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) 
         ORG_SLUG,
     ];
     args.extend_from_slice(extra);
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args(&args)
         .current_dir(cwd)
         .output()

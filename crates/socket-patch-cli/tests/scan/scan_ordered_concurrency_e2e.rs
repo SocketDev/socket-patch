@@ -10,12 +10,14 @@
 //! output. Where a pure oracle exists, the output is also compared with a
 //! zero-latency run of the same fixture.
 //!
-//! Subprocess runs scrub the `SOCKET_*` environment (the
-//! `in_process_redirect.rs::scrubbed_cli` pattern) so ambient
-//! configuration cannot reroute the branch under test.
+//! Subprocess runs use the hermetic `SOCKET_*` environment
+//! (`common/hermetic.rs`) so ambient configuration cannot reroute the
+//! branch under test.
 
 use std::path::Path;
 use std::process::Command;
+
+use crate::common::hermetic;
 use std::time::Duration;
 
 use wiremock::matchers::{body_string_contains, method, path};
@@ -55,21 +57,8 @@ fn encode_purl(purl: &str) -> String {
 }
 
 fn scrubbed_cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_ECOSYSTEMS", "cargo")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
-        .env_remove("SOCKET_DRY_RUN")
-        .env_remove("SOCKET_ECOSYSTEMS")
-        .env_remove("SOCKET_MANIFEST_PATH");
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&key);
-        }
-    }
+    let mut cmd = hermetic::binary_command();
     cmd.env_remove("VIRTUAL_ENV");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     cmd
 }
 

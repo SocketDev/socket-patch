@@ -23,6 +23,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::common::hermetic_command;
+
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -34,20 +36,13 @@ fn binary() -> PathBuf {
 }
 
 /// A `socket-patch` command rooted at `cwd` with every ambient `SOCKET_*`
-/// env var scrubbed (same rationale as `repair_invariants.rs`: an ambient
+/// env var scrubbed by `hermetic_command` (same rationale as `repair_invariants.rs`: an ambient
 /// `SOCKET_OFFLINE`/`SOCKET_JSON`/`SOCKET_SILENT` would flip the very
 /// loud-vs-quiet branches this suite exists to pin). Tests re-seed only
 /// what they deliberately control via `.env()` after this scrub.
 fn socket_cmd(cwd: &Path) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.current_dir(cwd);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("SOCKET_")
-            && name.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(name);
-        }
-    }
     cmd
 }
 

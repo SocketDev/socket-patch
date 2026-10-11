@@ -1,13 +1,12 @@
 //! Scan vendoring previews, lock failures and corrupt legacy manifests.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::process::Command;
 
 use fs2::FileExt;
 use wiremock::matchers::{method, path};
@@ -157,21 +156,12 @@ async fn mount_empty_discovery(mock: &MockServer) {
         .await;
 }
 
-/// Spawn the built binary in `root`, hermetically (the
-/// `scan_vendor_e2e.rs` pattern): scrub the ambient `SOCKET_*` surface so
-/// a developer's shell can't steer the child, then force the telemetry
-/// kill-switch so no run ever phones the live API.
+/// Spawn the built binary in `root` with the hermetic `SOCKET_*`
+/// environment: a developer's shell can't steer the child, and the forced
+/// telemetry kill-switch keeps any run from phoning the live API.
 fn run_cli(root: &Path, argv: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(argv).current_dir(root);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run");
     (
         out.status.code().unwrap_or(-1),

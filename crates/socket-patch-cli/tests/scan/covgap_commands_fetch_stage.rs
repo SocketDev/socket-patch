@@ -17,7 +17,8 @@
 //! human-mode (non-quiet) output shape and the mem-stager arms.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use crate::common::hermetic_command;
 
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
@@ -43,21 +44,12 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Spawn the built binary in `root` with a scrubbed `SOCKET_*` surface
-/// (prefix scrub — fixed lists rot), the telemetry kill-switch forced,
-/// and `extra_env` injected last so deliberate seeds survive the scrub.
-/// Mirrors `scan_vendor_e2e.rs::run_cli_env`.
+/// Spawn the built binary in `root` with the hermetic `SOCKET_*`
+/// environment (ambient vars scrubbed, telemetry kill-switch forced) and
+/// `extra_env` injected last so deliberate seeds survive the scrub.
 fn run_cli_env(root: &Path, argv: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(argv).current_dir(root);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
