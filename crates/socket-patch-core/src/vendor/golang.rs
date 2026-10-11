@@ -181,6 +181,18 @@ pub(crate) async fn service_preflight(
         .await
         .ok()
         .filter(|p| !p.copy_was_ok)?;
+    // `vendor_go_module` refuses a version the build doesn't select before
+    // it asks the service for anything (#392).
+    if crate::patch::redirect::golang_local::selection_refusal(
+        project_root,
+        &prelude.module,
+        &prelude.version,
+    )
+    .await
+    .is_some()
+    {
+        return None;
+    }
     // `go_service_redirect` extracts the module zip (its literal
     // `{module}@{version}/` prefix stripped) into the copy dir's stage.
     let prefix = format!("{}@{}/", prelude.module, prelude.version);
@@ -817,6 +829,11 @@ mod tests {
         };
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
+        // A go 1.16 go.mod listing no version of the module: neither
+        // version is shown unselected, so both ask for a grant.
+        tokio::fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.16\n")
+            .await
+            .unwrap();
         let server = wiremock::MockServer::start().await;
         mount_no_results(&server).await;
         let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Service, false);
@@ -909,6 +926,37 @@ mod tests {
                 )
             }
         }
+    }
+
+    /// #392 (vendored variant): in the go 1.16 graph where go.sum shows the
+    /// build selects v1.5.0, vendoring a v1.4.2 patch would commit a replace
+    /// go ignores. Refuse before fetching or writing anything.
+    #[tokio::test]
+    async fn test_vendor_refuses_a_version_the_build_does_not_select() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let go_mod = "module example.com/app\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n";
+        tokio::fs::write(root.join("go.mod"), go_mod).await.unwrap();
+        tokio::fs::write(
+            root.join("go.sum"),
+            "github.com/foo/bar v1.4.2/go.mod h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+             github.com/foo/bar v1.5.0 h1:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\n",
+        )
+        .await
+        .unwrap();
+        let outcome = run_vendor(PURL, root, &blobs, &pristine, &record, false).await;
+        let detail = expect_refused(outcome, "vendor_go_version_not_selected");
+        assert!(
+            detail.contains("the build selects github.com/foo/bar v1.5.0"),
+            "{detail}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
+            go_mod
+        );
+        assert!(!root.join(".socket/vendor").exists());
     }
 
     #[tokio::test]
