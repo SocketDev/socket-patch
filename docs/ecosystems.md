@@ -248,7 +248,15 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   downloads the served tarball to read it. If that download fails, the patch
   is skipped as `npm_manifest_unavailable`. A user-authored `resolutions` entry for the package
   is never overwritten (`redirect_yarn_berry_resolutions_conflict`), and
-  `.yarnrc.yml`'s `compressionLevel` must stay 0. The node-modules linker
+  `.yarnrc.yml`'s `compressionLevel` must stay 0. A range of the package
+  added after the pin (say a workspace member's `"left-pad": "1.3.0"`) is not
+  routed by any selector, so yarn locks it as a separate registry entry and
+  installs that copy unpatched; re-running `scan --mode hosted` adds a selector
+  for it and folds its entry into the pinned one. `rollback` and `remove` merge
+  the restored registry entry into such an entry (or into an `npm:` alias entry
+  of the package), as yarn writes two entries with one resolution, so
+  `--immutable` installs keep passing; `vendor --revert` does the same for a
+  vendored package. The node-modules linker
   is e2e-covered; PnP is untested for hosted — the lock rewrite fires, but PnP's
   `.yarn/cache` resolution isn't exercised. CRLF locks — what yarn writes on Windows,
   and what a `core.autocrlf` checkout produces anywhere — are rewritten in their own

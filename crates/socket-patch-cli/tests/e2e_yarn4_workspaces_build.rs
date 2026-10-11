@@ -358,6 +358,15 @@ fn fresh_checkout_install(tmp: &Path, proj: &Path, yarnrc: &str) -> (PathBuf, Ou
         fresh.join("packages/app/package.json"),
     )
     .unwrap();
+    // The member a test adds after pinning (#1082).
+    if proj.join("packages/b").is_dir() {
+        std::fs::create_dir_all(fresh.join("packages/b")).unwrap();
+        std::fs::copy(
+            proj.join("packages/b/package.json"),
+            fresh.join("packages/b/package.json"),
+        )
+        .unwrap();
+    }
     std::fs::copy(proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
     std::fs::write(fresh.join(".yarnrc.yml"), yarnrc).unwrap();
     // v5 hosted mode may leave no `.socket/` at all (no ledger, no manifest).
@@ -372,6 +381,104 @@ fn fresh_checkout_install(tmp: &Path, proj: &Path, yarnrc: &str) -> (PathBuf, Ou
         &[("YARN_GLOBAL_FOLDER", fresh_global.to_str().unwrap())],
     );
     (fresh, ci)
+}
+
+/// The patch API mocks and the hosted tarball route yarn hits at install
+/// time; returns the hosted tarball URL.
+async fn mount_hosted_api(
+    server: &MockServer,
+    checksum: &str,
+    orig: &[u8],
+    patched: &[u8],
+    tgz: &[u8],
+) -> String {
+    let hosted_url = format!(
+        "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
+        server.uri()
+    );
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": PURL,
+                "patches": [{
+                    "uuid": UUID, "purl": PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "workspaces hosted capstone fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": hosted_url,
+                    "purl": PURL,
+                    "artifacts": [
+                        { "kind": "tarball", "url": hosted_url,
+                          "integrity": { "sha512": "sha512-unused-by-berry==" } },
+                        { "kind": "yarn-berry-zip", "url": hosted_url,
+                          "integrity": { "yarnBerry10c0": checksum } }
+                    ],
+                    "registryOverride": null
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "package/index.js": {
+                    "beforeHash": compute_git_sha256_from_bytes(orig),
+                    "afterHash": compute_git_sha256_from_bytes(patched),
+                }
+            },
+            "vulnerabilities": {
+                GHSA: {
+                    "cves": [CVE], "summary": "workspaces capstone vuln",
+                    "severity": "high", "description": "d"
+                }
+            },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(tgz.to_vec(), "application/octet-stream"),
+        )
+        .mount(server)
+        .await;
+
+    hosted_url
 }
 
 // ── hosted capstone ───────────────────────────────────────────────────
@@ -410,91 +517,7 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
     // API mocks + the hosted tarball route yarn will hit at install time.
     let server = MockServer::start().await;
     let host = server.uri().replace("http://", "").replace("https://", "");
-    let hosted_url = format!(
-        "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
-        server.uri()
-    );
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "packages": [{
-                "purl": PURL,
-                "patches": [{
-                    "uuid": UUID, "purl": PURL, "tier": "free",
-                    "cveIds": [], "ghsaIds": [], "severity": "high",
-                    "title": "workspaces hosted capstone fixture"
-                }]
-            }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG}/patches/by-package/.+$"
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "patches": [{
-                "uuid": UUID, "purl": PURL,
-                "publishedAt": "2026-01-01T00:00:00Z",
-                "description": "x", "license": "MIT", "tier": "free",
-                "vulnerabilities": {}
-            }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": {
-                UUID: {
-                    "status": "granted",
-                    "url": hosted_url,
-                    "purl": PURL,
-                    "artifacts": [
-                        { "kind": "tarball", "url": hosted_url,
-                          "integrity": { "sha512": "sha512-unused-by-berry==" } },
-                        { "kind": "yarn-berry-zip", "url": hosted_url,
-                          "integrity": { "yarnBerry10c0": checksum } }
-                    ],
-                    "registryOverride": null
-                }
-            }
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": compute_git_sha256_from_bytes(&orig),
-                    "afterHash": compute_git_sha256_from_bytes(&patched),
-                }
-            },
-            "vulnerabilities": {
-                GHSA: {
-                    "cves": [CVE], "summary": "workspaces capstone vuln",
-                    "severity": "high", "description": "d"
-                }
-            },
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz"
-        )))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(tgz.clone(), "application/octet-stream"),
-        )
-        .mount(&server)
-        .await;
+    let hosted_url = mount_hosted_api(&server, &checksum, &orig, &patched, &tgz).await;
 
     let root_pkg_before = std::fs::read(proj.join("package.json")).unwrap();
     let member_pkg_before = std::fs::read(proj.join("packages/app/package.json")).unwrap();
@@ -648,6 +671,229 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
         pnp_cell: true,
     };
     yarn_berry_common::off_runtime(|| yarn_berry_common::run_manifestless_vex_matrix(&flow));
+}
+
+/// #1082 with a real yarn: a member added after the hosted pin depends on
+/// `left-pad@^1.3.0`, which no selector routes, so yarn locks a separate
+/// registry entry and installs that copy unpatched. A re-scan folds it
+/// into the pin (a fresh `--immutable` install then gets the patched bytes
+/// only), and `rollback` leaves the one merged registry entry yarn writes,
+/// so a fresh `--immutable` install of the restored lock passes (two
+/// entries sharing a resolution fail it with YN0028).
+#[tokio::test(flavor = "multi_thread")]
+async fn yarn4_hosted_pin_folds_a_member_added_later_and_rolls_back() {
+    if !has_corepack_pm(yarn_berry()) {
+        skip!(
+            "SKIP e2e_yarn4_workspaces_build (hosted, #1082): `corepack {}` unavailable",
+            yarn_berry()
+        );
+        return;
+    }
+    if !has_command("tar") {
+        skip!("SKIP e2e_yarn4_workspaces_build (hosted, #1082): `tar` not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let Some(orig) = install_workspace_fixture("hosted-1082", tmp.path(), &proj) else {
+        return;
+    };
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let registry_lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    let upstream_checksum = yarn_berry_common::yarn_written_checksum(&registry_lock)
+        .expect("the registry lock carries left-pad's checksum");
+    let global = tmp.path().join("yarn-global");
+    let global_env = [("YARN_GLOBAL_FOLDER", global.to_str().unwrap())];
+    let info = corepack(
+        &proj,
+        yarn_berry(),
+        &[
+            "npm",
+            "info",
+            &format!("{DEP}@{DEP_VERSION}"),
+            "--fields",
+            "dist",
+            "--json",
+        ],
+        &global_env,
+    );
+    if !info.status.success() {
+        skip!(
+            "SKIP e2e_yarn4_workspaces_build (hosted, #1082): `yarn npm info` failed:\n{}",
+            yarn_berry_common::yarn_output(&info)
+        );
+        return;
+    }
+    let info: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    let integrity = info["dist"]["integrity"].as_str().unwrap().to_string();
+
+    let tgz_path = tmp.path().join(format!("{DEP}-{DEP_VERSION}.tgz"));
+    build_patched_tgz(&proj.join("node_modules").join(DEP), &patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let Some(checksum) = bootstrap_berry_checksum(tmp.path(), &tgz_path) else {
+        return;
+    };
+    let server = MockServer::start().await;
+    let host = server.uri().replace("http://", "").replace("https://", "");
+    let host = host.split(':').next().unwrap_or("127.0.0.1").to_string();
+    let hosted_url = mount_hosted_api(&server, &checksum, &orig, &patched, &tgz).await;
+    // What `rollback` restores the registry entry's checksum from.
+    Mock::given(method("GET"))
+        .and(path(format!("/upstream/npm/{UUID}.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": DEP, "version": DEP_VERSION,
+            "integrity": integrity, "yarnBerry10c0": upstream_checksum,
+        })))
+        .mount(&server)
+        .await;
+    let scan = |label: &str| {
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "scan",
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                proj.to_str().unwrap(),
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+            ],
+        );
+        assert_eq!(code, 0, "{label}: stdout:\n{stdout}\nstderr:\n{stderr}");
+        let env: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(env["summary"]["applied"], 1, "{label}: {env}");
+        env
+    };
+    scan("first scan");
+
+    // A second member, added after pinning, with a range no selector routes.
+    std::fs::create_dir_all(proj.join("packages/b")).unwrap();
+    std::fs::write(
+        proj.join("packages/b/package.json"),
+        format!(r#"{{"name":"b","version":"1.0.0","dependencies":{{"{DEP}":"^{DEP_VERSION}"}}}}"#),
+    )
+    .unwrap();
+    let mut root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join("package.json")).unwrap()).unwrap();
+    root["workspaces"] = serde_json::json!(["packages/app", "packages/b"]);
+    std::fs::write(
+        proj.join("package.json"),
+        serde_json::to_string_pretty(&root).unwrap() + "\n",
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join(".yarnrc.yml"),
+        format!(
+            "nodeLinker: node-modules\nenableGlobalCache: false\n\
+             unsafeHttpWhitelist:\n  - \"{host}\"\n"
+        ),
+    )
+    .unwrap();
+    let install = corepack(&proj, yarn_berry(), &["install"], &global_env);
+    assert!(
+        install.status.success(),
+        "{}",
+        yarn_berry_common::yarn_output(&install)
+    );
+    let drifted = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        drifted.contains(&format!("\"{DEP}@npm:^{DEP_VERSION}\":")),
+        "yarn locks the new range as its own registry entry:\n{drifted}"
+    );
+
+    let rollback = || {
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "rollback",
+                "--json",
+                "--yes",
+                "--cwd",
+                proj.to_str().unwrap(),
+                "--patch-server-url",
+                &server.uri(),
+            ],
+        );
+        assert_eq!(code, 0, "rollback: stdout:\n{stdout}\nstderr:\n{stderr}");
+        let restored = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+        assert!(
+            restored.contains(&format!(
+                "\"{DEP}@npm:{DEP_VERSION}, {DEP}@npm:^{DEP_VERSION}\":"
+            )),
+            "{restored}"
+        );
+        assert!(!restored.contains(&hosted_url), "{restored}");
+        let (fresh, ci) = fresh_checkout_install(
+            tmp.path(),
+            &proj,
+            "nodeLinker: node-modules\nenableGlobalCache: false\n",
+        );
+        assert!(
+            ci.status.success(),
+            "a fresh `--immutable` install of the rolled-back lock (YN0028 = two \
+             entries with one resolution):\n{}",
+            yarn_berry_common::yarn_output(&ci)
+        );
+        assert_eq!(
+            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+            orig
+        );
+        std::fs::remove_dir_all(&fresh).unwrap();
+    };
+
+    // Rolled back as it stands: the restored entry merges into the new one.
+    let drifted_pkg = std::fs::read(proj.join("package.json")).unwrap();
+    rollback();
+    eprintln!("#1082 ROLLBACK OF THE DRIFTED PIN OK");
+    std::fs::write(proj.join("package.json"), drifted_pkg).unwrap();
+    std::fs::write(proj.join("yarn.lock"), &drifted).unwrap();
+
+    // The re-scan folds it into the pin.
+    scan("re-scan");
+    let folded = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(!folded.contains(&format!("{DEP}@npm:")), "{folded}");
+    assert_eq!(
+        folded.matches(&format!("resolution: \"{DEP}@")).count(),
+        1,
+        "{folded}"
+    );
+    let root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        root["resolutions"],
+        serde_json::json!({
+            format!("{DEP}@npm:{DEP_VERSION}"): hosted_url,
+            format!("{DEP}@npm:^{DEP_VERSION}"): hosted_url,
+        })
+    );
+    let offline = format!(
+        "nodeLinker: node-modules\nenableGlobalCache: false\n\
+         unsafeHttpWhitelist:\n  - \"{host}\"\n\
+         npmRegistryServer: \"http://127.0.0.1:1\"\n"
+    );
+    let (fresh, ci) = fresh_checkout_install(tmp.path(), &proj, &offline);
+    assert!(
+        ci.status.success(),
+        "a fresh `--immutable` install of the folded pin:\n{}",
+        yarn_berry_common::yarn_output(&ci)
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        patched
+    );
+    assert!(!fresh.join("packages/b/node_modules").join(DEP).exists());
+    std::fs::remove_dir_all(&fresh).unwrap();
+    eprintln!("#1082 RE-SCAN FOLD OK");
+
+    rollback();
+    eprintln!("#1082 ROLLBACK OK");
 }
 
 // ── vendored capstone ─────────────────────────────────────────────────

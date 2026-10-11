@@ -4707,6 +4707,18 @@ fn rewrite_yarn_berry_with_manifests(
             });
             continue;
         }
+        // #1082: a descriptor added after pinning, which no selector routes,
+        // gets its own registry entry beside the one an earlier hosted run
+        // keyed by its tarball URL; the pin is what keeps yarn from merging
+        // them. Folding it in (one more selector, its entry dropped) is what
+        // yarn writes once the selector exists.
+        let mut folded: Vec<(usize, Vec<String>)> = Vec::new();
+        if targets.len() > 1 && targets.iter().filter(|(_, r)| r.is_empty()).count() == 1 {
+            let (url_entry, registry): (Vec<_>, Vec<_>) =
+                targets.drain(..).partition(|(_, r)| r.is_empty());
+            targets = url_entry;
+            folded = registry;
+        }
         if targets.len() > 1 {
             result.warnings.push(RewriteWarning {
                 code: "redirect_yarn_berry_ambiguous_entry".into(),
@@ -4789,7 +4801,16 @@ fn rewrite_yarn_berry_with_manifests(
             current_url.as_deref(),
             &dep.artifact_url,
         ) {
-            Ok(pin) => pin,
+            Ok(mut pin) => {
+                let folded_ranges: Vec<&str> = folded
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().map(String::as_str))
+                    .collect();
+                if !folded_ranges.is_empty() {
+                    pin.add_ranges(yarnrc, &fname, &folded_ranges);
+                }
+                pin
+            }
             Err(warning) => {
                 result.warnings.push(warning);
                 continue;
@@ -4821,6 +4842,9 @@ fn rewrite_yarn_berry_with_manifests(
         )
         .join("\n");
         cut.extend(cut_descriptors(&block, &rewritten));
+        for (idx, _) in &folded {
+            cut.extend(cut_descriptors(&blocks[*idx], &rewritten));
+        }
         for (selector, original) in pin.apply(manifest_obj, &dep.artifact_url) {
             manifest_changed = true;
             result.edits.push(FileEdit {
@@ -4851,6 +4875,20 @@ fn rewrite_yarn_berry_with_manifests(
             });
             blocks[target_idx] = rewritten;
             moved_keys.push(new_key);
+            changed = true;
+        }
+        // Highest index first, so the lower ones stay valid.
+        folded.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
+        for (idx, _) in folded {
+            let removed = blocks.remove(idx);
+            result.edits.push(FileEdit {
+                path: "yarn.lock".into(),
+                kind: "redirect_yarn_berry_entry_folded".into(),
+                action: "removed".into(),
+                key: stanza_key(&removed).map(|k| k.trim_matches('"').to_string()),
+                original: Some(Value::String(doc.on_disk(&removed).into_owned())),
+                new: None,
+            });
             changed = true;
         }
         result
@@ -4915,6 +4953,7 @@ fn rewrite_yarn_berry_with_manifests(
                     result.edits.retain(|e| {
                         e.kind != "redirect_yarn_berry_entry"
                             && e.kind != "redirect_yarn_berry_entry_pruned"
+                            && e.kind != "redirect_yarn_berry_entry_folded"
                             && e.kind != "redirect_yarn_berry_resolution"
                     });
                     for dep in &npm {
@@ -5018,6 +5057,20 @@ struct BerryResolutionsPin {
 }
 
 impl BerryResolutionsPin {
+    /// Route `ranges` too: the registry entries of descriptors added after
+    /// pinning, which the pin folds in (#1082), with their catalog
+    /// selectors.
+    fn add_ranges(&mut self, yarnrc: Option<&str>, name: &str, ranges: &[&str]) {
+        let mut added: Vec<String> = ranges.iter().map(|r| format!("{name}@{r}")).collect();
+        added.extend(berry_catalog_selectors(yarnrc, name, ranges));
+        for selector in added {
+            self.stale.retain(|s| *s != selector);
+            if !self.selectors.contains(&selector) {
+                self.selectors.push(selector);
+            }
+        }
+    }
+
     /// Write the pin into `manifest`: every selector routed to `url`, stale
     /// ones dropped, and an emptied `resolutions` table removed. Returns
     /// `(selector, previous value)` for each selector it added or changed.
@@ -10518,6 +10571,83 @@ mod tests {
             manifest["resolutions"],
             json!({"left-pad@npm:^1.3.0": new_url})
         );
+    }
+
+    /// #1082: a descriptor added after pinning (a workspace member's
+    /// `left-pad: 1.3.0`) gets its own registry entry beside the hosted
+    /// one, because no selector routes it. A re-run folds it into the pin:
+    /// one more selector, the registry entry gone, the URL entry kept. A
+    /// superseding uuid folds it the same way.
+    #[test]
+    fn yarn_berry_rerun_folds_a_descriptor_added_after_pinning() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut first,
+        );
+        let registry_block = format!(
+            "\n\"left-pad@npm:1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  \
+             checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+            "3".repeat(128)
+        );
+        let drifted = berry_files(
+            format!("{}{registry_block}", first.files["yarn.lock"]),
+            first.files["package.json"].clone(),
+        );
+        let newer_url = url.replace(BERRY_UUID, "22222222-2222-4222-8222-222222222222");
+        for (dep_url, gone) in [(&url, None), (&newer_url, Some(BERRY_UUID))] {
+            let dep = berry_override("left-pad", "1.3.0", dep_url, &checksum);
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(&drifted, std::slice::from_ref(&dep), &mut r);
+            assert!(
+                !r.warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_yarn_berry_ambiguous_entry"),
+                "{:?}",
+                r.warnings
+            );
+            assert!(r
+                .confirmed_yarn_berry_uuids
+                .contains(dep.patch_uuid.as_str()));
+            let out = &r.files["yarn.lock"];
+            assert!(out.contains(&format!("\"left-pad@{dep_url}\":")), "{out}");
+            assert!(!out.contains("left-pad@npm:1.3.0"), "{out}");
+            assert_eq!(out.matches("version: 1.3.0").count(), 1, "{out}");
+            if let Some(old) = gone {
+                assert!(!out.contains(old), "{out}");
+            }
+            let manifest: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
+            assert_eq!(
+                manifest["resolutions"],
+                json!({"left-pad@npm:^1.3.0": dep_url, "left-pad@npm:1.3.0": dep_url})
+            );
+            // The folded pin is complete: another run changes nothing.
+            let mut again = RewriteResult::default();
+            rewrite_yarn_berry(
+                &berry_files(out.clone(), r.files["package.json"].clone()),
+                std::slice::from_ref(&dep),
+                &mut again,
+            );
+            assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+            assert!(again.files.is_empty(), "{:?}", again.files);
+        }
+
+        // Two registry entries and no pin of ours stay ambiguous.
+        let two = berry_files(
+            format!("{}{registry_block}", berry_lock("10c0")),
+            berry_manifest(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&two, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_yarn_berry_ambiguous_entry"));
     }
 
     /// The URL-keyed lock entry alone is half a pin: with its manifest
