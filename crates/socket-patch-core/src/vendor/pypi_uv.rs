@@ -1487,7 +1487,7 @@ fn locate_lock_array(
 /// The two files this backend edits — both are checked for symlinks before
 /// any write (uv itself writes through a link; the atomic rename would
 /// replace it) and re-verified against the pre-flight snapshot.
-const UV_PAIR: [&str; 2] = ["pyproject.toml", "uv.lock"];
+pub(super) const UV_PAIR: [&str; 2] = ["pyproject.toml", "uv.lock"];
 
 /// Whether a header for this `[tool.uv…]` table would be socket-patch's own
 /// bytes once a key is added: the table is absent, or exists only

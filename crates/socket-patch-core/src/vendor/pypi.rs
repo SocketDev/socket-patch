@@ -1648,7 +1648,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
     let wired: Result<(Vec<_>, MetaSlot), (&'static str, String)> = match plan {
         WiringPlan::Uv(project, sibling) => {
             let lock_before = if sibling {
-                snapshot_files(project_root, UV_PAIR).await
+                snapshot_files(project_root, &super::pypi_uv::UV_PAIR).await
             } else {
                 Vec::new()
             };
@@ -2521,9 +2521,6 @@ fn residual_reference_warning(uuid: &str, clause: &str) -> VendorWarning {
         ),
     )
 }
-
-/// The files the uv wiring writes.
-const UV_PAIR: &[&str] = &["pyproject.toml", "uv.lock"];
 
 /// The bytes of each of `files` that is a regular file now, to put back
 /// with [`restore_files`].
