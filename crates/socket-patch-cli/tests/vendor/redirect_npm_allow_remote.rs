@@ -909,6 +909,61 @@ async fn replace_registry_host_rewriting_the_pin_is_warned() {
     );
 }
 
+/// #1233: npm env-replaces every config value, so
+/// `replace-registry-host=${RRH}` with `RRH=always` rewrites every hosted
+/// pin exactly like `=always`. The scan read the literal `${RRH}`, matched
+/// no host and stayed silent; it now warns in the project and user layers.
+#[tokio::test]
+async fn replace_registry_host_via_env_interpolation_is_warned() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+
+    // Project `.npmrc`.
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    std::fs::write(tmp.path().join(".npmrc"), "replace-registry-host=${RRH}\n").unwrap();
+    let (code, doc, _) =
+        scan_hosted_env(tmp.path(), &server.uri(), &["--json"], &[("RRH", "always")]);
+    assert_eq!(code, 0, "{doc:#}");
+    let detail = replace_host_warning(&doc).unwrap_or_else(|| panic!("no {REPLACE_HOST}: {doc:#}"));
+    assert!(
+        detail.contains("the project .npmrc sets `replace-registry-host=always`"),
+        "{detail}"
+    );
+
+    // User config.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    let user = cfg.path().join("user.npmrc");
+    std::fs::write(&user, "replace-registry-host=${RRH}\n").unwrap();
+    let user_s = user.to_str().unwrap();
+    let (code, doc, _) = scan_hosted_env(
+        tmp.path(),
+        &server.uri(),
+        &["--json"],
+        &[
+            ("NPM_CONFIG_USERCONFIG", user_s),
+            ("npm_config_userconfig", user_s),
+            ("RRH", "always"),
+        ],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    let detail = replace_host_warning(&doc).unwrap_or_else(|| panic!("no {REPLACE_HOST}: {doc:#}"));
+    assert!(
+        detail.contains("the user npm config") && detail.contains(user_s),
+        "{detail}"
+    );
+
+    // An unset `${RRH}` stays literal for npm too, and matches no host.
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    std::fs::write(tmp.path().join(".npmrc"), "replace-registry-host=${RRH}\n").unwrap();
+    let (code, doc, _) = scan_hosted_env(tmp.path(), &server.uri(), &["--json"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(replace_host_warning(&doc), None, "{doc:#}");
+}
+
 /// Review finding: `remove` dropped the hosted leg's warnings. A
 /// redirect-created `.npmrc` the user has since added to is no longer the
 /// scaffold, so the restore keeps it byte-for-byte and warns that the
