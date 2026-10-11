@@ -234,6 +234,16 @@ pub async fn vendor_go_module<'a>(
     };
     let (module, version) = (module.as_str(), version.as_str());
 
+    // A replace the go.work in effect would override, ignore or reject
+    // (#393, #458, #531): refuse before fetching or wiring anything.
+    if !record.files.is_empty() {
+        if let Some(refusal) =
+            super::go_consumer_sync::replace_refusal(project_root, module, version, &base_rel).await
+        {
+            return refused("vendor_go_workspace_conflict", refusal);
+        }
+    }
+
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // A healthy committed copy requires neither a local module cache nor the service.

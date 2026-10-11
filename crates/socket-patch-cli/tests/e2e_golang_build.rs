@@ -675,3 +675,307 @@ fn patched_go_mod_requirement_bump_needs_go_mod_tidy() {
 
     chmod_writable(tmp.path());
 }
+
+// ── the go.work in effect (#393, #458, #531) ─────────────────────────
+
+/// Workspace-mode go env: `-mod=mod` is rejected in workspace mode, so
+/// `GOFLAGS` is cleared (the consumers carry a tidy go.sum instead).
+fn workspace_env<'a>(modcache: &'a str, proxy_url: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut env = go_env(modcache, proxy_url);
+    env.retain(|(k, _)| *k != "GOFLAGS");
+    env.push(("GOFLAGS", ""));
+    env
+}
+
+/// A module at `dir` that requires the upstream and prints its greeting,
+/// with the go.sum `go mod tidy` writes (outside any workspace).
+fn consumer_module(dir: &Path, module: &str, modcache: &str, proxy_url: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("go.mod"),
+        format!("module {module}\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.go"),
+        format!(
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"{UMOD}\"\n)\n\nfunc main() {{ fmt.Println(\"OUT:\", upstream.Greeting()) }}\n"
+        ),
+    )
+    .unwrap();
+    let mut env = go_env(modcache, proxy_url);
+    env.push(("GOWORK", "off"));
+    let tidy = go(dir, &["mod", "tidy"], &env);
+    assert!(
+        tidy.status.success(),
+        "go mod tidy: {}",
+        String::from_utf8_lossy(&tidy.stderr)
+    );
+}
+
+fn go_out(dir: &Path, env: &[(&str, &str)]) -> String {
+    let out = go(dir, &["run", "."], env);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+fn apply_json(dir: &Path, modcache: &Path) -> (i32, String, String) {
+    run_socket(
+        dir,
+        &[
+            "apply",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--json",
+            "--cwd",
+            dir.to_str().unwrap(),
+        ],
+        modcache,
+    )
+}
+
+fn check(dir: &Path, modcache: &Path) -> (i32, String, String) {
+    run_socket(
+        dir,
+        &[
+            "apply",
+            "--check",
+            "--ecosystems",
+            "golang",
+            "--cwd",
+            dir.to_str().unwrap(),
+        ],
+        modcache,
+    )
+}
+
+/// Standalone `vex --json` over `dir`: must not attest the upstream patch
+/// and must say why (`go_workspace_override`).
+fn assert_vex_omits(dir: &Path, modcache: &Path, product: &str) {
+    let r = VexRun {
+        offline: true,
+        product: Some(product.into()),
+        ..VexRun::default()
+    }
+    .env("GOMODCACHE", modcache)
+    .env("GOFLAGS", "");
+    let out = run_vex(&vex_e2e_common::binary(), dir, &r);
+    assert_absent(out.doc.as_ref(), UPURL);
+    vex_e2e_common::assert_not_attested(&out.envelope, UPURL, "go_workspace_override");
+    assert!(
+        warnings_of(&out.stdout).contains(&"go_workspace_replace_ineffective".to_string()),
+        "{out}"
+    );
+}
+
+fn replace_lines(go_mod: &Path) -> Vec<String> {
+    std::fs::read_to_string(go_mod)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("replace "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// #393: a user `replace` of the module in go.work overrides any member
+/// replace. apply must refuse instead of reporting a patch the build
+/// doesn't link; a replace written before the go.work appeared fails
+/// `apply --check` and is left out of VEX.
+#[test]
+fn go_work_replace_overrides_the_socket_replace() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(go-work-replace)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy_url) = stage(tmp.path());
+    let mc = modcache.to_str().unwrap();
+    let mut tidy_env = go_env(mc, &proxy_url);
+    tidy_env.push(("GOWORK", "off"));
+    assert!(go(&consumer, &["mod", "tidy"], &tidy_env).status.success());
+    let fork = tmp.path().join("fork");
+    std::fs::create_dir_all(&fork).unwrap();
+    std::fs::write(fork.join("go.mod"), format!("module {UMOD}\n\ngo 1.21\n")).unwrap();
+    std::fs::write(
+        fork.join("lib.go"),
+        "package upstream\n\nfunc Greeting() string { return \"FORK\" }\n",
+    )
+    .unwrap();
+    let go_work = format!("go 1.21\n\nuse .\n\nreplace {UMOD} {UVER} => ../fork\n");
+    std::fs::write(consumer.join("go.work"), &go_work).unwrap();
+    let env = workspace_env(mc, &proxy_url);
+    assert!(go_out(&consumer, &env).contains("OUT: FORK"));
+
+    write_patch(&consumer);
+    // The dry run predicts the refusal.
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "apply",
+            "--offline",
+            "--dry-run",
+            "--ecosystems",
+            "golang",
+            "--json",
+            "--cwd",
+            consumer.to_str().unwrap(),
+        ],
+        &modcache,
+    );
+    assert_ne!(
+        code, 0,
+        "apply --dry-run must predict the refusal:\n{so}\n{se}"
+    );
+    assert!(so.contains("go.work replaces"), "{so}");
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_ne!(
+        code, 0,
+        "apply must refuse an overridden replace:\n{so}\n{se}"
+    );
+    assert!(so.contains("go.work replaces"), "{so}");
+    assert!(replace_lines(&consumer.join("go.mod")).is_empty());
+    assert!(
+        !consumer.join(".socket/go-patches").exists(),
+        "a refused apply leaves no copy behind"
+    );
+    assert!(go_out(&consumer, &env).contains("OUT: FORK"));
+
+    // Applied before the go.work replace existed: the replace is inert.
+    std::fs::remove_file(consumer.join("go.work")).unwrap();
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(code, 0, "apply without go.work:\n{so}\n{se}");
+    std::fs::write(consumer.join("go.work"), &go_work).unwrap();
+    assert!(go_out(&consumer, &env).contains("OUT: FORK"));
+    // A re-run doesn't call the inert replace in sync.
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_ne!(code, 0, "re-run apply must refuse:\n{so}\n{se}");
+    let (code, so, se) = check(&consumer, &modcache);
+    assert_eq!(
+        code, 1,
+        "apply --check must flag the inert replace:\n{so}\n{se}"
+    );
+    assert!(
+        se.contains("go_workspace_replace_ineffective") || se.contains("go.work replaces"),
+        "{se}"
+    );
+    assert_vex_omits(
+        &consumer,
+        &modcache,
+        "pkg:golang/example.com/consumer@v0.0.1",
+    );
+
+    chmod_writable(tmp.path());
+}
+
+/// #458: a go.work that doesn't `use` the project makes every workspace
+/// build ignore the project's go.mod, replace included.
+#[test]
+fn go_work_without_the_project_ignores_its_replace() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(go-work-not-member)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy_url) = stage(tmp.path());
+    let mc = modcache.to_str().unwrap();
+    let mut tidy_env = go_env(mc, &proxy_url);
+    tidy_env.push(("GOWORK", "off"));
+    assert!(go(&consumer, &["mod", "tidy"], &tidy_env).status.success());
+    let svc = consumer.join("svc");
+    consumer_module(&svc, "example.com/svc", mc, &proxy_url);
+    let go_work = "go 1.21\n\nuse ./svc\n";
+    std::fs::write(consumer.join("go.work"), go_work).unwrap();
+    let env = workspace_env(mc, &proxy_url);
+    assert!(go_out(&svc, &env).contains("OUT: PRISTINE"));
+
+    write_patch(&consumer);
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_ne!(code, 0, "apply must refuse an ignored replace:\n{so}\n{se}");
+    assert!(so.contains("does not `use` this module"), "{so}");
+    assert!(replace_lines(&consumer.join("go.mod")).is_empty());
+
+    // Applied before the go.work existed.
+    std::fs::remove_file(consumer.join("go.work")).unwrap();
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(code, 0, "apply without go.work:\n{so}\n{se}");
+    std::fs::write(consumer.join("go.work"), go_work).unwrap();
+    assert!(go_out(&svc, &env).contains("OUT: PRISTINE"));
+    let (code, so, se) = check(&consumer, &modcache);
+    assert_eq!(
+        code, 1,
+        "apply --check must flag the ignored replace:\n{so}\n{se}"
+    );
+    assert_vex_omits(
+        &consumer,
+        &modcache,
+        "pkg:golang/example.com/consumer@v0.0.1",
+    );
+
+    // Positive control: once go.work uses the project, the same replace
+    // works and nothing is flagged.
+    std::fs::write(
+        consumer.join("go.work"),
+        "go 1.21\n\nuse (\n\t.\n\t./svc\n)\n",
+    )
+    .unwrap();
+    assert!(go_out(&svc, &env).contains("OUT: PATCHED"));
+    let (code, so, se) = check(&consumer, &modcache);
+    assert_eq!(code, 0, "{so}\n{se}");
+
+    chmod_writable(tmp.path());
+}
+
+/// #531: two members replacing the same module@version with different
+/// directories break the whole workspace build ("conflicting
+/// replacements"). The second apply must refuse (the first member's
+/// replace already patches the whole workspace); two replaces written
+/// before the go.work appeared fail `apply --check` and VEX.
+#[test]
+fn go_work_member_replaces_must_not_conflict() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(go-work-conflict)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (_consumer, modcache, proxy_url) = stage(tmp.path());
+    let mc = modcache.to_str().unwrap();
+    let ws = tmp.path().join("ws");
+    let (a, b) = (ws.join("a"), ws.join("b"));
+    consumer_module(&a, "example.com/a", mc, &proxy_url);
+    consumer_module(&b, "example.com/b", mc, &proxy_url);
+    write_patch(&a);
+    write_patch(&b);
+    let go_work = "go 1.21\n\nuse (\n\t./a\n\t./b\n)\n";
+    std::fs::write(ws.join("go.work"), go_work).unwrap();
+    let env = workspace_env(mc, &proxy_url);
+
+    let (code, so, se) = apply_json(&a, &modcache);
+    assert_eq!(code, 0, "first member apply:\n{so}\n{se}");
+    assert!(go_out(&b, &env).contains("OUT: PATCHED"));
+    let (code, so, se) = apply_json(&b, &modcache);
+    assert_ne!(code, 0, "second member apply must refuse:\n{so}\n{se}");
+    assert!(so.contains("conflicting"), "{so}");
+    assert!(replace_lines(&b.join("go.mod")).is_empty());
+    let out = go_out(&b, &env);
+    assert!(
+        out.contains("OUT: PATCHED"),
+        "the workspace still builds: {out}"
+    );
+    let (code, so, se) = check(&a, &modcache);
+    assert_eq!(code, 0, "{so}\n{se}");
+
+    // Both applied before the go.work existed: the workspace can't build.
+    std::fs::remove_file(ws.join("go.work")).unwrap();
+    let (code, so, se) = apply_json(&b, &modcache);
+    assert_eq!(code, 0, "apply without go.work:\n{so}\n{se}");
+    std::fs::write(ws.join("go.work"), go_work).unwrap();
+    assert!(go_out(&b, &env).contains("conflicting replacements"));
+    for member in [&a, &b] {
+        let (code, so, se) = check(member, &modcache);
+        assert_eq!(code, 1, "apply --check must flag the conflict:\n{so}\n{se}");
+    }
+    assert_vex_omits(&b, &modcache, "pkg:golang/example.com/b@v0.0.1");
+
+    chmod_writable(tmp.path());
+}

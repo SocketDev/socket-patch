@@ -238,6 +238,16 @@ pub async fn apply_go_redirect<'a>(
         );
     }
 
+    // A replace the go.work in effect would override, ignore or reject
+    // (#393, #458, #531) leaves the build unpatched or broken: refuse before
+    // copying anything, dry run and in-sync re-run alike.
+    if let Some(refusal) =
+        crate::vendor::go_consumer_sync::replace_refusal(project_root, module, version, base_rel)
+            .await
+    {
+        return synthesized_result(purl, &copy_dir, Vec::new(), false, Some(refusal));
+    }
+
     if dry_run {
         // Verify (read-only) against the pristine source for an accurate
         // "would patch" report, without creating the copy or editing go.mod.

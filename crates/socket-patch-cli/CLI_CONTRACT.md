@@ -544,6 +544,11 @@ are patched by `socket-patch apply` like every other ecosystem:
   `go.sum`-verified, so in-place patching can't build). Commit `go.mod` + `.socket/go-patches/` + your
   `.socket/` patches so a clone builds the patched bytes with no further step. `socket-patch apply
   --check` is a read-only audit of the committed redirect.
+  When a `go.work` is in effect, `apply` and `vendor` refuse a `replace` that it would override (a
+  go.work `replace` of the module), ignore (the project isn't a `use` member) or reject (another member
+  replaces the same `module@version` elsewhere); one already written fails `apply --check` /
+  `vendor --check` and warns `go_workspace_replace_ineffective`, and `vex` omits the patch with
+  `go_workspace_override` (#393, #458, #531).
 
 ### sbt / Mill / scala-cli caches in agent mode
 
