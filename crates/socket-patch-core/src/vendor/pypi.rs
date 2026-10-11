@@ -6973,6 +6973,27 @@ wheels = [
         );
     }
 
+    /// A FIFO at pyproject.toml or hatch.toml must not wedge the Pipenv
+    /// pylock probe: it reads them as regular files only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipenv_pylock_probe_skips_a_fifo_hatch_file() {
+        use std::os::unix::ffi::OsStrExt;
+        for file in ["pyproject.toml", "hatch.toml"] {
+            let fx = pipenv_pylock_fixture().await;
+            let path = std::ffi::CString::new(fx.root.join(file).as_os_str().as_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "{file}");
+            let found = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                super::super::pypi_lock::pipenv_pylocks(&fx.root, "six", "1.16.0"),
+            )
+            .await
+            .expect("the probe must not block on a FIFO");
+            assert_eq!(found.len(), 1, "{file}: {found:?}");
+        }
+    }
+
     async fn read_json(root: &Path, name: &str) -> serde_json::Value {
         serde_json::from_str(&tokio::fs::read_to_string(root.join(name)).await.unwrap()).unwrap()
     }

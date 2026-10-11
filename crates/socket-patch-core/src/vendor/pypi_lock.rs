@@ -282,13 +282,13 @@ async fn load_listed_locks(
 /// pylock.toml` and pip read the pylock, so it is wired with the lock.
 /// A pylock Hatch derives from pyproject (locked environments) is Hatch's
 /// own, regenerated on its next sync, so it is left out (#479).
-fn pipenv_pylock_paths(root: &Path) -> Vec<String> {
+async fn pipenv_pylock_paths(root: &Path) -> Vec<String> {
     if !root.join("Pipfile").is_file() {
         return Vec::new();
     }
     let mut hatch_files = std::collections::BTreeMap::new();
     for file in crate::utils::hatch::HATCH_FILES {
-        if let Ok(text) = std::fs::read_to_string(root.join(file)) {
+        if let Ok(text) = read_regular_to_string(&root.join(file)).await {
             hatch_files.insert(file.to_string(), text);
         }
     }
@@ -324,7 +324,7 @@ pub(super) async fn pipenv_pylocks(
     version: &str,
 ) -> Vec<(String, PipenvPylock)> {
     let mut found = Vec::new();
-    for path in pipenv_pylock_paths(root) {
+    for path in pipenv_pylock_paths(root).await {
         let Ok(text) = read_file(&root.join(&path)).await else {
             found.push((path, PipenvPylock::Unwirable));
             continue;
