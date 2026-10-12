@@ -1014,14 +1014,16 @@ jobs:
           cargo test --locked -p socket-patch-cli --all-features --tests --no-run --message-format=json-render-diagnostics > target-build.json
 
       - name: Bundle the binaries the legs run
-        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
+        # A reused push runs no leg, except e2e-full and cargo-vex-matrix-full
+        # on ubuntu when CI_SCOPE is `full`.
+        if: needs.clippy.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
         shell: bash
         env:
           BUNDLE_OS: ${{ matrix.os }}
         run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/e2e-bin
 
       - name: Compress the e2e binaries
-        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
+        if: needs.clippy.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
         # Compress the bundle as one stream so identical Rust code across
         # test binaries shares a dictionary. Zstd is on every runner image.
         # The 128 MiB window cuts the Linux artifact from ~200 MB to ~94 MB;
@@ -1032,7 +1034,7 @@ jobs:
           tar -C target/e2e-bin -cf - . | zstd -q -f -10 --long=27 -o target/e2e-bin.tar.zst
 
       - uses: ./.github/actions/upload-artifact
-        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
+        if: needs.clippy.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
         with:
           name: e2e-bin-${{ matrix.os }}
           path: target/e2e-bin.tar.zst
@@ -1807,10 +1809,10 @@ jobs:
 
   # The PM-version legs with no boundary of their own: the middle uv lines,
   # Pipenv releases and .NET SDK majors, and bundler 2.7. Skipped
-  # on pull_request (the `e2e` rows keep every named boundary, the oldest
-  # and newest release of each tool and every vlt era there); main pushes,
-  # v5 landings, the nightly schedule and dispatch run them with the `e2e`
-  # steps.
+  # on pull_request, merge_group and main pushes (the `e2e` rows keep every
+  # named boundary, the oldest and newest release of each tool and every vlt
+  # era there); v5 landings, the nightly schedule and dispatch run them with
+  # the `e2e` steps, and so do main pushes when CI_SCOPE is `full`.
 
   # Each OS consumes only its own build. A queued macOS runner must not
   # delay Linux or Windows, and a Windows compile must not delay Gradle.
@@ -2262,7 +2264,7 @@ jobs:
           YARN_BERRY_RELEASE: ${{ matrix.yarn }}
         run: scripts/yarn-berry-vex-matrix.sh "$YARN_BERRY_RELEASE"
 
-  # Skipped on pull_request (except v5 landings), like e2e-full.
+  # Nightly, on dispatch and on v5 landings only, like e2e-full.
 
   # The macOS rows of `yarn-berry-e2e`: they run on main, the merge queue and
   # nightly, not on every PR push, so PRs stop queueing on the small
@@ -2304,7 +2306,7 @@ jobs:
   # plus macOS and Windows; 1.93.1 with its own lock (on every OS) is the
   # pinned rust-toolchain.toml cell `cargo test` used to give
   # e2e_safety_cargo_build. cargo-vex-matrix-full runs the rest of the
-  # toolchain x lock cross off pull_request. Each leg also runs
+  # toolchain x lock cross nightly and on dispatch. Each leg also runs
   # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
     if: needs.e2e-build.outputs.reuse != 'true'

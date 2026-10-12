@@ -91,9 +91,9 @@ The `yarn-berry-e2e` job in `.github/workflows/ci.yml` runs
 | macos-latest | 4.12.0 |
 | windows-latest | 4.12.0 |
 
-Pull requests skip ubuntu 4.6.0 and 4.12.0 (the `yarn-berry-full` job, which
-runs nightly and on dispatch, and on main pushes only when `CI_SCOPE` is
-`full`).
+Pull requests, the merge queue and main pushes skip ubuntu 4.6.0 and 4.12.0
+(the `yarn-berry-full` job, which runs nightly, on dispatch and on the v5
+integration PR, and on main pushes only when `CI_SCOPE` is `full`).
 
 Each release drives four real-yarn suites — `e2e_redirect_yarn_berry_build`,
 `e2e_vendor_yarn_berry_build`, `e2e_yarn4_pnpm_linker_build` and
