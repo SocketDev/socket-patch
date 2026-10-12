@@ -199,6 +199,34 @@ fn classify_dependency(p: &PoetryProject, canon_name: &str) -> &'static str {
     }
 }
 
+/// The pyproject's `source = "…"` constraint on `canon_name`, if any. Poetry
+/// records nothing in the lock for a package pinned to PyPI, so only the
+/// pyproject shows it (#1282).
+fn source_constraint(p: &PoetryProject, canon_name: &str) -> Option<String> {
+    crate::utils::poetry_lock::pyproject_source_constraint(p.pyproject_text.as_deref()?, canon_name)
+}
+
+/// The advisory for a source-constrained package wired over a lock that a
+/// Poetry outside 1.4 – 2.2 wrote: the writer installs it, but a 1.4 – 2.2
+/// installer would refuse it. [`check_target_guards`] refuses the 1.4 – 2.2
+/// writers outright.
+pub(super) fn source_constraint_warning(
+    p: &PoetryProject,
+    canon_name: &str,
+) -> Option<VendorWarning> {
+    let source = source_constraint(p, canon_name)?;
+    Some(VendorWarning::new(
+        "pypi_poetry_source_constraint",
+        format!(
+            "pyproject.toml pins {canon_name} to the {source:?} source (`source = \
+             {source:?}`): Poetry 1.4 – 2.2 refuse to install {LOCK_FILE} with that \
+             constraint once it sources {canon_name} from the vendored wheel (1.1 – 1.3 \
+             and 2.3+ install it); drop the `source` key if this project is installed \
+             with one of them"
+        ),
+    ))
+}
+
 /// Target-specific guards (also re-run by [`wire_poetry`] right before
 /// writing). The orchestrator runs them pre-flight so a refusal happens
 /// before the wheel artifact is built. Lock names match by PEP 503 canonical
@@ -277,6 +305,22 @@ pub(super) fn check_target_guards(
                  {version}; re-lock so the lock matches the installed version"
             ),
         ));
+    }
+    // A pyproject `source = "…"` pin breaks every install of the wired lock
+    // on Poetry 1.4 – 2.2; refuse when one of those wrote the lock (#1282).
+    if let Some(source) = source_constraint(p, canon_name) {
+        if crate::utils::poetry_lock::source_constraint_breaks_writer(&p.lock_text) {
+            return Err((
+                "pypi_poetry_source_constraint",
+                format!(
+                    "pyproject.toml pins {canon_name} to the {source:?} source (`source = \
+                     {source:?}`), and {LOCK_FILE} was written by Poetry 1.4 – 2.2, whose \
+                     installer refuses that constraint on a package the lock sources from \
+                     a file: every `poetry install` would fail. Drop the `source` key, or \
+                     upgrade to Poetry >= 2.3 and re-lock, then re-run"
+                ),
+            ));
+        }
     }
     Ok(PoetryTarget::Fresh)
 }
@@ -844,6 +888,67 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
                 .iter()
                 .any(|w| w.code == "pypi_poetry_integrity_unverified");
             assert_eq!(fired, expect, "{version}: {:?}", project.warnings);
+        }
+    }
+
+    /// A pyproject `source = "pypi"` constraint on the vendored package has
+    /// no trace in the lock. Rewiring it to a file source breaks every
+    /// `poetry install` on Poetry 1.4 – 2.2, so a lock stamped by one of
+    /// those is refused before the wheel is built; other writers wire it with
+    /// a warning (#1282).
+    #[tokio::test]
+    async fn source_constrained_dependency_is_refused_for_poetry_1_4_to_2_2() {
+        const PYPROJECT: &str = "[tool.poetry.dependencies]\n\
+            python = \">=3.8\"\n\
+            urllib3 = {version = \"1.26.18\", source = \"pypi\"}\n";
+        for (version, broken) in [
+            ("0.12.17", false),
+            ("1.1.15", false),
+            ("1.3.2", false),
+            ("1.4.2", true),
+            ("1.6.1", true),
+            ("1.8.5", true),
+            ("2.0.1", true),
+            ("2.2.1", true),
+            ("2.3.4", false),
+            ("2.4.3", false),
+        ] {
+            let native = std::fs::read_to_string(format!(
+                "{}/tests/fixtures/poetry/{version}/poetry.lock",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let tmp = write_project(&native, PYPROJECT).await;
+            let project = load_poetry_project(tmp.path()).await.unwrap();
+            let guard = check_target_guards(&project, "urllib3", "1.26.18", UUID);
+            if broken {
+                let Err((code, detail)) = guard else {
+                    panic!("{version}: wired a source-constrained dep");
+                };
+                assert_eq!(code, "pypi_poetry_source_constraint", "{version}");
+                assert!(detail.contains("source = \"pypi\""), "{version}: {detail}");
+            } else {
+                assert!(
+                    matches!(guard, Ok(PoetryTarget::Fresh)),
+                    "{version}: {guard:?}"
+                );
+                let warning = source_constraint_warning(&project, "urllib3");
+                assert!(
+                    warning.is_some_and(|w| w.code == "pypi_poetry_source_constraint"),
+                    "{version}"
+                );
+            }
+            // Without the constraint every writer wires silently.
+            let plain = write_project(&native, PYPROJECT_DIRECT).await;
+            let project = load_poetry_project(plain.path()).await.unwrap();
+            assert!(
+                matches!(
+                    check_target_guards(&project, "urllib3", "1.26.18", UUID),
+                    Ok(PoetryTarget::Fresh)
+                ),
+                "{version}"
+            );
+            assert!(source_constraint_warning(&project, "urllib3").is_none());
         }
     }
 

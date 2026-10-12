@@ -1063,6 +1063,10 @@ async fn pypi_prelude<'p>(
                 }
                 Ok(PoetryTarget::Fresh) => {
                     warnings.extend(project.warnings.iter().cloned());
+                    warnings.extend(super::pypi_poetry::source_constraint_warning(
+                        &project,
+                        &canon_name,
+                    ));
                     WiringPlan::Poetry(Box::new(project))
                 }
                 Err(refusal) => {
@@ -2422,7 +2426,10 @@ async fn fresh_pyproject_plan(
             let project = super::pypi_poetry::load_poetry_project(project_root).await?;
             match super::pypi_poetry::check_target_guards(&project, canon_name, version, uuid)? {
                 PoetryTarget::Fresh => {
-                    let warnings = project.warnings.clone();
+                    let mut warnings = project.warnings.clone();
+                    warnings.extend(super::pypi_poetry::source_constraint_warning(
+                        &project, canon_name,
+                    ));
                     Ok((WiringPlan::Poetry(Box::new(project)), warnings))
                 }
                 PoetryTarget::InSync => not_fresh("pypi_poetry_source_already_exists"),
