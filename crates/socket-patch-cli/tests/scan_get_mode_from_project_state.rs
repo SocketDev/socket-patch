@@ -455,6 +455,79 @@ async fn bare_scan_and_get_refuse_a_project_with_agent_and_vendored_state() {
     }
 }
 
+/// A package of the project pinned to Socket's hosted patch server beside
+/// the vendored `left-pad`: the mixed state a partial `--mode hosted`
+/// takeover (#1039) or per-package `get --mode` leaves.
+const HOSTED_NAME: &str = "is-odd";
+const HOSTED_VERSION: &str = "3.0.1";
+const HOSTED_PIN_URL: &str = "https://patch.socket.dev/patch/npm/is-odd/3.0.1/55555555-5555-4555-8555-555555555555/22222222-2222-4222-8222-222222222222/is-odd-3.0.1.tgz";
+
+/// Add `is-odd`, pinned hosted, to the vendored project at `root`.
+fn add_hosted_pin(root: &Path) {
+    let mut pkg: Value =
+        serde_json::from_slice(&std::fs::read(root.join("package.json")).unwrap()).unwrap();
+    pkg["dependencies"][HOSTED_NAME] = json!(HOSTED_VERSION);
+    std::fs::write(root.join("package.json"), pkg.to_string()).unwrap();
+    let installed = root.join("node_modules").join(HOSTED_NAME);
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(
+        installed.join("package.json"),
+        format!(r#"{{"name":"{HOSTED_NAME}","version":"{HOSTED_VERSION}"}}"#),
+    )
+    .unwrap();
+    let mut lock: Value =
+        serde_json::from_slice(&std::fs::read(root.join("package-lock.json")).unwrap()).unwrap();
+    lock["packages"][""]["dependencies"][HOSTED_NAME] = json!(HOSTED_VERSION);
+    lock["packages"][format!("node_modules/{HOSTED_NAME}")] = json!({
+        "version": HOSTED_VERSION,
+        "resolved": HOSTED_PIN_URL,
+        "integrity": PATCHED_SHA512,
+    });
+    let mut text = serde_json::to_string_pretty(&lock).unwrap();
+    text.push('\n');
+    std::fs::write(root.join("package-lock.json"), text).unwrap();
+}
+
+/// Vendored packages beside hosted pins (#1437): keeping vendored mode
+/// would take every hosted pin over, which only an explicit
+/// `--mode vendored` may do. The run is a usage error naming `--mode`,
+/// and nothing is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn bare_scan_and_get_refuse_a_project_with_vendored_and_hosted_state() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vendor_project(root, &server.uri());
+    add_hosted_pin(root);
+    let before = snapshot(root);
+
+    for command in ["scan", "get"] {
+        let (code, env) = run_cmd(root, &server.uri(), command, None, &[]);
+        assert_eq!(code, 2, "{command}: {env:#}");
+        assert_eq!(env["status"], "error", "{command}: {env:#}");
+        assert!(
+            env.to_string().contains("mode_ambiguous"),
+            "{command}: the error carries its code: {env:#}"
+        );
+        assert!(
+            env.to_string().contains("--mode"),
+            "{command}: the error names the remedy: {env:#}"
+        );
+        assert_unchanged(root, &before, &env);
+        let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+        assert!(
+            lock.contains(HOSTED_PIN_URL),
+            "{command}: the hosted pin is kept:\n{lock}"
+        );
+    }
+
+    // An explicit `--mode` picks the mode: the run is not refused.
+    let (code, env) = run_cmd(root, &server.uri(), "scan", Some("vendored"), &[]);
+    assert_eq!(code, 0, "an explicit mode is not ambiguous: {env:#}");
+    assert_eq!(env["status"], "success", "{env:#}");
+}
+
 /// An agent-mode manifest holding the fixture patch under each of `purls`.
 fn write_manifest(root: &Path, purls: &[&str]) {
     std::fs::create_dir_all(root.join(".socket")).unwrap();
