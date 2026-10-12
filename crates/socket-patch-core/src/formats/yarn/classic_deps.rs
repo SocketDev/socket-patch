@@ -63,21 +63,45 @@ pub(crate) fn unlocked_descriptors(blocks: &[LockBlock], pkg: &Value) -> Vec<Str
 }
 
 /// Every descriptor of `descriptors` no block of `blocks` is keyed by,
-/// sorted and deduplicated.
+/// sorted and deduplicated. Only a block whose key text names one of the
+/// descriptors' packages is split into its patterns, and none is when
+/// there are no descriptors: the hosted flow asks once per patched
+/// package, so splitting every key of a big lock each time made a scan
+/// O(patched packages × lock size) (#1423).
 pub(crate) fn unlocked_among(
     blocks: &[LockBlock],
     descriptors: impl Iterator<Item = String>,
 ) -> Vec<String> {
-    let locked: std::collections::BTreeSet<String> = blocks
+    let mut missing: std::collections::BTreeSet<String> = descriptors.collect();
+    // A pattern is its key's text less the quotes, so the package name
+    // of a quote-free descriptor appears verbatim in any key locking it.
+    let names: Option<Vec<String>> = missing
         .iter()
-        .flat_map(|b| split_key_patterns(&b.key))
+        .map(|d| (!d.contains('"')).then(|| descriptor_name(d).to_string()))
         .collect();
-    let mut missing: Vec<String> = descriptors
-        .filter(|descriptor| !locked.contains(descriptor))
-        .collect();
-    missing.sort();
-    missing.dedup();
-    missing
+    for block in blocks {
+        if missing.is_empty() {
+            break;
+        }
+        if let Some(names) = &names {
+            if !names.iter().any(|name| block.key.contains(name.as_str())) {
+                continue;
+            }
+        }
+        for pattern in split_key_patterns(&block.key) {
+            missing.remove(&pattern);
+        }
+    }
+    missing.into_iter().collect()
+}
+
+/// The package name of a `name@range` descriptor (`@scope/x` keeps its
+/// leading `@`); the whole text when it has no range.
+fn descriptor_name(descriptor: &str) -> &str {
+    match descriptor.char_indices().skip(1).find(|&(_, c)| c == '@') {
+        Some((at, _)) => &descriptor[..at],
+        None => descriptor,
+    }
 }
 
 /// The descriptors (`name@range`) the dependency sub-maps of `lines` (one
@@ -195,6 +219,28 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()
+    }
+
+    /// #1423: only the keys naming a wanted package are split, and a
+    /// descriptor still resolves through any pattern of a multi-pattern,
+    /// quoted or scoped key.
+    #[test]
+    fn unlocked_among_finds_descriptors_in_any_key_pattern() {
+        let lock = "# yarn lockfile v1\n\n\
+                    \"@scope/x@^1.0.0\", \"@scope/x@~1.2.0\":\n  version \"1.2.3\"\n\n\
+                    left-pad@^1.0.0, left-pad@^1.3.0:\n  version \"1.3.0\"\n\n\
+                    lodash.debounce@^4.0.0:\n  version \"4.0.8\"\n";
+        let blocks = scan_blocks(lock);
+        let among = |ds: &[&str]| unlocked_among(&blocks, ds.iter().map(|d| d.to_string()));
+        assert!(among(&[]).is_empty());
+        assert!(among(&["@scope/x@~1.2.0", "left-pad@^1.3.0", "left-pad@^1.0.0"]).is_empty());
+        assert_eq!(
+            among(&["lodash@^4.0.0", "@scope/x@^2.0.0", "lodash@^4.0.0"]),
+            vec!["@scope/x@^2.0.0", "lodash@^4.0.0"]
+        );
+        assert_eq!(descriptor_name("@scope/x@^1.0.0"), "@scope/x");
+        assert_eq!(descriptor_name("left-pad@npm:other@^1"), "left-pad");
+        assert_eq!(descriptor_name("bare"), "bare");
     }
 
     #[test]
