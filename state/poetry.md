@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-09 (run 17), main `e782c9a` (main was force-updated after run 16; includes #1137, #1185, #1168, #1223, #1031 on top of earlier fixes), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10–17 have their own tables below. #327, #329, #945, #1024 and #1136 are closed: macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-12 (run 18), main `74a44b8` (shallow history; includes #1413, the fix for #1282), latest tag v4.0.0 (5.0.0 release notes are merged but no v5 tag is published). Run 9 re-measured the cells marked "r9". Runs 10–18 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136 and #1282 are closed: macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -13,7 +13,7 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | Linux | 1.1.15 | pass v5 | pass r8 (scan, re-run, vex, rollback); r9 `envs.toml` (3.10/3.11) pass | n/a | fixed by #527 (not re-run) | pass v5 (lock 1.1, extras + dev); r5 dotted name `jaraco.context` rewrite/install/vex/rollback | untested | pass v5 (LF + CRLF, unicode/space path) | pass r14 (both ways, LF + CRLF) | untested |
 | Linux | 1.2.2 | untested | untested | n/a | untested | pass v5 (lock 1.1, extras + dev, warm-venv stale check) | untested | pass (lock 1.1) | untested | untested |
 | Linux | 1.8.5 | untested | pass; r9 `envs.toml` + custom path pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path) | pass r9 (#527) | pass v5 (LF + CRLF) | pass r5 (#330) | pass v5 (LF + CRLF, unicode/space path) | pass r14 (both ways, LF + CRLF) | pass v5 (#380 fixed) |
-| Linux | 2.0.1 | pass r17 | pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path, both names) | fixed by #527 (not re-run) | pass v5 (LF + CRLF); r17 `re-resolve=false` pass; `source = "pypi"` fail #1282 | pass r5 (#330) | pass r17 (LF + CRLF, `re-resolve=false`); `source = "pypi"` fail #1282 | untested | untested |
+| Linux | 2.0.1 | pass r17 | pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path, both names) | fixed by #527 (not re-run) | pass v5 (LF + CRLF); r17 `re-resolve=false` pass; `source = "pypi"` fixed by #1413 (r18 on 1.5–2.5; 2.0.1 not re-run) | pass r5 (#330) | pass r17 (LF + CRLF, `re-resolve=false`); `source = "pypi"` fixed by #1413 (r18 on 1.5–2.5; 2.0.1 not re-run) | untested | untested |
 | Linux | 2.1.1 | untested | untested | untested | untested | pass v5 (repo e2e, up to rollback) | untested | pass v5 (repo e2e) | untested | untested |
 | Linux | 2.3.3 | pass | pass | pass r11 (all 3 layouts) | untested | pass (groups, markers, path/url deps, supersede, dry-run, get) | untested | pass (path/url deps) | fixed by #503 (not re-run) | fixed (#380) |
 | Linux | 2.4.3 | untested | pass | pass r11 (all 3 layouts) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF, CI) | untested | fixed (#380) |
@@ -189,16 +189,35 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | 1.4.2 – 2.2.1 | Patched dep declared with `source = "pypi"`: hosted / vendored, then install | fail #1282 (1.1.15, 1.2.2, 2.3.3, 2.4.3, 2.5.1 pass) |
 | 2.5.1, 1.8.5 | #1105 (hosted A → vendored B, warm venv) | still fails |
 
+### Run 18 cells (Linux, main `74a44b8`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 1.5.1, 1.8.5, 2.2.1 | #1282 re-check: `source = "pypi"`, hosted + vendored, then fresh install | pass (refused before any write, lock untouched) |
+| 2.5.1 | same | pass (rewired + `*_source_constraint` advisory, installs patched) |
+| 1.5.1, 2.2.1, 2.5.1 | `source = "PyPI"` spelling | same as `"pypi"` (pass) |
+| 1.2.2 | `source = "pypi"`, hosted + vendored | pass (installs patched) |
+| 1.3.0, 1.3.1, 1.3.2 | `source = "pypi"`, hosted + vendored | **fail #1447** (versionless stamp: guard skipped, install solver failure); control without `source` passes |
+| 2.2.1, 1.8.5 | Explicit `[[tool.poetry.source]] name = "PyPI"` primary + `source = "PyPI"` | guard correct (forced rewrite still fails "Repository \"pypi\" does not exist.") |
+| 2.2.1 | Path dep (`develop = true`) whose own pyproject pins six `source = "pypi"`, hosted | pass (transitive pin doesn't break install) |
+| 2.2.1 | PEP 621 `[project]` deps + `[tool.poetry.dependencies] six = {source = "pypi"}` | pass (refused) |
+| 2.2.1 | Already-wired lock + source pin: hosted re-scan / `rollback`; vendored re-scan / `vendor --revert` | pass (refusal names the right remedy; lock restored byte-identical; installs) |
+| 2.2.1 | Same, vendored → hosted takeover | pass (`redirect_takeover_kept_vendored`, lock untouched) |
+| 2.2.1 | Same, hosted → vendored takeover | wet exit 1, lock stays hosted (correct); dry run `verified` exit 0 (documented gap, #944); refusal remedy omits "rollback first" (nit, not filed) |
+| 2.2.1, 2.5.1 | #1023 re-check: lock-only vendored (in-project, no `.venv`, apt six) + agent | pass |
+| 2.5.1 | #671 re-check: `create = false` + stray `./venv` | pass (stray venv untouched; system copy patched = lead 4) |
+| 2.5.1 | #450 re-check | still fails (2/2) |
+
 ## Backlog
 
-1. Re-check #1282 once fixed: Poetry 1.4.2 / 1.8.5 / 2.2.1 must refuse or warn, 2.3+ keep rewriting. Also try the `source = "PyPI"` spelling and Poetry 1.3 / 1.5.
-2. Re-check #671 / #866 / #1023 when PR #1259 merges. Confirm `create = false` still falls back.
-3. Re-check #1105 (hosted A → vendored B, warm venv) and #1184 (export residual keep: drift wording, `vendor --check` "wiring missing") once fixed.
-4. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback crawls other interpreters' `dist-packages`. That follows from #538's "patch every copy" design and needs a maintainer call before anyone files it.
+1. Re-check #1447 once fixed: Poetry 1.3.0–1.3.2 locks with `source = "pypi"` must be refused; 1.2.2 and 2.3+ keep rewriting. Also try a 1.3-written lock installed by 1.2 / 2.5 (writer ≠ installer).
+2. #866 re-check (closed 2026-10-09 by the janitor's note): `{data-dir}/venvs` + `env use` + unrelated `VIRTUAL_ENV`, agent + hosted vex, on 2.5.1 / 1.8.5. Not re-run in run 18.
+3. Re-check #1105 (hosted A → vendored B, warm venv) and #1184 (export residual keep) once fixed.
+4. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback patches the system interpreter's dpkg-owned copy. That follows from #538's "patch every copy" design and needs a maintainer call before anyone files it. (Run 18: still so on 2.5.1.)
 5. Vendored `repair` / `scan --prune` after a superseding uuid; two-patch cells on a lock 1.1 and on a mixed-EOL lock.
-6. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG (`XDG_CACHE_HOME` / `XDG_CONFIG_HOME`) and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
-7. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist (run 17), and deletion was denied in runs 9–17. A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
-8. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Also, poetry-compatibility.md line 24 still describes CRLF / legacy `files` as a single-line inline array, which #1185 changed to multi-line.
+6. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
+7. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 18 (runs 9–18). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
+8. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). Line 43 says 1.1 – 1.3 install a `source = "pypi"` rewrite (1.3 doesn't, #1447).
 
 ## Known non-bugs
 
@@ -260,3 +279,7 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 - Vendored with `poetry.lock` + `requirements.txt` warns `pypi_multiple_lockfiles` and wires only `poetry.lock`. Documented.
 - Hosted rollback of a hand-edited six unit (inline / tab-indented / empty / wheel-only / sdist-only `files`, a missing `files` key, quoted or `six=[` `[metadata.files]` keys) writes Poetry's canonical multi-line full-release `files` back, not the original bytes. Documented (hosted rollback "has no … guarantee of the original byte layout").
 - `docs/testing/poetry-compatibility/` (named in the routine prompt) doesn't exist on main; only `docs/testing/poetry-compatibility.md` does.
+- Hosted → vendored `scan --dry-run` reports only `verified` (exit 0) and doesn't model the takeover, even when the wet run refuses (exit 1). Documented in CLI_CONTRACT "Takeover reconciliation"; #944 closed not planned. The wet run keeps the hosted pin.
+- A path dependency's own `source = "pypi"` pin doesn't break the root project's install after a rewrite (Poetry 2.2.1), so the guard reading only the root pyproject is correct.
+- An explicit `[[tool.poetry.source]] name = "PyPI"` declaration doesn't rescue Poetry 1.8 / 2.2 from the `source = "pypi"` failure, so the guard isn't over-refusing there.
+- Poetry 1.2.2 can't be installed with uv without `--prerelease=allow` + `cleo==1.0.0a5` (yanked cleo 1.0.0). Sandbox setup, not a product issue.
