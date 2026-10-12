@@ -8,10 +8,10 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // Every invocation must go through `common::run`/`run_with_env`: the binary
-// binds a wide `SOCKET_*` env surface, and a raw `Command::new(binary())`
+// binds a wide `SOCKET_*` env surface, and a bare spawn of the binary
 // inherits the developer's shell — `SOCKET_PROXY_URL` outranks the proxy
-// these tests pin, and `SOCKET_MANIFEST_PATH` makes a *passing* test write its manifest and
-// blobs into whatever real project the variable points at.
+// these tests pin, and `SOCKET_MANIFEST_PATH` makes a *passing* test write
+// its manifest and blobs into whatever real project the variable points at.
 use crate::common;
 
 const ORG_SLUG: &str = "test-org";

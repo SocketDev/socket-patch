@@ -20,10 +20,10 @@
 
 #![cfg(unix)]
 
-use crate::common::{binary, git_sha256};
+use crate::common::hermetic::{self, Extra};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const BASE_PURL: &str = "pkg:gem/rack@3.1.0";
 const QUALIFIED_PURL: &str = "pkg:gem/rack@3.1.0?platform=ruby";
@@ -126,20 +126,15 @@ fn build_fixture(with_store: bool, home_bytes: &[u8], purl: &str) -> Fixture {
     }
 }
 
-/// Run apply with SOCKET_*/BUNDLE_* scrubbed, PATH = the fake-gem bin dir
-/// only, and BUNDLE_PATH set to the store root when present.
+/// Run apply with the hermetic SOCKET_* env and BUNDLE_* scrubbed, PATH =
+/// the fake-gem bin dir only, and BUNDLE_PATH set to the store root when
+/// present.
 fn run_apply(fx: &Fixture, extra: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(["apply", "--offline", "--ecosystems", "gem", "--cwd"])
         .arg(fx.project.path())
         .args(extra);
-    for (key, _) in std::env::vars_os() {
-        let k = key.to_string_lossy();
-        if (k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG") || k.starts_with("BUNDLE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
     cmd.env("PATH", &fx.bin_dir);
     if let Some(store_root) = &fx.store_root {
         cmd.env("BUNDLE_PATH", store_root);

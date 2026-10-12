@@ -19,7 +19,8 @@
 //! Requires: `python3` with `venv` and `pip` on PATH. Skipped (visibly)
 //! when python3 is missing — same contract as `in_process_pypi_apply`.
 
-use crate::common::{binary, git_sha256};
+use crate::common::hermetic::{self, Extra};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,43 +29,21 @@ const PYPI_PACKAGE: &str = "six";
 const PYPI_VERSION: &str = "1.16.0";
 const UUID: &str = "12121212-1212-4121-8121-121212121212";
 
-/// Spawn the CLI with the ambient environment scrubbed, so the flags each
-/// test passes are the only thing deciding behaviour.
+/// Spawn the CLI with the hermetic `SOCKET_*` environment
+/// (`hermetic_command`), so the flags each test passes are the only thing
+/// deciding behaviour: an ambient `SOCKET_DRY_RUN=true` would turn both real
+/// applies here into no-op dry runs, and `SOCKET_GLOBAL` /
+/// `SOCKET_GLOBAL_PREFIX` would aim the crawl (and the patch writes) at the
+/// host's real site-packages.
 ///
-/// The binary binds a wide `SOCKET_*` env surface: an ambient
-/// `SOCKET_DRY_RUN=true` turns both real applies here into no-op dry runs
-/// (every variant `verified`, exit 0 — both tests red), and
-/// `SOCKET_GLOBAL` / `SOCKET_GLOBAL_PREFIX` aim the crawl — and the patch
-/// WRITES — at the host's real site-packages. Seed-then-scrub (mirrors
-/// `common::run_with_env`): the highest-risk vars are seeded with hostile
-/// values so a dropped scrub line turns the tests red immediately;
-/// telemetry opt-outs are deliberately kept.
-///
-/// `VIRTUAL_ENV` must go too: the PyPI crawler early-returns on it, so an
-/// activated ambient venv hijacks discovery away from the tmp venv (six is
-/// "not installed" — both tests red) or, if that venv holds six@1.16.0,
-/// aims the patch at the developer's own environment. A hostile seed is
-/// impossible here (only a *real* venv path triggers the early return), so
-/// it is plain-removed.
+/// `VIRTUAL_ENV` must go too (`Extra::Venv`): the PyPI crawler early-returns
+/// on it, so an activated ambient venv hijacks discovery away from the tmp
+/// venv (six is "not installed", both tests red) or, if that venv holds
+/// six@1.16.0, aims the patch at the developer's own environment.
 fn run_apply_scrubbed(args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(binary());
-    cmd.args(args)
-        .env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_GLOBAL", "true")
-        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
-        .env_remove("SOCKET_DRY_RUN")
-        .env_remove("SOCKET_GLOBAL")
-        .env_remove("SOCKET_GLOBAL_PREFIX")
-        .env_remove("SOCKET_MANIFEST_PATH")
-        .env_remove("VIRTUAL_ENV");
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
+    let mut cmd = hermetic_command(&binary());
+    cmd.args(args);
+    hermetic::scrub_extra(&mut cmd, &[Extra::Venv]);
     cmd.output().expect("run socket-patch apply")
 }
 

@@ -714,7 +714,6 @@ fn corrupt_manifest_under_pnp_layout_reports_manifest_error_not_refusal() {
 #[cfg(unix)]
 mod gem_fallback_home_human {
     use super::*;
-    use std::process::Command;
 
     const QUALIFIED_PURL: &str = "pkg:gem/rack@3.1.0?platform=ruby";
     const ORIGINAL: &[u8] = b"module Rack\n  VERSION = 'VULNERABLE'\nend\n";
@@ -753,19 +752,14 @@ mod gem_fallback_home_human {
         file
     }
 
-    /// Human-mode apply with SOCKET_*/BUNDLE_* scrubbed, PATH = the
-    /// fake-gem bin dir only, BUNDLE_PATH = the store root.
+    /// Human-mode apply with the hermetic SOCKET_* env and BUNDLE_*
+    /// scrubbed, PATH = the fake-gem bin dir only, BUNDLE_PATH = the store
+    /// root.
     fn run_apply_human(project: &Path, bin_dir: &Path, store_root: &Path) -> (i32, String, String) {
-        let mut cmd = Command::new(common::binary());
+        let mut cmd = common::hermetic_command(&common::binary());
         cmd.args(["apply", "--offline", "--ecosystems", "gem", "--cwd"])
             .arg(project);
-        for (key, _) in std::env::vars_os() {
-            let k = key.to_string_lossy();
-            if (k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG") || k.starts_with("BUNDLE_") {
-                cmd.env_remove(&key);
-            }
-        }
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+        common::hermetic::scrub_extra(&mut cmd, &[common::hermetic::Extra::Bundle]);
         cmd.env("PATH", bin_dir);
         cmd.env("BUNDLE_PATH", store_root);
         let out = cmd.output().expect("run socket-patch apply");

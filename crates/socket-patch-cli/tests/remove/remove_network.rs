@@ -16,10 +16,9 @@
 //! `rollback_patches` (the binary would contact the mock, succeed, and
 //! delete the entry).
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -99,10 +98,11 @@ async fn mount_before_blob(mock: &MockServer, before: &[u8], before_hash: &str) 
 fn run_remove(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String) {
     let mut argv: Vec<&str> = vec!["remove", PURL, "--json", "--yes"];
     argv.extend_from_slice(extra);
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(&argv).current_dir(cwd);
-    // Hermeticity: drop every ambient SOCKET_* var by prefix before
-    // re-setting only the four this test controls. The spawned child
+    // Hermeticity (`hermetic_command`): every ambient SOCKET_* var is
+    // dropped by prefix before re-setting only the three this test
+    // controls. The spawned child
     // inherits the parent environment, and the binary binds a wide
     // `SOCKET_*` env surface (clap-flattened `GlobalArgs`, per-command
     // flags, runtime toggles) — an ambient value satisfies (or defeats)
@@ -115,18 +115,10 @@ fn run_remove(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String) {
     // under which `remove --offline` skipped rollback entirely, exited
     // 0, and deleted the entry, failing both tests for the wrong
     // reason. The controlled set must be seeded *after* scrubbing.
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
     let out = cmd
         .env("SOCKET_API_URL", api_url)
         .env("SOCKET_API_TOKEN", "fake-token-for-test")
         .env("SOCKET_ORG_SLUG", ORG_SLUG)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run socket-patch");
     (

@@ -26,10 +26,9 @@
 //!     modified"). When NO variant matches, the base still fails with
 //!     "no matching variant found" and the file stays untouched.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const SINGLETON_PURL: &str = "pkg:gem/rack@3.1.0";
 const UUID_SINGLETON: &str = "31313131-3131-4131-8131-313131313131";
@@ -55,23 +54,14 @@ fn with_marker(base: &[u8], marker: &[u8]) -> Vec<u8> {
 }
 
 /// Run `socket-patch apply --offline --ecosystems gem <extra>` in `cwd`
-/// with the ambient `SOCKET_*` environment scrubbed (prefix scrub, keeping
-/// `SOCKET_NO_CONFIG`) so only the argv decides behavior, and telemetry
-/// disabled.
+/// with the hermetic `SOCKET_*` environment (`hermetic_command`), so only
+/// the argv decides behavior.
 fn run_apply(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("apply")
         .args(["--offline", "--ecosystems", "gem"])
         .args(extra)
         .current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch apply");
     (
         out.status.code().unwrap_or(-1),

@@ -12,11 +12,10 @@
 //! assert EVERY physical copy is patched (and later restored) AND that the
 //! JSON summary counts every copy.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Write `node_modules/.../<name>/{package.json,index.js}` at the given
 /// `pkg_dir` (which already encodes the nesting), returning the index.js path.
@@ -124,7 +123,7 @@ fn run_apply(root: &Path) -> (i32, serde_json::Value) {
 
 /// `run_apply` plus `extra` arguments (flags or path targets).
 fn run_apply_with(root: &Path, extra: &[&OsStr]) -> (i32, serde_json::Value) {
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "apply",
             "--json",
@@ -228,7 +227,7 @@ fn rollback_restores_every_on_disk_copy_of_a_duplicated_package() {
     }
 
     // Now roll back and assert EVERY copy is restored to pristine bytes.
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "rollback",
             "--json",
@@ -324,7 +323,7 @@ fn run_rollback(root: &Path) -> (i32, serde_json::Value) {
 
 /// `run_rollback` plus `extra` arguments (flags or path targets).
 fn run_rollback_with(root: &Path, extra: &[&OsStr]) -> (i32, serde_json::Value) {
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "rollback",
             "--json",
@@ -662,7 +661,7 @@ fn apply_and_rollback_refuse_a_node_modules_link_to_first_party_source() {
         );
     };
 
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "apply",
             "--json",

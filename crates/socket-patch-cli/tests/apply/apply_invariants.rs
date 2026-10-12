@@ -15,10 +15,9 @@
 //! crawler won't match, which trips the "no packages found / offline"
 //! branches and exercises the invariants without needing a real fixture.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
@@ -113,10 +112,9 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
 fn run_apply(cwd: &Path, extra: &[&str]) -> (i32, String) {
     let mut args = vec!["apply", "--json"];
     args.extend_from_slice(extra);
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args(&args)
         .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
         .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run socket-patch");
@@ -455,10 +453,9 @@ fn apply_with_no_socket_dir_emits_no_manifest_envelope() {
 #[test]
 fn apply_with_no_socket_dir_silent_emits_nothing() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args(["apply", "--silent"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run socket-patch");
@@ -475,10 +472,9 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
     // the message simply never existed — i.e. it would not actually prove
     // the silent-mode short-circuit suppresses anything.
     let tmp2 = tempfile::tempdir().expect("tempdir");
-    let loud = Command::new(binary())
+    let loud = hermetic_command(&binary())
         .args(["apply"])
         .current_dir(tmp2.path())
-        .env_remove("SOCKET_API_TOKEN")
         .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run socket-patch");

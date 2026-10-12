@@ -5,13 +5,13 @@
 //! unroutable localhost port.
 
 use crate::common::envelope::{codes_in, events};
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A `rollback` command with the full `SOCKET_*` environment scrubbed and the
-/// working directory pinned. All tests build their child process through here
+/// A `rollback` command with the hermetic `SOCKET_*` environment
+/// (`hermetic_command`) and the working directory pinned. All tests build their child process through here
 /// so none can be satisfied by ambient environment instead of the code path.
 ///
 /// The child process inherits the parent's environment, so an ambient value
@@ -19,20 +19,14 @@ use std::process::Command;
 /// real code path) it is named after — e.g. an ambient `SOCKET_OFFLINE=true`
 /// would satisfy the `--offline` tests even if `--offline` were broken, and
 /// `SOCKET_MANIFEST_PATH` would silently redirect the manifest out from under
-/// the no-manifest / override tests. Scrub by prefix, not by list: an explicit
-/// list rots as flags are added (it missed `SOCKET_VENDOR_SOURCE`, whose
-/// ambient garbage aborted every invocation with a clap usage error). Tests
-/// that need a `SOCKET_*` var seed it AFTER this scrub via `.env()`.
+/// the no-manifest / override tests. The shared builder scrubs by prefix,
+/// not by list: an explicit list rots as flags are added (one missed
+/// `SOCKET_VENDOR_SOURCE`, whose ambient garbage aborted every invocation
+/// with a clap usage error). Tests that need a `SOCKET_*` var seed it AFTER
+/// this scrub via `.env()`.
 fn rollback_cmd(cwd: &Path) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("rollback").current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
     cmd
 }
 
@@ -296,7 +290,6 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
     make_socket_dir(tmp.path());
     install_manifest_package(tmp.path());
     let out = rollback_cmd(tmp.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .args([
             "--json",
             "--api-url",
@@ -344,8 +337,8 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
     );
 
     // The env is scrubbed (no SOCKET_API_TOKEN) and socket-cli config is
-    // vetoed by the workspace-pinned SOCKET_NO_CONFIG=1, so every client
-    // build wants the no-token notice. Under --json it is muted entirely;
+    // vetoed by the SOCKET_NO_CONFIG=1 that `hermetic_command` forces, so
+    // every client build wants the no-token notice. Under --json it is muted entirely;
     // in human mode it must appear exactly once per invocation, not once
     // per internal phase.
     assert!(
@@ -353,7 +346,6 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
         "--json must mute the no-token notice; stderr=\n{stderr}"
     );
     let human = rollback_cmd(tmp.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .args([
             "--api-url",
             "http://127.0.0.1:1/",
@@ -479,7 +471,6 @@ fn rollback_not_installed_entry_triggers_no_blob_download() {
     make_socket_dir(tmp.path());
 
     let out = rollback_cmd(tmp.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .args([
             "--json",
             "--api-url",
