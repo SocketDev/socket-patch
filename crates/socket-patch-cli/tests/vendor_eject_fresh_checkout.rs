@@ -75,7 +75,7 @@ async fn mock_view(
         .await;
 }
 
-/// Run the binary with every ambient `SOCKET_*` var scrubbed, an empty
+/// Run the binary in the hermetic `SOCKET_*` environment, with an empty
 /// `CARGO_HOME`, and the API / registries / patch origin on `server`.
 fn run_json(root: &Path, server: &MockServer, args: &[&str]) -> (i32, Value) {
     run_json_with(root, server, args, &[])
@@ -105,8 +105,8 @@ fn run_json_with(
     (out.status.code().unwrap_or(-1), env)
 }
 
-/// The binary in `root` (the caller adds the args, then `--cwd`), with
-/// every ambient `SOCKET_*` var scrubbed, an empty `CARGO_HOME`, and the
+/// The binary in `root` (the caller adds the args, then `--cwd`), in the
+/// hermetic `SOCKET_*` environment, with an empty `CARGO_HOME` and the
 /// API / registries / patch origin on `server`.
 fn command(root: &Path, server: &MockServer, extra: &[(&str, String)]) -> Command {
     let cargo_home = root.join("../cargo-home");

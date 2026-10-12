@@ -73,8 +73,8 @@ impl Project {
         self.root().join(".socket/vendor/redirect-state.json")
     }
 
-    /// Run the binary against the mocks with every ambient `SOCKET_*` var
-    /// scrubbed.
+    /// Run the binary against the mocks in the hermetic `SOCKET_*`
+    /// environment.
     fn run(&self, args: &[&str]) -> (i32, String, String) {
         let mut cmd = hermetic::binary_command();
         cmd.args(args)
