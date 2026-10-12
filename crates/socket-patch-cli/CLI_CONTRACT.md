@@ -530,7 +530,11 @@ Hosted and vendored mode need no per-install step for any ecosystem. In agent mo
 are patched by `socket-patch apply` like every other ecosystem:
 
 - **cargo** — `apply` patches the crate **in place** wherever the crawler finds it: the project
-  `vendor/` directory or the shared registry cache (`$CARGO_HOME/registry/src/...`). The
+  `cargo vendor` directory source or the shared registry cache (`$CARGO_HOME/registry/src/...`).
+  The directory source is the one cargo builds from: the `[source.crates-io] replace-with` chain of
+  every `.cargo/config*` cargo reads (the working directory and each ancestor, then `$CARGO_HOME`'s),
+  wherever it points (#338). A `vendor/` no config wires is not crawled, and a configured directory
+  that is missing yields nothing rather than the registry copy cargo ignores. The
   `.cargo-checksum.json` sidecar is rewritten so `cargo build` accepts the modified files. Rollback
   restores the original bytes from the `beforeHash` blobs. *(Note: a non-vendored crate patches the
   **shared** registry cache, which affects other projects on the machine and is reset by `cargo clean`
