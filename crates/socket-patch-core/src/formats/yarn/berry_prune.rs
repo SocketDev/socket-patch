@@ -146,7 +146,10 @@ pub(crate) fn prune_unreferenced(
 /// `dependencies:` map naming it, or any mention of it in another entry's
 /// text (a `patch:` locator embeds its base descriptor, `:` spelled
 /// `%3A`). The entry keyed by it does not count.
-fn referenced(stanzas: &[String], descriptor: &str) -> bool {
+/// Whether some entry of `stanzas` other than one keyed by `descriptor`
+/// references it: names it in its `dependencies:` map, or wraps it (a
+/// `patch:` descriptor spells it percent-encoded).
+pub(crate) fn referenced(stanzas: &[String], descriptor: &str) -> bool {
     let encoded = descriptor.replace(':', "%3A");
     stanzas.iter().any(|s| {
         let own = stanza_key(s)

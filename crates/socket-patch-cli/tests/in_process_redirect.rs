@@ -5408,6 +5408,85 @@ async fn yarn_berry_unwind_merges_into_a_registry_entry_added_after_pinning() {
     }
 }
 
+/// #1435: a hosted berry pin routes each descriptor through its own
+/// `resolutions` selector. `yarn remove` in one workspace member, while
+/// another still uses the package, keeps the URL-keyed entry and both
+/// selectors. `rollback` and `remove` must rebuild the restored key from
+/// the descriptors the lock still declares, not from every selector, or
+/// every `yarn install --immutable` fails YN0028. A descriptor another
+/// entry still declares stays in the key.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_unwind_drops_a_descriptor_no_entry_declares() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    mock_reference_with_berry_url(&server, &hosted_url).await;
+    mock_view(&server).await;
+    mock_npm_registry_advertising(
+        &server,
+        &vlt_hosted_common::sha512_sri(&upstream_tarball()),
+        &format!(
+            "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+            server.uri()
+        ),
+    )
+    .await;
+    // A workspace member that declares the exact version: its entry is
+    // yarn's record that the second descriptor is still in use.
+    let member = format!(
+        "\n\"member@workspace:packages/member\":\n  version: 0.0.0-use.local\n  \
+         resolution: \"member@workspace:packages/member\"\n  dependencies:\n    \
+         {NAME}: \"npm:{VERSION}\"\n  languageName: unknown\n  linkType: soft\n"
+    );
+    for (declared, key) in [
+        (false, format!("\"{NAME}@npm:^{VERSION}\":")),
+        (
+            true,
+            format!("\"{NAME}@npm:{VERSION}, {NAME}@npm:^{VERSION}\":"),
+        ),
+    ] {
+        for command in ["rollback", "remove"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_berry_project(tmp.path());
+            let env = run_redirect_subprocess_with(
+                tmp.path(),
+                &server.uri(),
+                &["--patch-server-url", &server.uri()],
+            );
+            assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
+            // The selector a since-removed member's descriptor left behind.
+            let pkg_path = tmp.path().join("package.json");
+            let mut pkg: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+            pkg["resolutions"][format!("{NAME}@npm:{VERSION}")] =
+                serde_json::Value::String(hosted_url.clone());
+            std::fs::write(&pkg_path, serde_json::to_string_pretty(&pkg).unwrap()).unwrap();
+            let lock_path = tmp.path().join("yarn.lock");
+            if declared {
+                let pinned = std::fs::read_to_string(&lock_path).unwrap();
+                std::fs::write(&lock_path, format!("{pinned}{member}")).unwrap();
+            }
+
+            let args: &[&str] = if command == "rollback" {
+                &["rollback"]
+            } else {
+                &["remove", PURL]
+            };
+            let (code, env) = hosted_unwind_json(tmp.path(), &server, &server.uri(), args);
+            assert_eq!(code, Some(0), "{command} declared={declared}: {env:#}");
+            let restored = std::fs::read_to_string(&lock_path).unwrap();
+            assert!(
+                restored.contains(&format!("\n{key}\n")),
+                "{command} declared={declared}: restored key must be {key}:\n{restored}"
+            );
+            assert!(!restored.contains(&hosted_url), "{restored}");
+            let pkg = std::fs::read_to_string(&pkg_path).unwrap();
+            assert!(!pkg.contains("resolutions"), "{pkg}");
+        }
+    }
+}
+
 /// #908: the restore reads `dist.tarball` from the registry the project
 /// resolves against (`.yarnrc.yml` `npmRegistryServer`), not from the
 /// default registry. A mirror whose tarball URLs are off the conventional
