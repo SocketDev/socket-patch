@@ -23,7 +23,7 @@ a version without a non-empty section in this file.
 
 ## [Unreleased]
 
-## [5.0.0] — 2026-10-09
+## [5.0.0] — 2026-10-12
 
 v5 centers the workflow on `scan` (hosted patches), `vex` (OpenVEX attestations),
 and `vendor` (committed patched packages), with `list` for inspection. See the
@@ -31,11 +31,52 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
 
 ### Breaking changes
 
-- `scan` and `get` default to hosted mode. `scan` never prompts, and hosted or
-  vendored `get` selects without an interactive menu. Explicit `--mode agent`
-  retains in-place patching; `get --save-only` and global targeting select agent
-  behavior by default. A mode-less global scan or `scan --prune` does not acquire
-  new patches, though `--prune` still cleans up obsolete state.
+- `scan` and `get` default to hosted mode for a project that has no patches
+  yet. `scan` never prompts, and hosted or vendored `get` selects without an
+  interactive menu. Explicit `--mode agent` retains in-place patching;
+  `get --save-only` and global targeting select agent behavior by default. A
+  mode-less global scan or `scan --prune` does not acquire new patches, though
+  `--prune` still cleans up obsolete state.
+- A bare `scan` / `get` keeps the mode a project already uses: a vendor ledger
+  selects vendored mode and an agent manifest selects agent mode, so the quick
+  start no longer converts an existing project to hosted in place. Switching
+  modes (in either direction) takes an explicit `--mode`; a project holding
+  both kinds of state is a usage error (`mode_ambiguous`, exit 2). Human runs
+  print a note naming the mode kept (#1088).
+- Every command's `--json` output is one envelope: `command`, `status`,
+  `dryRun`, `events`, `summary`, `warnings`, plus `error: {code, message}` on
+  failure and `gc` when a sweep ran. `scan`, `get` and `rollback` drop their
+  own shapes: per-package outcomes (including `apply.patches`, `download`,
+  the nested `vendor` envelope, `redirect.patches`, rollback's `results[]`,
+  `rolledBack` and `hosted.*` lists) are events, and the count keys
+  (`found`, `redirected`, …) are replaced by `summary`, which always equals
+  the event counts. Statuses and actions are camelCase only (new action
+  `rolledBack`; `would_*` previews are `verified`), warnings are always
+  top-level `{code, detail}`, and events from the vendored and hosted legs
+  carry `details.mode`. Usage, lock and early errors print a full envelope,
+  and `scan --mode agent --json` no longer prints two documents. A corrupt or
+  unreadable manifest is `manifest_invalid` / `manifest_unreadable` on every
+  command. See the [CLI contract](crates/socket-patch-cli/CLI_CONTRACT.md)
+  (#931).
+- Artifact garbage collection reports one shape on `repair`, `remove`,
+  `rollback` and `scan --prune`: a top-level `gc` object
+  (`removedBlobs`, `removedDiffArchives`, `removedPackageArchives`,
+  `bytesFreed`) and `summary.bytesFreed`. `repair`'s GC event no longer bumps
+  `summary.removed`; rollback counts every leg it undid (#1257, #1066).
+- `get`, `remove` and `rollback` share one package-target grammar: a UUID,
+  `CVE-…` / `GHSA-…`, a purl, or an exact package name. `get <name>` no longer
+  fuzzy-matches (`get yaml` used to patch `yaml-ast-parser`) and searches
+  every installed version of that name; with no match it reports `noMatch`
+  and suggests close names. A name that reaches several packages (`core`) is
+  refused with the candidates listed (`ambiguous_target`). `remove` and
+  `rollback` accept a bare name or versionless purl, selecting every recorded
+  version. Package identity is case-preserving where the ecosystem is, so
+  `remove jsonstream` no longer also removes `JSONStream`. `get` honors
+  `--ecosystems` and socket.yml policy on every path, including `get <uuid>`,
+  and the bare-UUID shortcut works after global flags
+  (`socket-patch --json <uuid>`) (#453, #1280, #1292).
+- `--download-mode` is removed: patch content is always fetched as per-file
+  blobs, and the diff download path is gone (#792).
 - Hosted mode writes no ledger. `list`, VEX, and update discovery read the live
   dependency references. `rollback` and `remove` restore upstream registry entries
   rather than replaying saved edits, and refuse where restoration is unavailable
@@ -120,9 +161,9 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   first, and fails runs it cannot fully patch (`gradle_ro_cache_shadows`,
   `gradle_copy_unexpected_bytes`, …) (#349, #551).
 - `scan --mode agent --json` and `get --json` report a patch whose in-place
-  apply failed as `action: "failed"` with `errorCode` / `error`, count it in
-  `failed`, and count only patches that really applied in `applied`. They
-  used to list it as `added` with `failed: 0` (#424).
+  apply failed as a `failed` event with its error code, count it in
+  `summary.failed`, and count only patches that really applied as applied.
+  They used to list it as `added` with `failed: 0` (#424).
 - `vendor --check` is stricter: it fails (`vendor_check_failed`, exit 1) when a
   lockfile no longer points at a vendored entry in any ecosystem, not just
   Maven/Gradle, and reports lockfile references to `.socket/vendor/` that no
@@ -216,8 +257,8 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   trust-lockfile configuration. Explicit user settings are respected.
 - Path targeting on scan and rollback, hosted update detection from lockfiles,
   and configurable API request concurrency.
-- Hosted `--json` output lists every granted patch in `redirect.patches[]`
-  as pinned / would-pin, skipped (with its reason) or unpinned
+- Hosted `--json` output reports every granted patch as an event: pinned /
+  would-pin, skipped (with its reason) or unpinned
   (`redirect_unconfirmed`), so unwired patches are visible to tooling (#1029).
 - vlt 1.3.0–1.3.7 are supported (#1087).
 - Unknown subcommands get a precise usage error: `setup` and `unlock` name the
@@ -242,6 +283,44 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
 - VEX product detection resolves submodules and linked worktrees to their own
   origin, honors `GIT_CEILING_DIRECTORIES`, stops at the home directory, and
   warns when it skips a checkout owned by another user.
+- HTTPS trusts the platform certificate store and `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` in addition to the bundled Mozilla roots, so socket-patch
+  works behind a TLS-inspecting corporate proxy. Certificate verification is
+  never disabled (#1107).
+- socket-patch reads Go settings saved with `go env -w` (`GOPRIVATE`,
+  `GOPROXY`, `GOMODCACHE`, …) the way the `go` command does, so private
+  modules are no longer requested from `proxy.golang.org`, mirrors are used
+  and a relocated module cache is found (#344).
+- Every Go mode warns when a committed `vendor/modules.txt` or the consumer
+  `go.mod` needs a resync to build with the patch
+  (`go_vendor_modules_txt_out_of_sync`, `go_requirements_out_of_sync`),
+  naming `go mod vendor` / `go work vendor` or `go mod tidy`; `apply --check`
+  and `vendor --check` treat it as drift (#343, #618).
+- Vendored Pipenv and uv projects also wire an exported `requirements.txt`
+  (`pipenv requirements`, `uv export`) and Pipenv's `pylock.toml`
+  (`use_pylock`) to the same committed wheel, so installs from those files
+  get the patch and `vendor --check` / `vex` stop reporting contested wiring
+  (#612, #1368).
+- `--update` and the update notice give pnpm installs pnpm commands
+  (`pnpm add -g …`, `pnpm add …`, or `pnpm update --recursive --latest …` at a
+  workspace root) instead of an npm command that does nothing or writes a
+  stray `package-lock.json` (#1111).
+- `scan` and `apply` warn `gem_bundler_plugin_stale` when Bundler still
+  registers the v4 `socket-patch` plugin at a deleted path, naming
+  `bundle plugin uninstall socket-patch` (#1295).
+- Vendored yarn classic workspaces warn
+  `yarn_classic_workspace_member_install_risk`: a cold-cache install from a
+  member directory can't fetch the vendored tarball, so install from the
+  workspace root or use hosted mode (#691).
+- Telemetry records hosted-mode outcomes (`patch_applied` /
+  `patch_apply_failed` with `mode: "hosted"`), self-updates (`cli_updated` /
+  `cli_update_failed`), the requested and already-wired modes on
+  `patch_scanned`, and the ecosystems the crawl actually found.
+  `CLI_CONTRACT.md` lists which command sends which event.
+- [docs/ecosystems.md](docs/ecosystems.md) defines v5 support tiers
+  (Supported, Beta, Legacy, Not supported) per ecosystem and mode. Hosted and
+  vendored Maven/Gradle/sbt are Beta; binary `bun.lockb`, vendored pnpm 7/8
+  locks and early vlt lock eras are Legacy (#1156).
 
 See [ecosystem support](docs/ecosystems.md) and the
 [compatibility guides](docs/testing/README.md) for format boundaries, integrity
@@ -249,6 +328,35 @@ limits, and required install commands.
 
 ### Fixed
 
+- **Credentials no longer leak to logs, JSON, telemetry, VEX or the patch
+  server.** Hosted Composer pins drop the lock entry's `transport-options`
+  (and `source`), so `composer install` no longer sends a private
+  registry's auth headers, client certificates or proxy settings to the
+  patch server (`redirect_composer_transport_options_removed`) (#399). URL
+  userinfo, grant tokens and secret query values are redacted from
+  warnings, `--json` events, error messages, debug output and telemetry;
+  `patch_fetch_failed` sends a `uuid` only when the target was a UUID; and
+  the VEX product `@id` never carries credentials from a git remote.
+  Subcommand `--help` no longer prints the value of `SOCKET_API_TOKEN` /
+  `SOCKET_CLI_API_TOKEN`.
+- `--manifest-path` selects one project for every command. `rollback`,
+  `remove`, `repair`, `apply --check`, `vex` and agent-mode `scan` / `get`
+  used to read (and `rollback` / `remove` to write) the vendor ledger in
+  `--cwd` instead, so one run could unwind two projects (#745).
+- `repair` and `scan --prune` keep the original-file blobs of patches still
+  in the manifest, so an offline `rollback` after a repair works again (#893).
+- Human `scan --mode vendored --prune` runs the vendored GC when packages are
+  found but none is patched, as `--json` already did (#1127). Human and
+  `--json` `scan` exit 0 alike when the patch API answers with no records,
+  and partial detail-query failures warn in human output too (#1062).
+- The `apply --check` drift remedy repeats the check's own `--cwd`,
+  `--manifest-path`, `-g` / `--global-prefix` and `--ecosystems` flags,
+  instead of a bare `socket-patch apply` that acts on another tree (#1219).
+- The OpenVEX document is written with stage + rename, so a failed write no
+  longer leaves a truncated document behind (#1144).
+- Vendored Maven, Gradle and NuGet artifacts are protected from `.gitignore`
+  rules such as `*.jar` / `*.nupkg`, and vendoring is refused when git would
+  still drop them, as npm-family vendoring already was (#1061).
 - `scan --vex` in hosted mode no longer attests an npm patch as
   `not_affected` when `package-lock.json` also lists a bundled copy of the
   same `name@version` (`inBundle`, or `bundled` in a v1 lock). npm unpacks
@@ -680,11 +788,90 @@ limits, and required install commands.
   (#677).
 - Home-relative probes (Cargo, Maven, NuGet, Python, Ruby, Deno) no longer
   resolve against the working directory when `HOME` is unset.
-- **JVM.** Gradle rollback refuses a before-blob that does not hash to its
-  cache directory, and dry runs predict it; a crafted jar header can no longer
-  exhaust memory; Gradle cache and build files are read without hanging on a
-  FIFO (#646).
+- **JVM.**
+  - Gradle rollback refuses a before-blob that does not hash to its cache
+    directory, and dry runs predict it; a crafted jar header can no longer
+    exhaust memory; Gradle cache and build files are read without hanging on
+    a FIFO (#646).
+  - Hosted Maven edits only the markup Maven builds the project from: it
+    skips comments, `<profiles>` and plugin dependencies, honors
+    `<classifier>` and self-closed sections, and never writes a second
+    top-level section Maven refuses (#259, #262, #342).
+  - Hosted Maven refuses a multi-module reactor root
+    (`redirect_maven_multimodule_unsupported`) instead of pinning only the
+    root while a module's own `<version>` keeps the unpatched jar; `vex` no
+    longer attests such a pin (#261).
+  - Project-mode Maven scans look up only the coordinates the project's poms
+    reach, instead of everything other builds left in `~/.m2` (#265).
+  - Vendored Maven leaves a root unpinned, with a warning, when an imported
+    BOM or an external parent manages a different (or unknown) version, so
+    vendoring no longer silently downgrades or freezes it (#488).
+  - scala-cli fails closed on an unreadable or truncated Bloop project file,
+    as sbt does, instead of judging the remaining projects alone (#1270).
+- **NuGet.**
+  - Hosted unwinds restore the lock's real `contentHash`, not nuget.org's
+    catalog `packageHash`, so `dotnet restore` no longer fails NU1403 after
+    `rollback` / `remove` (#624).
+  - Hosted and vendored modes warn when the global packages folder already
+    holds the upstream bytes of the patched version
+    (`redirect_nuget_stale_global_package` /
+    `vendor_nuget_stale_global_package`), and the same run's VEX no longer
+    attests it (#352).
+  - The written `packageSourceMapping` keeps feeds defined in parent and
+    user configs working and routes the patched id exclusively to the Socket
+    source (#354, #462).
+  - Every lock the root `nuget.config` governs is pinned: member projects'
+    locks, `packages.<Project>.lock.json` and a literal `NuGetLockFilePath`
+    (#353, #514). Hosted lock reads accept a UTF-8 BOM and leave other
+    resolved versions of the id alone in multi-targeting locks (#593, #623).
+  - Vendored revert works on `core.autocrlf` checkouts and never leaves the
+    config and lock half-reverted (#537); `</packageSources >` and other
+    valid spellings are recognized (#685).
+- **Go.**
+  - A `replace` for a version the build list doesn't select is no longer
+    written as if it worked: `apply` refuses, `vendor` refuses
+    (`vendor_go_version_not_selected`), `apply --check` reports a mismatch
+    and `vex` omits the patch (`go_version_not_selected`) (#391, #392, #509).
+  - In a Go workspace, `apply` and `vendor` no longer write a go.mod
+    `replace` that the `go.work` in effect overrides, ignores or rejects;
+    `--check` fails on such a replace and `vex` no longer attests it
+    (#393, #458, #531).
+  - Agent `apply` and `vendor` work on Windows with Go's read-only module
+    cache instead of failing with `Access is denied` (#346).
+- **Composer.** Reinstall hints name the configured vendor directory
+  (`COMPOSER_VENDOR_DIR`, `config.vendor-dir`) instead of `vendor/` (#658).
 - **npm family.**
+  - npm's `${VAR}` expansion is applied to `replace-registry-host`, so a
+    setting that expands to `always` gets the hosted-pin warning (#1233).
+  - `vendor --check` fails, and `repair` reports
+    `vendor_dep_manifest_unlocked`, for a yarn classic lock an older release
+    vendored with dangling descriptors (#1379).
+  - Hosted yarn classic pins always carry the `#<sha1>` fragment yarn keys
+    its cache on, so a warm cache can't serve unpatched bytes; a tarball that
+    can't be verified is skipped (`npm_tarball_unavailable`) (#558). Lock
+    blocks for empty-range dependencies (`"left-pad": ""`) are found (#1271).
+  - A yarn classic package also installed through an `npm:` alias is no
+    longer attested by `scan --vex`, and a takeover that would unwire a
+    vendored alias block is retracted (#1081, #1158).
+  - Yarn Berry: a re-scan pins a range added after the hosted pin, and
+    unwinds no longer leave two entries with one resolution (#1082);
+    restores read the registry from `npmScopes`, `YARN_NPM_REGISTRY_SERVER`
+    and parent/home `.yarnrc.yml` like yarn (#1017) and put back the
+    registry's `bin:` map (#1131); pins of native addons drop the
+    registry-only `node-gyp` dependency (#737); and a `resolutions` selector
+    left by `yarn remove` is reported `hosted_resolution_orphaned` and
+    removed by `rollback` / `remove` instead of failing them (#1203).
+  - pnpm: a keyless `pnpm-workspace.yaml` gets a `packages: ['.']` scaffold
+    (removed again on unwind) so pnpm 8–10.4 keep working (#1096); vendored
+    scans skip orphaned `.pnpm` store entries (#1197); and a custom
+    `modulesDir` with `node-linker=pnp` is no longer mistaken for Yarn PnP
+    (#1129).
+  - Bun: hosted unwinds read the registry from the user's `.npmrc` and
+    global bunfig, as Bun does, instead of querying the public registry for
+    private scopes (#1276); a `bun.lockb` pin shared with a bundled copy can
+    be listed and unwound (#1243).
+  - Upgrading or downgrading a vendored npm or Bun package reverts cleanly
+    instead of being kept as drift (#1155).
   - Hosted scans pin npm aliases in a v2 lock's npm 6 `dependencies` mirror
     and in v1 locks, vendoring rewires them, and VEX withholds while the
     mirror still resolves from the registry (#432).
@@ -720,8 +907,26 @@ limits, and required install commands.
     reporting success (#362).
   - Apply and rollback report writes to every pnpm/vlt peer-variant store copy,
     not just the first (#756, #772).
-- **Cargo.** Hosted runs from a Cargo workspace member are refused (naming the
-  root) instead of rewriting the member as a lockless project (#417).
+- **Cargo.**
+  - Hosted runs from a Cargo workspace member are refused (naming the root)
+    instead of rewriting the member as a lockless project (#417).
+  - Agent mode patches, checks, attests and restores every crates.io copy in
+    a shared `CARGO_HOME` (one per registry index dir, as different cargo
+    versions use), not just the first (#339).
+  - After an in-place `apply` or `rollback`, the next `cargo build`
+    recompiles the changed crate instead of linking the rlib it cached
+    before (#387).
+  - `apply` on a cold or pruned registry cache exits 1 again and names
+    `cargo fetch`, instead of reporting success while the next build
+    compiles the unpatched crate (#616).
+  - An agent-to-vendored takeover followed by `rollback` / `remove`, and
+    `scan --prune` after a lock bump, no longer drop the record of a crate
+    still patched in the shared cache (#336, #1278).
+  - Hosted mode refuses a crate the user overrides with `[patch]`
+    (`redirect_cargo_dep_overridden`) instead of replacing the override
+    (#480). `vex` withholds, and restore handles, a hosted crate when a
+    later dependency locks its own crates.io copy of the same version
+    (#679, #863).
 - **RubyGems.**
   - Gemfile lines joining declarations with `;` are refused instead of losing
     the second gem; a declaration ending in a bare `;` is rewritten again
@@ -738,6 +943,18 @@ limits, and required install commands.
   - The crawler finds Bundler 4 standalone installs in `./bundle` (#796),
     honors `path.system` over a leftover `vendor/bundle` (#915), and VEX checks
     an out-of-tree `.bundle/config` path for stale copies (#709).
+  - Agent `apply`, `rollback`, `apply --check` and `vex` handle every platform
+    build of a gem version (`ffi-1.17.2-x86_64-linux-gnu`), the copy RubyGems
+    actually loads (#1092).
+  - A `BUNDLE_GEMFILE` that names the project's Gemfile through a symlinked
+    directory (macOS `/tmp`, a linked workspace) is recognized in every mode
+    (#896).
+  - Hosted unwinds keep the `!` Bundler writes for a gem declared in the
+    user's own `source … do` block, so frozen installs keep working (#1056).
+  - A hosted scan of a Gemfile with no lock no longer pins whatever version
+    the shared gem home holds (`redirect_gem_no_lockfile`) (#1125).
+  - Gem checks ignore system gem homes Bundler never loads for the project
+    (`deployment`, explicit `path`) (#1098, #1109).
 - **PyPI.**
   - A Pipenv project without a Pipenv venv no longer falls back to the system
     Python (agent patched system packages; vendored failed) (#504, #947).
@@ -753,6 +970,32 @@ limits, and required install commands.
     `uv sync --locked` keeps working after a requirement edit (#840).
   - Hosted Poetry and PDM scans rewrite each lock in one pass, which makes
     scans with many patches several times faster (#760, #762).
+  - Every `requirements.txt` pin is read by one grammar, so vendoring accepts
+    the legacy `six (==1.16.0)` form that scan and hosted mode did (#1365).
+    Lock-only discovery also looks up equivalent PEP 440 spellings
+    (`==1.16`, `==1.16.0.0`), so those pins get patched on a fresh
+    checkout (#604).
+  - Hosted mode no longer replaces a user's own direct reference
+    (`name @ <url>` to a mirror, fork or `file://` path) in
+    `requirements.txt` (`redirect_requirements_direct_reference`) (#542),
+    and neither uv writer touches a PEP 508 direct reference in
+    `pyproject.toml` (#767).
+  - uv: reverts handle a vendored package later added directly (#1374), each
+    PEP 723 script / `pylock` pair separately (#1285, #890), and a package
+    whose parent was `uv remove`d (#1287); hosted unwinds keep the user's own
+    `override-dependencies` pin (#411); and a scan from a workspace member
+    uses the workspace root's `uv.lock` (#1138).
+  - Hatch-derived `pylock.toml` files are no longer rewritten alone, since
+    Hatch regenerates them from `pyproject.toml`
+    (`redirect_hatch_lock_regenerated`) (#479).
+  - PDM restores of a `static_urls` lock from a private index are refused
+    instead of pointing the lock at files.pythonhosted.org (#413).
+  - A vendored revert kept because another file still installs the wheel is
+    reported as a residual reference, not drift, with a remedy that works
+    (#1184). After an unwind, PDM, uv and Pipenv projects get the correct
+    reinstall command for removing the patched build (#477).
+  - Vendored `Pipfile.lock` edits change only the patched entry (keeping
+    `\uXXXX` escapes and a leading BOM) (#1128).
 - **Vendoring.** Vendored mode refuses to replace a symlinked lockfile or
   manifest (`redirect_symlinked_file_unsupported`) instead of detaching it
   from its target (#627).
@@ -782,6 +1025,18 @@ limits, and required install commands.
   faster `bun.lock`, Poetry and PDM scans. CI runs through a merge queue with
   sharded, decoupled platform jobs and retries for registry test downloads.
   rustls is bumped to 0.23.45.
+- Help text, the README and the usage and migration guides are shorter and
+  describe lockfile-first patching, the package-target grammar and
+  service-only vendoring. `vendor --force` is documented as bypassing only
+  the installed-variant probe; `vendor_content_mismatch_overwritten` is no
+  longer emitted.
+- Obsolete local-build vendoring machinery, the `qbsdiff` dependency and
+  duplicate lock readers are removed; Pipfile.lock, nuget.config, purl
+  classification and BOM handling each go through one shared reader.
+- Linux CI runs on Depot runners with a lean per-package-manager gate on
+  PRs and the merge queue (the full matrix runs nightly), reuses the merge
+  queue's verdict on main, and spawns test binaries in a hermetic
+  environment.
 
 ## [4.0.0] — 2026-08-20
 
