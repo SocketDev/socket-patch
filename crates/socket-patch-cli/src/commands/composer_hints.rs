@@ -9,7 +9,8 @@
 //! Composer compares. Composer 1 never reinstalls a changed package. In both
 //! cases `<vendor-dir>/<vendor>/<name>` must be removed first, where
 //! `<vendor-dir>` is the directory Composer installs into
-//! (`COMPOSER_VENDOR_DIR`, else `config.vendor-dir`, else `vendor`): a hint
+//! (`COMPOSER_VENDOR_DIR`, else `config.vendor-dir`, else the user-level
+//! `$COMPOSER_HOME/config.json` `vendor-dir`, else `vendor`): a hint
 //! naming `vendor/` in a project that relocated it sends the user to delete
 //! a path that does not exist, and `composer install` then leaves the
 //! package unpatched (#658).
@@ -21,10 +22,10 @@ use socket_patch_core::patch::redirect::FileEdit;
 
 /// The project's Composer vendor directory as the hints print it: relative
 /// to `cwd` with `/` separators when it lies inside the project (`vendor`,
-/// `lib`, `deps/php`), else the absolute path `COMPOSER_VENDOR_DIR` named.
-/// A `config.vendor-dir` the crawler refuses (absolute, or climbing out of
-/// the project) prints as the `<vendor-dir>` placeholder rather than a
-/// directory that would be wrong.
+/// `lib`, `deps/php`), else the absolute path `COMPOSER_VENDOR_DIR` or the
+/// user-level config named. A `config.vendor-dir` the crawler refuses
+/// (absolute, home-relative, or climbing out of the project) prints as the
+/// `<vendor-dir>` placeholder rather than a directory that would be wrong.
 pub(crate) fn vendor_dir_label(cwd: &Path) -> String {
     let Some(dir) =
         socket_patch_core::crawlers::composer_crawler::resolve_local_vendor_dir_sync(cwd)
@@ -302,6 +303,11 @@ mod tests {
         );
         assert_eq!(
             label(Some(r#"{"config":{"vendor-dir":"../outside"}}"#)),
+            "<vendor-dir>"
+        );
+        // Composer would expand `~/`: the literal `<cwd>/~/deps` is wrong.
+        assert_eq!(
+            label(Some(r#"{"config":{"vendor-dir":"~/deps"}}"#)),
             "<vendor-dir>"
         );
     }
