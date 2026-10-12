@@ -16,9 +16,11 @@
 #![cfg(unix)]
 
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
-const BINARY: &str = env!("CARGO_BIN_EXE_socket-patch");
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
 /// `libc::SIGPIPE`, inlined so the test crate needs no libc dependency.
 const SIGPIPE: i32 = 13;
 
@@ -38,16 +40,13 @@ fn closed_stdout_pipe_is_not_a_panic() {
     let (reader, writer) = std::io::pipe().expect("pipe");
     drop(reader);
 
-    let mut cmd = Command::new(BINARY);
+    // Hermetic env: ambient SOCKET_* vars can never perturb the invocation
+    // (the assertion is about stdout plumbing).
+    let mut cmd = hermetic::binary_command();
     cmd.arg("list")
         .current_dir(dir.path())
         .stdout(Stdio::from(writer))
         .stderr(Stdio::piped());
-    // Scrub the global env-var surface so ambient SOCKET_* vars can never
-    // perturb the invocation (the assertion is about stdout plumbing).
-    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
-        cmd.env_remove(var);
-    }
     let out = cmd.output().expect("spawn socket-patch");
     let stderr = String::from_utf8_lossy(&out.stderr);
 

@@ -19,7 +19,8 @@ use base64::Engine as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const BINARY: &str = env!("CARGO_BIN_EXE_socket-patch");
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
 /// The platform env var that positions the socket-cli data dir.
 const DATA_DIR_VAR: &str = if cfg!(windows) {
@@ -43,24 +44,17 @@ fn write_config(data_dir: &Path, json: &serde_json::Value) {
     std::fs::write(dir.join("config.json"), encoded).unwrap();
 }
 
-/// Build a hermetic `socket-patch scan --json -e npm` command: every
-/// ambient `SOCKET_*` var is scrubbed (including the workspace-level
-/// `SOCKET_NO_CONFIG=1` guard — re-enabled with an explicit falsy value),
-/// the data dir points at `data_dir`, telemetry stays off.
+/// Build a hermetic `socket-patch scan --json -e npm` command: the shared
+/// hermetic env (every ambient `SOCKET_*` scrubbed, telemetry off) with the
+/// config layer re-enabled by an explicit falsy `SOCKET_NO_CONFIG`, and
+/// the data dir pointed at `data_dir`.
 fn scan_cmd(project: &Path, data_dir: &Path) -> Command {
-    let mut cmd = Command::new(BINARY);
+    let mut cmd = hermetic::binary_command();
     cmd.args(["scan", "--json", "-e", "npm", "--cwd"])
         .arg(project);
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") {
-            cmd.env_remove(&key);
-        }
-    }
     cmd.env_remove("VIRTUAL_ENV");
     cmd.env(DATA_DIR_VAR, data_dir);
     cmd.env("SOCKET_NO_CONFIG", "0");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     cmd
 }
 
