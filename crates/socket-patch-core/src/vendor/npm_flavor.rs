@@ -809,9 +809,10 @@ pub async fn revert_npm_any(
 
 /// `vendor --check`'s wiring audit for an npm-family entry: `Err` (the
 /// human reason) when the lock installs a copy of the entry's
-/// `name@version` the vendored artifact does not reach (#588). Only the
-/// package-lock flavor audits its lock today; the other flavors' wiring is
-/// left to the artifact check and `vex`.
+/// `name@version` the vendored artifact does not reach (#588), and for
+/// yarn classic when a wired block names a dependency the lock never
+/// resolves (#1379). The other flavors' wiring is left to the artifact
+/// check and `vex`.
 pub async fn check_npm_wiring(entry: &VendorEntry, project_root: &Path) -> Result<(), String> {
     match NpmLockFlavor::from_recorded(entry.flavor.as_deref()) {
         Some(NpmLockFlavor::PackageLock) => {
@@ -827,7 +828,26 @@ pub async fn check_npm_wiring(entry: &VendorEntry, project_root: &Path) -> Resul
                 None => Ok(()),
             }
         }
-        _ => Ok(()),
+        _ => match dangling_lock_dependencies(entry, project_root).await {
+            Some(detail) => Err(detail),
+            None => Ok(()),
+        },
+    }
+}
+
+/// The detail naming the dependencies `entry`'s wired lock entries list
+/// but the lock never resolves, for the flavors whose lock an older
+/// release could leave that way: yarn classic before #591's refusal
+/// (#1379). `None` for a sound lock and for every other flavor.
+pub async fn dangling_lock_dependencies(
+    entry: &VendorEntry,
+    project_root: &Path,
+) -> Option<String> {
+    match NpmLockFlavor::from_recorded(entry.flavor.as_deref()) {
+        Some(NpmLockFlavor::YarnClassic) => {
+            yarn_classic_lock::dangling_descriptors(entry, project_root).await
+        }
+        _ => None,
     }
 }
 
