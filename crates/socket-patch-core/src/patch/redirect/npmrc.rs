@@ -238,7 +238,8 @@ pub enum NpmrcPlan {
     /// full new text, with exactly one [`NPMRC_ALLOW_REMOTE_LINE`] line
     /// spliced in (after the last non-empty top-level line — before any
     /// `[section]` header — in the file's own line ending); every other byte
-    /// (BOM, CRLF, trailing-newline shape) preserved.
+    /// (BOM, CRLF, trailing-newline shape) preserved, except that an
+    /// unterminated last line it follows gains the file's terminator.
     Append(String),
     /// Already resolves to `allow-remote=all` — nothing to write.
     AlreadyAll,
@@ -720,8 +721,9 @@ pub fn replace_registry_host_rewrites(value: &str, host: &str) -> bool {
 
 /// Decide how to ensure `allow-remote=all` in the project `.npmrc`,
 /// considering only the project file (no outer npm config layers). Line
-/// splices only: untouched lines stay byte-identical, so an unwind can
-/// remove exactly what was added.
+/// splices only: untouched lines stay byte-identical, except that an
+/// unterminated last line the new line follows gains the file's
+/// terminator (#1196).
 pub fn plan_npmrc_allow_remote(existing: Option<&str>) -> NpmrcPlan {
     plan_npmrc_allow_remote_with(existing, &OuterAllowRemote::default())
 }
@@ -766,26 +768,23 @@ pub fn plan_npmrc_allow_remote_with(existing: Option<&str>, outer: &OuterAllowRe
         );
     }
     let (bom, body) = split_bom(text);
-    let crlf = crate::utils::line_endings::terminator(body) == "\r\n";
-    let line = if crlf {
-        format!("{NPMRC_ALLOW_REMOTE_LINE}\r")
-    } else {
-        NPMRC_ALLOW_REMOTE_LINE.to_string()
-    };
+    let term = crate::utils::line_endings::terminator(body);
     let mut lines: Vec<&str> = body.split('\n').collect();
     let end = top_level_end(bom, &lines);
     let anchor = lines[..end]
         .iter()
-        .rposition(|l| !l.trim().is_empty())
+        .rposition(|l| !js_trim(l).is_empty())
         .map_or(0, |i| i + 1);
     if anchor == lines.len() {
         // The anchor follows an unterminated last line (#1196): terminate
-        // it in the file's style and keep the no-final-newline shape,
-        // rather than letting the join give it a bare LF and leave the
-        // inserted line's CR dangling at end of file.
-        let term = if crlf { "\r\n" } else { "\n" };
+        // it in the file's style and keep the no-final-newline shape. The
+        // splice below would give it the join's bare LF and leave a CRLF
+        // file ending in a lone CR.
         return NpmrcPlan::Append(format!("{bom}{body}{term}{NPMRC_ALLOW_REMOTE_LINE}"));
     }
+    // Every line before the anchor is followed by a `\n` from the join,
+    // so the spliced line carries only the CR half of a CRLF terminator.
+    let line = format!("{NPMRC_ALLOW_REMOTE_LINE}{}", term.trim_end_matches('\n'));
     lines.insert(anchor, &line);
     NpmrcPlan::Append(format!("{bom}{}", lines.join("\n")))
 }
@@ -998,6 +997,9 @@ mod tests {
                 "fund=false\naudit=false\nallow-remote=all",
             ),
             ("a=1", "a=1\nallow-remote=all"),
+            // A BOM-only last line is blank to npm, so the line goes
+            // after `a=1`, not after the stray BOM.
+            ("a=1\r\n\u{feff}", "a=1\r\nallow-remote=all\r\n\u{feff}"),
         ] {
             let NpmrcPlan::Append(text) = plan_npmrc_allow_remote(Some(existing)) else {
                 panic!("append expected for {existing:?}");

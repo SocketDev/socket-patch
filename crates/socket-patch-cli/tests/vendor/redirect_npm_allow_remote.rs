@@ -393,9 +393,22 @@ async fn crlf_npmrc_without_final_newline_keeps_crlf_on_append() {
     std::fs::write(tmp.path().join(".npmrc"), "fund=false\r\naudit=false").unwrap();
     let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
     assert_eq!(code, 0, "{doc:#}");
+    let want = "fund=false\r\naudit=false\r\nallow-remote=all";
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
-        "fund=false\r\naudit=false\r\nallow-remote=all"
+        want
+    );
+
+    // A re-run reads the line it wrote: no CR-only refusal, no rewrite.
+    let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(
+        !doc.to_string().contains("carriage-return"),
+        "the re-run must not refuse the file it wrote: {doc:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
+        want
     );
 }
 
