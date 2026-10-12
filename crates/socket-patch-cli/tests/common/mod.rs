@@ -1,12 +1,9 @@
-//! Helpers shared across the e2e-safety test suites.
-//!
-//! The original e2e files (`e2e_npm.rs`, `e2e_pypi.rs`, `e2e_gem.rs`)
-//! each carry their own copy of the same `binary` / `run` /
-//! `assert_run_ok` / `git_sha256` helpers. Rather than refactor those
-//! files in this PR, this module is an additive landing place for the
-//! same surface plus the new helpers the safety suites need
-//! (synthetic manifest writers, pnpm runners, cargo runners). Existing
-//! suites can migrate in a follow-up.
+//! Helpers shared across the CLI test suites: the binary under test and
+//! the Git-blob hash oracle (`oracle`), `run` / `assert_run_ok`, and the
+//! synthetic manifest writers and package-manager runners the e2e suites
+//! need. Test files use these instead of private copies;
+//! `cli/shared_helper_copies.rs` enforces that for `binary` and
+//! `git_sha256` (#824).
 //!
 //! Each test file pulls this in with `#[path = "common/mod.rs"] mod common;`.
 //!
