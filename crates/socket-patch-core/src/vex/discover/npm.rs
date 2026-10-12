@@ -673,21 +673,31 @@ fn entry_ref(
 /// a file with neither `lockfileVersion:` nor `shrinkwrapVersion:` is not a
 /// pnpm lock ([`DIAG_LOCKFILE_UNPARSEABLE`]).
 async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
+    // pnpm's `lockfile` setting off (#1074): pnpm reads neither the root
+    // lock nor a member's, so their hosted pins keep no lockfile basis.
+    // Rush runs pnpm with a workspace and `.npmrc` of its own.
+    let rush = ctx.exists("rush.json").await;
+    let disabled = if rush {
+        None
+    } else {
+        crate::utils::pnpm_workspace::lockfile_disabled(&ctx.view, false).await
+    };
+    let disabled = disabled.as_deref();
     let root_lock = ctx.exists(PNPM_LOCK).await;
     if root_lock {
-        extract_pnpm_lock(ctx, PNPM_LOCK, out).await;
+        extract_pnpm_lock(ctx, PNPM_LOCK, disabled, out).await;
         // pnpm never reads the debris shrinkwrap: the patches it still names
         // are recognized as NOT wired (module docs, rule 11), so a ledger
         // record its stale Socket url alone keeps "mentioned" is dead.
         ctx.recognize_ignored(PNPM_SHRINKWRAP_LEGACY).await;
     } else {
-        extract_pnpm_lock(ctx, PNPM_SHRINKWRAP_LEGACY, out).await;
+        extract_pnpm_lock(ctx, PNPM_SHRINKWRAP_LEGACY, disabled, out).await;
     }
-    if ctx.exists("rush.json").await {
+    if rush {
         // The common lock, then each subspace's, sorted for deterministic
         // diagnostics (stat / list only — the reads below stay on the ctx).
         for rel in rush_lock_rels(ctx.view).await {
-            extract_pnpm_lock(ctx, &rel, out).await;
+            extract_pnpm_lock(ctx, &rel, None, out).await;
         }
     } else if let crate::utils::pnpm_workspace::MemberLocks::PerMember(rels) =
         crate::utils::pnpm_workspace::member_locks(&ctx.view).await
@@ -698,13 +708,22 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         // member importers) is a stale leftover pnpm never reads, and is
         // not among `rels`.
         for rel in rels {
-            extract_pnpm_lock(ctx, &rel, out).await;
+            extract_pnpm_lock(ctx, &rel, disabled, out).await;
         }
     }
 }
 
 /// One pnpm lock at root-relative `file` (see [`extract_pnpm`]).
-async fn extract_pnpm_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) {
+/// `disabled` names where pnpm's `lockfile` setting is turned off: its
+/// hosted refs then keep no lock pin, and one [`DIAG_REF_UNATTRIBUTABLE`]
+/// names them. Vendored refs are untouched: pnpm applies the `overrides`
+/// that wire them without a lock.
+async fn extract_pnpm_lock(
+    ctx: &DiscoverCtx<'_>,
+    file: &str,
+    disabled: Option<&str>,
+    out: &mut Discovery,
+) {
     let Some(text) = ctx.read_text(file, out).await else {
         return;
     };
@@ -719,12 +738,27 @@ async fn extract_pnpm_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discover
     }
     let mut copies: Vec<PnpmFileCopy> = Vec::new();
     let mut bundles: Vec<(&str, Bundled<'_>)> = Vec::new();
+    let mut withheld: BTreeSet<String> = BTreeSet::new();
     for package in lock.packages() {
-        pnpm_entry_ref(ctx, file, package, &mut copies, out);
+        let withhold = disabled.map(|_| &mut withheld);
+        pnpm_entry_ref(ctx, file, package, &mut copies, withhold, out);
         bundles.extend(entry_bundled(&package.entry).map(|b| (package.key, b)));
     }
     record_pnpm_file_copies(ctx, file, copies, out).await;
     record_pnpm_bundled_copies(file, bundles, out);
+    if let (Some(source), false) = (disabled, withheld.is_empty()) {
+        out.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            file,
+            format!(
+                "{file}: {}, so its hosted pins of {} are not attested from the lock alone, \
+                 only from an installed tree whose every copy verifies; \
+                 `socket-patch scan --mode vendored` wires them without a lock",
+                crate::utils::pnpm_workspace::describe_lockfile_disabled(source),
+                withheld.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
 }
 
 /// Record the bundled copies a pnpm lock installs ([`UnwiredCopy`]).
@@ -887,6 +921,7 @@ fn pnpm_entry_ref(
     file: &str,
     package: &PnpmPackage<'_>,
     copies: &mut Vec<PnpmFileCopy>,
+    withheld: Option<&mut BTreeSet<String>>,
     out: &mut Discovery,
 ) {
     let key = package.key;
@@ -937,6 +972,14 @@ fn pnpm_entry_ref(
                 ),
             );
             return;
+        };
+        // A lock pnpm does not read pins nothing (see `extract_pnpm_lock`).
+        let integrity = match withheld {
+            Some(withheld) => {
+                withheld.insert(purl.clone());
+                None
+            }
+            None => integrity,
         };
         out.push(PatchedRef::hosted(
             purl,
@@ -3064,6 +3107,59 @@ mod tests {
             run(&p).await.refs.is_empty(),
             "shared root lock: stale member"
         );
+    }
+
+    /// pnpm's `lockfile` setting off (#1074): pnpm neither reads nor writes
+    /// its lock and installs every dependency from the registry, so a
+    /// hosted pin in a committed lock keeps no lockfile basis (only an
+    /// installed tree attests it), and one diagnostic names the pins. Both
+    /// spellings count (pnpm 11+ `pnpm-workspace.yaml`, pnpm 9/10 `.npmrc`),
+    /// and so do the member locks of an unshared workspace.
+    #[tokio::test]
+    async fn pnpm_disabled_lockfile_withholds_the_lockfile_basis() {
+        let lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      ms:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  ms@1.3.0:\n    resolution: {integrity: sha512-UP==}\n";
+        let wired = hosted_rewrite("pnpm-lock.yaml", lock, &[pnpm_override("ms", UUID_B, None)]);
+        let withheld = |out: &Discovery, source: &str| {
+            assert_refs(out, &[("pkg:npm/ms@1.3.0", UUID_B, WiringMode::Hosted)]);
+            assert!(!out.refs[0].lockfile_basis_ok());
+            let diag = out
+                .diagnostics
+                .iter()
+                .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                .unwrap_or_else(|| panic!("{:#?}", out.diagnostics));
+            assert!(
+                diag.detail.contains("pkg:npm/ms@1.3.0") && diag.detail.contains(source),
+                "{}",
+                diag.detail
+            );
+        };
+
+        let p = Project::new();
+        p.write("pnpm-lock.yaml", &wired);
+        let out = run(&p).await;
+        assert!(out.refs[0].lockfile_basis_ok(), "control: the lock is read");
+        p.write("pnpm-workspace.yaml", "lockfile: false\n");
+        withheld(&run(&p).await, "`lockfile: false` in pnpm-workspace.yaml");
+
+        let p = Project::new();
+        p.write("pnpm-lock.yaml", &wired);
+        p.write(".npmrc", "lockfile=false\n");
+        withheld(&run(&p).await, "`lockfile=false` in .npmrc");
+
+        // npm's `package-lock=false`, which pnpm falls back to.
+        let p = Project::new();
+        p.write("pnpm-lock.yaml", &wired);
+        p.write(".npmrc", "package-lock=false\n");
+        withheld(&run(&p).await, "`package-lock=false` in .npmrc");
+
+        let p = Project::new();
+        p.write(
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\nlockfile: false\n",
+        );
+        p.write("packages/a/package.json", "{}");
+        p.write("packages/a/pnpm-lock.yaml", &wired);
+        withheld(&run(&p).await, "`lockfile: false` in pnpm-workspace.yaml");
     }
 
     /// `shrinkwrap.yaml` (pnpm <= 2) is read only when there is no

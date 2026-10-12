@@ -571,6 +571,96 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     })
 }
 
+/// Where pnpm's `lockfile` setting (or the `package-lock` it falls back
+/// to, see [`lockfile_off`]) is turned off (#1074), as a refusal
+/// names it (e.g. `` `lockfile: false` in pnpm-workspace.yaml ``); `None`
+/// when it is on (the default). With it off pnpm neither reads nor writes
+/// `pnpm-lock.yaml` (or a member's own lock): `pnpm install` resolves
+/// every dependency from the registry, so a pin in a committed lock is
+/// never what installs.
+///
+/// Each pnpm major reads the setting from one place: pnpm 11 and newer
+/// from `pnpm-workspace.yaml` (`lockfile: false`), pnpm 10 and older from
+/// `.npmrc` (`lockfile=false`; pnpm 10 ignores the YAML key). The major is
+/// the one that installed the project (`node_modules/.modules.yaml`), else
+/// the one package.json pins, else what the root lock's grammar implies
+/// (`pnpm_settings_major`). When none says, either source turning the
+/// setting off counts: withholding a pin is the safe side. With `env`, on
+/// disk, `pnpm_config_lockfile` / `npm_config_lockfile` count too (the
+/// hosted engine runs in the install's environment; `vex` need not).
+///
+/// Only the project's own files are read, through the view's
+/// fingerprinted reader, so a re-scan read cache stays valid; a workspace
+/// member with no settings file of its own is not related to its root's.
+pub async fn lockfile_disabled(view: &ProjectView<'_>, env: bool) -> Option<String> {
+    let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
+    let npmrc = view.read_text(".npmrc").await.ok();
+    let yaml = lockfile_off(|key, _| pnpm_setting(workspace.as_deref(), None, key, key));
+    let rc = lockfile_off(|_, key| pnpm_setting(None, npmrc.as_deref(), key, key));
+    let env = match view {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) if env => {
+            lockfile_off(|_, key| env_setting(key, |var| std::env::var(var).ok()))
+        }
+        _ => None,
+    };
+    if yaml.is_none() && rc.is_none() {
+        return env;
+    }
+    let major = pnpm_major(view).await;
+    match major {
+        Some(major) if major >= 11 => yaml,
+        Some(_) => rc,
+        None => yaml.or(rc),
+    }
+    .or(env)
+}
+
+/// Where one settings source turns pnpm's lock off: its `lockfile` when
+/// that reads as a boolean, else npm's `package-lock`, which every pnpm
+/// (7 through 11) falls back to for `useLockfile`. `setting` looks a key
+/// up in the source by its YAML spelling and its `.npmrc` spelling.
+fn lockfile_off(setting: impl Fn(&str, &str) -> Option<PnpmSetting>) -> Option<String> {
+    let off = |found: PnpmSetting| (found.as_bool() == Some(false)).then_some(found.source);
+    match setting("lockfile", "lockfile") {
+        Some(found) if found.as_bool().is_some() => off(found),
+        _ => setting("packageLock", "package-lock").and_then(off),
+    }
+}
+
+/// The pnpm major whose settings reading applies to the project at `view`
+/// (see [`lockfile_disabled`]).
+async fn pnpm_major(view: &ProjectView<'_>) -> Option<u32> {
+    use crate::patch::redirect::upstream::npm::{
+        modules_yaml_pnpm_major, package_json_pnpm_major, pnpm_settings_major,
+    };
+    let installed = view
+        .read_text("node_modules/.modules.yaml")
+        .await
+        .ok()
+        .as_deref()
+        .and_then(modules_yaml_pnpm_major);
+    let pinned = match installed {
+        Some(major) => Some(major),
+        None => view
+            .read_text("package.json")
+            .await
+            .ok()
+            .as_deref()
+            .and_then(package_json_pnpm_major),
+    };
+    let lock = view.read_text(PNPM_LOCK).await.ok().unwrap_or_default();
+    pnpm_settings_major(&lock, pinned)
+}
+
+/// What pnpm does with its `lockfile` setting off, for the refusals and
+/// diagnostics that name it ([`lockfile_disabled`]'s `source`).
+pub fn describe_lockfile_disabled(source: &str) -> String {
+    format!(
+        "{source} makes pnpm neither read nor write {PNPM_LOCK}, so `pnpm install` \
+         resolves every dependency from the registry whatever the lock pins"
+    )
+}
+
 /// The `pnpm-lock.<branch>.yaml` files in root-relative `dir` (`""` for
 /// the root), as root-relative paths, sorted.
 async fn branch_lock_names(view: &ProjectView<'_>, dir: &str) -> Vec<String> {
