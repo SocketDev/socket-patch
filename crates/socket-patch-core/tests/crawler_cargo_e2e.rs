@@ -1023,3 +1023,22 @@ async fn cargo_home_source_replacement_is_honoured() {
     assert_eq!(got, vec![vendored]);
     drop(cargo_home);
 }
+
+/// A `..` in the cwd is folded before the config walk: `b/../app` reads
+/// `app`'s ancestors, never `b/.cargo/config.toml`.
+#[tokio::test]
+#[serial_test::serial]
+async fn parent_dir_in_cwd_does_not_read_a_sibling_config() {
+    let cargo_home = CargoHomeGuard::new().await;
+    let cached = CargoHomeGuard::index(cargo_home.home.path()).join("cfg-if-1.0.0");
+    let tmp = tempfile::tempdir().unwrap();
+    let app = tmp.path().join("app");
+    write_app(&app).await;
+    let sibling = tmp.path().join("b");
+    stage_vendor_crate(&sibling.join("vendor"), "cfg-if", "1.0.0").await;
+    write_vendor_config(&sibling, "vendor").await;
+
+    let dotted = sibling.join("..").join("app");
+    assert_eq!(crawled_paths(&dotted).await, vec![cached]);
+    drop(cargo_home);
+}

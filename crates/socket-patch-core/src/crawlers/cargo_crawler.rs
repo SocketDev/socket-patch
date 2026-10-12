@@ -302,14 +302,32 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
     }
 }
 
+/// `path` with each `..` removing the component before it.
+fn fold_parent_dirs(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Where cargo takes crates.io packages from for a build in `cwd`: the
 /// source replacement of the cargo configs it reads there (every
 /// ancestor's `.cargo/config*`, then `$CARGO_HOME`'s). An unreadable
 /// config is skipped.
 async fn crates_io_source(cwd: &Path) -> CratesIoSource {
     // The logical path, not the canonical one: the crawled roots are
-    // reported under it, as the `<cwd>`-joined roots always were.
+    // reported under it, as the `<cwd>`-joined roots always were. A `..`
+    // is folded away so `a/b/../proj` walks `a/proj`'s ancestors, not
+    // `a/b`'s.
     let cwd = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd = fold_parent_dirs(&cwd);
     let cargo_home = CargoCrawler::cargo_home();
     run_blocking(move || {
         let files = config_layer_paths(&cwd, cargo_home.as_deref(), |p| p.is_file());
