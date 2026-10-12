@@ -379,6 +379,39 @@ async fn package_lock_redirect_writes_npmrc_warns_and_rollback_removes_it() {
     );
 }
 
+/// A CRLF `.npmrc` whose last line has no terminator (a Windows editor
+/// save) gets that line terminated in CRLF before the appended line,
+/// never `…\nallow-remote=all\r`: a bare LF plus a lone CR at end of
+/// file that the planner itself refuses on a later run (#1196).
+#[tokio::test]
+async fn crlf_npmrc_without_final_newline_keeps_crlf_on_append() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    std::fs::write(tmp.path().join(".npmrc"), "fund=false\r\naudit=false").unwrap();
+    let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
+    assert_eq!(code, 0, "{doc:#}");
+    let want = "fund=false\r\naudit=false\r\nallow-remote=all";
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
+        want
+    );
+
+    // A re-run reads the line it wrote: no CR-only refusal, no rewrite.
+    let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(
+        !doc.to_string().contains("carriage-return"),
+        "the re-run must not refuse the file it wrote: {doc:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
+        want
+    );
+}
+
 /// An existing `.npmrc` (BOM + CRLF, no allow-remote) gets exactly one
 /// appended line in its own line ending. With no ledger recording the
 /// append, rollback never edits a file the user owns: the `.npmrc` (and a

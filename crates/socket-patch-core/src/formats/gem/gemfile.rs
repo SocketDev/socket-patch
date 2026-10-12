@@ -57,7 +57,7 @@ enum Arg<'t> {
 /// string. `None` on an unbalanced quote. Throughout, a backslash escapes
 /// the next character in either quote style (Ruby's single-quoted strings
 /// honor `\'` and `\\` too).
-fn code_of(tail: &str) -> Option<&str> {
+pub(crate) fn code_of(tail: &str) -> Option<&str> {
     let mut quote: Option<char> = None;
     let mut escaped = false;
     for (i, c) in tail.char_indices() {

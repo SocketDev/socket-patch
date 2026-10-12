@@ -9,15 +9,10 @@
 use std::path::Path;
 
 /// Files that still define a private `binary()` or `git_sha256`. Each is
-/// changed by an open PR, or is a shared module whose includers don't all
-/// declare `mod common`. Migrate a file onto `common` and delete its entry;
-/// a stale entry is not an error, so a PR that migrates one never turns
-/// another red.
+/// a shared module whose includers don't all declare `mod common`.
+/// Migrate a file onto `common` and delete its entry; a stale entry is
+/// not an error, so a PR that migrates one never turns another red.
 const PENDING_PRIVATE_HELPERS: &[&str] = &[
-    "repair/covgap_commands_repair.rs",
-    "repair/covgap_commands_repair_vendor.rs",
-    "repair/repair_invariants.rs",
-    "scan/covgap_commands_fetch_stage.rs",
     "vex_e2e_common/mod.rs",
     "vlt_e2e_common/mod.rs",
     "vlt_hosted_common/mod.rs",
