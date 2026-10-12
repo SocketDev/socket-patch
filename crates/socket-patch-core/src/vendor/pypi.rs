@@ -778,22 +778,26 @@ async fn pipenv_stale_install_warning(
     // A base interpreter's copy a `--site-packages` venv inherits survives
     // both the uninstall-and-sync and the recreate-and-sync remedies (#1450).
     let inherited = crate::crawlers::python_crawler::inherited_base_site_dirs(&sites).await;
-    let base: Vec<_> = stale_dirs
-        .iter()
-        .filter(|d| inherited.contains(*d))
-        .collect();
-    let detail = if base.is_empty() {
+    let (base, own): (Vec<_>, Vec<_>) = stale_dirs.iter().partition(|d| inherited.contains(*d));
+    let mut detail =
+        format!("{purl}: the UNPATCHED upstream release is still installed in {listed}.");
+    if !own.is_empty() {
         let remedy = super::pypi_pipenv::stale_install_remedy(Some(lock), &name);
-        format!(
-            "{purl}: the UNPATCHED upstream release is still installed in {listed}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}; then `socket-patch vex` re-verifies the installed files."
-        )
-    } else {
+        let lead = if base.is_empty() {
+            String::new()
+        } else {
+            format!("For {}: ", join(&own))
+        };
+        detail.push_str(&format!(
+            " {lead}Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}."
+        ));
+    }
+    if !base.is_empty() {
         let remedy =
             super::pypi_pipenv::base_site_stale_install_remedy(Some(lock), &name, &join(&base));
-        format!(
-            "{purl}: the UNPATCHED upstream release is still installed in {listed}. {remedy}; then `socket-patch vex` re-verifies the installed files."
-        )
-    };
+        detail.push_str(&format!(" {remedy}."));
+    }
+    detail.push_str(" Then `socket-patch vex` re-verifies the installed files.");
     Some(VendorWarning::new("pypi_pipenv_stale_install", detail))
 }
 
@@ -4295,6 +4299,50 @@ mod tests {
                 warning.detail
             );
         }
+
+        // A second venv with its own stale copy keeps the usual remedy for
+        // that copy, beside the base-copy one.
+        let other = if cfg!(windows) {
+            fx.root.join("venv").join("Lib").join("site-packages")
+        } else {
+            fx.root
+                .join("venv")
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages")
+        };
+        let di = other.join("six-1.16.0.dist-info");
+        tokio::fs::create_dir_all(&di).await.unwrap();
+        tokio::fs::write(other.join("six.py"), ORIG).await.unwrap();
+        touch(
+            &di,
+            "METADATA",
+            "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+        )
+        .await;
+        touch(&fx.root.join("venv"), "pyvenv.cfg", "home = /usr/bin\n").await;
+        let warning = pipenv_stale_install_warning(
+            &fx.root,
+            "pkg:pypi/six@1.16.0",
+            &fx.record,
+            &InstalledSiteListings::default(),
+            &lock,
+        )
+        .await
+        .expect("both stale copies are reported");
+        let detail = &warning.detail;
+        assert!(
+            detail.contains(&format!("For {}: ", other.display())),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`pipenv run pip uninstall -y six && pipenv sync`"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("pipenv run pip install --no-deps --ignore-installed"),
+            "{detail}"
+        );
     }
 
     #[tokio::test]

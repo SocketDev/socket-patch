@@ -842,6 +842,13 @@ fn lock_sections<'a>(lock: Option<&'a Value>, name: &str) -> (Vec<&'a str>, Vec<
 pub fn base_site_stale_install_remedy(lock: Option<&Value>, name: &str, dir: &str) -> String {
     let (package, _) = lock_sections(lock, name);
     let categories = sync_args(&package);
+    // `pipenv requirements` arrived in 2022.4; its `--categories` later
+    // (present in 2022.12).
+    let since = if categories.starts_with(" --categories") {
+        "2022.12"
+    } else {
+        "2022.4"
+    };
     format!(
         "The upstream {name} in {dir} belongs to the base interpreter this `--site-packages` \
          virtualenv inherits: pip refuses to uninstall it from the virtualenv, and `pipenv \
@@ -849,8 +856,9 @@ pub fn base_site_stale_install_remedy(lock: Option<&Value>, name: &str, dir: &st
          Pipfile.lock does not protect installs on this host. Install the locked release \
          over it inside the virtualenv, leaving the base interpreter untouched: `pipenv \
          requirements{categories} > pipenv-locked.txt && pipenv run pip install --no-deps \
-         --ignore-installed -r pipenv-locked.txt` (Pipenv 2022.4+) — NOT `pipenv \
-         uninstall`, which rewrites the Pipfile and re-locks the patch away"
+         --ignore-installed -r pipenv-locked.txt` (Pipenv {since}+), then delete \
+         pipenv-locked.txt — NOT `pipenv uninstall`, which rewrites the Pipfile and \
+         re-locks the patch away"
     )
 }
 
@@ -2353,6 +2361,7 @@ mod tests {
             remedy.contains("`pipenv requirements --categories \"packages docs\" > "),
             "{remedy}"
         );
+        assert!(remedy.contains("(Pipenv 2022.12+)"), "{remedy}");
         let remedy = base_site_stale_install_remedy(None, "six", dir);
         assert!(remedy.contains("`pipenv requirements > "), "{remedy}");
     }

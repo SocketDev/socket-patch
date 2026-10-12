@@ -72,8 +72,22 @@ pub(super) async fn stale_install_warnings(
         // A `--system-site-packages` venv's own copy hides its base
         // interpreter's (#409).
         crawler.set_search_order(&sites).await;
-        let inherited =
-            socket_patch_core::crawlers::python_crawler::inherited_base_site_dirs(&sites).await;
+        // Only Pipenv's remedy reads this, and only for Pipenv's own venvs:
+        // a base dir only a Hatch env reaches is not one `pipenv run` fixes.
+        let inherited = if pipenv_uuids.is_empty() {
+            Default::default()
+        } else {
+            let pipenv_sites: Vec<_> = sites
+                .iter()
+                .filter(|site| {
+                    socket_patch_core::crawlers::hatch_env::environment_of(&hatch_envs, site)
+                        .is_none()
+                })
+                .cloned()
+                .collect();
+            socket_patch_core::crawlers::python_crawler::inherited_base_site_dirs(&pipenv_sites)
+                .await
+        };
         (sites, inherited)
     };
 
