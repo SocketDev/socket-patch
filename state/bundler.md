@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-09 (run 37), main `a8e9397`, latest release v5.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
+Last updated: 2026-10-12 (run 38), main `6ad6add`, latest release v5.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
 
 ## Coverage matrix
 
@@ -347,6 +347,19 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Migrator's own checkout following migrating-to-v5.md (incl. `bundle plugin uninstall`) | pass | — | — | — | — |
 | v4.0.0 hosted scan → v5 re-scan (lock byte-identical) → v5 `rollback` | — | — | pass (documented exact pin) | — | — |
 
+### Run 38 (main `6ad6add`, v5.0.0; Linux Ruby 3.3.6; agent hand-written manifest + `apply --offline` / `vex` / `rollback`, real `bundle install` / `bundle exec`; hosted via a scratch copy of `e2e_redirect_gem_build.rs`)
+
+| Cell | 4.0.22 | 4.0.18 | 2.6.9 | 2.5.22 | 2.3.27 |
+| --- | --- | --- | --- | --- | --- |
+| #952 fix: env `BUNDLE_GEMFILE=gemfiles/alt.gemfile` + `gemfiles/.bundle/config` path | — | pass | — | pass | — |
+| #952 neighbours: root-config `gemfile` (+ gemfiles path / + root-only path), env `BUNDLE_PATH` relative, `gemfiles` deployment, absolute env gemfile | — | pass | — | — | — |
+| #952 neighbours: `gemfiles/gems.rb`, leftover unpatched root `vendor/bundle` (left untouched) | pass | — | — | — | — |
+| #1092 fix: `ffi-1.17.2/` + `ffi-1.17.2-x86_64-linux-gnu/` in one home: apply both / runtime / `vex` / `rollback` both | pass | — | — | — | — |
+| #1295 fix: real Bundler-written stale `plugin/index` → `apply` `gem_bundler_plugin_stale` | — | pass | — | pass | pass |
+| #1056 fix: source-block unwind (plain / CRLF) | pass | pass | pass | — | — |
+| #1056 gap: `v = if … end` / `v = case … end` inside the user's `source … do` block → unwind drops `!` | fail (#1056 comment; exit 16 with CHECKSUMS) | fail (×2) | fail | — | — |
+| macOS / Windows probe (#952 backslash spelling, #1092 ucrt pair, #1295) | blocked: probe branch pushed, no Actions run triggered | | | | |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -369,11 +382,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Windows / macOS: the #1260 stale-cache warning and the #1295 plugin residue on a Windows checkout (probe branch; the capstones' `Command::new("bundle")` can't find `bundle.bat`, so the probe must script the CLI directly).
-2. H→V takeover with the hosted patched archive in `vendor/cache`, then `vendor --revert` / `remove`: the vendored revert has no stale-cache check (the takeover's restore does warn once). Low value; confirm with real installs before filing.
-3. #749 DSL gap: vendored DSL `lockfile`, and `lockfile false`.
-4. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch). #1056 neighbours: CRLF Gemfile and `gems.rb`.
-5. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 (PR #1290) / #1125 / #1295 when fixes merge.
+1. Windows / macOS probe (Actions did not trigger in run 38; retry): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1295 warning with `D:/…` plugin paths, the #1260 stale-cache warning.
+2. #1056 gap follow-up: re-run the assignment-form shapes when a fix lands (also `x = begin … end`, endless `def x = 1` inside a source block).
+3. H→V takeover with the hosted patched archive in `vendor/cache`, then `vendor --revert` / `remove` (no stale-cache check on that path).
+4. #749 DSL gap: vendored DSL `lockfile`, and `lockfile false`.
+5. Re-run #985 / #1109 (`.bundle`-default part, `agent:needs-human`) when fixes merge.
 
 ## Known non-bugs
 
@@ -483,3 +496,6 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Bundler's `Source::Path#cache` never copies a path gem that lives inside the project root, so `bundle cache --all` leaves vendored `.socket/vendor/...` gems alone and `vendor/cache/<name>/` can't shadow them (checked in the 4.0.18 source, run 37).
 - The v4.0.0 binary still runs `setup` for migration tests (`npm pack @socketsecurity/socket-patch-linux-x64-gnu@4.0.0`); `bundle plugin uninstall` exists on Bundler 2.3+ and clears `.bundle/plugin/index` even after the plugin dir is gone (run 37).
 - v5 `list` on a hosted gem project with a loopback patch registry shows 0 results unless `--patch-server-url <mock>` is passed (discovery trust rule, same as `vex`).
+- `gem_bundler_plugin_stale` reads only `<root>/.bundle/plugin/index` (or `BUNDLE_APP_CONFIG`), not the moved `gemfiles/.bundle` under a `BUNDLE_GEMFILE` Appraisal layout. It's warning-only, so a miss there isn't filed (run 38).
+- `scan --mode agent` with an unreachable API returns `status: error` with no warnings, so the #1295 warning isn't shown on that path. That's expected; `apply --offline` shows it (run 38).
+- `bughunt/bundler/20261012-win-mac-recheck` is also left behind (`git push --delete` hangs up), and no run ever triggered on it; its workflow is push-triggered only.
