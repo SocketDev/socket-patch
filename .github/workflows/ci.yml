@@ -653,9 +653,20 @@ jobs:
         env:
           SOCKET_PATCH_GO_E2E_REQUIRED: '1'
           SOCKET_PATCH_GO_E2E_VERSION: '1.24'
+        #
+        # The test output is also teed to a file so that a failing test's
+        # panic becomes an annotation (scripts/ci-test-failures.py): in a
+        # ~16k-line log it is otherwise buried far above the tail that log
+        # viewers and the log API return, and an intermittent failure
+        # can't be diagnosed once the re-run has passed.
         run: |
+          set -o pipefail
           cargo llvm-cov --workspace --no-fail-fast \
-            --no-report
+            --no-report 2>&1 | tee "$RUNNER_TEMP/coverage-tests.log" || {
+            status=$?
+            python3 scripts/ci-test-failures.py "$RUNNER_TEMP/coverage-tests.log" || true
+            exit "$status"
+          }
           cargo llvm-cov report --lcov --output-path coverage-host.lcov
           python3 scripts/ci-lcov-summary.py coverage-host.lcov | tee coverage-summary.txt
 
