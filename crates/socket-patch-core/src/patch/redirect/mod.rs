@@ -1747,11 +1747,12 @@ fn rewrite_cargo(
                 code: "redirect_cargo_directory_source".into(),
                 detail: format!(
                     "{}@{}: the project's {cargo_config_key} replaces crates.io with the \
-                     directory source `{}` (`cargo vendor`), so cargo builds the crate from \
-                     that directory and never reads a Socket registry; pinning it would \
-                     break `cargo build --frozen --offline` — dependency skipped (nothing \
-                     rewritten). Use agent mode (`scan --mode agent`), which patches the \
-                     vendored copy in place",
+                     directory source `{}` (`cargo vendor`), so the project builds offline \
+                     from that directory; a Socket registry pin would move the crate off it \
+                     onto a registry the vendored tree doesn't hold, and every \
+                     `cargo build --frozen --offline` would fail to find it — dependency \
+                     skipped (nothing rewritten). Use agent mode (`scan --mode agent`), which \
+                     patches the vendored copy in place",
                     dep.name,
                     dep.version,
                     dir.display()

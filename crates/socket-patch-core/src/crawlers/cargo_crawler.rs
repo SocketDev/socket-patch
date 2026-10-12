@@ -49,6 +49,18 @@ impl CargoCrawler {
         Ok(source_roots(options).await.0)
     }
 
+    /// The directory a local Cargo project in `cwd` builds its crates.io
+    /// dependencies from, when a cargo config replaces crates.io with a
+    /// directory source (`cargo vendor`): the crawl then searches only that
+    /// directory, never the shared registry cache. The directory need not
+    /// exist.
+    pub async fn directory_source(&self, cwd: &Path) -> Option<PathBuf> {
+        match crates_io_source(cwd).await {
+            CratesIoSource::Directory(dir) => Some(dir),
+            CratesIoSource::Registry | CratesIoSource::Other(_) => None,
+        }
+    }
+
     /// Crawl all discovered crate source directories and return every
     /// package found.
     ///

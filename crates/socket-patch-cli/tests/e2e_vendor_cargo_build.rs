@@ -1005,7 +1005,17 @@ fn agent_to_vendored_rollback_restores_shared_cache(cargo_vendor_dir: bool) {
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     if cargo_vendor_dir {
+        // A wired (but empty) directory source: the project crawl then
+        // searches only `vendor/` (#338).
         std::fs::create_dir_all(proj.join("vendor")).unwrap();
+        std::fs::create_dir_all(proj.join(".cargo")).unwrap();
+        let config = proj.join(".cargo/config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap_or_default();
+        text.push_str(
+            "\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+             [source.vendored-sources]\ndirectory = \"vendor\"\n",
+        );
+        std::fs::write(&config, text).unwrap();
     }
 
     let (code, stdout, stderr) = run_socket(
