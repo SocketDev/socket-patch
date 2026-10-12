@@ -27,6 +27,7 @@ use crate::api::types::PackageVendorResult;
 use crate::constants::npm_family::{
     RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
+use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::patch::redirect::npmrc::{
     effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
     NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
@@ -1339,6 +1340,11 @@ pub struct RewriteOptions<'a> {
     /// resolved only beside a classic `yarn.lock` (its offline-mirror
     /// refusal).
     pub yarn_classic_outer: &'a (dyn Fn() -> OuterYarnMirror + Send + Sync),
+    /// Where the cargo configs read for a build in the project (its own,
+    /// every parent directory's and `$CARGO_HOME`'s) take crates.io from,
+    /// resolved only when a cargo dep is rewritten (the cargo rewriter's
+    /// offline-source refusal).
+    pub cargo_outer: &'a (dyn Fn() -> CratesIoSource + Send + Sync),
     /// Run the rewriters on the blocking pool (the disk flow: pure CPU over
     /// every lock text).
     pub blocking: bool,
@@ -1923,6 +1929,11 @@ async fn rewrite_once(
     } else {
         OuterYarnMirror::default()
     };
+    let cargo_outer = if rewrite_overrides.iter().any(|o| o.ecosystem == "cargo") {
+        (options.cargo_outer)()
+    } else {
+        CratesIoSource::Registry
+    };
     let (files, mut rewrite) = if options.blocking {
         // Pure CPU over every lock text (the independent rewriter groups
         // run concurrently inside), so it runs on the blocking pool rather
@@ -1938,6 +1949,7 @@ async fn rewrite_once(
                 &withheld,
                 &gradle_unreadable,
                 &yarn_outer,
+                &cargo_outer,
             );
             (files, rewrite)
         })
@@ -1956,6 +1968,7 @@ async fn rewrite_once(
             withheld_from_vlt,
             &gradle_unreadable,
             &yarn_outer,
+            &cargo_outer,
         );
         (files, rewrite)
     };
@@ -3010,6 +3023,10 @@ mod tests {
     use super::*;
     use crate::vendor::lock_inventory::MemoryProject;
 
+    fn no_cargo_outer() -> CratesIoSource {
+        CratesIoSource::Registry
+    }
+
     const GRANT: &str = "GRANTTOKEN0123";
     const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
 
@@ -3177,6 +3194,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3248,6 +3266,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3552,6 +3571,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3786,6 +3806,7 @@ snapshots:
                 npm_allow_remote_config: true,
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
+                cargo_outer: &no_cargo_outer,
                 blocking: false,
                 takeover_uuids: Default::default(),
                 patch_server_origins: Vec::new(),
@@ -3889,6 +3910,7 @@ snapshots:
                 npm_allow_remote_config: true,
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
+                cargo_outer: &no_cargo_outer,
                 blocking: false,
                 takeover_uuids: Default::default(),
                 patch_server_origins: Vec::new(),
@@ -4063,6 +4085,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -4402,6 +4425,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
@@ -4616,6 +4640,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -4669,6 +4694,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -5164,6 +5190,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),

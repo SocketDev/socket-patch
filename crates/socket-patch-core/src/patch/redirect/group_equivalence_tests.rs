@@ -138,6 +138,7 @@ fn assert_same_with_metadata(
             python_metadata,
             &no_gradle_unreadable,
             &no_yarn_outer,
+            &CratesIoSource::Registry,
         );
         let merged = merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &groups)).map(
             |mut merged| {

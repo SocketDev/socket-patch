@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::formats::cargo::manifest::package_name_version;
-use crate::formats::cargo::source_replacement::{
-    self, config_layer_paths, ConfigLayer, CratesIoSource,
-};
+use crate::formats::cargo::source_replacement::{self, CratesIoSource};
 use crate::formats::cargo::CargoLock;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
@@ -57,7 +55,9 @@ impl CargoCrawler {
     pub async fn directory_source(&self, cwd: &Path) -> Option<PathBuf> {
         match crates_io_source(cwd).await {
             CratesIoSource::Directory(dir) => Some(dir),
-            CratesIoSource::Registry | CratesIoSource::Other(_) => None,
+            CratesIoSource::Registry
+            | CratesIoSource::LocalRegistry(_)
+            | CratesIoSource::Other(_) => None,
         }
     }
 
@@ -244,10 +244,7 @@ impl CargoCrawler {
     /// `PathBuf::from("")` would otherwise resolve `registry/src` against
     /// the CWD and silently crawl nothing.
     fn cargo_home() -> Option<PathBuf> {
-        match std::env::var("CARGO_HOME") {
-            Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
-            _ => crate::utils::fs::home_dir().map(|home| home.join(".cargo")),
-        }
+        source_replacement::cargo_home()
     }
 }
 
@@ -296,64 +293,20 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
                 (Vec::new(), false)
             }
         }
-        CratesIoSource::Registry | CratesIoSource::Other(_) => {
+        // Cargo unpacks a local registry's `.crate` files into the
+        // registry cache too.
+        CratesIoSource::Registry | CratesIoSource::LocalRegistry(_) | CratesIoSource::Other(_) => {
             (CargoCrawler::get_registry_src_paths().await, true)
         }
     }
 }
 
-/// `path` with each `..` removing the component before it.
-fn fold_parent_dirs(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Where cargo takes crates.io packages from for a build in `cwd`: the
-/// source replacement of the cargo configs it reads there (every
-/// ancestor's `.cargo/config*`, then `$CARGO_HOME`'s). An unreadable
-/// config is skipped.
+/// Where cargo takes crates.io packages from for a build in `cwd`
+/// ([`source_replacement::resolve_for`]), off the runtime.
 async fn crates_io_source(cwd: &Path) -> CratesIoSource {
-    // The logical path, not the canonical one: the crawled roots are
-    // reported under it, as the `<cwd>`-joined roots always were. The
-    // config walk uses it with `..` folded, so `a/b/../proj` reads
-    // `a/proj`'s ancestors, not `a/b`'s; a directory under the folded
-    // cwd is reported back under the cwd as given, which path-scoped
-    // commands strip as a prefix.
-    let given = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let folded = fold_parent_dirs(&given);
+    let cwd = cwd.to_path_buf();
     let cargo_home = CargoCrawler::cargo_home();
-    run_blocking(move || {
-        let files = config_layer_paths(&folded, cargo_home.as_deref(), |p| p.is_file());
-        let texts: Vec<(PathBuf, String)> = files
-            .into_iter()
-            .filter_map(|(file, base)| {
-                crate::utils::fs::read_regular_to_string_sync(&file)
-                    .ok()
-                    .map(|t| (base, t))
-            })
-            .collect();
-        let layers: Vec<ConfigLayer<'_>> = texts
-            .iter()
-            .map(|(base, text)| ConfigLayer { base, text })
-            .collect();
-        match source_replacement::crates_io_source(&layers) {
-            CratesIoSource::Directory(dir) => match dir.strip_prefix(&folded) {
-                Ok(rel) => CratesIoSource::Directory(given.join(rel)),
-                Err(_) => CratesIoSource::Directory(dir),
-            },
-            other => other,
-        }
-    })
-    .await
+    run_blocking(move || source_replacement::resolve_for(&cwd, cargo_home.as_deref())).await
 }
 
 /// The `(name, version)` of every registry-sourced `[[package]]` in

@@ -41,9 +41,24 @@ pub enum CratesIoSource {
     Registry,
     /// A directory source (`cargo vendor`): the resolved directory.
     Directory(PathBuf),
-    /// Some other replacement (a registry mirror, a local registry, git),
-    /// by source name.
+    /// A local registry (`cargo local-registry`): the resolved directory
+    /// of `.crate` files. Cargo unpacks them into the registry cache.
+    LocalRegistry(PathBuf),
+    /// Some other replacement (a registry mirror, git), by source name.
     Other(String),
+}
+
+impl CratesIoSource {
+    /// The on-disk source a project builds every crates.io crate from
+    /// with no network, and its kind: a directory source or a local
+    /// registry. A Socket registry pin moves a crate off it.
+    pub fn offline_source(&self) -> Option<(&'static str, &Path)> {
+        match self {
+            CratesIoSource::Directory(dir) => Some(("directory source", dir)),
+            CratesIoSource::LocalRegistry(dir) => Some(("local registry", dir)),
+            CratesIoSource::Registry | CratesIoSource::Other(_) => None,
+        }
+    }
 }
 
 /// Follow `[source.crates-io] replace-with` through `layers` (highest
@@ -82,10 +97,74 @@ pub fn crates_io_source(layers: &[ConfigLayer<'_>]) -> CratesIoSource {
     if name == "crates-io" {
         return CratesIoSource::Registry;
     }
-    match lookup(&name, "directory") {
-        Some((base, dir)) => CratesIoSource::Directory(base.join(dir)),
+    if let Some((base, dir)) = lookup(&name, "directory") {
+        return CratesIoSource::Directory(base.join(dir));
+    }
+    match lookup(&name, "local-registry") {
+        Some((base, dir)) => CratesIoSource::LocalRegistry(base.join(dir)),
         None => CratesIoSource::Other(name),
     }
+}
+
+/// `$CARGO_HOME`, defaulting to `$HOME/.cargo` (`None` with no home). An
+/// empty value means unset, as cargo treats it.
+pub fn cargo_home() -> Option<PathBuf> {
+    match std::env::var("CARGO_HOME") {
+        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
+        _ => crate::utils::fs::home_dir().map(|home| home.join(".cargo")),
+    }
+}
+
+/// [`crates_io_source`] for a cargo build in `cwd`, reading the config
+/// files [`config_layer_paths`] lists (an unreadable one is skipped).
+/// Blocking file reads.
+///
+/// `cwd` is taken as the logical absolute path, not the canonical one:
+/// a resolved directory is reported under it, as `<cwd>`-joined roots
+/// always were. The config walk folds `..` out of it, so `a/b/../proj`
+/// reads `a/proj`'s ancestors, not `a/b`'s; a directory under the folded
+/// cwd is reported back under the cwd as given, which path-scoped
+/// commands strip as a prefix.
+pub fn resolve_for(cwd: &Path, cargo_home: Option<&Path>) -> CratesIoSource {
+    let given = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let folded = fold_parent_dirs(&given);
+    let files = config_layer_paths(&folded, cargo_home, |p| p.is_file());
+    let texts: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .filter_map(|(file, base)| {
+            crate::utils::fs::read_regular_to_string_sync(&file)
+                .ok()
+                .map(|t| (base, t))
+        })
+        .collect();
+    let layers: Vec<ConfigLayer<'_>> = texts
+        .iter()
+        .map(|(base, text)| ConfigLayer { base, text })
+        .collect();
+    let under_given = |dir: PathBuf| match dir.strip_prefix(&folded) {
+        Ok(rel) => given.join(rel),
+        Err(_) => dir,
+    };
+    match crates_io_source(&layers) {
+        CratesIoSource::Directory(dir) => CratesIoSource::Directory(under_given(dir)),
+        CratesIoSource::LocalRegistry(dir) => CratesIoSource::LocalRegistry(under_given(dir)),
+        other => other,
+    }
+}
+
+/// `path` with each `..` removing the component before it.
+fn fold_parent_dirs(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The cargo config files cargo reads for a build in `cwd`, highest
@@ -222,6 +301,23 @@ mod tests {
             crates_io_source(&[layer(base, cycle)]),
             CratesIoSource::Registry
         );
+    }
+
+    #[test]
+    fn local_registry_replacement_resolves_its_directory() {
+        let base = Path::new("/p");
+        let text = "[source.crates-io]\nreplace-with = \"local\"\n\
+                    [source.local]\nlocal-registry = \"registry\"\n";
+        let got = crates_io_source(&[layer(base, text)]);
+        assert_eq!(
+            got,
+            CratesIoSource::LocalRegistry(PathBuf::from("/p/registry"))
+        );
+        assert_eq!(
+            got.offline_source(),
+            Some(("local registry", Path::new("/p/registry")))
+        );
+        assert_eq!(CratesIoSource::Other("m".into()).offline_source(), None);
     }
 
     #[test]
