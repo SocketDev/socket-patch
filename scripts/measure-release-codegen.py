@@ -232,14 +232,58 @@ def compare(toolchain):
     }
 
 
+def compare_compilers(units):
+    setting = 'implicit-default' if units is None else 1
+    pairs = []
+    old_sizes = []
+    new_sizes = []
+    for sample in sorted({row['sample'] for row in RESULTS}):
+        old = next((row for row in RESULTS if row['sample'] == sample and
+                    row['compiler'] == '1.93.1' and row['codegen_units'] == setting), None)
+        new = next((row for row in RESULTS if row['sample'] == sample and
+                    row['compiler'] == '1.99.0' and row['codegen_units'] == setting), None)
+        if old and new:
+            pairs.append(1 - new['elapsed_seconds'] / old['elapsed_seconds'])
+            old_sizes.append(old['binary_bytes'])
+            new_sizes.append(new['binary_bytes'])
+    return {
+        'codegen_units': setting,
+        'pairs': len(pairs),
+        '1.93.1_median_seconds': median([row['elapsed_seconds'] for row in RESULTS
+                                        if row['compiler'] == '1.93.1' and row['codegen_units'] == setting]),
+        '1.99.0_median_seconds': median([row['elapsed_seconds'] for row in RESULTS
+                                        if row['compiler'] == '1.99.0' and row['codegen_units'] == setting]),
+        'median_improvement_percent': round(100 * statistics.median(pairs), 2),
+        'each_pair_faster': all(value > 0 for value in pairs),
+        'paired_improvements_percent': [round(100 * value, 2) for value in pairs],
+        '1.93.1_median_binary_bytes': int(statistics.median(old_sizes)),
+        '1.99.0_median_binary_bytes': int(statistics.median(new_sizes)),
+        '1.99.0_no_larger': statistics.median(new_sizes) <= statistics.median(old_sizes),
+    }
+
+
 run_blocks(3, 0)
 comparisons = {toolchain: compare(toolchain) for toolchain in TOOLCHAINS}
 REPORT['comparisons'] = comparisons
+compiler_comparisons = {
+    label: compare_compilers(setting)
+    for label, setting in (('default', None), ('units1', 1))
+}
+REPORT['compiler_comparisons'] = compiler_comparisons
 save()
-if any(value['median_improvement_percent'] >= 5 and value['each_pair_faster'] for value in comparisons.values()):
+promising = any(value['median_improvement_percent'] >= 5 and value['each_pair_faster']
+                for value in comparisons.values())
+promising = promising or any(value['median_improvement_percent'] >= 5 and value['each_pair_faster']
+                             for value in compiler_comparisons.values())
+if promising:
     run_blocks(2, 3)
     comparisons = {toolchain: compare(toolchain) for toolchain in TOOLCHAINS}
     REPORT['comparisons'] = comparisons
+    compiler_comparisons = {
+        label: compare_compilers(setting)
+        for label, setting in (('default', None), ('units1', 1))
+    }
+    REPORT['compiler_comparisons'] = compiler_comparisons
 
 REPORT['cli_output_equivalence'] = all(
     len({row[key] for row in RESULTS}) == 1
@@ -264,11 +308,24 @@ for toolchain in TOOLCHAINS:
         raise SystemExit(1)
 sizes = [row['binary_bytes'] for row in RESULTS]
 REPORT['binary_size_bytes'] = {'minimum': min(sizes), 'maximum': max(sizes), 'all_equal': len(set(sizes)) == 1}
-if (REPORT['cli_output_equivalence'] and
-        all(value['pairs'] >= 5 and value['median_improvement_percent'] >= 5 and
-            value['each_pair_faster'] and value['units1_no_larger']
-            for value in comparisons.values())):
-    REPORT['conclusion'] = 'units1 meets the timing threshold on both toolchains; inspect size and correctness before considering a production change'
+units_benefits = {
+    toolchain: value['pairs'] >= 5 and value['median_improvement_percent'] >= 5 and
+    value['each_pair_faster'] and value['units1_no_larger']
+    for toolchain, value in comparisons.items()
+}
+compiler_benefit = compiler_comparisons['default']['pairs'] >= 5 and \
+    compiler_comparisons['default']['median_improvement_percent'] >= 5 and \
+    compiler_comparisons['default']['each_pair_faster'] and \
+    compiler_comparisons['default']['1.99.0_no_larger']
+REPORT['production_signal'] = {
+    'units1_by_compiler': units_benefits,
+    'rust_1_99_default': compiler_benefit,
+    'requires_cli_output_equivalence': REPORT['cli_output_equivalence'],
+}
+if not REPORT['cli_output_equivalence']:
+    REPORT['conclusion'] = 'no production change supported: CLI version/help output differs'
+elif any(units_benefits.values()) or compiler_benefit:
+    REPORT['conclusion'] = 'timing signal meets threshold for at least one independent change; review fixture results and signal scope before a production PR'
 else:
-    REPORT['conclusion'] = 'no demonstrated units1 benefit across both toolchains; no production change supported'
+    REPORT['conclusion'] = 'no demonstrated settings or compiler benefit; no production change supported'
 save()
