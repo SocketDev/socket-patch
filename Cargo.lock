@@ -1895,6 +1895,7 @@ version = "5.0.0"
 dependencies = [
  "base64",
  "clap",
+ "flate2",
  "hex",
  "libc",
  "regex",
@@ -1902,6 +1903,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "tar",
  "tempfile",
  "zip",
 ]
