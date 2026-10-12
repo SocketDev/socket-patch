@@ -838,8 +838,16 @@ limits, and required install commands.
     (#393, #458, #531).
   - Agent `apply` and `vendor` work on Windows with Go's read-only module
     cache instead of failing with `Access is denied` (#346).
-- **Composer.** Reinstall hints name the configured vendor directory
-  (`COMPOSER_VENDOR_DIR`, `config.vendor-dir`) instead of `vendor/` (#658).
+  - `vex` attests an applied agent-mode patch for a `+incompatible` module
+    instead of reporting `not_applied` (#484).
+- **Composer.**
+  - Reinstall hints name the configured vendor directory
+    (`COMPOSER_VENDOR_DIR`, `config.vendor-dir`) instead of `vendor/` (#658).
+  - `scan -g` and agent-mode scans find installs whose `vendor-dir` is set
+    in the global or another inherited config, not only the project's
+    `composer.json` (#439, #686).
+  - Global discovery finds a Composer 2 home in the XDG config dir even when
+    an old `~/.composer` directory remains (#586).
 - **npm family.**
   - npm's `${VAR}` expansion is applied to `replace-registry-host`, so a
     setting that expands to `always` gets the hosted-pin warning (#1233).
@@ -872,6 +880,19 @@ limits, and required install commands.
     be listed and unwound (#1243).
   - Upgrading or downgrading a vendored npm or Bun package reverts cleanly
     instead of being kept as drift (#1155).
+  - Hosted mode leaves pnpm locks alone when pnpm's `lockfile` setting is
+    off (`lockfile=false`, `lockfile: false` or `package-lock=false`), since
+    pnpm then installs from the registry; it warns
+    `redirect_pnpm_lockfile_disabled` and suggests vendored mode, and
+    lock-only `vex` no longer attests those pins (#1074).
+  - Yarn Berry rollback / remove after a `yarn remove` in one workspace
+    member restore the registry entry keyed only by the descriptors still
+    declared, so `yarn install --immutable` passes (#1435).
+  - `.yarnrc.yml` settings are read the way yarn reads them, including
+    `${VAR:-default}` and quoted YAML values, so a PnP project configured
+    through a variable is refused as PnP (#1100).
+  - Appending `allow-remote=all` to a CRLF `.npmrc` with no final newline
+    keeps its line endings intact (#1196).
   - Hosted scans pin npm aliases in a v2 lock's npm 6 `dependencies` mirror
     and in v1 locks, vendoring rewires them, and VEX withholds while the
     mirror still resolves from the registry (#432).
@@ -927,6 +948,15 @@ limits, and required install commands.
     (#480). `vex` withholds, and restore handles, a hosted crate when a
     later dependency locks its own crates.io copy of the same version
     (#679, #863).
+  - Cargo source replacement (`[source.crates-io] replace-with` to a
+    directory source) is followed through every config cargo reads, so
+    agent mode patches, and `vex` / rollback judge, the copy cargo builds
+    from instead of assuming `<cwd>/vendor`. A `vendor/` that no
+    `replace-with` wires is no longer crawled. Hosted mode skips every crate
+    when crates.io is replaced by an on-disk source
+    (`redirect_cargo_directory_source`) (#338, #455).
+  - Hosted mode pins a dependency declared with an explicit
+    `registry = "crates-io"` instead of skipping it (#386).
 - **RubyGems.**
   - Gemfile lines joining declarations with `;` are refused instead of losing
     the second gem; a declaration ending in a bare `;` is rewritten again
@@ -955,6 +985,11 @@ limits, and required install commands.
     the shared gem home holds (`redirect_gem_no_lockfile`) (#1125).
   - Gem checks ignore system gem homes Bundler never loads for the project
     (`deployment`, explicit `path`) (#1098, #1109).
+  - With `BUNDLE_GEMFILE` pointing into another directory (Appraisal-style
+    `gemfiles/rails_7.gemfile`), agent mode, `vex` and the stale-install
+    check probe the stores Bundler actually uses (#952).
+  - Vendored revert no longer half-reverts when the wired Gemfile line was
+    commented out (#988).
 - **PyPI.**
   - A Pipenv project without a Pipenv venv no longer falls back to the system
     Python (agent patched system packages; vendored failed) (#504, #947).
@@ -996,6 +1031,13 @@ limits, and required install commands.
     reinstall command for removing the patched build (#477).
   - Vendored `Pipfile.lock` edits change only the patched entry (keeping
     `\uXXXX` escapes and a leading BOM) (#1128).
+  - A Poetry dependency pinned to `source = "pypi"` is refused in a lock
+    written by Poetry 1.4–2.2, which can't install the rewired lock
+    (`redirect_poetry_lock_unsupported` / `pypi_poetry_source_constraint`);
+    other Poetry versions are rewired with a warning (#1282).
+  - Vendored Hatch refuses (`pypi_hatch_unsupported`) a checkout whose path
+    contains `%`, `#`, `;` or `?`, which Hatch's `{root:uri}` turns into a
+    broken file URL (#547).
 - **Vendoring.** Vendored mode refuses to replace a symlinked lockfile or
   manifest (`redirect_symlinked_file_unsupported`) instead of detaching it
   from its target (#627).
