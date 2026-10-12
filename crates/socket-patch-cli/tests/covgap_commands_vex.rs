@@ -1076,19 +1076,32 @@ fn go_patches_replace_for_an_unselected_version_is_not_attested() {
 /// #484: the patch API keys a `+incompatible` Go module as
 /// `@v2.0.0%2Bincompatible`, while go.mod spells the replace's version with
 /// a literal `+`. vex must match the two spellings: an applied go-patches
-/// redirect attests (it used to be omitted as `not_applied`, exit 1), and a
-/// go.work replace that overrides it is still caught and never attested.
+/// redirect attests (it used to be omitted as `not_applied`, exit 1), while
+/// a go.work replace that overrides it, or a require that selects another
+/// version, is still caught, never attested, and reported under the
+/// record's own `%2B` spelling.
 #[test]
 fn go_patches_replace_of_an_incompatible_module_matches_the_encoded_key() {
     let module = "example.com/legacy";
     let version = "v2.0.0+incompatible";
-    for overridden in [false, true] {
+    // (omission reason, if any)
+    for omitted in [
+        None,
+        Some("go_workspace_override"),
+        Some("go_version_not_selected"),
+    ] {
+        let overridden = omitted == Some("go_workspace_override");
+        let required = if omitted == Some("go_version_not_selected") {
+            "v2.1.0+incompatible"
+        } else {
+            version
+        };
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         std::fs::write(
             cwd.join("go.mod"),
             format!(
-                "module example.com/app\n\ngo 1.21\n\nrequire {module} {version}\n\n\
+                "module example.com/app\n\ngo 1.21\n\nrequire {module} {required}\n\n\
                  replace {module} {version} => ./.socket/go-patches/{module}@{version}\n"
             ),
         )
@@ -1143,11 +1156,12 @@ fn go_patches_replace_of_an_incompatible_module_matches_the_encoded_key() {
             .expect("invoke vex");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if overridden {
+        if let Some(reason) = omitted {
             assert_eq!(out.status.code(), Some(1), "stderr:\n{stderr}");
             assert!(!stdout.contains("not_affected"), "{stdout}");
             assert!(
-                stderr.contains("(go_workspace_override)"),
+                stderr.contains(&format!("omitting {encoded} from VEX"))
+                    && stderr.contains(&format!("({reason})")),
                 "stderr:\n{stderr}"
             );
         } else {
