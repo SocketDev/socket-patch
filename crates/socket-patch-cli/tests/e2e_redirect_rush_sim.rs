@@ -29,7 +29,7 @@ mod common;
 use common::binary;
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 use sha2::{Digest, Sha512};
 use wiremock::matchers::{method, path, path_regex};
@@ -82,7 +82,7 @@ fn has_corepack_pm(pm: &str) -> bool {
     };
     // Isolated too: this probe is what actually downloads the package manager
     // the first time, and corepack stores it under `COREPACK_HOME`.
-    let mut cmd = Command::new("corepack");
+    let mut cmd = hermetic::tool_command("corepack");
     cmd.args([pm, "--version"])
         .current_dir(probe.path())
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
@@ -95,7 +95,7 @@ fn has_corepack_pm(pm: &str) -> bool {
 }
 
 fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
+    let mut probe = hermetic::tool_command(cmd);
     probe.arg("--version");
     cache_env::isolate(&mut probe);
     probe
@@ -107,7 +107,7 @@ fn has_command(cmd: &str) -> bool {
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = hermetic::tool_command("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
     hermetic::scrub_socket_vars(&mut cmd);
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
@@ -652,7 +652,7 @@ async fn rush_hosted_real_rush_update_install() {
     let rush = |args: &[&str]| -> Output {
         let mut full = vec!["x", "-y", rush_pkg.as_str()];
         full.extend_from_slice(args);
-        let mut cmd = Command::new("npm");
+        let mut cmd = hermetic::tool_command("npm");
         cmd.args(&full).current_dir(root);
         hermetic::scrub_socket_vars(&mut cmd);
         hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);

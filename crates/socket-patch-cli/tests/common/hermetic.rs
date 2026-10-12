@@ -88,6 +88,20 @@ pub fn binary_command() -> Command {
     command(Path::new(env!("CARGO_BIN_EXE_socket-patch")))
 }
 
+/// A `Command` for the package-manager tool `name` on `PATH`, resolved the
+/// way the CLI resolves its own tools (every `PATHEXT` extension on
+/// Windows). npm and Node install `pnpm`, `corepack` and `npm` as `.cmd`
+/// shims there, and a bare `Command::new("corepack")` only finds
+/// `corepack.exe`, so the pnpm suites' probes reported the tool missing and
+/// every Windows test skipped. A tool that isn't on `PATH` keeps the bare
+/// name, so spawning it still fails the way the probes expect.
+pub fn tool_command(name: &str) -> Command {
+    Command::new(
+        socket_patch_core::utils::process::resolve_tool(name)
+            .map_or_else(|| name.into(), std::path::PathBuf::into_os_string),
+    )
+}
+
 /// Remove every ambient `SOCKET_*` var from `cmd`, except the telemetry
 /// opt-outs (an opted-out developer stays opted out), `SOCKET_NO_CONFIG`
 /// and `SOCKET_NO_UPDATE_CHECK`. [`command`] runs this; package-manager
