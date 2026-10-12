@@ -818,7 +818,8 @@ async fn generate_vex(
     // conflict with another member's (#393, #458, #531) is not what the
     // build links, however intact its copy or pin: never attest it.
     if !common.is_global() {
-        use socket_patch_core::utils::purl::{build_golang_purl, strip_purl_qualifiers};
+        use socket_patch_core::utils::purl::build_golang_purl;
+        use socket_patch_core::utils::purl_key::PurlKey;
         for issue in socket_patch_core::vendor::go_consumer_sync::workspace_audit(&common.cwd).await
         {
             let socket_patch_core::vendor::go_consumer_sync::GoSyncIssue::Workspace {
@@ -831,9 +832,9 @@ async fn generate_vex(
             };
             let purl = build_golang_purl(module, version);
             let before = outcome.applied.len();
-            outcome
-                .applied
-                .retain(|p| strip_purl_qualifiers(p) != purl.as_str());
+            // PurlKey, not string equality: go.mod spells `+incompatible`
+            // with a literal `+`, the manifest key with `%2B` (#484).
+            outcome.applied.retain(|p| !PurlKey::same(p, &purl));
             if outcome.applied.len() == before {
                 continue;
             }
@@ -1659,6 +1660,7 @@ async fn synthesize_go_patches(
         are_safe_redirect_coords, copy_dir_for,
     };
     use socket_patch_core::utils::purl::build_golang_purl;
+    use socket_patch_core::utils::purl_key::PurlKey;
     use socket_patch_core::vendor::go_mod_edit::{
         read_replace_entries, ReplaceOwner, GO_PATCHES_DIR,
     };
@@ -1671,10 +1673,18 @@ async fn synthesize_go_patches(
         let Some(version) = entry.version.as_deref() else {
             continue;
         };
-        let purl = build_golang_purl(&entry.module, version);
-        if !manifest.patches.contains_key(&purl) {
+        // go.mod spells `+incompatible` with a literal `+`; the API keys it
+        // `%2B` (#484). Match by release and key the copy by the record's
+        // own spelling, which is what verification looks up.
+        let wanted = PurlKey::new(&build_golang_purl(&entry.module, version));
+        let Some(purl) = manifest
+            .patches
+            .keys()
+            .find(|key| PurlKey::new(key) == wanted)
+            .cloned()
+        else {
             continue;
-        }
+        };
         // Explicit vendor entries take precedence over the synthesis
         // (vendor may have taken over an apply redirect).
         if socket_patch_core::vendor::lookup_entry(entries, &purl).is_some() {
