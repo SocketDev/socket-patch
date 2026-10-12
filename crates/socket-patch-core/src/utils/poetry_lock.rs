@@ -12,6 +12,8 @@
 //! panic: every table access here is guarded and degrades to an `Err`, which
 //! callers surface as a refusal warning.
 
+use std::collections::BTreeMap;
+
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
@@ -186,51 +188,118 @@ pub fn generated_by_version(lock_text: &str) -> Option<(u64, u64)> {
     Some((major, minor))
 }
 
-/// The `source = "<name>"` a pyproject's Poetry dependency tables pin
-/// `name` to: `[tool.poetry.dependencies]`, the legacy `dev-dependencies` and
-/// every `[tool.poetry.group.*.dependencies]`, in table, inline-table and
-/// multiple-constraint (array) form. Keys compare PEP 503-canonical.
-///
-/// Poetry writes nothing into `poetry.lock` for a dependency pinned to PyPI
-/// (`source = "pypi"`), so the lock alone can't show the constraint. An
-/// unreadable pyproject reads as no constraint.
-pub fn pyproject_source_constraint(pyproject: &str, name: &str) -> Option<String> {
-    let doc = pyproject.parse::<DocumentMut>().ok()?;
-    let poetry = doc
+/// Every `(key, spec)` entry of a pyproject's Poetry dependency tables:
+/// `[tool.poetry.dependencies]`, the legacy `dev-dependencies` and every
+/// `[tool.poetry.group.*.dependencies]`.
+pub(crate) fn poetry_dependency_entries(doc: &DocumentMut) -> Vec<(&str, &Item)> {
+    let Some(poetry) = doc
         .get("tool")
-        .and_then(Item::as_table_like)?
-        .get("poetry")
-        .and_then(Item::as_table_like)?;
+        .and_then(Item::as_table_like)
+        .and_then(|tool| tool.get("poetry"))
+        .and_then(Item::as_table_like)
+    else {
+        return Vec::new();
+    };
     let groups = poetry
         .get("group")
         .and_then(Item::as_table_like)
         .into_iter()
         .flat_map(|groups| groups.iter())
         .filter_map(|(_, group)| group.as_table_like()?.get("dependencies"));
-    let canon = canonicalize_pypi_name(name);
-    let source = ["dependencies", "dev-dependencies"]
+    ["dependencies", "dev-dependencies"]
         .into_iter()
         .filter_map(|table| poetry.get(table))
         .chain(groups)
         .filter_map(Item::as_table_like)
         .flat_map(|deps| deps.iter())
-        .filter(|(key, _)| canonicalize_pypi_name(key) == canon)
-        .find_map(|(_, spec)| {
-            let source_of = |table: &dyn TableLike| {
-                table
-                    .get("source")
-                    .and_then(Item::as_str)
-                    .map(str::to_string)
-            };
-            match spec {
-                Item::Value(Value::Array(constraints)) => constraints
-                    .iter()
-                    .filter_map(Value::as_inline_table)
-                    .find_map(|table| source_of(table)),
-                _ => spec.as_table_like().and_then(source_of),
+        .collect()
+}
+
+/// The `source = "<name>"` each Poetry dependency of a pyproject is pinned
+/// to, keyed by PEP 503-canonical name. Covers the table and inline-table
+/// forms and both spellings of multiple constraints (an inline array of
+/// tables, or `[[tool.poetry.dependencies.<name>]]`); the first constraint
+/// naming a source wins.
+///
+/// Poetry writes nothing into `poetry.lock` for a dependency pinned to PyPI
+/// (`source = "pypi"`), so the lock alone can't show the constraint. An
+/// unreadable pyproject reads as no constraints.
+pub fn pyproject_source_constraints(pyproject: &str) -> BTreeMap<String, String> {
+    let mut sources = BTreeMap::new();
+    let Ok(doc) = pyproject.parse::<DocumentMut>() else {
+        return sources;
+    };
+    let source_of = |table: &dyn TableLike| {
+        table
+            .get("source")
+            .and_then(Item::as_str)
+            .map(str::to_string)
+    };
+    for (key, spec) in poetry_dependency_entries(&doc) {
+        let source = match spec {
+            Item::Value(Value::Array(constraints)) => constraints
+                .iter()
+                .filter_map(Value::as_inline_table)
+                .find_map(|table| source_of(table)),
+            Item::ArrayOfTables(constraints) => {
+                constraints.iter().find_map(|table| source_of(table))
             }
-        });
-    source
+            _ => spec.as_table_like().and_then(source_of),
+        };
+        if let Some(source) = source {
+            sources.entry(canonicalize_pypi_name(key)).or_insert(source);
+        }
+    }
+    sources
+}
+
+/// Whether `lock_text` lists `name` (PEP 503-canonical) at `version`, i.e.
+/// whether a rewrite of that package would touch the lock at all.
+pub fn lock_lists(lock_text: &str, name: &str, version: &str) -> bool {
+    let Ok(lock) = lock_text.parse::<DocumentMut>() else {
+        return false;
+    };
+    let canon = canonicalize_pypi_name(name);
+    table_likes(lock.get("package")).into_iter().any(|package| {
+        package
+            .get("name")
+            .and_then(Item::as_str)
+            .is_some_and(|candidate| canonicalize_pypi_name(candidate) == canon)
+            && package.get("version").and_then(Item::as_str) == Some(version)
+    })
+}
+
+/// The refusal detail for a source-pinned package over a lock that
+/// [`source_constraint_breaks_writer`] flags; `kind` is how the rewrite
+/// would source it (`URL` hosted, `file` vendored).
+pub fn source_constraint_refusal(
+    pyproject_path: &str,
+    lock_path: &str,
+    name: &str,
+    source: &str,
+    kind: &str,
+) -> String {
+    format!(
+        "{pyproject_path} pins {name} to the {source:?} source (`source = {source:?}`), and \
+         {lock_path} was written by Poetry 1.4 – 2.2, whose installer refuses that constraint \
+         on a package the lock sources from a {kind}: every `poetry install` would fail. Drop \
+         the `source` key, or upgrade to Poetry >= 2.3 and re-lock, then re-run"
+    )
+}
+
+/// The advisory for a source-pinned package rewired over a lock that a
+/// Poetry outside 1.4 – 2.2 wrote.
+pub fn source_constraint_advisory(
+    pyproject_path: &str,
+    lock_path: &str,
+    name: &str,
+    source: &str,
+) -> String {
+    format!(
+        "{pyproject_path} pins {name} to the {source:?} source (`source = {source:?}`): \
+         Poetry 1.4 – 2.2 refuse to install {lock_path} with that constraint (1.1 – 1.3 and \
+         2.3+ install it); drop the `source` key if this project is installed with one of them"
+    )
 }
 
 /// Whether the lock's writer is a Poetry release (1.4 – 2.2) whose installer
@@ -707,6 +776,65 @@ fn poetry_lock_fragments_in<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every place Poetry reads a per-dependency `source` (#1282).
+    #[test]
+    fn pyproject_source_constraints_reads_every_declaration_form() {
+        let pyproject = r#"
+[tool.poetry.dependencies]
+python = ">=3.8"
+plain = "1.0"
+Inline_Name = {version = "1.0", source = "pypi"}
+arrayed = [{version = "1", python = "<3.8"}, {version = "2", source = "mirror"}]
+
+[[tool.poetry.dependencies.tabled]]
+version = "1"
+source = "PyPI"
+
+[tool.poetry.dependencies.table]
+version = "1"
+source = "pypi"
+
+[tool.poetry.dev-dependencies]
+legacy = {version = "*", source = "pypi"}
+
+[tool.poetry.group.test.dependencies]
+grouped = {version = "*", source = "pypi"}
+"#;
+        let got = pyproject_source_constraints(pyproject);
+        let want: BTreeMap<String, String> = [
+            ("inline-name", "pypi"),
+            ("arrayed", "mirror"),
+            ("tabled", "PyPI"),
+            ("table", "pypi"),
+            ("legacy", "pypi"),
+            ("grouped", "pypi"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(got, want);
+        assert!(pyproject_source_constraints("not = [toml").is_empty());
+        assert!(pyproject_source_constraints("[project]\nname = \"x\"\n").is_empty());
+    }
+
+    #[test]
+    fn source_constraint_breaks_only_poetry_1_4_to_2_2_writers() {
+        let stamp = |v: &str| {
+            format!("# This file is automatically @generated by Poetry {v} and should not be changed by hand.\n")
+        };
+        for (v, want) in [
+            ("1.3.2", false),
+            ("1.4.0", true),
+            ("1.8.5", true),
+            ("2.2.1", true),
+            ("2.3.0", false),
+            ("2.4.3", false),
+        ] {
+            assert_eq!(source_constraint_breaks_writer(&stamp(v)), want, "{v}");
+        }
+        assert!(!source_constraint_breaks_writer("[[package]]\n"));
+    }
 
     const WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
     const URL: &str = "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
