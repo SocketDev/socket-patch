@@ -253,38 +253,74 @@ pub fn pyproject_source_constraints(pyproject: &str) -> BTreeMap<String, String>
     sources
 }
 
-/// Whether `lock_text` lists `name` (PEP 503-canonical) at `version`, i.e.
-/// whether a rewrite of that package would touch the lock at all.
-pub fn lock_lists(lock_text: &str, name: &str, version: &str) -> bool {
-    let Ok(lock) = lock_text.parse::<DocumentMut>() else {
-        return false;
-    };
+/// What `lock_text` already wires for `name` (PEP 503-canonical) at
+/// `version`, or `None` when the lock doesn't list it there (a rewrite
+/// would not touch the lock).
+pub fn lock_wiring(lock_text: &str, name: &str, version: &str) -> Option<Wired> {
+    let lock = lock_text.parse::<DocumentMut>().ok()?;
     let canon = canonicalize_pypi_name(name);
-    table_likes(lock.get("package")).into_iter().any(|package| {
-        package
-            .get("name")
-            .and_then(Item::as_str)
-            .is_some_and(|candidate| canonicalize_pypi_name(candidate) == canon)
-            && package.get("version").and_then(Item::as_str) == Some(version)
+    let package = table_likes(lock.get("package"))
+        .into_iter()
+        .find(|package| {
+            package
+                .get("name")
+                .and_then(Item::as_str)
+                .is_some_and(|candidate| canonicalize_pypi_name(candidate) == canon)
+                && package.get("version").and_then(Item::as_str) == Some(version)
+        })?;
+    let source_type = package
+        .get("source")
+        .and_then(Item::as_table_like)
+        .and_then(|source| source.get("type"))
+        .and_then(Item::as_str);
+    Some(match source_type {
+        Some("url") => Wired::Hosted,
+        Some("file") => Wired::Vendored,
+        _ => Wired::No,
     })
 }
 
 /// The refusal detail for a source-pinned package over a lock that
 /// [`source_constraint_breaks_writer`] flags; `kind` is how the rewrite
-/// would source it (`URL` hosted, `file` vendored).
+/// would source it (`URL` hosted, `file` vendored). Dropping the key or
+/// upgrading Poetry both mean re-locking, which discards whatever the lock
+/// already wires: `wired` (the lock still carries a vendored or hosted pin
+/// for the package) puts `socket-patch vendor --revert` or `rollback` first.
 pub fn source_constraint_refusal(
     pyproject_path: &str,
     lock_path: &str,
     name: &str,
     source: &str,
     kind: &str,
+    wired: Wired,
 ) -> String {
+    let first = match wired {
+        Wired::No => "",
+        Wired::Vendored => {
+            "run `socket-patch vendor --revert` (it reverts EVERY vendored package in the \
+             project, not just this one), then "
+        }
+        Wired::Hosted => "run `socket-patch rollback` to restore the upstream entry, then ",
+    };
     format!(
         "{pyproject_path} pins {name} to the {source:?} source (`source = {source:?}`), and \
          {lock_path} was written by Poetry 1.4 – 2.2, whose installer refuses that constraint \
-         on a package the lock sources from a {kind}: every `poetry install` would fail. Drop \
-         the `source` key, or upgrade to Poetry >= 2.3 and re-lock, then re-run"
+         on a package the lock sources from a {kind}: every `poetry install` would fail. To \
+         patch it, {first}drop the `source` key or upgrade to Poetry >= 2.3, re-lock, and \
+         re-run"
     )
+}
+
+/// What the lock already wires for a package refused by
+/// [`source_constraint_refusal`], which decides the remedy's first step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wired {
+    /// Nothing yet: the lock still installs the upstream release.
+    No,
+    /// A vendored wheel, recorded in the vendor ledger.
+    Vendored,
+    /// A hosted URL pin.
+    Hosted,
 }
 
 /// The advisory for a source-pinned package rewired over a lock that a

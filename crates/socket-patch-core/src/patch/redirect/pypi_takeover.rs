@@ -18,7 +18,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::read_regular_to_string;
 use crate::utils::poetry_lock::{
     lock_version, pyproject_source_constraints, source_constraint_breaks_writer,
-    source_constraint_refusal,
+    source_constraint_refusal, Wired,
 };
 use crate::vendor::state::VendorEntry;
 
@@ -184,7 +184,14 @@ async fn preflight_poetry_source_constraint(
         detail: format!(
             "{lock_file}: {} is kept vendored (not switched to hosted): {}",
             entry.base_purl,
-            source_constraint_refusal(&pyproject_file, lock_file, name, &source, "URL"),
+            source_constraint_refusal(
+                &pyproject_file,
+                lock_file,
+                name,
+                &source,
+                "URL",
+                Wired::Vendored
+            ),
         ),
     })
 }
@@ -369,6 +376,7 @@ mod tests {
                 assert_eq!(err.code, "redirect_poetry_lock_unsupported", "{stamp}");
                 assert!(err.detail.contains("kept vendored"), "{}", err.detail);
                 assert!(err.detail.contains("source = \"pypi\""), "{}", err.detail);
+                assert_remedy_reverts_first(&err.detail);
             } else {
                 assert!(got.is_ok(), "{stamp}: {got:?}");
             }

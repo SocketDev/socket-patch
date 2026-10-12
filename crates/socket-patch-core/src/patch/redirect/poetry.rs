@@ -10,7 +10,7 @@ use toml_edit::DocumentMut;
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::poetry_lock::{
-    generated_by_version, lock_lists, lock_version, pyproject_source_constraints,
+    generated_by_version, lock_version, lock_wiring, pyproject_source_constraints,
     rewrite_poetry_lock_all, source_constraint_advisory, source_constraint_breaks_writer,
     source_constraint_refusal, LockBatch, LockStep, PoetryLockDep,
 };
@@ -77,9 +77,10 @@ pub(super) fn rewrite_poetry(
             usable.retain(|&(dep, _)| {
                 // A dep the lock doesn't list keeps its `entry_not_found`
                 // report; one it lists (even already redirected) is refused.
-                let Some(source) =
-                    constraint(dep).filter(|_| lock_lists(original, &dep.name, &dep.version))
-                else {
+                let Some(source) = constraint(dep) else {
+                    return true;
+                };
+                let Some(wired) = lock_wiring(original, &dep.name, &dep.version) else {
                     return true;
                 };
                 result
@@ -89,7 +90,14 @@ pub(super) fn rewrite_poetry(
                     code: "redirect_poetry_lock_unsupported".into(),
                     detail: format!(
                         "{path}: {}",
-                        source_constraint_refusal(&pyproject_path, path, &dep.name, source, "URL")
+                        source_constraint_refusal(
+                            &pyproject_path,
+                            path,
+                            &dep.name,
+                            source,
+                            "URL",
+                            wired,
+                        )
                     ),
                 });
                 false
@@ -383,6 +391,8 @@ mod equivalence_tests {
                     );
                     assert_eq!(codes, ["redirect_poetry_lock_unsupported"], "{what}");
                     assert!(got.warnings[0].detail.contains("source ="), "{what}");
+                    // Nothing is wired yet, so re-locking is the whole remedy.
+                    assert!(!got.warnings[0].detail.contains("rollback"), "{what}");
                 } else {
                     assert!(got.files.contains_key("poetry.lock"), "{what}");
                     assert!(got.refused_python_lock_uuids.is_empty(), "{what}");
@@ -405,6 +415,10 @@ mod equivalence_tests {
                         "{what}"
                     );
                     assert_eq!(codes, ["redirect_poetry_lock_unsupported"], "{what}");
+                    // Re-locking would drop the live pin: roll back first.
+                    let detail = &got.warnings[0].detail;
+                    let rollback = detail.find("socket-patch rollback").expect(detail);
+                    assert!(rollback < detail.find("re-lock").unwrap(), "{detail}");
                 } else {
                     assert!(got.refused_python_lock_uuids.is_empty(), "{what}");
                     assert!(

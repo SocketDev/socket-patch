@@ -217,6 +217,7 @@ pub(super) fn source_constraint_warning(
 fn source_constraint_guard(
     p: &PoetryProject,
     canon_name: &str,
+    wired: poetry_lock::Wired,
 ) -> Result<(), (&'static str, String)> {
     match source_constraint(p, canon_name) {
         Some(source) if poetry_lock::source_constraint_breaks_writer(&p.lock_text) => Err((
@@ -227,6 +228,7 @@ fn source_constraint_guard(
                 canon_name,
                 &source,
                 "file",
+                wired,
             ),
         )),
         _ => Ok(()),
@@ -275,7 +277,7 @@ pub(super) fn check_target_guards(
             // Ours, same patch generation: the in-sync hot path.
             Some(parts) if parts.eco == "pypi" && parts.uuid == record_uuid => {
                 // Wired before this guard existed: the install already fails.
-                source_constraint_guard(p, canon_name)?;
+                source_constraint_guard(p, canon_name, poetry_lock::Wired::Vendored)?;
                 Ok(PoetryTarget::InSync)
             }
             // Ours, but a STALE patch generation: wiring over it would lose
@@ -316,7 +318,7 @@ pub(super) fn check_target_guards(
     }
     // A pyproject `source = "…"` pin breaks every install of the wired lock
     // on Poetry 1.4 – 2.2; refuse when one of those wrote the lock.
-    source_constraint_guard(p, canon_name)?;
+    source_constraint_guard(p, canon_name, poetry_lock::Wired::No)?;
     Ok(PoetryTarget::Fresh)
 }
 
@@ -951,10 +953,13 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             let project = load_poetry_project(tmp.path()).await.unwrap();
             let guard = check_target_guards(&project, "urllib3", "1.26.18", UUID);
             if broken {
-                assert!(
-                    matches!(guard, Err(("pypi_poetry_source_constraint", _))),
-                    "{version}: {guard:?}"
-                );
+                let Err(("pypi_poetry_source_constraint", detail)) = guard else {
+                    panic!("{version}: {guard:?}");
+                };
+                // Re-locking would drop the live wiring: revert it first.
+                let revert = detail.find("vendor --revert").expect(&detail);
+                assert!(revert < detail.find("re-lock").unwrap(), "{detail}");
+                assert!(detail.contains("EVERY vendored package"), "{detail}");
             } else {
                 assert!(
                     matches!(guard, Ok(PoetryTarget::InSync)),
