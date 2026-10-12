@@ -1212,9 +1212,21 @@ pub fn yarn_classic_artifact_targets<'a>(
     if crate::patch::redirect::yarn_classic_hosted_refused(files, yarn_outer) {
         return Vec::new();
     }
-    // The pinned-artifact test is a substring search; the registry-copy
-    // test reads every block, so it runs once per lock, after it, and only
-    // when some dep still needs it (#1423).
+    select_classic_artifacts(candidates, lock, classic_registry_copies)
+}
+
+/// [`yarn_classic_artifact_targets`] over a classic `lock`, reading its
+/// registry copies through `read_copies`. The pinned-artifact and name
+/// tests are substring searches; the registry-copy test reads every
+/// block, so it runs after them, at most once per lock, and only when
+/// some dep still needs it (#1423): a rescan whose grants all carry a
+/// sha1 and are pinned already never reads the blocks.
+fn select_classic_artifacts<'a>(
+    candidates: &'a [Candidate],
+    lock: &str,
+    read_copies: impl FnOnce(&str) -> HashSet<(String, String)>,
+) -> Vec<&'a DepOverride> {
+    let mut read_copies = Some(read_copies);
     let mut registry_copies: Option<HashSet<(String, String)>> = None;
     let mut seen = BTreeSet::new();
     candidates
@@ -1225,9 +1237,13 @@ pub fn yarn_classic_artifact_targets<'a>(
             dep.integrity.sha1.is_none() || !lock.contains(&format!("\"{}#", dep.artifact_url))
         })
         .filter(|dep| {
-            registry_copies
-                .get_or_insert_with(|| classic_registry_copies(lock))
-                .contains(&(crate::patch::redirect::full_name(dep), dep.version.clone()))
+            let name = crate::patch::redirect::full_name(dep);
+            lock.contains(&name)
+                && registry_copies
+                    .get_or_insert_with(|| {
+                        read_copies.take().map_or_else(HashSet::new, |r| r(lock))
+                    })
+                    .contains(&(name, dep.version.clone()))
         })
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
@@ -1239,10 +1255,10 @@ pub fn yarn_classic_artifact_targets<'a>(
 /// by the blocks' real names, as the rewriter does, so `lodash` never
 /// matches a `lodash.debounce` block.
 fn classic_registry_copies(lock: &str) -> HashSet<(String, String)> {
-    use crate::formats::yarn::blocks::{classic_field, scan_blocks};
+    use crate::formats::yarn::blocks::classic_field;
     use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
     use crate::formats::yarn::source::{classic_copy_source, CopySource};
-    scan_blocks(lock)
+    crate::vendor::yarn_classic_lock::scan_blocks_shared(lock)
         .iter()
         .filter_map(|block| {
             let patterns = split_key_patterns(&block.key);
@@ -3119,14 +3135,13 @@ mod tests {
     }
 
     /// #1423: the served tarball is read only for a dep the lock locks as
-    /// a registry copy and doesn't pin to the artifact yet; a big lock
-    /// whose deps are all pinned already (a rescan) selects none, and many
-    /// deps over a big lock stay cheap (the lock is read once, not once
-    /// per dep).
+    /// a registry copy and doesn't pin to the artifact yet. The lock's
+    /// blocks are read at most once however many deps there are, and not
+    /// at all on a rescan whose deps are all pinned already.
     #[test]
-    fn classic_artifact_targets_select_unpinned_registry_copies() {
+    fn classic_artifact_targets_read_the_lock_blocks_at_most_once() {
         let mut lock = String::from("# yarn lockfile v1\n\n");
-        let n = 3000;
+        let n = 200;
         for i in 0..n {
             lock.push_str(&format!(
                 "pkg-{i}@^1.0.0:\n  version \"1.0.{i}\"\n  \
@@ -3140,37 +3155,46 @@ mod tests {
         let mut candidates: Vec<Candidate> = (0..n)
             .map(|i| classic_candidate(&format!("pkg-{i}"), &format!("1.0.{i}"), Some("s1")))
             .collect();
-        // Every dep pinned to its artifact already: nothing to fetch.
+        let reads = std::cell::Cell::new(0);
+        let counted = |lock: &str| {
+            reads.set(reads.get() + 1);
+            classic_registry_copies(lock)
+        };
+
+        // Every dep pinned to its artifact already: nothing to fetch, and
+        // the blocks are never read.
         let mut pinned = lock.clone();
         for c in &candidates {
             pinned.push_str(&format!("# \"{}#s1\"\n", c.dep.artifact_url));
         }
-        let files = BTreeMap::from([("yarn.lock".to_string(), pinned)]);
-        let outer = OuterYarnMirror::default();
-        let start = std::time::Instant::now();
-        assert!(yarn_classic_artifact_targets(&candidates, &files, &outer).is_empty());
+        assert!(select_classic_artifacts(&candidates, &pinned, counted).is_empty());
+        assert_eq!(reads.get(), 0);
 
         // Unpinned: every registry copy is selected once per artifact; a
-        // version the lock doesn't lock, a git copy and a non-npm dep never.
+        // version the lock doesn't lock, a name it doesn't have, a git copy
+        // and a non-npm dep never. One read of the blocks for all of them.
         candidates.push(classic_candidate("pkg-0", "9.9.9", None));
+        candidates.push(classic_candidate("absent", "1.0.0", None));
         candidates.push(classic_candidate("gitdep", "2.0.0", None));
         candidates.push(classic_candidate("pkg-1", "1.0.1", Some("s1")));
         let mut pypi = classic_candidate("pkg-2", "1.0.2", None);
         pypi.dep.ecosystem = "pypi".into();
         candidates.push(pypi);
-        let files = BTreeMap::from([("yarn.lock".to_string(), lock)]);
-        let got: Vec<String> = yarn_classic_artifact_targets(&candidates, &files, &outer)
+        let got: Vec<String> = select_classic_artifacts(&candidates, &lock, counted)
             .into_iter()
             .map(|d| format!("{}@{}", d.name, d.version))
             .collect();
+        assert_eq!(reads.get(), 1);
         assert_eq!(got.len(), n);
         assert_eq!(got[0], "pkg-0@1.0.0");
         assert_eq!(got[n - 1], format!("pkg-{}@1.0.{}", n - 1, n - 1));
-        // Per-dep lock scans took minutes here in a debug build.
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(20),
-            "{:?}",
-            start.elapsed()
+
+        // The public entry point selects the same deps from the files.
+        let files = BTreeMap::from([("yarn.lock".to_string(), lock)]);
+        let outer = OuterYarnMirror::default();
+        assert_eq!(
+            yarn_classic_artifact_targets(&candidates, &files, &outer).len(),
+            n
         );
     }
 
