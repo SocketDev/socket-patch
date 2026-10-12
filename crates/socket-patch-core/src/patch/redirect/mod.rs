@@ -13930,7 +13930,9 @@ mod tests {
     fn cargo_declared_floor_below_sparse_support_is_refused() {
         let app = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n";
         let deps = "\n[dependencies]\nserde = \"1.0.190\"\n";
-        let old: [(&str, String, Option<(&str, &str)>); 5] = [
+        /// `(case, Cargo.toml, a toolchain file to add)`.
+        type Case = (&'static str, String, Option<(&'static str, &'static str)>);
+        let old: [Case; 5] = [
             (
                 "rust-version",
                 format!("{app}rust-version = \"1.67\"\n{deps}"),

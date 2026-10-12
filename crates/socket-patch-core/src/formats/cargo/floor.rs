@@ -127,12 +127,14 @@ fn toolchain_channel(text: &str) -> Option<String> {
 
 /// The minor of the toolchain rustup picks from the root's toolchain files
 /// (`None` for a file that is absent or unreadable): the legacy file when
-/// it exists, else the TOML one.
+/// it exists, else the TOML one. A blank legacy text names no toolchain
+/// (the hosted engine records an unreadable in-memory entry as `""`), so
+/// it does not hide the TOML file's channel.
 pub(crate) fn toolchain_minor(
     toolchain_toml: Option<&str>,
     toolchain_legacy: Option<&str>,
 ) -> Option<u32> {
-    if let Some(legacy) = toolchain_legacy {
+    if let Some(legacy) = toolchain_legacy.filter(|t| !t.trim().is_empty()) {
         return match toolchain_channel(legacy) {
             Some(channel) => minor_of(&channel),
             None => minor_of(legacy),
@@ -225,6 +227,13 @@ mod tests {
             declared_cargo_minor(None, Some(toml), Some("stable\n")),
             None
         );
+        // A blank legacy placeholder (an unreadable entry) is no toolchain.
+        for blank in ["", " \n"] {
+            assert_eq!(
+                declared_cargo_minor(None, Some(toml), Some(blank)),
+                Some(67)
+            );
+        }
         // `rust-version` wins over the toolchain files.
         assert_eq!(
             declared_cargo_minor(
