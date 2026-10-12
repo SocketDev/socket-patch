@@ -540,10 +540,10 @@ fn expand_composer_path(raw: &str, var: &impl Fn(&str) -> Option<OsString>) -> O
 /// A composer.json that is NOT `manifest_trusted` (the scanned project's)
 /// names the directory apply later WRITES patch content into, so it keeps
 /// the stricter rule: only a plain relative subpath of the project, no
-/// expansion. `../../elsewhere`, `/etc` or `~/deps` is refused (`None`) rather than
-/// silently downgraded to `vendor/`, which would patch an unrelated tree.
-/// Composer accepts absolute and home-relative values there; refusing
-/// them means such a project discovers nothing.
+/// expansion. `../../elsewhere`, `/etc` or `~/deps` is refused (`None`)
+/// rather than silently downgraded to `vendor/`, which would patch an
+/// unrelated tree. Composer accepts absolute and home-relative values
+/// there; refusing them means such a project discovers nothing.
 fn resolve_vendor_dir(
     base: &Path,
     manifest: Option<&str>,
