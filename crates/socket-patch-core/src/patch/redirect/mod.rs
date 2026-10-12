@@ -1657,6 +1657,10 @@ fn rewrite_npm_entry(
 // while the manifest still says crates.io, or an inert `[registries.…]` block
 // with nothing referencing it) breaks `--locked` builds or silently drops the
 // patch while attesting it — the exact failure mode this shape forbids.
+/// The first stable cargo that loads a `sparse+` registry — the hosted
+/// redirect's source kind.
+const CARGO_SPARSE_MINOR: u32 = 68;
+
 fn rewrite_cargo(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -1736,8 +1740,37 @@ fn rewrite_cargo(
     // The manifests as they arrived: a generation they pin that the final
     // manifests no longer do was superseded by this run (see below).
     let manifests_before: Vec<String> = manifests.iter().map(|(_, t)| t.clone()).collect();
+    // The redirect is a `sparse+` registry, which cargo loads only from
+    // 1.68: older cargo refuses the source ("usage of sparse registries
+    // requires `-Z sparse-registry`"), so a project that declares an older
+    // cargo would fail every build on the pins this run writes. An
+    // undeclared floor is no evidence either way and still redirects.
+    let declared_floor = crate::formats::cargo::floor::declared_cargo_minor(
+        files.get("Cargo.toml").map(String::as_str),
+        files
+            .get(crate::formats::cargo::floor::TOOLCHAIN_TOML)
+            .map(String::as_str),
+        files
+            .get(crate::formats::cargo::floor::TOOLCHAIN_LEGACY)
+            .map(String::as_str),
+    )
+    .filter(|minor| *minor < CARGO_SPARSE_MINOR);
 
     for dep in &cargo {
+        if let Some(minor) = declared_floor {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_old_cargo".into(),
+                detail: format!(
+                    "{} not redirected: this project declares cargo 1.{minor} (`rust-version` \
+                     or `rust-toolchain`), but the hosted patch is served from a sparse \
+                     registry, which needs cargo 1.{CARGO_SPARSE_MINOR} or newer; nothing \
+                     rewritten. Use `--mode vendored` (builds on cargo 1.41+), or raise the \
+                     declared cargo to 1.{CARGO_SPARSE_MINOR}+",
+                    dep.name
+                ),
+            });
+            continue;
+        }
         let Some(ov) = registry_override_of_kind(dep, "cargo-sparse") else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_cargo_missing_override".into(),
@@ -13861,6 +13894,80 @@ mod tests {
         assert!(r.files.contains_key(".cargo/config.toml"));
         assert!(!r.files.contains_key(".cargo/config"));
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// #653: the hosted redirect is a `sparse+` registry, which cargo loads
+    /// only from 1.68. A project that declares an older cargo (its
+    /// `rust-version`, inherited or not, or a toolchain file) is refused
+    /// with nothing written, instead of a redirect every build then fails
+    /// on. A newer or undeclared cargo still redirects.
+    #[test]
+    fn cargo_declared_floor_below_sparse_support_is_refused() {
+        let app = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n";
+        let deps = "\n[dependencies]\nserde = \"1.0.190\"\n";
+        let old: [(&str, String, Option<(&str, &str)>); 5] = [
+            (
+                "rust-version",
+                format!("{app}rust-version = \"1.67\"\n{deps}"),
+                None,
+            ),
+            (
+                "inherited rust-version",
+                format!(
+                    "[workspace]\n\n[workspace.package]\nrust-version = \"1.60\"\n\n\
+                     {app}rust-version.workspace = true\n{deps}"
+                ),
+                None,
+            ),
+            (
+                "rust-toolchain.toml",
+                format!("{app}{deps}"),
+                Some(("rust-toolchain.toml", "[toolchain]\nchannel = \"1.67.1\"\n")),
+            ),
+            (
+                "rust-toolchain",
+                format!("{app}{deps}"),
+                Some(("rust-toolchain", "1.56.0\n")),
+            ),
+            (
+                "CRLF rust-version",
+                format!("{app}rust-version = \"1.67\"\n{deps}").replace('\n', "\r\n"),
+                None,
+            ),
+        ];
+        for (case, toml, toolchain) in old {
+            let mut files = cargo_files(&toml);
+            if let Some((path, text)) = toolchain {
+                files.insert(path.to_string(), text.to_string());
+            }
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert_eq!(
+                r.warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["redirect_cargo_old_cargo"],
+                "{case}: {:?}",
+                r.warnings
+            );
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains("1.68") && detail.contains("--mode vendored"),
+                "{case}: {detail}"
+            );
+            assert!(r.files.is_empty(), "{case}: nothing written: {:?}", r.files);
+            assert!(r.edits.is_empty(), "{case}: {:?}", r.edits);
+            assert!(r.confirmed_cargo_uuids.is_empty(), "{case}");
+        }
+
+        for (case, toml) in [
+            ("1.68", format!("{app}rust-version = \"1.68\"\n{deps}")),
+            ("undeclared", format!("{app}{deps}")),
+        ] {
+            let r = rewrite_registry_redirect(&cargo_files(&toml), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "{case}: {:?}", r.warnings);
+            assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID), "{case}");
+        }
     }
 
     /// The residue probe (`vendor`'s fail-closed guard against wiring
