@@ -96,6 +96,8 @@
 //! The native (registry) fixtures are rewired in the tests through the SAME
 //! rewriter functions the hosted and vendored backends call.
 
+use std::collections::BTreeSet;
+
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use super::{
@@ -344,6 +346,11 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
     // A PEP 723 script lock is scoped to its script's own install: it is not
     // evidence against the project's locks (see `contest_across_locks`).
     let script_lock = is_script_lock_name(file);
+    let locked: BTreeSet<String> = packages
+        .iter()
+        .filter_map(|p| p.get("name").and_then(Item::as_str))
+        .map(canonicalize_pypi_name)
+        .collect();
     for package in packages.iter() {
         if pep751 {
             pylock_candidates(ctx, file, package, out, &mut candidates);
@@ -365,6 +372,9 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
         if !pep751 {
             if let Some(meta) = paired_metadata_rel(file) {
                 ctx.recognize_ignored(meta).await;
+                if let Some(doc) = quiet_metadata(ctx, meta, script_lock).await {
+                    record_orphaned_overrides(ctx, file, &locked, &doc, script_lock, out);
+                }
             }
         }
         return;
@@ -374,6 +384,9 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
     } else {
         load_pairing(ctx, file, out).await
     };
+    if let Pairing::Sources { doc, .. } = &pairing {
+        record_orphaned_overrides(ctx, file, &locked, doc, script_lock, out);
+    }
     for c in candidates {
         match &pairing {
             Pairing::LockOnly => emit(out, file, c),
@@ -409,6 +422,117 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
             }
         }
     }
+}
+
+/// The paired metadata document of a lock with no Socket entry, read
+/// without recording the read or diagnosing a failure (the half-reverted
+/// sweep above reads it the same way): only the leftover-override check
+/// looks at it. A script's document is its PEP 723 block.
+async fn quiet_metadata(ctx: &DiscoverCtx<'_>, rel: &str, script: bool) -> Option<DocumentMut> {
+    if ctx.is_ignored(rel) {
+        return None;
+    }
+    let bytes = ctx.view.read_bytes(rel).await.ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    if script {
+        let (_, block) = crate::utils::python_script::script_metadata(&text).ok()?;
+        block.parse().ok()
+    } else {
+        text.parse().ok()
+    }
+}
+
+/// Record each hosted override pin the paired metadata still carries for a
+/// package `file` no longer locks ([`StaleSelector`], #1445): the hosted
+/// rewrite wires a TRANSITIVE package with an `override-dependencies`
+/// entry under its ownership comment plus a `[tool.uv.sources]` URL, and
+/// once the parent stops depending on it (`uv remove <parent>`, `uv lock
+/// --upgrade-package <parent>`) uv drops its `[[package]]` but never edits
+/// either line. That is Socket's own leftover pin, which the management
+/// commands retire instead of refusing around it as contested wiring. A
+/// user's own (unmarked) override, a package the lock still holds, and a
+/// source that is not one unconditional hosted URL naming the pinned
+/// release's artifact are left to the contested path.
+///
+/// [`StaleSelector`]: super::StaleSelector
+fn record_orphaned_overrides(
+    ctx: &DiscoverCtx<'_>,
+    file: &str,
+    locked: &BTreeSet<String>,
+    doc: &DocumentMut,
+    script: bool,
+    out: &mut Discovery,
+) {
+    let Some(sources) = doc
+        .get("tool")
+        .and_then(Item::as_table_like)
+        .and_then(|tool| tool.get("uv"))
+        .and_then(Item::as_table_like)
+        .and_then(|uv| uv.get("sources"))
+        .and_then(Item::as_table_like)
+    else {
+        return;
+    };
+    for pin in crate::utils::python_script::hosted_override_pins(doc, script) {
+        if locked.contains(&pin.name) {
+            continue;
+        }
+        let Some(source) = sources
+            .iter()
+            .find(|(key, _)| canonicalize_pypi_name(key) == pin.name)
+            .and_then(|(_, item)| item.as_table_like())
+        else {
+            continue;
+        };
+        if ["marker", "extra", "group"]
+            .iter()
+            .any(|key| source.contains_key(key))
+        {
+            continue;
+        }
+        let Some(url) = str_of(source, "url") else {
+            continue;
+        };
+        let Some(uuid) = ctx.hosted_uuid(url) else {
+            continue;
+        };
+        if !artifact_names_release(url, &pin.name, &pin.version) {
+            continue;
+        }
+        let Some(purl) = crate::utils::purl::pypi_purl(&pin.name, &pin.version) else {
+            continue;
+        };
+        out.stale_selectors.push(super::StaleSelector {
+            file: file.into(),
+            selector: pin.name,
+            url: url.to_string(),
+            purl: crate::utils::purl_key::canonical_base_purl(&purl),
+            uuid,
+        });
+    }
+}
+
+/// Whether `url`'s artifact (its last path segment: a wheel
+/// `<name>-<version>-….whl` or an sdist `<name>-<version>.tar.gz` / `.zip`)
+/// is release `version` of canonical package `name`.
+fn artifact_names_release(url: &str, name: &str, version: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let leaf = path.rsplit('/').next().unwrap_or("");
+    let stem_version = if let Some(stem) = leaf.strip_suffix(".whl") {
+        let mut parts = stem.split('-');
+        match (parts.next(), parts.next()) {
+            (Some(n), Some(v)) => Some((n, v)),
+            _ => None,
+        }
+    } else {
+        [".tar.gz", ".zip"]
+            .iter()
+            .find_map(|ext| leaf.strip_suffix(ext))
+            .and_then(|stem| stem.rsplit_once('-'))
+    };
+    stem_version.is_some_and(|(n, v)| {
+        canonicalize_pypi_name(n) == name && (v == version || v == version.replace('-', "_"))
+    })
 }
 
 /// The `pypi_purl` of a lock table's `name` + `version`.
