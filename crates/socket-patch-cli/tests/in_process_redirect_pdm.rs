@@ -677,13 +677,11 @@ async fn scan_json(
     extra: &[&str],
 ) -> (Option<i32>, serde_json::Value) {
     let mut std_cmd = hermetic::binary_command();
-    hermetic::scrub_extra(&mut std_cmd, &[hermetic::Extra::Venv]);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("PDM_") {
-            std_cmd.env_remove(key);
-        }
-    }
-    std_cmd.env_remove("UV_PROJECT_ENVIRONMENT");
+    hermetic::scrub_extra(&mut std_cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pdm]);
+    // The #[serial] in-process tests here `set_var` this for their own
+    // mock; a non-serial scan building its command meanwhile would inherit
+    // it, so remove it by name rather than only via the builder's sweep.
+    std_cmd.env_remove("SOCKET_PYPI_JSON_API");
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.args(["scan", "--mode", "hosted", "--yes", "--json", "--cwd"])
         .arg(root)

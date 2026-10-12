@@ -289,6 +289,15 @@ pub fn scrub_ambient_bun_env(cmd: &mut Command) {
     scrub_parent_vars(cmd, parent_var_names(), is_ambient_bun_var);
 }
 
+/// [`scrub_ambient_bun_env`] minus `SOCKET_*`, for a `socket-patch` child
+/// built with `hermetic::command`: the builder already handled `SOCKET_*`,
+/// and removing them again would undo the opt-outs it forces on.
+pub fn scrub_ambient_bun_tool_env(cmd: &mut Command) {
+    scrub_parent_vars(cmd, parent_var_names(), |name| {
+        !name.starts_with("SOCKET_") && is_ambient_bun_var(name)
+    });
+}
+
 /// The names of the PARENT environment, read once.
 fn parent_var_names() -> Vec<OsString> {
     std::env::vars_os().map(|(k, _)| k).collect()

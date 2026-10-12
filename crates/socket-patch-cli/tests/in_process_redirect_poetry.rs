@@ -387,12 +387,14 @@ fn install_package(root: &Path, venv: &str, bytes: &[u8]) -> std::path::PathBuf 
 
 async fn scan_output(root: &Path, server: &MockServer, extra: &[&str]) -> std::process::Output {
     let mut std_cmd = hermetic::binary_command();
-    hermetic::scrub_extra(&mut std_cmd, &[hermetic::Extra::Venv]);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("POETRY_") {
-            std_cmd.env_remove(key);
-        }
-    }
+    hermetic::scrub_extra(
+        &mut std_cmd,
+        &[hermetic::Extra::Venv, hermetic::Extra::Poetry],
+    );
+    // The #[serial] in-process tests here `set_var` this for their own
+    // mock; a non-serial scan building its command meanwhile would inherit
+    // it, so remove it by name rather than only via the builder's sweep.
+    std_cmd.env_remove("SOCKET_PYPI_JSON_API");
     let mut cmd = tokio::process::Command::from(std_cmd);
     // Hermetic against the runner's own Python user site, which a
     // `--system-site-packages` venv reaches (#409).

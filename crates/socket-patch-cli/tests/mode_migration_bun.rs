@@ -366,14 +366,7 @@ static ONLINE_ENV: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::n
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = common::hermetic_command(&binary());
     cmd.args(args).arg("--no-telemetry").current_dir(cwd);
-    // The bun suites' scrub minus `SOCKET_*`, which the builder handled
-    // (removing them again would undo the opt-outs it forces on).
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if !name.starts_with("SOCKET_") && cache_env::is_ambient_bun_var(&name) {
-            cmd.env_remove(&key);
-        }
-    }
+    cache_env::scrub_ambient_bun_tool_env(&mut cmd);
     for (k, v) in ONLINE_ENV.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         cmd.env(k, v);
     }
