@@ -1348,9 +1348,11 @@ async fn takeover_over_unrewritable_spelling_keeps_vendored() {
     for (tag, spelling) in [
         ("dotted", format!("{DEP}.version = \"1.0\"\n")),
         ("literal", format!("{DEP} = '1.0'\n")),
+        // An inline table spread over lines (#757). `registry = "crates-io"`
+        // was this case until #386 made hosted mode pin it.
         (
-            "crates-io",
-            format!("{DEP} = {{ version = \"1.0\", registry = \"crates-io\" }}\n"),
+            "multi-line-inline",
+            format!("{DEP} = {{ version = \"1.0\", features = [\n] }}\n"),
         ),
     ] {
         let tmp = tempfile::tempdir().unwrap();
