@@ -3096,3 +3096,79 @@ async fn pipenv_residual_export_takeover_refusal_names_the_export() {
         "the takeover reclaims the vendored wheel: {env:#}"
     );
 }
+
+/// The checkout directory names #547 reproduced. Hatch expands `{root:uri}`
+/// with hatchling's `path_to_uri`, which escapes only spaces, so pip reads
+/// `%XX` as an escape, `#` as a fragment, `?` as a query, and the PEP 508
+/// parser rejects `;`. (`?` cannot be a Windows file name.)
+fn unsafe_hatch_roots() -> Vec<&'static str> {
+    let mut names = vec!["app_feature%2Fsix-patch", "p%20q", "a#b", "semi;colon"];
+    if cfg!(unix) {
+        names.push("q?x");
+    }
+    names
+}
+
+/// #547: vendoring a Hatch project whose checkout path contains a character
+/// Hatch's `{root:uri}` leaves unescaped is refused before anything is
+/// written, so the scan no longer reports success for wiring no Hatch env
+/// can install. Paths Hatch does expand correctly (`@`, `'`, a space) still
+/// vendor.
+#[tokio::test]
+async fn hatch_vendored_refuses_a_root_hatch_cannot_expand() {
+    for name in unsafe_hatch_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        let files = stage_hatch(&root);
+        let original = std::fs::read_to_string(root.join(files[0])).unwrap();
+        stage_manifest(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 1, "{name}: {env:#}");
+        let rendered = env.to_string();
+        assert!(
+            rendered.contains("pypi_hatch_unsupported") && rendered.contains("{root:uri}"),
+            "{name}: the root-path guard is the reported refusal: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(files[0])).unwrap(),
+            original,
+            "{name}: pyproject.toml untouched"
+        );
+        assert!(
+            !root.join(".socket/vendor/state.json").exists(),
+            "{name}: nothing recorded"
+        );
+    }
+    for name in ["at@sign", "quo'te", "sp ace"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        let files = stage_hatch(&root);
+        vendor_project(&root, files);
+    }
+}
+
+/// #547: a vendored Hatch checkout moved to a path Hatch cannot expand
+/// (a Jenkins multibranch workspace such as `app_feature%2Fsix-patch`)
+/// fails the next `vendor` run instead of passing it as in sync, and the
+/// committed wiring is left as it was.
+#[tokio::test]
+async fn hatch_vendored_rerun_refuses_after_relocation_to_unsafe_root() {
+    let (tmp, root) = project();
+    let files = stage_hatch(&root);
+    vendor_project(&root, files);
+    let wired = std::fs::read_to_string(root.join(files[0])).unwrap();
+    let moved = tmp.path().join("app_feature%2Fsix-patch");
+    std::fs::rename(&root, &moved).unwrap();
+    let (code, env) = run_cli(&moved, &["vendor"], &[]);
+    assert_eq!(code, 1, "{env:#}");
+    assert!(
+        env.to_string().contains("pypi_hatch_unsupported"),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(moved.join(files[0])).unwrap(),
+        wired
+    );
+}
