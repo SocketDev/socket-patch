@@ -334,8 +334,9 @@ fn flow(flavor: Flavor, mode: Mode) {
                 .replacen("dependencies = [", "dependencies = [\"idna==3.7\", ", 1)
         };
         std::fs::write(edited.join("pyproject.toml"), edit(&wired)).unwrap();
-        let out = crate::vex_e2e_common::hermetic::binary_command()
-            .env_remove("VIRTUAL_ENV")
+        let mut cmd = vex_e2e_common::hermetic::binary_command();
+        vex_e2e_common::hermetic::scrub_extra(&mut cmd, &[vex_e2e_common::hermetic::Extra::Venv]);
+        let out = cmd
             .args(["vendor", "--revert", "--json", "--cwd"])
             .arg(&edited)
             .current_dir(&edited)
@@ -382,8 +383,9 @@ fn flow(flavor: Flavor, mode: Mode) {
             1,
         );
         std::fs::write(copied.join("pyproject.toml"), &with_copy).unwrap();
-        let out = crate::vex_e2e_common::hermetic::binary_command()
-            .env_remove("VIRTUAL_ENV")
+        let mut cmd = vex_e2e_common::hermetic::binary_command();
+        vex_e2e_common::hermetic::scrub_extra(&mut cmd, &[vex_e2e_common::hermetic::Extra::Venv]);
+        let out = cmd
             .args(["vendor", "--revert", "--json", "--cwd"])
             .arg(&copied)
             .current_dir(&copied)

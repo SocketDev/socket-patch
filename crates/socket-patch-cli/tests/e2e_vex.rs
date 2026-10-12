@@ -27,8 +27,10 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 
-/// Build a `Command` for the CLI with the entire `SOCKET_*` environment
-/// scrubbed from the child process.
+/// Build a `Command` for the CLI with the hermetic `SOCKET_*` environment of
+/// `tests/common/hermetic.rs`: ambient `SOCKET_*` vars (other than a
+/// telemetry opt-out) are removed from the child, and the config,
+/// update-check and telemetry opt-outs are forced on.
 ///
 /// Every flag these tests rely on has an env fallback: `--product`/
 /// `SOCKET_VEX_PRODUCT`, `--no-verify`/`SOCKET_VEX_NO_VERIFY`, `--doc-id`/

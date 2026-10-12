@@ -109,6 +109,7 @@ pub use oracle::{binary, git_sha256};
 
 /// The hermetic `SOCKET_*` environment [`run_vex`] spawns the binary with;
 /// suites that load no `common` reach it through here.
+#[allow(clippy::duplicate_mod)]
 #[path = "../common/hermetic.rs"]
 pub mod hermetic;
 

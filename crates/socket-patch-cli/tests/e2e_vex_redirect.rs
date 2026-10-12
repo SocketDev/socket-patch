@@ -96,8 +96,9 @@ fn write_hosted_package_lock(cwd: &Path, deps: &[(&str, &str, &str)], pinned: bo
     .unwrap();
 }
 
-/// CLI invocation with the ambient `SOCKET_*` environment scrubbed (explicit
-/// flags must be the sole source of truth).
+/// CLI invocation with the hermetic `SOCKET_*` environment of
+/// `tests/common/hermetic.rs` (explicit flags must be the sole source of
+/// truth).
 fn cli() -> Command {
     common::hermetic::binary_command()
 }
@@ -729,10 +730,8 @@ fn vex_json_env(cwd: &Path, extra: &[&str], envs: &[(&str, &Path)]) -> (Option<i
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
     let mut cmd = cli();
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_NO_API_TOKEN", "1")
-        .env_remove("VIRTUAL_ENV");
+    common::hermetic::scrub_extra(&mut cmd, &[common::hermetic::Extra::Venv]);
+    cmd.env("SOCKET_NO_API_TOKEN", "1");
     for (key, value) in envs {
         cmd.env(key, value);
     }
