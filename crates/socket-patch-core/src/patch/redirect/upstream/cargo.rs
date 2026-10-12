@@ -9,7 +9,9 @@
 //! always crates.io's. A declaration's original spelling is not recorded:
 //! the shorthand `name = { version = "…", registry = "…" }` the rewriter
 //! produces from `name = "…"` collapses back to that shorthand, and every
-//! other form just loses the pin.
+//! other form just loses the pin. That includes a pin that overwrote an
+//! explicit `registry = "crates-io"` (#386): the declaration comes back
+//! without the redundant key, which cargo resolves the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -330,14 +332,21 @@ static SHORTHAND_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
 });
 
 /// The line with its `registry = "<reg>"` pin removed: `Some(None)` drops
-/// the whole line (the table form's inserted `registry = …` line),
+/// the whole line (the table form's `registry = …` line; a trailing
+/// comment on it survives as a comment-only line),
 /// `Some(Some(line))` is the unpinned declaration, `None` a spelling this
 /// restore does not recognize.
 fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
     let trimmed = line.trim();
     let body = trimmed.split('#').next().unwrap_or(trimmed).trim();
     if body == format!("registry = \"{reg}\"") {
-        return Some(None);
+        // The pin may have overwritten a user's commented line in place
+        // (a superseded pin, or `registry = "crates-io"`): the comment
+        // stays, on its own line.
+        return Some(trimmed.find('#').map(|hash| {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            format!("{indent}{}", &trimmed[hash..])
+        }));
     }
     if let Some(c) = SHORTHAND_RE.captures(line) {
         if &c[3] == reg {
@@ -503,6 +512,16 @@ mod tests {
         assert_eq!(
             unpin_line(&format!("registry = \"{REG}\""), REG),
             Some(None)
+        );
+    }
+
+    /// A table-form pin that overwrote a commented `registry = "crates-io"`
+    /// line (#386) or an earlier pin keeps the user's comment on restore.
+    #[test]
+    fn table_form_line_keeps_its_comment() {
+        assert_eq!(
+            unpin_line(&format!("  registry = \"{REG}\" # stay on crates.io"), REG),
+            Some(Some("  # stay on crates.io".to_string()))
         );
     }
 

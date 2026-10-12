@@ -2612,7 +2612,8 @@ fn is_valid_gem_index_url(url: &str) -> bool {
 
 /// A registry name THIS rewriter owns: `socket-patch-<canonical-uuid>`. An
 /// existing pin matching this grammar was written by a previous run and may be
-/// superseded in place; any other registry pin is the user's and is refused.
+/// superseded in place. Other registry names are the user's: only `crates-io`
+/// is overwritten (see [`is_repinnable_registry_name`]), the rest refuse.
 fn is_socket_patch_registry_name(value: &str) -> bool {
     generation::pin_name_uuid(value, false).is_some()
 }
@@ -3099,7 +3100,8 @@ enum CargoTomlAction {
 
 /// Plan the full-manifest pin: EVERY occurrence of `crate_name` across every
 /// dependency table gains `registry = "<reg>"`, an existing
-/// `socket-patch-<uuid>` pin is superseded in place, and any occurrence that
+/// `socket-patch-<uuid>` pin (or an explicit `registry = "crates-io"`, #386)
+/// is overwritten in place, and any occurrence that
 /// cannot be handled refuses the whole dep. Nothing is applied unless every
 /// occurrence resolves.
 // The Cargo.toml planner's fixed probes, compiled once: `plan_cargo_toml`
@@ -22313,7 +22315,7 @@ packages:
                 toml.ends_with(&expected),
                 "{declaration}: crates-io must be replaced in place:\n{toml}"
             );
-            assert!(!toml.contains("crates-io\""), "{toml}");
+            assert!(!toml.contains("crates-io"), "{toml}");
             assert_eq!(cargo_socket_registry_pin(toml, "serde"), Some(reg.clone()));
             assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
             let toml_edits: Vec<_> = r.edits.iter().filter(|e| e.path == "Cargo.toml").collect();
