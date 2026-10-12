@@ -281,6 +281,10 @@ pub struct OuterAllowRemote {
     /// `replace-registry-host` in the same outer layers (see
     /// [`effective_replace_registry_host`]).
     pub replace_registry_host: OuterSetting,
+    /// The process facts the layers were resolved with: npm env-replaces
+    /// a value against them (see [`NpmConfigEnv::config_value`]),
+    /// whichever layer sets it, the project `.npmrc` included.
+    pub config_env: NpmConfigEnv,
 }
 
 /// One npm config key as the layers OUTSIDE the project `.npmrc` set it.
@@ -307,7 +311,7 @@ pub struct OuterFileValue {
 /// (`@npmcli/config`): environment, home directory, and the node binary
 /// (npm derives the default global prefix from `process.execPath`, and its
 /// own install root — the builtin config's home — sits beside it).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct NpmConfigEnv {
     pub vars: Vec<(String, String)>,
     pub home: Option<std::path::PathBuf>,
@@ -428,11 +432,19 @@ impl NpmConfigEnv {
         out
     }
 
-    /// A `path`-typed config value as npm's `parseField` reads it: trimmed,
-    /// env-replaced, then a leading `~/` (also `~\` on Windows) expands
-    /// against [`Self::home`].
+    /// A config value as npm's `parseField` reads it: trimmed, then
+    /// env-replaced. npm does this to every string value in every layer
+    /// (env, project, user, global, builtin), so
+    /// `replace-registry-host=${RRH}` with `RRH=always` is `always` to npm.
+    pub fn config_value(&self, value: &str) -> String {
+        self.env_replace(js_trim(value))
+    }
+
+    /// A `path`-typed config value as npm's `parseField` reads it:
+    /// [`Self::config_value`], then a leading `~/` (also `~\` on Windows)
+    /// expands against [`Self::home`].
     fn config_path(&self, value: &str) -> std::path::PathBuf {
-        let value = self.env_replace(value.trim_matches(is_js_ws));
+        let value = self.config_value(value);
         let rest = value
             .strip_prefix("~/")
             .or_else(|| value.strip_prefix("~\\").filter(|_| self.windows));
@@ -515,6 +527,7 @@ pub fn resolve_outer_allow_remote(
             env: env.npm_config(REPLACE_REGISTRY_HOST, "npmjs"),
             file: outer_file_value(&layers, REPLACE_REGISTRY_HOST),
         },
+        config_env: env.clone(),
     }
 }
 
@@ -631,21 +644,35 @@ pub enum SettingSource {
     },
 }
 
+/// The effective `replace-registry-host` setting: where it is set, the
+/// value as written there, and the value npm uses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveSetting {
+    /// The value npm uses: [`raw`](Self::raw) trimmed and env-replaced.
+    pub value: String,
+    /// The value as written in the file or variable (e.g. `${RRH}`).
+    pub raw: String,
+    pub source: SettingSource,
+}
+
 /// The `replace-registry-host` value npm would use, following its layer
 /// order (env > project > user > global > builtin), or `None` when no
-/// layer sets it (npm's default `npmjs`).
+/// layer sets it (npm's default `npmjs`). npm env-replaces the value in
+/// every layer (#1233), so `${RRH}` reads as what `RRH` holds; an unset
+/// `${RRH}` stays literal, as it does for npm.
 pub fn effective_replace_registry_host(
     project: Option<&str>,
     outer: &OuterAllowRemote,
-) -> Option<(String, SettingSource)> {
-    let outer = &outer.replace_registry_host;
-    if let Some((var, value)) = &outer.env {
-        return Some((value.clone(), SettingSource::Env(var.clone())));
-    }
-    if let Some(value) = project.and_then(|t| npmrc_top_level_value(t, REPLACE_REGISTRY_HOST)) {
-        return Some((value, SettingSource::Project));
-    }
-    outer.file.as_ref().map(|f| {
+) -> Option<EffectiveSetting> {
+    let setting = &outer.replace_registry_host;
+    let (raw, source) = if let Some((var, value)) = &setting.env {
+        (value.clone(), SettingSource::Env(var.clone()))
+    } else if let Some(value) =
+        project.and_then(|t| npmrc_top_level_value(t, REPLACE_REGISTRY_HOST))
+    {
+        (value, SettingSource::Project)
+    } else {
+        let f = setting.file.as_ref()?;
         (
             f.value.clone(),
             SettingSource::File {
@@ -653,6 +680,11 @@ pub fn effective_replace_registry_host(
                 path: f.path.clone(),
             },
         )
+    };
+    Some(EffectiveSetting {
+        value: outer.config_env.config_value(&raw),
+        raw,
+        source,
     })
 }
 
@@ -1046,7 +1078,13 @@ mod tests {
             &cfg_env(&[("npm_config_allow_remote", ""), ("npm_config_x", "none")]),
             |_| None,
         );
-        assert_eq!(outer, OuterAllowRemote::default());
+        assert_eq!(
+            outer,
+            OuterAllowRemote {
+                config_env: outer.config_env.clone(),
+                ..OuterAllowRemote::default()
+            }
+        );
         let outer =
             resolve_outer_allow_remote(&cfg_env(&[("npm_config_allow_remote", "all")]), |_| None);
         assert_eq!(
@@ -1303,6 +1341,12 @@ mod tests {
     /// against a pinned origin the way `@npmcli/arborist` does.
     #[test]
     fn replace_registry_host_layers_and_matching() {
+        fn effective(
+            project: Option<&str>,
+            outer: &OuterAllowRemote,
+        ) -> Option<(String, SettingSource)> {
+            effective_replace_registry_host(project, outer).map(|s| (s.value, s.source))
+        }
         use std::collections::HashMap;
         use std::path::{Path, PathBuf};
         let files: HashMap<PathBuf, &str> = HashMap::from([
@@ -1319,12 +1363,12 @@ mod tests {
 
         // Nothing set anywhere: npm's default (`npmjs`) applies.
         let outer = resolve_outer_allow_remote(&cfg_env(&[]), |_| None);
-        assert_eq!(effective_replace_registry_host(None, &outer), None);
+        assert_eq!(effective(None, &outer), None);
 
         // The user file beats the global one.
         let outer = resolve_outer_allow_remote(&cfg_env(&[]), read);
         assert_eq!(
-            effective_replace_registry_host(Some("fund=false\n"), &outer),
+            effective(Some("fund=false\n"), &outer),
             Some((
                 "always".into(),
                 SettingSource::File {
@@ -1335,7 +1379,7 @@ mod tests {
         );
         // ...the project file beats both...
         assert_eq!(
-            effective_replace_registry_host(Some("replace-registry-host=npmjs\n"), &outer),
+            effective(Some("replace-registry-host=npmjs\n"), &outer),
             Some(("npmjs".into(), SettingSource::Project))
         );
         // ...and the env beats every file, in any spelling npm normalizes.
@@ -1345,7 +1389,7 @@ mod tests {
         ] {
             let outer = resolve_outer_allow_remote(&cfg_env(&[(var, "always")]), read);
             assert_eq!(
-                effective_replace_registry_host(Some("replace-registry-host=never\n"), &outer),
+                effective(Some("replace-registry-host=never\n"), &outer),
                 Some(("always".into(), SettingSource::Env(var.into())))
             );
         }
@@ -1370,5 +1414,69 @@ mod tests {
         assert!(!replace_registry_host_rewrites("PATCH.SOCKET.DEV", host));
         assert!(replace_registry_host_rewrites("[::1]", "[::1]:80"));
         assert!(replace_registry_host_rewrites("[::1]", "[::1]"));
+    }
+
+    /// #1233: npm env-replaces every config value (`@npmcli/config`
+    /// `parseField` -> `envReplace`), in every layer. A
+    /// `replace-registry-host=${RRH}` with `RRH=always` is `always` to npm,
+    /// so it must read as `always` here too, wherever it is set, while the
+    /// spelling the user wrote is kept for the warning.
+    #[test]
+    fn replace_registry_host_values_are_env_replaced_like_npm() {
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+        let host = "patch.socket.dev";
+        let rrh = [("RRH", "always")];
+
+        // Project `.npmrc`.
+        let outer = resolve_outer_allow_remote(&cfg_env(&rrh), |_| None);
+        let got = effective_replace_registry_host(Some("replace-registry-host=${RRH}\n"), &outer)
+            .expect("project layer sets it");
+        assert_eq!(
+            got,
+            EffectiveSetting {
+                value: "always".into(),
+                raw: "${RRH}".into(),
+                source: SettingSource::Project,
+            }
+        );
+        assert!(replace_registry_host_rewrites(&got.value, host));
+        // `${RRH?}` and a padded value read the same way.
+        let got =
+            effective_replace_registry_host(Some("replace-registry-host = ${RRH?} \n"), &outer)
+                .unwrap();
+        assert_eq!(got.value, "always");
+
+        // User `.npmrc`.
+        let files: HashMap<PathBuf, &str> = HashMap::from([(
+            PathBuf::from("/home/u/.npmrc"),
+            "replace-registry-host=${RRH}\n",
+        )]);
+        let read = |p: &Path| files.get(p).map(|s| s.to_string());
+        let outer = resolve_outer_allow_remote(&cfg_env(&rrh), read);
+        let got = effective_replace_registry_host(None, &outer).unwrap();
+        assert_eq!((got.value.as_str(), got.raw.as_str()), ("always", "${RRH}"));
+        assert!(matches!(
+            got.source,
+            SettingSource::File { layer: "user", .. }
+        ));
+
+        // An `npm_config_*` variable is env-replaced too.
+        let outer = resolve_outer_allow_remote(
+            &cfg_env(&[
+                ("RRH", host),
+                ("npm_config_replace_registry_host", "${RRH}"),
+            ]),
+            |_| None,
+        );
+        let got = effective_replace_registry_host(None, &outer).unwrap();
+        assert!(replace_registry_host_rewrites(&got.value, host), "{got:?}");
+
+        // Unset: npm keeps `${RRH}` verbatim, which matches no host.
+        let outer = resolve_outer_allow_remote(&cfg_env(&[]), |_| None);
+        let got = effective_replace_registry_host(Some("replace-registry-host=${RRH}\n"), &outer)
+            .unwrap();
+        assert_eq!(got.value, "${RRH}");
+        assert!(!replace_registry_host_rewrites(&got.value, host));
     }
 }
