@@ -1649,6 +1649,17 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         script_sibling_revert(uv, &report, &proj, tmp.path());
     }
 
+    // ── 5c. the parent dropped after the hosted run (#1445) ───────────
+    if mode == Mode::Hosted && lane == Lane::Transitive {
+        transitive_orphan_unwind(
+            uv,
+            &report,
+            &proj,
+            tmp.path(),
+            patch_server.as_deref().unwrap(),
+        );
+    }
+
     // ── 6. the real revert ────────────────────────────────────────────
     // Vendored: `vendor --revert` restores every wiring file byte for
     // byte. Hosted (v5): `rollback` rewrites each pin back to the DEFAULT
@@ -1891,6 +1902,98 @@ fn script_sibling_revert(uv: &Uv, report: &Report<'_>, proj: &Path, tmp: &Path) 
         report.what("sibling-revert")
     );
     report.row("sibling-revert", "restored, user addition kept");
+}
+
+/// #1445: once the parent that pulled `six` in is removed (what `uv remove
+/// python-dateutil` does to the metadata, then a relock), uv drops `six`
+/// from uv.lock but keeps the hosted `override-dependencies` entry, its
+/// `[tool.uv.sources]` URL and the lock's `[manifest] overrides` record.
+/// That leftover is Socket's own pin: `list` lists around it and `rollback`
+/// retires all three, leaving a lock uv accepts as is. Runs on a copy so
+/// the real revert below is unaffected.
+fn transitive_orphan_unwind(uv: &Uv, report: &Report<'_>, proj: &Path, tmp: &Path, uri: &str) {
+    let what = report.what("orphan-unwind");
+    let dir = tmp.join("orphan");
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["pyproject.toml", "uv.lock"] {
+        std::fs::copy(proj.join(f), dir.join(f)).unwrap();
+    }
+    let path = dir.join("pyproject.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let dropped = text.replace(
+        "dependencies = [\"python-dateutil==2.9.0.post0\"]",
+        "dependencies = []",
+    );
+    assert_ne!(dropped, text, "{what}: no python-dateutil to drop:\n{text}");
+    std::fs::write(&path, dropped).unwrap();
+    let cache = tmp.join("orphan-cache");
+    let out = uv.run_py(&dir, &["lock"], &cache);
+    if !ok(&out) {
+        report.row("orphan-unwind", "n/a (`uv lock` without the parent failed)");
+        println!("{}", dump(&out));
+        return;
+    }
+    let uuid = Mode::Hosted.uuid();
+    let lock = std::fs::read_to_string(dir.join("uv.lock")).unwrap();
+    let pyproject = std::fs::read_to_string(&path).unwrap();
+    if lock.contains("name = \"six\"\nversion") || !pyproject.contains(uuid) {
+        report.row("orphan-unwind", "n/a (uv dropped the override itself)");
+        return;
+    }
+    let server = |args: &[&str]| -> Output {
+        let mut all = args.to_vec();
+        all.extend_from_slice(&[
+            "--json",
+            "--cwd",
+            dir.to_str().unwrap(),
+            "--api-url",
+            uri,
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG,
+            "--patch-server-url",
+            uri,
+        ]);
+        socket_patch(&dir, &all)
+    };
+    let warned = |env: &Value| {
+        env["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|w| w["code"] == "hosted_resolution_orphaned")
+    };
+    let out = server(&["list"]);
+    let env = envelope(&out, &what);
+    assert!(
+        out.status.code() == Some(0) && warned(&env),
+        "{what}: list must list around the leftover pin:\n{}",
+        dump(&out)
+    );
+    let out = server(&["rollback", "--yes"]);
+    let env = envelope(&out, &what);
+    assert!(
+        out.status.code() == Some(0) && warned(&env),
+        "{what}: rollback must retire the leftover pin:\n{}",
+        dump(&out)
+    );
+    for f in ["pyproject.toml", "uv.lock"] {
+        let body = std::fs::read_to_string(dir.join(f)).unwrap();
+        assert!(
+            !body.contains(uuid) && !body.contains("six"),
+            "{what}: {f} still wires six:\n{body}"
+        );
+    }
+    let retired = std::fs::read(dir.join("uv.lock")).unwrap();
+    let out = uv.run_py(&dir, &["lock"], &cache);
+    assert!(ok(&out), "{what}: uv lock:\n{}", dump(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(dir.join("uv.lock")).unwrap()),
+        String::from_utf8_lossy(&retired),
+        "{what}: uv rewrote the retired lock"
+    );
+    report.row("orphan-unwind", "retired; uv keeps the lock as is");
 }
 
 // ── production legs ────────────────────────────────────────────────────
