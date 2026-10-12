@@ -197,8 +197,8 @@ fn source_constraint(p: &PoetryProject, canon_name: &str) -> Option<String> {
 }
 
 /// The advisory for a source-constrained package wired over a lock that a
-/// Poetry outside 1.4 – 2.2 wrote: the writer installs it, but a 1.4 – 2.2
-/// installer would refuse it. [`check_target_guards`] refuses the 1.4 – 2.2
+/// Poetry outside 1.3 – 2.2 wrote: the writer installs it, but a 1.3 – 2.2
+/// installer would refuse it. [`check_target_guards`] refuses the 1.3 – 2.2
 /// writers outright.
 pub(super) fn source_constraint_warning(
     p: &PoetryProject,
@@ -212,7 +212,7 @@ pub(super) fn source_constraint_warning(
 }
 
 /// Refuse a source-constrained package over a lock written by Poetry
-/// 1.4 – 2.2: its installer fails every install once the lock sources the
+/// 1.3 – 2.2: its installer fails every install once the lock sources the
 /// package from the vendored wheel (#1282).
 fn source_constraint_guard(
     p: &PoetryProject,
@@ -319,7 +319,7 @@ pub(super) fn check_target_guards(
         ));
     }
     // A pyproject `source = "…"` pin breaks every install of the wired lock
-    // on Poetry 1.4 – 2.2; refuse when one of those wrote the lock.
+    // on Poetry 1.3 – 2.2; refuse when one of those wrote the lock.
     source_constraint_guard(p, canon_name, version, poetry_lock::Wired::No)?;
     Ok(PoetryTarget::Fresh)
 }
@@ -892,18 +892,19 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
 
     /// A pyproject `source = "pypi"` constraint on the vendored package has
     /// no trace in the lock. Rewiring it to a file source breaks every
-    /// `poetry install` on Poetry 1.4 – 2.2, so a lock stamped by one of
-    /// those is refused before the wheel is built; other writers wire it with
-    /// a warning (#1282).
+    /// `poetry install` on Poetry 1.3 – 2.2, so a lock one of those wrote is
+    /// refused before the wheel is built; other writers wire it with a
+    /// warning (#1282, #1447).
     #[tokio::test]
-    async fn source_constrained_dependency_is_refused_for_poetry_1_4_to_2_2() {
+    async fn source_constrained_dependency_is_refused_for_poetry_1_3_to_2_2() {
         const PYPROJECT: &str = "[tool.poetry.dependencies]\n\
             python = \">=3.8\"\n\
             urllib3 = {version = \"1.26.18\", source = \"pypi\"}\n";
         for (version, broken) in [
             ("0.12.17", false),
             ("1.1.15", false),
-            ("1.3.2", false),
+            ("1.2.2", false),
+            ("1.3.2", true),
             ("1.4.2", true),
             ("1.6.1", true),
             ("1.8.5", true),

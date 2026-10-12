@@ -1176,10 +1176,11 @@ fn poetry_vendored_revendors_to_a_superseding_patch() {
 }
 
 /// `six = {version = "1.16.0", source = "pypi"}` leaves no trace in the
-/// lock, and Poetry 1.4 – 2.2 refuse to install a lock that then sources six
-/// from a URL or file ("Repository \"pypi\" does not exist."). Over a lock
-/// one of them wrote, both modes refuse and leave the lock installable;
-/// other releases install the rewired lock, with a warning (#1282).
+/// lock, and Poetry 1.3 – 2.2 refuse to install a lock that then sources six
+/// from a URL or file ("Repository \"pypi\" does not exist."; 1.3 and 1.4
+/// report a solver failure). Over a lock one of them wrote, both modes
+/// refuse and leave the lock installable; other releases install the
+/// rewired lock, with a warning (#1282, #1447).
 #[test]
 #[ignore = "real Poetry + PyPI; run by the CI e2e matrix per Poetry release"]
 fn poetry_source_pypi_constraint_never_breaks_install() {
@@ -1204,7 +1205,7 @@ fn poetry_source_pypi_constraint_never_breaks_install() {
         return;
     };
     // The lock was written by this Poetry, so it is also the installer.
-    let refused = ((1, 4)..(2, 3)).contains(&poetry.major_minor());
+    let refused = ((1, 3)..(2, 3)).contains(&poetry.major_minor());
     let mut patched = pristine.clone();
     patched.extend_from_slice(MARKER);
     let wheel = build_wheel(&patched);
@@ -1243,7 +1244,7 @@ fn poetry_source_pypi_constraint_never_breaks_install() {
             assert_ne!(lock, pristine_lock, "{mode}: rewired: {env}");
             assert!(
                 report.contains("source_constraint"),
-                "{mode}: warns about Poetry 1.4 – 2.2: {env}"
+                "{mode}: warns about Poetry 1.3 – 2.2: {env}"
             );
         }
         // Either way a fresh install works, and installs the patch whenever

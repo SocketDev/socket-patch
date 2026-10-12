@@ -60,7 +60,7 @@ pub(super) fn rewrite_poetry(
     }
     for (path, original) in locks {
         // A pyproject `source = "…"` constraint on the dep (#1282). Poetry
-        // 1.4 – 2.2 fail every install of a lock that sources it from a URL,
+        // 1.3 – 2.2 fail every install of a lock that sources it from a URL,
         // so a lock one of them wrote is refused; other writers are warned.
         // The constraint lives in the pyproject beside the lock.
         let pyproject_path = format!(
@@ -345,12 +345,12 @@ mod equivalence_tests {
 
     /// A dependency the pyproject pins to a named source (`source = "pypi"`)
     /// has no trace in the lock. Rewriting it to a URL source breaks every
-    /// `poetry install` on Poetry 1.4 – 2.2, so a lock stamped by one of
-    /// those is refused before any write; other writers are rewritten with a
-    /// warning (#1282). A sibling lock whose pyproject has no constraint is
+    /// `poetry install` on Poetry 1.3 – 2.2, so a lock one of those wrote is
+    /// refused before any write; other writers are rewritten with a warning
+    /// (#1282, #1447). A sibling lock whose pyproject has no constraint is
     /// rewritten as before.
     #[test]
-    fn source_constrained_dependency_is_refused_for_poetry_1_4_to_2_2() {
+    fn source_constrained_dependency_is_refused_for_poetry_1_3_to_2_2() {
         const PYPROJECTS: &[&str] = &[
             "[tool.poetry.dependencies]\nurllib3 = {version = \"1.26.18\", source = \"pypi\"}\n",
             "[tool.poetry.dependencies.URLLib3]\nversion = \"1.26.18\"\nsource = \"PyPI\"\n",
@@ -362,7 +362,15 @@ mod equivalence_tests {
         for version in VERSIONS.iter().filter(|version| !version.starts_with("0.")) {
             let broken = matches!(
                 *version,
-                "1.4.2" | "1.5.1" | "1.6.1" | "1.7.1" | "1.8.5" | "2.0.1" | "2.1.4" | "2.2.1"
+                "1.3.2"
+                    | "1.4.2"
+                    | "1.5.1"
+                    | "1.6.1"
+                    | "1.7.1"
+                    | "1.8.5"
+                    | "2.0.1"
+                    | "2.1.4"
+                    | "2.2.1"
             );
             for pyproject in PYPROJECTS {
                 let lock = fixture(version);
@@ -379,7 +387,14 @@ mod equivalence_tests {
                 let got = run(rewrite_poetry, &files, &deps);
                 let what = format!("{version} {pyproject:?}: {:?}", got.warnings);
                 assert!(got.files.contains_key("sub/poetry.lock"), "{what}");
-                let codes: Vec<&str> = got.warnings.iter().map(|w| w.code.as_str()).collect();
+                // Only the root lock's warnings: the sibling is rewritten,
+                // and a pre-1.4 one (1.3) also warns about stale installs.
+                let codes: Vec<&str> = got
+                    .warnings
+                    .iter()
+                    .filter(|w| !w.detail.starts_with("sub/"))
+                    .map(|w| w.code.as_str())
+                    .collect();
                 if broken {
                     assert!(!got.files.contains_key("poetry.lock"), "{what}");
                     assert!(
@@ -404,11 +419,16 @@ mod equivalence_tests {
                 }
 
                 // A lock a pre-#1282 run already redirected: still refused
-                // (never confirmed) on 1.4 – 2.2, still warned elsewhere.
+                // (never confirmed) on 1.3 – 2.2, still warned elsewhere.
                 let mut again = files.clone();
                 again.insert("poetry.lock".into(), got.files["sub/poetry.lock"].clone());
                 let got = run(rewrite_poetry, &again, &deps);
-                let codes: Vec<&str> = got.warnings.iter().map(|w| w.code.as_str()).collect();
+                let codes: Vec<&str> = got
+                    .warnings
+                    .iter()
+                    .filter(|w| !w.detail.starts_with("sub/"))
+                    .map(|w| w.code.as_str())
+                    .collect();
                 assert!(!got.files.contains_key("poetry.lock"), "{what}");
                 if broken {
                     assert!(
