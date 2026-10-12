@@ -44,14 +44,14 @@ pub mod envelope;
 
 pub use envelope::{envelope_error_code, envelope_error_message, json_string, parse_json_envelope};
 
-// ── Binary discovery + invocation ─────────────────────────────────────
+/// The binary under test and the Git-blob hash oracle. Shared modules
+/// whose includers don't all declare `mod common` pull it in on its own
+/// with `#[path = "../common/oracle.rs"] mod oracle;`.
+pub mod oracle;
 
-/// Absolute path to the built `socket-patch` binary that cargo
-/// provides via the `CARGO_BIN_EXE_*` env var. Available because
-/// these tests live in the same crate that produces the binary.
-pub fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+pub use oracle::{binary, git_sha256};
+
+// ── Binary discovery + invocation ─────────────────────────────────────
 
 /// Quick check whether `cmd` is on PATH. Used to soft-skip
 /// toolchain-dependent tests when the toolchain isn't installed
@@ -125,17 +125,6 @@ pub fn assert_run_ok(cwd: &Path, args: &[&str], context: &str) -> (String, Strin
 }
 
 // ── Hashing ───────────────────────────────────────────────────────────
-
-/// Compute Git-flavored SHA-256: `SHA256("blob <len>\0" ++ content)`.
-/// This is the hash socket-patch records in manifests under
-/// `before_hash` / `after_hash`.
-pub fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// Git-SHA-256 of the file at `path`. Panics if the file can't be
 /// read — tests use this on paths they know exist.

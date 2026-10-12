@@ -99,16 +99,14 @@ pub fn installed_pnpm_pre_10_5(proj: &Path) -> bool {
     }
 }
 
-/// Absolute path of the `socket-patch` binary under test.
-pub fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+/// The binary under test and the Git-blob hash (the `afterHash` a patch
+/// view carries for a patched file), shared with `common` (#824).
+#[path = "../common/oracle.rs"]
+mod oracle;
 
-/// Git-style sha256 of `bytes` — the `afterHash` a patch view carries for a
-/// patched file (what installed-tree verification recomputes).
-pub fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
+// Not every includer uses these.
+#[allow(unused_imports)]
+pub use oracle::{binary, git_sha256};
 
 // ── Project shaping ───────────────────────────────────────────────────
 
