@@ -387,12 +387,16 @@ mod equivalence_tests {
                 let got = run(rewrite_poetry, &files, &deps);
                 let what = format!("{version} {pyproject:?}: {:?}", got.warnings);
                 assert!(got.files.contains_key("sub/poetry.lock"), "{what}");
-                // Only the root lock's warnings: the sibling is rewritten,
-                // and a pre-1.4 one (1.3) also warns about stale installs.
+                // The sibling is rewritten, and a pre-1.4 one (1.3) also
+                // warns about stale installs; nothing else may name it.
+                let sibling_stale = |w: &RewriteWarning| {
+                    w.code == "redirect_poetry_stale_install_risk"
+                        && w.detail.starts_with("sub/poetry.lock ")
+                };
                 let codes: Vec<&str> = got
                     .warnings
                     .iter()
-                    .filter(|w| !w.detail.starts_with("sub/"))
+                    .filter(|w| !sibling_stale(w))
                     .map(|w| w.code.as_str())
                     .collect();
                 if broken {
@@ -426,7 +430,7 @@ mod equivalence_tests {
                 let codes: Vec<&str> = got
                     .warnings
                     .iter()
-                    .filter(|w| !w.detail.starts_with("sub/"))
+                    .filter(|w| !sibling_stale(w))
                     .map(|w| w.code.as_str())
                     .collect();
                 assert!(!got.files.contains_key("poetry.lock"), "{what}");
