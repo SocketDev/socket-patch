@@ -59,6 +59,25 @@ class Failures(unittest.TestCase):
             ],
         )
 
+    def test_real_cargo_log_covers_crashes_tests_and_doctests(self):
+        # `cargo test --no-fail-fast` over a crate whose lib test prints a
+        # child's "     Running npm install", one test binary aborts, one test
+        # fails printing a ``` line, and one doctest fails.
+        found = self.parse((ROOT / "scripts/tests/fixtures/cargo-test-failures.log").read_text())
+        self.assertEqual(
+            [(t, n) for t, n, _ in found],
+            [
+                ("a_crash", "(test binary exited without a test report)"),
+                ("b_fail", "bad"),
+                ("demo doctests", "src/lib.rs - one (line 1)"),
+            ],
+        )
+        crash = "\n".join(found[0][2])
+        self.assertIn("SIGABRT", crash)
+        self.assertNotIn("b_fail", crash)
+        self.assertIn("panicked at tests/b_fail.rs", "\n".join(found[1][2]))
+        self.assertEqual(tf.fence(found[1][2]), "````")
+
     def test_a_passing_log_has_no_failures(self):
         self.assertEqual(self.parse("     Running tests/a.rs (target/debug/deps/a-1)\ntest x ... ok\n"), [])
 
@@ -66,6 +85,22 @@ class Failures(unittest.TestCase):
         body = tf.trim([str(i) for i in range(tf.MAX_LINES + 5)] + ["", ""])
         self.assertEqual(len(body), tf.MAX_LINES + 1)
         self.assertIn("5 more lines", body[-1])
+
+    def test_overlong_lines_are_cut(self):
+        self.assertEqual(len(tf.trim(["x" * 10_000])[0]), tf.MAX_LINE_CHARS + len(" ...(cut)"))
+
+    def test_annotations_past_the_cap_are_counted(self):
+        log = "".join(f"---- t{i} stdout ----\npanic {i}\n" for i in range(tf.MAX_ANNOTATIONS + 3))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "log")
+            path.write_text(log)
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+                with contextlib.redirect_stdout(out):
+                    tf.main(["ci-test-failures.py", str(path)])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), tf.MAX_ANNOTATIONS + 1)
+        self.assertEqual(lines[-1], "::error::3 more failing tests; see the job summary")
 
     def test_annotations_and_summary_are_escaped(self):
         with tempfile.TemporaryDirectory() as tmp:

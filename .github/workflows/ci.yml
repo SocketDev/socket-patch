@@ -667,6 +667,7 @@ jobs:
             python3 scripts/ci-test-failures.py "$RUNNER_TEMP/coverage-tests.log" || true
             exit "$status"
           }
+          set +o pipefail
           cargo llvm-cov report --lcov --output-path coverage-host.lcov
           python3 scripts/ci-lcov-summary.py coverage-host.lcov | tee coverage-summary.txt
 
