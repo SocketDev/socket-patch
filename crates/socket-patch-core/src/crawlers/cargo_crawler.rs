@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::formats::cargo::manifest::package_name_version;
+use crate::formats::cargo::source_replacement::{
+    self, config_layer_paths, ConfigLayer, CratesIoSource,
+};
 use crate::formats::cargo::CargoLock;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
@@ -267,14 +270,50 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
         return (Vec::new(), false);
     }
 
-    // Cargo project: prefer a vendored source tree if present, else
-    // fall back to the global registry cache.
-    let vendor_dir = options.cwd.join("vendor");
-    if is_dir(&vendor_dir).await {
-        return (vec![vendor_dir], false);
+    // Cargo project: crawl what cargo builds from. A config that
+    // replaces crates.io with a directory source (`cargo vendor`) names
+    // that directory, wherever it is; without one, cargo reads the
+    // registry cache, even when an unwired `vendor/` sits beside the
+    // manifest (#338). A replacement directory that is missing yields
+    // nothing: cargo can't build from the cache either.
+    match crates_io_source(&options.cwd).await {
+        CratesIoSource::Directory(dir) => {
+            if is_dir(&dir).await {
+                (vec![dir], false)
+            } else {
+                (Vec::new(), false)
+            }
+        }
+        CratesIoSource::Registry | CratesIoSource::Other(_) => {
+            (CargoCrawler::get_registry_src_paths().await, true)
+        }
     }
+}
 
-    (CargoCrawler::get_registry_src_paths().await, true)
+/// Where cargo takes crates.io packages from for a build in `cwd`: the
+/// source replacement of the cargo configs it reads there (every
+/// ancestor's `.cargo/config*`, then `$CARGO_HOME`'s). An unreadable
+/// config is skipped.
+async fn crates_io_source(cwd: &Path) -> CratesIoSource {
+    let cwd = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let cargo_home = CargoCrawler::cargo_home();
+    run_blocking(move || {
+        let files = config_layer_paths(&cwd, cargo_home.as_deref(), |p| p.is_file());
+        let texts: Vec<(PathBuf, String)> = files
+            .into_iter()
+            .filter_map(|(file, base)| {
+                crate::utils::fs::read_regular_to_string_sync(&file)
+                    .ok()
+                    .map(|t| (base, t))
+            })
+            .collect();
+        let layers: Vec<ConfigLayer<'_>> = texts
+            .iter()
+            .map(|(base, text)| ConfigLayer { base, text })
+            .collect();
+        source_replacement::crates_io_source(&layers)
+    })
+    .await
 }
 
 /// The `(name, version)` of every registry-sourced `[[package]]` in
@@ -390,6 +429,18 @@ impl Default for CargoCrawler {
 
 #[cfg(test)]
 mod tests {
+    /// `<root>/.cargo/config.toml` replacing crates.io with `<root>/vendor`,
+    /// as `cargo vendor` asks: only a wired tree is cargo's source (#338).
+    fn wire_vendor(root: &Path) {
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo").join("config.toml"),
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+             [source.vendored-sources]\ndirectory = \"vendor\"\n",
+        )
+        .unwrap();
+    }
+
     use super::*;
 
     #[test]
@@ -569,6 +620,7 @@ mod tests {
         )
         .await
         .unwrap();
+        wire_vendor(dir.path());
 
         let crawler = CargoCrawler::new();
         let options = CrawlerOptions {
@@ -622,6 +674,7 @@ mod tests {
         tokio::fs::write(dir.path().join("Cargo.lock"), "version = 3\n")
             .await
             .unwrap();
+        wire_vendor(dir.path());
 
         let crawler = CargoCrawler::new();
         let options = CrawlerOptions {
@@ -1144,6 +1197,7 @@ version = "fake"
             write(&vendored.path().join("Cargo.lock"), &locked);
             stage(&vendored.path().join("vendor"), "unlocked", "1.0.0");
             mkdir(&vendored.path().join("vendor").join(".hidden"));
+            wire_vendor(vendored.path());
             assert_eq!(
                 purls(&crawler.crawl_all(&local(vendored.path())).await),
                 ["pkg:cargo/unlocked@1.0.0"]
@@ -1332,6 +1386,7 @@ version = "fake"
         tokio::fs::create_dir_all(&left).await.unwrap();
         let fifo = left.join("Cargo.toml");
         make_fifo(&fifo);
+        wire_vendor(dir.path());
         // A readable crate beside the FIFO proves the crawl continues.
         let serde_dir = vendor.join("serde");
         tokio::fs::create_dir_all(&serde_dir).await.unwrap();
