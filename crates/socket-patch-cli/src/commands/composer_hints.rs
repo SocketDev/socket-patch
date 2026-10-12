@@ -24,8 +24,8 @@ use socket_patch_core::patch::redirect::FileEdit;
 /// to `cwd` with `/` separators when it lies inside the project (`vendor`,
 /// `lib`, `deps/php`), else the absolute path `COMPOSER_VENDOR_DIR` or the
 /// user-level config named. A `config.vendor-dir` the crawler refuses
-/// (absolute, home-relative, or climbing out of the project) prints as the `<vendor-dir>` placeholder rather than a
-/// directory that would be wrong.
+/// (absolute, home-relative, or climbing out of the project) prints as the
+/// `<vendor-dir>` placeholder rather than a directory that would be wrong.
 pub(crate) fn vendor_dir_label(cwd: &Path) -> String {
     let Some(dir) =
         socket_patch_core::crawlers::composer_crawler::resolve_local_vendor_dir_sync(cwd)

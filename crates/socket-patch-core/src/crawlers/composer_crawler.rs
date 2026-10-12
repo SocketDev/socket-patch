@@ -389,14 +389,15 @@ async fn get_composer_home() -> Option<PathBuf> {
     }
 
     // Platform defaults (see `composer_home_candidates`).
-    let var = |name: &str| std::env::var_os(name);
-    for candidate in composer_home_candidates(&var, cfg!(windows)) {
-        if is_dir(&candidate).await {
-            return Some(candidate);
-        }
-    }
+    run_blocking(|| default_composer_home(&|name: &str| std::env::var_os(name))).await
+}
 
-    None
+/// The first of [`composer_home_candidates`] that exists: the platform
+/// default home both global and local discovery fall back to.
+fn default_composer_home(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    composer_home_candidates(var, cfg!(windows))
+        .into_iter()
+        .find(|candidate| is_dir_sync(candidate))
 }
 
 /// The directories Composer itself uses as its home when `COMPOSER_HOME`
@@ -490,13 +491,19 @@ fn parse_config_vendor_dir(composer_json: &str) -> Option<String> {
 /// `None` when the placeholder names nothing usable (no home, an unset or
 /// empty variable). Composer would substitute `""` there and resolve a
 /// root-relative path, which is never the tree a real install used.
-fn expand_composer_path(raw: &str, var: &impl Fn(&str) -> Option<OsString>) -> Option<String> {
+fn expand_composer_path(raw: &str, var: &impl Fn(&str) -> Option<OsString>) -> Option<OsString> {
+    // Built from `OsString`s so a non-UTF-8 home or variable keeps its bytes.
+    let join = |head: OsString, rest: &str| {
+        let mut out = head;
+        out.push(rest);
+        out
+    };
     if let Some(rest) = raw.strip_prefix('~') {
         if rest.starts_with(['/', '\\']) {
             let home = crate::utils::fs::home_from_env(var)?;
-            return Some(format!("{}{rest}", home.to_string_lossy()));
+            return Some(join(home.into_os_string(), rest));
         }
-        return Some(raw.to_string());
+        return Some(raw.into());
     }
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let (name, rest) = if let Some(after) = raw.strip_prefix('$') {
@@ -506,20 +513,20 @@ fn expand_composer_path(raw: &str, var: &impl Fn(&str) -> Option<OsString>) -> O
         let end = after.find(|c| !is_word(c)).unwrap_or(after.len());
         match after[end..].strip_prefix('%') {
             Some(rest) => (&after[..end], rest),
-            None => return Some(raw.to_string()),
+            None => return Some(raw.into()),
         }
     } else {
-        return Some(raw.to_string());
+        return Some(raw.into());
     };
     if name.is_empty() {
-        return Some(raw.to_string());
+        return Some(raw.into());
     }
     // Composer treats `HOME` as an alias for `USERPROFILE` on Windows.
     let value = match name {
         "HOME" => crate::utils::fs::home_from_env(var).map(PathBuf::into_os_string),
         _ => var(name).filter(|v| !v.is_empty()),
     }?;
-    Some(format!("{}{rest}", value.to_string_lossy()))
+    Some(join(value, rest))
 }
 
 /// Resolve Composer's `vendor-dir` the way `Config::get` does, highest
@@ -528,7 +535,8 @@ fn expand_composer_path(raw: &str, var: &impl Fn(&str) -> Option<OsString>) -> O
 /// 1. `COMPOSER_VENDOR_DIR`;
 /// 2. the project's composer.json `config.vendor-dir` (`manifest`);
 /// 3. the user-level `$COMPOSER_HOME/config.json` `config.vendor-dir`
-///    (`user_config`, what `composer config -g vendor-dir` writes);
+///    (`user_config` reads its text; what `composer config -g vendor-dir`
+///    writes);
 /// 4. `vendor`.
 ///
 /// Every value is expanded (`~/`, `$VAR`, `%VAR%`) and a relative one
@@ -548,7 +556,7 @@ fn resolve_vendor_dir(
     base: &Path,
     manifest: Option<&str>,
     manifest_trusted: bool,
-    user_config: Option<&str>,
+    user_config: impl FnOnce() -> Option<String>,
     var: &impl Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
     let honoured = |raw: &str| expand_composer_path(raw, var).map(|value| base.join(value));
@@ -570,32 +578,31 @@ fn resolve_vendor_dir(
         }
         // A placeholder Composer would expand (`~/x`, `$HOME/x`) names a
         // directory outside the project, never the literal `<proj>/~/x`.
-        if expand_composer_path(&configured, var).as_deref() != Some(configured.as_str()) {
+        if expand_composer_path(&configured, var) != Some(OsString::from(&configured)) {
             return None;
         }
         return normalize_config_vendor_dir(&configured)
             .filter(|normalized| path_safety::is_safe_multi_segment(normalized))
             .map(|normalized| base.join(normalized));
     }
-    match user_config.and_then(parse_config_vendor_dir) {
+    // Read only when nothing above decided: most projects never need it.
+    match user_config().as_deref().and_then(parse_config_vendor_dir) {
         Some(configured) => honoured(&configured),
         None => Some(base.join("vendor")),
     }
 }
 
-/// `$COMPOSER_HOME` for LOCAL discovery, without running `composer`: the
-/// env var, else the first platform default that exists (the fallbacks
-/// [`get_composer_home`] ends with). Local scans read the user-level
-/// `config.json` from here and must not spawn a subprocess to find it.
-fn local_composer_home(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    if let Some(home) = var("COMPOSER_HOME").map(PathBuf::from) {
-        if is_dir_sync(&home) {
-            return Some(home);
-        }
+/// `$COMPOSER_HOME` for LOCAL discovery of the project at `cwd`, without
+/// running `composer`: the env var exactly as Composer uses it (a relative
+/// value against the directory composer runs in, the project; a missing
+/// directory just holds no config), else [`default_composer_home`]. Local
+/// scans read the user-level `config.json` from here and must not spawn a
+/// subprocess to find it.
+fn local_composer_home(cwd: &Path, var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    match var("COMPOSER_HOME").filter(|home| !home.is_empty()) {
+        Some(home) => Some(cwd.join(home)),
+        None => default_composer_home(var),
     }
-    composer_home_candidates(var, cfg!(windows))
-        .into_iter()
-        .find(|candidate| is_dir_sync(candidate))
 }
 
 /// The vendor directory of the global project at `composer_home`: its
@@ -605,12 +612,11 @@ fn global_vendor_dir_sync(composer_home: &Path) -> Option<PathBuf> {
     let read =
         |name: &str| crate::utils::fs::read_regular_to_string_sync(&composer_home.join(name)).ok();
     let manifest = read("composer.json");
-    let user_config = read("config.json");
     resolve_vendor_dir(
         composer_home,
         manifest.as_deref(),
         true,
-        user_config.as_deref(),
+        || read("config.json"),
         &|name| std::env::var_os(name),
     )
 }
@@ -640,14 +646,9 @@ pub fn resolve_local_vendor_dir_sync(cwd: &Path) -> Option<PathBuf> {
     let var = |name: &str| std::env::var_os(name);
     let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
     let manifest = read(&cwd.join("composer.json"));
-    let user_config = local_composer_home(&var).and_then(|home| read(&home.join("config.json")));
-    resolve_vendor_dir(
-        cwd,
-        manifest.as_deref(),
-        false,
-        user_config.as_deref(),
-        &var,
-    )
+    let user_config =
+        || local_composer_home(cwd, &var).and_then(|home| read(&home.join("config.json")));
+    resolve_vendor_dir(cwd, manifest.as_deref(), false, user_config, &var)
 }
 
 /// Reduce a `config.vendor-dir` value to plain `a/b` segments before the
@@ -1686,7 +1687,7 @@ mod tests {
             "EMPTY" => Some(OsString::new()),
             _ => None,
         };
-        let x = |raw: &str| expand_composer_path(raw, &env);
+        let x = |raw: &str| expand_composer_path(raw, &env).map(|v| v.into_string().unwrap());
         assert_eq!(x("~/shared").as_deref(), Some("/home/u/shared"));
         assert_eq!(x("~\\shared").as_deref(), Some("/home/u\\shared"));
         assert_eq!(x("$HOME/shared").as_deref(), Some("/home/u/shared"));
@@ -1714,8 +1715,15 @@ mod tests {
         let lib = Some(r#"{"config":{"vendor-dir":"lib"}}"#);
         let abs = Some(r#"{"config":{"vendor-dir":"/abs/deps"}}"#);
         let home = Some(r#"{"config":{"vendor-dir":"~/deps"}}"#);
-        let r =
-            |manifest, trusted, user| resolve_vendor_dir(base, manifest, trusted, user, &no_env);
+        let r = |manifest, trusted, user: Option<&str>| {
+            resolve_vendor_dir(
+                base,
+                manifest,
+                trusted,
+                || user.map(str::to_string),
+                &no_env,
+            )
+        };
 
         assert_eq!(r(None, false, None), Some(base.join("vendor")));
         assert_eq!(r(None, false, lib), Some(base.join("lib")));
@@ -1731,9 +1739,30 @@ mod tests {
 
         let env = |name: &str| (name == "COMPOSER_VENDOR_DIR").then(|| OsString::from("third/"));
         assert_eq!(
-            resolve_vendor_dir(base, abs, false, lib, &env),
+            resolve_vendor_dir(base, abs, false, || panic!("env decided"), &env),
             Some(base.join("third"))
         );
+        // The user config is only read when nothing above decided.
+        assert_eq!(
+            resolve_vendor_dir(base, lib, false, || panic!("manifest decided"), &no_env),
+            Some(base.join("lib"))
+        );
+    }
+
+    /// A set `COMPOSER_HOME` is used exactly as Composer uses it, even when
+    /// the directory is missing (no fallback to another home's config), and
+    /// a relative value resolves against the project.
+    #[test]
+    fn test_local_composer_home_honours_set_env() {
+        let cwd = Path::new("/proj");
+        let env = |value: &'static str| {
+            move |name: &str| (name == "COMPOSER_HOME").then(|| OsString::from(value))
+        };
+        assert_eq!(
+            local_composer_home(cwd, &env("/missing/composer-home")),
+            Some(PathBuf::from("/missing/composer-home"))
+        );
+        assert_eq!(local_composer_home(cwd, &env("ch")), Some(cwd.join("ch")));
     }
 
     #[test]
