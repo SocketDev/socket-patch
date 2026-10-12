@@ -177,7 +177,8 @@ pub(super) async fn cleanup(root: &Path, entry: &VendorEntry, dry_run: bool) -> 
                 paths.push(path)
             }
             Ok(_) => return Err("workspace tarball changed; superseded artifacts kept".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Gone already: its `<uuid>/.gitignore` still goes.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => paths.push(path),
             Err(e) => return Err(format!("cannot read workspace tarball: {e}")),
         }
     }

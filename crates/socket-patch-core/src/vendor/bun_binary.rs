@@ -294,10 +294,14 @@ impl NpmLockBackend for BunBinaryBackend {
                 }
                 mirror_backups.push((path, before));
             }
-            if let Err(e) = keep_mirror_committable(root, rel, warnings).await {
+            if let Err(e) = restore_mirror_metadata(root, rel).await {
                 undo_mirrors(&mirror_backups).await;
                 return Err(e);
             }
+        }
+        if let Err(e) = probe_mirrors(root, &mirrors, warnings).await {
+            undo_mirrors(&mirror_backups).await;
+            return Err(e);
         }
         if !lock_changed && mirror_backups.is_empty() {
             return Ok(None);
@@ -626,7 +630,8 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
                         Ok(Some(path))
                     }
                     Ok(_) => Err("workspace tarball has changed; left alone".into()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    // Gone already: its `<uuid>/.gitignore` still goes.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(path)),
                     Err(e) => Err(format!("cannot read workspace tarball: {e}")),
                 }
             })();
@@ -978,7 +983,7 @@ async fn refuse_ignored_mirrors(
     match super::npm_dir::gitignored(root, &dirs).await {
         Some(rules) => Err(Box::new(refused(
             super::npm_dir::GITIGNORED,
-            super::npm_dir::gitignored_detail(dirs[0].trim_end_matches('/'), &rules),
+            super::npm_dir::gitignored_detail(&first_ignored(&rules, &dirs[0]), &rules),
         ))),
         None => Ok(()),
     }
@@ -994,37 +999,54 @@ pub(super) async fn restore_mirror_metadata(root: &Path, rel: &str) -> Result<St
     Ok(dir_rel)
 }
 
-/// Give a written workspace mirror the root artifact's `<uuid>/.gitignore`
-/// and `<uuid>/.gitattributes` (#837), so a file rule such as
-/// Node.gitignore's `*.tgz` cannot keep it out of the commit (#1116), then
-/// ask git whether it would commit them. Still ignored is an error (the
-/// caller unwinds); git failing to answer is only a warning.
-async fn keep_mirror_committable(
+/// Ask git, in one probe, whether it would commit every written workspace
+/// mirror and the `<uuid>/.gitignore` and `<uuid>/.gitattributes` beside
+/// it ([`restore_mirror_metadata`], which overrides file rules such as
+/// Node.gitignore's `*.tgz`, #1116). Still ignored is an error (the caller
+/// unwinds); git failing to answer is only a warning.
+async fn probe_mirrors(
     root: &Path,
-    rel: &str,
+    mirrors: &[(String, String)],
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(), String> {
-    let dir_rel = restore_mirror_metadata(root, rel).await?;
-    let probe = [
-        rel.to_string(),
-        format!("{dir_rel}/.gitignore"),
-        format!("{dir_rel}/.gitattributes"),
-    ];
+    let mut probe = Vec::new();
+    for (_, rel) in mirrors {
+        let dir_rel = mirror_uuid_dir_rel(rel).ok_or("invalid workspace tarball path")?;
+        probe.push(rel.clone());
+        probe.push(format!("{dir_rel}/.gitignore"));
+        probe.push(format!("{dir_rel}/.gitattributes"));
+    }
+    if probe.is_empty() {
+        return Ok(());
+    }
     match super::npm_dir::gitignore_probe(root, &probe).await {
         Ok(Some(rules)) => Err(format!(
             "{}: {}",
             super::npm_dir::GITIGNORED,
-            super::npm_dir::gitignored_detail(rel, &rules)
+            super::npm_dir::gitignored_detail(&first_ignored(&rules, &probe[0]), &rules)
         )),
         Ok(None) => Ok(()),
         Err(why) => {
             warnings.push(VendorWarning::new(
                 super::npm_dir::GITIGNORE_UNCHECKED,
-                super::npm_dir::gitignore_unchecked_detail(rel, &why),
+                super::npm_dir::gitignore_unchecked_detail(&probe[0], &why),
             ));
             Ok(())
         }
     }
+}
+
+/// The first path [`super::npm_dir::gitignored`]'s rules name
+/// (`<source>:<line>:<pattern>\t<path>; ...`), without a trailing `/`;
+/// `fallback` when they name none.
+pub(super) fn first_ignored(rules: &str, fallback: &str) -> String {
+    rules
+        .split("; ")
+        .next()
+        .and_then(|rule| rule.rsplit_once('\t'))
+        .map(|(_, path)| path.trim_end_matches('/').to_string())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| fallback.trim_end_matches('/').to_string())
 }
 
 /// The `<uuid>/.gitignore` and `<uuid>/.gitattributes` beside a workspace
@@ -1032,12 +1054,15 @@ async fn keep_mirror_committable(
 /// when nothing but the mirror itself (and the scope directory holding it)
 /// is left in that uuid dir, so the member's `.socket/` can still be pruned.
 fn mirror_metadata(path: &Path) -> Vec<PathBuf> {
-    let Some(dir) = path
-        .to_str()
-        .map(|p| p.replace('\\', "/"))
-        .and_then(|p| mirror_uuid_dir_rel(&p))
-        .map(PathBuf::from)
-    else {
+    // `<member>/.socket/vendor/npm/<uuid>`: the ancestor under `vendor/npm`.
+    let Some(dir) = path.ancestors().skip(1).find(|dir| {
+        let npm = dir.parent();
+        npm.and_then(Path::file_name).is_some_and(|n| n == "npm")
+            && npm
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "vendor")
+    }) else {
         return Vec::new();
     };
     let ours = [
@@ -1045,7 +1070,7 @@ fn mirror_metadata(path: &Path) -> Vec<PathBuf> {
         (".gitattributes", super::npm_dir::UUID_GITATTRIBUTES),
     ];
     let mut metadata = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     for entry in entries.flatten() {
@@ -1074,7 +1099,7 @@ fn mirror_metadata(path: &Path) -> Vec<PathBuf> {
     metadata
 }
 
-/// Remove a reverted workspace tarball (with its `<uuid>/.gitignore` and
+/// Remove a reverted workspace tarball, if still there (with its `<uuid>/.gitignore` and
 /// `.gitattributes`, see [`mirror_metadata`]) and prune its emptied
 /// parents through the workspace's `.socket/`, or queue all of them for
 /// after the commit of a staged hosted takeover (see
@@ -1087,13 +1112,24 @@ pub(super) async fn remove_mirror(path: &Path) -> std::io::Result<()> {
         .find(|dir| dir.file_name().is_some_and(|name| name == ".socket"))
         .unwrap_or(path);
     let metadata = mirror_metadata(path);
-    if crate::utils::group_commit::defer_removal(path, bound) {
-        for file in &metadata {
-            crate::utils::group_commit::defer_removal(file, bound);
+    // A tarball already gone (deleted by hand) still takes its metadata.
+    let present = tokio::fs::symlink_metadata(path).await.is_ok();
+    let queue: Vec<&Path> = present
+        .then_some(path)
+        .into_iter()
+        .chain(metadata.iter().map(PathBuf::as_path))
+        .collect();
+    if let Some((first, rest)) = queue.split_first() {
+        if crate::utils::group_commit::defer_removal(first, bound) {
+            for file in rest {
+                crate::utils::group_commit::defer_removal(file, bound);
+            }
+            return Ok(());
         }
-        return Ok(());
     }
-    tokio::fs::remove_file(path).await?;
+    if present {
+        tokio::fs::remove_file(path).await?;
+    }
     for file in &metadata {
         let _ = tokio::fs::remove_file(file).await;
     }
@@ -1674,6 +1710,8 @@ mod rebuild_tests {
             "repair restores the mirrors' .gitignore"
         );
 
+        // A mirror deleted by hand still takes its metadata on revert.
+        std::fs::remove_file(root.join(&mirrors[0])).unwrap();
         ts::persist(root, PURL, entry.clone()).await;
         let outcome = revert(&entry, root, RevertOpts::new(false)).await;
         assert!(outcome.success, "{outcome:?}");
@@ -1756,6 +1794,19 @@ mod rebuild_tests {
                 assert!(!root.join(&member).join(".socket").exists(), "{label}");
             }
         }
+    }
+
+    /// A refusal names the path git reports as ignored, not the first one
+    /// probed: with members `a` and `b`, only `b` may be ignored.
+    #[test]
+    fn first_ignored_names_the_path_git_reports() {
+        let rules = "packages/b/.gitignore:1:.socket/\tpackages/b/.socket/vendor/npm/u/; \
+                     .gitignore:2:x\tpackages/c/.socket/vendor/npm/u/";
+        assert_eq!(
+            first_ignored(rules, "packages/a/.socket/vendor/npm/u/"),
+            "packages/b/.socket/vendor/npm/u"
+        );
+        assert_eq!(first_ignored("", "packages/a/x/"), "packages/a/x");
     }
 
     // ── bun.lockb migrated to bun.lock (#784) ─────────────────────────────

@@ -239,7 +239,10 @@ pub async fn npm_tarball_gitignore_preflight(
     let rules = npm_dir::gitignored(project_root, &probe).await?;
     Some((
         npm_dir::GITIGNORED,
-        npm_dir::gitignored_detail(&mirrors[0], &rules),
+        npm_dir::gitignored_detail(
+            &super::bun_binary::first_ignored(&rules, &mirrors[0]),
+            &rules,
+        ),
     ))
 }
 
