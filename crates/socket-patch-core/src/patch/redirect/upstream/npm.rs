@@ -757,6 +757,8 @@ async fn restore_berry(
         url_pin: bool,
     }
     let mut hits: Vec<Hit> = Vec::new();
+    // What the lock still declares, read once for the URL-keyed hits.
+    let mut declared: Option<BTreeSet<String>> = None;
     for (i, block) in blocks.iter().enumerate() {
         let lines = stanza_lines(block);
         let Some(resolution) = berry_field(&lines, "resolution").map(str::to_string) else {
@@ -829,14 +831,15 @@ async fn restore_berry(
             // entry: `yarn remove` in one workspace member leaves its
             // selector behind while another member keeps the URL entry
             // live, and yarn keys the entry by what is declared (#1435).
-            // The selectors are all dropped below either way.
-            let declared: Vec<String> = descriptors
+            // The selectors are all dropped below either way. A lock that
+            // declares none of them (a spelling not read here) keeps every
+            // selector's descriptor, as before.
+            let declared = declared.get_or_insert_with(|| berry_declared_descriptors(&blocks));
+            if descriptors
                 .iter()
-                .filter(|d| berry_descriptor_declared(&blocks, d))
-                .cloned()
-                .collect();
-            if !declared.is_empty() {
-                descriptors = declared;
+                .any(|d| berry_descriptor_declared(declared, d))
+            {
+                descriptors.retain(|d| berry_descriptor_declared(declared, d));
             }
             if descriptors.is_empty() {
                 result.refuse(
@@ -1064,21 +1067,50 @@ async fn restore_berry(
     view.write(rel, doc.render(&moved));
 }
 
-/// Whether a berry lock's `stanzas` still declare the `name@npm:range`
-/// `descriptor`: an entry's `dependencies:` map names it (yarn 4 spells
-/// the range `npm:range`, yarn 2 and 3 a bare `range`) or a `patch:`
-/// descriptor wraps it.
-fn berry_descriptor_declared(stanzas: &[String], descriptor: &str) -> bool {
-    use crate::formats::yarn::berry_prune::{dependency_descriptors, referenced};
+/// The descriptors a berry lock's `stanzas` still declare: every
+/// entry's `dependencies:` map, plus the descriptor a `patch:` descriptor
+/// wraps (`name@patch:name@npm%3A1.3.0#…` wraps `name@npm:1.3.0`), in
+/// either a dependency map or a key. Yarn 4 spells a registry range
+/// `npm:range`, yarn 2 and 3 a bare `range`; see
+/// [`berry_descriptor_declared`].
+fn berry_declared_descriptors(stanzas: &[String]) -> BTreeSet<String> {
+    use crate::formats::yarn::berry_prune::dependency_descriptors;
+    use crate::formats::yarn::patterns::split_berry_key_patterns;
+    use crate::formats::yarn::stanzas::stanza_key;
+
+    let mut out = BTreeSet::new();
+    for stanza in stanzas {
+        let keys = stanza_key(stanza)
+            .map(split_berry_key_patterns)
+            .unwrap_or_default();
+        for descriptor in dependency_descriptors(stanza) {
+            if let Some(inner) = berry_patch_inner(&descriptor) {
+                out.insert(inner);
+            }
+            out.insert(descriptor);
+        }
+        out.extend(keys.iter().filter_map(|k| berry_patch_inner(k)));
+    }
+    out
+}
+
+/// The descriptor a `name@patch:<inner>#<patch>` descriptor wraps, with
+/// yarn's percent-encoding of the inner `:` undone.
+fn berry_patch_inner(descriptor: &str) -> Option<String> {
+    let (_, rest) = descriptor.split_once("@patch:")?;
+    let inner = rest.split('#').next().unwrap_or(rest);
+    Some(inner.replace("%3A", ":"))
+}
+
+/// Whether the `name@npm:range` `descriptor` is in `declared`
+/// ([`berry_declared_descriptors`]), in yarn 4's spelling or yarn 2/3's
+/// bare `name@range`.
+fn berry_descriptor_declared(declared: &BTreeSet<String>, descriptor: &str) -> bool {
     use crate::formats::yarn::patterns::split_pattern;
-    let bare = split_pattern(descriptor)
-        .and_then(|(name, range)| Some(format!("{name}@{}", range.strip_prefix("npm:")?)));
-    referenced(stanzas, descriptor)
-        || bare.is_some_and(|bare| {
-            stanzas
-                .iter()
-                .any(|s| dependency_descriptors(s).contains(&bare))
-        })
+    declared.contains(descriptor)
+        || split_pattern(descriptor)
+            .and_then(|(name, range)| Some(format!("{name}@{}", range.strip_prefix("npm:")?)))
+            .is_some_and(|bare| declared.contains(&bare))
 }
 
 /// Retire the leftover hosted `resolutions` selectors of a yarn berry root
@@ -2759,31 +2791,47 @@ mod tests {
     fn berry_descriptor_declared_reads_what_the_lock_still_uses() {
         let declared = |stanzas: &[&str], d: &str| {
             let stanzas: Vec<String> = stanzas.iter().map(|s| s.to_string()).collect();
-            super::berry_descriptor_declared(&stanzas, d)
+            super::berry_descriptor_declared(&super::berry_declared_descriptors(&stanzas), d)
         };
         let url_entry = "\"left-pad@http://patch.test/left-pad-1.3.0.tgz\":\n  version: 1.3.0\n  \
                          resolution: \"left-pad@http://patch.test/left-pad-1.3.0.tgz\"";
-        let member = |range: &str| {
+        let member = |dep: &str| {
             format!(
                 "\"b@workspace:packages/b\":\n  version: 0.0.0-use.local\n  dependencies:\n    \
-                 left-pad: \"{range}\"\n  linkType: soft"
+                 {dep}\n  linkType: soft"
             )
         };
         // Yarn 4 spells the range `npm:range`; yarn 2 and 3 a bare one.
-        let yarn4 = member("npm:^1.3.0");
-        let yarn3 = member("^1.3.0");
+        let yarn4 = member("left-pad: \"npm:^1.3.0\"");
+        let yarn3 = member("left-pad: ^1.3.0");
         assert!(declared(&[url_entry, &yarn4], "left-pad@npm:^1.3.0"));
         assert!(declared(&[url_entry, &yarn3], "left-pad@npm:^1.3.0"));
         // The member a `yarn remove` emptied declares nothing.
         assert!(!declared(&[url_entry, &yarn4], "left-pad@npm:1.3.0"));
         assert!(!declared(&[url_entry, &yarn3], "left-pad@npm:1.3.0"));
-        // A `yarn patch` of the descriptor still uses it.
-        let patched = "\"left-pad@patch:left-pad@npm%3A1.3.0#~/.yarn/patches/x.patch\":\n  \
-                       version: 1.3.0";
-        assert!(declared(&[url_entry, patched], "left-pad@npm:1.3.0"));
-        // An alias of the same version declares another descriptor.
-        let alias = "\"lp@npm:left-pad@1.3.0\":\n  version: 1.3.0";
-        assert!(!declared(&[url_entry, alias], "left-pad@npm:1.3.0"));
+        // A `yarn patch` of the descriptor still uses it, in a dependency
+        // map or a key.
+        let patch = "left-pad@patch:left-pad@npm%3A1.3.0#~/.yarn/patches/x.patch";
+        let patched = format!("\"{patch}\":\n  version: 1.3.0");
+        assert!(declared(&[url_entry, &patched], "left-pad@npm:1.3.0"));
+        let patch_dep = member(&format!("left-pad: \"{}\"", &patch["left-pad@".len()..]));
+        assert!(declared(&[url_entry, &patch_dep], "left-pad@npm:1.3.0"));
+        // An alias, a scoped namesake and a longer range declare other
+        // descriptors.
+        for other in [
+            member("lp: \"npm:left-pad@1.3.0\""),
+            member("\"@acme/left-pad\": \"npm:1.3.0\""),
+            member("left-pad: \"npm:1.3.0-rc.1\""),
+            "\"@acme/left-pad@patch:@acme/left-pad@npm%3A1.3.0#x.patch\":\n  version: 1.3.0"
+                .to_string(),
+            "\"left-pad@patch:left-pad@npm%3A1.3.0-rc.1#x.patch\":\n  version: 1.3.0-rc.1"
+                .to_string(),
+        ] {
+            assert!(
+                !declared(&[url_entry, &other], "left-pad@npm:1.3.0"),
+                "{other}"
+            );
+        }
     }
 
     fn files(npmrc: &[(&str, bool)], bunfig: &[(&str, bool)]) -> super::BunConfigFiles {

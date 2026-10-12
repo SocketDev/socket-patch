@@ -5461,12 +5461,22 @@ async fn yarn_berry_unwind_drops_a_descriptor_no_entry_declares() {
                 serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
             pkg["resolutions"][format!("{NAME}@npm:{VERSION}")] =
                 serde_json::Value::String(hosted_url.clone());
-            std::fs::write(&pkg_path, serde_json::to_string_pretty(&pkg).unwrap()).unwrap();
             let lock_path = tmp.path().join("yarn.lock");
             if declared {
+                pkg["workspaces"] = serde_json::json!(["packages/*"]);
+                let dir = tmp.path().join("packages").join("member");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("package.json"),
+                    format!(
+                        r#"{{ "name": "member", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+                    ),
+                )
+                .unwrap();
                 let pinned = std::fs::read_to_string(&lock_path).unwrap();
                 std::fs::write(&lock_path, format!("{pinned}{member}")).unwrap();
             }
+            std::fs::write(&pkg_path, serde_json::to_string_pretty(&pkg).unwrap()).unwrap();
 
             let args: &[&str] = if command == "rollback" {
                 &["rollback"]
