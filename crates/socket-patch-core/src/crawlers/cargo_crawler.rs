@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::formats::cargo::manifest::package_name_version;
-use crate::formats::cargo::source_replacement::{self, CratesIoSource};
+use crate::formats::cargo::source_replacement::{
+    self, config_layer_paths, ConfigLayer, CratesIoSource,
+};
 use crate::formats::cargo::CargoLock;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
@@ -244,7 +246,18 @@ impl CargoCrawler {
     /// `PathBuf::from("")` would otherwise resolve `registry/src` against
     /// the CWD and silently crawl nothing.
     fn cargo_home() -> Option<PathBuf> {
-        source_replacement::cargo_home()
+        match std::env::var("CARGO_HOME") {
+            Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
+            _ => crate::utils::fs::home_dir().map(|home| home.join(".cargo")),
+        }
+    }
+
+    /// Where cargo takes crates.io packages from for a build in `cwd`: the
+    /// source replacement of every cargo config it reads there (`cwd`'s and
+    /// each parent directory's `.cargo/config*`, then `$CARGO_HOME`'s).
+    /// Blocking file reads; the hosted scan's cargo refusal reads it too.
+    pub fn crates_io_source_for(cwd: &Path) -> CratesIoSource {
+        resolve_for(cwd, Self::cargo_home().as_deref())
     }
 }
 
@@ -301,12 +314,64 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
     }
 }
 
+/// [`source_replacement::crates_io_source`] for a cargo build in `cwd`,
+/// reading the config files [`config_layer_paths`] lists (an unreadable one is skipped).
+/// Blocking file reads.
+///
+/// `cwd` is taken as the logical absolute path, not the canonical one:
+/// a resolved directory is reported under it, as `<cwd>`-joined roots
+/// always were. The config walk folds `..` out of it, so `a/b/../proj`
+/// reads `a/proj`'s ancestors, not `a/b`'s; a directory under the folded
+/// cwd is reported back under the cwd as given, which path-scoped
+/// commands strip as a prefix.
+fn resolve_for(cwd: &Path, cargo_home: Option<&Path>) -> CratesIoSource {
+    let given = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let folded = fold_parent_dirs(&given);
+    let files = config_layer_paths(&folded, cargo_home, |p| p.is_file());
+    let texts: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .filter_map(|(file, base)| {
+            crate::utils::fs::read_regular_to_string_sync(&file)
+                .ok()
+                .map(|t| (base, t))
+        })
+        .collect();
+    let layers: Vec<ConfigLayer<'_>> = texts
+        .iter()
+        .map(|(base, text)| ConfigLayer { base, text })
+        .collect();
+    let under_given = |dir: PathBuf| match dir.strip_prefix(&folded) {
+        Ok(rel) => given.join(rel),
+        Err(_) => dir,
+    };
+    match source_replacement::crates_io_source(&layers) {
+        CratesIoSource::Directory(dir) => CratesIoSource::Directory(under_given(dir)),
+        CratesIoSource::LocalRegistry(dir) => CratesIoSource::LocalRegistry(under_given(dir)),
+        other => other,
+    }
+}
+
+/// `path` with each `..` removing the component before it.
+fn fold_parent_dirs(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Where cargo takes crates.io packages from for a build in `cwd`
-/// ([`source_replacement::resolve_for`]), off the runtime.
+/// ([`resolve_for`]), off the runtime.
 async fn crates_io_source(cwd: &Path) -> CratesIoSource {
     let cwd = cwd.to_path_buf();
     let cargo_home = CargoCrawler::cargo_home();
-    run_blocking(move || source_replacement::resolve_for(&cwd, cargo_home.as_deref())).await
+    run_blocking(move || resolve_for(&cwd, cargo_home.as_deref())).await
 }
 
 /// The `(name, version)` of every registry-sourced `[[package]]` in

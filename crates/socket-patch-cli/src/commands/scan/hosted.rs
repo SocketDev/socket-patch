@@ -9,7 +9,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::types::BatchPackagePatches;
-use socket_patch_core::formats::cargo::source_replacement;
+use socket_patch_core::crawlers::CargoCrawler;
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::yarnrc::resolve_outer_yarn_mirror_for_process;
 use socket_patch_core::patch::redirect::DepOverride;
@@ -1296,9 +1296,7 @@ async fn run_redirect_selected_untracked(
     // The cargo configs cargo reads for a build here (the project's, every
     // parent directory's and `$CARGO_HOME`'s): a directory source or local
     // registry in any of them refuses the cargo rewrite like a project one.
-    let cargo_outer = || {
-        source_replacement::resolve_for(&common.cwd, source_replacement::cargo_home().as_deref())
-    };
+    let cargo_outer = || CargoCrawler::crates_io_source_for(&common.cwd);
     let rewrite_options = || {
         RewriteOptions {
         dry_run: common.dry_run,

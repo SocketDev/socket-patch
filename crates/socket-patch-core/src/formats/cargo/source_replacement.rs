@@ -106,67 +106,6 @@ pub fn crates_io_source(layers: &[ConfigLayer<'_>]) -> CratesIoSource {
     }
 }
 
-/// `$CARGO_HOME`, defaulting to `$HOME/.cargo` (`None` with no home). An
-/// empty value means unset, as cargo treats it.
-pub fn cargo_home() -> Option<PathBuf> {
-    match std::env::var("CARGO_HOME") {
-        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
-        _ => crate::utils::fs::home_dir().map(|home| home.join(".cargo")),
-    }
-}
-
-/// [`crates_io_source`] for a cargo build in `cwd`, reading the config
-/// files [`config_layer_paths`] lists (an unreadable one is skipped).
-/// Blocking file reads.
-///
-/// `cwd` is taken as the logical absolute path, not the canonical one:
-/// a resolved directory is reported under it, as `<cwd>`-joined roots
-/// always were. The config walk folds `..` out of it, so `a/b/../proj`
-/// reads `a/proj`'s ancestors, not `a/b`'s; a directory under the folded
-/// cwd is reported back under the cwd as given, which path-scoped
-/// commands strip as a prefix.
-pub fn resolve_for(cwd: &Path, cargo_home: Option<&Path>) -> CratesIoSource {
-    let given = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let folded = fold_parent_dirs(&given);
-    let files = config_layer_paths(&folded, cargo_home, |p| p.is_file());
-    let texts: Vec<(PathBuf, String)> = files
-        .into_iter()
-        .filter_map(|(file, base)| {
-            crate::utils::fs::read_regular_to_string_sync(&file)
-                .ok()
-                .map(|t| (base, t))
-        })
-        .collect();
-    let layers: Vec<ConfigLayer<'_>> = texts
-        .iter()
-        .map(|(base, text)| ConfigLayer { base, text })
-        .collect();
-    let under_given = |dir: PathBuf| match dir.strip_prefix(&folded) {
-        Ok(rel) => given.join(rel),
-        Err(_) => dir,
-    };
-    match crates_io_source(&layers) {
-        CratesIoSource::Directory(dir) => CratesIoSource::Directory(under_given(dir)),
-        CratesIoSource::LocalRegistry(dir) => CratesIoSource::LocalRegistry(under_given(dir)),
-        other => other,
-    }
-}
-
-/// `path` with each `..` removing the component before it.
-fn fold_parent_dirs(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// The cargo config files cargo reads for a build in `cwd`, highest
 /// precedence first, each with its [`ConfigLayer::base`]: every ancestor's
 /// `.cargo/config` (cargo prefers the legacy extensionless file when both

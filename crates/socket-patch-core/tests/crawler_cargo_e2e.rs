@@ -1073,9 +1073,9 @@ async fn directory_source_keeps_the_given_cwd_prefix() {
 /// #455 review: the process-level resolve the hosted scan uses sees a
 /// monorepo root's source replacement from a nested Cargo project.
 #[test]
-#[serial_test::parallel]
+#[serial_test::serial]
 fn resolve_for_reads_a_monorepo_root_config() {
-    use socket_patch_core::formats::cargo::source_replacement::{resolve_for, CratesIoSource};
+    use socket_patch_core::formats::cargo::source_replacement::CratesIoSource;
     let tmp = tempfile::tempdir().unwrap();
     let rust = tmp.path().join("rust");
     std::fs::create_dir_all(&rust).unwrap();
@@ -1086,8 +1086,15 @@ fn resolve_for_reads_a_monorepo_root_config() {
     )
     .unwrap();
     let empty_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var("CARGO_HOME").ok();
+    std::env::set_var("CARGO_HOME", empty_home.path());
+    let got = CargoCrawler::crates_io_source_for(&rust);
+    match prev {
+        Some(v) => std::env::set_var("CARGO_HOME", v),
+        None => std::env::remove_var("CARGO_HOME"),
+    }
     assert_eq!(
-        resolve_for(&rust, Some(empty_home.path())),
+        got,
         CratesIoSource::Directory(std::path::absolute(tmp.path()).unwrap().join("vendor"))
     );
 }
