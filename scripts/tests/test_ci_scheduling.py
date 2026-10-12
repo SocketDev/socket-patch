@@ -152,8 +152,10 @@ class Scheduling(unittest.TestCase):
                  "e2e-build-windows", "yarn-classic-matrix", "yarn-berry-e2e",
                  "cargo-old-toolchains"}
         never_on_pr = "    if: (github.event_name != 'pull_request'"
-        v5_pr_only = ("    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group')"
-                      " || github.head_ref == 'release/v5-prerelease'")
+        # The full tier runs on a PR only as the v5 integration PR.
+        full_tier = ("    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+                     " || (github.event_name == 'push' && vars.CI_SCOPE == 'full')"
+                     " || github.head_ref == 'release/v5-prerelease'")
         for job in JOBS:
             condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
             with self.subTest(job=job):
@@ -167,8 +169,8 @@ class Scheduling(unittest.TestCase):
             with self.subTest(job=job):
                 # Ungated jobs wait on a gated build, never run on a PR, or run
                 # only on the v5 integration PR, which never reuses (below).
-                self.assertTrue(ancestors(job) & gated or condition.startswith(never_on_pr)
-                                and (condition == v5_pr_only or "head_ref" not in condition), job)
+                self.assertTrue(ancestors(job) & gated or condition == full_tier
+                                or condition.startswith(never_on_pr) and "head_ref" not in condition, job)
         clippy = "\n".join(JOBS["clippy"])
         self.assertIn("pr_unchanged: ${{ steps.pr-head.outputs.unchanged }}", clippy)
         self.assertIn("python3 scripts/ci-reuse-pr-head.py", clippy)
