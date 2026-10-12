@@ -34,7 +34,7 @@ pub const MVN_ENV: &str = "SOCKET_PATCH_MAVEN_E2E_MVN";
 pub const VERSION_ENV: &str = "SOCKET_PATCH_MAVEN_E2E_VERSION";
 pub const REQUIRED_ENV: &str = "SOCKET_PATCH_MAVEN_E2E_REQUIRED";
 
-/// What Maven 4's `CIDetector`s key on (4.0.0-rc-6 `cisupport`: generic
+/// What Maven 4's `CIDetector`s key on (4.0.0-rc-7 `cisupport`: generic
 /// `CI`, GitHub `GITHUB_ACTIONS`, CircleCI, Jenkins `WORKSPACE`, TeamCity,
 /// Travis). When one is set, Maven 4 swaps in the `QuietMavenTransferListener`
 /// even under `-B` — no "Downloading from …" lines and, crucially, no
