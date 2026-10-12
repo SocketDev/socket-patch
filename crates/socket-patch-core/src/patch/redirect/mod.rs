@@ -2617,6 +2617,15 @@ fn is_socket_patch_registry_name(value: &str) -> bool {
     generation::pin_name_uuid(value, false).is_some()
 }
 
+/// A `registry = …` value the Cargo.toml pin may overwrite in place: an
+/// earlier `socket-patch-<uuid>` pin (superseded), or `crates-io`, Cargo's
+/// built-in name for crates.io, which resolves exactly like a declaration
+/// with no `registry` key (#386). Any other name is a registry the user
+/// chose, and the dep is refused.
+fn is_repinnable_registry_name(value: &str) -> bool {
+    value == "crates-io" || is_socket_patch_registry_name(value)
+}
+
 /// The `socket-patch-<uuid>` registry name pinning `crate_name` in this
 /// manifest, in EVERY declaration shape [`plan_cargo_toml`] writes: a
 /// `[…dependencies.<key>]` header table (whose pin is a standalone
@@ -3320,7 +3329,7 @@ fn plan_cargo_toml(
                         if ws {
                             ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                         }
-                    } else if is_socket_patch_registry_name(&value) {
+                    } else if is_repinnable_registry_name(&value) {
                         let old_line = lines[line_idx];
                         let new_text = registry_val_re
                             .replace(old_line, format!("registry = \"{reg}\"").as_str())
@@ -3434,7 +3443,7 @@ fn plan_cargo_toml(
                     if workspace {
                         ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                     }
-                } else if is_socket_patch_registry_name(&value) {
+                } else if is_repinnable_registry_name(&value) {
                     let new_text = registry_val_re
                         .replace(raw, format!("registry = \"{reg}\"").as_str())
                         .into_owned();
@@ -22265,6 +22274,67 @@ packages:
             r.warnings[0].detail
         );
         assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// #386: `crates-io` is Cargo's built-in name for crates.io, so a
+    /// declaration that names it explicitly is a plain crates.io dependency.
+    /// The pin replaces the value in place (inline, table and quoted-key
+    /// spellings) instead of refusing it as another registry, and a re-run
+    /// over the rewritten manifest is a silent no-op.
+    #[test]
+    fn cargo_explicit_crates_io_registry_is_pinned_in_place() {
+        let reg = cargo_reg();
+        for (declaration, expected) in [
+            (
+                "[dependencies]\nserde = { version = \"1.0.190\", registry = \"crates-io\" }\n"
+                    .to_string(),
+                format!("[dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{reg}\" }}\n"),
+            ),
+            (
+                "[dependencies]\nserde = { registry = 'crates-io', version = \"1.0.190\" } # explicit\n"
+                    .to_string(),
+                format!("[dependencies]\nserde = {{ registry = \"{reg}\", version = \"1.0.190\" }} # explicit\n"),
+            ),
+            (
+                "[dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"crates-io\"\n".to_string(),
+                format!("[dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"{reg}\"\n"),
+            ),
+            (
+                "[dependencies.alias]\npackage = \"serde\"\nversion = \"1.0.190\"\n\"registry\" = \"crates-io\"\n"
+                    .to_string(),
+                format!("[dependencies.alias]\npackage = \"serde\"\nversion = \"1.0.190\"\nregistry = \"{reg}\"\n"),
+            ),
+        ] {
+            let manifest = format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{declaration}");
+            let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "{declaration}: {:?}", r.warnings);
+            let toml = r.files.get("Cargo.toml").expect("manifest pinned");
+            assert!(
+                toml.ends_with(&expected),
+                "{declaration}: crates-io must be replaced in place:\n{toml}"
+            );
+            assert!(!toml.contains("crates-io\""), "{toml}");
+            assert_eq!(cargo_socket_registry_pin(toml, "serde"), Some(reg.clone()));
+            assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+            let toml_edits: Vec<_> = r.edits.iter().filter(|e| e.path == "Cargo.toml").collect();
+            assert_eq!(toml_edits.len(), 1, "{:?}", r.edits);
+            assert!(
+                toml_edits[0]
+                    .original
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("crates-io")),
+                "the edit's original records the crates-io spelling: {:?}",
+                toml_edits[0]
+            );
+
+            let mut rerun_files = cargo_files(&manifest);
+            rerun_files.extend(r.files);
+            let rerun = rewrite_registry_redirect(&rerun_files, &[cargo_sparse_override()]);
+            assert!(rerun.files.is_empty(), "{:?}", rerun.files.keys());
+            assert!(rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+            assert!(rerun.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
     }
 
     /// The TABLE-FORM twins of the inline-table registry matrix: an existing
