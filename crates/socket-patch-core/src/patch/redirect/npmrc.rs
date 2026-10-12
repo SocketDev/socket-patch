@@ -778,6 +778,14 @@ pub fn plan_npmrc_allow_remote_with(existing: Option<&str>, outer: &OuterAllowRe
         .iter()
         .rposition(|l| !l.trim().is_empty())
         .map_or(0, |i| i + 1);
+    if anchor == lines.len() {
+        // The anchor follows an unterminated last line (#1196): terminate
+        // it in the file's style and keep the no-final-newline shape,
+        // rather than letting the join give it a bare LF and leave the
+        // inserted line's CR dangling at end of file.
+        let term = if crlf { "\r\n" } else { "\n" };
+        return NpmrcPlan::Append(format!("{bom}{body}{term}{NPMRC_ALLOW_REMOTE_LINE}"));
+    }
     lines.insert(anchor, &line);
     NpmrcPlan::Append(format!("{bom}{}", lines.join("\n")))
 }
@@ -967,6 +975,37 @@ mod tests {
                 panic!("append expected for {existing:?}");
             };
             assert_eq!(text, want, "{existing:?}");
+        }
+    }
+
+    /// A last line with no terminator gets the file's terminator before
+    /// the appended line, which keeps the no-final-newline shape (#1196).
+    /// The old splice gave CRLF files `…\nallow-remote=all\r`: a bare LF
+    /// on the old last line and a lone CR at end of file.
+    #[test]
+    fn append_after_an_unterminated_last_line_keeps_its_terminator() {
+        for (existing, want) in [
+            (
+                "fund=false\r\naudit=false",
+                "fund=false\r\naudit=false\r\nallow-remote=all",
+            ),
+            (
+                "\u{feff}fund=false\r\naudit=false",
+                "\u{feff}fund=false\r\naudit=false\r\nallow-remote=all",
+            ),
+            (
+                "fund=false\naudit=false",
+                "fund=false\naudit=false\nallow-remote=all",
+            ),
+            ("a=1", "a=1\nallow-remote=all"),
+        ] {
+            let NpmrcPlan::Append(text) = plan_npmrc_allow_remote(Some(existing)) else {
+                panic!("append expected for {existing:?}");
+            };
+            assert_eq!(text, want, "{existing:?}");
+            assert!(!has_lone_cr(&text), "{text:?}");
+            // The result is stable: a re-plan sees the line it wrote.
+            assert_eq!(plan_npmrc_allow_remote(Some(&text)), NpmrcPlan::AlreadyAll);
         }
     }
 
