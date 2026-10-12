@@ -1031,9 +1031,10 @@ async fn materialise_patched_copy(
 /// block, splice the lock's spec block back into GEM specs (sorted), the
 /// original DEPENDENCIES entry back in and the registry CHECKSUMS line back
 /// over the bare path form, then remove the validated uuid dir.
-/// Each fragment that no longer looks like what vendor wrote — a hand edit, a
-/// `bundle update`, a newer vendor run — is left alone with a
-/// `vendor_lock_entry_drifted` warning.
+/// A fragment that no longer looks like what vendor wrote — a hand edit, a
+/// `bundle update`, a newer vendor run — gets a `vendor_lock_entry_drifted`
+/// warning, and then neither file is written: the Gemfile and the lock are
+/// reverted together or not at all (#988).
 pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool) -> RevertOutcome {
     revert_gem_opts(entry, project_root, RevertOpts::new(dry_run)).await
 }
@@ -1055,7 +1056,6 @@ pub async fn revert_gem_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
-    let dry_run = opts.dry_run;
     // SECURITY: state.json is committed and tamper-able; the uuid keys the
     // directory we are about to delete. Anything but the canonical uuid
     // grammar is rejected fail-closed before any disk access.
@@ -1094,18 +1094,18 @@ pub async fn revert_gem_opts(
     }
 
     // Wiring is restored in reverse application order: lock first, Gemfile
-    // last (the mirror image of vendor's Gemfile-then-lock).
+    // last (the mirror image of vendor's Gemfile-then-lock). Every record is
+    // planned against in-memory text first and nothing is written unless
+    // none drifted: the Gemfile `path:` and the lock's PATH section must
+    // move together, or bundler refuses the pair on every frozen install
+    // (#988).
+    let mut files = RevertFiles::new(project_root);
+    let mut drifted = false;
     for w in entry.wiring.iter().rev() {
         let restored = match w.kind.as_str() {
-            LOCK_WIRING_KIND => {
-                revert_lock_record(&project_root.join(GEMFILE_LOCK), w, dry_run).await
-            }
-            LOCK_CHECKSUM_WIRING_KIND => {
-                revert_lock_checksum_record(&project_root.join(GEMFILE_LOCK), w, dry_run).await
-            }
-            GEMFILE_WIRING_KIND => {
-                revert_gemfile_record(&project_root.join(GEMFILE), w, dry_run).await
-            }
+            LOCK_WIRING_KIND => revert_lock_record(&mut files, w).await,
+            LOCK_CHECKSUM_WIRING_KIND => revert_lock_checksum_record(&mut files, w).await,
+            GEMFILE_WIRING_KIND => revert_gemfile_record(&mut files, w).await,
             _ => {
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
@@ -1117,13 +1117,16 @@ pub async fn revert_gem_opts(
         let key = w.key.as_deref().unwrap_or("<unknown>");
         match restored {
             Ok(RecordRevert::Done) => {}
-            Ok(RecordRevert::Drifted) => warnings.push(VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!(
-                    "{} no longer carries what vendor wrote for {key}; left alone",
-                    w.file
-                ),
-            )),
+            Ok(RecordRevert::Drifted) => {
+                drifted = true;
+                warnings.push(VendorWarning::new(
+                    "vendor_lock_entry_drifted",
+                    format!(
+                        "{} no longer carries what vendor wrote for {key}; left alone",
+                        w.file
+                    ),
+                ));
+            }
             // A missing wired file cannot still route through the copy dir:
             // reported, but not drift — the artifact may still be removed.
             Ok(RecordRevert::FileMissing) => warnings.push(VendorWarning::new(
@@ -1147,6 +1150,18 @@ pub async fn revert_gem_opts(
         warnings,
         error: None,
     };
+    // All-or-nothing: a drifted record leaves every file as found. A record
+    // of a kind this build cannot read still lets the known ones restore
+    // (forward compatibility); its warning keeps the artifact below.
+    if !drifted && !opts.dry_run {
+        if let Err(e) = files.write_changed().await {
+            return RevertOutcome {
+                success: false,
+                error: Some(e),
+                ..outcome
+            };
+        }
+    }
     // Drift-keep (see the fn doc): never delete a copy dir a left-alone
     // record may still reference.
     revert::finish(
@@ -2099,17 +2114,94 @@ enum RecordRevert {
     FileMissing,
 }
 
+/// The Gemfile and Gemfile.lock as one revert sees them: read on first
+/// use, edited in memory, and written back only by
+/// [`RevertFiles::write_changed`], which [`revert_gem_opts`] skips when any
+/// record drifted. So a revert never leaves the lock restored while the
+/// Gemfile still names the `path:` copy, or the other way round.
+struct RevertFiles<'a> {
+    root: &'a Path,
+    lock: Option<RevertFile>,
+    gemfile: Option<RevertFile>,
+}
+
+struct RevertFile {
+    /// `None`: the file does not exist.
+    text: Option<String>,
+    changed: bool,
+}
+
+impl<'a> RevertFiles<'a> {
+    fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            lock: None,
+            gemfile: None,
+        }
+    }
+
+    /// The text of `name` (`GEMFILE` or `GEMFILE_LOCK`), reading it on
+    /// first use; `Ok(None)` when it does not exist.
+    async fn text(&mut self, name: &str) -> Result<Option<&mut RevertFile>, String> {
+        let root = self.root;
+        let slot = if name == GEMFILE {
+            &mut self.gemfile
+        } else {
+            &mut self.lock
+        };
+        if slot.is_none() {
+            let text = match read_regular_to_string(&root.join(name)).await {
+                Ok(t) => Some(t),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("unreadable {name}: {e}")),
+            };
+            *slot = Some(RevertFile {
+                text,
+                changed: false,
+            });
+        }
+        let file = slot.as_mut().expect("just filled");
+        Ok(file.text.is_some().then_some(file))
+    }
+
+    /// Write every edited file, lock first.
+    async fn write_changed(&self) -> Result<(), String> {
+        for (name, file) in [(GEMFILE_LOCK, &self.lock), (GEMFILE, &self.gemfile)] {
+            let Some(RevertFile {
+                text: Some(text),
+                changed: true,
+            }) = file
+            else {
+                continue;
+            };
+            atomic_write_bytes_preserving_mode(&self.root.join(name), text.as_bytes())
+                .await
+                .map_err(|e| format!("failed to write {name}: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl RevertFile {
+    fn text(&self) -> &str {
+        self.text.as_deref().unwrap_or_default()
+    }
+
+    fn set(&mut self, text: String) {
+        self.text = Some(text);
+        self.changed = true;
+    }
+}
+
 /// Restore one `gemfile_line` record.
 async fn revert_gemfile_record(
-    gemfile_path: &Path,
+    files: &mut RevertFiles<'_>,
     w: &WiringRecord,
-    dry_run: bool,
 ) -> Result<RecordRevert, String> {
-    let text = match read_regular_to_string(gemfile_path).await {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RecordRevert::FileMissing),
-        Err(e) => return Err(format!("unreadable Gemfile: {e}")),
+    let Some(file) = files.text(GEMFILE).await? else {
+        return Ok(RecordRevert::FileMissing);
     };
+    let text = file.text();
     let Some(written) = w.new.as_ref().and_then(Value::as_str) else {
         return Ok(RecordRevert::Drifted);
     };
@@ -2119,7 +2211,7 @@ async fn revert_gemfile_record(
                 return Ok(RecordRevert::Drifted);
             };
             let mut lines: Vec<&str> = text.split('\n').collect();
-            let Some(i) = lines.iter().position(|l| *l == written) else {
+            let Some(i) = find_wired_gemfile_line(&lines, written) else {
                 // ALREADY CONVERGED: the pre-vendor line is back (a hand
                 // restore, a `bundle update` regeneration, an earlier partial
                 // revert) — not drift, nothing to write.
@@ -2129,7 +2221,8 @@ async fn revert_gemfile_record(
                     RecordRevert::Drifted
                 });
             };
-            lines[i] = original;
+            let line = restore_gemfile_line(lines[i], written, original);
+            lines[i] = &line;
             lines.join("\n")
         }
         WiringAction::Added => {
@@ -2144,20 +2237,65 @@ async fn revert_gemfile_record(
             out
         }
     };
-    if !dry_run {
-        atomic_write_bytes_preserving_mode(gemfile_path, restored.as_bytes())
-            .await
-            .map_err(|e| format!("failed to write Gemfile: {e}"))?;
-    }
+    file.set(restored);
     Ok(RecordRevert::Done)
+}
+
+/// The index of the Gemfile line carrying the `written` wiring: the exact
+/// line, or else the one top-level `gem "<name>"` declaration whose `path:`
+/// still names the same vendored copy (a comment the user added or edited,
+/// or reformatted options). Vendor's in-sync check reads such a line as
+/// wired, so revert must too (#988). `None` when no line, or more than one,
+/// matches.
+fn find_wired_gemfile_line(lines: &[&str], written: &str) -> Option<usize> {
+    if let Some(i) = lines.iter().position(|l| *l == written) {
+        return Some(i);
+    }
+    let ours = gem_declaration_any(written)?;
+    let copy = gem_line_path_value(ours.rest)?;
+    let mut hits = lines.iter().enumerate().filter(|(_, l)| {
+        gem_declaration(l, ours.name)
+            .is_some_and(|d| !d.paren && gem_line_path_value(d.rest) == Some(copy))
+    });
+    let (i, _) = hits.next()?;
+    hits.next().is_none().then_some(i)
+}
+
+/// The pre-vendor `original` line to put back over `live`, the wired line
+/// as found. When the user changed the trailing comment vendor wrote, their
+/// comment (and the spacing before it) replaces the original's, so a note
+/// like `# CVE fix, do not bump` survives the revert. A CR line ending is
+/// the original's.
+fn restore_gemfile_line(live: &str, written: &str, original: &str) -> String {
+    let (live_code, live_comment) = split_line_comment(live);
+    let (_, written_comment) = split_line_comment(written);
+    if live == written || live_comment.trim() == written_comment.trim() {
+        return original.to_string();
+    }
+    let (original_code, _) = split_line_comment(original);
+    let cr = if original.ends_with('\r') { "\r" } else { "" };
+    let live_body = live.strip_suffix('\r').unwrap_or(live);
+    let suffix = &live_body[live_code.trim_end().len()..];
+    if suffix.trim().is_empty() {
+        format!("{}{cr}", original_code.trim_end())
+    } else {
+        format!("{}{suffix}{cr}", original_code.trim_end())
+    }
+}
+
+/// A Gemfile line split into its code and its trailing `#` comment (empty
+/// when it has none), outside quotes; a CR line ending belongs to neither.
+fn split_line_comment(line: &str) -> (&str, &str) {
+    let body = line.strip_suffix('\r').unwrap_or(line);
+    let code = gemfile::code_of(body).unwrap_or(body);
+    (code, &body[code.len()..])
 }
 
 /// Restore one `gemfile_lock_spec` record. Drift leaves the lock alone in
 /// full — a partial splice would corrupt it.
 async fn revert_lock_record(
-    lock_path: &Path,
+    files: &mut RevertFiles<'_>,
     w: &WiringRecord,
-    dry_run: bool,
 ) -> Result<RecordRevert, String> {
     let Some(original_lines) = wiring_string_array(w.original.as_ref()) else {
         return Ok(RecordRevert::Drifted);
@@ -2165,28 +2303,23 @@ async fn revert_lock_record(
     let Some(new_lines) = wiring_string_array(w.new.as_ref()) else {
         return Ok(RecordRevert::Drifted);
     };
-    let text = match read_regular_to_string(lock_path).await {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RecordRevert::FileMissing),
-        Err(e) => return Err(format!("unreadable Gemfile.lock: {e}")),
+    let Some(file) = files.text(GEMFILE_LOCK).await? else {
+        return Ok(RecordRevert::FileMissing);
     };
-    let Some(restored) = revert_lock_text(&text, &original_lines, &new_lines) else {
+    let text = file.text();
+    let Some(restored) = revert_lock_text(text, &original_lines, &new_lines) else {
         // ALREADY CONVERGED: our PATH section is gone and every pre-vendor
         // spec line is back in GEM/specs (a `bundle update` regeneration or
         // an earlier partial revert) — not drift, nothing to write.
         return Ok(
-            if lock_record_converged(&text, &original_lines, &new_lines) {
+            if lock_record_converged(text, &original_lines, &new_lines) {
                 RecordRevert::Done
             } else {
                 RecordRevert::Drifted
             },
         );
     };
-    if !dry_run {
-        atomic_write_bytes_preserving_mode(lock_path, restored.as_bytes())
-            .await
-            .map_err(|e| format!("failed to write Gemfile.lock: {e}"))?;
-    }
+    file.set(restored);
     Ok(RecordRevert::Done)
 }
 
@@ -2234,21 +2367,20 @@ fn wiring_string_array(v: Option<&Value>) -> Option<Vec<String>> {
 /// The line vendor wrote being gone is drift — unless the registry line it
 /// replaced is already back (convergence), left alone either way.
 async fn revert_lock_checksum_record(
-    lock_path: &Path,
+    files: &mut RevertFiles<'_>,
     w: &WiringRecord,
-    dry_run: bool,
 ) -> Result<RecordRevert, String> {
     let Some(written) = w.new.as_ref().and_then(Value::as_str) else {
         return Ok(RecordRevert::Drifted);
     };
-    let text = match read_regular_to_string(lock_path).await {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RecordRevert::FileMissing),
-        Err(e) => return Err(format!("unreadable Gemfile.lock: {e}")),
+    let Some(file) = files.text(GEMFILE_LOCK).await? else {
+        return Ok(RecordRevert::FileMissing);
     };
-    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    let mut lines: Vec<String> = file.text().split('\n').map(str::to_string).collect();
     let Some((ck_start, ck_end)) = section_span(&lines, "CHECKSUMS") else {
-        return Ok(RecordRevert::Drifted);
+        // ALREADY CONVERGED: a lock without a CHECKSUMS section carries no
+        // checksum for the gem at all, so there is no line left to restore.
+        return Ok(RecordRevert::Done);
     };
     let original = w.original.as_ref().and_then(Value::as_str);
     let Some(i) = (ck_start + 1..ck_end).find(|&i| lines[i] == written) else {
@@ -2271,11 +2403,7 @@ async fn revert_lock_checksum_record(
         return Ok(RecordRevert::Done);
     };
     lines[i] = original.to_string();
-    if !dry_run {
-        atomic_write_bytes_preserving_mode(lock_path, lines.join("\n").as_bytes())
-            .await
-            .map_err(|e| format!("failed to write Gemfile.lock: {e}"))?;
-    }
+    file.set(lines.join("\n"));
     Ok(RecordRevert::Done)
 }
 
@@ -3623,7 +3751,11 @@ mod tests {
 
             let outcome = revert_gem(&entry, &root, false).await;
             assert!(outcome.success, "{edit:?}: {:?}", outcome.error);
-            assert!(outcome.warnings.is_empty(), "{edit:?}: {:?}", outcome.warnings);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{edit:?}: {:?}",
+                outcome.warnings
+            );
             assert_eq!(
                 tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
                 gemfile.replace(
@@ -3642,8 +3774,8 @@ mod tests {
         }
     }
 
-    /// #988: a CRLF Gemfile whose wired line gained a comment restores with
-    /// its CRLF ending intact.
+    /// #988: a CRLF Gemfile whose wired line gained a comment restores the
+    /// original line's CRLF ending.
     #[tokio::test]
     async fn revert_commented_gemfile_line_keeps_crlf() {
         let gemfile = GEMFILE_DIRECT.replace('\n', "\r\n");
@@ -3653,12 +3785,11 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         let entry = entry.unwrap();
         let wired = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
-        let wired_line = format!("gem \"rack\", \"3.2.6\", path: \"{}\"\r\n", copy_rel());
+        // The forward rewrite writes the wired line with a bare LF (a
+        // separate line-ending gap); revert restores the original's CRLF.
+        let wired_line = format!("gem \"rack\", \"3.2.6\", path: \"{}\"\n", copy_rel());
         assert!(wired.contains(&wired_line), "{wired:?}");
-        let annotated = wired.replace(
-            &wired_line,
-            &wired_line.replace("\r\n", " # keep\r\n"),
-        );
+        let annotated = wired.replace(&wired_line, &wired_line.replace('\n', " # keep\n"));
         tokio::fs::write(root.join(GEMFILE), &annotated)
             .await
             .unwrap();
@@ -3706,7 +3837,11 @@ mod tests {
         for pass in 0..2 {
             let outcome = revert_gem(&entry, &root, false).await;
             assert!(outcome.success, "pass {pass}: {:?}", outcome.error);
-            assert!(outcome.drift_skipped(), "pass {pass}: {:?}", outcome.warnings);
+            assert!(
+                outcome.drift_skipped(),
+                "pass {pass}: {:?}",
+                outcome.warnings
+            );
             assert!(outcome.kept_artifact, "pass {pass}");
             assert_eq!(
                 tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -4215,8 +4350,9 @@ mod tests {
 
         // Third-party drift on ONLY the checksum line (someone hand-restored
         // a token): revert must leave that line alone with a warning, never
-        // clobber it, while the other records still restore cleanly.
+        // clobber it, and writes nothing else either (#988: all-or-nothing).
         let drifted_line = "  rack (3.1.8) sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let wired_gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
         let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
             .await
             .unwrap();
@@ -4254,12 +4390,13 @@ mod tests {
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
                 .await
                 .unwrap(),
-            SPIKE_LOCK_CHECKSUMS_BEFORE.replace(SPIKE_RACK_SHA_LINE, drifted_line),
-            "everything else restored; the drifted checksum line preserved verbatim"
+            edited,
+            "the lock is left exactly as found, drifted checksum line included"
         );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
-            SPIKE_GEMFILE_CHECKSUMS
+            wired_gemfile,
+            "the Gemfile keeps its `path:` wiring alongside the unreverted lock"
         );
     }
 
@@ -6944,10 +7081,11 @@ mod tests {
     }
 
     /// The lock lost the `!` dep pin: the spec record's precondition fails →
-    /// that record drifts (left alone in FULL — no partial splice) while the
-    /// checksum record and Gemfile still restore.
+    /// that record drifts and the whole revert writes nothing (#988). Before,
+    /// the checksum record and the Gemfile still restored, pairing a
+    /// registry Gemfile line with a lock that keeps the PATH section.
     #[tokio::test]
-    async fn revert_missing_dep_pin_leaves_lock_spec_alone() {
+    async fn revert_missing_dep_pin_leaves_both_files_alone() {
         let (_tmp, root, installed, blobs, record) =
             fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
         let (r1, e1, _) =
@@ -6957,6 +7095,7 @@ mod tests {
         let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
             .await
             .unwrap();
+        let wired_gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
         let no_pin = wired.replace("DEPENDENCIES\n  rack (= 3.1.8)!\n", "DEPENDENCIES\n");
         assert_ne!(no_pin, wired, "fixture edit must hit the pin");
         tokio::fs::write(root.join(GEMFILE_LOCK), &no_pin)
@@ -6979,23 +7118,23 @@ mod tests {
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
                 .await
                 .unwrap(),
-            no_pin.replace(
-                "CHECKSUMS\n  rack (3.1.8)\n",
-                &format!("CHECKSUMS\n{SPIKE_RACK_SHA_LINE}\n")
-            ),
-            "checksum restored; the drifted spec fragment left alone in full"
+            no_pin,
+            "the lock is left exactly as found"
         );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
-            SPIKE_GEMFILE_CHECKSUMS,
-            "Gemfile still restored"
+            wired_gemfile,
+            "the Gemfile keeps its `path:` while the lock keeps its PATH section"
         );
     }
 
-    /// The whole CHECKSUMS section is gone: only the checksum record drifts;
-    /// the spec splice and Gemfile restore normally.
+    /// The whole CHECKSUMS section is gone: a lock without one carries no
+    /// checksum for the gem, which is a valid registry lock, so the checksum
+    /// record has converged. The spec splice and Gemfile restore normally
+    /// and the artifact goes (with an all-or-nothing revert, calling this
+    /// drift would wedge the entry until the user re-added the section).
     #[tokio::test]
-    async fn revert_checksums_section_gone_drifts_only_checksum_record() {
+    async fn revert_checksums_section_gone_is_converged() {
         let (_tmp, root, installed, blobs, record) =
             fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
         let (r1, e1, _) =
@@ -7018,7 +7157,9 @@ mod tests {
             .iter()
             .filter(|w| w.code == "vendor_lock_entry_drifted")
             .count();
-        assert_eq!(drift, 1, "{:?}", outcome.warnings);
+        assert_eq!(drift, 0, "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact);
+        assert!(!root.join(copy_rel_318()).exists());
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
                 .await
@@ -7628,10 +7769,11 @@ mod tests {
     /// block artifact removal.
     #[tokio::test]
     async fn revert_gemfile_record_unreadable_gemfile_is_an_error() {
-        // The tempdir itself squats the Gemfile path: a directory is
-        // readable-as-path but not a regular file, so the guarded read
-        // errors with a non-NotFound kind.
+        // A directory squats the Gemfile path: it is readable-as-path but
+        // not a regular file, so the guarded read errors with a non-NotFound
+        // kind.
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(GEMFILE)).unwrap();
         let w = WiringRecord {
             file: GEMFILE.to_string(),
             kind: GEMFILE_WIRING_KIND.to_string(),
@@ -7643,7 +7785,7 @@ mod tests {
                 copy_rel()
             ))),
         };
-        let err = revert_gemfile_record(dir.path(), &w, true)
+        let err = revert_gemfile_record(&mut RevertFiles::new(dir.path()), &w)
             .await
             .expect_err("a directory squatting the Gemfile path must error");
         assert!(err.contains("unreadable Gemfile"), "{err}");
@@ -7655,6 +7797,7 @@ mod tests {
     #[tokio::test]
     async fn revert_lock_record_non_array_new_is_drift_before_reading() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(GEMFILE_LOCK)).unwrap();
         let w = WiringRecord {
             file: GEMFILE_LOCK.to_string(),
             kind: LOCK_WIRING_KIND.to_string(),
@@ -7663,7 +7806,9 @@ mod tests {
             original: Some(serde_json::json!(["    rack (3.2.6)"])),
             new: Some(Value::String("not-an-array".to_string())),
         };
-        let restored = revert_lock_record(dir.path(), &w, true).await.unwrap();
+        let restored = revert_lock_record(&mut RevertFiles::new(dir.path()), &w)
+            .await
+            .unwrap();
         assert_eq!(
             restored,
             RecordRevert::Drifted,
