@@ -9,7 +9,6 @@
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::Digest;
 use wiremock::matchers::{method, path};
@@ -55,7 +54,7 @@ mod vex_e2e_common;
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic_command};
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -184,10 +183,10 @@ async fn mount_patch_api(mock: &MockServer, uuid: &str) {
 /// Spawn the built binary in `root` with `extra_env` injected into the
 /// child environment.
 fn run_cli_env(root: &Path, argv: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(argv).current_dir(root);
-    // Scrub the ambient `SOCKET_*` surface (prefix scrub — fixed lists rot)
-    // so a developer's shell can't steer the child, then force the telemetry
+    // The hermetic builder scrubs the ambient `SOCKET_*` surface so a
+    // developer's shell can't steer the child, and forces the telemetry
     // kill-switch: telemetry resolves its endpoint from `SOCKET_API_URL` /
     // `SOCKET_PROXY_URL` env ONLY (`--api-url` is invisible to it), so an
     // ambient value would send every run's events to the LIVE API with the
@@ -195,14 +194,6 @@ fn run_cli_env(root: &Path, argv: &[&str], extra_env: &[(&str, &str)]) -> (i32, 
     // injections survive the scrub —
     // `scan_vendor_emits_no_telemetry_even_with_endpoint_env` seeds those
     // endpoint vars deliberately and proves the kill-switch still holds.
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -744,7 +735,7 @@ async fn scan_vendor_fetch_failure_reports_error() {
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
 
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "scan",
             "--mode",
@@ -758,7 +749,6 @@ async fn scan_vendor_fetch_failure_reports_error() {
             ORG_SLUG,
         ])
         .current_dir(tmp.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
@@ -795,9 +785,8 @@ async fn scan_mode_sync_conflicts_are_usage_errors() {
         &["scan", "--mode", "vendored", "--sync"][..],
         &["scan", "--mode", "hosted", "--sync"][..],
     ] {
-        let out = Command::new(binary())
+        let out = hermetic_command(&binary())
             .args(argv)
-            .env("SOCKET_TELEMETRY_DISABLED", "1")
             .output()
             .expect("run");
         let code = out.status.code().unwrap_or(-1);
@@ -1105,7 +1094,7 @@ async fn scan_prune_reverts_unused_vendored_entry() {
 
     // Plain prune scan (read-only discovery + GC; no --mode vendored, no --mode agent).
     let run_prune = || {
-        let out = Command::new(binary())
+        let out = hermetic_command(&binary())
             .args([
                 "scan",
                 "--json",
@@ -1234,7 +1223,7 @@ async fn scan_prune_reverts_vendored_entry_after_version_upgrade() {
     )
     .unwrap();
 
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "scan",
             "--json",
@@ -1456,7 +1445,7 @@ async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
     )
     .unwrap();
 
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "scan",
             "--mode",
@@ -1617,11 +1606,10 @@ fn run_vendor(root: &Path, extra: &[&str]) -> (i32, serde_json::Value, String) {
     let mut argv = vec!["vendor", "--json"];
     argv.extend_from_slice(extra);
     let fixture = prebuilt_common::Server::project(root);
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .env("SOCKET_VENDOR_URL", &fixture.uri)
         .args(&argv)
         .current_dir(root)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run vendor");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -1735,7 +1723,7 @@ async fn vendor_auto_takes_a_missing_package_from_the_service_without_the_regist
     );
     seed_manifest_and_blob(tmp.path());
     let vendor = |extra: &[&str]| {
-        let mut cmd = Command::new(binary());
+        let mut cmd = hermetic_command(&binary());
         cmd.args([
             "vendor",
             "--json",
@@ -1750,12 +1738,7 @@ async fn vendor_auto_takes_a_missing_package_from_the_service_without_the_regist
         ])
         .args(extra)
         .current_dir(tmp.path());
-        for (key, _) in std::env::vars() {
-            if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-                cmd.env_remove(key);
-            }
-        }
-        let out = cmd.env("SOCKET_TELEMETRY_DISABLED", "1").output().unwrap();
+        let out = cmd.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         let v: serde_json::Value = serde_json::from_str(stdout.trim())
             .unwrap_or_else(|e| panic!("{e}: {stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
@@ -1944,7 +1927,7 @@ async fn scan_discovers_lockfile_only_packages_with_warning() {
     );
 
     // JSON shape.
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "scan",
             "--json",
@@ -1956,7 +1939,6 @@ async fn scan_discovers_lockfile_only_packages_with_warning() {
             ORG_SLUG,
         ])
         .current_dir(tmp.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1966,7 +1948,7 @@ async fn scan_discovers_lockfile_only_packages_with_warning() {
     assert_eq!(v["packages"][0]["notInstalled"], true, "{v}");
 
     // Human output: the table marker + the note.
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "scan",
             "--api-url",
@@ -1979,7 +1961,6 @@ async fn scan_discovers_lockfile_only_packages_with_warning() {
             "--yes",
         ])
         .current_dir(tmp.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2080,7 +2061,7 @@ async fn scan_flags_scoped_lockfile_only_package_despite_api_purl_encoding() {
 
     // JSON: the additive notInstalled flag must be set even though the
     // API spelled the purl percent-encoded.
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "scan",
             "--json",
@@ -2092,7 +2073,6 @@ async fn scan_flags_scoped_lockfile_only_package_despite_api_purl_encoding() {
             ORG_SLUG,
         ])
         .current_dir(tmp.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2106,7 +2086,7 @@ async fn scan_flags_scoped_lockfile_only_package_despite_api_purl_encoding() {
 
     // Human table: the [NOT INSTALLED] marker must match through the
     // encoding difference too.
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "scan",
             "--api-url",
@@ -2119,7 +2099,6 @@ async fn scan_flags_scoped_lockfile_only_package_despite_api_purl_encoding() {
             "--yes",
         ])
         .current_dir(tmp.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2143,7 +2122,7 @@ async fn scan_apply_skips_lockfile_only_without_error() {
         &sri_of(b"unused"),
     );
 
-    let out = Command::new(binary())
+    let out = hermetic_command(&binary())
         .args([
             "scan",
             "--json",
@@ -2158,7 +2137,6 @@ async fn scan_apply_skips_lockfile_only_without_error() {
             ORG_SLUG,
         ])
         .current_dir(tmp.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .output()
         .expect("run");
     let stdout = String::from_utf8_lossy(&out.stdout);

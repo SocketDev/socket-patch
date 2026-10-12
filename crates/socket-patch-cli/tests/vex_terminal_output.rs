@@ -1,8 +1,11 @@
 //! Terminal-output contract for the standalone `vex` command: what a human
 //! (and a `--json` consumer) sees for dry runs, `-O -`, stale-document
 //! cleanup, omission reporting and flag typos. Fixtures are self-contained
-//! tempdir projects driven through the built binary with a scrubbed
+//! tempdir projects driven through the built binary with the hermetic
 //! `SOCKET_*` environment (the parent env is never mutated).
+
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,14 +19,7 @@ use socket_patch_core::manifest::schema::{
 const STALE_OPENVEX_DOC: &str = r#"{"@context":"https://openvex.dev/ns/v0.2.0","@id":"urn:uuid:stale","author":"Socket","timestamp":"2020-01-01T00:00:00Z","version":1,"statements":[]}"#;
 
 fn cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
-    cmd
+    hermetic::binary_command()
 }
 
 fn record(uuid: &str, ghsa: &str) -> PatchRecord {

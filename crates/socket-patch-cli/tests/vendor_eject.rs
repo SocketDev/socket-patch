@@ -15,12 +15,13 @@
 
 #[path = "common/envelope.rs"]
 mod envelope;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 use envelope::find_event;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -75,19 +76,13 @@ impl Project {
     /// Run the binary against the mocks with every ambient `SOCKET_*` var
     /// scrubbed.
     fn run(&self, args: &[&str]) -> (i32, String, String) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        let mut cmd = hermetic::binary_command();
         cmd.args(args)
             .arg("--cwd")
             .arg(self.root())
             .current_dir(self.root());
-        for (key, _) in std::env::vars() {
-            if key.starts_with("SOCKET_") {
-                cmd.env_remove(key);
-            }
-        }
         let uri = self.server.uri();
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-            .env("SOCKET_API_URL", &uri)
+        cmd.env("SOCKET_API_URL", &uri)
             .env("SOCKET_API_TOKEN", "fake-token")
             .env("SOCKET_ORG_SLUG", ORG)
             .env("SOCKET_NPM_REGISTRY", &uri)

@@ -7,6 +7,8 @@
 //! from the registry (verified against that checksum) instead of requiring
 //! an installed tree. Every registry and API endpoint is a wiremock.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -109,16 +111,10 @@ fn run_json_with(
 fn command(root: &Path, server: &MockServer, extra: &[(&str, String)]) -> Command {
     let cargo_home = root.join("../cargo-home");
     std::fs::create_dir_all(&cargo_home).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
     let uri = server.uri();
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_API_URL", &uri)
+    cmd.env("SOCKET_API_URL", &uri)
         .env("SOCKET_API_TOKEN", "fake-token")
         .env("SOCKET_ORG_SLUG", ORG)
         .env("SOCKET_NPM_REGISTRY", &uri)

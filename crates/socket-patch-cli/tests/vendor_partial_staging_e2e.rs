@@ -1,11 +1,12 @@
 //! Vendoring consumes immutable service artifacts without downloading patch blobs.
 #[path = "common/envelope.rs"]
 mod envelope;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 use envelope::events;
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{json, Value};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -160,7 +161,7 @@ fn tgz_members(tgz: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 }
 
 fn vendor_cli_with_source(root: &Path, api_url: &str, source: &str) -> (i32, Value, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args([
         "vendor",
         "--json",
@@ -174,12 +175,6 @@ fn vendor_cli_with_source(root: &Path, api_url: &str, source: &str) -> (i32, Val
         ORG,
     ])
     .current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("spawn socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -240,7 +235,7 @@ async fn mount_discovery(server: &MockServer) {
 }
 
 fn scan_vendored_cli(root: &Path, api_url: &str) -> (i32, Value, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args([
         "scan",
         "--json",
@@ -257,12 +252,6 @@ fn scan_vendored_cli(root: &Path, api_url: &str) -> (i32, Value, String) {
         ORG,
     ])
     .current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("spawn socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -394,7 +383,7 @@ async fn local_build_source_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     fixture(tmp.path());
     let before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let out = hermetic::binary_command()
         .current_dir(tmp.path())
         .args([
             "vendor",

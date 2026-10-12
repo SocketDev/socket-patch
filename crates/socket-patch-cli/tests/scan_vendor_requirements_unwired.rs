@@ -13,8 +13,10 @@
 //! package name is a fixture no interpreter on the machine has installed
 //! (a crawled install would bypass the supplement).
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -98,10 +100,9 @@ fn run_scan_vendored(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, serde
         mock_uri,
     ];
     argv.extend_from_slice(extra);
-    let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let out = hermetic::binary_command()
         .args(&argv)
         .current_dir(root)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env_remove("VIRTUAL_ENV")
         .env_remove("CONDA_PREFIX")
         .output()
@@ -259,7 +260,7 @@ async fn human_prune_reverts_unwired_entry_when_no_package_is_patched() {
     )
     .unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let out = hermetic::binary_command()
         .args([
             "scan",
             "--mode",
@@ -278,7 +279,6 @@ async fn human_prune_reverts_unwired_entry_when_no_package_is_patched() {
             &mock.uri(),
         ])
         .current_dir(root)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env_remove("VIRTUAL_ENV")
         .env_remove("CONDA_PREFIX")
         .output()
