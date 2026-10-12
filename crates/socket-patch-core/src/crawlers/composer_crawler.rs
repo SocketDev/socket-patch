@@ -384,8 +384,12 @@ async fn get_composer_home() -> Option<PathBuf> {
     }
 
     // Platform defaults (see `composer_home_candidates`).
-    let var = |name: &str| std::env::var_os(name);
-    for candidate in composer_home_candidates(&var, cfg!(windows)) {
+    // Built on the blocking pool: the XDG check stats `/etc/xdg`.
+    let candidates = run_blocking(|| {
+        composer_home_candidates(&|name: &str| std::env::var_os(name), cfg!(windows))
+    })
+    .await;
+    for candidate in candidates {
         if is_dir(&candidate).await {
             return Some(candidate);
         }
@@ -404,6 +408,8 @@ async fn get_composer_home() -> Option<PathBuf> {
 ///   `$XDG_CONFIG_HOME/composer` or else `~/.config/composer`, when it
 ///   exists, else `~/.composer`. A leftover `~/.composer` from the
 ///   Composer 1 era (which probed it first) must not hide the real home.
+///   A relative `XDG_CONFIG_HOME` names a directory relative to wherever
+///   Composer ran, so its XDG home is skipped rather than guessed.
 /// - elsewhere: `~/.composer`.
 ///
 /// `~/.config/composer` stays as a last probe on every platform, so a
@@ -416,13 +422,14 @@ pub(crate) fn composer_home_candidates(
     var: &impl Fn(&str) -> Option<std::ffi::OsString>,
     windows: bool,
 ) -> Vec<PathBuf> {
-    composer_home_candidates_for(var, windows, !windows && uses_xdg())
+    let xdg = !windows && (var("XDG_CONFIG_HOME").is_some() || uses_xdg());
+    composer_home_candidates_for(var, windows, xdg)
 }
 
 /// Composer's `Factory::useXdg`: any `XDG_*` environment variable is
 /// set, or `/etc/xdg` exists.
 fn uses_xdg() -> bool {
-    std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("XDG_"))
+    std::env::vars_os().any(|(key, _)| key.as_encoded_bytes().starts_with(b"XDG_"))
         || is_dir_sync(Path::new("/etc/xdg"))
 }
 
@@ -445,8 +452,11 @@ fn composer_home_candidates_for(
         }
     }
     if xdg {
-        let config =
-            absolute("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|h| h.join(".config")));
+        // Composer treats an empty XDG_CONFIG_HOME as unset.
+        let config = match var("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+            Some(_) => absolute("XDG_CONFIG_HOME"),
+            None => home.as_ref().map(|home| home.join(".config")),
+        };
         if let Some(config) = config {
             candidates.push(config.join("composer"));
         }
@@ -803,15 +813,30 @@ mod tests {
                 PathBuf::from("/h/.config/composer"),
             ]
         );
-        // A relative XDG_CONFIG_HOME counts as unset.
+        // An empty XDG_CONFIG_HOME counts as unset, as in Composer.
         assert_eq!(
             composer_home_candidates_for(
-                &env(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "rel")]),
+                &env(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "")]),
                 false,
                 true
             )[0],
             PathBuf::from("/h/.config/composer")
         );
+        // A relative one points somewhere under Composer's CWD, not at
+        // `~/.config`: probe `~/.composer` first instead of guessing.
+        assert_eq!(
+            composer_home_candidates_for(
+                &env(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "rel")]),
+                false,
+                true
+            ),
+            vec![
+                PathBuf::from("/h/.composer"),
+                PathBuf::from("/h/.config/composer"),
+            ]
+        );
+        // With HOME unset nothing is left to probe.
+        assert!(composer_home_candidates_for(&env(&[("HOME", "")]), false, true).is_empty());
     }
 
     /// Off XDG, Composer only uses `~/.composer`; `~/.config/composer`
@@ -826,7 +851,18 @@ mod tests {
                 PathBuf::from("/h/.config/composer"),
             ]
         );
-        assert!(composer_home_candidates_for(&env(&[("HOME", "")]), false, true).is_empty());
+        assert!(composer_home_candidates_for(&env(&[("HOME", "")]), false, false).is_empty());
+    }
+
+    /// An XDG_CONFIG_HOME in the supplied environment makes it an XDG
+    /// system even when the process environment has no `XDG_*` variable.
+    #[cfg(unix)]
+    #[test]
+    fn test_home_candidates_supplied_xdg_config_home_counts_as_xdg() {
+        assert_eq!(
+            composer_home_candidates(&env(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "/x")]), false)[0],
+            PathBuf::from("/x/composer")
+        );
     }
 
     #[tokio::test]

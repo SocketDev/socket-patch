@@ -165,6 +165,8 @@ async fn get_vendor_paths_global_composer_cli_nonexistent_home_falls_back() {
     let _composer_home = EnvVarGuard::remove("COMPOSER_HOME");
     let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
     let _path = EnvVarGuard::set("PATH", shim_dir.path().as_os_str());
+    // `$XDG_CONFIG_HOME/composer` would outrank the HOME candidate here.
+    let _xdg = EnvVarGuard::remove("XDG_CONFIG_HOME");
 
     let crawler = ComposerCrawler;
     let paths = crawler

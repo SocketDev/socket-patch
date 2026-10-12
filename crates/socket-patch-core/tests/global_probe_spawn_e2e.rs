@@ -340,8 +340,8 @@ async fn composer_home_falls_back_to_appdata_on_windows() {
     assert_eq!(paths, vec![vendor]);
 }
 
-/// #438 (2), Unix: with no `composer` to ask and no `~/.composer`,
-/// Composer uses `$XDG_CONFIG_HOME/composer`.
+/// #438 (2), Unix: with no `composer` to ask, Composer 2 uses
+/// `$XDG_CONFIG_HOME/composer` (ahead of `~/.composer` since #586).
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
