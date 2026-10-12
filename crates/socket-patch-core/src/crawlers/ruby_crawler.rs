@@ -88,6 +88,7 @@ impl RubyCrawler {
     /// from (`None` in global / `--global-prefix` mode, which never probes
     /// the Bundler roots), so a caller that needs the discovery's advisories
     /// (`skipped_config_path`) does not probe the roots a second time.
+    #[allow(clippy::too_many_arguments)]
     async fn gem_paths_and_discovery(
         options: &CrawlerOptions,
         gemfile_env: Option<&OsStr>,
@@ -393,6 +394,7 @@ impl RubyCrawler {
     /// [`bundler_ignores_config`]) bundler reads no config file, so the app
     /// config's `BUNDLE_PATH` is neither a root nor a refused root, and it
     /// shadows nothing. (Callers already drop `global_config` then.)
+    #[allow(clippy::too_many_arguments)]
     async fn discover_bundle_stores_impl(
         cwd: &Path,
         gemfile_env: Option<&OsStr>,
@@ -653,6 +655,7 @@ impl RubyCrawler {
     /// [`Self::verification_only_gem_paths`] with the environment passed
     /// explicitly (the hermetic test seam, like
     /// [`Self::get_gem_paths_with_env`]).
+    #[allow(clippy::too_many_arguments)]
     pub async fn verification_only_gem_paths_with_env(
         &self,
         options: &CrawlerOptions,
