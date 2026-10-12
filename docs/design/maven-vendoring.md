@@ -249,7 +249,7 @@ checkouts, root and module invocations, Gradle strict locking and repository
 mode, existing verification metadata, offline builds, tamper detection and
 byte-exact revert; `e2e_vendor_gradle_build` covers each Gradle rule above
 against a fake Central, asserting on the jar Gradle actually consumes. The PR
-tier pins Maven 3.6.3, 3.8.9, 3.9.2, 3.9.16 and 4.0.0-rc-6 (macOS and Windows on
+tier pins Maven 3.6.3, 3.8.9, 3.9.2, 3.9.16 and 4.0.0-rc-7 (macOS and Windows on
 3.9.16), and Gradle 6.9.4, 7.6.6, 8.14.3 and 9.8.0 on Linux, plus a Windows
 8.14.3 row; `gradle-compatibility.yml` runs every Gradle version on Linux,
 macOS and Windows nightly.
