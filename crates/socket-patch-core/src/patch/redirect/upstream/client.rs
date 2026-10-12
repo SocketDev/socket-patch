@@ -172,7 +172,9 @@ type RegistryCache<T> = Mutex<HashMap<(String, Option<String>, String, String), 
 pub(crate) struct UpstreamClient {
     http: RegistryClient,
     /// At most [`crate::utils::concurrent::registry_concurrency`] requests
-    /// to the public registries in flight at once.
+    /// in flight at once. Every request this client sends takes a slot: the
+    /// public registries, a project's private registry or mirror, and the
+    /// patch service's upstream checksum metadata alike.
     permits: Semaphore,
     offline: bool,
     npm: RegistryCache<NpmDist>,
@@ -741,7 +743,7 @@ pub(crate) mod peak_server {
 
     pub(crate) struct PeakServer {
         pub base: String,
-        pub requests: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
     }
 
@@ -797,6 +799,11 @@ pub(crate) mod peak_server {
             }
         }
 
+        /// How many requests the server has answered or is answering.
+        pub(crate) fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+
         /// The most requests the server ever held open at once.
         pub(crate) fn peak(&self) -> usize {
             self.peak.load(Ordering::SeqCst)
@@ -826,10 +833,7 @@ mod tests {
         for found in futures_util::future::join_all(lookups).await {
             found.unwrap();
         }
-        assert_eq!(
-            server.requests.load(std::sync::atomic::Ordering::SeqCst),
-            10
-        );
+        assert_eq!(server.requests(), 10);
         assert_eq!(server.peak(), 1);
     }
 
