@@ -18,8 +18,9 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
   vendor ledger (`.socket/vendor/state.json`) stays vendored, and one whose
   `.socket/manifest.json` holds patches stays in agent mode. Switching modes needs an
   explicit `--mode` (for example `scan --mode hosted` converts a vendored project in
-  place). A project holding both agent and vendored patches must pass `--mode`
-  (`mode_ambiguous`, exit 2). Global scans and a mode-less
+  place). A project holding both agent and vendored patches, or vendored patches
+  beside hosted pins in its lockfiles, must pass `--mode` (`mode_ambiguous`,
+  exit 2). Global scans and a mode-less
   `scan --prune` do not acquire new patches; `--prune` still performs cleanup.
 - Hosted state lives in dependency files. No command writes
   `.socket/vendor/redirect-state.json`. Legacy hosted records can still supply
