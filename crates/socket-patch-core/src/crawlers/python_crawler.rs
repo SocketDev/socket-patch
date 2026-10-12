@@ -338,10 +338,15 @@ struct PyvenvCfg {
 }
 
 /// Parses `pyvenv.cfg` the way CPython's `site.venv()` does: `key = value`
-/// lines, keys case-insensitive, the last one wins, and only the value
-/// `true` (any case) turns system site-packages on.
+/// lines, keys case-insensitive, the last one wins, and system
+/// site-packages are on unless `include-system-site-packages` says
+/// something other than `true` (any case). `venv`, virtualenv and uv always
+/// write the key.
 fn parse_pyvenv_cfg(text: &str) -> PyvenvCfg {
-    let mut cfg = PyvenvCfg::default();
+    let mut cfg = PyvenvCfg {
+        system_site_packages: true,
+        ..PyvenvCfg::default()
+    };
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -519,14 +524,17 @@ fn system_site_dirs_of_venv(
     let Some(home) = cfg.home.filter(|home| home.is_absolute()) else {
         return Vec::new();
     };
-    let version = cfg.version.or_else(|| {
-        site.parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("python"))
-            .filter(|v| v.contains('.'))
-            .map(str::to_string)
-    });
+    // The site dir's `pythonX.Y` parent first: it keeps the ABI suffix of a
+    // free-threaded build (`python3.13t`), which `pyvenv.cfg`'s version
+    // drops and the base interpreter's own dirs carry.
+    let version = site
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("python"))
+        .filter(|v| v.contains('.'))
+        .map(str::to_string)
+        .or(cfg.version);
     let prefix = base_prefix_of_home(&home, version.as_deref());
     let framework = cfg!(target_os = "macos")
         && prefix
@@ -560,7 +568,9 @@ fn add_system_site_packages(sites: &mut Vec<PathBuf>, var: &impl Fn(&str) -> Opt
 /// canonical names it hides: those installed in the venv itself or in an
 /// earlier base site dir. Python imports the first copy of a package on
 /// `sys.path`, and pip treats that copy as the installed one, so a hidden
-/// copy is never consumed and never the one an install replaces.
+/// copy is never consumed and never the one an install replaces. A base
+/// dir several venvs reach hides only what EVERY one of them hides: a
+/// venv without its own copy still imports the base one.
 fn shadowed_names_sync(
     sites: &[PathBuf],
     var: &impl Fn(&str) -> Option<String>,
@@ -593,10 +603,14 @@ fn shadowed_names_sync(
                 continue;
             }
             let here = names_in(&base);
-            shadowed
-                .entry(base)
-                .or_default()
-                .extend(hidden.iter().cloned());
+            match shadowed.entry(base) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(hidden.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    slot.get_mut().retain(|name| hidden.contains(name));
+                }
+            }
             hidden.extend(here);
         }
     }
@@ -3559,8 +3573,18 @@ impl PythonCrawler {
         if purl_lookup.is_empty() {
             return HashMap::new();
         }
-        let listing = self.visible(site_packages_path, listing.to_vec());
-        match_listing(&purl_lookup, site_packages_path, &listing)
+        let hidden = self.shadowed_lock().get(site_packages_path).cloned();
+        match hidden {
+            Some(hidden) => {
+                let listing: Vec<(String, String)> = listing
+                    .iter()
+                    .filter(|(name, _)| !hidden.contains(name))
+                    .cloned()
+                    .collect();
+                match_listing(&purl_lookup, site_packages_path, &listing)
+            }
+            None => match_listing(&purl_lookup, site_packages_path, listing),
+        }
     }
 }
 
@@ -3830,7 +3854,11 @@ mod tests {
         let parent = root.parent().unwrap();
         let leaf = root.file_name().unwrap().to_str().unwrap();
         let site = fake_venv(parent, leaf);
-        std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        std::fs::write(
+            root.join("pyvenv.cfg"),
+            "home = /usr/bin\ninclude-system-site-packages = false\n",
+        )
+        .unwrap();
         let python = if cfg!(windows) {
             root.join("Scripts").join("python.exe")
         } else {
@@ -3915,7 +3943,9 @@ mod tests {
             )
             .system_site_packages
         );
-        assert_eq!(parse_pyvenv_cfg("no equals sign\n"), PyvenvCfg::default());
+        // No key at all: CPython's default, system site-packages on.
+        assert!(parse_pyvenv_cfg("home = /usr/bin\n").system_site_packages);
+        assert!(!parse_pyvenv_cfg("include-system-site-packages = false\n").system_site_packages);
     }
 
     #[tokio::test]
@@ -3977,7 +4007,7 @@ mod tests {
     async fn base_copy_behind_a_system_site_venv_is_crawled() {
         let tmp = tempfile::tempdir().unwrap();
         let (project, _, base_site) = system_site_layout(tmp.path(), "true");
-        install_dist(&base_site, "six", "1.16.0");
+        install_dist(&base_site, "sp409-six", "1.16.0");
         let crawler = PythonCrawler::new();
         let options = CrawlerOptions {
             cwd: project,
@@ -3985,7 +4015,7 @@ mod tests {
         };
         let sites = crawler.get_site_packages_paths(&options).await.unwrap();
         assert!(sites.contains(&base_site), "{sites:?}");
-        let purl = "pkg:pypi/six@1.16.0".to_string();
+        let purl = "pkg:pypi/sp409-six@1.16.0".to_string();
         let found = crawler
             .find_by_purls(&base_site, std::slice::from_ref(&purl))
             .await
@@ -4005,14 +4035,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (project, venv_site, base_site) = system_site_layout(tmp.path(), "true");
         // `pip install --force-reinstall` in the venv: a copy in each.
-        install_dist(&venv_site, "six", "1.16.0");
-        install_dist(&base_site, "six", "1.16.0");
+        install_dist(&venv_site, "sp409-six", "1.16.0");
+        install_dist(&base_site, "sp409-six", "1.16.0");
         // A different release in the venv hides the base one too: imports
         // and pip resolve by name.
-        install_dist(&venv_site, "idna", "3.7");
-        install_dist(&base_site, "idna", "3.6");
+        install_dist(&venv_site, "sp409-idna", "3.7");
+        install_dist(&base_site, "sp409-idna", "3.6");
         // Not in the venv: the base copy is the one imported.
-        install_dist(&base_site, "certifi", "2024.2.2");
+        install_dist(&base_site, "sp409-certifi", "2024.2.2");
         let crawler = PythonCrawler::new();
         let options = CrawlerOptions {
             cwd: project,
@@ -4020,16 +4050,16 @@ mod tests {
         };
         let sites = crawler.get_site_packages_paths(&options).await.unwrap();
         let purls: Vec<String> = [
-            "pkg:pypi/six@1.16.0",
-            "pkg:pypi/idna@3.6",
-            "pkg:pypi/certifi@2024.2.2",
+            "pkg:pypi/sp409-six@1.16.0",
+            "pkg:pypi/sp409-idna@3.6",
+            "pkg:pypi/sp409-certifi@2024.2.2",
         ]
         .map(String::from)
         .to_vec();
         let in_base = crawler.find_by_purls(&base_site, &purls).await.unwrap();
         assert_eq!(
             in_base.keys().collect::<Vec<_>>(),
-            vec!["pkg:pypi/certifi@2024.2.2"]
+            vec!["pkg:pypi/sp409-certifi@2024.2.2"]
         );
         let each = crawler.find_each_by_purl(&base_site, &purls).await;
         assert!(each[0].is_none() && each[1].is_none() && each[2].is_some());
@@ -4041,15 +4071,17 @@ mod tests {
             1
         );
         let in_venv = crawler.find_by_purls(&venv_site, &purls).await.unwrap();
-        assert!(in_venv.contains_key("pkg:pypi/six@1.16.0"));
+        assert!(in_venv.contains_key("pkg:pypi/sp409-six@1.16.0"));
         let crawled = crawler.crawl_all(&options).await;
         assert!(
-            !crawled.iter().any(|pkg| pkg.purl == "pkg:pypi/idna@3.6"),
+            !crawled
+                .iter()
+                .any(|pkg| pkg.purl == "pkg:pypi/sp409-idna@3.6"),
             "{crawled:?}"
         );
         assert!(crawled
             .iter()
-            .any(|pkg| pkg.purl == "pkg:pypi/six@1.16.0" && pkg.path == venv_site));
+            .any(|pkg| pkg.purl == "pkg:pypi/sp409-six@1.16.0" && pkg.path == venv_site));
 
         // Without the project's search order (a global crawl), every copy
         // is visible.
@@ -4095,13 +4127,32 @@ mod tests {
                 .join("python3.12")
                 .join("site-packages")
         };
-        install_dist(&user_site, "six", "1.17.0");
-        install_dist(&base_site, "six", "1.16.0");
+        install_dist(&user_site, "sp409-six", "1.17.0");
+        install_dist(&base_site, "sp409-six", "1.16.0");
         let var = env_of(&[("PYTHONUSERBASE", user_base.to_string_lossy().into_owned())]);
         let sites = vec![venv_site, user_site.clone(), base_site.clone()];
         let shadowed = shadowed_names_sync(&sites, &var);
-        assert!(shadowed[&base_site].contains("six"), "{shadowed:?}");
-        assert!(!shadowed[&user_site].contains("six"), "{shadowed:?}");
+        assert!(shadowed[&base_site].contains("sp409-six"), "{shadowed:?}");
+        assert!(!shadowed[&user_site].contains("sp409-six"), "{shadowed:?}");
+    }
+
+    #[test]
+    fn shared_base_copy_stays_visible_to_a_venv_without_its_own() {
+        // `.venv` holds its own copy, a Hatch env on the same base does
+        // not: that env imports the base copy, so it must stay visible.
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, venv_site, base_site) = system_site_layout(tmp.path(), "true");
+        let other_site = fake_venv(&project, "other");
+        std::fs::copy(
+            project.join(".venv").join("pyvenv.cfg"),
+            project.join("other").join("pyvenv.cfg"),
+        )
+        .unwrap();
+        install_dist(&venv_site, "sp409-six", "1.16.0");
+        install_dist(&base_site, "sp409-six", "1.16.0");
+        let sites = vec![venv_site, other_site, base_site.clone()];
+        let shadowed = shadowed_names_sync(&sites, &env_of(&[]));
+        assert!(!shadowed[&base_site].contains("sp409-six"), "{shadowed:?}");
     }
 
     #[cfg(not(windows))]
