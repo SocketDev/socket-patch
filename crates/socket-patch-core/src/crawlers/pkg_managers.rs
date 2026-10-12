@@ -214,13 +214,14 @@ impl YarnEnv {
 
     /// A `nodeLinker` value as yarn resolves it: its `${…}` references
     /// expanded. When one cannot be (an unset variable with no fallback:
-    /// yarn refuses to run) or the value expands to nothing (no linker
-    /// yarn knows), it is the text as written, which [`yarn_linker_is_pnp`]
-    /// reads as PnP (fail closed) and a refusal can name.
+    /// yarn refuses to run), the value expands to nothing, or it still
+    /// holds a literal `${` (no linker yarn knows), it is the text as
+    /// written, which [`yarn_linker_is_pnp`] reads as PnP (fail closed).
+    /// So a value a refusal names never carries an expanded variable.
     fn resolve_linker(&self, raw: &str) -> String {
         crate::formats::yarn::rc::expand_env(raw, &mut |name| Ok(self.var(name)))
             .ok()
-            .filter(|v| !v.is_empty())
+            .filter(|v| !v.is_empty() && !v.contains("${"))
             .unwrap_or_else(|| raw.to_string())
     }
 

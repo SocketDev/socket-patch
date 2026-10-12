@@ -1179,6 +1179,41 @@ mod tests {
         assert_eq!(flavor, NpmLockFlavor::YarnBerry, "YARN_RC_FILENAME");
     }
 
+    /// #1100 review: a linker that still holds a literal `${` after its
+    /// references expand is refused as PnP, and the refusal names it as
+    /// written: it never prints the variable it expanded, from the rc file
+    /// or from `YARN_NODE_LINKER`.
+    #[tokio::test]
+    async fn unexpandable_linker_refusal_never_prints_an_expanded_variable() {
+        use crate::crawlers::pkg_managers::{yarn_node_linker_in, YarnEnv};
+        let raw = "${SOCKET_PATCH_T_SECRET}${";
+        for (rc, env_linker) in [
+            (format!("nodeLinker: \"{raw}\"\n"), None),
+            (
+                "enableGlobalCache: false\n".to_string(),
+                Some(raw.to_string()),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+            touch(tmp.path(), ".yarnrc.yml", &rc).await;
+            let env = YarnEnv {
+                node_linker: env_linker,
+                rc_filename: ".yarnrc.yml".into(),
+                home: None,
+                vars: Some([("SOCKET_PATCH_T_SECRET".to_string(), "secret".to_string())].into()),
+            };
+            let (code, message) = detect_vendorable_npm_flavor_with(tmp.path(), || {
+                yarn_node_linker_in(tmp.path(), &env)
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(code, "vendor_yarn_berry_unsupported", "{rc:?}");
+            assert!(!message.contains("secret"), "{rc:?}: {message}");
+            assert!(message.contains(raw), "{rc:?}: {message}");
+        }
+    }
+
     /// Stage the root markers a real `pnpm install` with
     /// `node-linker=pnp` emits (layout verified against pnpm 10.28.2):
     /// the `.pnp.cjs` loader, pnpm-lock.yaml, and an installed virtual
