@@ -1217,35 +1217,22 @@ async fn run_redirect_selected_untracked(
             Some((dep.artifact_url.clone(), sha512, dep.clone()))
         })
         .collect();
-    // Fetched concurrently but folded in target order (#1423), so the
-    // recorded sha1s, the skips and the held-back `--debug` lines come out
-    // exactly as the serial loop's did.
-    let mut fetched = std::pin::pin!(ordered_concurrent(
-        classic_targets.iter(),
-        api_concurrency_for(api_client.uses_public_proxy(), classic_targets.len()),
-        |(url, sha512, _)| {
-            hold_back_debug(
-                socket_patch_core::hosted::npm_manifest::fetch_hosted_classic_artifact(
-                    api_client, url, sha512,
-                ),
-            )
-        },
-    ));
-    for (url, _, dep) in &classic_targets {
+    for (url, sha512, dep) in classic_targets {
         status.set(format!("Fetching hosted tarball for {}...", dep.name));
-        let Some(fetch) = fetched.next().await else {
-            break;
-        };
-        match fetch.release() {
+        match socket_patch_core::hosted::npm_manifest::fetch_hosted_classic_artifact(
+            api_client, &url, &sha512,
+        )
+        .await
+        {
             Ok(artifact) => engine::record_classic_artifact(
                 &mut candidates,
                 &mut python_metadata,
-                url,
+                &url,
                 &artifact,
             ),
             Err(detail) => {
                 unavailable_python_artifacts.insert(url.clone());
-                skipped.push(engine::npm_tarball_unavailable(dep, &detail));
+                skipped.push(engine::npm_tarball_unavailable(&dep, &detail));
             }
         }
     }
