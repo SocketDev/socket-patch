@@ -65,7 +65,9 @@ pub fn raw_setting(rc: &str, key: &str) -> Option<String> {
 
 /// The root mapping's keys, each with its scalar value (`None` for a
 /// nested mapping, sequence or alias); the last occurrence of a key wins,
-/// as in yarn. `Err` when the text is not a single YAML document.
+/// as in yarn. A root that is not a mapping (a list, a lone scalar) sets
+/// nothing: yarn refuses such a file. `Err` when the text is not a single
+/// YAML document.
 fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
     let mut options = Options::default();
     options.emit_comments = false;
@@ -75,6 +77,7 @@ fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
     let mut pending_key: Option<String> = None;
     // Whether the next root-level node is a key (true) or a value.
     let mut at_key = true;
+    let mut root_is_mapping = false;
     for event in Parser::new_from_str_with_options(rc, options) {
         let (event, _) = event.map_err(|_| ())?;
         match event {
@@ -86,7 +89,9 @@ fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
                 }
             }
             Event::MappingStart(..) | Event::SequenceStart(..) => {
-                if depth == 1 && !at_key {
+                if depth == 0 {
+                    root_is_mapping = matches!(event, Event::MappingStart(..));
+                } else if depth == 1 && !at_key {
                     if let Some(key) = pending_key.take() {
                         out.insert(key, None);
                     }
@@ -99,7 +104,7 @@ fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
                 depth += 1;
             }
             Event::MappingEnd | Event::SequenceEnd => depth = depth.saturating_sub(1),
-            Event::Scalar(text, ..) if depth == 1 => {
+            Event::Scalar(text, ..) if depth == 1 && root_is_mapping => {
                 if at_key {
                     pending_key = Some(text.into_owned());
                     at_key = false;
@@ -110,7 +115,7 @@ fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
                     at_key = true;
                 }
             }
-            Event::Alias(_) if depth == 1 => {
+            Event::Alias(_) if depth == 1 && root_is_mapping => {
                 if !at_key {
                     if let Some(key) = pending_key.take() {
                         out.insert(key, None);
@@ -291,6 +296,16 @@ mod tests {
         assert_eq!(raw_setting("", "nodeLinker"), None);
         assert_eq!(raw_setting("# only a comment\n", "nodeLinker"), None);
         assert_eq!(raw_setting("- a\n- b\n", "nodeLinker"), None);
+        // A root list is not settings, even one that pairs up as a key and
+        // a value (yarn refuses the file).
+        assert_eq!(
+            raw_setting("- nodeLinker\n- node-modules\n", "nodeLinker"),
+            None
+        );
+        assert_eq!(
+            raw_setting("[nodeLinker, node-modules]\n", "nodeLinker"),
+            None
+        );
         let rc = "a: &x pnp\nnodeLinker: *x\nb: 1\n";
         assert_eq!(raw_setting(rc, "nodeLinker"), None);
         assert_eq!(raw_setting(rc, "b").as_deref(), Some("1"));

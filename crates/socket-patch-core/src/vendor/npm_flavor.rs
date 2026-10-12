@@ -378,12 +378,16 @@ async fn detect_vendorable_npm_flavor_with(
     if !crate::crawlers::pkg_managers::yarn_linker_is_pnp(linker.as_deref()) {
         return Ok(found);
     }
-    let why = match linker {
-        Some(_) => "the configured yarn linker is `nodeLinker: pnp`",
-        None => {
-            "no yarn rc file (the project's, its parents' or the home folder's) \
-             sets `nodeLinker`, so yarn berry uses its default `pnp` linker"
-        }
+    let why = match linker.as_deref() {
+        Some("pnp") => "the configured yarn linker is `nodeLinker: pnp`".to_string(),
+        Some(other) => format!(
+            "the configured yarn linker `nodeLinker: {other}` references an environment \
+             variable that is unset with no fallback (or expands to nothing), so it is \
+             treated as yarn berry's default `pnp` linker"
+        ),
+        None => "no yarn rc file (the project's, its parents' or the home folder's) \
+                 sets `nodeLinker`, so yarn berry uses its default `pnp` linker"
+            .to_string(),
     };
     Err((
         "vendor_yarn_berry_unsupported",
