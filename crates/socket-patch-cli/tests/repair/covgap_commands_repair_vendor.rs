@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 use crate::common::{binary, git_sha256, hermetic_command};
 
-use sha2::Digest;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -41,7 +40,7 @@ const GEMSPEC_STUB: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"padloc
 
 fn sri_of(bytes: &[u8]) -> String {
     use base64::Engine as _;
-    use sha2::Sha512;
+    use sha2::{Digest as _, Sha512};
     format!(
         "sha512-{}",
         base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))

@@ -27,7 +27,6 @@ const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const BEFORE: &[u8] = b"before\n";
 const AFTER: &[u8] = b"after\n";
-/// base64 of AFTER, the shape the view response's `blobContent` carries.
 
 /// Spawn the built binary in `root` with the hermetic `SOCKET_*`
 /// environment (ambient vars scrubbed, telemetry kill-switch forced) and
