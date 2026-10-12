@@ -63,7 +63,7 @@ class Failures(unittest.TestCase):
         # `cargo test --no-fail-fast` over a crate whose lib test prints a
         # child's "     Running npm install", one test binary aborts, one test
         # fails printing a ``` line, and one doctest fails.
-        found = self.parse((ROOT / "scripts/tests/fixtures/cargo-test-failures.log").read_text())
+        found = self.parse((ROOT / "scripts/tests/fixtures/cargo-test-failures.txt").read_text())
         self.assertEqual(
             [(t, n) for t, n, _ in found],
             [
