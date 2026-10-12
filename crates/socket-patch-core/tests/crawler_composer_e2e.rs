@@ -1341,3 +1341,236 @@ async fn uppercase_v_version_normalizes_identically_in_crawl_and_lock_inventory(
          package double-counts as installed + lockfile-only"
     );
 }
+
+// ── vendor-dir config cascade (#439, #686) ────────────────────────────
+
+/// Sets environment variables for one test and restores their previous
+/// values on drop, so a failing assert can't leak them into later tests.
+struct EnvVars(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvVars {
+    fn set(vars: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in vars {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        EnvVars(saved)
+    }
+}
+
+impl Drop for EnvVars {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+fn global_opts(cwd: &Path) -> CrawlerOptions {
+    CrawlerOptions {
+        cwd: cwd.to_path_buf(),
+        global: true,
+        global_prefix: None,
+    }
+}
+
+/// #439: `composer global config vendor-dir deps` writes the setting into
+/// the global project's `$COMPOSER_HOME/composer.json`, and `composer
+/// global require` then installs under `$COMPOSER_HOME/deps`. `scan -g`
+/// must crawl that tree, not the hardcoded `$COMPOSER_HOME/vendor`.
+#[tokio::test]
+#[serial_test::serial]
+async fn global_vendor_dir_from_global_composer_json() {
+    let home = tempfile::tempdir().unwrap();
+    let vendor = stage_relocated_project(home.path(), "deps", Some("deps")).await;
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", Some(home.path().as_os_str())),
+        ("COMPOSER_VENDOR_DIR", None),
+    ]);
+
+    let crawler = ComposerCrawler;
+    let paths = crawler
+        .get_vendor_paths(&global_opts(home.path()))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![vendor.clone()]);
+    let packages = crawler.crawl_all(&global_opts(home.path())).await;
+    assert_eq!(packages.len(), 1, "got {packages:?}");
+    assert_eq!(packages[0].path, vendor.join("monolog").join("monolog"));
+}
+
+/// #439: the user-level `$COMPOSER_HOME/config.json` applies to the global
+/// project too (Composer loads it under every project's composer.json).
+#[tokio::test]
+#[serial_test::serial]
+async fn global_vendor_dir_from_user_config_json() {
+    let home = tempfile::tempdir().unwrap();
+    let vendor = stage_relocated_project(home.path(), "gdeps", None).await;
+    tokio::fs::write(
+        home.path().join("config.json"),
+        br#"{"config":{"vendor-dir":"gdeps"}}"#,
+    )
+    .await
+    .unwrap();
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", Some(home.path().as_os_str())),
+        ("COMPOSER_VENDOR_DIR", None),
+    ]);
+
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_opts(home.path()))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![vendor]);
+}
+
+/// #439: `COMPOSER_VENDOR_DIR=gdeps composer global require …` installs
+/// under `$COMPOSER_HOME/gdeps`: Composer resolves the relative value
+/// against the global project's directory, the Composer home — not the
+/// directory `scan -g` happens to run from.
+#[tokio::test]
+#[serial_test::serial]
+async fn global_vendor_dir_env_resolves_against_composer_home() {
+    let home = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let vendor = stage_relocated_project(home.path(), "gdeps", None).await;
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", Some(home.path().as_os_str())),
+        ("COMPOSER_VENDOR_DIR", Some(std::ffi::OsStr::new("gdeps"))),
+    ]);
+
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_opts(elsewhere.path()))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![vendor]);
+}
+
+/// #439: `composer config -g vendor-dir lib` writes the user-level
+/// `$COMPOSER_HOME/config.json`, and every project's `composer install`
+/// then installs into `<project>/lib`. Local discovery must read that
+/// layer under the project's own composer.json.
+#[tokio::test]
+#[serial_test::serial]
+async fn local_vendor_dir_from_user_config_json() {
+    let home = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        home.path().join("config.json"),
+        br#"{"config":{"vendor-dir":"lib"}}"#,
+    )
+    .await
+    .unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let vendor = stage_relocated_project(proj.path(), "lib", None).await;
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", Some(home.path().as_os_str())),
+        ("COMPOSER_VENDOR_DIR", None),
+    ]);
+
+    let crawler = ComposerCrawler;
+    let paths = crawler
+        .get_vendor_paths(&options_at(proj.path()))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![vendor.clone()]);
+    let packages = crawler.crawl_all(&options_at(proj.path())).await;
+    assert_eq!(packages.len(), 1, "got {packages:?}");
+    assert_eq!(packages[0].path, vendor.join("monolog").join("monolog"));
+}
+
+/// The project's own `config.vendor-dir` outranks the user-level layer,
+/// as Composer merges the project config over `config.json`.
+#[tokio::test]
+#[serial_test::serial]
+async fn project_vendor_dir_outranks_user_config_json() {
+    let home = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        home.path().join("config.json"),
+        br#"{"config":{"vendor-dir":"lib"}}"#,
+    )
+    .await
+    .unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let vendor = stage_relocated_project(proj.path(), "deps", Some("deps")).await;
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", Some(home.path().as_os_str())),
+        ("COMPOSER_VENDOR_DIR", None),
+    ]);
+
+    let paths = ComposerCrawler
+        .get_vendor_paths(&options_at(proj.path()))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![vendor]);
+}
+
+/// #686 (the part this fix covers): Composer expands a leading `~/` and
+/// `$VAR` in every `*-dir` setting (`Platform::expandPath`). A value from
+/// the invoking user's own `config.json` or environment is honoured after
+/// that expansion, absolute results included.
+#[tokio::test]
+#[serial_test::serial]
+async fn user_level_vendor_dir_expands_home_and_env_placeholders() {
+    let home = tempfile::tempdir().unwrap();
+    let user_home = tempfile::tempdir().unwrap();
+    let shared = stage_relocated_project(user_home.path(), "shared-deps", None).await;
+    let proj = tempfile::tempdir().unwrap();
+    tokio::fs::write(proj.path().join("composer.json"), b"{}")
+        .await
+        .unwrap();
+
+    for value in [
+        "~/shared-deps",
+        "$HOME/shared-deps",
+        "$SP_DEPS_ROOT/shared-deps",
+    ] {
+        tokio::fs::write(
+            home.path().join("config.json"),
+            format!(r#"{{"config":{{"vendor-dir":"{value}"}}}}"#),
+        )
+        .await
+        .unwrap();
+        let _env = EnvVars::set(&[
+            ("COMPOSER_HOME", Some(home.path().as_os_str())),
+            ("COMPOSER_VENDOR_DIR", None),
+            ("HOME", Some(user_home.path().as_os_str())),
+            ("SP_DEPS_ROOT", Some(user_home.path().as_os_str())),
+        ]);
+        let paths = ComposerCrawler
+            .get_vendor_paths(&options_at(proj.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec![shared.clone()],
+            "config.json vendor-dir {value}"
+        );
+    }
+
+    // The env var gets the same expansion.
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", Some(home.path().as_os_str())),
+        (
+            "COMPOSER_VENDOR_DIR",
+            Some(std::ffi::OsStr::new("~/shared-deps")),
+        ),
+        ("HOME", Some(user_home.path().as_os_str())),
+    ]);
+    tokio::fs::remove_file(home.path().join("config.json"))
+        .await
+        .unwrap();
+    let paths = ComposerCrawler
+        .get_vendor_paths(&options_at(proj.path()))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![shared]);
+}

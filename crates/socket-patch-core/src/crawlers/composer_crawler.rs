@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
@@ -38,12 +39,14 @@ impl ComposerCrawler {
 
     /// Get vendor paths based on options.
     ///
-    /// In global mode, checks `$COMPOSER_HOME/vendor/` (env var, command
-    /// fallback, or platform defaults).
+    /// In global mode, checks the global project's vendor directory under
+    /// `$COMPOSER_HOME` (env var, command fallback, or platform defaults),
+    /// resolved through the same `vendor-dir` cascade as a local project.
     ///
     /// In local mode, checks the project's vendor directory
     /// (`COMPOSER_VENDOR_DIR` / composer.json `config.vendor-dir` /
-    /// `vendor`, see [`resolve_local_vendor_dir`]) but only if the
+    /// `$COMPOSER_HOME/config.json` / `vendor`, see
+    /// [`resolve_vendor_dir`]) but only if the
     /// directory contains `composer/installed.json` and the cwd looks like
     /// a PHP project (`composer.json` or `composer.lock` present).
     pub async fn get_vendor_paths(
@@ -56,9 +59,11 @@ impl ComposerCrawler {
             }
             let mut paths = Vec::new();
             if let Some(composer_home) = get_composer_home().await {
-                let vendor_dir = composer_home.join("vendor");
-                if is_dir(&vendor_dir).await {
-                    paths.push(vendor_dir);
+                let vendor_dir = run_blocking(move || global_vendor_dir_sync(&composer_home)).await;
+                if let Some(vendor_dir) = vendor_dir {
+                    if is_dir(&vendor_dir).await {
+                        paths.push(vendor_dir);
+                    }
                 }
             }
             return Ok(paths);
@@ -464,15 +469,12 @@ pub(crate) fn normalize_version(version: &str) -> &str {
 /// filesystem can't widen the write boundary.
 const PROJECT_ROOT_SEARCH_DEPTH: usize = 3;
 
-/// Read `config.vendor-dir` out of a composer.json body, mirroring the
+/// Read `config.vendor-dir` out of a composer.json (or the user-level
+/// `config.json`, same `{"config": {...}}` shape) body, mirroring the
 /// slice of Composer's `Config::get('vendor-dir')` that matters here:
 /// trailing separators are trimmed (`"vendor/"` is legal) and an empty
-/// value counts as unset.
-///
-/// Composer additionally expands `$HOME`/`~`/`%VAR%` placeholders
-/// (`Platform::expandPath`); that is deliberately NOT implemented — an
-/// unexpanded value simply resolves to a directory that does not exist,
-/// so discovery reports nothing rather than guessing at a path.
+/// value counts as unset. Placeholder expansion is the caller's call, see
+/// [`resolve_vendor_dir`].
 fn parse_config_vendor_dir(composer_json: &str) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_str(composer_json).ok()?;
     let raw = doc.get("config")?.get("vendor-dir")?.as_str()?;
@@ -480,64 +482,172 @@ fn parse_config_vendor_dir(composer_json: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Resolve the vendor directory of a local project the way Composer does:
-/// `COMPOSER_VENDOR_DIR` wins, else composer.json `config.vendor-dir`
-/// (relative to the manifest directory), else `vendor`.
+/// Expand the placeholders Composer expands in every `*-dir` setting
+/// (`Platform::expandPath`): a leading `~/` (or `~\`) becomes the user's
+/// home, and a leading `$VAR` or `%VAR%` becomes that environment
+/// variable. Anything else is returned as is.
+///
+/// `None` when the placeholder names nothing usable (no home, an unset or
+/// empty variable). Composer would substitute `""` there and resolve a
+/// root-relative path, which is never the tree a real install used.
+fn expand_composer_path(raw: &str, var: &impl Fn(&str) -> Option<OsString>) -> Option<String> {
+    if let Some(rest) = raw.strip_prefix('~') {
+        if rest.starts_with(['/', '\\']) {
+            let home = crate::utils::fs::home_from_env(var)?;
+            return Some(format!("{}{rest}", home.to_string_lossy()));
+        }
+        return Some(raw.to_string());
+    }
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let (name, rest) = if let Some(after) = raw.strip_prefix('$') {
+        let end = after.find(|c| !is_word(c)).unwrap_or(after.len());
+        (&after[..end], &after[end..])
+    } else if let Some(after) = raw.strip_prefix('%') {
+        let end = after.find(|c| !is_word(c)).unwrap_or(after.len());
+        match after[end..].strip_prefix('%') {
+            Some(rest) => (&after[..end], rest),
+            None => return Some(raw.to_string()),
+        }
+    } else {
+        return Some(raw.to_string());
+    };
+    if name.is_empty() {
+        return Some(raw.to_string());
+    }
+    // Composer treats `HOME` as an alias for `USERPROFILE` on Windows.
+    let value = match name {
+        "HOME" => crate::utils::fs::home_from_env(var).map(PathBuf::into_os_string),
+        _ => var(name).filter(|v| !v.is_empty()),
+    }?;
+    Some(format!("{}{rest}", value.to_string_lossy()))
+}
+
+/// Resolve Composer's `vendor-dir` the way `Config::get` does, highest
+/// precedence first:
+///
+/// 1. `COMPOSER_VENDOR_DIR`;
+/// 2. the project's composer.json `config.vendor-dir` (`manifest`);
+/// 3. the user-level `$COMPOSER_HOME/config.json` `config.vendor-dir`
+///    (`user_config`, what `composer config -g vendor-dir` writes);
+/// 4. `vendor`.
+///
+/// Every value is expanded (`~/`, `$VAR`, `%VAR%`) and a relative one
+/// resolves against `base`: the project directory, or `$COMPOSER_HOME`
+/// for the global project. The environment and the Composer home belong
+/// to the invoking user, the same trust level as `CARGO_HOME` /
+/// `NUGET_PACKAGES` / `MAVEN_REPO_LOCAL`, so they are honoured as given.
+///
+/// A composer.json that is NOT `manifest_trusted` (the scanned project's)
+/// names the directory apply later WRITES patch content into, so it keeps
+/// the stricter rule: only a plain relative subpath of the project, no
+/// expansion. `../../elsewhere`, `/etc` or `~/deps` is refused (`None`) rather than
+/// silently downgraded to `vendor/`, which would patch an unrelated tree.
+/// Composer accepts absolute and home-relative values there; refusing
+/// them means such a project discovers nothing.
+fn resolve_vendor_dir(
+    base: &Path,
+    manifest: Option<&str>,
+    manifest_trusted: bool,
+    user_config: Option<&str>,
+    var: &impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let honoured = |raw: &str| expand_composer_path(raw, var).map(|value| base.join(value));
+    // A set-but-empty value counts as unset (twin of the MAVEN_REPO_LOCAL
+    // and NUGET_PACKAGES rules): honoring `""` would resolve the vendor
+    // tree to the project root itself. `join` substitutes an absolute
+    // value for the base, matching Composer's relative-to-the-base-dir
+    // resolution.
+    if let Some(from_env) = var("COMPOSER_VENDOR_DIR")
+        .and_then(|v| v.into_string().ok())
+        .map(|v| v.trim_end_matches(['/', '\\']).to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return honoured(&from_env);
+    }
+    if let Some(configured) = manifest.and_then(parse_config_vendor_dir) {
+        if manifest_trusted {
+            return honoured(&configured);
+        }
+        // A placeholder Composer would expand (`~/x`, `$HOME/x`) names a
+        // directory outside the project, never the literal `<proj>/~/x`.
+        if expand_composer_path(&configured, var).as_deref() != Some(configured.as_str()) {
+            return None;
+        }
+        return normalize_config_vendor_dir(&configured)
+            .filter(|normalized| path_safety::is_safe_multi_segment(normalized))
+            .map(|normalized| base.join(normalized));
+    }
+    match user_config.and_then(parse_config_vendor_dir) {
+        Some(configured) => honoured(&configured),
+        None => Some(base.join("vendor")),
+    }
+}
+
+/// `$COMPOSER_HOME` for LOCAL discovery, without running `composer`: the
+/// env var, else the first platform default that exists (the fallbacks
+/// [`get_composer_home`] ends with). Local scans read the user-level
+/// `config.json` from here and must not spawn a subprocess to find it.
+fn local_composer_home(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if let Some(home) = var("COMPOSER_HOME").map(PathBuf::from) {
+        if is_dir_sync(&home) {
+            return Some(home);
+        }
+    }
+    composer_home_candidates(var, cfg!(windows))
+        .into_iter()
+        .find(|candidate| is_dir_sync(candidate))
+}
+
+/// The vendor directory of the global project at `composer_home`: its
+/// composer.json and config.json both live in the user's own Composer
+/// home, so every layer is honoured as Composer honours it (#439).
+fn global_vendor_dir_sync(composer_home: &Path) -> Option<PathBuf> {
+    let read =
+        |name: &str| crate::utils::fs::read_regular_to_string_sync(&composer_home.join(name)).ok();
+    let manifest = read("composer.json");
+    let user_config = read("config.json");
+    resolve_vendor_dir(
+        composer_home,
+        manifest.as_deref(),
+        true,
+        user_config.as_deref(),
+        &|name| std::env::var_os(name),
+    )
+}
+
+/// Resolve the vendor directory of a local project the way Composer does
+/// (see [`resolve_vendor_dir`] for the cascade and the rules).
 ///
 /// Composer relocates the WHOLE vendor tree — `composer/installed.json`
 /// included — so assuming `<cwd>/vendor` makes every installed package
 /// invisible: scan reports them as lockfile-only ("not yet installed")
 /// and apply resolves them as `package_not_found`.
 ///
-/// Returns `None` when composer.json configures a value that is not a
-/// plain relative subpath. That value comes from the project being
-/// scanned and names the directory apply later WRITES patch content into,
-/// so `../../elsewhere` or `/etc` is refused outright rather than
-/// silently downgraded to `vendor/` (which would patch an unrelated
-/// tree). Absolute paths are legal in Composer but are refused for the
-/// same reason; a project using one discovers nothing, exactly as today.
-/// `COMPOSER_VENDOR_DIR` is not gated — it comes from the invoking
-/// environment, the same trust level as `CARGO_HOME` / `NUGET_PACKAGES` /
-/// `MAVEN_REPO_LOCAL`, which are all honored verbatim.
+/// Returns `None` when the project's composer.json configures a value the
+/// crawler refuses (absolute, home-relative, or climbing out of the
+/// project), or a user-level value whose placeholder names nothing.
 async fn resolve_local_vendor_dir(cwd: &Path) -> Option<PathBuf> {
-    let manifest = crate::utils::fs::read_regular_to_string(&cwd.join("composer.json"))
-        .await
-        .ok();
-    vendor_dir_from(cwd, manifest.as_deref())
+    let cwd = cwd.to_path_buf();
+    run_blocking(move || resolve_local_vendor_dir_sync(&cwd)).await
 }
 
-/// The blocking twin of [`resolve_local_vendor_dir`], for the human
-/// next-step hints that name the installed package directory a user has
-/// to remove before `composer install` (#658): those are formatted on a
-/// synchronous path after the run, and must name the directory Composer
+/// The blocking form of [`resolve_local_vendor_dir`], also used by the
+/// human next-step hints that name the installed package directory a user
+/// has to remove before `composer install` (#658): those are formatted on
+/// a synchronous path after the run, and must name the directory Composer
 /// actually installed into, not a hardcoded `vendor/`.
 pub fn resolve_local_vendor_dir_sync(cwd: &Path) -> Option<PathBuf> {
-    let manifest = crate::utils::fs::read_regular_to_string_sync(&cwd.join("composer.json")).ok();
-    vendor_dir_from(cwd, manifest.as_deref())
-}
-
-/// The shared resolution of the two entry points above, given the
-/// composer.json text (`None` when it is missing or unreadable).
-fn vendor_dir_from(cwd: &Path, composer_json: Option<&str>) -> Option<PathBuf> {
-    // A set-but-empty value counts as unset (twin of the MAVEN_REPO_LOCAL
-    // and NUGET_PACKAGES rules): honoring `""` would resolve the vendor
-    // tree to the project root itself.
-    if let Some(from_env) = std::env::var("COMPOSER_VENDOR_DIR")
-        .ok()
-        .map(|v| v.trim_end_matches(['/', '\\']).to_string())
-        .filter(|v| !v.is_empty())
-    {
-        // `join` substitutes an absolute value for the base, matching
-        // Composer's own relative-to-the-manifest-dir resolution.
-        return Some(cwd.join(from_env));
-    }
-
-    match composer_json.and_then(parse_config_vendor_dir) {
-        Some(configured) => normalize_config_vendor_dir(&configured)
-            .filter(|normalized| path_safety::is_safe_multi_segment(normalized))
-            .map(|normalized| cwd.join(normalized)),
-        None => Some(cwd.join("vendor")),
-    }
+    let var = |name: &str| std::env::var_os(name);
+    let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
+    let manifest = read(&cwd.join("composer.json"));
+    let user_config = local_composer_home(&var).and_then(|home| read(&home.join("config.json")));
+    resolve_vendor_dir(
+        cwd,
+        manifest.as_deref(),
+        false,
+        user_config.as_deref(),
+        &var,
+    )
 }
 
 /// Reduce a `config.vendor-dir` value to plain `a/b` segments before the
@@ -1563,6 +1673,67 @@ mod tests {
             None
         );
         assert_eq!(parse_config_vendor_dir("{ not json"), None);
+    }
+
+    /// Composer's `Platform::expandPath`: only a LEADING `~/`, `$VAR` or
+    /// `%VAR%` expands; a placeholder naming nothing resolves nothing
+    /// rather than a root-relative path.
+    #[test]
+    fn test_expand_composer_path() {
+        let env = |name: &str| match name {
+            "HOME" => Some(OsString::from("/home/u")),
+            "DEPS" => Some(OsString::from("/srv/deps")),
+            "EMPTY" => Some(OsString::new()),
+            _ => None,
+        };
+        let x = |raw: &str| expand_composer_path(raw, &env);
+        assert_eq!(x("~/shared").as_deref(), Some("/home/u/shared"));
+        assert_eq!(x("~\\shared").as_deref(), Some("/home/u\\shared"));
+        assert_eq!(x("$HOME/shared").as_deref(), Some("/home/u/shared"));
+        assert_eq!(x("$DEPS/php").as_deref(), Some("/srv/deps/php"));
+        assert_eq!(x("%DEPS%/php").as_deref(), Some("/srv/deps/php"));
+        // Not placeholders: left as is.
+        assert_eq!(x("lib/deps").as_deref(), Some("lib/deps"));
+        assert_eq!(x("~user/x").as_deref(), Some("~user/x"));
+        assert_eq!(x("lib/$DEPS").as_deref(), Some("lib/$DEPS"));
+        assert_eq!(x("%DEPS/x").as_deref(), Some("%DEPS/x"));
+        assert_eq!(x("$/x").as_deref(), Some("$/x"));
+        // Placeholders naming nothing.
+        assert_eq!(x("$UNSET/x"), None);
+        assert_eq!(x("$EMPTY/x"), None);
+        assert_eq!(expand_composer_path("~/x", &|_: &str| None), None);
+    }
+
+    /// The cascade: env, then the project's composer.json, then the
+    /// user-level config.json, then `vendor`; only the scanned project's
+    /// composer.json keeps the relative-subpath gate (#439, #686).
+    #[test]
+    fn test_resolve_vendor_dir_cascade() {
+        let base = Path::new("/proj");
+        let no_env = |name: &str| (name == "HOME").then(|| OsString::from("/home/u"));
+        let lib = Some(r#"{"config":{"vendor-dir":"lib"}}"#);
+        let abs = Some(r#"{"config":{"vendor-dir":"/abs/deps"}}"#);
+        let home = Some(r#"{"config":{"vendor-dir":"~/deps"}}"#);
+        let r =
+            |manifest, trusted, user| resolve_vendor_dir(base, manifest, trusted, user, &no_env);
+
+        assert_eq!(r(None, false, None), Some(base.join("vendor")));
+        assert_eq!(r(None, false, lib), Some(base.join("lib")));
+        assert_eq!(
+            r(home, false, lib),
+            None,
+            "untrusted ~/ is refused, not skipped"
+        );
+        assert_eq!(r(abs, false, lib), None, "untrusted absolute is refused");
+        assert_eq!(r(abs, true, lib), Some(PathBuf::from("/abs/deps")));
+        assert_eq!(r(home, true, None), Some(PathBuf::from("/home/u/deps")));
+        assert_eq!(r(None, false, home), Some(PathBuf::from("/home/u/deps")));
+
+        let env = |name: &str| (name == "COMPOSER_VENDOR_DIR").then(|| OsString::from("third/"));
+        assert_eq!(
+            resolve_vendor_dir(base, abs, false, lib, &env),
+            Some(base.join("third"))
+        );
     }
 
     #[test]
