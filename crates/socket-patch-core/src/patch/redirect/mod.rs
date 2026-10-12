@@ -3978,6 +3978,9 @@ fn rewrite_yarn_classic_with(
     // byte span once, at the end: re-scanning and re-copying the whole lock
     // per pinned block is quadratic in a large lock.
     let mut pinned_blocks: Vec<bool> = vec![false; blocks.len()];
+    // Every pattern the keys hold, for the served-manifest check (#591):
+    // gathered from `heads` once, when the first dep needs it (#1423).
+    let mut locked_patterns: Option<std::collections::HashSet<&str>> = None;
     let mut segments: Option<ClassicSegments> = None;
     let mut changed = false;
     let mut any_pinned = false;
@@ -4018,7 +4021,13 @@ fn rewrite_yarn_classic_with(
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .filter(Value::is_object);
         if let Some(pkg) = &served_manifest {
-            let missing = crate::formats::yarn::classic_deps::unlocked_descriptors(&blocks, pkg);
+            let locked = locked_patterns.get_or_insert_with(|| {
+                heads
+                    .iter()
+                    .flat_map(|(patterns, _)| patterns.iter().map(String::as_str))
+                    .collect()
+            });
+            let missing = crate::formats::yarn::classic_deps::unlocked_descriptors_in(locked, pkg);
             if !missing.is_empty() {
                 result
                     .refused_yarn_classic_uuids
