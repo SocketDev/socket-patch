@@ -295,6 +295,8 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
 /// ancestor's `.cargo/config*`, then `$CARGO_HOME`'s). An unreadable
 /// config is skipped.
 async fn crates_io_source(cwd: &Path) -> CratesIoSource {
+    // The logical path, not the canonical one: the crawled roots are
+    // reported under it, as the `<cwd>`-joined roots always were.
     let cwd = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let cargo_home = CargoCrawler::cargo_home();
     run_blocking(move || {
@@ -1310,6 +1312,7 @@ version = "fake"
             let mut perms = PermGuard::default();
             let mut rng = Rng::new(7);
             write(&tmp.path().join("Cargo.toml"), "[workspace]\n");
+            wire_vendor(tmp.path());
             tree(
                 &mut rng,
                 &tmp.path().join("vendor"),
