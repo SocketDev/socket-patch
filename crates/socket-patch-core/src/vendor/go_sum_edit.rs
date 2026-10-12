@@ -289,6 +289,17 @@ impl GoSumEditor {
             .any(|l| is_version_line(l, module, version))
     }
 
+    /// The versions of `module` the content carries a zip (`h1:` of the
+    /// module tree) line for, in file order — the versions whose packages
+    /// the build loads, unlike the `/go.mod` lines go writes for every
+    /// version MVS reads.
+    pub(crate) fn zip_versions(&self, module: &str) -> Vec<String> {
+        self.current_lines()
+            .flat_map(go_sum_lines)
+            .filter_map(|l| l.zip_version_of(module).map(str::to_string))
+            .collect()
+    }
+
     /// Remove the lines for exactly `module@version` (both the zip and
     /// `/go.mod` forms). Used to prune the REPLACED original's lines: once a
     /// version-pinned `replace` covers the resolved version, go never fetches
@@ -361,6 +372,16 @@ pub(crate) struct GoSumLine<'a> {
     pub(crate) hash: &'a str,
     /// The line carries more than three tokens (not a line go writes).
     pub(crate) extra_tokens: bool,
+}
+
+impl<'a> GoSumLine<'a> {
+    /// The version, when this is a zip (`h1:` of the module tree) line for
+    /// `module`: the line go records for a version whose packages the build
+    /// loads, unlike the `/go.mod` line it writes for every version MVS
+    /// reads.
+    pub(crate) fn zip_version_of(&self, module: &str) -> Option<&'a str> {
+        (!self.go_mod && self.module == module).then_some(self.version)
+    }
 }
 
 /// Every line of `text` with at least three tokens, in file order; shorter

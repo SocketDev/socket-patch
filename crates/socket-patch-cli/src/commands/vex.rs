@@ -845,6 +845,47 @@ async fn generate_vex(
         }
     }
 
+    // Go keys a replace by module AND version: a Socket replace (agent,
+    // vendored or hosted) pinned to a version the build list does not select
+    // is inert, and the build links the unpatched module however intact the
+    // copy or pin (#391, #392, #509). go.mod + go.sum say which version the
+    // build selects; never attest a patch for another one.
+    if !common.is_global() {
+        use socket_patch_core::utils::purl::build_golang_purl;
+        use socket_patch_core::utils::purl_key::PurlKey;
+        use socket_patch_core::vendor::go_build_list::{project_selection, Selection};
+        for entry in socket_patch_core::vendor::go_mod_edit::read_replace_entries(&common.cwd).await
+        {
+            let Some(version) = entry.version.as_deref().filter(|_| entry.socket_owned()) else {
+                continue;
+            };
+            let purl = build_golang_purl(&entry.module, version);
+            if !outcome.applied.iter().any(|p| PurlKey::same(p, &purl)) {
+                continue;
+            }
+            let Some(Selection::Other(selected)) =
+                project_selection(&common.cwd, &entry.module, version).await
+            else {
+                continue;
+            };
+            outcome.applied.retain(|p| !PurlKey::same(p, &purl));
+            note_warning(
+                warnings,
+                common,
+                GO_VERSION_NOT_SELECTED,
+                format!(
+                    "{purl}: the build selects {} {selected}, so the replace pinned to \
+                     {version} is ignored and the build links the unpatched module",
+                    entry.module
+                ),
+            );
+            outcome.failed.push(FailedPatch {
+                purl,
+                reason: GO_VERSION_NOT_SELECTED.to_string(),
+            });
+        }
+    }
+
     // The plan's gate omissions (record_unavailable / record_mismatch /
     // vendor_unwired / redirect_unwired / wiring_conflict) join the omission
     // channel so they surface as per-purl `skipped` events like any
@@ -1599,6 +1640,10 @@ fn join_and(items: &[&str]) -> String {
 /// overrides, ignores or rejects (#393, #458, #531).
 const GO_WORKSPACE_OVERRIDE: &str = "go_workspace_override";
 
+/// Omission tag for a Go patch whose version-pinned replace names a version
+/// the build list does not select (#391, #392, #509).
+const GO_VERSION_NOT_SELECTED: &str = "go_version_not_selected";
+
 /// Synthesize go-patches redirect targets for `vex`: for every socket-owned (`.socket/go-patches/`) `replace` in
 /// `go.mod` whose module+version maps to a golang PURL of the record view
 /// (`manifest` — for `vex` the merged manifest + ledger + lockfile view, so
@@ -1732,6 +1777,10 @@ fn omission_phrase(reason: &str) -> &'static str {
         GO_WORKSPACE_OVERRIDE => {
             "the go.work in effect overrides, ignores or conflicts with its go.mod replace, \
              so the build does not link the patched module"
+        }
+        GO_VERSION_NOT_SELECTED => {
+            "go.mod and go.sum show the build selects another version of the module, so its \
+             version-pinned replace is ignored and the build links the unpatched module"
         }
         WIRING_CONFLICT => {
             "the lockfiles wire this package to different patches, so which one the build \
@@ -1916,6 +1965,7 @@ mod tests {
             REDIRECT_UNWIRED,
             WIRING_CONFLICT,
             GO_WORKSPACE_OVERRIDE,
+            GO_VERSION_NOT_SELECTED,
         ] {
             assert_ne!(
                 omission_phrase(tag),

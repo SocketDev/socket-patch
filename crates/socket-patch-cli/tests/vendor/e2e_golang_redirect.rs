@@ -253,13 +253,18 @@ fn check_detects_resolved_version_mismatch() {
     );
 
     // apply must NOT silently paper over it: a version bump means the manifest
-    // is stale (it patches v1.4.2, the build wants v1.5.0). apply re-affirms the
-    // v1.4.2 redirect but cannot make the build use it, so check STAYS red until
-    // a human re-scans. (Fail-closed stays closed — never a false "in sync".)
+    // is stale (it patches v1.4.2, the build wants v1.5.0). A v1.4.2 redirect
+    // can't make the build use it, so apply refuses and names the selected
+    // version (#392) instead of reporting the patch applied, and check STAYS
+    // red until a human re-scans. (Fail-closed stays closed.)
+    let (code, so, se) = apply(root, &gomodcache);
     assert_eq!(
-        apply(root, &gomodcache).0,
-        0,
-        "apply itself succeeds (re-affirms v1.4.2)"
+        code, 1,
+        "apply must refuse an unselected version.\n{so}\n{se}"
+    );
+    assert!(
+        format!("{so}{se}").contains("v1.5.0"),
+        "the refusal names the version the build selects.\n{so}\n{se}"
     );
     assert_eq!(
         check(root, &gomodcache),

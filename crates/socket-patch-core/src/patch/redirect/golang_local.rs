@@ -38,9 +38,9 @@ use crate::vendor::common::{
 use crate::constants::SOCKET_DIR;
 use crate::patch::path_safety;
 use crate::utils::socket_dir::remove_tree_and_prune;
+use crate::vendor::go_build_list::{self, Selection};
 use crate::vendor::go_mod_edit::{
-    self, read_replace_entries, read_required_versions, replace_target_path, ReplaceOwner,
-    GO_PATCHES_DIR,
+    self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
 };
 use crate::vendor::PackageSource;
 
@@ -72,9 +72,10 @@ pub enum Drift {
     },
     /// A socket-owned `replace` directive exists with no desired PURL.
     OrphanReplace { module: String },
-    /// `go.mod`'s `require` set resolves this module to a version that does NOT
-    /// match the patched version, so the version-pinned `replace` is unused and
-    /// the build silently links the UNPATCHED module.
+    /// The build list selects a version of this module that does NOT match
+    /// the patched version (`go.mod`'s `require`, or for a pre-1.17 graph the
+    /// version go.sum records as built), so the version-pinned `replace` is
+    /// unused and the build silently links the UNPATCHED module.
     ResolvedVersionMismatch {
         purl: String,
         patched_version: String,
@@ -117,8 +118,8 @@ impl std::fmt::Display for Drift {
                 required_version,
             } => write!(
                 f,
-                "{purl}: patched version {patched_version} is not the required version \
-                 (go.mod requires {required_version}) — go would link the UNPATCHED module"
+                "{purl}: patched version {patched_version} is not the version the build \
+                 selects ({required_version}) — go would link the UNPATCHED module"
             ),
         }
     }
@@ -245,6 +246,14 @@ pub async fn apply_go_redirect<'a>(
         crate::vendor::go_consumer_sync::replace_refusal(project_root, module, version, base_rel)
             .await
     {
+        return synthesized_result(purl, &copy_dir, Vec::new(), false, Some(refusal));
+    }
+
+    // A replace for a version the build list doesn't select is inert: the
+    // build links the unpatched module while apply would report it patched
+    // (#392). Discovery offers every cached version, so refuse before
+    // copying anything, the same gate the hosted rewriter applies.
+    if let Some(refusal) = selection_refusal(project_root, module, version).await {
         return synthesized_result(purl, &copy_dir, Vec::new(), false, Some(refusal));
     }
 
@@ -454,13 +463,12 @@ pub async fn reconcile_go_redirects(
 /// committed copies, and `go.mod` — never the module cache, no network — so it
 /// works on a fresh clone / airgapped CI.
 ///
-/// Version cross-check limitation: the resolved-version comparison uses
-/// `go.mod`'s `require` directives. After `go mod tidy` these list the selected
-/// version of every module that provides an imported package (direct *and*
-/// `// indirect`), so the common cases are covered. A patched module that is
-/// **transitive-only and absent from `require`** cannot be version-checked here
-/// (full MVS needs the toolchain); such a patch falling stale relies on the
-/// build-time guard (which runs where `go` is present) for eventual detection.
+/// Version cross-check: [`go_build_list::selection`] reads the selected
+/// version from `go.mod` and `go.sum`. For a go ≥ 1.17 graph `require` lists
+/// it for every module that provides a package; for an older graph go.sum's
+/// zip lines show which version is built (#392). When neither file says,
+/// the patch is not flagged; the build-time guard (which runs where `go` is
+/// present) catches it.
 pub async fn verify_go_redirect_state(
     project_root: &Path,
     manifest: &PatchManifest,
@@ -468,9 +476,6 @@ pub async fn verify_go_redirect_state(
 ) -> Result<(), Vec<Drift>> {
     let mut drifts = Vec::new();
     let entries = read_replace_entries(project_root).await;
-    // Required versions from go.mod (None ⇒ no go.mod ⇒ skip the version
-    // cross-check). Read once, project-local, offline.
-    let required = read_required_versions(project_root).await;
     let desired_modules: HashSet<String> = desired
         .iter()
         .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m.into_owned()))
@@ -507,20 +512,20 @@ pub async fn verify_go_redirect_state(
             continue;
         }
 
-        // go.mod `require` cross-check: if the graph resolves this module to a
-        // version that is NOT the patched one, the version-pinned `replace` is
-        // unused and the build links the unpatched module — a silent-stale hole
-        // the copy/directive checks below can't see. (A module absent from
-        // `require` is harmless — it isn't built — so only flag a
-        // present-but-different resolution.)
-        if let Some(req) = required.as_ref().and_then(|r| r.get(module)) {
-            if req != version {
-                drifts.push(Drift::ResolvedVersionMismatch {
-                    purl: purl.clone(),
-                    patched_version: version.to_string(),
-                    required_version: req.clone(),
-                });
-            }
+        // Selected-version cross-check: if the build list selects a version
+        // that is NOT the patched one, the version-pinned `replace` is unused
+        // and the build links the unpatched module — a silent-stale hole the
+        // copy/directive checks below can't see. Only a proven other version
+        // is flagged: a module the build doesn't use at all isn't linked.
+        // Project-local and offline: go.mod + go.sum only.
+        if let Some(Selection::Other(selected)) =
+            go_build_list::project_selection(project_root, module, version).await
+        {
+            drifts.push(Drift::ResolvedVersionMismatch {
+                purl: purl.clone(),
+                patched_version: version.to_string(),
+                required_version: selected,
+            });
         }
 
         let copy_dir = copy_dir_for(project_root, GO_PATCHES_DIR, module, version);
@@ -592,6 +597,28 @@ pub async fn verify_go_redirect_state(
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Why apply must not write a `replace` for `module@version`, when go.mod
+/// and go.sum prove the build list does not select that version.
+pub(crate) async fn selection_refusal(
+    project_root: &Path,
+    module: &str,
+    version: &str,
+) -> Option<String> {
+    match go_build_list::project_selection(project_root, module, version).await? {
+        Selection::Other(selected) => Some(format!(
+            "the build selects {module} {selected}, not the patched {version}: a replace \
+             pinned to {version} would be ignored and the build would link the unpatched \
+             module; nothing written (get a patch for {selected}, or require {version})"
+        )),
+        Selection::NotInGraph => Some(format!(
+            "{module} {version} is not in this project's build graph (go.mod does not \
+             require it and go.sum has no zip line for it): its replace would be ignored; \
+             nothing written"
+        )),
+        Selection::Selected | Selection::Unknown => None,
+    }
+}
 
 /// Failure cleanup for the rebuild legs of [`apply_go_redirect`]. By the time
 /// a rebuild leg fails, any pre-existing copy is already gone (`fresh_copy`
@@ -1711,6 +1738,126 @@ mod tests {
             .any(|d| matches!(d, Drift::ResolvedVersionMismatch { .. })));
     }
 
+    /// The #392 graph in a go 1.16 go.mod: `mida` requires bar v1.4.2,
+    /// `midb` requires v1.5.0, MVS selects v1.5.0. go.mod lists neither
+    /// version; go.sum keeps only a `/go.mod` line for the losing v1.4.2.
+    const GO116_MOD: &str = "module example.com/app\n\ngo 1.16\n\nrequire (\n\texample.com/mida v1.0.0\n\texample.com/midb v1.0.0\n)\n";
+    const GO116_SUM: &str = "github.com/foo/bar v1.4.2/go.mod h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+                             github.com/foo/bar v1.5.0 h1:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\n\
+                             github.com/foo/bar v1.5.0/go.mod h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
+
+    async fn apply_fixture(
+        root: &Path,
+        blobs: &Path,
+        pristine: &Path,
+        files: &HashMap<String, PatchFileInfo>,
+    ) -> ApplyResult {
+        let sources = PatchSources::blobs_only(blobs);
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            pristine,
+            root,
+            GO_PATCHES_DIR,
+            files,
+            &sources,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await
+    }
+
+    /// #392: apply must not write a replace for a version the build list
+    /// doesn't select — not in a go 1.16 graph where go.sum shows another
+    /// version is built, not when a go >= 1.17 go.mod requires another
+    /// version, and not when the project doesn't use the module at all.
+    #[tokio::test]
+    async fn test_apply_refuses_a_version_the_build_does_not_select() {
+        for (go_mod, go_sum, needle) in [
+            (GO116_MOD, Some(GO116_SUM), "the build selects github.com/foo/bar v1.5.0"),
+            (
+                "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.5.0 // indirect\n",
+                None,
+                "the build selects github.com/foo/bar v1.5.0",
+            ),
+            ("module example.com/app\n\ngo 1.21\n", None, "not in this project's build graph"),
+        ] {
+            let (dir, blobs, pristine, files, _after) = fixture().await;
+            let root = dir.path();
+            tokio::fs::write(root.join("go.mod"), go_mod).await.unwrap();
+            if let Some(sum) = go_sum {
+                tokio::fs::write(root.join("go.sum"), sum).await.unwrap();
+            }
+            let result = apply_fixture(root, &blobs, &pristine, &files).await;
+            assert!(!result.success, "{go_mod}");
+            let error = result.error.unwrap_or_default();
+            assert!(error.contains(needle), "{error}");
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("go.mod")).await.unwrap(),
+                go_mod,
+                "nothing written"
+            );
+            assert!(!root.join(GO_PATCHES_DIR).exists(), "no copy");
+        }
+    }
+
+    /// The selected version still applies in a go 1.16 graph, including a
+    /// transitive module go.mod doesn't list, and the re-run after
+    /// `go mod tidy` (which drops the replaced original's go.sum lines)
+    /// stays in sync.
+    #[tokio::test]
+    async fn test_apply_go116_selected_version_still_applies() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        tokio::fs::write(root.join("go.mod"), GO116_MOD)
+            .await
+            .unwrap();
+        let sum = "github.com/foo/bar v1.4.2 h1:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=\n\
+                   github.com/foo/bar v1.4.2/go.mod h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
+        tokio::fs::write(root.join("go.sum"), sum).await.unwrap();
+        assert!(apply_fixture(root, &blobs, &pristine, &files).await.success);
+        // `go mod tidy` drops the replaced original's lines.
+        tokio::fs::write(root.join("go.sum"), "").await.unwrap();
+        assert!(apply_fixture(root, &blobs, &pristine, &files).await.success);
+        let manifest = manifest_with(&files);
+        let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
+        assert_eq!(
+            verify_go_redirect_state(root, &manifest, &desired).await,
+            Ok(())
+        );
+    }
+
+    /// #392: in a go 1.16 graph `apply --check` must flag a redirect whose
+    /// module go.mod doesn't list when go.sum shows the build selects
+    /// another version — "absent from require" isn't "not built" there.
+    #[tokio::test]
+    async fn test_verify_flags_go116_transitive_version_mismatch() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        assert!(apply_fixture(root, &blobs, &pristine, &files).await.success);
+        let replace = "\nreplace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n";
+        tokio::fs::write(root.join("go.mod"), format!("{GO116_MOD}{replace}"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("go.sum"), GO116_SUM)
+            .await
+            .unwrap();
+        let manifest = manifest_with(&files);
+        let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            drifts,
+            vec![Drift::ResolvedVersionMismatch {
+                purl: PURL.into(),
+                patched_version: VERSION.into(),
+                required_version: "v1.5.0".into(),
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn test_verify_orphan_replace() {
         let (dir, blobs, pristine, files, _after) = fixture().await;
@@ -1940,6 +2087,13 @@ mod tests {
         let (module, version) = parse_golang_purl(encoded_purl).unwrap();
         // After parsing, version is `v2.0.0+incompatible` (decoded).
         assert_eq!(version, "v2.0.0+incompatible");
+        // The build must select the patched version for apply to wire it.
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v2.0.0+incompatible\n",
+        )
+        .await
+        .unwrap();
 
         let result = apply_go_redirect(
             encoded_purl,
