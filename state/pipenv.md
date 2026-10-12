@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-09 ~15:40Z, main `2e0d17f`. No new issues. Added Pipenv evidence to #1127 (human `scan --mode vendored --prune` skips the vendored GC when nothing left has a patch; `--json` works). #1184 / #612 unchanged. #1245 (shared vendored revert step) regression checks pass: `use_pylock` revert / rollback / remove, named categories, 2018.11.26 / 2023 / 2024 / 2026 core. #1259 (Python env rework): Pipenv agent discovery passes, including IGNORE / ACTIVE and a `[tool.poetry]` pyproject. Previous run: 2026-10-09 ~09:36Z.
+Last run: 2026-10-12 ~21:20Z, main `6ad6add` (v5.0.0). Filed #1450 (the Pipenv stale-install remedy can't replace a base-interpreter copy in a `--site-packages` venv). Verified fixed: #612, #1184, and #1368 / #912 `use_pylock` vendored co-wiring. #409 / #1419 Pipenv lane: the warning and vex are correct. #842 and #981 are unchanged. Previous run: 2026-10-09 ~15:40Z.
 
 ## Coverage matrix
 
@@ -98,10 +98,13 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `15:40Z` run (2026-10-09), `2e0d17f`: vendored lifecycle on 2023.12.1 / 2024.4.1 / 2026.8.0, and 2018.11.26 (py3.8) hosted + vendored: pass. Named `[tests]` category, hosted + vendored on 2023 / 2026: pass. `use_pylock` vendored revert / rollback / remove: pass. `pylock_name` with both files: hosted pass, vendored #612. Pipfile + pylock + uv project: fail-closed, pass. Hosted `pipenv requirements --hash` sibling with `pip --require-hashes`: pass. Agent mode after #1259 (WORKON, in-project, foreign VIRTUAL_ENV, IGNORE / ACTIVE, `[tool.poetry]` pyproject): pass. Human `--prune` after uninstall: fail #1127 (cross-PM).
 
+`21:20Z` run (2026-10-12), `6ad6add`: #612 (vendored + root export, 2023 / 2026), #1184 (residual keep wording, re-export + remove) and `use_pylock` vendored co-wiring (2026): pass. `pipenv --site-packages` / `PIPENV_SITE_PACKAGES=1` with a Debian base six (2023 / 2026, hosted + vendored): warning and vex `not_applied` pass; both printed remedies fail #1450 (also 2022 remedy 1).
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
+00000000000000. **New (2026-10-12):** re-verify #1450 once fixed. #1437 / #1440 on Pipenv (one package hosted plus one vendored in one Pipfile.lock; bare `scan` / `get` should give `mode_ambiguous` exit 2 and write nothing). #409 lanes: a base with a different version, and a uv-managed base interpreter. (#612 / #1184 / #1368 verified fixed 2026-10-12.)
 0000000000000. #1127 (human `scan --mode vendored --prune` skips the vendored GC when no remaining package has a patch; Pipenv evidence added 2026-10-09 15:40Z): re-verify once fixed, for `[packages]`, named categories and `use_pylock`. Until then, test #1050 GC lanes with `--json --prune`. Still to do: #1050 GC on `use_pylock` / `pylock_name`; vendored undo on 2022 / 2025 after #1245; hosted rollback of a valid hand-written pylock entry.
 000000000000. #1219: re-verify once fixed (`apply --check` remedy with `-g`, `--global-prefix`, `--cwd`, `--manifest-path`).
 00000000000. #1184: re-verify once fixed (remove / rollback / takeover / `vendor --revert` summary wording and the loop; also subdir and UTF-16 exports). (#1167 Pipenv lane verified fixed on `f3c6313`, 2026-10-09.)
@@ -218,3 +221,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Hosted rollback of a `use_pylock` / `pylock_name` project re-derives the pylock entry from PyPI (adds the sdist, uses the real files.pythonhosted.org URLs). Pipenv 2026.8.0's own entry is malformed (two `py3-none-any` names with fake `pypi.org/simple` URLs), so the restore is valid but not byte-exact. Pipfile.lock is byte-exact, and sync works. Upstream re-derivation, by design.
 - `pipenv requirements --dev > requirements-dev.txt` beside Pipfile.lock isn't rewritten by hosted (only the root `requirements.txt` and its `-r` includes are candidates, CLI_CONTRACT pypi row), so `pip install -r requirements-dev.txt` installs upstream. Documented scope, not filed.
 - Human `scan --mode vendored --prune` doing no GC after `pipenv uninstall`: that's #1127 (all ecosystems), not a Pipenv revert bug. Use `--json --prune` in harnesses.
+- Since #1419, agent mode in a `pipenv --site-packages` venv patches the base interpreter's copy (e.g. `/usr/lib/python3/dist-packages`) that the venv imports, with no `-g`. That's deliberate (#409 fix), not filed.
+- `vendor_pypi_reinstall_required` after `remove` / `vendor --revert` says the patched build is "still installed" even when nothing is installed (lock-only checkout). It's unconditional by design (#477) and conservative.
+- Vendored `use_pylock` with Pipfile.lock deleted afterwards (pylock-only): Pipenv sync gives UPSTREAM, vex withholds, and `vendor --check` says "dependency removed" although pylock.toml still names the wheel. An artificial shape; the wording is imprecise but fail-closed.
+- Harness note (2026-10-12): the mock is two instances, hosted (`MOCK_MODE=hosted`) and vendor (`SOCKET_VENDOR_URL`, `/artifacts/<uuid>/<wheel>`, sha512 SRI). `SOCKET_PROXY_URL` is needed for vex records.
