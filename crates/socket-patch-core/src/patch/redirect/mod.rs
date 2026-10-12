@@ -5782,12 +5782,15 @@ fn plan_python_metadata_with(
         detail: format!("{metadata_path}: {detail}"),
     };
     source_scope().map_err(unsupported)?;
+    let project_file = |rel: &str| files.get(rel).map(String::as_str);
     crate::utils::python_script::refuse_uv_no_sources(
-        &original,
-        script,
-        files
-            .get(crate::utils::python_script::UV_TOML)
-            .map(String::as_str),
+        script.then_some(original.as_str()),
+        if script {
+            project_file("pyproject.toml")
+        } else {
+            Some(&original)
+        },
+        project_file(crate::utils::python_script::UV_TOML),
     )
     .map_err(unsupported)?;
     let rewritten = if script {
@@ -25441,6 +25444,31 @@ mod python_metadata_pairing_tests {
             &[
                 ("tool.py", &script_false),
                 ("uv.toml", "no-sources = true\n"),
+            ],
+        );
+        // A script without its own setting takes the project's: uv.toml,
+        // else pyproject's [tool.uv].
+        assert_eq!(
+            refused(
+                "tool.py.lock",
+                &[("tool.py", SCRIPT), ("pyproject.toml", &project_no_sources)]
+            ),
+            "redirect_uv_script_unsupported"
+        );
+        wired(
+            "tool.py.lock",
+            &[
+                ("tool.py", SCRIPT),
+                ("pyproject.toml", &project_no_sources),
+                ("uv.toml", "offline = false\n"),
+            ],
+        );
+        // A uv.toml that does not parse sets nothing (uv reports it).
+        wired(
+            "uv.lock",
+            &[
+                ("pyproject.toml", PYPROJECT),
+                ("uv.toml", "no-sources = [\n"),
             ],
         );
     }

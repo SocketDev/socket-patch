@@ -180,10 +180,11 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   unpatched registry wheel. Both modes refuse it before any file is written:
   vendored with `pypi_uv_no_sources`, hosted with
   `redirect_uv_project_unsupported` / `redirect_uv_script_unsupported`
-  (#564). The setting is read where uv reads it: a project `uv.toml`
-  replaces pyproject's `[tool.uv]` settings, and a PEP 723 script's own
-  `[tool.uv]` wins over `uv.toml`. `UV_NO_SOURCES` and `--no-sources` are
-  install-time choices the scan cannot see.
+  (#564). The setting is read where uv reads it: a PEP 723 script's own
+  `[tool.uv]` wins; otherwise a project `uv.toml` replaces pyproject's
+  `[tool.uv]` settings outright. `UV_NO_SOURCES`, `--no-sources` and a
+  user-level `uv.toml` belong to the machine that installs, which the scan
+  cannot see.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751

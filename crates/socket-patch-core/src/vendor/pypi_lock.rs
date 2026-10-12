@@ -179,6 +179,9 @@ async fn load_listed_locks(
     let mut files = Vec::new();
     let mut in_sync = true;
     let mut pin = None;
+    // The project's pyproject.toml and uv.toml, read once on the first
+    // script lock for the no-sources check (#564).
+    let mut project_config: Option<(Option<String>, Option<String>)> = None;
     for path in paths.into_iter().filter(|path| path != "uv.lock") {
         let text = read_file(&root.join(&path)).await?;
         let rewritten = rewrite_python_lock(
@@ -241,12 +244,17 @@ async fn load_listed_locks(
                 return Err(("pypi_script_multiple_versions", format!("{path} resolves multiple versions of {name}; a script source override cannot select only {version}")));
             }
             let script = read_file(&root.join(script_name)).await?;
-            refuse_uv_no_sources(
-                &script,
-                true,
-                super::pypi_uv::read_uv_toml(root).await?.as_deref(),
-            )
-            .map_err(|detail| ("pypi_uv_no_sources", format!("{script_name}: {detail}")))?;
+            let (pyproject, uv_toml) = match &project_config {
+                Some(config) => config,
+                None => project_config.insert((
+                    read_regular_to_string(&root.join("pyproject.toml"))
+                        .await
+                        .ok(),
+                    super::pypi_uv::read_uv_toml(root).await,
+                )),
+            };
+            refuse_uv_no_sources(Some(&script), pyproject.as_deref(), uv_toml.as_deref())
+                .map_err(|detail| ("pypi_uv_no_sources", format!("{script_name}: {detail}")))?;
             let script_wheel = source_path(package).unwrap_or(&placeholder);
             if rewrite_script_metadata(&script, name, version, ArtifactSource::Path(script_wheel))
                 .map_err(|error| {
@@ -1239,16 +1247,23 @@ mod tests {
         );
     }
 
-    /// #564: a script lock whose script (or the uv.toml beside it) sets
-    /// `no-sources = true` is refused before anything is written, since uv
-    /// would ignore the vendored `[tool.uv.sources]` entry.
+    /// #564: a script lock whose script (or, without its own setting, the
+    /// project's uv.toml or pyproject `[tool.uv]`) sets `no-sources = true`
+    /// is refused before anything is written, since uv would ignore the
+    /// vendored `[tool.uv.sources]` entry.
     #[tokio::test]
     async fn script_no_sources_refuses_before_writing() {
         let lock = "version = 1\n[[package]]\nname = \"two\"\nversion = \"2\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
         let plain = "# /// script\n# dependencies = [\"two==2\"]\n# ///\n";
         let no_sources =
             "# /// script\n# dependencies = [\"two==2\"]\n#\n# [tool.uv]\n# no-sources = true\n# ///\n";
-        for (script, uv_toml) in [(no_sources, None), (plain, Some("no-sources = true\n"))] {
+        let pyproject_no_sources =
+            "[project]\nname = \"p\"\nversion = \"0\"\n[tool.uv]\nno-sources = true\n";
+        for (script, file, config) in [
+            (no_sources, None, ""),
+            (plain, Some("uv.toml"), "no-sources = true\n"),
+            (plain, Some("pyproject.toml"), pyproject_no_sources),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             tokio::fs::write(temp.path().join("job.py.lock"), lock)
                 .await
@@ -1256,8 +1271,8 @@ mod tests {
             tokio::fs::write(temp.path().join("job.py"), script)
                 .await
                 .unwrap();
-            if let Some(uv_toml) = uv_toml {
-                tokio::fs::write(temp.path().join("uv.toml"), uv_toml)
+            if let Some(file) = file {
+                tokio::fs::write(temp.path().join(file), config)
                     .await
                     .unwrap();
             }
@@ -1269,7 +1284,7 @@ mod tests {
             )
             .await
             else {
-                panic!("{script:?} with uv.toml {uv_toml:?} must refuse");
+                panic!("{script:?} with {file:?} must refuse");
             };
             assert_eq!(error.0, "pypi_uv_no_sources", "{}", error.1);
             assert_eq!(

@@ -4213,7 +4213,6 @@ mod tests {
                 "Pipfile",
                 "pyproject.toml",
                 "hatch.toml",
-                "uv.toml",
                 "Cargo.toml",
                 "Cargo.lock",
                 ".cargo/config.toml",

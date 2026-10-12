@@ -99,16 +99,10 @@ pub(super) struct UvProject {
 }
 
 /// The project's `uv.toml` beside `root`'s pyproject.toml (or a script),
-/// `None` when there is none, for [`refuse_uv_no_sources`].
-pub(super) async fn read_uv_toml(root: &Path) -> Result<Option<String>, (&'static str, String)> {
-    match read_regular_to_string(&root.join(UV_TOML)).await {
-        Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err((
-            "pypi_uv_lock_parse_failed",
-            format!("cannot read {UV_TOML}: {e}"),
-        )),
-    }
+/// for [`refuse_uv_no_sources`]. Advisory: one that is missing or cannot
+/// be read sets nothing (uv reports an unreadable one itself).
+pub(super) async fn read_uv_toml(root: &Path) -> Option<String> {
+    read_regular_to_string(&root.join(UV_TOML)).await.ok()
 }
 
 /// Read + parse the pair and run every project-level guard. Refuses before
@@ -228,8 +222,12 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
 
     // uv ignores every [tool.uv.sources] entry under no-sources = true, so
     // the vendored source would be dropped by the next `uv sync` (#564).
-    refuse_uv_no_sources(&pyproject_text, false, read_uv_toml(root).await?.as_deref())
-        .map_err(|detail| ("pypi_uv_no_sources", detail))?;
+    refuse_uv_no_sources(
+        None,
+        Some(&pyproject_text),
+        read_uv_toml(root).await.as_deref(),
+    )
+    .map_err(|detail| ("pypi_uv_no_sources", detail))?;
 
     // PEP 621 dynamic dependencies are resolved by a build backend at lock
     // time — there is no static dependency list to classify against.
