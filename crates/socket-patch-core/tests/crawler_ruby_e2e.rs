@@ -1329,6 +1329,44 @@ async fn moved_bundle_gemfile_root_crawls_the_loaded_copy() {
         }
     }
 
+    let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+    for key in keys {
+        std::env::remove_var(key);
+    }
+    std::env::set_var("HOME", tmp.path().join("home"));
+    let non_ruby = tmp.path().join("frontend");
+    std::fs::create_dir_all(&non_ruby).unwrap();
+    // `gemfiles/.bundle/config` recording `../vendor/bundle` installs back
+    // in the project's own `vendor/bundle`: still inside the project, so
+    // not refused by the containment guard.
+    let climbing_store = root.join("vendor/bundle/ruby/3.3.0/gems");
+    let climbing_copy = stage_gem(&climbing_store, "colorize", "0.8.1").await;
+    std::fs::remove_dir_all(root.join(".bundle")).ok();
+    std::fs::remove_dir_all(root.join("gemfiles/vendor")).unwrap();
+    std::fs::create_dir_all(root.join("gemfiles/.bundle")).unwrap();
+    std::fs::write(
+        root.join("gemfiles/.bundle/config"),
+        "---\nBUNDLE_PATH: \"../vendor/bundle\"\n",
+    )
+    .unwrap();
+    std::env::set_var("BUNDLE_GEMFILE", &alt);
+    let climbing = RubyCrawler::discover_bundle_stores(&root).await;
+    // A machine-wide BUNDLE_GEMFILE export does not make a directory with
+    // no Gemfile a Ruby project.
+    let foreign = RubyCrawler::discover_bundle_stores(&non_ruby).await;
+    std::env::remove_var("BUNDLE_GEMFILE");
+    for (key, value) in keys.into_iter().zip(previous) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    assert_eq!(climbing.stores, vec![climbing_store.clone()]);
+    assert_eq!(climbing.skipped_config_path, None);
+    assert!(climbing_copy.is_dir());
+    assert_eq!(foreign.bundler_root, None);
+    assert!(foreign.stores.is_empty(), "{:?}", foreign.stores);
+
     for (label, stores, found, unused) in cases {
         assert_eq!(stores, vec![loaded_store.clone()], "{label}");
         // The loaded copy is found first, as the primary store's copy.

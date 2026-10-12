@@ -137,9 +137,7 @@ impl RubyCrawler {
         // `Gem.path`, and a gem the project loads routinely lives in a
         // non-`gemdir` home (rvm keeps shared gems in the `@global` gemset;
         // `--user-install` puts them under `~/.gem`/`$XDG_DATA_HOME`).
-        if !discovery.default_root_has_stores
-            && (discovery.bundler_root.is_some() || Self::has_bundler_manifest(&options.cwd).await)
-        {
+        if !discovery.default_root_has_stores && Self::has_bundler_manifest(&options.cwd).await {
             let mut seen: HashSet<PathBuf> = paths.iter().cloned().collect();
             for gems_dir in Self::gem_env_gems_dirs().await {
                 if seen.insert(gems_dir.clone()) {
@@ -409,21 +407,37 @@ impl RubyCrawler {
         // Every root below is relative to `Bundler.root`, which a
         // `BUNDLE_GEMFILE` naming a gemfile in another directory moves
         // there (#952): the app config, a relative `BUNDLE_PATH`, the
-        // standalone and default stores all follow it. A configured
-        // gemfile that exists also makes this a Ruby project for the
-        // gates below, whatever the project root itself holds.
-        let bundler_root = bundler_moved_root(
-            cwd,
-            BundlerEnv {
-                gemfile: gemfile_env,
-                lockfile: None,
-                app_config: app_config_env,
-                ignore_config,
-                global_config,
-            },
-        )
-        .await;
-        let has_manifest = bundler_root.is_some() || Self::has_bundler_manifest(cwd).await;
+        // standalone and default stores all follow it. Only for a Ruby
+        // project, like every explicit root: a machine-wide
+        // `BUNDLE_GEMFILE` export must not pull another project's stores
+        // into a non-Ruby scan.
+        let has_manifest = Self::has_bundler_manifest(cwd).await;
+        let bundler_root = if has_manifest {
+            bundler_moved_root(
+                cwd,
+                BundlerEnv {
+                    gemfile: gemfile_env,
+                    lockfile: None,
+                    app_config: app_config_env,
+                    ignore_config,
+                    global_config,
+                },
+                home,
+            )
+            .await
+        } else {
+            None
+        };
+        // The app config's `BUNDLE_PATH` stays contained in the project
+        // even when it resolves against a moved root inside it
+        // (`gemfiles/` recording `../vendor/bundle`). A root the user's
+        // own environment moved outside the project bounds it instead.
+        let containment = match &bundler_root {
+            Some(root) if !std::path::absolute(cwd).is_ok_and(|p| root.starts_with(p)) => {
+                root.clone()
+            }
+            _ => cwd.to_path_buf(),
+        };
         let cwd = bundler_root.as_deref().unwrap_or(cwd);
         let default_root = cwd.join("vendor").join("bundle");
         let default_root = normalize_lexically(&default_root).unwrap_or(default_root);
@@ -458,7 +472,13 @@ impl RubyCrawler {
             if let Some(value) =
                 Self::app_config_bundle_path(cwd, app_config_env, ignore_config, home).await
             {
-                match resolve_config_bundle_path(cwd, &value, home) {
+                let contained = match &bundler_root {
+                    None => resolve_config_bundle_path(cwd, &value, home),
+                    Some(_) => resolve_bundle_path(cwd, Path::new(&value), home)
+                        .to_str()
+                        .and_then(|moved| resolve_config_bundle_path(&containment, moved, home)),
+                };
+                match contained {
                     Some(root) => roots.push(root),
                     // Refused by the containment guard. Recorded — not
                     // printed: the crawler has no --silent/--json context,
@@ -724,7 +744,7 @@ impl RubyCrawler {
             Vec::new()
         };
         bundler_gem_homes_from(
-            &options.cwd,
+            discovery.bundler_root.as_deref().unwrap_or(&options.cwd),
             &discovery.stores,
             &verification,
             &system_homes,
@@ -762,9 +782,7 @@ impl RubyCrawler {
     /// ([`Self::bundler_install_homes`]) and `vex`
     /// ([`Self::bundler_unused_system_gem_homes`]) use.
     async fn bundler_uses_system_gems(cwd: &Path, discovery: &BundleStoreDiscovery) -> bool {
-        if discovery.default_root_has_stores
-            || (discovery.bundler_root.is_none() && !Self::has_bundler_manifest(cwd).await)
-        {
+        if discovery.default_root_has_stores || !Self::has_bundler_manifest(cwd).await {
             return false;
         }
         let ignore_config = bundler_ignores_config();
@@ -1861,11 +1879,17 @@ pub async fn bundler_loaded_manifest_with_env(
 /// bundle path against it (#952). Only an existing file moves the root:
 /// Bundler refuses a missing gemfile, so nothing installs from there.
 ///
+/// A leading `~` expands against `home`, as in bundler's `expand_path`.
+///
 /// The env and global config values are the user's own machine state; a
 /// value from the app config is project input, so it only moves the root
-/// to a directory inside `root`: the moved root's stores become apply
-/// write targets.
-pub(crate) async fn bundler_moved_root(root: &Path, env: BundlerEnv<'_>) -> Option<PathBuf> {
+/// to a directory inside `root`, through symlinks too: the moved root's
+/// stores become apply write targets.
+pub(crate) async fn bundler_moved_root(
+    root: &Path,
+    env: BundlerEnv<'_>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
     use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
     let LoadedManifest::Unsupported { value, by } =
         bundler_loaded_manifest_with_env(root, env).await
@@ -1877,7 +1901,7 @@ pub(crate) async fn bundler_moved_root(root: &Path, env: BundlerEnv<'_>) -> Opti
             .ok()
             .and_then(|p| normalize_lexically(&p))
     };
-    let gemfile = absolute(&root.join(&value))?;
+    let gemfile = absolute(&root.join(expand_tilde(Path::new(&value), home)))?;
     let is_file = tokio::fs::metadata(&gemfile)
         .await
         .is_ok_and(|m| m.is_file());
@@ -1886,8 +1910,15 @@ pub(crate) async fn bundler_moved_root(root: &Path, env: BundlerEnv<'_>) -> Opti
     if dir == here || same_file::is_same_file(dir, &here).unwrap_or(false) {
         return None;
     }
-    if by == GemfileSetting::AppConfig && !dir.starts_with(&here) {
-        return None;
+    if by == GemfileSetting::AppConfig {
+        let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+        let contained = match (canonical(dir), canonical(&here)) {
+            (Some(real_dir), Some(real_here)) => real_dir.starts_with(real_here),
+            _ => false,
+        };
+        if !dir.starts_with(&here) || !contained {
+            return None;
+        }
     }
     Some(dir.to_path_buf())
 }
@@ -2414,8 +2445,11 @@ mod tests {
         ] {
             std::fs::write(file, "gem \"foo\"\n").unwrap();
         }
+        // `~` is the temp dir, so `~/app/...` names the project's files.
+        let home = tmp.path().to_path_buf();
         let moved = |gemfile: Option<&'static str>| {
             let root = root.clone();
+            let home = home.clone();
             async move {
                 bundler_moved_root(
                     &root,
@@ -2423,6 +2457,7 @@ mod tests {
                         gemfile: gemfile.map(OsStr::new),
                         ..BundlerEnv::default()
                     },
+                    Some(&home),
                 )
                 .await
             }
@@ -2441,6 +2476,10 @@ mod tests {
         assert_eq!(moved(Some("Gemfile.next")).await, None);
         assert_eq!(moved(Some("gemfiles/missing.gemfile")).await, None);
         assert_eq!(moved(Some("gemfiles")).await, None, "a directory");
+        assert_eq!(
+            moved(Some("~/app/gemfiles/alt.gemfile")).await,
+            Some(gemfiles.clone())
+        );
         // The user's own environment may point anywhere.
         assert_eq!(
             moved(Some("../elsewhere/Gemfile")).await,
@@ -2450,9 +2489,14 @@ mod tests {
         // A committed app config may move the root inside the project
         // only: the moved root's stores become apply write targets.
         std::fs::create_dir_all(root.join(".bundle")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
         for (value, expected) in [
             ("gemfiles/alt.gemfile", Some(gemfiles.clone())),
             ("../elsewhere/Gemfile", None),
+            // A committed symlink must not carry the root out either.
+            #[cfg(unix)]
+            ("linked/Gemfile", None),
         ] {
             std::fs::write(
                 root.join(".bundle/config"),
