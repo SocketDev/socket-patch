@@ -1321,6 +1321,7 @@ async fn cargo_hosted_refuses_a_project_declaring_cargo_below_1_68() {
         refused: Some("redirect_cargo_old_cargo"),
         prefetch: "",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
 }
