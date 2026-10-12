@@ -1216,9 +1216,9 @@ pub fn yarn_classic_artifact_targets<'a>(
 }
 
 /// [`yarn_classic_artifact_targets`] over a classic `lock`, reading its
-/// registry copies through `read_copies`. The pinned-artifact and name
-/// tests are substring searches; the registry-copy test reads every
-/// block, so it runs after them, at most once per lock, and only when
+/// registry copies through `read_copies`. The lock is read in one pass for
+/// the artifacts it pins already; the registry-copy test reads every
+/// block, so it runs after that, at most once per lock, and only when
 /// some dep still needs it (#1423): a rescan whose grants all carry a
 /// sha1 and are pinned already never reads the blocks.
 fn select_classic_artifacts<'a>(
@@ -1226,6 +1226,7 @@ fn select_classic_artifacts<'a>(
     lock: &str,
     read_copies: impl FnOnce(&str) -> HashSet<(String, String)>,
 ) -> Vec<&'a DepOverride> {
+    let pinned = quoted_fragment_urls(lock);
     let mut read_copies = Some(read_copies);
     let mut registry_copies: Option<HashSet<(String, String)>> = None;
     let mut seen = BTreeSet::new();
@@ -1233,20 +1234,32 @@ fn select_classic_artifacts<'a>(
         .iter()
         .map(|c| &c.dep)
         .filter(|dep| dep.ecosystem == "npm" && dep.integrity.sha512.is_some())
+        .filter(|dep| dep.integrity.sha1.is_none() || !pinned.contains(dep.artifact_url.as_str()))
         .filter(|dep| {
-            dep.integrity.sha1.is_none() || !lock.contains(&format!("\"{}#", dep.artifact_url))
-        })
-        .filter(|dep| {
-            let name = crate::patch::redirect::full_name(dep);
-            lock.contains(&name)
-                && registry_copies
-                    .get_or_insert_with(|| {
-                        read_copies.take().map_or_else(HashSet::new, |r| r(lock))
-                    })
-                    .contains(&(name, dep.version.clone()))
+            registry_copies
+                .get_or_insert_with(|| read_copies.take().map_or_else(HashSet::new, |r| r(lock)))
+                .contains(&(crate::patch::redirect::full_name(dep), dep.version.clone()))
         })
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
+}
+
+/// Every `<url>` that `text` writes as `"<url>#…`: an opening quote, then
+/// text with no quote, `#` or line break, then a `#` (a `resolved` URL
+/// with its fragment). One pass, so asking whether the lock pins an
+/// artifact is a set lookup rather than a search of the whole lock.
+fn quoted_fragment_urls(text: &str) -> HashSet<&str> {
+    let mut urls = HashSet::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let end = after.find(['"', '#', '\n']).unwrap_or(after.len());
+        if after[end..].starts_with('#') {
+            urls.insert(&after[..end]);
+        }
+        rest = &after[end..];
+    }
+    urls
 }
 
 /// The `(name, version)` of every registry block in a classic `lock`: the
@@ -3132,6 +3145,19 @@ mod tests {
             purl: format!("pkg:npm/{name}@{version}"),
             dep,
         }
+    }
+
+    #[test]
+    fn quoted_fragment_urls_reads_each_resolved_url() {
+        let lock = "a@^1:\n  resolved \"https://r/a.tgz#aa\"\n\
+                    b@^1:\n  resolved \"https://r/b.tgz\"\n\
+                    \"c@^1\", \"c@^2\":\n  resolved \"https://r/c.tgz#cc\"\n";
+        let urls = quoted_fragment_urls(lock);
+        assert_eq!(
+            urls,
+            HashSet::from(["https://r/a.tgz", "https://r/c.tgz"]),
+            "{urls:?}"
+        );
     }
 
     /// #1423: the served tarball is read only for a dep the lock locks as
