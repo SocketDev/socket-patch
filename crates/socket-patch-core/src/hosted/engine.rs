@@ -1217,16 +1217,17 @@ pub fn yarn_classic_artifact_targets<'a>(
 
 /// [`yarn_classic_artifact_targets`] over a classic `lock`, reading its
 /// registry copies through `read_copies`. The lock is read in one pass for
-/// the artifacts it pins already; the registry-copy test reads every
-/// block, so it runs after that, at most once per lock, and only when
-/// some dep still needs it (#1423): a rescan whose grants all carry a
-/// sha1 and are pinned already never reads the blocks.
+/// the artifacts it pins already, once a dep with a sha1 asks; the
+/// registry-copy test reads every block, so it runs after that, at most
+/// once per lock, and only when some dep still needs it (#1423): a rescan
+/// whose grants all carry a sha1 and are pinned already never reads the
+/// blocks.
 fn select_classic_artifacts<'a>(
     candidates: &'a [Candidate],
     lock: &str,
     read_copies: impl FnOnce(&str) -> HashSet<(String, String)>,
 ) -> Vec<&'a DepOverride> {
-    let pinned = quoted_fragment_urls(lock);
+    let mut pinned: Option<HashSet<&str>> = None;
     let mut read_copies = Some(read_copies);
     let mut registry_copies: Option<HashSet<(String, String)>> = None;
     let mut seen = BTreeSet::new();
@@ -1234,7 +1235,12 @@ fn select_classic_artifacts<'a>(
         .iter()
         .map(|c| &c.dep)
         .filter(|dep| dep.ecosystem == "npm" && dep.integrity.sha512.is_some())
-        .filter(|dep| dep.integrity.sha1.is_none() || !pinned.contains(dep.artifact_url.as_str()))
+        .filter(|dep| {
+            dep.integrity.sha1.is_none()
+                || !pinned
+                    .get_or_insert_with(|| quoted_fragment_urls(lock))
+                    .contains(dep.artifact_url.as_str())
+        })
         .filter(|dep| {
             registry_copies
                 .get_or_insert_with(|| read_copies.take().map_or_else(HashSet::new, |r| r(lock)))
@@ -1268,10 +1274,10 @@ fn quoted_fragment_urls(text: &str) -> HashSet<&str> {
 /// by the blocks' real names, as the rewriter does, so `lodash` never
 /// matches a `lodash.debounce` block.
 fn classic_registry_copies(lock: &str) -> HashSet<(String, String)> {
-    use crate::formats::yarn::blocks::classic_field;
+    use crate::formats::yarn::blocks::{classic_field, scan_blocks};
     use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
     use crate::formats::yarn::source::{classic_copy_source, CopySource};
-    crate::vendor::yarn_classic_lock::scan_blocks_shared(lock)
+    scan_blocks(lock)
         .iter()
         .filter_map(|block| {
             let patterns = split_key_patterns(&block.key);

@@ -53,55 +53,49 @@ pub(crate) fn with_manifest_dep_maps(lines: &[String], pkg: &Value) -> Vec<Strin
 /// block of `blocks` is keyed by, sorted and deduplicated: the ones a lock
 /// rewritten to the patched manifest would leave unresolved.
 pub(crate) fn unlocked_descriptors(blocks: &[LockBlock], pkg: &Value) -> Vec<String> {
-    unlocked_among(
-        blocks,
-        manifest_dep_maps(pkg)
-            .into_iter()
-            .flat_map(|(_, deps)| deps)
-            .map(|(name, range)| format!("{name}@{range}")),
-    )
+    unlocked_among(blocks, manifest_descriptors(pkg))
+}
+
+/// [`unlocked_descriptors`] against `locked`, every pattern the lock's
+/// keys hold: for a caller that checks many manifests against one lock
+/// and splits its keys once, not once per manifest (#1423).
+pub(crate) fn unlocked_descriptors_in(
+    locked: &std::collections::HashSet<&str>,
+    pkg: &Value,
+) -> Vec<String> {
+    sorted_missing(manifest_descriptors(pkg), |d| locked.contains(d))
 }
 
 /// Every descriptor of `descriptors` no block of `blocks` is keyed by,
-/// sorted and deduplicated. Only a block whose key text names one of the
-/// descriptors' packages is split into its patterns, and none is when
-/// there are no descriptors: the hosted flow asks once per patched
-/// package, so splitting every key of a big lock each time made a scan
-/// O(patched packages × lock size) (#1423).
+/// sorted and deduplicated.
 pub(crate) fn unlocked_among(
     blocks: &[LockBlock],
     descriptors: impl Iterator<Item = String>,
 ) -> Vec<String> {
-    let mut missing: std::collections::BTreeSet<String> = descriptors.collect();
-    // A pattern is its key's text less the quotes, so the package name
-    // of a quote-free descriptor appears verbatim in any key locking it.
-    let names: Option<Vec<String>> = missing
+    let locked: std::collections::BTreeSet<String> = blocks
         .iter()
-        .map(|d| (!d.contains('"')).then(|| descriptor_name(d).to_string()))
+        .flat_map(|b| split_key_patterns(&b.key))
         .collect();
-    for block in blocks {
-        if missing.is_empty() {
-            break;
-        }
-        if let Some(names) = &names {
-            if !names.iter().any(|name| block.key.contains(name.as_str())) {
-                continue;
-            }
-        }
-        for pattern in split_key_patterns(&block.key) {
-            missing.remove(&pattern);
-        }
-    }
-    missing.into_iter().collect()
+    sorted_missing(descriptors, |d| locked.contains(d))
 }
 
-/// The package name of a `name@range` descriptor (`@scope/x` keeps its
-/// leading `@`); the whole text when it has no range.
-fn descriptor_name(descriptor: &str) -> &str {
-    match descriptor.char_indices().skip(1).find(|&(_, c)| c == '@') {
-        Some((at, _)) => &descriptor[..at],
-        None => descriptor,
-    }
+/// The descriptors `pkg`'s dependency maps declare, as `name@range`.
+fn manifest_descriptors(pkg: &Value) -> impl Iterator<Item = String> {
+    manifest_dep_maps(pkg)
+        .into_iter()
+        .flat_map(|(_, deps)| deps)
+        .map(|(name, range)| format!("{name}@{range}"))
+}
+
+/// The descriptors `is_locked` rejects, sorted and deduplicated.
+fn sorted_missing(
+    descriptors: impl Iterator<Item = String>,
+    is_locked: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut missing: Vec<String> = descriptors.filter(|d| !is_locked(d)).collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 /// The descriptors (`name@range`) the dependency sub-maps of `lines` (one
@@ -221,28 +215,6 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
         text.lines().map(str::to_string).collect()
     }
 
-    /// #1423: only the keys naming a wanted package are split, and a
-    /// descriptor still resolves through any pattern of a multi-pattern,
-    /// quoted or scoped key.
-    #[test]
-    fn unlocked_among_finds_descriptors_in_any_key_pattern() {
-        let lock = "# yarn lockfile v1\n\n\
-                    \"@scope/x@^1.0.0\", \"@scope/x@~1.2.0\":\n  version \"1.2.3\"\n\n\
-                    left-pad@^1.0.0, left-pad@^1.3.0:\n  version \"1.3.0\"\n\n\
-                    lodash.debounce@^4.0.0:\n  version \"4.0.8\"\n";
-        let blocks = scan_blocks(lock);
-        let among = |ds: &[&str]| unlocked_among(&blocks, ds.iter().map(|d| d.to_string()));
-        assert!(among(&[]).is_empty());
-        assert!(among(&["@scope/x@~1.2.0", "left-pad@^1.3.0", "left-pad@^1.0.0"]).is_empty());
-        assert_eq!(
-            among(&["lodash@^4.0.0", "@scope/x@^2.0.0", "lodash@^4.0.0"]),
-            vec!["@scope/x@^2.0.0", "lodash@^4.0.0"]
-        );
-        assert_eq!(descriptor_name("@scope/x@^1.0.0"), "@scope/x");
-        assert_eq!(descriptor_name("left-pad@npm:other@^1"), "left-pad");
-        assert_eq!(descriptor_name("bare"), "bare");
-    }
-
     #[test]
     fn unlocked_descriptors_names_only_the_unresolved_ones() {
         let blocks = scan_blocks(LOCK);
@@ -257,6 +229,31 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
         let unchanged = serde_json::json!({"dependencies": {"is-number": "^6.0.0"}});
         assert!(unlocked_descriptors(&blocks, &unchanged).is_empty());
         assert!(unlocked_descriptors(&blocks, &serde_json::json!({})).is_empty());
+    }
+
+    /// #1423: the pre-split form agrees with [`unlocked_descriptors`].
+    #[test]
+    fn unlocked_descriptors_in_matches_the_block_scan() {
+        let blocks = scan_blocks(LOCK);
+        let patterns: Vec<String> = blocks
+            .iter()
+            .flat_map(|b| split_key_patterns(&b.key))
+            .collect();
+        let locked: std::collections::HashSet<&str> = patterns.iter().map(String::as_str).collect();
+        for pkg in [
+            serde_json::json!({
+                "dependencies": {"is-number": "^7.0.0", "wow": "^1.0.0"},
+                "optionalDependencies": {"@scope/opt": "^2.0.0"},
+            }),
+            serde_json::json!({"dependencies": {"is-number": "^6.0.0"}}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                unlocked_descriptors_in(&locked, &pkg),
+                unlocked_descriptors(&blocks, &pkg),
+                "{pkg}"
+            );
+        }
     }
 
     #[test]
