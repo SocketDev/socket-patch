@@ -543,8 +543,27 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     if locks.is_empty() && members_unlisted.is_none() {
         return None;
     }
+    let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
+    let npmrc = view.read_text(".npmrc").await.ok();
+    const KEYS: (&str, &str) = ("gitBranchLockfile", "git-branch-lockfile");
+    let mut setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1);
+    if setting.is_none() {
+        if let Some(file) = governing_file(view) {
+            let workspace = read_regular_to_string(&file).await.ok();
+            let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
+                .await
+                .ok();
+            setting =
+                pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1).map(|found| {
+                    PnpmSetting {
+                        source: format!("{} (at {})", found.source, file.display()),
+                        ..found
+                    }
+                });
+        }
+    }
     let setting =
-        git_branch_on(project_setting(view, "gitBranchLockfile", "git-branch-lockfile").await)?;
+        git_branch_on(setting.or_else(|| view_setting(view, None, None, KEYS.0, KEYS.1)))?;
     Some(GitBranchLocks {
         setting,
         locks,
@@ -552,51 +571,78 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     })
 }
 
-/// A pnpm setting as the project at `view` sees it: its own
-/// `pnpm-workspace.yaml` / `.npmrc` (read through the view's FIFO-safe
-/// reader, see [`pnpm_setting`]); on disk, for a project with no
-/// `pnpm-workspace.yaml` of its own (a workspace member), the governing
-/// ancestor's file and the `.npmrc` beside it ([`governing_workspace_file`]);
-/// then, on disk, the `pnpm_config_<key>` / `npm_config_<key>` environment
-/// spellings.
-async fn project_setting(
-    view: &ProjectView<'_>,
-    yaml_key: &str,
-    npmrc_key: &str,
-) -> Option<PnpmSetting> {
-    let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
-    let npmrc = view.read_text(".npmrc").await.ok();
-    let mut setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), yaml_key, npmrc_key);
-    if setting.is_none() {
-        if let Some(file) = governing_file(view) {
-            let workspace = read_regular_to_string(&file).await.ok();
-            let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
-                .await
-                .ok();
-            setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), yaml_key, npmrc_key)
-                .map(|found| PnpmSetting {
-                    source: format!("{} (at {})", found.source, file.display()),
-                    ..found
-                });
-        }
-    }
-    setting.or_else(|| view_setting(view, None, None, yaml_key, npmrc_key))
-}
-
 /// Where pnpm's `lockfile` setting is turned off (#1074), as a refusal
 /// names it (e.g. `` `lockfile: false` in pnpm-workspace.yaml ``); `None`
-/// when it is on (the default). pnpm 11 and newer read the setting from
-/// `pnpm-workspace.yaml`, pnpm 10 and older from `.npmrc` (`lockfile=false`),
-/// both read through [`project_setting`]. With it off pnpm neither reads
-/// nor writes `pnpm-lock.yaml` (or a member's own lock): a plain
-/// `pnpm install` re-resolves every dependency from the registry, so a
-/// pin in a committed lock is never what installs. A value the setting's
-/// reader does not take as a boolean leaves the default.
-pub async fn lockfile_disabled(view: &ProjectView<'_>) -> Option<String> {
-    project_setting(view, "lockfile", "lockfile")
+/// when it is on (the default). With it off pnpm neither reads nor writes
+/// `pnpm-lock.yaml` (or a member's own lock): `pnpm install` resolves
+/// every dependency from the registry, so a pin in a committed lock is
+/// never what installs.
+///
+/// Each pnpm major reads the setting from one place: pnpm 11 and newer
+/// from `pnpm-workspace.yaml` (`lockfile: false`), pnpm 10 and older from
+/// `.npmrc` (`lockfile=false`; pnpm 10 ignores the YAML key). The major is
+/// the one that installed the project (`node_modules/.modules.yaml`), else
+/// the one package.json pins, else what the root lock's grammar implies
+/// (`pnpm_settings_major`). When none says, either source turning the
+/// setting off counts: withholding a pin is the safe side. With `env`, on
+/// disk, `pnpm_config_lockfile` / `npm_config_lockfile` count too (the
+/// hosted engine runs in the install's environment; `vex` need not).
+///
+/// Only the project's own files are read, through the view's
+/// fingerprinted reader, so a re-scan read cache stays valid; a workspace
+/// member with no settings file of its own is not related to its root's.
+pub async fn lockfile_disabled(view: &ProjectView<'_>, env: bool) -> Option<String> {
+    const KEY: &str = "lockfile";
+    let off = |setting: Option<PnpmSetting>| {
+        setting
+            .filter(|setting| setting.as_bool() == Some(false))
+            .map(|setting| setting.source)
+    };
+    let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
+    let npmrc = view.read_text(".npmrc").await.ok();
+    let yaml = off(pnpm_setting(workspace.as_deref(), None, KEY, KEY));
+    let rc = off(pnpm_setting(None, npmrc.as_deref(), KEY, KEY));
+    let env = match view {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) if env => {
+            off(env_setting(KEY, |var| std::env::var(var).ok()))
+        }
+        _ => None,
+    };
+    if yaml.is_none() && rc.is_none() {
+        return env;
+    }
+    let major = pnpm_major(view).await;
+    match major {
+        Some(major) if major >= 11 => yaml,
+        Some(_) => rc,
+        None => yaml.or(rc),
+    }
+    .or(env)
+}
+
+/// The pnpm major whose settings reading applies to the project at `view`
+/// (see [`lockfile_disabled`]).
+async fn pnpm_major(view: &ProjectView<'_>) -> Option<u32> {
+    use crate::patch::redirect::upstream::npm::{
+        modules_yaml_pnpm_major, package_json_pnpm_major, pnpm_settings_major,
+    };
+    let installed = view
+        .read_text("node_modules/.modules.yaml")
         .await
-        .filter(|setting| setting.as_bool() == Some(false))
-        .map(|setting| setting.source)
+        .ok()
+        .as_deref()
+        .and_then(modules_yaml_pnpm_major);
+    let pinned = match installed {
+        Some(major) => Some(major),
+        None => view
+            .read_text("package.json")
+            .await
+            .ok()
+            .as_deref()
+            .and_then(package_json_pnpm_major),
+    };
+    let lock = view.read_text(PNPM_LOCK).await.ok().unwrap_or_default();
+    pnpm_settings_major(&lock, pinned)
 }
 
 /// What pnpm does with its `lockfile` setting off, for the refusals and

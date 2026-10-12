@@ -680,7 +680,7 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let disabled = if rush {
         None
     } else {
-        crate::utils::pnpm_workspace::lockfile_disabled(&ctx.view).await
+        crate::utils::pnpm_workspace::lockfile_disabled(&ctx.view, false).await
     };
     let disabled = disabled.as_deref();
     let root_lock = ctx.exists(PNPM_LOCK).await;

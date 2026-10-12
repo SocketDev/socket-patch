@@ -1202,7 +1202,7 @@ impl PnpmTarballPolicy {
 /// (only pnpm <= 8 writes those), else 11 for a lock carrying pnpm 11+'s
 /// env lockfile document ahead of the project lock (only pnpm >= 11
 /// writes one, so its `.npmrc` pnpm settings are ignored).
-fn pnpm_settings_major(text: &str, pm_major: Option<u32>) -> Option<u32> {
+pub(crate) fn pnpm_settings_major(text: &str, pm_major: Option<u32>) -> Option<u32> {
     use crate::formats::pnpm::grammar::{is_pnpm_lock_text, main_document};
     use crate::formats::pnpm::lock_version_major;
 
@@ -1479,7 +1479,7 @@ fn pnpm_spec_major(spec: &str) -> Option<u32> {
 
 /// The pnpm major an install record names: `node_modules/.modules.yaml`'s
 /// `packageManager` (JSON on pnpm 10+, a top-level YAML scalar before).
-fn modules_yaml_pnpm_major(text: &str) -> Option<u32> {
+pub(crate) fn modules_yaml_pnpm_major(text: &str) -> Option<u32> {
     let text = crate::formats::text::strip_bom(text);
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         return value
@@ -1493,7 +1493,7 @@ fn modules_yaml_pnpm_major(text: &str) -> Option<u32> {
 }
 
 /// The pnpm major package.json's corepack `packageManager` pins.
-fn package_json_pnpm_major(text: &str) -> Option<u32> {
+pub(crate) fn package_json_pnpm_major(text: &str) -> Option<u32> {
     serde_json::from_str::<serde_json::Value>(crate::formats::text::strip_bom(text))
         .ok()?
         .get("packageManager")?

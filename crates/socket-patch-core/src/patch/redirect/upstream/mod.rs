@@ -34,7 +34,7 @@ mod gem;
 mod golang;
 mod gradle;
 mod maven;
-mod npm;
+pub(crate) mod npm;
 mod nuget;
 mod pypi;
 mod pypi_locks;
