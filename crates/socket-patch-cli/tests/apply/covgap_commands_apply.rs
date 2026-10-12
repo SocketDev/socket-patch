@@ -39,15 +39,13 @@ use common::{git_sha256, parse_json_envelope, run_with_env};
 
 // ───────────────────────── shared fixture helpers ─────────────────────────
 
-/// Run `socket-patch apply <args>` in `cwd` with the ambient `SOCKET_*`
-/// environment scrubbed (see `common::run_with_env`), telemetry disabled,
-/// and `extra_env` landing last (so tests can inject API URLs / TMPDIR).
+/// Run `socket-patch apply <args>` in `cwd` with the hermetic `SOCKET_*`
+/// environment (see `common::run_with_env`) and `extra_env` landing last
+/// (so tests can inject API URLs / TMPDIR).
 fn run_apply(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
     let mut argv: Vec<&str> = vec!["apply"];
     argv.extend_from_slice(args);
-    let mut env: Vec<(&str, &str)> = vec![("SOCKET_TELEMETRY_DISABLED", "1")];
-    env.extend_from_slice(extra_env);
-    run_with_env(cwd, &argv, &env)
+    run_with_env(cwd, &argv, extra_env)
 }
 
 /// One camelCase manifest record (the TS-compatible on-disk schema).
@@ -714,7 +712,6 @@ fn corrupt_manifest_under_pnp_layout_reports_manifest_error_not_refusal() {
 #[cfg(unix)]
 mod gem_fallback_home_human {
     use super::*;
-    use std::process::Command;
 
     const QUALIFIED_PURL: &str = "pkg:gem/rack@3.1.0?platform=ruby";
     const ORIGINAL: &[u8] = b"module Rack\n  VERSION = 'VULNERABLE'\nend\n";
@@ -753,19 +750,14 @@ mod gem_fallback_home_human {
         file
     }
 
-    /// Human-mode apply with SOCKET_*/BUNDLE_* scrubbed, PATH = the
-    /// fake-gem bin dir only, BUNDLE_PATH = the store root.
+    /// Human-mode apply with the hermetic SOCKET_* env and BUNDLE_*
+    /// scrubbed, PATH = the fake-gem bin dir only, BUNDLE_PATH = the store
+    /// root.
     fn run_apply_human(project: &Path, bin_dir: &Path, store_root: &Path) -> (i32, String, String) {
-        let mut cmd = Command::new(common::binary());
+        let mut cmd = common::hermetic_command(&common::binary());
         cmd.args(["apply", "--offline", "--ecosystems", "gem", "--cwd"])
             .arg(project);
-        for (key, _) in std::env::vars_os() {
-            let k = key.to_string_lossy();
-            if (k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG") || k.starts_with("BUNDLE_") {
-                cmd.env_remove(&key);
-            }
-        }
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+        common::hermetic::scrub_extra(&mut cmd, &[common::hermetic::Extra::Bundle]);
         cmd.env("PATH", bin_dir);
         cmd.env("BUNDLE_PATH", store_root);
         let out = cmd.output().expect("run socket-patch apply");

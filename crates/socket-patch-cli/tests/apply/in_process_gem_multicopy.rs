@@ -17,10 +17,10 @@
 //! physical copy is patched (and later restored) AND that the JSON summary
 //! counts every copy.
 
-use crate::common::{binary, git_sha256};
+use crate::common::hermetic::{self, Extra};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const PURL: &str = "pkg:gem/rack@3.1.0";
 
@@ -94,21 +94,15 @@ fn build_two_store_project(tmp: &Path) -> (PathBuf, PathBuf, PathBuf, String, St
     )
 }
 
-/// Run the given subcommand with the ambient `SOCKET_*` and `BUNDLE_*`
-/// environment scrubbed (a developer's `BUNDLE_PATH` export or
-/// `BUNDLE_APP_CONFIG` must not steer discovery), telemetry disabled.
+/// Run the given subcommand with the hermetic `SOCKET_*` environment and
+/// the ambient `BUNDLE_*` scrubbed (a developer's `BUNDLE_PATH` export or
+/// `BUNDLE_APP_CONFIG` must not steer discovery).
 fn run_json(root: &Path, args: &[&str]) -> (i32, serde_json::Value) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(args)
         .args(["--json", "--offline", "--ecosystems", "gem", "--cwd"])
         .arg(root);
-    for (key, _) in std::env::vars_os() {
-        let k = key.to_string_lossy();
-        if (k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG") || k.starts_with("BUNDLE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
     let out = cmd.output().expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -269,17 +263,11 @@ fn build_platform_variant_project(tmp: &Path) -> (PathBuf, PathBuf, PathBuf, Vec
 
 /// `run_json` without `--json`, for `vex`, whose stdout is the document.
 fn run_raw(root: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(args)
         .args(["--offline", "--ecosystems", "gem", "--cwd"])
         .arg(root);
-    for (key, _) in std::env::vars_os() {
-        let k = key.to_string_lossy();
-        if (k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG") || k.starts_with("BUNDLE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
     let out = cmd.output().expect("run socket-patch");
     (
         out.status.code().unwrap_or(-1),

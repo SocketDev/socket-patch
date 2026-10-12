@@ -29,15 +29,7 @@ use serial_test::serial;
 /// children see whatever `SOCKET_*` the ambient shell exports unless the file
 /// scrubs by hand.
 const PENDING_RAW_SPAWNS: &[&str] = &[
-    "apply/apply_invariants.rs",
     "apply/apply_network.rs",
-    "apply/cli_gem_variant_mismatch_policy.rs",
-    "apply/covgap_commands_apply.rs",
-    "apply/in_process_gem_config_warning.rs",
-    "apply/in_process_gem_fallback_home.rs",
-    "apply/in_process_gem_multicopy.rs",
-    "apply/in_process_npm_multicopy.rs",
-    "apply/in_process_variant_apply_failure.rs",
     "cli/covgap_api_client.rs",
     "cli/covgap_commands_list.rs",
     "cli/telemetry_e2e.rs",
@@ -109,8 +101,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "e2e_vex_lockfile/yarn.rs",
     "e2e_vex_redirect.rs",
     "e2e_vex_vendor.rs",
-    "get/get_edge_cases_e2e.rs",
-    "get/global_packages_e2e.rs",
     "hosted_memory_common/mod.rs",
     "hosted_memory_engine.rs",
     "hosted_superseding_pypi.rs",
@@ -126,11 +116,7 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "mode_migration_bun.rs",
     "mode_migration_cargo.rs",
     "mode_migration_pypi.rs",
-    "remove/remove_network.rs",
     "remove_rollback_api_overrides.rs",
-    "rollback/cli_rollback_silent.rs",
-    "rollback/rollback_duality_invariants.rs",
-    "rollback/rollback_invariants.rs",
     "rollback/rollback_multicopy_blob_gate.rs",
     "scan_api_retry_e2e.rs",
     "scan_pnpm_relocated_store_cwd_e2e.rs",
@@ -499,12 +485,39 @@ fn yarn_classic_extra_sweeps_mirror_rc_and_prefix_overrides() {
 
 #[test]
 #[serial]
+fn bundle_extra_sweeps_every_bundler_override() {
+    with_ambient(
+        &[
+            ("BUNDLE_PATH", "/ambient/bundle"),
+            ("BUNDLE_APP_CONFIG", "/ambient/.bundle"),
+            ("BUNDLE_GEMFILE", "/ambient/Gemfile"),
+            ("GEM_HOME", "/ambient/gems"),
+        ],
+        || {
+            let mut cmd = Command::new("bundle");
+            hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
+            let env = effective_env(&cmd);
+            assert_eq!(get(&env, "BUNDLE_PATH"), None);
+            assert_eq!(get(&env, "BUNDLE_APP_CONFIG"), None);
+            assert_eq!(get(&env, "BUNDLE_GEMFILE"), None);
+            assert_eq!(get(&env, "GEM_HOME"), Some("/ambient/gems"));
+
+            // A suite's own BUNDLE_PATH, set after the scrub, survives.
+            cmd.env("BUNDLE_PATH", "/store");
+            assert_eq!(get(&effective_env(&cmd), "BUNDLE_PATH"), Some("/store"));
+        },
+    );
+}
+
+#[test]
+#[serial]
 fn extra_seeds_are_scrubbed_whatever_the_ambient_value() {
     let mut cmd = Command::new("tool");
-    hermetic::scrub_extra(&mut cmd, &[Extra::Yarn, Extra::Pnpm]);
+    hermetic::scrub_extra(&mut cmd, &[Extra::Yarn, Extra::Pnpm, Extra::Bundle]);
     let env = effective_env(&cmd);
     assert_eq!(get(&env, "YARN_NODE_LINKER"), None);
     assert_eq!(get(&env, "npm_config_node_linker"), None);
+    assert_eq!(get(&env, "BUNDLE_APP_CONFIG"), None);
 }
 
 /// Every `.rs` file under `tests/`, as `/`-separated paths relative to it.

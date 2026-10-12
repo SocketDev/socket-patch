@@ -4,30 +4,23 @@
 //! blob-pinning rules that keep revert data alive for out-of-scope and
 //! not-installed entries.
 //!
-//! Same shape as `rollback_invariants.rs`: binary-driven, SOCKET_*-scrubbed
+//! Same shape as `rollback_invariants.rs`: binary-driven, hermetic
 //! child processes, hand-written camelCase manifests, git-sha256 oracle,
 //! `--offline` throughout (before-blobs are staged, so nothing fetches).
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A `rollback` command with the full `SOCKET_*` environment scrubbed and
-/// the working directory pinned (same rationale as the twin helper in
-/// `rollback_invariants.rs`: an ambient `SOCKET_OFFLINE`/`SOCKET_DRY_RUN`/
+/// A `rollback` command with the hermetic `SOCKET_*` environment
+/// (`hermetic_command`) and the working directory pinned (same rationale as
+/// the twin helper in `rollback_invariants.rs`: an ambient `SOCKET_OFFLINE`/`SOCKET_DRY_RUN`/
 /// `SOCKET_PRESERVE_STATE` must never satisfy — or sabotage — a test that
-/// is named after the flag's real code path). Scrub by prefix, not list.
+/// is named after the flag's real code path).
 fn rollback_cmd(cwd: &Path) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("rollback").current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
     cmd
 }
 

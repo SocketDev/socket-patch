@@ -25,36 +25,17 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::cache_env;
-use crate::common::binary;
+use crate::common::{binary, hermetic_command};
 
-/// Build a `socket-patch` `Command` with the ambient `SOCKET_*` env
-/// surface scrubbed (mirrors `common::run_with_env`). The binary binds
-/// ~20 `SOCKET_*` vars via clap, so an ambient value silently changes
-/// what these tests exercise — `SOCKET_DRY_RUN=true` flips every apply
-/// envelope's `dryRun` field, and `SOCKET_GLOBAL_PREFIX` bypasses the
-/// npm/yarn/pnpm resolution chain this file exists to cover. The
-/// highest-risk vars are seeded with hostile values and then scrubbed —
-/// `env_remove` clears the seed too, so the child never sees it, but if
-/// a scrub line is ever dropped the seed (rather than a developer's
-/// ambient shell, which the suite can't rely on) turns the tests red
-/// immediately. Telemetry opt-outs are kept so an opted-out dev stays
-/// opted out.
+/// Build a `socket-patch` `Command` with the hermetic `SOCKET_*`
+/// environment (`hermetic_command`). The binary binds ~20 `SOCKET_*` vars
+/// via clap, so an ambient value silently changes what these tests
+/// exercise: `SOCKET_DRY_RUN=true` flips every apply envelope's `dryRun`
+/// field, and `SOCKET_GLOBAL_PREFIX` bypasses the npm/yarn/pnpm resolution
+/// chain this file exists to cover.
 fn cli(cwd: &Path) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.current_dir(cwd);
-    cmd.env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
-        .env_remove("SOCKET_DRY_RUN")
-        .env_remove("SOCKET_GLOBAL_PREFIX")
-        .env_remove("SOCKET_MANIFEST_PATH");
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
     // Download caches only — NOT the full `cache_env::isolate`. Resolving the
     // real global prefixes is the whole point of this file, and those come out
     // of `$HOME`/`PNPM_HOME`, so redirecting either would change the answer the

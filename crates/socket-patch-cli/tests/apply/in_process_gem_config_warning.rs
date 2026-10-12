@@ -10,10 +10,10 @@
 //!   * non-JSON runs print ONE stderr warning, gated on `!--silent`
 //!     (`--silent` = errors only — a bare crawler eprintln violated that).
 
-use crate::common::{binary, git_sha256};
+use crate::common::hermetic::{self, Extra};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::Path;
-use std::process::Command;
 
 const PURL: &str = "pkg:gem/rack@3.1.0";
 const CODE: &str = "gem_bundle_config_path_ignored";
@@ -76,21 +76,15 @@ fn build_project(root: &Path, outside: &Path, with_store: bool) {
     }
 }
 
-/// Run the binary with SOCKET_*/BUNDLE_* scrubbed and PATH pointed at an
-/// empty dir, so no ambient bundler config and no real `gem` binary can
-/// perturb discovery.
+/// Run the binary with the hermetic SOCKET_* env, BUNDLE_* scrubbed and
+/// PATH pointed at an empty dir, so no ambient bundler config and no real
+/// `gem` binary can perturb discovery.
 fn run(root: &Path, args: &[&str]) -> (i32, String, String) {
     let empty_path = root.join("empty-bin");
     std::fs::create_dir_all(&empty_path).unwrap();
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(args).arg("--cwd").arg(root);
-    for (key, _) in std::env::vars_os() {
-        let k = key.to_string_lossy();
-        if (k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG") || k.starts_with("BUNDLE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
     cmd.env("PATH", &empty_path);
     let out = cmd.output().expect("run socket-patch");
     (

@@ -19,26 +19,16 @@
 //! command (offline runs suppress it) and is out of scope for `rollback`'s
 //! `--silent` gating.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::Path;
-use std::process::Command;
 
-/// Run `socket-patch rollback` in `cwd` with the entire `SOCKET_*` ambient
-/// environment scrubbed (prefix scrub — ambient tokens, silent toggles, or
-/// manifest redirects must not change the branch under test) and telemetry
-/// disabled.
+/// Run `socket-patch rollback` in `cwd` with the hermetic `SOCKET_*`
+/// environment (`hermetic_command`: ambient tokens, silent toggles, or
+/// manifest redirects must not change the branch under test).
 fn run_rollback(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("rollback").args(args).current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch rollback");
     (
         out.status.code().unwrap_or(-1),
