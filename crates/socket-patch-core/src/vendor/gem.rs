@@ -1122,7 +1122,8 @@ pub async fn revert_gem_opts(
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
                     format!(
-                        "{} no longer carries what vendor wrote for {key}; left alone",
+                        "{} no longer carries what vendor wrote for {key}; left \
+                         alone, and neither {GEMFILE} nor {GEMFILE_LOCK} was changed",
                         w.file
                     ),
                 ));
@@ -2128,6 +2129,8 @@ struct RevertFiles<'a> {
 struct RevertFile {
     /// `None`: the file does not exist.
     text: Option<String>,
+    /// The bytes as read, to put back if a later write fails.
+    read: Option<String>,
     changed: bool,
 }
 
@@ -2156,6 +2159,7 @@ impl<'a> RevertFiles<'a> {
                 Err(e) => return Err(format!("unreadable {name}: {e}")),
             };
             *slot = Some(RevertFile {
+                read: text.clone(),
                 text,
                 changed: false,
             });
@@ -2164,19 +2168,33 @@ impl<'a> RevertFiles<'a> {
         Ok(file.text.is_some().then_some(file))
     }
 
-    /// Write every edited file, lock first.
+    /// Write every edited file, lock first. When the Gemfile write fails
+    /// after the lock was written, the lock's bytes as read are put back so
+    /// the pair is not left half reverted.
     async fn write_changed(&self) -> Result<(), String> {
+        let mut written: Option<(&str, &str)> = None;
         for (name, file) in [(GEMFILE_LOCK, &self.lock), (GEMFILE, &self.gemfile)] {
             let Some(RevertFile {
                 text: Some(text),
+                read,
                 changed: true,
             }) = file
             else {
                 continue;
             };
-            atomic_write_bytes_preserving_mode(&self.root.join(name), text.as_bytes())
-                .await
-                .map_err(|e| format!("failed to write {name}: {e}"))?;
+            if let Err(e) =
+                atomic_write_bytes_preserving_mode(&self.root.join(name), text.as_bytes()).await
+            {
+                if let Some((prev, bytes)) = written {
+                    let _ =
+                        atomic_write_bytes_preserving_mode(&self.root.join(prev), bytes.as_bytes())
+                            .await;
+                }
+                return Err(format!("failed to write {name}: {e}"));
+            }
+            if let Some(read) = read {
+                written = Some((name, read));
+            }
         }
         Ok(())
     }
@@ -2215,11 +2233,10 @@ async fn revert_gemfile_record(
                 // ALREADY CONVERGED: the pre-vendor line is back (a hand
                 // restore, a `bundle update` regeneration, an earlier partial
                 // revert) — not drift, nothing to write.
-                return Ok(if lines.contains(&original) {
-                    RecordRevert::Done
-                } else {
-                    RecordRevert::Drifted
-                });
+                if lines.contains(&original) {
+                    return Ok(RecordRevert::Done);
+                }
+                return Ok(gemfile_left_without_our_line(text, written));
             };
             let line = restore_gemfile_line(lines[i], written, original);
             lines[i] = &line;
@@ -2228,8 +2245,9 @@ async fn revert_gemfile_record(
         WiringAction::Added => {
             let Some(at) = text.find(written) else {
                 // ALREADY CONVERGED: an Added block's reverted state is its
-                // absence (the LIVENESS CONTRACT's "key is absent" case).
-                return Ok(RecordRevert::Done);
+                // absence (the LIVENESS CONTRACT's "key is absent" case) —
+                // unless an edited copy of it still wires the gem in.
+                return Ok(gemfile_left_without_our_line(text, written));
             };
             let mut out = String::with_capacity(text.len());
             out.push_str(&text[..at]);
@@ -2242,23 +2260,48 @@ async fn revert_gemfile_record(
 }
 
 /// The index of the Gemfile line carrying the `written` wiring: the exact
-/// line, or else the one top-level `gem "<name>"` declaration whose `path:`
-/// still names the same vendored copy (a comment the user added or edited,
-/// or reformatted options). Vendor's in-sync check reads such a line as
-/// wired, so revert must too (#988). `None` when no line, or more than one,
-/// matches.
+/// line, or else the one line whose code matches it and whose trailing
+/// comment the user added, edited or removed (#988). A line whose code
+/// changed too (an option added, the line reformatted) is not matched:
+/// restoring the original over it would silently drop the user's edit.
+/// `None` when no line, or more than one, matches.
 fn find_wired_gemfile_line(lines: &[&str], written: &str) -> Option<usize> {
     if let Some(i) = lines.iter().position(|l| *l == written) {
         return Some(i);
     }
-    let ours = gem_declaration_any(written)?;
-    let copy = gem_line_path_value(ours.rest)?;
-    let mut hits = lines.iter().enumerate().filter(|(_, l)| {
-        gem_declaration(l, ours.name)
-            .is_some_and(|d| !d.paren && gem_line_path_value(d.rest) == Some(copy))
-    });
+    let code = split_line_comment(written).0.trim_end();
+    let mut hits = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| split_line_comment(l).0.trim_end() == code);
     let (i, _) = hits.next()?;
     hits.next().is_none().then_some(i)
+}
+
+/// What a Gemfile whose recorded wiring (`written`: the rewritten line or
+/// the managed block) is no longer found verbatim means for the revert.
+/// Vendor reads a Gemfile that still contains the copy path as wired, so
+/// revert does too: such a Gemfile, or one that now points the gem at
+/// another source, is drift and keeps the lock wired as well. A Gemfile
+/// that declares the gem from the registry again (or not at all) has
+/// converged, so the lock can follow it back.
+fn gemfile_left_without_our_line(text: &str, written: &str) -> RecordRevert {
+    let Some((name, copy)) = written.split('\n').find_map(|l| {
+        let d = gem_declaration_any(l)?;
+        Some((d.name, gem_line_path_value(d.rest)?))
+    }) else {
+        return RecordRevert::Drifted;
+    };
+    let repointed = text.split('\n').any(|l| {
+        gem_declaration(l.trim_start(), name).is_some_and(|d| {
+            gem_line_path_value(d.rest).is_some() || gemfile::source_option(d.rest).is_some()
+        })
+    });
+    if text.contains(copy) || repointed {
+        RecordRevert::Drifted
+    } else {
+        RecordRevert::Done
+    }
 }
 
 /// The pre-vendor `original` line to put back over `live`, the wired line
@@ -3857,6 +3900,95 @@ mod tests {
             );
             assert!(root.join(copy_rel()).exists(), "pass {pass}");
         }
+    }
+
+    /// The Gemfile still routes the gem through the copy, but in a form
+    /// revert won't rewrite (an option added to the wired line, or a
+    /// comment added inside the managed block): drift, and neither file is
+    /// written, so the user's edit is never dropped and the lock never
+    /// leaves the Gemfile's `path:` behind.
+    #[tokio::test]
+    async fn revert_still_wired_but_edited_gemfile_writes_neither_file() {
+        let rack_line = format!("gem \"rack\", \"3.2.6\", path: \"{}\"", copy_rel());
+        let cases = [
+            (
+                GEMFILE_DIRECT,
+                LOCK_DIRECT,
+                format!("{rack_line}, require: false"),
+            ),
+            (
+                GEMFILE_TRANSITIVE,
+                LOCK_TRANSITIVE,
+                format!("{rack_line} # managed, keep"),
+            ),
+        ];
+        for (gemfile, lock, edited_line) in cases {
+            let (_tmp, root, installed, blobs, record) = fixture(gemfile, lock).await;
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            let wired = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+            let edited = wired.replace(&rack_line, &edited_line);
+            assert_ne!(edited, wired, "{edited_line}");
+            tokio::fs::write(root.join(GEMFILE), &edited).await.unwrap();
+            let wired_lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap();
+
+            let outcome = revert_gem(&entry, &root, false).await;
+            assert!(outcome.success, "{edited_line}: {:?}", outcome.error);
+            assert!(
+                outcome.drift_skipped(),
+                "{edited_line}: {:?}",
+                outcome.warnings
+            );
+            assert!(outcome.kept_artifact, "{edited_line}");
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                edited,
+                "{edited_line}"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                wired_lock,
+                "{edited_line}"
+            );
+            assert!(root.join(copy_rel()).exists(), "{edited_line}");
+        }
+    }
+
+    /// The user already put the gem back on the registry by hand, with a
+    /// different constraint than the original: the Gemfile no longer routes
+    /// through the copy, so that record has converged and the lock is
+    /// restored to match it instead of being kept on the PATH section.
+    #[tokio::test]
+    async fn revert_hand_restored_gemfile_converges_and_restores_lock() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        let hand = GEMFILE_DIRECT.replace("\"~> 3.1\"", "\"~> 3.2\"  # restored");
+        tokio::fs::write(root.join(GEMFILE), &hand).await.unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            hand
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
     }
 
     /// A `bundle update` regenerated both files back to their pre-vendor
