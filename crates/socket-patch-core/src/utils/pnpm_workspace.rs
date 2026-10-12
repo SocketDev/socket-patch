@@ -543,32 +543,69 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     if locks.is_empty() && members_unlisted.is_none() {
         return None;
     }
+    let setting =
+        git_branch_on(project_setting(view, "gitBranchLockfile", "git-branch-lockfile").await)?;
+    Some(GitBranchLocks {
+        setting,
+        locks,
+        members_unlisted,
+    })
+}
+
+/// A pnpm setting as the project at `view` sees it: its own
+/// `pnpm-workspace.yaml` / `.npmrc` (read through the view's FIFO-safe
+/// reader, see [`pnpm_setting`]); on disk, for a project with no
+/// `pnpm-workspace.yaml` of its own (a workspace member), the governing
+/// ancestor's file and the `.npmrc` beside it ([`governing_workspace_file`]);
+/// then, on disk, the `pnpm_config_<key>` / `npm_config_<key>` environment
+/// spellings.
+async fn project_setting(
+    view: &ProjectView<'_>,
+    yaml_key: &str,
+    npmrc_key: &str,
+) -> Option<PnpmSetting> {
     let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
     let npmrc = view.read_text(".npmrc").await.ok();
-    const KEYS: (&str, &str) = ("gitBranchLockfile", "git-branch-lockfile");
-    let mut setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1);
+    let mut setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), yaml_key, npmrc_key);
     if setting.is_none() {
         if let Some(file) = governing_file(view) {
             let workspace = read_regular_to_string(&file).await.ok();
             let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
                 .await
                 .ok();
-            setting =
-                pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1).map(|found| {
-                    PnpmSetting {
-                        source: format!("{} (at {})", found.source, file.display()),
-                        ..found
-                    }
+            setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), yaml_key, npmrc_key)
+                .map(|found| PnpmSetting {
+                    source: format!("{} (at {})", found.source, file.display()),
+                    ..found
                 });
         }
     }
-    let setting =
-        git_branch_on(setting.or_else(|| view_setting(view, None, None, KEYS.0, KEYS.1)))?;
-    Some(GitBranchLocks {
-        setting,
-        locks,
-        members_unlisted,
-    })
+    setting.or_else(|| view_setting(view, None, None, yaml_key, npmrc_key))
+}
+
+/// Where pnpm's `lockfile` setting is turned off (#1074), as a refusal
+/// names it (e.g. `` `lockfile: false` in pnpm-workspace.yaml ``); `None`
+/// when it is on (the default). pnpm 11 and newer read the setting from
+/// `pnpm-workspace.yaml`, pnpm 10 and older from `.npmrc` (`lockfile=false`),
+/// both read through [`project_setting`]. With it off pnpm neither reads
+/// nor writes `pnpm-lock.yaml` (or a member's own lock): a plain
+/// `pnpm install` re-resolves every dependency from the registry, so a
+/// pin in a committed lock is never what installs. A value the setting's
+/// reader does not take as a boolean leaves the default.
+pub async fn lockfile_disabled(view: &ProjectView<'_>) -> Option<String> {
+    project_setting(view, "lockfile", "lockfile")
+        .await
+        .filter(|setting| setting.as_bool() == Some(false))
+        .map(|setting| setting.source)
+}
+
+/// What pnpm does with its `lockfile` setting off, for the refusals and
+/// diagnostics that name it ([`lockfile_disabled`]'s `source`).
+pub fn describe_lockfile_disabled(source: &str) -> String {
+    format!(
+        "{source} makes pnpm neither read nor write {PNPM_LOCK}, so `pnpm install` \
+         resolves every dependency from the registry whatever the lock pins"
+    )
 }
 
 /// The `pnpm-lock.<branch>.yaml` files in root-relative `dir` (`""` for

@@ -718,7 +718,9 @@ pub async fn read_candidate_files(
             }
         }
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
-        if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
+        if let Some(source) = crate::utils::pnpm_workspace::lockfile_disabled(view).await {
+            refuse_disabled_lockfile(&mut out, &source);
+        } else if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
             refuse_git_branch_locks(&mut out, &branch);
         } else {
             read_pnpm_member_locks(view, unreadable, &mut out).await;
@@ -850,6 +852,40 @@ fn refuse_git_branch_locks(
         .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
     out.pnpm_refusal = Some(git_branch_lock_refusal(branch));
 }
+
+/// pnpm's `lockfile` setting is off (#1074): pnpm neither reads nor
+/// writes its lock, so a pin there never installs. Every root pnpm lock is
+/// left out (member locks are never read) and the run refuses every pnpm
+/// pin (see [`CandidateFiles::pnpm_refusal`]), as for a branch lock.
+fn refuse_disabled_lockfile(out: &mut CandidateFiles, source: &str) {
+    const ROOT_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
+    for lock in ROOT_LOCKS {
+        out.files.remove(lock);
+    }
+    out.symlinked_reads
+        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
+    out.unreadable_reads
+        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
+    out.pnpm_refusal = Some(disabled_lockfile_refusal(source));
+}
+
+/// The [`PNPM_LOCKFILE_DISABLED`] warning for a `lockfile` setting turned
+/// off at `source` (see [`crate::utils::pnpm_workspace::lockfile_disabled`]).
+pub fn disabled_lockfile_refusal(source: &str) -> RewriteWarning {
+    RewriteWarning {
+        code: PNPM_LOCKFILE_DISABLED.into(),
+        detail: format!(
+            "{}; no pnpm lock was rewritten — use `--mode vendored` (pnpm applies its \
+             `overrides` without a lock), or remove the setting, run `pnpm install` and \
+             re-run",
+            crate::utils::pnpm_workspace::describe_lockfile_disabled(source)
+        ),
+    }
+}
+
+/// Refusal code for a project whose pnpm `lockfile` setting is off, so
+/// pnpm never reads the lock a hosted pin goes into (#1074).
+pub const PNPM_LOCKFILE_DISABLED: &str = "redirect_pnpm_lockfile_disabled";
 
 /// The [`PNPM_GIT_BRANCH_LOCKFILE`] warning for `branch`: the hosted
 /// rewrite's, and the vendored→hosted takeover's (which keeps the vendored
@@ -5534,6 +5570,106 @@ snapshots:
             assert_eq!(done.confirmed.len(), 1, "{workspace}");
             assert!(!warning_codes(&done).contains(&PNPM_GIT_BRANCH_LOCKFILE));
             assert!(!done.rewrite.files.contains_key(BRANCH_LOCK));
+        }
+    }
+
+    fn assert_disabled_lockfile_refused(read: &CandidateFiles, done: &Rewritten, source: &str) {
+        assert!(!read.files.contains_key("pnpm-lock.yaml"));
+        // Neither the lock nor a `trustLockfile` key is written.
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        let codes = warning_codes(done);
+        assert!(codes.contains(&PNPM_LOCKFILE_DISABLED), "{codes:?}");
+        assert!(
+            !codes.contains(&"redirect_pnpm_no_lockfile")
+                && !codes.contains(&"redirect_npm_no_lockfile")
+                && !codes.contains(&"redirect_pnpm_trust_lockfile"),
+            "{codes:?}"
+        );
+        let detail = &done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == PNPM_LOCKFILE_DISABLED)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains(source) && detail.contains("--mode vendored"),
+            "{detail}"
+        );
+    }
+
+    /// pnpm's `lockfile` setting off (#1074): pnpm never reads the
+    /// committed lock and installs the upstream package, so pinning it
+    /// would confirm (and VEX attest) a patch no install applies. pnpm 11+
+    /// read the setting from `pnpm-workspace.yaml`, pnpm 9/10 from
+    /// `.npmrc`.
+    #[tokio::test]
+    async fn a_disabled_lockfile_is_never_pinned() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "lockfile: false\n", true);
+        std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_disabled_lockfile_refused(&read, &done, "`lockfile: false` in pnpm-workspace.yaml");
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "packages:\n  - '.'\n", true);
+        std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+        std::fs::remove_file(tmp.path().join("pnpm-workspace.yaml")).unwrap();
+        write_rel(tmp.path(), ".npmrc", "lockfile=false\n");
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_disabled_lockfile_refused(&read, &done, "`lockfile=false` in .npmrc");
+
+        // The in-memory engine refuses the same project.
+        let mut project = MemoryProject::new();
+        project.insert_text("package.json", r#"{"name":"app"}"#);
+        project.insert_text("pnpm-workspace.yaml", "lockfile: false\n");
+        project.insert_text("pnpm-lock.yaml", v9_member_lock(true));
+        let (read, done) = view_rewrite(&ProjectView::Memory(&project)).await;
+        assert_disabled_lockfile_refused(&read, &done, "`lockfile: false` in pnpm-workspace.yaml");
+    }
+
+    /// With the lock off, pnpm reads no member's own lock either
+    /// (`sharedWorkspaceLockfile: false`, #492): none is pinned.
+    #[tokio::test]
+    async fn a_disabled_lockfile_pins_no_member_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\nlockfile: false\n",
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert!(read.pnpm_member_lock_keys.is_empty());
+        assert!(!read.files.keys().any(|k| k.ends_with("pnpm-lock.yaml")));
+        assert_disabled_lockfile_refused(&read, &done, "`lockfile: false` in pnpm-workspace.yaml");
+    }
+
+    /// The setting on (or unset) keeps the lock pinned as usual, and a
+    /// YAML value pnpm's reader takes for no boolean leaves the default.
+    #[tokio::test]
+    async fn an_enabled_lockfile_is_pinned() {
+        for (workspace, npmrc) in [
+            ("lockfile: true\n", None),
+            ("packages:\n  - '.'\n", Some("lockfile=true\n")),
+            ("lockfile: maybe\n", None),
+            // The YAML wins over `.npmrc` (see `pnpm_setting`).
+            ("lockfile: true\n", Some("lockfile=false\n")),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_branch_lock_project(tmp.path(), workspace, true);
+            std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+            if let Some(npmrc) = npmrc {
+                write_rel(tmp.path(), ".npmrc", npmrc);
+            }
+            let (_, done) = member_rewrite(tmp.path()).await;
+            let text = done
+                .rewrite
+                .files
+                .get("pnpm-lock.yaml")
+                .unwrap_or_else(|| panic!("{workspace}: {:?}", done.rewrite.warnings));
+            assert!(text.contains(MEMBER_URL), "{text}");
+            assert_eq!(done.confirmed.len(), 1, "{workspace}");
+            assert!(!warning_codes(&done).contains(&PNPM_LOCKFILE_DISABLED));
         }
     }
 }
