@@ -617,6 +617,31 @@ fn shadowed_names_sync(
     shadowed
 }
 
+/// The dirs among `sites` that a `--system-site-packages` venv also in
+/// `sites` reaches in its base interpreter (see [`add_system_site_packages`])
+/// rather than a venv's own site-packages. A copy installed there is outside
+/// every venv: pip refuses to uninstall it from one, and an install into the
+/// venv counts it as already present (#1450).
+pub async fn inherited_base_site_dirs(sites: &[PathBuf]) -> HashSet<PathBuf> {
+    let var = |name: &str| std::env::var(name).ok();
+    let sites = sites.to_vec();
+    run_blocking(move || inherited_base_site_dirs_sync(&sites, &var)).await
+}
+
+fn inherited_base_site_dirs_sync(
+    sites: &[PathBuf],
+    var: &impl Fn(&str) -> Option<String>,
+) -> HashSet<PathBuf> {
+    let own: Vec<(PathBuf, &PathBuf)> = sites
+        .iter()
+        .filter_map(|site| venv_root_of_site(site).map(|root| (root, site)))
+        .collect();
+    own.iter()
+        .flat_map(|(root, site)| system_site_dirs_of_venv(root, site, var))
+        .filter(|dir| sites.contains(dir) && !own.iter().any(|(_, site)| *site == dir))
+        .collect()
+}
+
 /// Find local virtual environment `site-packages` directories.
 ///
 /// Checks (in order):
@@ -3961,6 +3986,25 @@ mod tests {
             local_site_packages_with(&project, &no_env).await,
             vec![venv_site, base_site]
         );
+    }
+
+    /// #1450: the base dirs a `--system-site-packages` venv inherits are
+    /// told apart from the venv's own site-packages.
+    #[test]
+    fn inherited_base_site_dirs_are_the_base_interpreters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, venv_site, base_site) = system_site_layout(tmp.path(), "true");
+        let no_env = env_of(&[]);
+        let sites = vec![venv_site.clone(), base_site.clone()];
+        assert_eq!(
+            inherited_base_site_dirs_sync(&sites, &no_env),
+            HashSet::from([base_site.clone()])
+        );
+        // Only dirs actually in `sites` are reported.
+        assert!(inherited_base_site_dirs_sync(&[venv_site], &no_env).is_empty());
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, venv_site, base_site) = system_site_layout(tmp.path(), "false");
+        assert!(inherited_base_site_dirs_sync(&[venv_site, base_site], &no_env).is_empty());
     }
 
     #[tokio::test]
