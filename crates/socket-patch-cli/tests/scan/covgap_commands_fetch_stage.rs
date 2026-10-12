@@ -16,33 +16,17 @@
 //! `coverage_fix_apply_silent_mute_exit.rs`; this suite covers the
 //! human-mode (non-quiet) output shape and the mem-stager arms.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::common::hermetic_command;
+use crate::common::{binary, git_sha256, hermetic_command};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const BEFORE: &[u8] = b"before\n";
 const AFTER: &[u8] = b"after\n";
-/// base64 of AFTER, the shape the view response's `blobContent` carries.
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content). Computed independently
-/// of the code under test.
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// Spawn the built binary in `root` with the hermetic `SOCKET_*`
 /// environment (ambient vars scrubbed, telemetry kill-switch forced) and

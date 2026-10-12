@@ -7,17 +7,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::common::hermetic_command;
+use crate::common::{binary, git_sha256, hermetic_command};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG_SLUG: &str = "test-org";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// A `socket-patch` command rooted at `cwd` with every ambient `SOCKET_*`
 /// env var scrubbed (`hermetic_command`), so every assertion exercises the flag/argv path and
@@ -42,15 +37,6 @@ fn socket_cmd(cwd: &Path) -> Command {
     let mut cmd = hermetic_command(&binary());
     cmd.current_dir(cwd);
     cmd
-}
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// A manifest with one patch referencing one blob. Used as the baseline
