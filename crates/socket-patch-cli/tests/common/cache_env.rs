@@ -59,6 +59,7 @@
 
 #![allow(dead_code)]
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -285,8 +286,22 @@ pub fn is_ambient_bun_var(name: &str) -> bool {
 /// rule in the module docs: the scrub iterates the parent env and would
 /// otherwise remove what those seed).
 pub fn scrub_ambient_bun_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars_os() {
-        if is_ambient_bun_var(&k.to_string_lossy()) {
+    scrub_parent_vars(cmd, parent_var_names(), is_ambient_bun_var);
+}
+
+/// The names of the PARENT environment, read once.
+fn parent_var_names() -> Vec<OsString> {
+    std::env::vars_os().map(|(k, _)| k).collect()
+}
+
+/// Remove every name in `parent` that `ambient` matches from `cmd`. The
+/// scrubs and their self-tests share it so a self-test can check the
+/// result against the same snapshot of the parent env the scrub saw:
+/// in-process tests in the same binary mirror flags into the env
+/// (`--offline` sets `SOCKET_OFFLINE`), so two separate reads race.
+fn scrub_parent_vars(cmd: &mut Command, parent: Vec<OsString>, ambient: fn(&str) -> bool) {
+    for k in parent {
+        if ambient(&k.to_string_lossy()) {
             cmd.env_remove(&k);
         }
     }
@@ -316,11 +331,7 @@ pub fn is_ambient_vlt_var(name: &str) -> bool {
 /// Remove every [`is_ambient_vlt_var`] variable of the PARENT environment
 /// from `cmd` (call it before [`isolate`], see the module docs).
 pub fn scrub_ambient_vlt_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars_os() {
-        if is_ambient_vlt_var(&k.to_string_lossy()) {
-            cmd.env_remove(&k);
-        }
-    }
+    scrub_parent_vars(cmd, parent_var_names(), is_ambient_vlt_var);
 }
 
 // ── Self-tests ────────────────────────────────────────────────────────
@@ -373,8 +384,9 @@ mod cache_env_selftests {
     /// nothing else is touched, and no matching parent variable is missed.
     #[test]
     fn ambient_bun_scrub_removes_only_matching_parent_vars() {
+        let parent = parent_var_names();
         let mut cmd = Command::new("true");
-        scrub_ambient_bun_env(&mut cmd);
+        scrub_parent_vars(&mut cmd, parent.clone(), is_ambient_bun_var);
         let removed: Vec<String> = cmd
             .get_envs()
             .filter(|(_, value)| value.is_none())
@@ -386,7 +398,7 @@ mod cache_env_selftests {
                 "{name} was removed but is not an ambient bun var"
             );
         }
-        for (name, _) in std::env::vars_os() {
+        for name in &parent {
             let name = name.to_string_lossy();
             if is_ambient_bun_var(&name) {
                 assert!(
@@ -435,8 +447,9 @@ mod cache_env_selftests {
 
     #[test]
     fn ambient_vlt_scrub_removes_only_matching_parent_vars() {
+        let parent = parent_var_names();
         let mut cmd = Command::new("true");
-        scrub_ambient_vlt_env(&mut cmd);
+        scrub_parent_vars(&mut cmd, parent.clone(), is_ambient_vlt_var);
         let removed: Vec<String> = cmd
             .get_envs()
             .filter(|(_, value)| value.is_none())
@@ -445,7 +458,7 @@ mod cache_env_selftests {
         for name in &removed {
             assert!(is_ambient_vlt_var(name), "{name} was removed");
         }
-        for (name, _) in std::env::vars_os() {
+        for name in &parent {
             let name = name.to_string_lossy();
             if is_ambient_vlt_var(&name) {
                 assert!(removed.iter().any(|r| *r == name), "{name} kept");
