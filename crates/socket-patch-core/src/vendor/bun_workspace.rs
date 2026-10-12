@@ -135,6 +135,14 @@ pub(super) async fn repair(
             }
             written.push((path.clone(), before.clone()));
         }
+        // Every mirror carries the root artifact's `<uuid>/.gitignore`, so
+        // a `*.tgz` rule cannot keep a rebuilt one out of the commit (#1116).
+        for rec in &wiring {
+            if let Err(e) = super::bun_binary::restore_mirror_metadata(root, &rec.file).await {
+                undo_mirrors(&written).await;
+                return Err(e);
+            }
+        }
     }
     Ok((wiring, !updates.is_empty()))
 }

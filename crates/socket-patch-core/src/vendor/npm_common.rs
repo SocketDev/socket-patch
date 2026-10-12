@@ -223,10 +223,23 @@ pub async fn npm_tarball_gitignore_preflight(
     uuid: &str,
 ) -> Option<(&'static str, String)> {
     let uuid_dir_rel = vendor_uuid_dir_rel("npm", uuid)?;
-    let rules = npm_dir::gitignored(project_root, &[format!("{uuid_dir_rel}/")]).await?;
+    if let Some(rules) = npm_dir::gitignored(project_root, &[format!("{uuid_dir_rel}/")]).await {
+        return Some((
+            npm_dir::GITIGNORED,
+            npm_dir::gitignored_detail(&uuid_dir_rel, &rules),
+        ));
+    }
+    // A `bun.lockb` workspace also mirrors the tarball into each member
+    // (#1116), which the vendoring's own pre-flight probes the same way.
+    let mirrors = super::bun_binary::workspace_mirror_dirs(project_root, uuid);
+    let probe: Vec<String> = mirrors.iter().map(|dir| format!("{dir}/")).collect();
+    if probe.is_empty() {
+        return None;
+    }
+    let rules = npm_dir::gitignored(project_root, &probe).await?;
     Some((
         npm_dir::GITIGNORED,
-        npm_dir::gitignored_detail(&uuid_dir_rel, &rules),
+        npm_dir::gitignored_detail(&mirrors[0], &rules),
     ))
 }
 
