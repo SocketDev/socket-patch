@@ -52,8 +52,10 @@ pub fn crates_io_source(layers: &[ConfigLayer<'_>]) -> CratesIoSource {
     let docs: Vec<(&Path, DocumentMut)> = layers
         .iter()
         .filter_map(|l| {
-            let text = l.text.strip_prefix('\u{feff}').unwrap_or(l.text);
-            text.parse::<DocumentMut>().ok().map(|d| (l.base, d))
+            crate::formats::text::strip_bom(l.text)
+                .parse::<DocumentMut>()
+                .ok()
+                .map(|d| (l.base, d))
         })
         .collect();
     let lookup = |name: &str, key: &str| -> Option<(&Path, String)> {

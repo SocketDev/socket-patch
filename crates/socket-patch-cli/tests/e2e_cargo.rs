@@ -223,6 +223,14 @@ async fn scan_discovers_vendor_crates() {
     // a crate source once the root is identified as a Cargo project. A vendored
     // project always carries a lockfile, so stage one as the project marker.
     std::fs::write(dir.path().join("Cargo.lock"), "version = 3\n").unwrap();
+    // `cargo vendor`'s source replacement: only a wired tree is where
+    // cargo builds from (#338).
+    std::fs::create_dir_all(dir.path().join(".cargo")).unwrap();
+    std::fs::write(
+        dir.path().join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n",
+    )
+    .unwrap();
 
     // Set up vendor directory
     let vendor_dir = dir.path().join("vendor");
@@ -494,6 +502,12 @@ async fn sync_keeps_shared_cache_entry_behind_a_cargo_vendor_dir() {
     .unwrap();
     let registry = root.join(".cargo/registry/src/index.crates.io-test");
     let itoa_old = fake_registry_crate(&registry, "itoa", "1.0.11", patched);
+    // The source replacement that makes `vendor/` cargo's source (#338).
+    std::fs::write(
+        root.join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n",
+    )
+    .unwrap();
 
     let socket = root.join(".socket");
     let itoa = "pkg:cargo/itoa@1.0.11";
