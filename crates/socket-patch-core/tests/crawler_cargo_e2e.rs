@@ -1042,3 +1042,27 @@ async fn parent_dir_in_cwd_does_not_read_a_sibling_config() {
     assert_eq!(crawled_paths(&dotted).await, vec![cached]);
     drop(cargo_home);
 }
+
+/// A directory source under a cwd given with `..` is reported under that
+/// cwd as given: path-scoped commands strip it as a prefix.
+#[tokio::test]
+#[serial_test::serial]
+async fn directory_source_keeps_the_given_cwd_prefix() {
+    let cargo_home = CargoHomeGuard::new().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let app = tmp.path().join("app");
+    write_app(&app).await;
+    stage_vendor_crate(&app.join("vendor"), "cfg-if", "1.0.0").await;
+    write_vendor_config(&app, "vendor").await;
+    std::fs::create_dir_all(tmp.path().join("b")).unwrap();
+
+    let dotted = tmp.path().join("b").join("..").join("app");
+    let paths = CargoCrawler
+        .get_crate_source_paths(&options_at(&dotted))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![dotted.join("vendor")]);
+    let crawled = crawled_paths(&dotted).await;
+    assert_eq!(crawled, vec![dotted.join("vendor").join("cfg-if")]);
+    drop(cargo_home);
+}

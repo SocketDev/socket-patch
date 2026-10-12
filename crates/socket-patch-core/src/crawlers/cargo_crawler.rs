@@ -323,14 +323,16 @@ fn fold_parent_dirs(path: &Path) -> PathBuf {
 /// config is skipped.
 async fn crates_io_source(cwd: &Path) -> CratesIoSource {
     // The logical path, not the canonical one: the crawled roots are
-    // reported under it, as the `<cwd>`-joined roots always were. A `..`
-    // is folded away so `a/b/../proj` walks `a/proj`'s ancestors, not
-    // `a/b`'s.
-    let cwd = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let cwd = fold_parent_dirs(&cwd);
+    // reported under it, as the `<cwd>`-joined roots always were. The
+    // config walk uses it with `..` folded, so `a/b/../proj` reads
+    // `a/proj`'s ancestors, not `a/b`'s; a directory under the folded
+    // cwd is reported back under the cwd as given, which path-scoped
+    // commands strip as a prefix.
+    let given = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let folded = fold_parent_dirs(&given);
     let cargo_home = CargoCrawler::cargo_home();
     run_blocking(move || {
-        let files = config_layer_paths(&cwd, cargo_home.as_deref(), |p| p.is_file());
+        let files = config_layer_paths(&folded, cargo_home.as_deref(), |p| p.is_file());
         let texts: Vec<(PathBuf, String)> = files
             .into_iter()
             .filter_map(|(file, base)| {
@@ -343,7 +345,13 @@ async fn crates_io_source(cwd: &Path) -> CratesIoSource {
             .iter()
             .map(|(base, text)| ConfigLayer { base, text })
             .collect();
-        source_replacement::crates_io_source(&layers)
+        match source_replacement::crates_io_source(&layers) {
+            CratesIoSource::Directory(dir) => match dir.strip_prefix(&folded) {
+                Ok(rel) => CratesIoSource::Directory(given.join(rel)),
+                Err(_) => CratesIoSource::Directory(dir),
+            },
+            other => other,
+        }
     })
     .await
 }
