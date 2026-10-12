@@ -175,16 +175,19 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   `redirect_uv_lock_unsupported` (#767). Before, vendored left a lock that
   `uv sync --locked` rejects, and hosted replaced the user's URL with one its
   own rollback then refused to restore.
-- `no-sources = true` makes uv ignore every `[tool.uv.sources]` entry, so a
-  wired source fails `uv sync --locked` and a plain `uv sync` installs the
-  unpatched registry wheel. Both modes refuse it before any file is written:
-  vendored with `pypi_uv_no_sources`, hosted with
-  `redirect_uv_project_unsupported` / `redirect_uv_script_unsupported`
-  (#564). The setting is read where uv reads it: a PEP 723 script's own
-  `[tool.uv]` wins; otherwise a project `uv.toml` replaces pyproject's
-  `[tool.uv]` settings outright. `UV_NO_SOURCES`, `--no-sources` and a
-  user-level `uv.toml` belong to the machine that installs, which the scan
-  cannot see.
+- `no-sources = true` makes uv ignore every `[tool.uv.sources]` entry, and
+  `no-sources-package = [...]` ignores the entries of the packages it names
+  (uv 0.10+), so a wired source fails `uv sync --locked` and a plain
+  `uv sync` installs the unpatched registry wheel. Both modes refuse it
+  before any file is written: vendored with `pypi_uv_no_sources`, hosted
+  with `redirect_uv_project_unsupported` / `redirect_uv_script_unsupported`
+  (#564). The settings are read where uv reads them (checked against uv
+  0.11): a project `uv.toml` replaces pyproject's `[tool.uv]` outright; a
+  PEP 723 script's own `no-sources` wins over the project's, while the two
+  `no-sources-package` lists combine; and an explicit `no-sources = false`
+  disables the list. `UV_NO_SOURCES`, `UV_NO_SOURCES_PACKAGE`, the matching
+  flags and a user-level `uv.toml` belong to the machine that installs,
+  which the scan cannot see.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751

@@ -253,8 +253,13 @@ async fn load_listed_locks(
                     super::pypi_uv::read_uv_toml(root).await,
                 )),
             };
-            refuse_uv_no_sources(Some(&script), pyproject.as_deref(), uv_toml.as_deref())
-                .map_err(|detail| ("pypi_uv_no_sources", format!("{script_name}: {detail}")))?;
+            refuse_uv_no_sources(
+                name,
+                Some(&script),
+                pyproject.as_deref(),
+                uv_toml.as_deref(),
+            )
+            .map_err(|detail| ("pypi_uv_no_sources", format!("{script_name}: {detail}")))?;
             let script_wheel = source_path(package).unwrap_or(&placeholder);
             if rewrite_script_metadata(&script, name, version, ArtifactSource::Path(script_wheel))
                 .map_err(|error| {
@@ -1263,6 +1268,7 @@ mod tests {
             (no_sources, None, ""),
             (plain, Some("uv.toml"), "no-sources = true\n"),
             (plain, Some("pyproject.toml"), pyproject_no_sources),
+            (plain, Some("uv.toml"), "no-sources-package = [\"Two\"]\n"),
         ] {
             let temp = tempfile::tempdir().unwrap();
             tokio::fs::write(temp.path().join("job.py.lock"), lock)

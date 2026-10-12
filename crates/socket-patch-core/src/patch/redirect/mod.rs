@@ -5784,6 +5784,7 @@ fn plan_python_metadata_with(
     source_scope().map_err(unsupported)?;
     let project_file = |rel: &str| files.get(rel).map(String::as_str);
     crate::utils::python_script::refuse_uv_no_sources(
+        &dep.name,
         script.then_some(original.as_str()),
         if script {
             project_file("pyproject.toml")
@@ -25469,6 +25470,47 @@ mod python_metadata_pairing_tests {
             &[
                 ("pyproject.toml", PYPROJECT),
                 ("uv.toml", "no-sources = [\n"),
+            ],
+        );
+
+        // no-sources-package drops the source of the packages it names
+        // (normalized), in either file; a script's list combines with the
+        // project's, and an explicit no-sources = false disables it.
+        let names = |list: &str| format!("{PYPROJECT}\n[tool.uv]\nno-sources-package = {list}\n");
+        assert_eq!(
+            refused("uv.lock", &[("pyproject.toml", &names("[\"Click\"]"))]),
+            "redirect_uv_project_unsupported"
+        );
+        assert_eq!(
+            refused(
+                "uv.lock",
+                &[
+                    ("pyproject.toml", PYPROJECT),
+                    ("uv.toml", "no-sources-package = [\"click\"]\n")
+                ]
+            ),
+            "redirect_uv_project_unsupported"
+        );
+        wired("uv.lock", &[("pyproject.toml", &names("[\"requests\"]"))]);
+        let script_names = SCRIPT.replace(
+            "# ///\n",
+            "#\n# [tool.uv]\n# no-sources-package = [\"requests\"]\n# ///\n",
+        );
+        assert_eq!(
+            refused(
+                "tool.py.lock",
+                &[
+                    ("tool.py", &script_names),
+                    ("uv.toml", "no-sources-package = [\"click\"]\n")
+                ]
+            ),
+            "redirect_uv_script_unsupported"
+        );
+        wired(
+            "tool.py.lock",
+            &[
+                ("tool.py", &script_false),
+                ("uv.toml", "no-sources-package = [\"click\"]\n"),
             ],
         );
     }

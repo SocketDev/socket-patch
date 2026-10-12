@@ -308,50 +308,84 @@ fn contains_dependency(item: Option<&Item>, name: &str) -> bool {
 /// beside a PEP 723 script, from uv's working directory).
 pub const UV_TOML: &str = "uv.toml";
 
-/// Refuse to wire a `[tool.uv.sources]` entry that uv would ignore (#564).
+/// Refuse to wire a `[tool.uv.sources]` entry for `name` that uv would
+/// ignore (#564).
 ///
-/// Under `no-sources = true` uv drops every source, so a wired entry fails
-/// `uv sync --locked`, and a plain `uv sync` relocks the package to the
-/// registry and installs the unpatched wheel. `script` is the PEP 723
-/// script being wired (`None` for a project), and `pyproject` and `uv_toml`
-/// are the project's files, when present. The precedence is uv's (checked
-/// against uv 0.11): a script's own `[tool.uv]` wins; otherwise a `uv.toml`
-/// replaces pyproject's `[tool.uv]` settings outright. A file that does not
-/// parse sets nothing here: uv reports it itself, and the rewriters report
-/// a metadata file they cannot edit.
+/// Under `no-sources = true`, or a `no-sources-package` list naming the
+/// package, uv drops the source, so a wired entry fails `uv sync --locked`,
+/// and a plain `uv sync` relocks the package to the registry and installs
+/// the unpatched wheel. `script` is the PEP 723 script being wired (`None`
+/// for a project), and `pyproject` and `uv_toml` are the project's files,
+/// when present. Each file's settings are uv's (checked against uv 0.11): a
+/// `uv.toml` replaces pyproject's `[tool.uv]` outright; a script's own
+/// `no-sources` wins over the project's, while the two `no-sources-package`
+/// lists combine; and an explicit `no-sources = false` disables the list.
+/// A file that does not parse sets nothing here: uv reports it itself, and
+/// the rewriters report a metadata file they cannot edit.
 pub fn refuse_uv_no_sources(
+    name: &str,
     script: Option<&str>,
     pyproject: Option<&str>,
     uv_toml: Option<&str>,
 ) -> Result<(), String> {
-    fn setting(toml: &str, path: &[&str]) -> Option<bool> {
+    struct Settings {
+        file: &'static str,
+        no_sources: Option<bool>,
+        packages: Vec<String>,
+    }
+    fn settings(file: &'static str, toml: &str, path: &[&str]) -> Option<Settings> {
         let document: DocumentMut = toml.parse().ok()?;
         let mut table = document.as_table() as &dyn TableLike;
         for key in path {
             table = table.get(key)?.as_table_like()?;
         }
-        table.get("no-sources")?.as_bool()
+        Some(Settings {
+            file,
+            no_sources: table.get("no-sources").and_then(Item::as_bool),
+            packages: table
+                .get("no-sources-package")
+                .and_then(Item::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(canonicalize_pypi_name)
+                .collect(),
+        })
     }
-    let from_script = script.and_then(|text| {
+    let script = script.and_then(|text| {
         let (_, metadata) = script_metadata(text).ok()?;
-        Some((
-            "the script's [tool.uv]",
-            setting(&metadata, &["tool", "uv"])?,
-        ))
+        settings("the script's [tool.uv]", &metadata, &["tool", "uv"])
     });
-    let from_project = || match uv_toml {
-        Some(text) => setting(text, &[]).map(|value| (UV_TOML, value)),
-        None => pyproject
-            .and_then(|text| setting(text, &["tool", "uv"]))
-            .map(|value| ("pyproject.toml [tool.uv]", value)),
+    let project = match uv_toml {
+        Some(text) => settings(UV_TOML, text, &[]),
+        None => {
+            pyproject.and_then(|text| settings("pyproject.toml [tool.uv]", text, &["tool", "uv"]))
+        }
     };
-    match from_script.or_else(from_project) {
-        Some((file, true)) => Err(format!(
-            "{file} sets no-sources = true, so uv ignores [tool.uv.sources] and a plain \
+    let levels = [script, project];
+    let levels = levels.iter().flatten();
+    let refusal = |file: &str, setting: &str| {
+        Err(format!(
+            "{file} sets {setting}, so uv ignores the [tool.uv.sources] entry and a plain \
              `uv sync` would install the unpatched registry wheel; remove the setting to \
              wire a patch"
-        )),
-        _ => Ok(()),
+        ))
+    };
+    match levels
+        .clone()
+        .find_map(|level| Some((level.file, level.no_sources?)))
+    {
+        Some((file, true)) => return refusal(file, "no-sources = true"),
+        Some((_, false)) => return Ok(()),
+        None => {}
+    }
+    let name = canonicalize_pypi_name(name);
+    match levels
+        .into_iter()
+        .find(|level| level.packages.contains(&name))
+    {
+        Some(level) => refusal(level.file, &format!("no-sources-package naming {name}")),
+        None => Ok(()),
     }
 }
 
