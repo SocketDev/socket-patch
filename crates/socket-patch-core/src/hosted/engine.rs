@@ -700,6 +700,21 @@ pub async fn read_candidate_files(
         out.read(view, unreadable, &path).await;
     }
 
+    // Beside a uv project or script lock, the project's `uv.toml` may set
+    // `no-sources`, under which uv ignores the `[tool.uv.sources]` entry the
+    // rewrite would add (#564). Advisory: never rewritten, so a link or an
+    // unreadable in-memory entry is left out rather than refused.
+    if out
+        .files
+        .keys()
+        .any(|path| path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path))
+    {
+        let rel = crate::utils::python_script::UV_TOML;
+        if let Some(text) = read_advisory(view, unreadable, rel).await {
+            out.files.insert(rel.to_string(), text);
+        }
+    }
+
     // Rush monorepos have no root package.json/lock pair: the single pnpm
     // source-of-truth lock lives at common/config/rush/pnpm-lock.yaml, and
     // (when subspaces are enabled) one lock per subspace under

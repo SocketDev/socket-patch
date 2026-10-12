@@ -10,7 +10,7 @@ use crate::utils::python_lock::{
     is_python_lock_name, python_lock_paths, rewrite_python_lock, script_of_lock, ArtifactSource,
 };
 use crate::utils::python_script::{
-    replace_script_metadata, rewrite_script_metadata, script_metadata,
+    refuse_uv_no_sources, replace_script_metadata, rewrite_script_metadata, script_metadata,
 };
 
 use super::common::{record, refuse_symlinked};
@@ -179,6 +179,9 @@ async fn load_listed_locks(
     let mut files = Vec::new();
     let mut in_sync = true;
     let mut pin = None;
+    // The project's pyproject.toml and uv.toml, read once on the first
+    // script lock for the no-sources check (#564).
+    let mut project_config: Option<(Option<String>, Option<String>)> = None;
     for path in paths.into_iter().filter(|path| path != "uv.lock") {
         let text = read_file(&root.join(&path)).await?;
         let rewritten = rewrite_python_lock(
@@ -241,6 +244,22 @@ async fn load_listed_locks(
                 return Err(("pypi_script_multiple_versions", format!("{path} resolves multiple versions of {name}; a script source override cannot select only {version}")));
             }
             let script = read_file(&root.join(script_name)).await?;
+            let (pyproject, uv_toml) = match &project_config {
+                Some(config) => config,
+                None => project_config.insert((
+                    read_regular_to_string(&root.join("pyproject.toml"))
+                        .await
+                        .ok(),
+                    super::pypi_uv::read_uv_toml(root).await,
+                )),
+            };
+            refuse_uv_no_sources(
+                name,
+                Some(&script),
+                pyproject.as_deref(),
+                uv_toml.as_deref(),
+            )
+            .map_err(|detail| ("pypi_uv_no_sources", format!("{script_name}: {detail}")))?;
             let script_wheel = source_path(package).unwrap_or(&placeholder);
             if rewrite_script_metadata(&script, name, version, ArtifactSource::Path(script_wheel))
                 .map_err(|error| {
@@ -1231,6 +1250,56 @@ mod tests {
             packages.get(1).unwrap()["metadata"]["requires-dist"][0]["specifier"].as_str(),
             Some(">=1")
         );
+    }
+
+    /// #564: a script lock whose script (or, without its own setting, the
+    /// project's uv.toml or pyproject `[tool.uv]`) sets `no-sources = true`
+    /// is refused before anything is written, since uv would ignore the
+    /// vendored `[tool.uv.sources]` entry.
+    #[tokio::test]
+    async fn script_no_sources_refuses_before_writing() {
+        let lock = "version = 1\n[[package]]\nname = \"two\"\nversion = \"2\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        let plain = "# /// script\n# dependencies = [\"two==2\"]\n# ///\n";
+        let no_sources =
+            "# /// script\n# dependencies = [\"two==2\"]\n#\n# [tool.uv]\n# no-sources = true\n# ///\n";
+        let pyproject_no_sources =
+            "[project]\nname = \"p\"\nversion = \"0\"\n[tool.uv]\nno-sources = true\n";
+        for (script, file, config) in [
+            (no_sources, None, ""),
+            (plain, Some("uv.toml"), "no-sources = true\n"),
+            (plain, Some("pyproject.toml"), pyproject_no_sources),
+            (plain, Some("uv.toml"), "no-sources-package = [\"Two\"]\n"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            tokio::fs::write(temp.path().join("job.py.lock"), lock)
+                .await
+                .unwrap();
+            tokio::fs::write(temp.path().join("job.py"), script)
+                .await
+                .unwrap();
+            if let Some(file) = file {
+                tokio::fs::write(temp.path().join(file), config)
+                    .await
+                    .unwrap();
+            }
+            let Err(error) = load_python_locks(
+                temp.path(),
+                "two",
+                "2",
+                "11111111-1111-4111-8111-111111111111",
+            )
+            .await
+            else {
+                panic!("{script:?} with {file:?} must refuse");
+            };
+            assert_eq!(error.0, "pypi_uv_no_sources", "{}", error.1);
+            assert_eq!(
+                tokio::fs::read_to_string(temp.path().join("job.py"))
+                    .await
+                    .unwrap(),
+                script
+            );
+        }
     }
 
     #[tokio::test]

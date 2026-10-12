@@ -37,6 +37,7 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::line_endings::terminator;
 use crate::utils::purl::purl_name_version;
 use crate::utils::python_lock::preserve_line_endings;
+use crate::utils::python_script::{refuse_uv_no_sources, UV_TOML};
 
 use super::common::{
     ensure_unchanged, item_get, pep508_name, pyproject_dependency_specs, record, refuse_symlinked,
@@ -93,8 +94,17 @@ pub(super) struct UvProject {
     pub lock: Arc<DocumentMut>,
     /// uv.lock `revision` (diagnostics; recorded into [`UvMeta`]).
     pub lock_revision: Option<u64>,
+    /// The project's `uv.toml`, for the no-sources check (#564).
+    pub uv_toml: Option<String>,
     /// Non-fatal advisories raised during load (untested lock revision).
     pub warnings: Vec<VendorWarning>,
+}
+
+/// The project's `uv.toml` beside `root`'s pyproject.toml (or a script),
+/// for [`refuse_uv_no_sources`]. Advisory: one that is missing or cannot
+/// be read sets nothing (uv reports an unreadable one itself).
+pub(super) async fn read_uv_toml(root: &Path) -> Option<String> {
+    read_regular_to_string(&root.join(UV_TOML)).await.ok()
 }
 
 /// Read + parse the pair and run every project-level guard. Refuses before
@@ -212,6 +222,8 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
         }
     }
 
+    let uv_toml = read_uv_toml(root).await;
+
     // PEP 621 dynamic dependencies are resolved by a build backend at lock
     // time — there is no static dependency list to classify against.
     if pyproject
@@ -262,6 +274,7 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
         pyproject,
         lock,
         lock_revision,
+        uv_toml,
         warnings,
     })
 }
@@ -319,6 +332,16 @@ pub(super) fn check_target_guards(
     canon_name: &str,
     record_uuid: &str,
 ) -> Result<UvTarget, (&'static str, String)> {
+    // uv drops the [tool.uv.sources] entry under no-sources (or a
+    // no-sources-package list naming the package), so the vendored source
+    // would be ignored by the next `uv sync` (#564).
+    refuse_uv_no_sources(
+        canon_name,
+        None,
+        Some(&p.pyproject_text),
+        p.uv_toml.as_deref(),
+    )
+    .map_err(|detail| ("pypi_uv_no_sources", detail))?;
     // The same name at multiple versions/sources (platform forks) means one
     // surgical [[package]] rewrite would mispin the other forks — refuse.
     let units = p
@@ -2869,6 +2892,46 @@ wheels = [
         .await;
         let err = load_uv_project(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_uv_dynamic_dependencies");
+
+        // #564: uv ignores [tool.uv.sources] under no-sources = true, or a
+        // no-sources-package list naming the package, set in pyproject's
+        // [tool.uv] or in a project uv.toml (which replaces it).
+        let target = |p: &UvProject| {
+            check_target_guards(p, "six", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f").map(|_| ())
+        };
+        for setting in ["no-sources = true", "no-sources-package = [\"Six\"]"] {
+            let tmp = write_pair(
+                &format!("{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\n{setting}\n"),
+                DIRECT_REGISTRY_LOCK,
+            )
+            .await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let err = target(&p).unwrap_err();
+            assert_eq!(err.0, "pypi_uv_no_sources", "{setting}: {}", err.1);
+            tokio::fs::write(tmp.path().join("uv.toml"), "offline = false\n")
+                .await
+                .unwrap();
+            target(&load_uv_project(tmp.path()).await.unwrap()).unwrap();
+            let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+            tokio::fs::write(tmp.path().join("uv.toml"), format!("{setting}\n"))
+                .await
+                .unwrap();
+            let err = target(&load_uv_project(tmp.path()).await.unwrap()).unwrap_err();
+            assert_eq!(err.0, "pypi_uv_no_sources", "{setting}: {}", err.1);
+        }
+        // A list naming other packages, or disabled by no-sources = false,
+        // leaves the source in force.
+        for setting in [
+            "no-sources-package = [\"requests\"]",
+            "no-sources = false\nno-sources-package = [\"six\"]",
+        ] {
+            let tmp = write_pair(
+                &format!("{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\n{setting}\n"),
+                DIRECT_REGISTRY_LOCK,
+            )
+            .await;
+            target(&load_uv_project(tmp.path()).await.unwrap()).unwrap();
+        }
 
         // forked package (six at two versions)
         let fork = format!(
@@ -5682,6 +5745,7 @@ wheels = [
             pyproject: Arc::new(pyproject.parse().unwrap()),
             lock: Arc::new(lock.parse().unwrap()),
             lock_revision: None,
+            uv_toml: None,
             warnings: Vec::new(),
         }
     }

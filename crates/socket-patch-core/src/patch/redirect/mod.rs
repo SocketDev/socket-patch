@@ -5868,6 +5868,18 @@ fn plan_python_metadata_with(
         detail: format!("{metadata_path}: {detail}"),
     };
     source_scope().map_err(unsupported)?;
+    let project_file = |rel: &str| files.get(rel).map(String::as_str);
+    crate::utils::python_script::refuse_uv_no_sources(
+        &dep.name,
+        script.then_some(original.as_str()),
+        if script {
+            project_file("pyproject.toml")
+        } else {
+            Some(&original)
+        },
+        project_file(crate::utils::python_script::UV_TOML),
+    )
+    .map_err(unsupported)?;
     let rewritten = if script {
         rewrite_script_metadata(
             &original,
@@ -25613,6 +25625,152 @@ mod python_metadata_pairing_tests {
             panic!("a pyproject without [project] must refuse");
         };
         assert_eq!(bad.code, "redirect_uv_project_unsupported");
+    }
+
+    /// #564: under `no-sources = true` uv ignores every `[tool.uv.sources]`
+    /// entry, so a wired source fails `uv sync --locked` and a plain
+    /// `uv sync` installs the unpatched registry wheel. The planner refuses
+    /// before writing. A project `uv.toml` replaces pyproject's `[tool.uv]`
+    /// settings, while a script's own `[tool.uv]` wins over `uv.toml`.
+    #[test]
+    fn no_sources_refuses_a_source_uv_would_ignore() {
+        let refused = |path: &str, files: &[(&str, &str)]| match plan(path, files, &[]) {
+            Err(warning) => {
+                assert!(warning.detail.contains("no-sources"), "{}", warning.detail);
+                warning.code
+            }
+            Ok(_) => panic!("{path} with {files:?} must refuse"),
+        };
+        let wired = |path: &str, files: &[(&str, &str)]| {
+            let (edit, _) =
+                plan(path, files, &[]).unwrap_or_else(|w| panic!("{}: {}", w.code, w.detail));
+            assert!(edit.is_some(), "{path} with {files:?} must be wired");
+        };
+        let project_no_sources = format!("{PYPROJECT}\n[tool.uv]\nno-sources = true\n");
+        let script_no_sources = |value: bool| {
+            SCRIPT.replace(
+                "# ///\n",
+                &format!("#\n# [tool.uv]\n# no-sources = {value}\n# ///\n"),
+            )
+        };
+        let script_true = script_no_sources(true);
+        let script_false = script_no_sources(false);
+
+        assert_eq!(
+            refused("uv.lock", &[("pyproject.toml", &project_no_sources)]),
+            "redirect_uv_project_unsupported"
+        );
+        assert_eq!(
+            refused(
+                "uv.lock",
+                &[
+                    ("pyproject.toml", PYPROJECT),
+                    ("uv.toml", "no-sources = true\n")
+                ]
+            ),
+            "redirect_uv_project_unsupported"
+        );
+        assert_eq!(
+            refused("tool.py.lock", &[("tool.py", &script_true)]),
+            "redirect_uv_script_unsupported"
+        );
+        assert_eq!(
+            refused(
+                "tool.py.lock",
+                &[("tool.py", SCRIPT), ("uv.toml", "no-sources = true\n")]
+            ),
+            "redirect_uv_script_unsupported"
+        );
+
+        // uv.toml without the key overrides pyproject's [tool.uv] entirely.
+        wired(
+            "uv.lock",
+            &[
+                ("pyproject.toml", &project_no_sources),
+                ("uv.toml", "offline = false\n"),
+            ],
+        );
+        wired(
+            "uv.lock",
+            &[
+                ("pyproject.toml", PYPROJECT),
+                ("uv.toml", "no-sources = false\n"),
+            ],
+        );
+        // The script's own setting wins over uv.toml.
+        wired(
+            "tool.py.lock",
+            &[
+                ("tool.py", &script_false),
+                ("uv.toml", "no-sources = true\n"),
+            ],
+        );
+        // A script without its own setting takes the project's: uv.toml,
+        // else pyproject's [tool.uv].
+        assert_eq!(
+            refused(
+                "tool.py.lock",
+                &[("tool.py", SCRIPT), ("pyproject.toml", &project_no_sources)]
+            ),
+            "redirect_uv_script_unsupported"
+        );
+        wired(
+            "tool.py.lock",
+            &[
+                ("tool.py", SCRIPT),
+                ("pyproject.toml", &project_no_sources),
+                ("uv.toml", "offline = false\n"),
+            ],
+        );
+        // A uv.toml that does not parse sets nothing (uv reports it).
+        wired(
+            "uv.lock",
+            &[
+                ("pyproject.toml", PYPROJECT),
+                ("uv.toml", "no-sources = [\n"),
+            ],
+        );
+
+        // no-sources-package drops the source of the packages it names
+        // (normalized), in either file; a script's list combines with the
+        // project's, and an explicit no-sources = false disables it.
+        let names = |list: &str| format!("{PYPROJECT}\n[tool.uv]\nno-sources-package = {list}\n");
+        assert_eq!(
+            refused("uv.lock", &[("pyproject.toml", &names("[\"Click\"]"))]),
+            "redirect_uv_project_unsupported"
+        );
+        assert_eq!(
+            refused(
+                "uv.lock",
+                &[
+                    ("pyproject.toml", PYPROJECT),
+                    ("uv.toml", "no-sources-package = [\"click\"]\n")
+                ]
+            ),
+            "redirect_uv_project_unsupported"
+        );
+        wired("uv.lock", &[("pyproject.toml", &names("[\"requests\"]"))]);
+        let script_names = SCRIPT.replace(
+            "# ///\n",
+            "#\n# [tool.uv]\n# no-sources-package = [\"requests\"]\n# ///\n",
+        );
+        assert_eq!(
+            refused(
+                "tool.py.lock",
+                &[
+                    ("tool.py", &script_names),
+                    ("uv.toml", "no-sources-package = [\"click\"]\n")
+                ]
+            ),
+            "redirect_uv_script_unsupported"
+        );
+        wired(
+            "tool.py.lock",
+            &[
+                ("tool.py", &script_false),
+                ("uv.toml", "no-sources-package = [\"click\"]\n"),
+            ],
+        );
     }
 }
 
