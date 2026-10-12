@@ -395,18 +395,36 @@ pub async fn run(args: ListArgs) -> i32 {
             eprintln!("Warning: {}", crate::ui::sentence_case(detail));
         }
     }
-    // A hosted `resolutions` selector no lock installs any more (#1203) is
-    // no patch either: say how to retire it.
+    // A hosted `resolutions` selector (#1203) or uv override pin (#1445)
+    // no lock installs any more is no patch either: say how to retire it.
     for pin in &inventory.stale {
         // Named by file and purl, as the contested refusal names files: a
         // hosted URL carries its grant token, which output never prints.
-        let detail = format!(
-            "{} keeps a hosted `resolutions` entry for {} that no lockfile installs any \
-             more; `socket-patch remove {}` removes that entry alone",
-            pin.files.join(", "),
-            pin.purl,
-            pin.purl
-        );
+        // A uv pin lives in the lock's paired metadata (and the lock's
+        // `[manifest]` record of it).
+        let uv_metadata: Vec<&str> = pin
+            .files
+            .iter()
+            .filter_map(|f| socket_patch_core::utils::python_lock::paired_metadata_rel(f))
+            .collect();
+        let detail = if uv_metadata.is_empty() {
+            format!(
+                "{} keeps a hosted `resolutions` entry for {} that no lockfile installs any \
+                 more; `socket-patch remove {}` removes that entry alone",
+                pin.files.join(", "),
+                pin.purl,
+                pin.purl
+            )
+        } else {
+            format!(
+                "{} keeps a hosted `override-dependencies` pin and `[tool.uv.sources]` URL for \
+                 {} that {} no longer installs; `socket-patch remove {}` removes that pin alone",
+                uv_metadata.join(", "),
+                pin.purl,
+                pin.files.join(", "),
+                pin.purl
+            )
+        };
         if args.common.json {
             warnings.push(RunWarning {
                 code: "hosted_resolution_orphaned".to_string(),

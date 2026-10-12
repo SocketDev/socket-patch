@@ -678,14 +678,12 @@ async fn uv_override_left_beside_a_live_hosted_pin_is_stale() {
     let other = format!(
         "https://patch.socket.dev/patch/pypi/other/1.0.0/{GRANT}/{SIX_PATCH}/other-1.0.0-py3-none-any.whl"
     );
-    let pyproject = pyproject
-        .replace(
-            "override-dependencies = [\"six==1.17.0\"]",
-            "override-dependencies = [\"six==1.17.0\",\n    \
+    let pyproject = pyproject.replace(
+        "override-dependencies = [\"six==1.17.0\"]",
+        "override-dependencies = [\"six==1.17.0\",\n    \
              # socket-patch hosted: pins a patched transitive dependency; rollback removes it\n    \
              \"other==1.0.0\",\n]",
-        )
-        + &format!("other = {{ url = \"{other}\" }}\n");
+    ) + &format!("other = {{ url = \"{other}\" }}\n");
     std::fs::write(tmp.path().join("pyproject.toml"), pyproject).unwrap();
     let lock = std::fs::read_to_string(tmp.path().join("uv.lock")).unwrap();
     let lock = lock.replacen(

@@ -329,7 +329,11 @@ pub(crate) fn hosted_override_pins(doc: &DocumentMut, script: bool) -> Vec<Hoste
         .enumerate()
         .filter(|(_, value)| is_hosted_override(value))
         .filter_map(|(index, value)| {
-            let compact: String = value.as_str()?.chars().filter(|c| !c.is_whitespace()).collect();
+            let compact: String = value
+                .as_str()?
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
             let raw = pep508_name(&compact);
             let version = compact[raw.len()..].strip_prefix("==")?;
             let exact = !version.is_empty()
