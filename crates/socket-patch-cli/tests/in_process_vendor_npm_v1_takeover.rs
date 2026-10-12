@@ -14,11 +14,12 @@
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
 //! telemetry hard-disabled; each test runs in its own tempdir.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::Path;
-use std::process::Command;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -191,18 +192,12 @@ async fn mock_api(server: &MockServer) {
 
 // ───────────────────────── subprocess runner ─────────────────────────
 
-/// Run the built binary with every ambient `SOCKET_*` var scrubbed and the
-/// npm registry pointed at the mock. Returns `(exit_code, envelope)`.
+/// Run the built binary in the hermetic environment
+/// (`tests/common/hermetic.rs`) with the npm registry pointed at the mock.
+/// Returns `(exit_code, envelope)`.
 fn run_json(cwd: &Path, registry: &str, args: &[&str]) -> (i32, Value) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.current_dir(cwd);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NPM_REGISTRY", registry);
+    let mut cmd = hermetic::binary_command();
+    cmd.current_dir(cwd).env("SOCKET_NPM_REGISTRY", registry);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("spawn socket-patch binary");
     let stdout = String::from_utf8_lossy(&out.stdout);

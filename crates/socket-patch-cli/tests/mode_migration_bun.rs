@@ -360,12 +360,20 @@ fn bun(cwd: &Path, args: &[&str], bun_home: &Path) -> Output {
 /// `#[serial]`, so one slot is enough.
 static ONLINE_ENV: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
-/// The real binary with `--no-telemetry` appended: nothing in this suite
-/// should ever post a telemetry event, mocked API or not.
+/// The real binary in the hermetic environment (`tests/common/hermetic.rs`)
+/// with `--no-telemetry` appended: nothing in this suite should ever post a
+/// telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = common::hermetic_command(&binary());
     cmd.args(args).arg("--no-telemetry").current_dir(cwd);
-    scrub_env(&mut cmd);
+    // The bun suites' scrub minus `SOCKET_*`, which the builder handled
+    // (removing them again would undo the opt-outs it forces on).
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if !name.starts_with("SOCKET_") && cache_env::is_ambient_bun_var(&name) {
+            cmd.env_remove(&key);
+        }
+    }
     for (k, v) in ONLINE_ENV.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         cmd.env(k, v);
     }

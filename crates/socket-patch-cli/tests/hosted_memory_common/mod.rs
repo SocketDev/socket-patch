@@ -18,6 +18,9 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+#[path = "../common/hermetic.rs"]
+pub mod hermetic;
+
 pub const ORG: &str = "test-org";
 
 pub fn fixtures_root() -> PathBuf {
@@ -405,7 +408,10 @@ fn disk_command(
     // The checkout is its own repo: no socket.yml above the temp dir applies.
     std::fs::create_dir_all(checkout.path().join(".git")).unwrap();
     let cwd = checkout.path().join(cwd_rel);
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    // The hermetic builder, then a cleared environment: the disk scan must
+    // see none of the host's tool state either, so only the vars set below
+    // (including the builder's three opt-outs, set again) reach the child.
+    let mut cmd = hermetic::binary_command();
     cmd.env_clear();
     for keep in [
         "SYSTEMROOT",

@@ -11,12 +11,13 @@
 //! from the staged manifest by the prebuilt fixture server, and the hosted
 //! API + hosted wheel are a wiremock.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -145,15 +146,9 @@ fn run_raw(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, 
         "lib/python3.11/site-packages"
     }))
     .unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args(args).arg("--cwd").arg(root).current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("VIRTUAL_ENV", &venv)
+    cmd.env("VIRTUAL_ENV", &venv)
         .env("PIPENV_IGNORE_VIRTUALENVS", "0")
         .envs(extra.iter().copied());
     let fixture = (args.first() == Some(&"vendor")).then(|| {

@@ -48,11 +48,12 @@
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::Path;
-use std::process::Command;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -352,9 +353,8 @@ fn registry_uri() -> &'static str {
     })
 }
 
-/// Run the built `socket-patch` binary with every ambient `SOCKET_*` var
-/// scrubbed (except the hermetic `SOCKET_NO_CONFIG`) and telemetry
-/// hard-disabled; `https://patch.socket.dev` counts as the patch server
+/// Run the built `socket-patch` binary in the hermetic environment
+/// (`tests/common/hermetic.rs`); `https://patch.socket.dev` counts as the patch server
 /// (`SOCKET_PATCH_SERVER_URL`) and the registry is the shared mirror
 /// (`SOCKET_NPM_REGISTRY`). Returns `(exit_code, stdout, stderr)`.
 fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
@@ -364,13 +364,8 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// [`run_cli`] with `env` set last, over the stand-in `HOME` (a test's own
 /// user-level Bun config, #1276).
 fn run_cli_env(cwd: &Path, args: &[&str], env: &[(&str, String)]) -> (i32, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.current_dir(cwd);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
     // A registry exported by npm (`npm_config_registry`) or Bun would
     // steer the Bun restores off the fixtures' registries (#992).
     // So would a user-level `.npmrc` / bunfig under `XDG_CONFIG_HOME`
@@ -383,8 +378,7 @@ fn run_cli_env(cwd: &Path, args: &[&str], env: &[(&str, String)]) -> (i32, Strin
     ] {
         cmd.env_remove(key);
     }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NPM_REGISTRY", registry_uri());
+    cmd.env("SOCKET_NPM_REGISTRY", registry_uri());
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     for (key, value) in env {
         cmd.env(key, value);

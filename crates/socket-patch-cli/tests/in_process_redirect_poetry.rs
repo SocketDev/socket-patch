@@ -11,6 +11,8 @@
 
 use std::path::Path;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -384,29 +386,17 @@ fn install_package(root: &Path, venv: &str, bytes: &[u8]) -> std::path::PathBuf 
 }
 
 async fn scan_output(root: &Path, server: &MockServer, extra: &[&str]) -> std::process::Output {
-    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut std_cmd = hermetic::binary_command();
+    hermetic::scrub_extra(&mut std_cmd, &[hermetic::Extra::Venv]);
     for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") || name.starts_with("POETRY_") || name == "VIRTUAL_ENV" {
-            cmd.env_remove(key);
+        if key.to_string_lossy().starts_with("POETRY_") {
+            std_cmd.env_remove(key);
         }
     }
-    // In-process tests in this binary `std::env::set_var` these via
-    // `apply_env_toggles`; one set by a parallel test between the scan
-    // above and the spawn would be inherited, so remove them
-    // unconditionally (see in_process_vendor.rs `run_cli`).
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
-    ] {
-        cmd.env_remove(key);
-    }
+    let mut cmd = tokio::process::Command::from(std_cmd);
     // Hermetic against the runner's own Python user site, which a
     // `--system-site-packages` venv reaches (#409).
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("PYTHONNOUSERSITE", "1")
+    cmd.env("PYTHONNOUSERSITE", "1")
         .args(["scan", "--mode", "hosted", "--yes", "--cwd"])
         .arg(root)
         .args([

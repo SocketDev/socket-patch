@@ -808,7 +808,7 @@ async fn hosted_bundle_command_prints_the_engine_result() {
         .map(|(k, v)| (k, String::from_utf8(v).unwrap()))
         .collect();
     let bundle = serde_json::json!({ "files": files, "presentOnly": [".pnp.loader.mjs"] });
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let mut child = hermetic::binary_command()
         .args([
             "hosted-bundle",
             "--org",
@@ -818,8 +818,6 @@ async fn hosted_bundle_command_prints_the_engine_result() {
             "--api-url",
             &server.uri(),
         ])
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -852,11 +850,8 @@ async fn hosted_bundle_command_prints_the_engine_result() {
         .unwrap()
         .starts_with(env!("CARGO_PKG_VERSION")));
 
-    let missing = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let missing = hermetic::binary_command()
         .args(["hosted-bundle"])
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_ORG_SLUG")
-        .env("SOCKET_NO_CONFIG", "1")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();

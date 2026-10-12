@@ -17,6 +17,8 @@ use socket_patch_cli::commands::rollback::{self, RollbackArgs};
 use socket_patch_cli::commands::scan::{run, ScanArgs, ScanMode};
 use std::path::Path;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use wiremock::matchers::{method, path, path_regex};
@@ -1031,34 +1033,12 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
     }
 }
 
-/// The CLI binary with ambient SOCKET_* env scrubbed (same hermeticity rule
-/// as `in_process_redirect.rs`'s `scrubbed_cli`; duplicated because test
-/// binaries cannot share helpers). Subprocess (not in-process `run`) so the
-/// `--json` stdout envelope can be read back — the diagnostics under test
-/// ARE the envelope's `redirect.warnings`.
+/// The CLI binary in the hermetic environment (`tests/common/hermetic.rs`).
+/// Subprocess (not in-process `run`) so the `--json` stdout envelope can be
+/// read back — the diagnostics under test ARE the envelope's
+/// `redirect.warnings`.
 fn scrubbed_cli() -> std::process::Command {
-    let cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    let mut cmd = cmd;
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    // In-process tests in this binary `std::env::set_var` these via
-    // `apply_env_toggles`; one set by a parallel test between the scan
-    // above and the spawn would be inherited, so remove them
-    // unconditionally (see in_process_vendor.rs `run_cli`).
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
-    ] {
-        cmd.env_remove(key);
-    }
-    cmd
+    hermetic::binary_command()
 }
 
 /// Run `scan --mode hosted --json` as a subprocess against `cwd` and parse

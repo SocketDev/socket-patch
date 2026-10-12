@@ -46,7 +46,7 @@ use common::{binary, git_sha256};
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use sha2::{Digest, Sha256};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -84,14 +84,9 @@ fn run_socket_env(
     cargo_home: &Path,
     env: &[(&str, &str)],
 ) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = common::hermetic_command(&binary());
     cmd.current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
+    common::hermetic::scrub_extra(&mut cmd, &[common::hermetic::Extra::Venv]);
     cmd.env("CARGO_HOME", cargo_home);
     for (k, v) in env {
         cmd.env(k, v);

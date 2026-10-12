@@ -8,6 +8,8 @@
 //! This is the CLI counterpart of the depscan-side install-verify e2e; the
 //! rewriter bytes themselves are pinned by the shared golden fixtures.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
@@ -2273,52 +2275,18 @@ async fn native_binary_no_matching_version_preserves_exact_bytes() {
         .exists());
 }
 
-/// A `socket-patch` Command with the ambient `SOCKET_*` env surface scrubbed,
-/// for the subprocess tests below: the binary binds a wide clap env surface
-/// (SOCKET_DRY_RUN, SOCKET_OFFLINE, SOCKET_ECOSYSTEMS, SOCKET_PROXY_URL, ...),
-/// and an ambient value silently changes what these tests exercise — ambient
-/// `SOCKET_DRY_RUN=true` turns the rewrite into a no-op and every on-disk
-/// oracle red. Seed-then-scrub (the `common/mod.rs` pattern): the hostile
-/// seeds never reach the child because `env_remove` clears them too, but if a
-/// scrub line is ever dropped the seed turns the suite red immediately.
-/// Telemetry opt-outs are deliberately kept so an opted-out dev stays opted
-/// out. The in-process tests above don't need this — their literal `ScanArgs`
-/// bypass clap's env bindings entirely.
+/// A `socket-patch` Command in the hermetic environment
+/// (`tests/common/hermetic.rs`), for the subprocess tests below. The
+/// in-process tests above don't need it: their literal `ScanArgs` bypass
+/// clap's env bindings entirely.
 fn scrubbed_cli() -> std::process::Command {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_OFFLINE", "true")
-        .env("SOCKET_ECOSYSTEMS", "cargo")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
-        .env_remove("SOCKET_DRY_RUN")
-        .env_remove("SOCKET_OFFLINE")
-        .env_remove("SOCKET_ECOSYSTEMS")
-        .env_remove("SOCKET_MANIFEST_PATH");
+    let mut cmd = hermetic::binary_command();
     // A registry exported by npm (`npm_config_registry`) or Bun would
     // steer the Bun restores off the fixtures' registry.
     for key in [
         "BUN_CONFIG_REGISTRY",
         "NPM_CONFIG_REGISTRY",
         "npm_config_registry",
-    ] {
-        cmd.env_remove(key);
-    }
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    // In-process tests in this binary `std::env::set_var` these via
-    // `apply_env_toggles`; one set by a parallel test between the scan
-    // above and the spawn would be inherited, so remove them
-    // unconditionally (see in_process_vendor.rs `run_cli`).
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
     ] {
         cmd.env_remove(key);
     }
