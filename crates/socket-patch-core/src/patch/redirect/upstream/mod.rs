@@ -264,7 +264,7 @@ impl HostedInventory {
                 continue;
             }
             let file = norm(&selector.file);
-            let paired = crate::utils::python_lock::paired_metadata_rel(&file).map(str::to_string);
+            let paired = crate::utils::python_lock::paired_metadata_path(&file);
             for segment in url_uuid_segments(&selector.url) {
                 stale_excused.insert((file.clone(), segment.clone()));
                 if let Some(paired) = &paired {

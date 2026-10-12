@@ -402,10 +402,10 @@ pub async fn run(args: ListArgs) -> i32 {
         // hosted URL carries its grant token, which output never prints.
         // A uv pin lives in the lock's paired metadata (and the lock's
         // `[manifest]` record of it).
-        let uv_metadata: Vec<&str> = pin
+        let uv_metadata: Vec<String> = pin
             .files
             .iter()
-            .filter_map(|f| socket_patch_core::utils::python_lock::paired_metadata_rel(f))
+            .filter_map(|f| socket_patch_core::utils::python_lock::paired_metadata_path(f))
             .collect();
         let detail = if uv_metadata.is_empty() {
             format!(

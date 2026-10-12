@@ -346,11 +346,17 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
     // A PEP 723 script lock is scoped to its script's own install: it is not
     // evidence against the project's locks (see `contest_across_locks`).
     let script_lock = is_script_lock_name(file);
-    let locked: BTreeSet<String> = packages
-        .iter()
-        .filter_map(|p| p.get("name").and_then(Item::as_str))
-        .map(canonicalize_pypi_name)
-        .collect();
+    // The packages a uv / script lock holds (a pylock has no paired
+    // metadata to leave an override behind in).
+    let locked: BTreeSet<String> = if pep751 {
+        BTreeSet::new()
+    } else {
+        packages
+            .iter()
+            .filter_map(|p| p.get("name").and_then(Item::as_str))
+            .map(canonicalize_pypi_name)
+            .collect()
+    };
     for package in packages.iter() {
         if pep751 {
             pylock_candidates(ctx, file, package, out, &mut candidates);
@@ -463,33 +469,13 @@ fn record_orphaned_overrides(
     script: bool,
     out: &mut Discovery,
 ) {
-    let Some(sources) = doc
-        .get("tool")
-        .and_then(Item::as_table_like)
-        .and_then(|tool| tool.get("uv"))
-        .and_then(Item::as_table_like)
-        .and_then(|uv| uv.get("sources"))
-        .and_then(Item::as_table_like)
-    else {
-        return;
-    };
     for pin in crate::utils::python_script::hosted_override_pins(doc, script) {
         if locked.contains(&pin.name) {
             continue;
         }
-        let Some(source) = sources
-            .iter()
-            .find(|(key, _)| canonicalize_pypi_name(key) == pin.name)
-            .and_then(|(_, item)| item.as_table_like())
-        else {
+        let Some(source) = unconditional_source(doc, &pin.name) else {
             continue;
         };
-        if ["marker", "extra", "group"]
-            .iter()
-            .any(|key| source.contains_key(key))
-        {
-            continue;
-        }
         let Some(url) = str_of(source, "url") else {
             continue;
         };
@@ -767,34 +753,35 @@ fn unusable(file: &str, why: &str) -> Pairing {
     }
 }
 
-/// Whether `doc`'s `[tool.uv.sources]` routes canonical package `canon` to
-/// exactly `wired`'s patch: a single unconditional `{ url | path }` source
-/// (our writers' shape; a marker / extra / group split applies only to some
-/// installs, and an array of sources is such a split).
-fn sources_confirm(ctx: &DiscoverCtx<'_>, doc: &DocumentMut, canon: &str, wired: &Wired) -> bool {
-    let Some(sources) = doc
+/// `doc`'s `[tool.uv.sources]` entry for canonical package `canon` when it
+/// is a single unconditional table (our writers' shape; a marker / extra /
+/// group split applies only to some installs, and an array of sources is
+/// such a split).
+fn unconditional_source<'d>(doc: &'d DocumentMut, canon: &str) -> Option<&'d dyn TableLike> {
+    let source = doc
         .get("tool")
         .and_then(Item::as_table_like)
         .and_then(|tool| tool.get("uv"))
         .and_then(Item::as_table_like)
         .and_then(|uv| uv.get("sources"))
-        .and_then(Item::as_table_like)
-    else {
-        return false;
-    };
-    let Some(source) = sources
+        .and_then(Item::as_table_like)?
         .iter()
         .find(|(key, _)| canonicalize_pypi_name(key) == canon)
-        .and_then(|(_, item)| item.as_table_like())
-    else {
+        .and_then(|(_, item)| item.as_table_like())?;
+    (!["marker", "extra", "group"]
+        .iter()
+        .any(|key| source.contains_key(key)))
+    .then_some(source)
+}
+
+/// Whether `doc`'s `[tool.uv.sources]` routes canonical package `canon` to
+/// exactly `wired`'s patch: a single unconditional `{ url | path }` source
+/// (our writers' shape; a marker / extra / group split applies only to some
+/// installs, and an array of sources is such a split).
+fn sources_confirm(ctx: &DiscoverCtx<'_>, doc: &DocumentMut, canon: &str, wired: &Wired) -> bool {
+    let Some(source) = unconditional_source(doc, canon) else {
         return false;
     };
-    if ["marker", "extra", "group"]
-        .iter()
-        .any(|key| source.contains_key(key))
-    {
-        return false;
-    }
     let Some(location) = str_of(source, "url").or_else(|| str_of(source, "path")) else {
         return false;
     };

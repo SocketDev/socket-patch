@@ -778,3 +778,44 @@ async fn restore_retires_a_leftover_uv_override() {
     let after = inventory(tmp.path()).await;
     assert!(after.is_empty(), "{after:?}");
 }
+
+#[tokio::test]
+async fn leftover_uv_override_is_not_retired_against_another_patchs_record() {
+    use socket_patch_core::patch::redirect::upstream::{
+        restore_upstream, PinStatus, RestoreOptions,
+    };
+    // The lock's `[manifest] overrides` record names another patch than
+    // the metadata's source: removing the override and source alone would
+    // leave a lock uv rejects, so the pin is refused and nothing is written.
+    let tmp = tempfile::tempdir().unwrap();
+    write_uv_override_left_by_relock(tmp.path(), true);
+    let lock = std::fs::read_to_string(tmp.path().join("uv.lock"))
+        .unwrap()
+        .replace(SIX_PATCH, OTHER_PATCH);
+    std::fs::write(tmp.path().join("uv.lock"), &lock).unwrap();
+    let pyproject = std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    let inv = inventory(tmp.path()).await;
+    assert_eq!(inv.stale.len(), 1, "{inv:?}");
+    assert!(
+        inv.contested_refusal().is_some(),
+        "the other patch's record is contested: {inv:?}"
+    );
+    let opts = RestoreOptions {
+        offline: true,
+        ..Default::default()
+    };
+    let outcome = restore_upstream(tmp.path(), &inv.stale, &opts).await;
+    match &outcome.pins[0].status {
+        PinStatus::Refused(why) => assert!(why.contains("[manifest] overrides"), "{why}"),
+        other => panic!("must refuse: {other:?}"),
+    }
+    assert!(outcome.reverted_files.is_empty(), "{outcome:?}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("uv.lock")).unwrap(),
+        lock
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap(),
+        pyproject
+    );
+}
