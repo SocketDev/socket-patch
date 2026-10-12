@@ -111,13 +111,21 @@ class Scheduling(unittest.TestCase):
 
     def test_reused_push_keeps_cache_writers_and_unqueued_jobs(self):
         # A push whose SHA passed the merge queue still compiles (main is the
-        # only cache writer) and still runs what the queue never ran.
+        # only cache writer) and still runs what the queue never ran. The
+        # full tier runs on a push only when CI_SCOPE is full, so only then
+        # does e2e-build still ship the ubuntu binaries it downloads.
         for job in ("clippy", "node-addon", "test", "test-release", "coverage", "e2e-build",
                     "e2e-build-windows", "e2e-build-macos", "cargo-old-toolchains",
                     "e2e-full", "cargo-vex-matrix-full", "yarn-berry-full", "hosted-e2e"):
             with self.subTest(job=job):
                 condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
                 self.assertNotIn("outputs.reuse", condition)
+        ship = [body for name, body in reader.steps(JOBS["e2e-build"])
+                if name.startswith(("Bundle ", "Compress ")) or "upload-artifact" in body]
+        self.assertEqual(len(ship), 3)
+        for body in ship:
+            self.assertIn("if: needs.clippy.outputs.reuse != 'true'"
+                          " || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')", body)
         for job in ("docker-base", "yarn-classic-matrix", "yarn-berry-e2e", "yarn-berry-e2e-macos"):
             with self.subTest(job=job):
                 condition = next(line for line in JOBS[job] if line.startswith("    if:"))
@@ -152,8 +160,10 @@ class Scheduling(unittest.TestCase):
                  "e2e-build-windows", "yarn-classic-matrix", "yarn-berry-e2e",
                  "cargo-old-toolchains"}
         never_on_pr = "    if: (github.event_name != 'pull_request'"
-        v5_pr_only = ("    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group')"
-                      " || github.head_ref == 'release/v5-prerelease'")
+        # The full tier runs on a PR only as the v5 integration PR.
+        full_tier = ("    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+                     " || (github.event_name == 'push' && vars.CI_SCOPE == 'full')"
+                     " || github.head_ref == 'release/v5-prerelease'")
         for job in JOBS:
             condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
             with self.subTest(job=job):
@@ -167,8 +177,8 @@ class Scheduling(unittest.TestCase):
             with self.subTest(job=job):
                 # Ungated jobs wait on a gated build, never run on a PR, or run
                 # only on the v5 integration PR, which never reuses (below).
-                self.assertTrue(ancestors(job) & gated or condition.startswith(never_on_pr)
-                                and (condition == v5_pr_only or "head_ref" not in condition), job)
+                self.assertTrue(ancestors(job) & gated or condition == full_tier
+                                or condition.startswith(never_on_pr) and "head_ref" not in condition, job)
         clippy = "\n".join(JOBS["clippy"])
         self.assertIn("pr_unchanged: ${{ steps.pr-head.outputs.unchanged }}", clippy)
         self.assertIn("python3 scripts/ci-reuse-pr-head.py", clippy)

@@ -1195,3 +1195,186 @@ async fn global_gem_discovery_via_rbenv_layout() {
         "~/.rbenv/versions/*/lib/ruby/gems/*/gems must be discovered; got {paths:?}"
     );
 }
+
+/// #952: `BUNDLE_GEMFILE=gemfiles/alt.gemfile` (the Appraisal / CI-matrix
+/// layout) moves `Bundler.root` to `gemfiles/`. Bundler then reads
+/// `gemfiles/.bundle/config` and resolves a relative bundle path, from
+/// that config or from the env `BUNDLE_PATH`, against `gemfiles/`, so
+/// `bundle install` puts the loaded copy in `gemfiles/vendor/bundle`.
+/// The same holds when the project's own `.bundle/config` names the
+/// gemfile. Discovery must crawl that copy as the project's store (so
+/// apply patches it), and `vex` must treat the `gem env` home as one
+/// Bundler never loads, rather than attest its patched copy.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn moved_bundle_gemfile_root_crawls_the_loaded_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(root.join("gemfiles")).unwrap();
+    let gemfile = "source \"https://rubygems.org\"\ngem \"colorize\", \"0.8.1\"\n";
+    std::fs::write(root.join("Gemfile"), gemfile).unwrap();
+    std::fs::write(root.join("gemfiles/alt.gemfile"), gemfile).unwrap();
+    let loaded_store = root.join("gemfiles/vendor/bundle/ruby/3.3.0/gems");
+    let loaded_copy = stage_gem(&loaded_store, "colorize", "0.8.1").await;
+
+    let gemdir = tmp.path().join("system-gem-home");
+    let system_gems = gemdir.join("gems");
+    stage_gem(&system_gems, "colorize", "0.8.1").await;
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    install_fake_gem(&bin, &gemdir);
+
+    let keys = [
+        "BUNDLE_CONFIG",
+        "BUNDLE_USER_CONFIG",
+        "BUNDLE_USER_HOME",
+        "BUNDLE_APP_CONFIG",
+        "BUNDLE_IGNORE_CONFIG",
+        "BUNDLE_GEMFILE",
+        "BUNDLE_LOCKFILE",
+        "BUNDLE_PATH",
+        "BUNDLE_PATH__SYSTEM",
+        "BUNDLE_DISABLE_SHARED_GEMS",
+        "HOME",
+    ];
+    let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+    for key in keys {
+        std::env::remove_var(key);
+    }
+    std::env::set_var("HOME", tmp.path().join("home"));
+    let crawler = RubyCrawler;
+    let options = options_at(&root);
+    let alt = root.join("gemfiles/alt.gemfile");
+    let mut cases = Vec::new();
+    // (label, project .bundle/config, gemfiles/.bundle/config,
+    //  env BUNDLE_GEMFILE, env BUNDLE_PATH)
+    let variants: [(
+        &str,
+        Option<String>,
+        Option<&str>,
+        Option<&Path>,
+        Option<&str>,
+    ); 4] = [
+        (
+            "env gemfile, root config path",
+            None,
+            Some("---\nBUNDLE_PATH: \"vendor/bundle\"\n"),
+            Some(alt.as_path()),
+            None,
+        ),
+        (
+            "env gemfile, env path",
+            None,
+            None,
+            Some(Path::new("gemfiles/alt.gemfile")),
+            Some("vendor/bundle"),
+        ),
+        (
+            "app config gemfile, root config path",
+            Some("---\nBUNDLE_GEMFILE: \"gemfiles/alt.gemfile\"\n".to_string()),
+            Some("---\nBUNDLE_PATH: \"vendor/bundle\"\n"),
+            None,
+            None,
+        ),
+        (
+            "app config gemfile, env path",
+            Some(format!("---\nBUNDLE_GEMFILE: \"{}\"\n", alt.display())),
+            None,
+            None,
+            Some("vendor/bundle"),
+        ),
+    ];
+    for (label, app_config, root_config, gemfile_env, path_env) in variants {
+        for (dir, text) in [
+            (root.join(".bundle"), app_config.as_deref()),
+            (root.join("gemfiles/.bundle"), root_config),
+        ] {
+            let _ = std::fs::remove_dir_all(&dir);
+            if let Some(text) = text {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("config"), text).unwrap();
+            }
+        }
+        if let Some(value) = gemfile_env {
+            std::env::set_var("BUNDLE_GEMFILE", value);
+        }
+        if let Some(value) = path_env {
+            std::env::set_var("BUNDLE_PATH", value);
+        }
+        let stores = RubyCrawler::discover_bundle_stores(&root).await.stores;
+        let paths = with_path(&bin, || async { crawler.get_gem_paths(&options).await })
+            .await
+            .unwrap();
+        let unused = with_path(&bin, || async {
+            crawler.bundler_unused_system_gem_homes(&options).await
+        })
+        .await;
+        std::env::remove_var("BUNDLE_GEMFILE");
+        std::env::remove_var("BUNDLE_PATH");
+        let mut found = Vec::new();
+        for gems_dir in &paths {
+            let hits = crawler
+                .find_each_by_purl(gems_dir, &["pkg:gem/colorize@0.8.1".to_string()])
+                .await;
+            found.extend(hits.into_iter().flatten().map(|p| p.path));
+        }
+        cases.push((label, stores, found, unused));
+    }
+    // Restore the ambient state before any assertion can panic.
+    for (key, value) in keys.into_iter().zip(previous) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+    for key in keys {
+        std::env::remove_var(key);
+    }
+    std::env::set_var("HOME", tmp.path().join("home"));
+    let non_ruby = tmp.path().join("frontend");
+    std::fs::create_dir_all(&non_ruby).unwrap();
+    // `gemfiles/.bundle/config` recording `../vendor/bundle` installs back
+    // in the project's own `vendor/bundle`: still inside the project, so
+    // not refused by the containment guard.
+    let climbing_store = root.join("vendor/bundle/ruby/3.3.0/gems");
+    let climbing_copy = stage_gem(&climbing_store, "colorize", "0.8.1").await;
+    std::fs::remove_dir_all(root.join(".bundle")).ok();
+    std::fs::remove_dir_all(root.join("gemfiles/vendor")).unwrap();
+    std::fs::create_dir_all(root.join("gemfiles/.bundle")).unwrap();
+    std::fs::write(
+        root.join("gemfiles/.bundle/config"),
+        "---\nBUNDLE_PATH: \"../vendor/bundle\"\n",
+    )
+    .unwrap();
+    std::env::set_var("BUNDLE_GEMFILE", &alt);
+    let climbing = RubyCrawler::discover_bundle_stores(&root).await;
+    // The same project spelled with a `..` (`--cwd app/gemfiles/..`).
+    let climbing_dotdot = RubyCrawler::discover_bundle_stores(&root.join("gemfiles/..")).await;
+    // A machine-wide BUNDLE_GEMFILE export does not make a directory with
+    // no Gemfile a Ruby project.
+    let foreign = RubyCrawler::discover_bundle_stores(&non_ruby).await;
+    std::env::remove_var("BUNDLE_GEMFILE");
+    for (key, value) in keys.into_iter().zip(previous) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    assert_eq!(climbing.stores, vec![climbing_store.clone()]);
+    assert_eq!(climbing.skipped_config_path, None);
+    assert_eq!(climbing_dotdot.stores, vec![climbing_store.clone()]);
+    assert_eq!(climbing_dotdot.skipped_config_path, None);
+    assert!(climbing_copy.is_dir());
+    assert_eq!(foreign.bundler_root, None);
+    assert!(foreign.stores.is_empty(), "{:?}", foreign.stores);
+
+    for (label, stores, found, unused) in cases {
+        assert_eq!(stores, vec![loaded_store.clone()], "{label}");
+        // The loaded copy is found first, as the primary store's copy.
+        assert_eq!(found.first(), Some(&loaded_copy), "{label}: {found:?}");
+        assert_eq!(unused, vec![system_gems.clone()], "{label}");
+    }
+}

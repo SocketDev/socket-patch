@@ -1073,6 +1073,109 @@ fn go_patches_replace_for_an_unselected_version_is_not_attested() {
     }
 }
 
+/// #484: the patch API keys a `+incompatible` Go module as
+/// `@v2.0.0%2Bincompatible`, while go.mod spells the replace's version with
+/// a literal `+`. vex must match the two spellings: an applied go-patches
+/// redirect attests (it used to be omitted as `not_applied`, exit 1), while
+/// a go.work replace that overrides it, or a require that selects another
+/// version, is still caught, never attested, and reported under the
+/// record's own `%2B` spelling.
+#[test]
+fn go_patches_replace_of_an_incompatible_module_matches_the_encoded_key() {
+    let module = "example.com/legacy";
+    let version = "v2.0.0+incompatible";
+    // (omission reason, if any)
+    for omitted in [
+        None,
+        Some("go_workspace_override"),
+        Some("go_version_not_selected"),
+    ] {
+        let overridden = omitted == Some("go_workspace_override");
+        let required = if omitted == Some("go_version_not_selected") {
+            "v2.1.0+incompatible"
+        } else {
+            version
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(
+            cwd.join("go.mod"),
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire {module} {required}\n\n\
+                 replace {module} {version} => ./.socket/go-patches/{module}@{version}\n"
+            ),
+        )
+        .unwrap();
+        let go_work = cwd.join("go.work");
+        if overridden {
+            std::fs::write(
+                &go_work,
+                format!("go 1.21\n\nuse .\n\nreplace {module} {version} => ./fork\n"),
+            )
+            .unwrap();
+        }
+        let patched = b"package legacy // patched\n";
+        let copy = cwd.join(format!(".socket/go-patches/{module}@{version}"));
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("lib.go"), patched).unwrap();
+        let encoded = "pkg:golang/example.com/legacy@v2.0.0%2Bincompatible";
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            encoded.to_string(),
+            make_record(
+                GOOD_UUID,
+                "lib.go",
+                "a".repeat(64).as_str(),
+                &compute_git_sha256_from_bytes(patched),
+                "GHSA-go-incompatible",
+                &["CVE-2026-484"],
+            ),
+        );
+        write_manifest(cwd, &manifest);
+        let empty_cache = cwd.join("empty-gomodcache");
+        std::fs::create_dir_all(&empty_cache).unwrap();
+
+        let out = cli()
+            .env("GOMODCACHE", &empty_cache)
+            .env(
+                "GOWORK",
+                if overridden {
+                    go_work.as_os_str()
+                } else {
+                    "off".as_ref()
+                },
+            )
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--product",
+                "pkg:golang/example.com/app@v0.0.1",
+            ])
+            .output()
+            .expect("invoke vex");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if let Some(reason) = omitted {
+            assert_eq!(out.status.code(), Some(1), "stderr:\n{stderr}");
+            assert!(!stdout.contains("not_affected"), "{stdout}");
+            assert!(
+                stderr.contains(&format!("omitting {encoded} from VEX"))
+                    && stderr.contains(&format!("({reason})")),
+                "stderr:\n{stderr}"
+            );
+        } else {
+            assert!(out.status.success(), "stderr:\n{stderr}");
+            let doc: Value = serde_json::from_str(&stdout).expect("VEX JSON on stdout");
+            let stmts = doc["statements"].as_array().unwrap();
+            assert_eq!(stmts.len(), 1, "{stdout}");
+            assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-go-incompatible");
+            assert_eq!(stmts[0]["status"], "not_affected");
+            assert_eq!(stmts[0]["products"][0]["subcomponents"][0]["@id"], encoded);
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Corrupt vendor ledger on a MANIFEST-FREE project (the D2 vendored
 // posture): the ledger was the only possible source of records, and it

@@ -26,6 +26,10 @@ regex = { workspace = true }
 # uv's hosted rewrite reads the patched wheel's METADATA, so the mock
 # serves real (tiny) wheels.
 zip = { workspace = true }
+# yarn classic's hosted pin reads the patched tarball's package.json, so
+# the mock serves real (tiny) npm tarballs.
+tar = { workspace = true }
+flate2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -19,7 +19,7 @@
 //! network: every host effect (locking, probes, record fetches, the commit
 //! of the rewritten files) stays with the caller.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,7 @@ use crate::api::types::PackageVendorResult;
 use crate::constants::npm_family::{
     RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
+use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::patch::redirect::npmrc::{
     effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
     NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
@@ -369,8 +370,9 @@ pub struct CandidateFiles {
     pub gem_refusal: Option<RewriteWarning>,
     /// Set when the root pnpm lock pins nothing pnpm installs: the
     /// workspace keeps one lock per member but the members cannot be
-    /// listed (#492), or `gitBranchLockfile` installs the branch from a
-    /// `pnpm-lock.<branch>.yaml` (#556). The root lock was left out of
+    /// listed (#492), `gitBranchLockfile` installs the branch from a
+    /// `pnpm-lock.<branch>.yaml` (#556), or pnpm's `lockfile` setting is
+    /// off so pnpm reads no lock at all (#1074). The root lock was left out of
     /// `files`, and the rewrite reports this instead of a redirect or a
     /// "no lockfile" hint.
     pub pnpm_refusal: Option<RewriteWarning>,
@@ -718,7 +720,22 @@ pub async fn read_candidate_files(
             }
         }
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
-        if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
+        // Only a pnpm project (a root pnpm lock, or a pnpm-workspace.yaml)
+        // is refused for pnpm's `lockfile` setting: an npm, yarn or bun
+        // project keeps its own hints.
+        let pnpm_lock = ROOT_PNPM_LOCKS.iter().any(|lock| {
+            out.files.contains_key(*lock)
+                || out.symlinked_reads.iter().any(|r| r == lock)
+                || out.unreadable_reads.iter().any(|r| r == lock)
+        });
+        let pnpm_project = pnpm_lock || view.read_text(PNPM_WORKSPACE_REL).await.is_ok();
+        let disabled = match pnpm_project {
+            true => crate::utils::pnpm_workspace::lockfile_disabled(view, true).await,
+            false => None,
+        };
+        if let Some(source) = disabled {
+            withhold_root_pnpm_locks(&mut out, disabled_lockfile_refusal(&source, pnpm_lock));
+        } else if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
             refuse_git_branch_locks(&mut out, &branch);
         } else {
             read_pnpm_member_locks(view, unreadable, &mut out).await;
@@ -834,22 +851,58 @@ fn refuse_pnpm_members(out: &mut CandidateFiles, why: String) {
 /// `gitBranchLockfile` with a branch lock present (#556): pnpm installs
 /// the branch from that lock, which hosted mode cannot pin, so the root
 /// lock (stale on the branch) is left out and the run refuses every pnpm
-/// pin (see [`CandidateFiles::pnpm_refusal`]). In memory the root lock is
-/// dropped from the link and unreadable lists too: it is not written.
+/// pin (see [`CandidateFiles::pnpm_refusal`]).
 fn refuse_git_branch_locks(
     out: &mut CandidateFiles,
     branch: &crate::utils::pnpm_workspace::GitBranchLocks,
 ) {
-    const ROOT_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
-    for lock in ROOT_LOCKS {
+    withhold_root_pnpm_locks(out, git_branch_lock_refusal(branch));
+}
+
+/// The root pnpm locks (see [`withhold_root_pnpm_locks`]).
+const ROOT_PNPM_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
+
+/// Leave every root pnpm lock out of the run and refuse every pnpm pin
+/// with `refusal` (see [`CandidateFiles::pnpm_refusal`]): a branch lock
+/// (#556) or pnpm's `lockfile` setting off (#1074, where pnpm reads no
+/// lock at all; member locks are never read then). In memory the root
+/// lock is dropped from the link and unreadable lists too: it is not
+/// written.
+fn withhold_root_pnpm_locks(out: &mut CandidateFiles, refusal: RewriteWarning) {
+    for lock in ROOT_PNPM_LOCKS {
         out.files.remove(lock);
     }
     out.symlinked_reads
-        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
+        .retain(|r| !ROOT_PNPM_LOCKS.contains(&r.as_str()));
     out.unreadable_reads
-        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
-    out.pnpm_refusal = Some(git_branch_lock_refusal(branch));
+        .retain(|r| !ROOT_PNPM_LOCKS.contains(&r.as_str()));
+    out.pnpm_refusal = Some(refusal);
 }
+
+/// The [`PNPM_LOCKFILE_DISABLED`] warning for a `lockfile` setting turned
+/// off at `source` (see [`crate::utils::pnpm_workspace::lockfile_disabled`]).
+/// Vendored mode is named only when a pnpm lock exists: its pnpm backend
+/// wires the lock it finds (pnpm then applies the `overrides` without
+/// reading it) and refuses a project with none.
+fn disabled_lockfile_refusal(source: &str, pnpm_lock: bool) -> RewriteWarning {
+    let remedy = if pnpm_lock {
+        "use `--mode vendored` (pnpm applies the `overrides` it wires without a lock), \
+         or remove the setting, run `pnpm install` and re-run"
+    } else {
+        "remove the setting, run `pnpm install` so pnpm writes pnpm-lock.yaml, and re-run"
+    };
+    RewriteWarning {
+        code: PNPM_LOCKFILE_DISABLED.into(),
+        detail: format!(
+            "{}; no pnpm lock was rewritten — {remedy}",
+            crate::utils::pnpm_workspace::describe_lockfile_disabled(source)
+        ),
+    }
+}
+
+/// Refusal code for a project whose pnpm `lockfile` setting is off, so
+/// pnpm never reads the lock a hosted pin goes into (#1074).
+pub const PNPM_LOCKFILE_DISABLED: &str = "redirect_pnpm_lockfile_disabled";
 
 /// The [`PNPM_GIT_BRANCH_LOCKFILE`] warning for `branch`: the hosted
 /// rewrite's, and the vendored→hosted takeover's (which keeps the vendored
@@ -1212,40 +1265,82 @@ pub fn yarn_classic_artifact_targets<'a>(
     if crate::patch::redirect::yarn_classic_hosted_refused(files, yarn_outer) {
         return Vec::new();
     }
+    select_classic_artifacts(candidates, lock, classic_registry_copies)
+}
+
+/// [`yarn_classic_artifact_targets`] over a classic `lock`, reading its
+/// registry copies through `read_copies`. The lock is read in one pass for
+/// the artifacts it pins already, once a dep with a sha1 asks; the
+/// registry-copy test reads every block, so it runs after that, at most
+/// once per lock, and only when some dep still needs it (#1423): a rescan
+/// whose grants all carry a sha1 and are pinned already never reads the
+/// blocks.
+fn select_classic_artifacts<'a>(
+    candidates: &'a [Candidate],
+    lock: &str,
+    read_copies: impl FnOnce(&str) -> HashSet<(String, String)>,
+) -> Vec<&'a DepOverride> {
+    let mut pinned: Option<HashSet<&str>> = None;
+    let mut read_copies = Some(read_copies);
+    let mut registry_copies: Option<HashSet<(String, String)>> = None;
     let mut seen = BTreeSet::new();
     candidates
         .iter()
         .map(|c| &c.dep)
         .filter(|dep| dep.ecosystem == "npm" && dep.integrity.sha512.is_some())
         .filter(|dep| {
-            classic_locks_registry_copy(lock, &crate::patch::redirect::full_name(dep), &dep.version)
+            dep.integrity.sha1.is_none()
+                || !pinned
+                    .get_or_insert_with(|| quoted_fragment_urls(lock))
+                    .contains(dep.artifact_url.as_str())
         })
         .filter(|dep| {
-            dep.integrity.sha1.is_none() || !lock.contains(&format!("\"{}#", dep.artifact_url))
+            registry_copies
+                .get_or_insert_with(|| read_copies.take().map_or_else(HashSet::new, |r| r(lock)))
+                .contains(&(crate::patch::redirect::full_name(dep), dep.version.clone()))
         })
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
 }
 
-/// Whether a classic `lock` has a registry block of `name@version`: the
-/// only copy a hosted pin rewrites (a git, `file:`, `link:` or remote
+/// Every `<url>` that `text` writes as `"<url>#…`: an opening quote, then
+/// text with no quote, `#` or line break, then a `#` (a `resolved` URL
+/// with its fragment). One pass, so asking whether the lock pins an
+/// artifact is a set lookup rather than a search of the whole lock.
+fn quoted_fragment_urls(text: &str) -> HashSet<&str> {
+    let mut urls = HashSet::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let end = after.find(['"', '#', '\n']).unwrap_or(after.len());
+        if after[end..].starts_with('#') {
+            urls.insert(&after[..end]);
+        }
+        rest = &after[end..];
+    }
+    urls
+}
+
+/// The `(name, version)` of every registry block in a classic `lock`: the
+/// only copies a hosted pin rewrites (a git, `file:`, `link:` or remote
 /// tarball copy is skipped by name, so it needs no served tarball). Read
 /// by the blocks' real names, as the rewriter does, so `lodash` never
 /// matches a `lodash.debounce` block.
-fn classic_locks_registry_copy(lock: &str, name: &str, version: &str) -> bool {
+fn classic_registry_copies(lock: &str) -> HashSet<(String, String)> {
     use crate::formats::yarn::blocks::{classic_field, scan_blocks};
     use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
     use crate::formats::yarn::source::{classic_copy_source, CopySource};
-    if !lock.contains(name) {
-        return false;
-    }
-    scan_blocks(lock).iter().any(|block| {
-        let patterns = split_key_patterns(&block.key);
-        classic_key_real_name(&patterns) == Some(name)
-            && classic_field(&block.lines, "version") == Some(version)
-            && classic_copy_source(&patterns, classic_field(&block.lines, "resolved"))
-                == CopySource::Registry
-    })
+    scan_blocks(lock)
+        .iter()
+        .filter_map(|block| {
+            let patterns = split_key_patterns(&block.key);
+            let name = classic_key_real_name(&patterns)?;
+            let version = classic_field(&block.lines, "version")?;
+            (classic_copy_source(&patterns, classic_field(&block.lines, "resolved"))
+                == CopySource::Registry)
+                .then(|| (name.to_string(), version.to_string()))
+        })
+        .collect()
 }
 
 /// Record what the served tarball at `url` yielded: its sha1 on every
@@ -1339,6 +1434,11 @@ pub struct RewriteOptions<'a> {
     /// resolved only beside a classic `yarn.lock` (its offline-mirror
     /// refusal).
     pub yarn_classic_outer: &'a (dyn Fn() -> OuterYarnMirror + Send + Sync),
+    /// Where the cargo configs read for a build in the project (its own,
+    /// every parent directory's and `$CARGO_HOME`'s) take crates.io from,
+    /// resolved only when a cargo dep is rewritten (the cargo rewriter's
+    /// offline-source refusal).
+    pub cargo_outer: &'a (dyn Fn() -> CratesIoSource + Send + Sync),
     /// Run the rewriters on the blocking pool (the disk flow: pure CPU over
     /// every lock text).
     pub blocking: bool,
@@ -1923,6 +2023,11 @@ async fn rewrite_once(
     } else {
         OuterYarnMirror::default()
     };
+    let cargo_outer = if rewrite_overrides.iter().any(|o| o.ecosystem == "cargo") {
+        (options.cargo_outer)()
+    } else {
+        CratesIoSource::Registry
+    };
     let (files, mut rewrite) = if options.blocking {
         // Pure CPU over every lock text (the independent rewriter groups
         // run concurrently inside), so it runs on the blocking pool rather
@@ -1938,6 +2043,7 @@ async fn rewrite_once(
                 &withheld,
                 &gradle_unreadable,
                 &yarn_outer,
+                &cargo_outer,
             );
             (files, rewrite)
         })
@@ -1956,6 +2062,7 @@ async fn rewrite_once(
             withheld_from_vlt,
             &gradle_unreadable,
             &yarn_outer,
+            &cargo_outer,
         );
         (files, rewrite)
     };
@@ -3010,6 +3117,10 @@ mod tests {
     use super::*;
     use crate::vendor::lock_inventory::MemoryProject;
 
+    fn no_cargo_outer() -> CratesIoSource {
+        CratesIoSource::Registry
+    }
+
     const GRANT: &str = "GRANTTOKEN0123";
     const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
 
@@ -3088,15 +3199,104 @@ mod tests {
                     resolved \"git+https://github.com/x/left-pad.git#abc\"\n\n\
                     is-odd@^3.0.0:\n  version \"3.0.1\"\n  \
                     resolved \"https://registry.yarnpkg.com/is-odd/-/is-odd-3.0.1.tgz#bb\"\n";
-        assert!(!classic_locks_registry_copy(lock, "lodash", "4.17.21"));
-        assert!(!classic_locks_registry_copy(lock, "left-pad", "1.3.0"));
-        assert!(!classic_locks_registry_copy(lock, "is-odd", "3.0.0"));
-        assert!(classic_locks_registry_copy(lock, "is-odd", "3.0.1"));
-        assert!(classic_locks_registry_copy(
-            lock,
-            "lodash.debounce",
-            "4.17.21"
-        ));
+        let copies = classic_registry_copies(lock);
+        let has = |name: &str, version: &str| copies.contains(&(name.into(), version.into()));
+        assert!(!has("lodash", "4.17.21"));
+        assert!(!has("left-pad", "1.3.0"));
+        assert!(!has("is-odd", "3.0.0"));
+        assert!(has("is-odd", "3.0.1"));
+        assert!(has("lodash.debounce", "4.17.21"));
+        assert_eq!(copies.len(), 2);
+    }
+
+    fn classic_candidate(name: &str, version: &str, sha1: Option<&str>) -> Candidate {
+        let url = format!("https://h/serve/{GRANT}/{name}-{version}.tgz");
+        let mut dep = grant_dep("npm", url);
+        dep.name = name.into();
+        dep.version = version.into();
+        dep.integrity.sha512 = Some("sha512-x".into());
+        dep.integrity.sha1 = sha1.map(Into::into);
+        Candidate {
+            purl: format!("pkg:npm/{name}@{version}"),
+            dep,
+        }
+    }
+
+    #[test]
+    fn quoted_fragment_urls_reads_each_resolved_url() {
+        let lock = "a@^1:\n  resolved \"https://r/a.tgz#aa\"\n\
+                    b@^1:\n  resolved \"https://r/b.tgz\"\n\
+                    \"c@^1\", \"c@^2\":\n  resolved \"https://r/c.tgz#cc\"\n";
+        let urls = quoted_fragment_urls(lock);
+        assert_eq!(
+            urls,
+            HashSet::from(["https://r/a.tgz", "https://r/c.tgz"]),
+            "{urls:?}"
+        );
+    }
+
+    /// #1423: the served tarball is read only for a dep the lock locks as
+    /// a registry copy and doesn't pin to the artifact yet. The lock's
+    /// blocks are read at most once however many deps there are, and not
+    /// at all on a rescan whose deps are all pinned already.
+    #[test]
+    fn classic_artifact_targets_read_the_lock_blocks_at_most_once() {
+        let mut lock = String::from("# yarn lockfile v1\n\n");
+        let n = 200;
+        for i in 0..n {
+            lock.push_str(&format!(
+                "pkg-{i}@^1.0.0:\n  version \"1.0.{i}\"\n  \
+                 resolved \"https://registry.yarnpkg.com/pkg-{i}/-/pkg-{i}-1.0.{i}.tgz#aa\"\n\n"
+            ));
+        }
+        lock.push_str(
+            "gitdep@git+https://github.com/x/gitdep.git:\n  version \"2.0.0\"\n  \
+             resolved \"git+https://github.com/x/gitdep.git#abc\"\n",
+        );
+        let mut candidates: Vec<Candidate> = (0..n)
+            .map(|i| classic_candidate(&format!("pkg-{i}"), &format!("1.0.{i}"), Some("s1")))
+            .collect();
+        let reads = std::cell::Cell::new(0);
+        let counted = |lock: &str| {
+            reads.set(reads.get() + 1);
+            classic_registry_copies(lock)
+        };
+
+        // Every dep pinned to its artifact already: nothing to fetch, and
+        // the blocks are never read.
+        let mut pinned = lock.clone();
+        for c in &candidates {
+            pinned.push_str(&format!("# \"{}#s1\"\n", c.dep.artifact_url));
+        }
+        assert!(select_classic_artifacts(&candidates, &pinned, counted).is_empty());
+        assert_eq!(reads.get(), 0);
+
+        // Unpinned: every registry copy is selected once per artifact; a
+        // version the lock doesn't lock, a name it doesn't have, a git copy
+        // and a non-npm dep never. One read of the blocks for all of them.
+        candidates.push(classic_candidate("pkg-0", "9.9.9", None));
+        candidates.push(classic_candidate("absent", "1.0.0", None));
+        candidates.push(classic_candidate("gitdep", "2.0.0", None));
+        candidates.push(classic_candidate("pkg-1", "1.0.1", Some("s1")));
+        let mut pypi = classic_candidate("pkg-2", "1.0.2", None);
+        pypi.dep.ecosystem = "pypi".into();
+        candidates.push(pypi);
+        let got: Vec<String> = select_classic_artifacts(&candidates, &lock, counted)
+            .into_iter()
+            .map(|d| format!("{}@{}", d.name, d.version))
+            .collect();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(got.len(), n);
+        assert_eq!(got[0], "pkg-0@1.0.0");
+        assert_eq!(got[n - 1], format!("pkg-{}@1.0.{}", n - 1, n - 1));
+
+        // The public entry point selects the same deps from the files.
+        let files = BTreeMap::from([("yarn.lock".to_string(), lock)]);
+        let outer = OuterYarnMirror::default();
+        assert_eq!(
+            yarn_classic_artifact_targets(&candidates, &files, &outer).len(),
+            n
+        );
     }
 
     #[test]
@@ -3204,6 +3404,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3275,6 +3476,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3579,6 +3781,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3813,6 +4016,7 @@ snapshots:
                 npm_allow_remote_config: true,
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
+                cargo_outer: &no_cargo_outer,
                 blocking: false,
                 takeover_uuids: Default::default(),
                 patch_server_origins: Vec::new(),
@@ -3916,6 +4120,7 @@ snapshots:
                 npm_allow_remote_config: true,
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
+                cargo_outer: &no_cargo_outer,
                 blocking: false,
                 takeover_uuids: Default::default(),
                 patch_server_origins: Vec::new(),
@@ -4090,6 +4295,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -4429,6 +4635,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
@@ -4643,6 +4850,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -4696,6 +4904,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -5191,6 +5400,7 @@ snapshots:
             npm_allow_remote_config: true,
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -5562,6 +5772,240 @@ snapshots:
             assert!(!warning_codes(&done).contains(&PNPM_GIT_BRANCH_LOCKFILE));
             assert!(!done.rewrite.files.contains_key(BRANCH_LOCK));
         }
+    }
+
+    fn assert_disabled_lockfile_refused(read: &CandidateFiles, done: &Rewritten, source: &str) {
+        assert!(!read.files.contains_key("pnpm-lock.yaml"));
+        // Neither the lock nor a `trustLockfile` key is written.
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        let codes = warning_codes(done);
+        assert!(codes.contains(&PNPM_LOCKFILE_DISABLED), "{codes:?}");
+        assert!(
+            !codes.contains(&"redirect_pnpm_no_lockfile")
+                && !codes.contains(&"redirect_npm_no_lockfile")
+                && !codes.contains(&"redirect_pnpm_trust_lockfile"),
+            "{codes:?}"
+        );
+        let detail = &done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == PNPM_LOCKFILE_DISABLED)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains(source) && detail.contains("--mode vendored"),
+            "{detail}"
+        );
+    }
+
+    /// pnpm's `lockfile` setting off (#1074): pnpm never reads the
+    /// committed lock and installs the upstream package, so pinning it
+    /// would confirm (and VEX attest) a patch no install applies. pnpm 11+
+    /// read the setting from `pnpm-workspace.yaml`, pnpm 9/10 from
+    /// `.npmrc`.
+    #[tokio::test]
+    async fn a_disabled_lockfile_is_never_pinned() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "lockfile: false\n", true);
+        std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_disabled_lockfile_refused(&read, &done, "`lockfile: false` in pnpm-workspace.yaml");
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "packages:\n  - '.'\n", true);
+        std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+        std::fs::remove_file(tmp.path().join("pnpm-workspace.yaml")).unwrap();
+        write_rel(tmp.path(), ".npmrc", "lockfile=false\n");
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_disabled_lockfile_refused(&read, &done, "`lockfile=false` in .npmrc");
+
+        // The in-memory engine refuses the same project.
+        let mut project = MemoryProject::new();
+        project.insert_text("package.json", r#"{"name":"app"}"#);
+        project.insert_text("pnpm-workspace.yaml", "lockfile: false\n");
+        project.insert_text("pnpm-lock.yaml", v9_member_lock(true));
+        let (read, done) = view_rewrite(&ProjectView::Memory(&project)).await;
+        assert_disabled_lockfile_refused(&read, &done, "`lockfile: false` in pnpm-workspace.yaml");
+    }
+
+    /// With the lock off, pnpm reads no member's own lock either
+    /// (`sharedWorkspaceLockfile: false`, #492): none is pinned.
+    #[tokio::test]
+    async fn a_disabled_lockfile_pins_no_member_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\nlockfile: false\n",
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert!(read.pnpm_member_lock_keys.is_empty());
+        assert!(!read.files.keys().any(|k| k.ends_with("pnpm-lock.yaml")));
+        assert_disabled_lockfile_refused(&read, &done, "`lockfile: false` in pnpm-workspace.yaml");
+    }
+
+    /// The setting on (or unset) keeps the lock pinned as usual, and a
+    /// YAML value pnpm's reader takes for no boolean leaves the default.
+    /// With a known pnpm major only the file that major reads counts:
+    /// pnpm 11+ ignores `.npmrc`'s `lockfile`, pnpm 10 and older the YAML
+    /// key.
+    #[tokio::test]
+    async fn an_enabled_lockfile_is_pinned() {
+        for (workspace, npmrc, pm) in [
+            ("lockfile: true\n", None, None),
+            ("packages:\n  - '.'\n", Some("lockfile=true\n"), None),
+            ("lockfile: maybe\n", None, None),
+            (
+                "lockfile: true\n",
+                Some("lockfile=false\n"),
+                Some("pnpm@11.2.0"),
+            ),
+            ("lockfile: false\n", None, Some("pnpm@10.34.6")),
+            (
+                "lockfile: false\n",
+                Some("lockfile=true\n"),
+                Some("pnpm@9.15.9"),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_branch_lock_project(tmp.path(), workspace, true);
+            std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+            if let Some(npmrc) = npmrc {
+                write_rel(tmp.path(), ".npmrc", npmrc);
+            }
+            if let Some(pm) = pm {
+                write_pinned_manifest(tmp.path(), pm);
+            }
+            let (_, done) = member_rewrite(tmp.path()).await;
+            let text = done
+                .rewrite
+                .files
+                .get("pnpm-lock.yaml")
+                .unwrap_or_else(|| panic!("{workspace} {pm:?}: {:?}", done.rewrite.warnings));
+            assert!(text.contains(MEMBER_URL), "{text}");
+            assert_eq!(done.confirmed.len(), 1, "{workspace}");
+            assert!(!warning_codes(&done).contains(&PNPM_LOCKFILE_DISABLED));
+        }
+    }
+
+    fn write_pinned_manifest(root: &std::path::Path, pm: &str) {
+        write_rel(
+            root,
+            "package.json",
+            &format!(
+                r#"{{"name":"app","packageManager":"{pm}","dependencies":{{"is-number":"7.0.0"}}}}"#
+            ),
+        );
+    }
+
+    /// The file the pinned major reads decides (#1074): pnpm 9 ignores a
+    /// YAML `lockfile: true` and reads `.npmrc`'s `lockfile=false`; with no
+    /// major known, either file turning it off refuses.
+    #[tokio::test]
+    async fn a_disabled_lockfile_is_read_where_the_pnpm_major_reads_it() {
+        for (workspace, npmrc, pm, source) in [
+            (
+                "lockfile: true\n",
+                "lockfile=false\n",
+                Some("pnpm@9.15.9"),
+                "`lockfile=false` in .npmrc",
+            ),
+            (
+                "lockfile: true\n",
+                "lockfile=false\n",
+                None,
+                "`lockfile=false` in .npmrc",
+            ),
+            (
+                "lockfile: false\n",
+                "lockfile=true\n",
+                Some("pnpm@12.10.1"),
+                "`lockfile: false` in pnpm-workspace.yaml",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_branch_lock_project(tmp.path(), workspace, true);
+            std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+            write_rel(tmp.path(), ".npmrc", npmrc);
+            if let Some(pm) = pm {
+                write_pinned_manifest(tmp.path(), pm);
+            }
+            let (read, done) = member_rewrite(tmp.path()).await;
+            assert_disabled_lockfile_refused(&read, &done, source);
+        }
+    }
+
+    /// pnpm reads `lockfile` only when it is a boolean, else falls back to
+    /// npm's `package-lock` (`useLockfile` in every pnpm 7–11): the common
+    /// npm-era `package-lock=false` turns pnpm's lock off too, unless
+    /// `lockfile=true` says otherwise.
+    #[tokio::test]
+    async fn package_lock_false_disables_the_lockfile() {
+        for (npmrc, refused) in [
+            ("package-lock=false\n", true),
+            ("lockfile=true\npackage-lock=false\n", false),
+            ("package-lock=true\n", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_branch_lock_project(tmp.path(), "packages:\n  - '.'\n", true);
+            std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+            write_rel(tmp.path(), ".npmrc", npmrc);
+            write_pinned_manifest(tmp.path(), "pnpm@10.33.0");
+            let (read, done) = member_rewrite(tmp.path()).await;
+            if refused {
+                assert_disabled_lockfile_refused(&read, &done, "`package-lock=false` in .npmrc");
+            } else {
+                assert!(
+                    done.rewrite.files.contains_key("pnpm-lock.yaml"),
+                    "{npmrc}: {:?}",
+                    done.rewrite.warnings
+                );
+            }
+        }
+        // pnpm 11+ reads the YAML spelling.
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "packageLock: false\n", true);
+        std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+        write_pinned_manifest(tmp.path(), "pnpm@11.28.5");
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_disabled_lockfile_refused(
+            &read,
+            &done,
+            "`packageLock: false` in pnpm-workspace.yaml",
+        );
+    }
+
+    /// With no pnpm lock the remedy cannot be vendored mode (its pnpm
+    /// backend needs a lock to wire), and an npm project's `.npmrc`
+    /// `lockfile=false` is no pnpm setting at all: it keeps npm's hints.
+    #[tokio::test]
+    async fn a_disabled_lockfile_without_a_pnpm_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "lockfile: false\n", false);
+        std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+        let (_, done) = member_rewrite(tmp.path()).await;
+        let detail = &done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == PNPM_LOCKFILE_DISABLED)
+            .unwrap_or_else(|| panic!("{:?}", done.rewrite.warnings))
+            .detail;
+        assert!(
+            !detail.contains("--mode vendored") && detail.contains("pnpm install"),
+            "{detail}"
+        );
+
+        let mut project = MemoryProject::new();
+        project.insert_text("package.json", r#"{"name":"app"}"#);
+        project.insert_text(".npmrc", "lockfile=false\n");
+        let (_, done) = view_rewrite(&ProjectView::Memory(&project)).await;
+        assert!(
+            !warning_codes(&done).contains(&PNPM_LOCKFILE_DISABLED),
+            "{:?}",
+            done.rewrite.warnings
+        );
     }
 }
 

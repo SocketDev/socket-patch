@@ -123,6 +123,11 @@ struct Shape {
     /// beside the Socket one (#679, #863): VEX must then attest nothing, and
     /// `remove` must merge the Socket block into the crates.io one.
     contest: Option<&'static str>,
+    /// Files `remove` restores to different but equivalent bytes: the
+    /// upstream restore drops the pin, so a declaration that named
+    /// crates.io explicitly (`registry = "crates-io"`, #386) comes back
+    /// without the redundant key, which cargo resolves identically.
+    restored: Vec<(&'static str, String)>,
 }
 
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
@@ -759,6 +764,11 @@ async fn run_shape(shape: Shape) -> Option<()> {
             // appended registry block with the same bytes whether or not the
             // original file ended in a newline — so an UNTERMINATED file can
             // only come back with its final newline (every other byte exact).
+            let bytes = &shape
+                .restored
+                .iter()
+                .find(|(path, _)| path == rel)
+                .map_or_else(|| bytes.clone(), |(_, text)| text.as_bytes().to_vec());
             let want = match after.get(rel) {
                 Some(got)
                     if !bytes.ends_with(b"\n") && *got == [bytes.as_slice(), b"\n"].concat() =>
@@ -1004,6 +1014,7 @@ async fn cargo_hosted_multi_version_pins_each_declaration_and_removes_cleanly() 
         refused: None,
         prefetch: "",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
 }
@@ -1029,8 +1040,57 @@ async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
         refused: None,
         prefetch: "",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
+}
+
+/// #386: `registry = "crates-io"` names Cargo's built-in crates.io
+/// registry, so the declaration is a plain crates.io dependency. It was
+/// refused as "another registry" and nothing was redirected; it must be
+/// pinned in place, in both the inline and the table spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_explicit_crates_io_registry_is_pinned() {
+    for (tag, manifest, restored) in [
+        (
+            "crates-io-inline",
+            consumer_manifest("cfg-if = { version = \"1.0.4\", registry = \"crates-io\" }\n"),
+            consumer_manifest("cfg-if = \"1.0.4\"\n"),
+        ),
+        (
+            "crates-io-table",
+            format!(
+                "{}\n[dependencies.cfg-if]\nversion = \"1.0.4\"\nregistry = \"crates-io\"\n",
+                consumer_manifest("")
+            ),
+            format!(
+                "{}\n[dependencies.cfg-if]\nversion = \"1.0.4\"\n",
+                consumer_manifest("")
+            ),
+        ),
+    ] {
+        let shape = Shape {
+            tag,
+            files: vec![
+                ("Cargo.toml", manifest),
+                ("src/main.rs", "fn main() {}\n".to_string()),
+            ],
+            patches: vec![CFG_IF_1],
+            oracle: vec![(
+                "src/main.rs",
+                "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
+            )],
+            crlf: false,
+            lockless: false,
+            refused: None,
+            prefetch: "",
+            contest: None,
+            restored: vec![("Cargo.toml", restored)],
+        };
+        if run_shape(shape).await.is_none() {
+            return;
+        }
+    }
 }
 
 /// Bug H: a config ending in a blank line comes back byte-for-byte (the
@@ -1069,6 +1129,7 @@ async fn cargo_hosted_config_trailing_bytes_are_restored() {
             refused: None,
             prefetch: "",
             contest: None,
+            restored: vec![],
         };
         if run_shape(shape).await.is_none() {
             return;
@@ -1104,6 +1165,7 @@ async fn cargo_hosted_same_line_in_two_sections_removes_cleanly() {
         refused: None,
         prefetch: "",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
 }
@@ -1145,6 +1207,7 @@ async fn cargo_hosted_workspace_member_declaration_is_pinned() {
         refused: None,
         prefetch: "",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
 }
@@ -1169,6 +1232,7 @@ async fn cargo_hosted_crlf_project_keeps_its_line_endings() {
         refused: None,
         prefetch: "",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
 }
@@ -1196,6 +1260,7 @@ async fn cargo_hosted_refuses_a_crate_another_crate_depends_on() {
         refused: Some("redirect_cargo_transitive_dependents"),
         prefetch: "",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
 }
@@ -1224,6 +1289,7 @@ async fn cargo_hosted_refuses_a_lockless_project_with_other_dependencies() {
         refused: Some("redirect_cargo_lockless_dependents"),
         prefetch: "",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
 }
@@ -1299,6 +1365,7 @@ async fn cargo_hosted_refuses_a_crate_the_root_manifest_patch_overrides() {
         refused: Some("redirect_cargo_dep_overridden"),
         prefetch: "cfg-if = \"=1.0.4\"\n",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
 }
@@ -1332,6 +1399,7 @@ async fn cargo_hosted_refuses_a_crate_a_config_patch_overrides() {
         refused: Some("redirect_cargo_dep_overridden"),
         prefetch: "cfg-if = \"=1.0.4\"\n",
         contest: None,
+        restored: vec![],
     };
     let _ = run_shape(shape).await;
 }
@@ -1355,6 +1423,7 @@ async fn cargo_hosted_contested_by_a_later_crates_io_copy() {
         lockless: false,
         refused: None,
         contest: Some("crc32fast = \"=1.5.0\""),
+        restored: vec![],
         prefetch: "",
     };
     let _ = run_shape(shape).await;

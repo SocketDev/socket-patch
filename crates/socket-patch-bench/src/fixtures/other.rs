@@ -709,11 +709,14 @@ pub fn build_nuget(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
             )
         })
         .collect();
+    // A restored project's ~/.nuget/packages holds every patched
+    // package's unpatched copy, which NuGet would restore ahead of the
+    // Socket source: the scan rightly warns for each one (#352).
     Ok(fixture(
         pkgs.len(),
         patches,
         &["nuget.config", "packages.lock.json"],
-        &[],
+        &["redirect_nuget_stale_global_package"],
     ))
 }
 

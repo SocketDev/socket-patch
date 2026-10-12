@@ -206,17 +206,9 @@ impl Graph {
 }
 
 pub fn write_package(t: &mut Tree, dir: &str, p: &Pkg, rng: &mut Rng) -> std::io::Result<()> {
-    let manifest = json!({
-        "name": p.name,
-        "version": p.version,
-        "description": format!("synthetic package {}", p.name),
-        "main": "index.js",
-        "license": "MIT",
-        "dependencies": p.deps.iter().map(|(k, v)| (k.clone(), format!("^{v}"))).collect::<BTreeMap<_, _>>(),
-    });
     t.write(
         &format!("{dir}/package.json"),
-        serde_json::to_string_pretty(&manifest).unwrap(),
+        serde_json::to_string_pretty(&manifest_json(p)).unwrap(),
     )?;
     t.write(&format!("{dir}/index.js"), gen::js_source(&p.name, rng))?;
     if rng.chance(0.5) {
@@ -228,10 +220,57 @@ pub fn write_package(t: &mut Tree, dir: &str, p: &Pkg, rng: &mut Rng) -> std::io
     Ok(())
 }
 
-/// The bytes the artifact host serves for a patched package (only vlt's
-/// preflight downloads them; the hash is what matters).
+fn manifest_json(p: &Pkg) -> Value {
+    json!({
+        "name": p.name,
+        "version": p.version,
+        "description": format!("synthetic package {}", p.name),
+        "main": "index.js",
+        "license": "MIT",
+        "dependencies": p.deps.iter().map(|(k, v)| (k.clone(), format!("^{v}"))).collect::<BTreeMap<_, _>>(),
+    })
+}
+
+/// The bytes the artifact host serves for a patched package: a real npm
+/// tarball (`package/package.json` with the installed copy's
+/// dependencies, so nothing new needs locking, plus `package/index.js`).
+/// vlt's preflight checks its sha512; yarn classic's hosted pin also
+/// reads its package.json (#591). Deterministic: fixed mtimes and modes.
 pub fn artifact_bytes(p: &Pkg) -> Vec<u8> {
-    format!("patched tarball for {}@{}\n", p.name, p.version).into_bytes()
+    let manifest = serde_json::to_string_pretty(&manifest_json(p)).unwrap();
+    let index = format!(
+        "// patched {}@{}\nmodule.exports = {{}};\n",
+        p.name, p.version
+    );
+    let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::fast(),
+    ));
+    for (path, body) in [
+        ("package/package.json", manifest.as_bytes()),
+        ("package/index.js", index.as_bytes()),
+    ] {
+        let mut header = tar::Header::new_ustar();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        tar.append_data(&mut header, path, body).unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap()
+}
+
+/// Serve every patched package's [`artifact_bytes`] at its grant's URL.
+fn serve_artifacts(f: &mut Fixture, g: &Graph) {
+    for p in g.pkgs.iter().filter(|p| p.patched) {
+        let uuid = gen::uuid(&format!("patch:{}", p.purl()));
+        let token = gen::uuid(&format!("grant:{uuid}"));
+        f.files.push((
+            artifact_path(p, &token, &uuid),
+            artifact_bytes(p),
+            "application/octet-stream",
+        ));
+    }
 }
 
 fn sri_of(bytes: &[u8]) -> String {
@@ -533,7 +572,12 @@ pub fn build_yarn_classic(t: &mut Tree, size: Size) -> std::io::Result<Fixture> 
     )?;
     g.install_hoisted(t, "project/")?;
     t.mkdir("home")?;
-    Ok(fixture(g.pkgs.len(), g.patches(false), &["yarn.lock"], &[]))
+    let mut f = fixture(g.pkgs.len(), g.patches(false), &["yarn.lock"], &[]);
+    // The hosted pin reads each served tarball's package.json before
+    // pinning it (#591), so the wet scan downloads every patched
+    // package's tarball once; a rescan's pins are already in place.
+    serve_artifacts(&mut f, &g);
+    Ok(f)
 }
 
 // ── yarn berry ─────────────────────────────────────────────────────────
@@ -815,14 +859,6 @@ pub fn build_vlt(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
     // then a rescan sees them in the lock only.
     f.expect.rescan_lockfile_only = f.patches.len();
     // vlt's preflight downloads each artifact and checks its sha512.
-    for p in g.pkgs.iter().filter(|p| p.patched) {
-        let uuid = gen::uuid(&format!("patch:{}", p.purl()));
-        let token = gen::uuid(&format!("grant:{uuid}"));
-        f.files.push((
-            artifact_path(p, &token, &uuid),
-            artifact_bytes(p),
-            "application/octet-stream",
-        ));
-    }
+    serve_artifacts(&mut f, &g);
     Ok(f)
 }

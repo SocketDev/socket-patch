@@ -9,6 +9,7 @@
 //! * where yarn 1 installs a block's copy from ([`source`]);
 //! * the stanza view the hosted berry writers re-key and re-order
 //!   entries in ([`stanzas`]);
+//! * a `.yarnrc.yml` setting as yarn resolves it ([`rc`]);
 //! * the berry pinned-entry renderer ([`berry_entry`]) and the walk that
 //!   drops the entries a pin leaves unreachable ([`berry_prune`]).
 //!
@@ -23,6 +24,7 @@ pub(crate) mod berry_prune;
 pub(crate) mod blocks;
 pub(crate) mod classic_deps;
 pub(crate) mod patterns;
+pub mod rc;
 pub(crate) mod source;
 pub(crate) mod stanzas;
 

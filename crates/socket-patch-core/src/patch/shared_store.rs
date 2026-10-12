@@ -351,7 +351,10 @@ fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
         .collect();
     let nearest = |key: &str| {
         rcs.iter().find_map(|(dir, rc)| {
-            crate::formats::yarn::berry_gates::yarnrc_scalar(rc, key).map(|v| (*dir, v.to_string()))
+            // The value yarn uses (`${…}` expanded, #1100); one it cannot
+            // expand admits nothing.
+            crate::formats::yarn::rc::process_setting(rc, key)
+                .map(|setting| (*dir, setting.value.unwrap_or_default()))
         })
     };
     if nearest("nodeLinker").is_none_or(|(_, linker)| linker != "pnpm") {

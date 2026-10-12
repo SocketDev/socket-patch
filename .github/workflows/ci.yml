@@ -17,7 +17,8 @@ on:
     types: [checks_requested]
   schedule:
     # Nightly on main: the `full` tier (e2e-full, cargo-vex-matrix-full,
-    # yarn-berry-full) and e2e-docker, which pull_request runs skip.
+    # yarn-berry-full) and e2e-docker, which pull_request, merge_group and
+    # push runs skip.
     - cron: '41 5 * * *'
   workflow_dispatch:
     inputs:
@@ -68,10 +69,11 @@ concurrency:
 # MERGE-QUEUE REUSE: a push to main whose exact SHA already passed this
 # workflow in the merge queue (scripts/ci-reuse-merge-group.py, run by
 # clippy) only compiles, to refresh the main-only caches, and skips the
-# test steps and test-only jobs the queue already ran. Jobs the queue never
-# runs (test-release, e2e-full, yarn-berry-full, cargo-vex-matrix-full) and
-# hosted-e2e still run. API errors, missing evidence and direct pushes run
-# everything.
+# test steps and test-only jobs the queue already ran. hosted-e2e still
+# runs. The full tier (e2e-full, yarn-berry-full, cargo-vex-matrix-full)
+# never runs on push unless CI_SCOPE is `full`; it is nightly and on
+# dispatch. API errors, missing evidence and direct pushes run everything
+# else.
 # MERGE-MAIN REUSE: a pull_request push that only merged the base branch,
 # with the PR's own diff unchanged and the previous head green
 # (scripts/ci-reuse-pr-head.py, run by clippy), runs only clippy, the cheap
@@ -651,9 +653,21 @@ jobs:
         env:
           SOCKET_PATCH_GO_E2E_REQUIRED: '1'
           SOCKET_PATCH_GO_E2E_VERSION: '1.24'
+        #
+        # The test output is also teed to a file so that a failing test's
+        # panic becomes an annotation (scripts/ci-test-failures.py): in a
+        # ~16k-line log it is otherwise buried far above the tail that log
+        # viewers and the log API return, and an intermittent failure
+        # can't be diagnosed once the re-run has passed.
         run: |
+          set -o pipefail
           cargo llvm-cov --workspace --no-fail-fast \
-            --no-report
+            --no-report 2>&1 | tee "$RUNNER_TEMP/coverage-tests.log" || {
+            status=$?
+            python3 scripts/ci-test-failures.py "$RUNNER_TEMP/coverage-tests.log" || true
+            exit "$status"
+          }
+          set +o pipefail
           cargo llvm-cov report --lcov --output-path coverage-host.lcov
           python3 scripts/ci-lcov-summary.py coverage-host.lcov | tee coverage-summary.txt
 
@@ -1012,14 +1026,16 @@ jobs:
           cargo test --locked -p socket-patch-cli --all-features --tests --no-run --message-format=json-render-diagnostics > target-build.json
 
       - name: Bundle the binaries the legs run
-        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
+        # A reused push runs no leg, except e2e-full and cargo-vex-matrix-full
+        # on ubuntu when CI_SCOPE is `full`.
+        if: needs.clippy.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
         shell: bash
         env:
           BUNDLE_OS: ${{ matrix.os }}
         run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/e2e-bin
 
       - name: Compress the e2e binaries
-        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
+        if: needs.clippy.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
         # Compress the bundle as one stream so identical Rust code across
         # test binaries shares a dictionary. Zstd is on every runner image.
         # The 128 MiB window cuts the Linux artifact from ~200 MB to ~94 MB;
@@ -1030,7 +1046,7 @@ jobs:
           tar -C target/e2e-bin -cf - . | zstd -q -f -10 --long=27 -o target/e2e-bin.tar.zst
 
       - uses: ./.github/actions/upload-artifact
-        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
+        if: needs.clippy.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
         with:
           name: e2e-bin-${{ matrix.os }}
           path: target/e2e-bin.tar.zst
@@ -1700,8 +1716,7 @@ jobs:
           # the matching matrix key, which the suites treat as unset.
           SOCKET_PATCH_NPM_E2E_REQUIRED: ${{ matrix.npm_required || '' }}
           # `pnpm_required` does the same for the pnpm-family suites
-          # (corepack pnpm / pnpm on PATH). Set on the Linux rows only; the
-          # Windows and macOS rows have not been checked against it yet.
+          # (corepack pnpm / pnpm on PATH), on every OS that runs them.
           SOCKET_PATCH_PNPM_E2E_REQUIRED: ${{ matrix.pnpm_required || '' }}
           SOCKET_PATCH_CARGO_E2E_REQUIRED: ${{ matrix.suite == 'e2e_safety_cargo_build' && '1' || '' }}
           SOCKET_PATCH_UV_E2E_REQUIRED: ${{ matrix.uv != '' && '1' || '' }}
@@ -1805,10 +1820,10 @@ jobs:
 
   # The PM-version legs with no boundary of their own: the middle uv lines,
   # Pipenv releases and .NET SDK majors, and bundler 2.7. Skipped
-  # on pull_request (the `e2e` rows keep every named boundary, the oldest
-  # and newest release of each tool and every vlt era there); main pushes,
-  # v5 landings, the nightly schedule and dispatch run them with the `e2e`
-  # steps.
+  # on pull_request, merge_group and main pushes (the `e2e` rows keep every
+  # named boundary, the oldest and newest release of each tool and every vlt
+  # era there); v5 landings, the nightly schedule and dispatch run them with
+  # the `e2e` steps, and so do main pushes when CI_SCOPE is `full`.
 
   # Each OS consumes only its own build. A queued macOS runner must not
   # delay Linux or Windows, and a Windows compile must not delay Gradle.
@@ -1942,11 +1957,13 @@ jobs:
         include:
           - os: windows-latest
             suite: e2e_safety_pnpm
+            pnpm_required: '1'
           - os: windows-latest
             suite: e2e_redirect_npm_build
             npm_required: '1'
           - os: windows-latest
             suite: e2e_redirect_rush_sim
+            pnpm_required: '1'
           - os: windows-latest
             suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.4.2'
@@ -1959,7 +1976,7 @@ jobs:
           - {os: windows-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
           - {os: windows-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: windows-latest, suite: e2e_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix', pnpm_required: '1'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: gradle, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
@@ -1979,11 +1996,13 @@ jobs:
         include:
           - os: macos-latest
             suite: e2e_safety_pnpm
+            pnpm_required: '1'
           - os: macos-latest
             suite: e2e_redirect_npm_build
             npm_required: '1'
           - os: macos-latest
             suite: e2e_redirect_rush_sim
+            pnpm_required: '1'
           - os: macos-latest
             suite: e2e_redirect_bun_build
             bun: '1.4.2'
@@ -2001,7 +2020,7 @@ jobs:
           - {os: macos-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: macos-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
           - {os: macos-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          - {os: macos-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix', pnpm_required: '1'}
           - {os: macos-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
           - {os: macos-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
           - {os: macos-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
@@ -2028,8 +2047,9 @@ jobs:
     steps: *e2e-steps
 
   e2e-full:
-    # merge_group runs the pull_request tier: the queue gates on ci-ok.
-    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
+    # Nightly, on dispatch (release-qa) and on v5 landings only, like
+    # e2e-docker; CI_SCOPE=full also runs it on pushes to main.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.CI_SCOPE == 'full') || github.head_ref == 'release/v5-prerelease'
     needs: [e2e-build]
     strategy:
       fail-fast: false
@@ -2259,7 +2279,7 @@ jobs:
           YARN_BERRY_RELEASE: ${{ matrix.yarn }}
         run: scripts/yarn-berry-vex-matrix.sh "$YARN_BERRY_RELEASE"
 
-  # Skipped on pull_request (except v5 landings), like e2e-full.
+  # Nightly, on dispatch and on v5 landings only, like e2e-full.
 
   # The macOS rows of `yarn-berry-e2e`: they run on main, the merge queue and
   # nightly, not on every PR push, so PRs stop queueing on the small
@@ -2282,8 +2302,8 @@ jobs:
 
   yarn-berry-full:
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
-    # merge_group runs the pull_request tier: the queue gates on ci-ok.
-    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
+    # Same gate as e2e-full.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.CI_SCOPE == 'full') || github.head_ref == 'release/v5-prerelease'
     needs: clippy
     strategy:
       fail-fast: false
@@ -2301,7 +2321,7 @@ jobs:
   # plus macOS and Windows; 1.93.1 with its own lock (on every OS) is the
   # pinned rust-toolchain.toml cell `cargo test` used to give
   # e2e_safety_cargo_build. cargo-vex-matrix-full runs the rest of the
-  # toolchain x lock cross off pull_request. Each leg also runs
+  # toolchain x lock cross nightly and on dispatch. Each leg also runs
   # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
     if: needs.e2e-build.outputs.reuse != 'true'
@@ -2422,8 +2442,8 @@ jobs:
 
   cargo-vex-matrix-full:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    # merge_group runs the pull_request tier: the queue gates on ci-ok.
-    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
+    # Same gate as e2e-full.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.CI_SCOPE == 'full') || github.head_ref == 'release/v5-prerelease'
     needs: [e2e-build]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40

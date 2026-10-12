@@ -8,8 +8,11 @@ use serde_json::Value;
 use toml_edit::DocumentMut;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::poetry_lock::{
-    generated_by_version, lock_version, rewrite_poetry_lock_all, LockBatch, LockStep, PoetryLockDep,
+    generated_by_version, lock_version, lock_wiring, pyproject_source_constraints,
+    rewrite_poetry_lock_all, source_constraint_advisory, source_constraint_breaks_writer,
+    source_constraint_refusal, LockBatch, LockStep, PoetryLockDep,
 };
 
 /// Whether the lock was written by a Poetry release older than 1.4. Those
@@ -56,6 +59,51 @@ pub(super) fn rewrite_poetry(
         }
     }
     for (path, original) in locks {
+        // A pyproject `source = "…"` constraint on the dep (#1282). Poetry
+        // 1.4 – 2.2 fail every install of a lock that sources it from a URL,
+        // so a lock one of them wrote is refused; other writers are warned.
+        // The constraint lives in the pyproject beside the lock.
+        let pyproject_path = format!(
+            "{}pyproject.toml",
+            path.strip_suffix("poetry.lock").unwrap_or("")
+        );
+        let constraints = files
+            .get(&pyproject_path)
+            .map(|text| pyproject_source_constraints(text))
+            .unwrap_or_default();
+        let constraint = |dep: &DepOverride| constraints.get(&canonicalize_pypi_name(&dep.name));
+        let mut usable = usable.clone();
+        if !constraints.is_empty() && source_constraint_breaks_writer(original) {
+            usable.retain(|&(dep, _)| {
+                // A dep the lock doesn't list keeps its `entry_not_found`
+                // report; one it lists (even already redirected) is refused.
+                let Some(source) = constraint(dep) else {
+                    return true;
+                };
+                let Some(wired) = lock_wiring(original, &dep.name, &dep.version) else {
+                    return true;
+                };
+                result
+                    .refused_python_lock_uuids
+                    .insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_poetry_lock_unsupported".into(),
+                    detail: format!(
+                        "{path}: {}",
+                        source_constraint_refusal(
+                            &pyproject_path,
+                            path,
+                            &dep.name,
+                            &dep.version,
+                            source,
+                            "URL",
+                            wired,
+                        )
+                    ),
+                });
+                false
+            });
+        }
         let deps: Vec<PoetryLockDep> = usable
             .iter()
             .map(|&(dep, sha256)| PoetryLockDep {
@@ -92,6 +140,17 @@ pub(super) fn rewrite_poetry(
                     result
                         .confirmed_python_lock_uuids
                         .insert(dep.patch_uuid.clone());
+                    if let Some(source) = constraint(dep) {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_poetry_source_constraint".into(),
+                            detail: source_constraint_advisory(
+                                &pyproject_path,
+                                path,
+                                &dep.name,
+                                source,
+                            ),
+                        });
+                    }
                     if !stale_warned {
                         if let Some(format) =
                             *writer_format.get_or_insert_with(|| pre_1_4_writer(&content))
@@ -129,6 +188,17 @@ pub(super) fn rewrite_poetry(
                     result
                         .confirmed_python_lock_uuids
                         .insert(dep.patch_uuid.clone());
+                    if let Some(source) = constraint(dep) {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_poetry_source_constraint".into(),
+                            detail: source_constraint_advisory(
+                                &pyproject_path,
+                                path,
+                                &dep.name,
+                                source,
+                            ),
+                        });
+                    }
                 }
                 LockStep::NotFound => result.warnings.push(RewriteWarning {
                     code: "redirect_poetry_entry_not_found".into(),
@@ -271,6 +341,130 @@ mod equivalence_tests {
             }
         }
         g.finish();
+    }
+
+    /// A dependency the pyproject pins to a named source (`source = "pypi"`)
+    /// has no trace in the lock. Rewriting it to a URL source breaks every
+    /// `poetry install` on Poetry 1.4 – 2.2, so a lock stamped by one of
+    /// those is refused before any write; other writers are rewritten with a
+    /// warning (#1282). A sibling lock whose pyproject has no constraint is
+    /// rewritten as before.
+    #[test]
+    fn source_constrained_dependency_is_refused_for_poetry_1_4_to_2_2() {
+        const PYPROJECTS: &[&str] = &[
+            "[tool.poetry.dependencies]\nurllib3 = {version = \"1.26.18\", source = \"pypi\"}\n",
+            "[tool.poetry.dependencies.URLLib3]\nversion = \"1.26.18\"\nsource = \"PyPI\"\n",
+            "[tool.poetry.group.dev.dependencies]\nurllib3 = {version = \"*\", source = \"pypi\"}\n",
+            "[tool.poetry.dev-dependencies]\nurllib3 = {version = \"*\", source = \"pypi\"}\n",
+            "[tool.poetry.dependencies]\nurllib3 = [\n  {version = \"1.26.18\", python = \">=3.8\", source = \"pypi\"},\n  {version = \"1.26.17\", python = \"<3.8\"},\n]\n",
+            "[[tool.poetry.dependencies.urllib3]]\nversion = \"1.26.18\"\npython = \">=3.8\"\nsource = \"pypi\"\n\n[[tool.poetry.dependencies.urllib3]]\nversion = \"1.26.17\"\npython = \"<3.8\"\n",
+        ];
+        for version in VERSIONS.iter().filter(|version| !version.starts_with("0.")) {
+            let broken = matches!(
+                *version,
+                "1.4.2" | "1.5.1" | "1.6.1" | "1.7.1" | "1.8.5" | "2.0.1" | "2.1.4" | "2.2.1"
+            );
+            for pyproject in PYPROJECTS {
+                let lock = fixture(version);
+                let files = BTreeMap::from([
+                    ("poetry.lock".to_string(), lock.clone()),
+                    ("pyproject.toml".to_string(), pyproject.to_string()),
+                    ("sub/poetry.lock".to_string(), lock.clone()),
+                    (
+                        "sub/pyproject.toml".to_string(),
+                        "[tool.poetry.dependencies]\nurllib3 = \"1.26.18\"\n".to_string(),
+                    ),
+                ]);
+                let deps = [dep("urllib3", "1.26.18", Some(SHA), 0)];
+                let got = run(rewrite_poetry, &files, &deps);
+                let what = format!("{version} {pyproject:?}: {:?}", got.warnings);
+                assert!(got.files.contains_key("sub/poetry.lock"), "{what}");
+                let codes: Vec<&str> = got.warnings.iter().map(|w| w.code.as_str()).collect();
+                if broken {
+                    assert!(!got.files.contains_key("poetry.lock"), "{what}");
+                    assert!(
+                        got.edits.iter().all(|edit| edit.path == "sub/poetry.lock"),
+                        "{what}"
+                    );
+                    assert!(
+                        got.refused_python_lock_uuids.contains(&deps[0].patch_uuid),
+                        "{what}"
+                    );
+                    assert_eq!(codes, ["redirect_poetry_lock_unsupported"], "{what}");
+                    assert!(got.warnings[0].detail.contains("source ="), "{what}");
+                    // Nothing is wired yet, so re-locking is the whole remedy.
+                    assert!(!got.warnings[0].detail.contains("rollback"), "{what}");
+                } else {
+                    assert!(got.files.contains_key("poetry.lock"), "{what}");
+                    assert!(got.refused_python_lock_uuids.is_empty(), "{what}");
+                    assert!(
+                        codes.contains(&"redirect_poetry_source_constraint"),
+                        "{what}"
+                    );
+                }
+
+                // A lock a pre-#1282 run already redirected: still refused
+                // (never confirmed) on 1.4 – 2.2, still warned elsewhere.
+                let mut again = files.clone();
+                again.insert("poetry.lock".into(), got.files["sub/poetry.lock"].clone());
+                let got = run(rewrite_poetry, &again, &deps);
+                let codes: Vec<&str> = got.warnings.iter().map(|w| w.code.as_str()).collect();
+                assert!(!got.files.contains_key("poetry.lock"), "{what}");
+                if broken {
+                    assert!(
+                        got.refused_python_lock_uuids.contains(&deps[0].patch_uuid),
+                        "{what}"
+                    );
+                    assert_eq!(codes, ["redirect_poetry_lock_unsupported"], "{what}");
+                    // Re-locking would drop the live pin: roll back first.
+                    let detail = &got.warnings[0].detail;
+                    let rollback = detail
+                        .find("socket-patch rollback pkg:pypi/urllib3@1.26.18")
+                        .expect(detail);
+                    assert!(rollback < detail.find("re-lock").unwrap(), "{detail}");
+                } else {
+                    assert!(got.refused_python_lock_uuids.is_empty(), "{what}");
+                    assert!(
+                        codes.contains(&"redirect_poetry_source_constraint"),
+                        "{what}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A package pinned to a private index already carries that index as a
+    /// `[package.source]` in the lock. The rewriter refuses it as a
+    /// user-authored source, as before #1282: the source-pin refusal (whose
+    /// remedy is to drop the `source` key) must not take it over.
+    #[test]
+    fn private_index_pin_keeps_the_user_authored_source_refusal() {
+        for version in ["1.8.5", "2.2.1", "2.4.3"] {
+            let lock = fixture(version).replacen(
+                "\n[metadata]",
+                "\n[package.source]\ntype = \"legacy\"\nurl = \"https://pypi.corp.example/simple\"\nreference = \"corp\"\n\n[metadata]",
+                1,
+            );
+            let files = BTreeMap::from([
+                ("poetry.lock".to_string(), lock),
+                (
+                    "pyproject.toml".to_string(),
+                    "[tool.poetry.dependencies]\nurllib3 = {version = \"1.26.18\", source = \"corp\"}\n"
+                        .to_string(),
+                ),
+            ]);
+            let deps = [dep("urllib3", "1.26.18", Some(SHA), 0)];
+            let got = run(rewrite_poetry, &files, &deps);
+            assert!(got.files.is_empty(), "{version}: {:?}", got.warnings);
+            assert_eq!(got.warnings.len(), 1, "{version}: {:?}", got.warnings);
+            let detail = &got.warnings[0].detail;
+            assert_eq!(got.warnings[0].code, "redirect_poetry_lock_unsupported");
+            assert!(
+                detail.contains("refusing to replace an existing Poetry source"),
+                "{version}: {detail}"
+            );
+            assert!(!detail.contains("source ="), "{version}: {detail}");
+        }
     }
 
     /// A dozen patched packages in one lock cost one whole-lock render and

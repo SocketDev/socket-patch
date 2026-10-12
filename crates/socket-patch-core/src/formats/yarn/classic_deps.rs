@@ -53,13 +53,17 @@ pub(crate) fn with_manifest_dep_maps(lines: &[String], pkg: &Value) -> Vec<Strin
 /// block of `blocks` is keyed by, sorted and deduplicated: the ones a lock
 /// rewritten to the patched manifest would leave unresolved.
 pub(crate) fn unlocked_descriptors(blocks: &[LockBlock], pkg: &Value) -> Vec<String> {
-    unlocked_among(
-        blocks,
-        manifest_dep_maps(pkg)
-            .into_iter()
-            .flat_map(|(_, deps)| deps)
-            .map(|(name, range)| format!("{name}@{range}")),
-    )
+    unlocked_among(blocks, manifest_descriptors(pkg))
+}
+
+/// [`unlocked_descriptors`] against `locked`, every pattern the lock's
+/// keys hold: for a caller that checks many manifests against one lock
+/// and splits its keys once, not once per manifest (#1423).
+pub(crate) fn unlocked_descriptors_in(
+    locked: &std::collections::HashSet<&str>,
+    pkg: &Value,
+) -> Vec<String> {
+    sorted_missing(manifest_descriptors(pkg), |d| locked.contains(d))
 }
 
 /// Every descriptor of `descriptors` no block of `blocks` is keyed by,
@@ -72,9 +76,23 @@ pub(crate) fn unlocked_among(
         .iter()
         .flat_map(|b| split_key_patterns(&b.key))
         .collect();
-    let mut missing: Vec<String> = descriptors
-        .filter(|descriptor| !locked.contains(descriptor))
-        .collect();
+    sorted_missing(descriptors, |d| locked.contains(d))
+}
+
+/// The descriptors `pkg`'s dependency maps declare, as `name@range`.
+fn manifest_descriptors(pkg: &Value) -> impl Iterator<Item = String> {
+    manifest_dep_maps(pkg)
+        .into_iter()
+        .flat_map(|(_, deps)| deps)
+        .map(|(name, range)| format!("{name}@{range}"))
+}
+
+/// The descriptors `is_locked` rejects, sorted and deduplicated.
+fn sorted_missing(
+    descriptors: impl Iterator<Item = String>,
+    is_locked: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut missing: Vec<String> = descriptors.filter(|d| !is_locked(d)).collect();
     missing.sort();
     missing.dedup();
     missing
@@ -211,6 +229,31 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
         let unchanged = serde_json::json!({"dependencies": {"is-number": "^6.0.0"}});
         assert!(unlocked_descriptors(&blocks, &unchanged).is_empty());
         assert!(unlocked_descriptors(&blocks, &serde_json::json!({})).is_empty());
+    }
+
+    /// #1423: the pre-split form agrees with [`unlocked_descriptors`].
+    #[test]
+    fn unlocked_descriptors_in_matches_the_block_scan() {
+        let blocks = scan_blocks(LOCK);
+        let patterns: Vec<String> = blocks
+            .iter()
+            .flat_map(|b| split_key_patterns(&b.key))
+            .collect();
+        let locked: std::collections::HashSet<&str> = patterns.iter().map(String::as_str).collect();
+        for pkg in [
+            serde_json::json!({
+                "dependencies": {"is-number": "^7.0.0", "wow": "^1.0.0"},
+                "optionalDependencies": {"@scope/opt": "^2.0.0"},
+            }),
+            serde_json::json!({"dependencies": {"is-number": "^6.0.0"}}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                unlocked_descriptors_in(&locked, &pkg),
+                unlocked_descriptors(&blocks, &pkg),
+                "{pkg}"
+            );
+        }
     }
 
     #[test]

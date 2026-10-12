@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::api::types::PackageVendorResult;
+use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::hosted::engine::{
     self, Candidate, CandidateFiles, Refusal, RewriteOptions, SkippedPatch,
 };
@@ -374,6 +375,8 @@ pub(crate) async fn rewrite(
             npm_allow_remote_config: options.npm_allow_remote_config,
             npm_outer: &npm_outer,
             yarn_classic_outer: &yarn_classic_outer,
+            // The in-memory engine has no project on disk to read.
+            cargo_outer: &|| CratesIoSource::Registry,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),

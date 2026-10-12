@@ -58,6 +58,7 @@ pub mod presence;
 use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
+use crate::formats::cargo::source_replacement::{crates_io_source, ConfigLayer, CratesIoSource};
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
@@ -598,6 +599,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &yarnrc::OuterYarnMirror::default(),
+        &CratesIoSource::Registry,
     )
 }
 
@@ -677,6 +679,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     vlt_withheld: &std::collections::BTreeSet<String>,
     gradle_unreadable: &std::collections::BTreeSet<String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
+    cargo_outer: &CratesIoSource,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
@@ -703,6 +706,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         artifact_metadata,
         gradle_unreadable,
         yarn_outer,
+        cargo_outer,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -721,6 +725,7 @@ type RewriterGroup<'a> = Box<dyn Fn(&mut RewriteResult) + Send + Sync + 'a>;
 /// withholding prefix's. Every group sees the full withheld override slice,
 /// exactly as the serial chain did; the vlt rewriter sees `vlt_overrides`,
 /// that slice minus the vlt-withheld uuids.
+#[allow(clippy::too_many_arguments)]
 fn rewriter_groups<'a>(
     files: &'a BTreeMap<String, String>,
     overrides: &'a [DepOverride],
@@ -729,6 +734,7 @@ fn rewriter_groups<'a>(
     artifact_metadata: &'a BTreeMap<String, String>,
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
     yarn_outer: &'a yarnrc::OuterYarnMirror,
+    cargo_outer: &'a CratesIoSource,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
@@ -747,7 +753,7 @@ fn rewriter_groups<'a>(
             rewrite_uv_lock(files, overrides, artifact_metadata, result);
             poetry::rewrite_poetry(files, overrides, result);
         }),
-        Box::new(move |result| rewrite_cargo(files, overrides, result)),
+        Box::new(move |result| rewrite_cargo_with(files, overrides, cargo_outer, result)),
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
         Box::new(move |result| rewrite_nuget(files, overrides, result)),
         Box::new(move |result| rewrite_gem(files, overrides, result)),
@@ -1661,9 +1667,23 @@ const CARGO_SPARSE_MINOR: u32 = 68;
 // while the manifest still says crates.io, or an inert `[registries.…]` block
 // with nothing referencing it) breaks `--locked` builds or silently drops the
 // patch while attesting it — the exact failure mode this shape forbids.
+#[cfg(test)]
 fn rewrite_cargo(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    rewrite_cargo_with(files, overrides, &CratesIoSource::Registry, result);
+}
+
+/// [`rewrite_cargo`] with `cargo_outer`: where the cargo configs read for a
+/// build in the project (its own, every parent directory's and
+/// `$CARGO_HOME`'s) take crates.io from. The project's own config is also
+/// in `files`, and is checked first so the refusal can name it.
+fn rewrite_cargo_with(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    cargo_outer: &CratesIoSource,
     result: &mut RewriteResult,
 ) {
     let cargo: Vec<&DepOverride> = overrides
@@ -1736,6 +1756,52 @@ fn rewrite_cargo(
         .cloned()
         .map(|t| to_lf(cargo_config_key, t))
         .unwrap_or_default();
+    // A `cargo vendor` or `cargo local-registry` project: crates.io is
+    // replaced by an on-disk source, so cargo builds every crates.io
+    // dependency from it with no network. A Socket registry pin moves the
+    // crate onto a registry that source doesn't hold, so every `--frozen`
+    // `--offline` build breaks (#455) and the vendored copy stays
+    // unpatched: nothing is pinned. The replacement may sit in the
+    // project's config or in one cargo reads from outside it (a monorepo
+    // root, `$CARGO_HOME`).
+    let project_source = crates_io_source(&[ConfigLayer {
+        base: std::path::Path::new(""),
+        text: &cargo_config,
+    }]);
+    let offline = match project_source.offline_source() {
+        Some((kind, dir)) => Some((
+            kind,
+            dir.to_path_buf(),
+            format!("the project's {cargo_config_key}"),
+        )),
+        None => cargo_outer.offline_source().map(|(kind, dir)| {
+            (
+                kind,
+                dir.to_path_buf(),
+                "a cargo config outside the project (a parent directory's or $CARGO_HOME's)"
+                    .to_string(),
+            )
+        }),
+    };
+    if let Some((kind, dir, origin)) = offline {
+        for dep in &cargo {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_directory_source".into(),
+                detail: format!(
+                    "{}@{}: {origin} replaces crates.io with the {kind} `{}`, so the \
+                     project builds offline from it; a Socket registry pin would move the \
+                     crate off it onto a registry it doesn't hold, and every \
+                     `cargo build --frozen --offline` would fail to find it — dependency \
+                     skipped (nothing rewritten). Use agent mode (`scan --mode agent`), which \
+                     patches the copy cargo builds in place",
+                    dep.name,
+                    dep.version,
+                    dir.display()
+                ),
+            });
+        }
+        return;
+    }
     let (mut lock_changed, mut config_changed) = (false, false);
     // The manifests as they arrived: a generation they pin that the final
     // manifests no longer do was superseded by this run (see below).
@@ -2670,9 +2736,19 @@ fn is_valid_gem_index_url(url: &str) -> bool {
 
 /// A registry name THIS rewriter owns: `socket-patch-<canonical-uuid>`. An
 /// existing pin matching this grammar was written by a previous run and may be
-/// superseded in place; any other registry pin is the user's and is refused.
+/// superseded in place. Other registry names are the user's: only `crates-io`
+/// is overwritten (see [`is_repinnable_registry_name`]), the rest refuse.
 fn is_socket_patch_registry_name(value: &str) -> bool {
     generation::pin_name_uuid(value, false).is_some()
+}
+
+/// A `registry = …` value the Cargo.toml pin may overwrite in place: an
+/// earlier `socket-patch-<uuid>` pin (superseded), or `crates-io`, Cargo's
+/// built-in name for crates.io, which resolves exactly like a declaration
+/// with no `registry` key (#386). Any other name is a registry the user
+/// chose, and the dep is refused.
+fn is_repinnable_registry_name(value: &str) -> bool {
+    value == "crates-io" || is_socket_patch_registry_name(value)
 }
 
 /// The `socket-patch-<uuid>` registry name pinning `crate_name` in this
@@ -3148,7 +3224,8 @@ enum CargoTomlAction {
 
 /// Plan the full-manifest pin: EVERY occurrence of `crate_name` across every
 /// dependency table gains `registry = "<reg>"`, an existing
-/// `socket-patch-<uuid>` pin is superseded in place, and any occurrence that
+/// `socket-patch-<uuid>` pin (or an explicit `registry = "crates-io"`, #386)
+/// is overwritten in place, and any occurrence that
 /// cannot be handled refuses the whole dep. Nothing is applied unless every
 /// occurrence resolves.
 // The Cargo.toml planner's fixed probes, compiled once: `plan_cargo_toml`
@@ -3378,7 +3455,7 @@ fn plan_cargo_toml(
                         if ws {
                             ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                         }
-                    } else if is_socket_patch_registry_name(&value) {
+                    } else if is_repinnable_registry_name(&value) {
                         let old_line = lines[line_idx];
                         let new_text = registry_val_re
                             .replace(old_line, format!("registry = \"{reg}\"").as_str())
@@ -3492,7 +3569,7 @@ fn plan_cargo_toml(
                     if workspace {
                         ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                     }
-                } else if is_socket_patch_registry_name(&value) {
+                } else if is_repinnable_registry_name(&value) {
                     let new_text = registry_val_re
                         .replace(raw, format!("registry = \"{reg}\"").as_str())
                         .into_owned();
@@ -4025,6 +4102,9 @@ fn rewrite_yarn_classic_with(
     // byte span once, at the end: re-scanning and re-copying the whole lock
     // per pinned block is quadratic in a large lock.
     let mut pinned_blocks: Vec<bool> = vec![false; blocks.len()];
+    // Every pattern the keys hold, for the served-manifest check (#591):
+    // gathered from `heads` once, when the first dep needs it (#1423).
+    let mut locked_patterns: Option<std::collections::HashSet<&str>> = None;
     let mut segments: Option<ClassicSegments> = None;
     let mut changed = false;
     let mut any_pinned = false;
@@ -4065,7 +4145,13 @@ fn rewrite_yarn_classic_with(
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .filter(Value::is_object);
         if let Some(pkg) = &served_manifest {
-            let missing = crate::formats::yarn::classic_deps::unlocked_descriptors(&blocks, pkg);
+            let locked = locked_patterns.get_or_insert_with(|| {
+                heads
+                    .iter()
+                    .flat_map(|(patterns, _)| patterns.iter().map(String::as_str))
+                    .collect()
+            });
+            let missing = crate::formats::yarn::classic_deps::unlocked_descriptors_in(locked, pkg);
             if !missing.is_empty() {
                 result
                     .refused_yarn_classic_uuids
@@ -12097,6 +12183,7 @@ mod tests {
             &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
             &refusing[3],
+            &CratesIoSource::Registry,
         );
         assert!(!r.files.contains_key("yarn.lock"));
         assert!(r
@@ -14378,6 +14465,116 @@ mod tests {
                 .into(),
         );
         assert_cargo_override_refused(&aliased, "lockless aliased config override");
+    }
+
+    /// #455: a `cargo vendor` project builds from the directory source its
+    /// cargo config replaces crates.io with, never from a registry, so a
+    /// Socket registry pin breaks every `cargo build --frozen --offline`.
+    /// Hosted mode refuses it with nothing written, in either config
+    /// spelling and through a multi-hop chain; a registry mirror is not a
+    /// directory source and is still redirected.
+    #[test]
+    fn cargo_directory_source_replacement_is_refused() {
+        let toml = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                    [dependencies]\nserde = \"1.0.190\"\n";
+        let vendored = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+                        [source.vendored-sources]\ndirectory = \"vendor\"\n";
+        let chained =
+            "[source.crates-io]\nreplace-with = \"a\"\n[source.a]\nreplace-with = \"b\"\n\
+                       [source.b]\ndirectory = \"third_party\"\n";
+        let cases = [
+            (".cargo/config.toml", vendored.to_string()),
+            (".cargo/config", vendored.to_string()),
+            (".cargo/config.toml", vendored.replace('\n', "\r\n")),
+            (".cargo/config.toml", chained.to_string()),
+        ];
+        for (key, config) in cases {
+            let mut files = cargo_files(toml);
+            files.insert(key.to_string(), config.clone());
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(r.files.is_empty(), "{key} {config:?}: {:?}", r.files);
+            assert!(r.edits.is_empty(), "{key} {config:?}: {:?}", r.edits);
+            assert!(r.confirmed_cargo_uuids.is_empty(), "{key} {config:?}");
+            let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                ["redirect_cargo_directory_source"],
+                "{key} {config:?}"
+            );
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains("serde@1.0.190") && detail.contains(key),
+                "{detail}"
+            );
+        }
+
+        let mut files = cargo_files(toml);
+        files.insert(
+            ".cargo/config.toml".to_string(),
+            "[source.crates-io]\nreplace-with = \"mirror\"\n\
+             [source.mirror]\nregistry = \"sparse+https://mirror.test/\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// #455 review: the offline source may come from outside the project
+    /// files (a monorepo root's `.cargo/config.toml`, `$CARGO_HOME`'s), or
+    /// be a `cargo local-registry`; both are refused like a project
+    /// `cargo vendor` directory. An outer registry mirror is still pinned.
+    #[test]
+    fn cargo_offline_source_outside_the_project_or_local_registry_is_refused() {
+        let toml = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                    [dependencies]\nserde = \"1.0.190\"\n";
+        let refused = |files: &BTreeMap<String, String>, outer: &CratesIoSource, what: &str| {
+            let mut r = RewriteResult::default();
+            rewrite_cargo_with(files, &[cargo_sparse_override()], outer, &mut r);
+            assert!(r.files.is_empty(), "{what}: {:?}", r.files);
+            assert!(r.edits.is_empty(), "{what}");
+            assert!(r.confirmed_cargo_uuids.is_empty(), "{what}");
+            let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(codes, ["redirect_cargo_directory_source"], "{what}");
+            r.warnings.remove(0).detail
+        };
+
+        let files = cargo_files(toml);
+        let detail = refused(
+            &files,
+            &CratesIoSource::Directory("/repo/vendor".into()),
+            "monorepo-root directory source",
+        );
+        assert!(
+            detail.contains("outside the project") && detail.contains("/repo/vendor"),
+            "{detail}"
+        );
+        let detail = refused(
+            &files,
+            &CratesIoSource::LocalRegistry("/ci/registry".into()),
+            "CARGO_HOME local registry",
+        );
+        assert!(detail.contains("local registry"), "{detail}");
+
+        let mut local = cargo_files(toml);
+        local.insert(
+            ".cargo/config.toml".to_string(),
+            "[source.crates-io]\nreplace-with = \"local\"\n\
+             [source.local]\nlocal-registry = \"registry\"\n"
+                .to_string(),
+        );
+        let detail = refused(&local, &CratesIoSource::Registry, "project local registry");
+        assert!(detail.contains(".cargo/config.toml"), "{detail}");
+
+        let mut r = RewriteResult::default();
+        rewrite_cargo_with(
+            &files,
+            &[cargo_sparse_override()],
+            &CratesIoSource::Other("mirror".into()),
+            &mut r,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
     /// Control for #480: an override of an UNRELATED crate leaves the
@@ -22510,6 +22707,67 @@ packages:
             r.warnings[0].detail
         );
         assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// #386: `crates-io` is Cargo's built-in name for crates.io, so a
+    /// declaration that names it explicitly is a plain crates.io dependency.
+    /// The pin replaces the value in place (inline, table and quoted-key
+    /// spellings) instead of refusing it as another registry, and a re-run
+    /// over the rewritten manifest is a silent no-op.
+    #[test]
+    fn cargo_explicit_crates_io_registry_is_pinned_in_place() {
+        let reg = cargo_reg();
+        for (declaration, expected) in [
+            (
+                "[dependencies]\nserde = { version = \"1.0.190\", registry = \"crates-io\" }\n"
+                    .to_string(),
+                format!("[dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{reg}\" }}\n"),
+            ),
+            (
+                "[dependencies]\nserde = { registry = 'crates-io', version = \"1.0.190\" } # explicit\n"
+                    .to_string(),
+                format!("[dependencies]\nserde = {{ registry = \"{reg}\", version = \"1.0.190\" }} # explicit\n"),
+            ),
+            (
+                "[dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"crates-io\"\n".to_string(),
+                format!("[dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"{reg}\"\n"),
+            ),
+            (
+                "[dependencies.alias]\npackage = \"serde\"\nversion = \"1.0.190\"\n\"registry\" = \"crates-io\"\n"
+                    .to_string(),
+                format!("[dependencies.alias]\npackage = \"serde\"\nversion = \"1.0.190\"\nregistry = \"{reg}\"\n"),
+            ),
+        ] {
+            let manifest = format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{declaration}");
+            let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "{declaration}: {:?}", r.warnings);
+            let toml = r.files.get("Cargo.toml").expect("manifest pinned");
+            assert!(
+                toml.ends_with(&expected),
+                "{declaration}: crates-io must be replaced in place:\n{toml}"
+            );
+            assert!(!toml.contains("crates-io"), "{toml}");
+            assert_eq!(cargo_socket_registry_pin(toml, "serde"), Some(reg.clone()));
+            assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+            let toml_edits: Vec<_> = r.edits.iter().filter(|e| e.path == "Cargo.toml").collect();
+            assert_eq!(toml_edits.len(), 1, "{:?}", r.edits);
+            assert!(
+                toml_edits[0]
+                    .original
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("crates-io")),
+                "the edit's original records the crates-io spelling: {:?}",
+                toml_edits[0]
+            );
+
+            let mut rerun_files = cargo_files(&manifest);
+            rerun_files.extend(r.files);
+            let rerun = rewrite_registry_redirect(&rerun_files, &[cargo_sparse_override()]);
+            assert!(rerun.files.is_empty(), "{:?}", rerun.files.keys());
+            assert!(rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+            assert!(rerun.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
     }
 
     /// The TABLE-FORM twins of the inline-table registry matrix: an existing

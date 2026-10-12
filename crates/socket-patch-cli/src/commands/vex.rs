@@ -818,7 +818,8 @@ async fn generate_vex(
     // conflict with another member's (#393, #458, #531) is not what the
     // build links, however intact its copy or pin: never attest it.
     if !common.is_global() {
-        use socket_patch_core::utils::purl::{build_golang_purl, strip_purl_qualifiers};
+        use socket_patch_core::utils::purl::build_golang_purl;
+        use socket_patch_core::utils::purl_key::PurlKey;
         for issue in socket_patch_core::vendor::go_consumer_sync::workspace_audit(&common.cwd).await
         {
             let socket_patch_core::vendor::go_consumer_sync::GoSyncIssue::Workspace {
@@ -829,19 +830,22 @@ async fn generate_vex(
             else {
                 continue;
             };
-            let purl = build_golang_purl(module, version);
-            let before = outcome.applied.len();
-            outcome
-                .applied
-                .retain(|p| strip_purl_qualifiers(p) != purl.as_str());
-            if outcome.applied.len() == before {
-                continue;
+            // PurlKey, not string equality: go.mod spells `+incompatible`
+            // with a literal `+`, the manifest key with `%2B` (#484). Report
+            // each omission under the record's own spelling.
+            let wanted = PurlKey::new(&build_golang_purl(module, version));
+            let (overridden, kept): (Vec<String>, Vec<String>) =
+                std::mem::take(&mut outcome.applied)
+                    .into_iter()
+                    .partition(|p| PurlKey::new(p) == wanted);
+            outcome.applied = kept;
+            for purl in overridden {
+                note_warning(warnings, common, issue.code(), format!("{purl}: {issue}"));
+                outcome.failed.push(FailedPatch {
+                    purl,
+                    reason: GO_WORKSPACE_OVERRIDE.to_string(),
+                });
             }
-            note_warning(warnings, common, issue.code(), format!("{purl}: {issue}"));
-            outcome.failed.push(FailedPatch {
-                purl,
-                reason: GO_WORKSPACE_OVERRIDE.to_string(),
-            });
         }
     }
 
@@ -859,8 +863,8 @@ async fn generate_vex(
             let Some(version) = entry.version.as_deref().filter(|_| entry.socket_owned()) else {
                 continue;
             };
-            let purl = build_golang_purl(&entry.module, version);
-            if !outcome.applied.iter().any(|p| PurlKey::same(p, &purl)) {
+            let wanted = PurlKey::new(&build_golang_purl(&entry.module, version));
+            if !outcome.applied.iter().any(|p| PurlKey::new(p) == wanted) {
                 continue;
             }
             let Some(Selection::Other(selected)) =
@@ -868,21 +872,29 @@ async fn generate_vex(
             else {
                 continue;
             };
-            outcome.applied.retain(|p| !PurlKey::same(p, &purl));
-            note_warning(
-                warnings,
-                common,
-                GO_VERSION_NOT_SELECTED,
-                format!(
-                    "{purl}: the build selects {} {selected}, so the replace pinned to \
-                     {version} is ignored and the build links the unpatched module",
-                    entry.module
-                ),
-            );
-            outcome.failed.push(FailedPatch {
-                purl,
-                reason: GO_VERSION_NOT_SELECTED.to_string(),
-            });
+            // Report each omission under the record's own spelling (`%2B`
+            // for `+incompatible`, #484), not go.mod's.
+            let (unselected, kept): (Vec<String>, Vec<String>) =
+                std::mem::take(&mut outcome.applied)
+                    .into_iter()
+                    .partition(|p| PurlKey::new(p) == wanted);
+            outcome.applied = kept;
+            for purl in unselected {
+                note_warning(
+                    warnings,
+                    common,
+                    GO_VERSION_NOT_SELECTED,
+                    format!(
+                        "{purl}: the build selects {} {selected}, so the replace pinned to \
+                         {version} is ignored and the build links the unpatched module",
+                        entry.module
+                    ),
+                );
+                outcome.failed.push(FailedPatch {
+                    purl,
+                    reason: GO_VERSION_NOT_SELECTED.to_string(),
+                });
+            }
         }
     }
 
@@ -1659,10 +1671,19 @@ async fn synthesize_go_patches(
         are_safe_redirect_coords, copy_dir_for,
     };
     use socket_patch_core::utils::purl::build_golang_purl;
+    use socket_patch_core::utils::purl_key::PurlKey;
     use socket_patch_core::vendor::go_mod_edit::{
         read_replace_entries, ReplaceOwner, GO_PATCHES_DIR,
     };
 
+    let mut by_release: HashMap<PurlKey, Vec<&String>> = HashMap::new();
+    for key in manifest
+        .patches
+        .keys()
+        .filter(|k| k.starts_with("pkg:golang/"))
+    {
+        by_release.entry(PurlKey::new(key)).or_default().push(key);
+    }
     let mut go_patches = HashMap::new();
     for entry in read_replace_entries(&common.cwd).await {
         if entry.owner != Some(ReplaceOwner::GoPatches) {
@@ -1671,15 +1692,6 @@ async fn synthesize_go_patches(
         let Some(version) = entry.version.as_deref() else {
             continue;
         };
-        let purl = build_golang_purl(&entry.module, version);
-        if !manifest.patches.contains_key(&purl) {
-            continue;
-        }
-        // Explicit vendor entries take precedence over the synthesis
-        // (vendor may have taken over an apply redirect).
-        if socket_patch_core::vendor::lookup_entry(entries, &purl).is_some() {
-            continue;
-        }
         // SECURITY: module/version come from a committed (tamper-able)
         // go.mod and are about to key a path we hash. Apply the same
         // fail-closed coordinate guard `go_redirect` itself uses before
@@ -1687,10 +1699,25 @@ async fn synthesize_go_patches(
         if !are_safe_redirect_coords(&entry.module, version) {
             continue;
         }
-        go_patches.insert(
-            purl,
-            copy_dir_for(&common.cwd, GO_PATCHES_DIR, &entry.module, version),
-        );
+        // go.mod spells `+incompatible` with a literal `+`; the API keys it
+        // `%2B` (#484). Match by release and key the copy by each record's
+        // own spelling, which is what verification looks up.
+        let Some(records) =
+            by_release.get(&PurlKey::new(&build_golang_purl(&entry.module, version)))
+        else {
+            continue;
+        };
+        for purl in records {
+            // Explicit vendor entries take precedence over the synthesis
+            // (vendor may have taken over an apply redirect).
+            if socket_patch_core::vendor::lookup_entry(entries, purl).is_some() {
+                continue;
+            }
+            go_patches.insert(
+                (*purl).clone(),
+                copy_dir_for(&common.cwd, GO_PATCHES_DIR, &entry.module, version),
+            );
+        }
     }
     go_patches
 }

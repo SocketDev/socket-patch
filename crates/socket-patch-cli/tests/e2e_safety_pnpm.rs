@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 mod common;
 
 use common::{
-    assert_run_ok, git_sha256, git_sha256_file, has_command, pnpm_run, write_blob,
+    assert_run_ok, git_sha256, git_sha256_file, hermetic, pnpm_run, write_blob,
     write_minimal_manifest, write_package_json, PatchEntry,
 };
 
@@ -43,6 +43,22 @@ const BEFORE_HASH: &str = "311f1e893e6eac502693fad8617dcf5353a043ccc0f7b4ba9fe38
 /// failure, never a skip. Empty (the value on other legs) = unset.
 fn pnpm_required() -> bool {
     std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some_and(|v| !v.is_empty())
+}
+
+/// `pnpm --version` succeeds. Probed through [`hermetic::tool_command`]: on
+/// Windows pnpm is the `pnpm.cmd` shim `npm install -g` writes, which
+/// `common::has_command`'s bare `Command::new` never finds. The exit status
+/// counts too, since a resolved `.cmd` spawns through `cmd.exe` even when
+/// the shim itself is broken.
+fn has_pnpm() -> bool {
+    let mut probe = hermetic::tool_command("pnpm");
+    probe.arg("--version");
+    common::cache_env::isolate(&mut probe);
+    probe
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Print the SKIP line for a missing pnpm, or panic under [`pnpm_required`].
@@ -249,7 +265,7 @@ fn file_identity(path: &Path) -> (u64, u64) {
 #[test]
 #[ignore]
 fn pnpm_install_produces_symlinked_layout() {
-    if !has_command("pnpm") {
+    if !has_pnpm() {
         skip_missing_pnpm();
         return;
     }
@@ -313,7 +329,7 @@ fn pnpm_install_produces_symlinked_layout() {
 #[test]
 #[ignore]
 fn apply_in_a_does_not_mutate_b_or_store() {
-    if !has_command("pnpm") {
+    if !has_pnpm() {
         skip_missing_pnpm();
         return;
     }
@@ -417,7 +433,7 @@ fn apply_in_a_does_not_mutate_b_or_store() {
 #[test]
 #[ignore]
 fn pnpm_install_in_b_does_not_revert_a() {
-    if !has_command("pnpm") {
+    if !has_pnpm() {
         skip_missing_pnpm();
         return;
     }
@@ -532,7 +548,7 @@ fn pnpm_install_in_b_does_not_revert_a() {
 #[test]
 #[ignore]
 fn apply_in_pnpm_project_emits_layout_note() {
-    if !has_command("pnpm") {
+    if !has_pnpm() {
         skip_missing_pnpm();
         return;
     }

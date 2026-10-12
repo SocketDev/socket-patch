@@ -15,15 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::common::hermetic_command;
+use crate::common::{binary, git_sha256, hermetic_command};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -43,17 +38,9 @@ const GEM_PURL_QUALIFIED: &str = "pkg:gem/padlock@1.2.0?platform=ruby";
 const GEM_ENCODED: &str = "pkg%3Agem%2Fpadlock%401.2.0";
 const GEMSPEC_STUB: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.summary = \"repair fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
 
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
-
 fn sri_of(bytes: &[u8]) -> String {
     use base64::Engine as _;
-    use sha2::Sha512;
+    use sha2::{Digest as _, Sha512};
     format!(
         "sha512-{}",
         base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))

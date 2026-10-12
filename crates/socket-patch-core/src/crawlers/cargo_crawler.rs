@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::formats::cargo::manifest::package_name_version;
+use crate::formats::cargo::source_replacement::{
+    self, config_layer_paths, ConfigLayer, CratesIoSource,
+};
 use crate::formats::cargo::CargoLock;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
@@ -44,6 +47,20 @@ impl CargoCrawler {
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         Ok(source_roots(options).await.0)
+    }
+
+    /// The directory a local Cargo project in `cwd` builds its crates.io
+    /// dependencies from, when a cargo config replaces crates.io with a
+    /// directory source (`cargo vendor`): the crawl then searches only that
+    /// directory, never the shared registry cache. The directory need not
+    /// exist.
+    pub async fn directory_source(&self, cwd: &Path) -> Option<PathBuf> {
+        match crates_io_source(cwd).await {
+            CratesIoSource::Directory(dir) => Some(dir),
+            CratesIoSource::Registry
+            | CratesIoSource::LocalRegistry(_)
+            | CratesIoSource::Other(_) => None,
+        }
     }
 
     /// Crawl all discovered crate source directories and return every
@@ -234,6 +251,14 @@ impl CargoCrawler {
             _ => crate::utils::fs::home_dir().map(|home| home.join(".cargo")),
         }
     }
+
+    /// Where cargo takes crates.io packages from for a build in `cwd`: the
+    /// source replacement of every cargo config it reads there (`cwd`'s and
+    /// each parent directory's `.cargo/config*`, then `$CARGO_HOME`'s).
+    /// Blocking file reads; the hosted scan's cargo refusal reads it too.
+    pub fn crates_io_source_for(cwd: &Path) -> CratesIoSource {
+        resolve_for(cwd, Self::cargo_home().as_deref())
+    }
 }
 
 /// [`CargoCrawler::get_crate_source_paths`], and whether those roots are
@@ -267,14 +292,86 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
         return (Vec::new(), false);
     }
 
-    // Cargo project: prefer a vendored source tree if present, else
-    // fall back to the global registry cache.
-    let vendor_dir = options.cwd.join("vendor");
-    if is_dir(&vendor_dir).await {
-        return (vec![vendor_dir], false);
+    // Cargo project: crawl what cargo builds from. A config that
+    // replaces crates.io with a directory source (`cargo vendor`) names
+    // that directory, wherever it is; without one, cargo reads the
+    // registry cache, even when an unwired `vendor/` sits beside the
+    // manifest (#338). A replacement directory that is missing yields
+    // nothing: cargo can't build from the cache either.
+    match crates_io_source(&options.cwd).await {
+        CratesIoSource::Directory(dir) => {
+            if is_dir(&dir).await {
+                (vec![dir], false)
+            } else {
+                (Vec::new(), false)
+            }
+        }
+        // Cargo unpacks a local registry's `.crate` files into the
+        // registry cache too.
+        CratesIoSource::Registry | CratesIoSource::LocalRegistry(_) | CratesIoSource::Other(_) => {
+            (CargoCrawler::get_registry_src_paths().await, true)
+        }
     }
+}
 
-    (CargoCrawler::get_registry_src_paths().await, true)
+/// [`source_replacement::crates_io_source`] for a cargo build in `cwd`,
+/// reading the config files [`config_layer_paths`] lists (an unreadable one is skipped).
+/// Blocking file reads.
+///
+/// `cwd` is taken as the logical absolute path, not the canonical one:
+/// a resolved directory is reported under it, as `<cwd>`-joined roots
+/// always were. The config walk folds `..` out of it, so `a/b/../proj`
+/// reads `a/proj`'s ancestors, not `a/b`'s; a directory under the folded
+/// cwd is reported back under the cwd as given, which path-scoped
+/// commands strip as a prefix.
+fn resolve_for(cwd: &Path, cargo_home: Option<&Path>) -> CratesIoSource {
+    let given = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let folded = fold_parent_dirs(&given);
+    let files = config_layer_paths(&folded, cargo_home, |p| p.is_file());
+    let texts: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .filter_map(|(file, base)| {
+            crate::utils::fs::read_regular_to_string_sync(&file)
+                .ok()
+                .map(|t| (base, t))
+        })
+        .collect();
+    let layers: Vec<ConfigLayer<'_>> = texts
+        .iter()
+        .map(|(base, text)| ConfigLayer { base, text })
+        .collect();
+    let under_given = |dir: PathBuf| match dir.strip_prefix(&folded) {
+        Ok(rel) => given.join(rel),
+        Err(_) => dir,
+    };
+    match source_replacement::crates_io_source(&layers) {
+        CratesIoSource::Directory(dir) => CratesIoSource::Directory(under_given(dir)),
+        CratesIoSource::LocalRegistry(dir) => CratesIoSource::LocalRegistry(under_given(dir)),
+        other => other,
+    }
+}
+
+/// `path` with each `..` removing the component before it.
+fn fold_parent_dirs(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Where cargo takes crates.io packages from for a build in `cwd`
+/// ([`resolve_for`]), off the runtime.
+async fn crates_io_source(cwd: &Path) -> CratesIoSource {
+    let cwd = cwd.to_path_buf();
+    let cargo_home = CargoCrawler::cargo_home();
+    run_blocking(move || resolve_for(&cwd, cargo_home.as_deref())).await
 }
 
 /// The `(name, version)` of every registry-sourced `[[package]]` in
@@ -390,6 +487,18 @@ impl Default for CargoCrawler {
 
 #[cfg(test)]
 mod tests {
+    /// `<root>/.cargo/config.toml` replacing crates.io with `<root>/vendor`,
+    /// as `cargo vendor` asks: only a wired tree is cargo's source (#338).
+    fn wire_vendor(root: &Path) {
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo").join("config.toml"),
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+             [source.vendored-sources]\ndirectory = \"vendor\"\n",
+        )
+        .unwrap();
+    }
+
     use super::*;
 
     #[test]
@@ -569,6 +678,7 @@ mod tests {
         )
         .await
         .unwrap();
+        wire_vendor(dir.path());
 
         let crawler = CargoCrawler::new();
         let options = CrawlerOptions {
@@ -622,6 +732,7 @@ mod tests {
         tokio::fs::write(dir.path().join("Cargo.lock"), "version = 3\n")
             .await
             .unwrap();
+        wire_vendor(dir.path());
 
         let crawler = CargoCrawler::new();
         let options = CrawlerOptions {
@@ -1144,6 +1255,7 @@ version = "fake"
             write(&vendored.path().join("Cargo.lock"), &locked);
             stage(&vendored.path().join("vendor"), "unlocked", "1.0.0");
             mkdir(&vendored.path().join("vendor").join(".hidden"));
+            wire_vendor(vendored.path());
             assert_eq!(
                 purls(&crawler.crawl_all(&local(vendored.path())).await),
                 ["pkg:cargo/unlocked@1.0.0"]
@@ -1256,6 +1368,7 @@ version = "fake"
             let mut perms = PermGuard::default();
             let mut rng = Rng::new(7);
             write(&tmp.path().join("Cargo.toml"), "[workspace]\n");
+            wire_vendor(tmp.path());
             tree(
                 &mut rng,
                 &tmp.path().join("vendor"),
@@ -1332,6 +1445,7 @@ version = "fake"
         tokio::fs::create_dir_all(&left).await.unwrap();
         let fifo = left.join("Cargo.toml");
         make_fifo(&fifo);
+        wire_vendor(dir.path());
         // A readable crate beside the FIFO proves the crawl continues.
         let serde_dir = vendor.join("serde");
         tokio::fs::create_dir_all(&serde_dir).await.unwrap();

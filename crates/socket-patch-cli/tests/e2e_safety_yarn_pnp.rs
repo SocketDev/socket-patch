@@ -1224,6 +1224,86 @@ fn pnp_loader_under_explicit_pnp_linker_still_refuses() {
     assert_eq!(std::fs::read(&index).unwrap(), ORIGINAL_BYTES);
 }
 
+/// #1100: yarn expands `${NAME}` / `${NAME:-fallback}` in `.yarnrc.yml`
+/// values, so a live loader under an interpolated linker that resolves to
+/// `pnp` (yarn's own `config get nodeLinker` says `pnp`) is Plug'n'Play:
+/// apply refuses instead of exiting 0 `package_not_installed`. A
+/// reference yarn cannot expand fails closed the same way.
+#[test]
+fn pnp_loader_under_interpolated_pnp_linker_refuses() {
+    for (rc, env) in [
+        ("nodeLinker: \"${SOCKET_PATCH_T1100_L:-pnp}\"\n", &[][..]),
+        (
+            "nodeLinker: \"${SOCKET_PATCH_T1100_L}\"\n",
+            &[("SOCKET_PATCH_T1100_L", "pnp")][..],
+        ),
+        (
+            "nodeLinker: \"${SOCKET_PATCH_T1100_L:-node-modules}\"\n",
+            &[("SOCKET_PATCH_T1100_L", "pnp")][..],
+        ),
+        ("nodeLinker: ${SOCKET_PATCH_T1100_L}\n", &[][..]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        make_yarn_berry_project(dir.path());
+        std::fs::write(dir.path().join(".yarnrc.yml"), rc).unwrap();
+        let index = stage_applicable_package(dir.path());
+        let (code, stdout, _) = run_with_env(dir.path(), &["apply", "--json"], env);
+        assert_eq!(code, 1, "{rc:?}: {stdout}");
+        let envelope = parse_json_envelope(&stdout);
+        assert_eq!(
+            envelope_error_code(&envelope),
+            Some("yarn_pnp_unsupported"),
+            "{rc:?}"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), ORIGINAL_BYTES, "{rc:?}");
+    }
+}
+
+/// #1100: yarn parses `.yarnrc.yml` as YAML and reads `yarn_*` environment
+/// keys in any case. A quoted key, a value on the next line, a flow map,
+/// or `yarn_node_linker` all set `node-modules`, so a stale loader is
+/// disowned and apply patches the installed copy instead of refusing.
+#[test]
+fn stale_pnp_loader_under_yaml_spelled_linker_applies() {
+    let mut cases: Vec<(Option<&str>, &[(&str, &str)])> = vec![
+        (Some("\"nodeLinker\": node-modules\n"), &[]),
+        (Some("nodeLinker:\n  node-modules\n"), &[]),
+        (Some("{nodeLinker: node-modules}\n"), &[]),
+        (
+            Some("nodeLinker: \"${SOCKET_PATCH_T1100_L:-node-modules}\"\n"),
+            &[],
+        ),
+    ];
+    if !cfg!(windows) {
+        cases.push((None, &[("yarn_node_linker", "node-modules")]));
+    }
+    for (rc, env) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{"name":"migrated","version":"0.0.0","private":true}"#,
+        )
+        .unwrap();
+        std::fs::write(cwd.join("yarn.lock"), "__metadata:\n  version: 8\n").unwrap();
+        std::fs::write(cwd.join(".pnp.js"), b"// stale Yarn 2 loader\n").unwrap();
+        if let Some(rc) = rc {
+            std::fs::write(cwd.join(".yarnrc.yml"), rc).unwrap();
+        }
+        let index = stage_applicable_package(cwd);
+        let (code, stdout, stderr) = run_with_env(cwd, &["apply", "--json"], env);
+        assert_eq!(
+            code, 0,
+            "{rc:?} {env:?}: a stale loader must not refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            PATCHED_BYTES,
+            "{rc:?} {env:?}: the node_modules copy is patched"
+        );
+    }
+}
+
 /// #1129: pnpm's `node-linker=pnp` with a custom `modulesDir` keeps its
 /// store in `<modulesDir>/.pnpm`, not `node_modules/.pnpm`. The layout
 /// detector reads the same modules dirs as the crawler, so the tree is

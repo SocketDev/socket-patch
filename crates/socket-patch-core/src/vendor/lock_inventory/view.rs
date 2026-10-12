@@ -865,11 +865,11 @@ impl<'a> ProjectView<'a> {
             ProjectView::Memory(project) => {
                 let lock = project.read_text("yarn.lock").ok();
                 effective_yarn_linker(lock.as_deref(), || {
-                    let node_linker = |rc: &str| {
-                        crate::formats::yarn::berry_gates::yarnrc_scalar(rc, "nodeLinker")
-                            .filter(|v| !v.is_empty())
-                            .map(str::to_string)
-                    };
+                    // The repository alone: a `${NAME}` reference never
+                    // reads the scanning host's environment.
+                    let env = crate::crawlers::pkg_managers::YarnEnv::repository_only();
+                    let node_linker =
+                        |rc: &str| crate::crawlers::pkg_managers::rc_node_linker(rc, &env);
                     project
                         .read_text(".yarnrc.yml")
                         .ok()

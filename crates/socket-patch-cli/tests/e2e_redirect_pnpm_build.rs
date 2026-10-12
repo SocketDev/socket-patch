@@ -124,7 +124,7 @@ fn pnpm_command(pm: &str) -> Command {
     if let Some(bin) = std::env::var_os("SOCKET_PATCH_PNPM_E2E_BIN") {
         Command::new(bin)
     } else {
-        let mut cmd = Command::new("corepack");
+        let mut cmd = hermetic::tool_command("corepack");
         cmd.arg(pm);
         cmd
     }
@@ -1203,6 +1203,95 @@ async fn pnpm11_zero_touch_frozen_install_lands_patched_bytes_via_auto_trust_con
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_TERTIARY, "pnpm11-zero-touch", &[], true);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm11 zero-touch");
     assert_fixture_manifestless_vex(&fx, &fresh, "pnpm11 zero-touch");
+}
+
+/// #1074: with pnpm's `lockfile` setting off, pnpm neither reads nor
+/// writes `pnpm-lock.yaml` and installs the upstream package from the
+/// registry, so a hosted pin in the committed lock patches nothing. Over a
+/// lock the real pnpm 11 scan pinned, once `lockfile: false` lands in
+/// `pnpm-workspace.yaml`:
+///
+/// * a re-run of `scan --mode hosted` refuses with
+///   `redirect_pnpm_lockfile_disabled` and leaves the lock and the
+///   workspace file byte-for-byte;
+/// * lock-only `vex` (no node_modules, no manifest, no ledgers: the CI/SBOM
+///   case) no longer attests the patch from the lock pin.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm11_disabled_lockfile_is_neither_pinned_nor_attested() {
+    let Some(fx) = redirect_scanned_pnpm_project(
+        PNPM_TERTIARY,
+        "pnpm11-lockfile-off",
+        false,
+        false,
+        HostedDriver::Scan,
+    )
+    .await
+    else {
+        return;
+    };
+    let ws_path = fx.proj.join("pnpm-workspace.yaml");
+    let mut workspace = std::fs::read_to_string(&ws_path).unwrap_or_default();
+    if !workspace.is_empty() && !workspace.ends_with('\n') {
+        workspace.push('\n');
+    }
+    workspace.push_str("lockfile: false\n");
+    std::fs::write(&ws_path, &workspace).unwrap();
+    let lock_path = fx.proj.join(&fx.lock_name);
+    let lock_wired = std::fs::read_to_string(&lock_path).unwrap();
+    assert_ne!(
+        lock_wired, fx.lock_before,
+        "the fixture scan pinned the lock"
+    );
+
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &fx.proj, &fx._server.uri(), &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 0, "{env}");
+    let codes = warning_codes(&env);
+    assert!(
+        codes.contains(&"redirect_pnpm_lockfile_disabled".to_string())
+            && !codes.contains(&"redirect_pnpm_trust_lockfile".to_string()),
+        "{codes:?}\n{env}"
+    );
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_wired);
+    assert_eq!(std::fs::read_to_string(&ws_path).unwrap(), workspace);
+
+    // A lock-only checkout: package.json, the pinned lock and the workspace
+    // file pnpm reads the setting from, nothing installed.
+    let fresh = fx.tmp.path().join("fresh-lockfile-off");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in ["package.json", fx.lock_name.as_str(), "pnpm-workspace.yaml"] {
+        std::fs::copy(fx.proj.join(file), fresh.join(file)).unwrap();
+    }
+    let patch_server = fx._server.uri();
+    off_runtime(|| {
+        let api = hosted_patch_api(PURL, &fx.patched);
+        let out = run_vex(
+            &socket_bin(),
+            &fresh,
+            &VexRun {
+                patch_server_url: Some(patch_server.clone()),
+                ..VexRun::online(&api)
+            },
+        );
+        assert_ne!(out.code, Some(0), "lock-only vex must not attest: {out}");
+        assert_absent(out.doc.as_ref(), PURL);
+
+        // Control: the same checkout with the setting removed attests.
+        std::fs::remove_file(fresh.join("pnpm-workspace.yaml")).unwrap();
+        let out = run_vex(
+            &socket_bin(),
+            &fresh,
+            &VexRun {
+                patch_server_url: Some(patch_server.clone()),
+                ..VexRun::online(&api)
+            },
+        );
+        assert_eq!(out.code, Some(0), "control: {out}");
+        assert_attested(out.doc(), PURL, UUID, Marker::Redirected, HOSTED_VULNS);
+    });
 }
 
 /// `--no-trust-lockfile-config` control: pins the opt-out (the scan writes
