@@ -135,6 +135,14 @@ pub(super) async fn repair(
             }
             written.push((path.clone(), before.clone()));
         }
+        // Every mirror carries the root artifact's `<uuid>/.gitignore`, so
+        // a `*.tgz` rule cannot keep a rebuilt one out of the commit (#1116).
+        for rec in &wiring {
+            if let Err(e) = super::bun_binary::restore_mirror_metadata(root, &rec.file).await {
+                undo_mirrors(&written).await;
+                return Err(e);
+            }
+        }
     }
     Ok((wiring, !updates.is_empty()))
 }
@@ -169,7 +177,8 @@ pub(super) async fn cleanup(root: &Path, entry: &VendorEntry, dry_run: bool) -> 
                 paths.push(path)
             }
             Ok(_) => return Err("workspace tarball changed; superseded artifacts kept".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Gone already: its `<uuid>/.gitignore` still goes.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => paths.push(path),
             Err(e) => return Err(format!("cannot read workspace tarball: {e}")),
         }
     }
