@@ -1,23 +1,13 @@
 //! One `binary()` and one `git_sha256` for every CLI test target (#824).
 //!
-//! `common/mod.rs` owns both helpers, and its own tests pin `git_sha256`
-//! to the canonical Git-blob hash and to production's
-//! `compute_git_sha256_from_bytes` (the two shapes the per-file copies
-//! took). This ratchet keeps new private copies out: a file may define its
-//! own only while it is listed below.
+//! `common/oracle.rs` owns both helpers and `common/mod.rs` re-exports
+//! them; `common`'s own tests pin `git_sha256` to the canonical Git-blob
+//! hash and to production's `compute_git_sha256_from_bytes` (the two
+//! shapes the per-file copies took). Shared modules whose includers don't
+//! all declare `mod common` pull `common/oracle.rs` in on its own and
+//! re-export it. This check keeps new private copies out.
 
 use std::path::Path;
-
-/// Files that still define a private `binary()` or `git_sha256`. Each is
-/// a shared module whose includers don't all declare `mod common`.
-/// Migrate a file onto `common` and delete its entry; a stale entry is
-/// not an error, so a PR that migrates one never turns another red.
-const PENDING_PRIVATE_HELPERS: &[&str] = &[
-    "vex_e2e_common/mod.rs",
-    "vlt_e2e_common/mod.rs",
-    "vlt_hosted_common/mod.rs",
-    "vlt_vendor_common/mod.rs",
-];
 
 /// Every `.rs` file under `tests/`, as (`/`-joined relative path, text).
 fn test_sources() -> Vec<(String, String)> {
@@ -66,19 +56,16 @@ fn defines_private_helper(text: &str) -> bool {
 fn no_new_private_binary_or_git_sha256() {
     let unexpected: Vec<String> = test_sources()
         .into_iter()
-        .filter(|(rel, text)| {
-            !rel.starts_with("common/")
-                && !PENDING_PRIVATE_HELPERS.contains(&rel.as_str())
-                && defines_private_helper(text)
-        })
+        .filter(|(rel, text)| !rel.starts_with("common/") && defines_private_helper(text))
         .map(|(rel, _)| rel)
         .collect();
     assert!(
         unexpected.is_empty(),
         "these test files define their own binary() or git_sha256: {unexpected:?}. \
          Use `common::binary` / `common::git_sha256` instead (declare \
-         `#[path = \"common/mod.rs\"] mod common;`, or `use crate::common::..` in a \
-         directory test binary). Do not add them to PENDING_PRIVATE_HELPERS."
+         `#[path = \"common/mod.rs\"] mod common;`, `use crate::common::..` in a \
+         directory test binary, or re-export them from `common/oracle.rs` in a \
+         shared module)."
     );
 }
 

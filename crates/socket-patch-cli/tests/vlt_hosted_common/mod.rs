@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -91,12 +91,13 @@ pub fn with_flags(line: &str, flags: u8) -> String {
     line.replacen("[0,", &format!("[{flags},"), 1)
 }
 
-pub fn git_sha256(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
+#[path = "../common/oracle.rs"]
+mod oracle;
+
+/// The Git-blob hash oracle shared with `common` (#824).
+// Not every includer uses it.
+#[allow(unused_imports)]
+pub use oracle::git_sha256;
 
 pub fn sha512_sri(bytes: &[u8]) -> String {
     format!(

@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 pub const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 pub const UUID2: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
@@ -43,12 +42,13 @@ pub const VLT_LOCK: &str = "vlt-lock.json";
 /// The real-vlt versions whose captures are committed.
 pub const CAPTURED: &[&str] = &["1.2.0", "1.0.10", "1.0.4", "1.0.0-rc.32", "1.0.0-rc.14"];
 
-pub fn git_sha256(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
+#[path = "../common/oracle.rs"]
+mod oracle;
+
+/// The Git-blob hash oracle shared with `common` (#824).
+// Not every includer uses it.
+#[allow(unused_imports)]
+pub use oracle::git_sha256;
 
 pub fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../socket-patch-core/tests/fixtures/vendor/npm/vlt")

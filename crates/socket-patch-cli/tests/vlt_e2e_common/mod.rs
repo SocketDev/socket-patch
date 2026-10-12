@@ -1280,12 +1280,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-pub fn git_sha256(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(format!("blob {}\0", bytes.len()).as_bytes());
-    h.update(bytes);
-    hex::encode(h.finalize())
-}
+// Not every includer uses it.
+#[allow(unused_imports)]
+pub use common::git_sha256;
 
 /// A dir vlt (rc.14) renames an old tree to and deletes in the background.
 pub fn is_vlt_delete_staging(name: &std::ffi::OsStr) -> bool {
