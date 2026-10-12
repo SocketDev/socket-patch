@@ -71,23 +71,25 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 const MULTI_VERSION_CARGO_MINOR: u32 = 45;
 
 /// The lowest cargo minor this project TELLS us it must build on, read
-/// offline from the project root ([`floor::declared_cargo_minor`]).
+/// offline from the project root ([`floor::declared_cargo_minor`]); the
+/// toolchain files are read only when `Cargo.toml` declares nothing.
 async fn declared_cargo_minor(project_root: &Path) -> Option<u32> {
     let read = |name: &str| project_root.join(name);
-    let manifest = read_regular_to_string(&read(cargo_manifest::CARGO_TOML))
-        .await
-        .ok();
+    let manifest = read_regular_to_string(&read(cargo_manifest::CARGO_TOML)).await;
+    if let Some(minor) = manifest
+        .ok()
+        .as_deref()
+        .and_then(floor::root_manifest_minor)
+    {
+        return Some(minor);
+    }
     let toolchain_toml = read_regular_to_string(&read(floor::TOOLCHAIN_TOML))
         .await
         .ok();
     let toolchain_legacy = read_regular_to_string(&read(floor::TOOLCHAIN_LEGACY))
         .await
         .ok();
-    floor::declared_cargo_minor(
-        manifest.as_deref(),
-        toolchain_toml.as_deref(),
-        toolchain_legacy.as_deref(),
-    )
+    floor::toolchain_minor(toolchain_toml.as_deref(), toolchain_legacy.as_deref())
 }
 
 /// A warning when THIS vendor puts a SECOND version of `name` behind
