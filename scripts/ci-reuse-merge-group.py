@@ -47,7 +47,7 @@ def main():
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
         output.write(f"reuse={'true' if reuse else 'false'}\n")
     if reuse:
-        print(f"Merge-queue CI run {run} passed this SHA; retaining cache builds and the full tier.")
+        print(f"Merge-queue CI run {run} passed this SHA; retaining cache builds only.")
     else:
         print("No verified merge-queue CI result for this push; running all checks.")
 

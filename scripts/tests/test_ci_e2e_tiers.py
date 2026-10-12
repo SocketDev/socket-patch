@@ -59,15 +59,17 @@ class Tiers(unittest.TestCase):
         self.assertFalse(set(pr_rows) & set(full_rows), "a row in both tiers runs twice")
         self.assertEqual(len(pr_rows + full_rows), len(set(pr_rows + full_rows)), "duplicate rows")
 
-    def test_full_jobs_skip_pull_requests_and_share_steps(self):
+    def test_full_jobs_run_nightly_only_and_share_steps(self):
         for job, anchor in (("e2e-full", "e2e-steps"), ("yarn-berry-full", "yarn-berry-steps"),
                             ("cargo-vex-matrix-full", "cargo-vex-steps")):
             with self.subTest(job=job):
                 text = job_text(job)
-                # The merge queue runs the pull_request tier, so the full tier
-                # skips merge_group too.
-                self.assertIn("if: (github.event_name != 'pull_request' && github.event_name != 'merge_group')",
-                              text)
+                # Nightly, dispatch (release-qa) and v5 landings, like
+                # e2e-docker: not on PRs, the merge queue or a lean push to
+                # main, where its 41 legs ran on every landing.
+                self.assertIn("    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+                              " || (github.event_name == 'push' && vars.CI_SCOPE == 'full')"
+                              " || github.head_ref == 'release/v5-prerelease'\n", text)
                 self.assertIn(f"steps: *{anchor}", text)
                 self.assertIn(f"steps: &{anchor}", TEXT)
 
