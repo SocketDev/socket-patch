@@ -290,6 +290,7 @@ pub fn source_constraint_refusal(
     pyproject_path: &str,
     lock_path: &str,
     name: &str,
+    version: &str,
     source: &str,
     kind: &str,
     wired: Wired,
@@ -300,7 +301,10 @@ pub fn source_constraint_refusal(
             "run `socket-patch vendor --revert` (it reverts EVERY vendored package in the \
              project, not just this one), then "
         }
-        Wired::Hosted => "run `socket-patch rollback` to restore the upstream entry, then ",
+        Wired::Hosted => &format!(
+            "run `socket-patch rollback pkg:pypi/{name}@{version}` (only this package's \
+             hosted pin; a bare `rollback` undoes every patch in the project), then "
+        ),
     };
     format!(
         "{pyproject_path} pins {name} to the {source:?} source (`source = {source:?}`), and \

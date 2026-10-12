@@ -169,10 +169,10 @@ async fn preflight_poetry_source_constraint(
     let Ok(pyproject) = read_regular_to_string(&root.join(&pyproject_file)).await else {
         return Ok(());
     };
-    let name = entry
+    let (name, version) = entry
         .base_purl
         .strip_prefix("pkg:pypi/")
-        .and_then(|rest| rest.split('@').next())
+        .and_then(|rest| rest.split_once('@'))
         .unwrap_or_default();
     let Some(source) =
         pyproject_source_constraints(&pyproject).remove(&canonicalize_pypi_name(name))
@@ -188,6 +188,7 @@ async fn preflight_poetry_source_constraint(
                 &pyproject_file,
                 lock_file,
                 name,
+                version,
                 &source,
                 "URL",
                 Wired::Vendored

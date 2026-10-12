@@ -94,6 +94,7 @@ pub(super) fn rewrite_poetry(
                             &pyproject_path,
                             path,
                             &dep.name,
+                            &dep.version,
                             source,
                             "URL",
                             wired,
@@ -417,7 +418,9 @@ mod equivalence_tests {
                     assert_eq!(codes, ["redirect_poetry_lock_unsupported"], "{what}");
                     // Re-locking would drop the live pin: roll back first.
                     let detail = &got.warnings[0].detail;
-                    let rollback = detail.find("socket-patch rollback").expect(detail);
+                    let rollback = detail
+                        .find("socket-patch rollback pkg:pypi/urllib3@1.26.18")
+                        .expect(detail);
                     assert!(rollback < detail.find("re-lock").unwrap(), "{detail}");
                 } else {
                     assert!(got.refused_python_lock_uuids.is_empty(), "{what}");
