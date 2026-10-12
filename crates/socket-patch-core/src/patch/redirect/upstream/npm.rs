@@ -598,53 +598,13 @@ fn yaml_path_in(lines: &[String], path: &[&str]) -> Result<Option<String>, Strin
 /// the default registry with `upstream_registry_fallback`, as for the Bun
 /// and pnpm settings, which never expand an arbitrary variable either.
 fn yarn_expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(at) = rest.find("${") {
-        out.push_str(&rest[..at]);
-        let body = &rest[at + 2..];
-        let name_len = body
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(body.len());
-        let name = &body[..name_len];
-        let mut tail = &body[name_len..];
-        let colon = tail.starts_with(':');
-        if colon {
-            tail = &tail[1..];
-        }
-        let fallback = match tail.strip_prefix('-') {
-            Some(after) => match after.find('}') {
-                Some(close) => {
-                    tail = &after[close..];
-                    Some(&after[..close])
-                }
-                None => None,
-            },
-            None => None,
-        };
-        let Some(after) = tail.strip_prefix('}').filter(|_| !name.is_empty()) else {
-            // Not a reference yarn recognizes: kept literally.
-            out.push_str("${");
-            rest = body;
-            continue;
-        };
-        let set = var(name);
-        let expanded = match (set, fallback) {
-            (Some(v), _) if !v.is_empty() => {
-                return Err(format!(
-                    "it references the environment variable {name}, which socket-patch does \
-                     not expand into a registry URL"
-                ))
-            }
-            (Some(v), _) if !colon => v,
-            (_, Some(fallback)) => fallback.to_string(),
-            (_, None) => return Err(format!("the environment variable {name} is not set")),
-        };
-        out.push_str(&expanded);
-        rest = after;
-    }
-    out.push_str(rest);
-    Ok(out)
+    crate::formats::yarn::rc::expand_env(value, &mut |name| match var(name) {
+        Some(v) if !v.is_empty() => Err(format!(
+            "it references the environment variable {name}, which socket-patch does \
+             not expand into a registry URL"
+        )),
+        unset_or_empty => Ok(unset_or_empty),
+    })
 }
 
 /// The yarn berry settings that decide which registry a package resolves

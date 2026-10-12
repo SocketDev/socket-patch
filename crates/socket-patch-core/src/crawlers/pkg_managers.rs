@@ -166,27 +166,63 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
 /// The yarn environment that decides which rc files yarn berry reads:
 /// `YARN_NODE_LINKER`, `YARN_RC_FILENAME` (the rc file name yarn looks for
 /// in every folder, `.yarnrc.yml` by default) and the home folder, whose
-/// rc file yarn reads last.
+/// rc file yarn reads last; plus the variables an rc value's `${NAME}`
+/// references expand from (#1100).
 #[derive(Debug, Clone)]
 pub(crate) struct YarnEnv {
     pub node_linker: Option<String>,
     pub rc_filename: String,
     pub home: Option<PathBuf>,
+    /// The variables `${NAME}` references read; `None` reads this
+    /// process's environment.
+    pub vars: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl YarnEnv {
     pub(crate) fn current() -> Self {
-        let set = |k: &str| {
-            std::env::var(k)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        };
         Self {
-            node_linker: set("YARN_NODE_LINKER"),
-            rc_filename: set("YARN_RC_FILENAME").unwrap_or_else(|| ".yarnrc.yml".to_string()),
+            // Yarn takes the last `yarn_node_linker` spelling in the
+            // environment (each one overwrites the setting) but the first
+            // `yarn_rc_filename` (`getRcFilename` returns on a match).
+            node_linker: yarn_env_key(std::env::vars_os(), "YARN_NODE_LINKER", true),
+            rc_filename: yarn_env_key(std::env::vars_os(), "YARN_RC_FILENAME", false)
+                .unwrap_or_else(|| ".yarnrc.yml".to_string()),
             home: crate::utils::fs::home_dir(),
+            vars: None,
         }
+    }
+
+    /// The repository alone, not the host it is scanned on: no
+    /// environment override, no home rc file, and no variables, so a
+    /// `${NAME}` reference takes its fallback or fails closed. For a view
+    /// of a repository that is not checked out on this host.
+    pub(crate) fn repository_only() -> Self {
+        Self {
+            node_linker: None,
+            rc_filename: ".yarnrc.yml".to_string(),
+            home: None,
+            vars: Some(Default::default()),
+        }
+    }
+
+    fn var(&self, name: &str) -> Option<String> {
+        match &self.vars {
+            Some(vars) => vars.get(name).cloned(),
+            None => std::env::var(name).ok(),
+        }
+    }
+
+    /// A `nodeLinker` value as yarn resolves it: its `${…}` references
+    /// expanded. When one cannot be (an unset variable with no fallback:
+    /// yarn refuses to run), the value expands to nothing, or it still
+    /// holds a literal `${` (no linker yarn knows), it is the text as
+    /// written, which [`yarn_linker_is_pnp`] reads as PnP (fail closed).
+    /// So a value a refusal names never carries an expanded variable.
+    fn resolve_linker(&self, raw: &str) -> String {
+        crate::formats::yarn::rc::expand_env(raw, &mut |name| Ok(self.var(name)))
+            .ok()
+            .filter(|v| !v.is_empty() && !v.contains("${"))
+            .unwrap_or_else(|| raw.to_string())
     }
 
     /// The `nodeLinker` the home folder's rc file sets: yarn reads it after
@@ -197,15 +233,37 @@ impl YarnEnv {
             &self.home.as_ref()?.join(&self.rc_filename),
         )
         .ok()?;
-        rc_node_linker(&rc)
+        rc_node_linker(&rc, self)
     }
 }
 
-/// The `nodeLinker` the rc file text `rc` sets, if any.
-fn rc_node_linker(rc: &str) -> Option<String> {
-    crate::formats::yarn::berry_gates::yarnrc_scalar(rc, "nodeLinker")
+/// The yarn environment setting `key` (upper case) in `vars`: yarn
+/// lower-cases every environment key before matching it, so
+/// `yarn_node_linker` sets the linker as `YARN_NODE_LINKER` does (#1100;
+/// Windows keys are case-insensitive anyway). `last` takes the last match
+/// in environment order, else the first; an empty value sets nothing.
+fn yarn_env_key(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    key: &str,
+    last: bool,
+) -> Option<String> {
+    let mut found = vars.filter_map(|(k, v)| {
+        let (k, v) = (k.to_str()?, v.to_str()?.trim());
+        (k.eq_ignore_ascii_case(key) && !v.is_empty()).then(|| v.to_string())
+    });
+    if last {
+        found.last()
+    } else {
+        found.next()
+    }
+}
+
+/// The `nodeLinker` the rc file text `rc` sets, if any, as yarn resolves
+/// it under `env` ([`YarnEnv::resolve_linker`]).
+pub(crate) fn rc_node_linker(rc: &str, env: &YarnEnv) -> Option<String> {
+    crate::formats::yarn::rc::raw_setting(rc, "nodeLinker")
         .filter(|v| !v.is_empty())
-        .map(str::to_string)
+        .map(|raw| env.resolve_linker(&raw))
 }
 
 /// The `nodeLinker` yarn berry resolves for `project_root`:
@@ -220,8 +278,8 @@ pub fn yarn_node_linker(project_root: &Path) -> Option<String> {
 }
 
 pub(crate) fn yarn_node_linker_in(project_root: &Path, env: &YarnEnv) -> Option<String> {
-    if let Some(linker) = env.node_linker.clone() {
-        return Some(linker);
+    if let Some(linker) = &env.node_linker {
+        return Some(env.resolve_linker(linker));
     }
     let start = std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     start
@@ -229,7 +287,7 @@ pub(crate) fn yarn_node_linker_in(project_root: &Path, env: &YarnEnv) -> Option<
         .find_map(|dir| {
             let rc =
                 crate::utils::fs::read_regular_to_string_sync(&dir.join(&env.rc_filename)).ok()?;
-            rc_node_linker(&rc)
+            rc_node_linker(&rc, env)
         })
         .or_else(|| env.home_node_linker())
 }
@@ -250,9 +308,11 @@ pub(crate) fn effective_yarn_linker(
 }
 
 /// Whether a yarn `nodeLinker` setting (`None` = unset) is Plug'n'Play:
-/// `pnp` itself, or nothing set at all (berry's default).
+/// `pnp` itself, nothing set at all (berry's default), or a `${…}`
+/// reference left unexpanded because yarn could not expand it either
+/// ([`YarnEnv::resolve_linker`]): an unknown linker fails closed.
 pub fn yarn_linker_is_pnp(linker: Option<&str>) -> bool {
-    linker.is_none_or(|l| l == "pnp")
+    linker.is_none_or(|l| l == "pnp" || l.contains("${"))
 }
 
 /// The PnP loader file that makes `project_root` a live yarn Plug'n'Play
@@ -497,6 +557,120 @@ mod tests {
         );
     }
 
+    /// #1100: yarn parses `.yarnrc.yml` as YAML and expands `${…}` in its
+    /// values, so a live loader under `nodeLinker: "${L:-pnp}"` is PnP, and
+    /// a quoted key, a next-line value or a flow map still says
+    /// `node-modules`. A reference yarn cannot expand counts as PnP while a
+    /// loader exists (fail closed).
+    #[test]
+    fn yarnrc_linker_is_read_as_yarn_resolves_it() {
+        for (rc, live) in [
+            ("nodeLinker: \"${SOCKET_PATCH_T1100_UNSET:-pnp}\"\n", true),
+            ("nodeLinker: \"${SOCKET_PATCH_T1100_UNSET-pnp}\"\n", true),
+            ("nodeLinker: ${SOCKET_PATCH_T1100_UNSET}\n", true),
+            (
+                "nodeLinker: \"${SOCKET_PATCH_T1100_UNSET:-node-modules}\"\n",
+                false,
+            ),
+            ("\"nodeLinker\": node-modules\n", false),
+            ("nodeLinker:\n  node-modules\n", false),
+            ("{nodeLinker: node-modules}\n", false),
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
+            std::fs::write(d.path().join(".yarnrc.yml"), rc).unwrap();
+            assert_eq!(
+                live_pnp_marker_with(
+                    || yarn_node_linker_in(d.path(), &bare_env(None)),
+                    |m| d.path().join(m).is_file()
+                ),
+                live.then_some(".pnp.cjs"),
+                "{rc:?}"
+            );
+        }
+    }
+
+    /// #1100: `${NAME}` references read the environment yarn runs in, in
+    /// the rc file and in `YARN_NODE_LINKER` alike.
+    #[test]
+    fn yarnrc_linker_references_read_the_environment() {
+        let d = tempfile::tempdir().unwrap();
+        let mut env = bare_env(None);
+        env.vars = Some([("L".to_string(), "pnp".to_string())].into());
+        for (rc, linker) in [
+            ("nodeLinker: \"${L}\"\n", "pnp"),
+            ("nodeLinker: \"${L:-node-modules}\"\n", "pnp"),
+            ("nodeLinker: \"${M:-node-modules}\"\n", "node-modules"),
+        ] {
+            std::fs::write(d.path().join(".yarnrc.yml"), rc).unwrap();
+            assert_eq!(
+                yarn_node_linker_in(d.path(), &env).as_deref(),
+                Some(linker),
+                "{rc:?}"
+            );
+        }
+        env.node_linker = Some("${L}".into());
+        assert_eq!(yarn_node_linker_in(d.path(), &env).as_deref(), Some("pnp"));
+    }
+
+    /// #1100: yarn matches its `yarn_` environment keys case-insensitively:
+    /// the last spelling of a setting wins, the first of the rc file name.
+    #[test]
+    fn yarn_env_keys_match_any_case() {
+        let vars = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        let linker = |pairs| yarn_env_key(vars(pairs), "YARN_NODE_LINKER", true);
+        assert_eq!(
+            linker(&[("yarn_node_linker", "node-modules")]).as_deref(),
+            Some("node-modules")
+        );
+        assert_eq!(
+            linker(&[
+                ("YARN_NODE_LINKER", "node-modules"),
+                ("yarn_node_linker", "pnp"),
+            ])
+            .as_deref(),
+            Some("pnp")
+        );
+        assert_eq!(
+            linker(&[("YARN_NODE_LINKER", " "), ("yarn_nodelinker", "x")]),
+            None
+        );
+        assert_eq!(
+            yarn_env_key(
+                vars(&[
+                    ("yarn_rc_filename", ".a.yml"),
+                    ("YARN_RC_FILENAME", ".b.yml")
+                ]),
+                "YARN_RC_FILENAME",
+                false
+            )
+            .as_deref(),
+            Some(".a.yml")
+        );
+    }
+
+    /// #1100: a project rc whose reference expands to nothing does not
+    /// fall through to a parent rc (yarn keeps the nearest value); it is
+    /// no linker yarn knows, so a loader counts (fail closed).
+    #[test]
+    fn an_empty_expansion_does_not_inherit_a_parent_linker() {
+        let d = tempfile::tempdir().unwrap();
+        let member = d.path().join("app");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(d.path().join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
+        std::fs::write(member.join(".yarnrc.yml"), "nodeLinker: \"${L}\"\n").unwrap();
+        let mut env = bare_env(None);
+        env.vars = Some([("L".to_string(), String::new())].into());
+        assert_eq!(yarn_node_linker_in(&member, &env).as_deref(), Some("${L}"));
+        assert!(yarn_linker_is_pnp(Some("${L}")));
+    }
+
     /// yarn's own precedence: the env var, then the nearest rc file that
     /// sets the key, walking up past rc files that don't.
     #[test]
@@ -533,6 +707,7 @@ mod tests {
             node_linker: node_linker.map(str::to_string),
             rc_filename: ".yarnrc.yml".into(),
             home: None,
+            vars: Some(Default::default()),
         }
     }
 
