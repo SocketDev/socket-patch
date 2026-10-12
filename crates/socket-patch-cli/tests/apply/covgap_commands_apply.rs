@@ -39,15 +39,13 @@ use common::{git_sha256, parse_json_envelope, run_with_env};
 
 // ───────────────────────── shared fixture helpers ─────────────────────────
 
-/// Run `socket-patch apply <args>` in `cwd` with the ambient `SOCKET_*`
-/// environment scrubbed (see `common::run_with_env`), telemetry disabled,
-/// and `extra_env` landing last (so tests can inject API URLs / TMPDIR).
+/// Run `socket-patch apply <args>` in `cwd` with the hermetic `SOCKET_*`
+/// environment (see `common::run_with_env`) and `extra_env` landing last
+/// (so tests can inject API URLs / TMPDIR).
 fn run_apply(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
     let mut argv: Vec<&str> = vec!["apply"];
     argv.extend_from_slice(args);
-    let mut env: Vec<(&str, &str)> = vec![("SOCKET_TELEMETRY_DISABLED", "1")];
-    env.extend_from_slice(extra_env);
-    run_with_env(cwd, &argv, &env)
+    run_with_env(cwd, &argv, extra_env)
 }
 
 /// One camelCase manifest record (the TS-compatible on-disk schema).

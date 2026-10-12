@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A `rollback` command with the hermetic `SOCKET_*` environment
-/// (`hermetic_command`) and the working directory pinned (same rationale as the twin helper in
-/// `rollback_invariants.rs`: an ambient `SOCKET_OFFLINE`/`SOCKET_DRY_RUN`/
+/// (`hermetic_command`) and the working directory pinned (same rationale as
+/// the twin helper in `rollback_invariants.rs`: an ambient `SOCKET_OFFLINE`/`SOCKET_DRY_RUN`/
 /// `SOCKET_PRESERVE_STATE` must never satisfy — or sabotage — a test that
 /// is named after the flag's real code path).
 fn rollback_cmd(cwd: &Path) -> Command {

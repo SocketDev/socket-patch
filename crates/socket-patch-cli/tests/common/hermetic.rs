@@ -161,10 +161,11 @@ pub enum Extra {
     /// the full `YARN_*` sweep.
     YarnClassic,
     /// Every `BUNDLE_*` var. Bundler lets any `.bundle/config` setting be
-    /// overridden by env, so an ambient `BUNDLE_PATH` or `BUNDLE_GEMFILE`
-    /// moves the gem store or project the gem suites point it at. Seeded
-    /// with `BUNDLE_GEMFILE` and then scrubbed; run it before the suite
-    /// sets its own `BUNDLE_*` values.
+    /// overridden by env, and the gem crawler reads `BUNDLE_PATH`,
+    /// `BUNDLE_APP_CONFIG` and friends, so an ambient value moves the gem
+    /// store the suite points it at. Seeded with a bogus
+    /// `BUNDLE_APP_CONFIG` and then scrubbed; run it before the suite sets
+    /// its own `BUNDLE_*` values.
     Bundle,
 }
 
@@ -213,13 +214,13 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                 cmd.env_remove("PREFIX");
             }
             Extra::Bundle => {
-                cmd.env("BUNDLE_GEMFILE", "/nonexistent/Gemfile");
+                cmd.env("BUNDLE_APP_CONFIG", "/nonexistent/.bundle");
                 for (key, _) in std::env::vars_os() {
                     if key.to_string_lossy().starts_with("BUNDLE_") {
                         cmd.env_remove(&key);
                     }
                 }
-                cmd.env_remove("BUNDLE_GEMFILE");
+                cmd.env_remove("BUNDLE_APP_CONFIG");
             }
         }
     }

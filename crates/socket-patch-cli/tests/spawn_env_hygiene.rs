@@ -517,7 +517,7 @@ fn extra_seeds_are_scrubbed_whatever_the_ambient_value() {
     let env = effective_env(&cmd);
     assert_eq!(get(&env, "YARN_NODE_LINKER"), None);
     assert_eq!(get(&env, "npm_config_node_linker"), None);
-    assert_eq!(get(&env, "BUNDLE_GEMFILE"), None);
+    assert_eq!(get(&env, "BUNDLE_APP_CONFIG"), None);
 }
 
 /// Every `.rs` file under `tests/`, as `/`-separated paths relative to it.

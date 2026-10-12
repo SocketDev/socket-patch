@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A `rollback` command with the hermetic `SOCKET_*` environment
-/// (`hermetic_command`) and the working directory pinned. All tests build their child process through here
-/// so none can be satisfied by ambient environment instead of the code path.
+/// (`hermetic_command`) and the working directory pinned. All tests build
+/// their child process through here so none can be satisfied by ambient
+/// environment instead of the code path.
 ///
 /// The child process inherits the parent's environment, so an ambient value
 /// would let a test pass via the environment instead of via the flag (and the
@@ -338,9 +339,9 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
 
     // The env is scrubbed (no SOCKET_API_TOKEN) and socket-cli config is
     // vetoed by the SOCKET_NO_CONFIG=1 that `hermetic_command` forces, so
-    // every client build wants the no-token notice. Under --json it is muted entirely;
-    // in human mode it must appear exactly once per invocation, not once
-    // per internal phase.
+    // every client build wants the no-token notice. Under --json it is
+    // muted entirely; in human mode it must appear exactly once per
+    // invocation, not once per internal phase.
     assert!(
         !stderr.contains("No SOCKET_API_TOKEN set"),
         "--json must mute the no-token notice; stderr=\n{stderr}"

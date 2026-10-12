@@ -115,7 +115,6 @@ fn run_apply(cwd: &Path, extra: &[&str]) -> (i32, String) {
     let out = hermetic_command(&binary())
         .args(&args)
         .current_dir(cwd)
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run socket-patch");
     (
@@ -456,7 +455,6 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
     let out = hermetic_command(&binary())
         .args(["apply", "--silent"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run socket-patch");
     assert_eq!(out.status.code(), Some(0));
@@ -475,7 +473,6 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
     let loud = hermetic_command(&binary())
         .args(["apply"])
         .current_dir(tmp2.path())
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run socket-patch");
     assert_eq!(loud.status.code(), Some(0));

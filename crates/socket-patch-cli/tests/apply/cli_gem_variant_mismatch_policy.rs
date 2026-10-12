@@ -26,6 +26,7 @@
 //!     modified"). When NO variant matches, the base still fails with
 //!     "no matching variant found" and the file stays untouched.
 
+use crate::common::hermetic::{self, Extra};
 use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
@@ -54,14 +55,15 @@ fn with_marker(base: &[u8], marker: &[u8]) -> Vec<u8> {
 }
 
 /// Run `socket-patch apply --offline --ecosystems gem <extra>` in `cwd`
-/// with the hermetic `SOCKET_*` environment (`hermetic_command`), so only
-/// the argv decides behavior.
+/// with the hermetic `SOCKET_*` environment (`hermetic_command`) and the
+/// ambient `BUNDLE_*` scrubbed, so only the argv decides behavior.
 fn run_apply(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
     cmd.arg("apply")
         .args(["--offline", "--ecosystems", "gem"])
         .args(extra)
         .current_dir(cwd);
+    hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
     let out = cmd.output().expect("run socket-patch apply");
     (
         out.status.code().unwrap_or(-1),

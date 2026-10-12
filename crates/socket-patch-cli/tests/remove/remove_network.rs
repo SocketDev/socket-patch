@@ -101,20 +101,12 @@ fn run_remove(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String) {
     let mut cmd = hermetic_command(&binary());
     cmd.args(&argv).current_dir(cwd);
     // Hermeticity (`hermetic_command`): every ambient SOCKET_* var is
-    // dropped by prefix before re-setting only the three this test
-    // controls. The spawned child
-    // inherits the parent environment, and the binary binds a wide
-    // `SOCKET_*` env surface (clap-flattened `GlobalArgs`, per-command
-    // flags, runtime toggles) — an ambient value satisfies (or defeats)
-    // the behaviour under test *instead of* the argv. An ambient
-    // `SOCKET_OFFLINE` would make the `--offline` test pass even if the
-    // *flag* handling regressed; `SOCKET_MANIFEST_PATH`/`SOCKET_CWD`
-    // could aim the binary at the wrong manifest. Scrub by prefix, not
-    // an enumerated list: a list drifts from the binary's env surface —
-    // it missed `SOCKET_SKIP_ROLLBACK` (remove's own env-bound flag),
-    // under which `remove --offline` skipped rollback entirely, exited
-    // 0, and deleted the entry, failing both tests for the wrong
-    // reason. The controlled set must be seeded *after* scrubbing.
+    // dropped before the three this test controls are set. An ambient
+    // value would satisfy (or defeat) the behaviour under test instead of
+    // the argv: `SOCKET_OFFLINE` would make the `--offline` test pass even
+    // if the flag handling regressed, and `SOCKET_SKIP_ROLLBACK` (remove's
+    // own env-bound flag) once made `remove --offline` skip rollback, exit
+    // 0 and delete the entry, failing both tests for the wrong reason.
     let out = cmd
         .env("SOCKET_API_URL", api_url)
         .env("SOCKET_API_TOKEN", "fake-token-for-test")
