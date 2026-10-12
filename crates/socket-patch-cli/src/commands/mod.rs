@@ -115,9 +115,14 @@ pub(crate) async fn mode_from_project_state(
             manifest_path.display(),
         )),
         (true, false) => {
-            // Lockless cargo/nuget pins are never refs, so
+            // Lockless cargo/nuget pins and Gemfile-only gem pins (a
+            // CHECKSUMS-less lock, #1224) are never refs, so
             // `HostedPin::recorded` drops them; they are hosted state too.
             let discovery = discover_wiring(common, &project_root).await;
+            let gemfile_pins = socket_patch_core::vex::discover::gem_manifest_source_pins(
+                &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&project_root),
+            )
+            .await;
             let mut purls: Vec<String> =
                 socket_patch_core::patch::redirect::upstream::HostedPin::recorded(&discovery)
                     .into_iter()
@@ -128,6 +133,7 @@ pub(crate) async fn mode_from_project_state(
                             .iter()
                             .map(|pin| format!("pkg:{}/{}", pin.ecosystem, pin.name)),
                     )
+                    .chain(gemfile_pins.into_iter().map(|(purl, _)| purl))
                     .collect();
             if purls.is_empty() {
                 return Ok(scan::ScanMode::Vendored);
@@ -566,6 +572,32 @@ mod tests {
         let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
         let err = mode.expect_err("vendored and lockless hosted state together");
         assert!(err.contains("pkg:nuget/Newtonsoft.Json"), "{err}");
+    }
+
+    /// A gem pinned only in the Gemfile (the hosted rewriter's wiring over
+    /// a CHECKSUMS-less lock, #1224) has no lock ref yet, but it is hosted
+    /// state all the same.
+    #[tokio::test]
+    async fn a_gemfile_only_hosted_pin_beside_a_ledger_is_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ledger(tmp.path()).await;
+        std::fs::write(
+            tmp.path().join("Gemfile"),
+            format!(
+                "source \"https://rubygems.org\"\n\nsource \"https://patch.socket.dev/\
+                 patch-registry/gem/tok/{UUID}/\" do\n  gem \"rails\", \"7.0.0\"\nend\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n",
+        )
+        .unwrap();
+        let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
+        let err = mode.expect_err("vendored and Gemfile-only hosted state together");
+        assert!(err.contains("pkg:gem/rails@7.0.0"), "{err}");
     }
 
     /// Hosted pins alone are a hosted project, and need no ledger.
