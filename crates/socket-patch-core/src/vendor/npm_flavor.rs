@@ -1151,6 +1151,7 @@ mod tests {
             node_linker: None,
             rc_filename: ".yarnrc.yml".into(),
             home: Some(home.path().to_path_buf()),
+            vars: Some(Default::default()),
         };
         let (flavor, _) =
             detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))
@@ -1165,6 +1166,7 @@ mod tests {
             node_linker: None,
             rc_filename: ".yarnrc.ci.yml".into(),
             home: None,
+            vars: Some(Default::default()),
         };
         let (flavor, _) =
             detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))

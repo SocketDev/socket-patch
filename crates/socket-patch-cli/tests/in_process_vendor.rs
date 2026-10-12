@@ -1408,6 +1408,11 @@ async fn berry_lock_only_pnp_project_refused_up_front() {
         ),
         ("default linker", Some("enableGlobalCache: false\n")),
         ("no yarnrc", None),
+        // #1100: yarn expands the reference to `pnp`.
+        (
+            "interpolated pnp",
+            Some("nodeLinker: \"${SOCKET_PATCH_T1100_UNSET:-pnp}\"\nenableGlobalCache: false\n"),
+        ),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();

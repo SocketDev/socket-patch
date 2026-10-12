@@ -162,10 +162,12 @@ pub fn check_yarnrc(yarnrc: Yarnrc<'_>) -> Result<(), BerryGate> {
         Yarnrc::Unreadable(error) => Err(BerryGate::YarnrcUnreadable {
             error: error.to_string(),
         }),
-        Yarnrc::Text(rc) => match yarnrc_compression_level(rc) {
-            Some(level) if level != "0" => Err(BerryGate::Compression {
-                level: level.to_string(),
-            }),
+        // The level yarn uses is the value with its `${…}` references
+        // expanded (#1100); a refusal names it as written.
+        Yarnrc::Text(rc) => match super::rc::process_setting(rc, "compressionLevel") {
+            Some(level) if level.value.as_deref() != Some("0") => {
+                Err(BerryGate::Compression { level: level.raw })
+            }
             _ => Ok(()),
         },
     }
@@ -179,38 +181,15 @@ pub(crate) fn cache_key(blocks: &[LockBlock]) -> Option<&str> {
     berry_field(&berry_metadata(blocks)?.lines, "cacheKey")
 }
 
-/// The `.yarnrc.yml` `compressionLevel` value, when set. A flat line scan is
-/// enough: yarn writes the knob as a top-level scalar, and any
-/// value we cannot positively read as `0` makes the caller refuse. /// CRLF lines split like LF ones (`str::lines`), and a leading BOM is
-/// skipped the way yarn's YAML parser skips it — otherwise a knob on the
-/// first line of a BOM'd file would read as unset (the offline-reproducible
-/// default) while yarn applies it and every install fails YN0018.
-///
-/// The value is read as a YAML scalar: a quoted value ends at its closing
-/// quote, and a plain value ends before a whitespace-separated `#` comment
-/// (`compressionLevel: 0 # keep yarn default` is `0`, #370). A `#` with no
-/// whitespace before it stays part of a plain value, as in YAML.
-pub fn yarnrc_compression_level(rc: &str) -> Option<&str> {
-    yarnrc_scalar(rc, "compressionLevel")
-}
-
-/// The top-level `.yarnrc.yml` scalar `key`, when set, read as
-/// [`yarnrc_compression_level`] describes.
-pub fn yarnrc_scalar<'a>(rc: &'a str, key: &str) -> Option<&'a str> {
-    let rc = crate::formats::text::strip_bom(rc);
-    rc.lines().find_map(|line| {
-        let rest = line.strip_prefix(key)?.strip_prefix(':')?.trim();
-        if let Some(quote) = rest.chars().next().filter(|c| matches!(c, '\'' | '"')) {
-            if let Some(end) = rest[1..].find(quote) {
-                return Some(&rest[1..1 + end]);
-            }
-        }
-        let value = rest
-            .char_indices()
-            .find(|&(i, c)| c == '#' && rest[..i].ends_with([' ', '\t']))
-            .map_or(rest, |(i, _)| &rest[..i]);
-        Some(value.trim_end().trim_matches(['\'', '"']))
-    })
+/// The `.yarnrc.yml` `compressionLevel` value as written (quotes removed,
+/// `${…}` references not expanded), when set: [`super::rc::raw_setting`].
+/// A CRLF file reads like an LF one, and a leading BOM is skipped the way
+/// yarn's YAML parser skips it — otherwise a knob on the first line of a
+/// BOM'd file would read as unset (the offline-reproducible default) while
+/// yarn applies it and every install fails YN0018. A trailing comment is
+/// not part of the value (#370).
+pub fn yarnrc_compression_level(rc: &str) -> Option<String> {
+    super::rc::raw_setting(rc, "compressionLevel")
 }
 
 #[cfg(test)]
@@ -305,6 +284,40 @@ mod tests {
         );
     }
 
+    /// #1100: yarn expands `${…}` before it reads the level, so a
+    /// reference that resolves to 0 is the supported default, and one that
+    /// resolves elsewhere (or cannot resolve) still refuses, naming the
+    /// value as written.
+    #[test]
+    fn an_interpolated_compression_level_is_read_as_yarn_resolves_it() {
+        let lf = lock("10c0");
+        for rc in [
+            "compressionLevel: \"${SOCKET_PATCH_T1100_UNSET:-0}\"\n",
+            "\"compressionLevel\": 0\n",
+            "{compressionLevel: 0, nodeLinker: node-modules}\n",
+        ] {
+            assert_eq!(check(&lf, None, Yarnrc::Text(rc)), Ok(()), "{rc:?}");
+        }
+        for (rc, level) in [
+            (
+                "compressionLevel: \"${SOCKET_PATCH_T1100_UNSET:-9}\"\n",
+                "${SOCKET_PATCH_T1100_UNSET:-9}",
+            ),
+            (
+                "compressionLevel: ${SOCKET_PATCH_T1100_UNSET}\n",
+                "${SOCKET_PATCH_T1100_UNSET}",
+            ),
+        ] {
+            assert_eq!(
+                check(&lf, None, Yarnrc::Text(rc)),
+                Err(BerryGate::Compression {
+                    level: level.into()
+                }),
+                "{rc:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_sub_map_or_later_block_never_supplies_the_cache_key() {
         let text = "__metadata:\n  version: 8\n  nested:\n    cacheKey: 10c0\n\n\
@@ -317,20 +330,21 @@ mod tests {
     #[test]
     fn yarnrc_compression_level_reads_past_a_bom_and_crlf() {
         assert_eq!(
-            yarnrc_compression_level("\u{feff}compressionLevel: mixed\r\nnodeLinker: pnp\r\n"),
+            yarnrc_compression_level("\u{feff}compressionLevel: mixed\r\nnodeLinker: pnp\r\n")
+                .as_deref(),
             Some("mixed")
         );
         assert_eq!(
-            yarnrc_compression_level("nodeLinker: pnp\r\ncompressionLevel: 0\r\n"),
+            yarnrc_compression_level("nodeLinker: pnp\r\ncompressionLevel: 0\r\n").as_deref(),
             Some("0")
         );
         assert_eq!(
-            yarnrc_compression_level("\u{feff}nodeLinker: pnp\r\n"),
+            yarnrc_compression_level("\u{feff}nodeLinker: pnp\r\n").as_deref(),
             None
         );
         // A second BOM is content (#905): the key is not at column 0.
         assert_eq!(
-            yarnrc_compression_level("\u{feff}\u{feff}compressionLevel: 0\n"),
+            yarnrc_compression_level("\u{feff}\u{feff}compressionLevel: 0\n").as_deref(),
             None
         );
     }
@@ -348,7 +362,11 @@ mod tests {
             ("compressionLevel: mixed # not the default\n", "mixed"),
             ("compressionLevel: 9 #\r\n", "9"),
         ] {
-            assert_eq!(yarnrc_compression_level(rc), Some(level), "{rc:?}");
+            assert_eq!(
+                yarnrc_compression_level(rc).as_deref(),
+                Some(level),
+                "{rc:?}"
+            );
         }
     }
 
@@ -357,11 +375,11 @@ mod tests {
     #[test]
     fn yarnrc_compression_level_keeps_an_unseparated_hash() {
         assert_eq!(
-            yarnrc_compression_level("compressionLevel: 0#x\n"),
+            yarnrc_compression_level("compressionLevel: 0#x\n").as_deref(),
             Some("0#x")
         );
         assert_eq!(
-            yarnrc_compression_level("compressionLevel: \"0 # in quotes\"\n"),
+            yarnrc_compression_level("compressionLevel: \"0 # in quotes\"\n").as_deref(),
             Some("0 # in quotes")
         );
     }
