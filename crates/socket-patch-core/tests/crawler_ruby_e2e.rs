@@ -1351,6 +1351,8 @@ async fn moved_bundle_gemfile_root_crawls_the_loaded_copy() {
     .unwrap();
     std::env::set_var("BUNDLE_GEMFILE", &alt);
     let climbing = RubyCrawler::discover_bundle_stores(&root).await;
+    // The same project spelled with a `..` (`--cwd app/gemfiles/..`).
+    let climbing_dotdot = RubyCrawler::discover_bundle_stores(&root.join("gemfiles/..")).await;
     // A machine-wide BUNDLE_GEMFILE export does not make a directory with
     // no Gemfile a Ruby project.
     let foreign = RubyCrawler::discover_bundle_stores(&non_ruby).await;
@@ -1363,6 +1365,8 @@ async fn moved_bundle_gemfile_root_crawls_the_loaded_copy() {
     }
     assert_eq!(climbing.stores, vec![climbing_store.clone()]);
     assert_eq!(climbing.skipped_config_path, None);
+    assert_eq!(climbing_dotdot.stores, vec![climbing_store.clone()]);
+    assert_eq!(climbing_dotdot.skipped_config_path, None);
     assert!(climbing_copy.is_dir());
     assert_eq!(foreign.bundler_root, None);
     assert!(foreign.stores.is_empty(), "{:?}", foreign.stores);

@@ -433,7 +433,12 @@ impl RubyCrawler {
         // (`gemfiles/` recording `../vendor/bundle`). A root the user's
         // own environment moved outside the project bounds it instead.
         let containment = match &bundler_root {
-            Some(root) if !std::path::absolute(cwd).is_ok_and(|p| root.starts_with(p)) => {
+            Some(root)
+                if !std::path::absolute(cwd)
+                    .ok()
+                    .and_then(|p| normalize_lexically(&p))
+                    .is_some_and(|p| root.starts_with(p)) =>
+            {
                 root.clone()
             }
             _ => cwd.to_path_buf(),
@@ -744,7 +749,7 @@ impl RubyCrawler {
             Vec::new()
         };
         bundler_gem_homes_from(
-            discovery.bundler_root.as_deref().unwrap_or(&options.cwd),
+            &options.cwd,
             &discovery.stores,
             &verification,
             &system_homes,
