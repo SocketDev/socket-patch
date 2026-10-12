@@ -343,9 +343,10 @@ fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
         // The pin may have overwritten a user's commented line in place
         // (a superseded pin, or `registry = "crates-io"`): the comment
         // stays, on its own line.
-        return Some(trimmed.find('#').map(|hash| {
+        // Sliced from the raw line, so a CRLF file's `\r` stays on it.
+        return Some(line.find('#').map(|hash| {
             let indent = &line[..line.len() - line.trim_start().len()];
-            format!("{indent}{}", &trimmed[hash..])
+            format!("{indent}{}", &line[hash..])
         }));
     }
     if let Some(c) = SHORTHAND_RE.captures(line) {
@@ -522,6 +523,11 @@ mod tests {
         assert_eq!(
             unpin_line(&format!("  registry = \"{REG}\" # stay on crates.io"), REG),
             Some(Some("  # stay on crates.io".to_string()))
+        );
+        // A CRLF manifest is split on `\n`: the kept line keeps its `\r`.
+        assert_eq!(
+            unpin_line(&format!("registry = \"{REG}\" # note\r"), REG),
+            Some(Some("# note\r".to_string()))
         );
     }
 
