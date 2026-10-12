@@ -824,6 +824,51 @@ async fn uv_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, files).await;
 }
 
+/// #564: under `no-sources = true` (pyproject's `[tool.uv]` or a project
+/// `uv.toml`) uv ignores `[tool.uv.sources]`, so a wired source fails
+/// `uv sync --locked` and a plain `uv sync` installs the unpatched wheel.
+/// Both modes used to wire it and exit 0; they must refuse and write
+/// nothing.
+#[tokio::test]
+async fn uv_no_sources_is_refused_in_both_modes() {
+    for (file, setting) in [
+        ("pyproject.toml", "\n[tool.uv]\nno-sources = true\n"),
+        ("uv.toml", "no-sources = true\n"),
+    ] {
+        let (_tmp, root) = project();
+        stage_uv(&root);
+        let path = root.join(file);
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(setting);
+        std::fs::write(&path, text).unwrap();
+        let before = tree(&root);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        // Skipped with the refusal as its warning, like the other uv
+        // project shapes hosted mode cannot wire.
+        assert_eq!(code, 0, "hosted {file}: {env:#}");
+        assert_eq!(hosted_pinned(&env), 0, "hosted {file}: {env:#}");
+        assert!(
+            env.to_string().contains("redirect_uv_project_unsupported")
+                && env.to_string().contains("no-sources"),
+            "hosted {file}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "hosted {file} wrote nothing");
+
+        stage_manifest(&root);
+        let before = tree(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_ne!(code, 0, "vendored {file}: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_uv_no_sources"),
+            "vendored {file}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "vendored {file} wrote nothing");
+    }
+}
+
 /// A Hatch project; returns its wiring files.
 fn stage_hatch(root: &Path) -> &'static [&'static str] {
     std::fs::write(

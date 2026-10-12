@@ -175,6 +175,15 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   `redirect_uv_lock_unsupported` (#767). Before, vendored left a lock that
   `uv sync --locked` rejects, and hosted replaced the user's URL with one its
   own rollback then refused to restore.
+- `no-sources = true` makes uv ignore every `[tool.uv.sources]` entry, so a
+  wired source fails `uv sync --locked` and a plain `uv sync` installs the
+  unpatched registry wheel. Both modes refuse it before any file is written:
+  vendored with `pypi_uv_no_sources`, hosted with
+  `redirect_uv_project_unsupported` / `redirect_uv_script_unsupported`
+  (#564). The setting is read where uv reads it: a project `uv.toml`
+  replaces pyproject's `[tool.uv]` settings, and a PEP 723 script's own
+  `[tool.uv]` wins over `uv.toml`. `UV_NO_SOURCES` and `--no-sources` are
+  install-time choices the scan cannot see.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751
