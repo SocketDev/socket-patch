@@ -453,7 +453,7 @@ async fn dispatch_find(
         eco = Ecosystem::Pypi,
         options = options,
         silent = silent,
-        crawler = PythonCrawler,
+        crawler = PythonCrawler::new(),
         get_paths = get_site_packages_paths,
         using_label = "",
         err_label = "Python packages",
@@ -1151,7 +1151,7 @@ async fn crawl_every_ecosystem(
         if walk_pool::fd_limit_is_tight() {
             (
                 crawl!(Ecosystem::Npm, NpmCrawler.crawl_all_with_roots(options)).await,
-                crawl!(Ecosystem::Pypi, PythonCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Pypi, PythonCrawler::new().crawl_all(options)).await,
                 crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)).await,
                 crawl!(
                     Ecosystem::Gem,
@@ -1167,7 +1167,7 @@ async fn crawl_every_ecosystem(
         } else {
             tokio::join!(
                 crawl!(Ecosystem::Npm, NpmCrawler.crawl_all_with_roots(options)),
-                crawl!(Ecosystem::Pypi, PythonCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Pypi, PythonCrawler::new().crawl_all(options)),
                 crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)),
                 crawl!(
                     Ecosystem::Gem,
@@ -2400,7 +2400,10 @@ mod tests {
             }};
         }
         serial!(Ecosystem::Npm, NpmCrawler.crawl_all(&options).await);
-        serial!(Ecosystem::Pypi, PythonCrawler.crawl_all(&options).await);
+        serial!(
+            Ecosystem::Pypi,
+            PythonCrawler::new().crawl_all(&options).await
+        );
         serial!(Ecosystem::Cargo, CargoCrawler.crawl_all(&options).await);
         serial!(Ecosystem::Gem, RubyCrawler.crawl_all(&options).await);
         serial!(Ecosystem::Golang, GoCrawler.crawl_all(&options).await);

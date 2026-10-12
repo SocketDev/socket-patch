@@ -843,6 +843,9 @@ async fn stale_install_sites(
     // lookup below is never the empty one `find_by_purls` short-circuits on.
     let base = strip_purl_qualifiers(purl).to_string();
     let crawler = PythonCrawler::new();
+    // A `--system-site-packages` venv's own copy hides its base
+    // interpreter's (#409).
+    crawler.set_search_order(sites).await;
     let mut stale_dirs: Vec<std::path::PathBuf> = Vec::new();
     for site in sites {
         let listed = listings.of(site).await;

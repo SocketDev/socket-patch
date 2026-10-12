@@ -168,7 +168,7 @@ async fn python_crawler_find_by_purls_empty_returns_empty() {
     .await
     .unwrap();
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
 
     // Positive control on the same site-packages path.
     let hit = crawler
@@ -185,7 +185,7 @@ async fn python_crawler_find_by_purls_empty_returns_empty() {
 
 #[tokio::test]
 async fn python_crawler_crawl_all_empty_returns_empty() {
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
 
     // Positive control: a populated .venv site-packages yields the package.
     let populated = tempfile::tempdir().unwrap();

@@ -63,8 +63,13 @@ pub(super) async fn stale_install_warnings(
             .await
             .unwrap_or_default()
     } else {
-        socket_patch_core::crawlers::python_crawler::find_local_venv_site_packages(&common.cwd)
-            .await
+        let sites =
+            socket_patch_core::crawlers::python_crawler::find_local_venv_site_packages(&common.cwd)
+                .await;
+        // A `--system-site-packages` venv's own copy hides its base
+        // interpreter's (#409).
+        crawler.set_search_order(&sites).await;
+        sites
     };
 
     #[derive(Default)]

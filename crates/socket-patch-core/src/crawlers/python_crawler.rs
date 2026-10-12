@@ -318,6 +318,291 @@ async fn find_site_packages_under(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers: a `--system-site-packages` venv's base interpreter
+// ---------------------------------------------------------------------------
+
+/// What a venv's `pyvenv.cfg` says about the interpreter behind it.
+#[derive(Debug, Default, PartialEq)]
+struct PyvenvCfg {
+    /// `include-system-site-packages = true`: the venv's interpreter also
+    /// imports from its base interpreter's site dirs (`python -m venv
+    /// --system-site-packages`, `virtualenv --system-site-packages`,
+    /// Poetry's `virtualenvs.options.system-site-packages`, `pipenv
+    /// --site-packages`).
+    system_site_packages: bool,
+    /// `home`: the directory holding the base interpreter.
+    home: Option<PathBuf>,
+    /// `X.Y` from `version` (venv) or `version_info` (virtualenv, uv).
+    version: Option<String>,
+}
+
+/// Parses `pyvenv.cfg` the way CPython's `site.venv()` does: `key = value`
+/// lines, keys case-insensitive, the last one wins, and only the value
+/// `true` (any case) turns system site-packages on.
+fn parse_pyvenv_cfg(text: &str) -> PyvenvCfg {
+    let mut cfg = PyvenvCfg::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "include-system-site-packages" => {
+                cfg.system_site_packages = value.eq_ignore_ascii_case("true");
+            }
+            "home" if !value.is_empty() => cfg.home = Some(PathBuf::from(value)),
+            "version" | "version_info" => {
+                let mut parts = value.split('.');
+                if let (Some(major), Some(minor)) = (parts.next(), parts.next()) {
+                    if !major.is_empty()
+                        && !minor.is_empty()
+                        && major
+                            .bytes()
+                            .chain(minor.bytes())
+                            .all(|b| b.is_ascii_digit())
+                    {
+                        cfg.version = Some(format!("{major}.{minor}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+/// The venv a `site-packages` dir belongs to: the nearest of its first
+/// three ancestors (`<root>/lib/python3.X/site-packages`,
+/// `<root>\Lib\site-packages`) holding a `pyvenv.cfg`.
+fn venv_root_of_site(site: &Path) -> Option<PathBuf> {
+    site.ancestors()
+        .skip(1)
+        .take(3)
+        .find(|dir| dir.join("pyvenv.cfg").is_file())
+        .map(Path::to_path_buf)
+}
+
+/// The base interpreter's prefix for a venv whose `pyvenv.cfg` names `home`:
+/// the nearest ancestor of `home` (or of the resolved interpreter in it, for
+/// a symlinked one such as Homebrew's `opt/python@3.X/bin`) holding the
+/// standard library landmark (`lib/pythonX.Y/os.py`, `Lib\os.py` on
+/// Windows), as CPython's own prefix search does. Without one, the plain
+/// layout: `home`'s parent on Unix, `home` itself on Windows.
+fn base_prefix_of_home(home: &Path, version: Option<&str>) -> PathBuf {
+    let landmark = |prefix: &Path| {
+        if cfg!(windows) {
+            prefix.join("Lib").join("os.py").is_file()
+        } else {
+            version.is_some_and(|v| {
+                prefix
+                    .join("lib")
+                    .join(format!("python{v}"))
+                    .join("os.py")
+                    .is_file()
+            })
+        }
+    };
+    let mut starts = vec![home.to_path_buf()];
+    let exe_names: Vec<String> = version
+        .map(|v| format!("python{v}"))
+        .into_iter()
+        .chain(["python3".to_string(), "python".to_string()])
+        .collect();
+    for exe in exe_names {
+        if let Ok(real) = std::fs::canonicalize(home.join(exe)) {
+            if let Some(dir) = real.parent() {
+                starts.push(dir.to_path_buf());
+            }
+            break;
+        }
+    }
+    for start in &starts {
+        if let Some(prefix) = start.ancestors().take(3).find(|dir| landmark(dir)) {
+            return prefix.to_path_buf();
+        }
+    }
+    if cfg!(windows) {
+        home.to_path_buf()
+    } else {
+        home.parent().unwrap_or(home).to_path_buf()
+    }
+}
+
+/// The base interpreter's site dirs a `--system-site-packages` venv imports
+/// from, in `sys.path` order: the user site (unless `PYTHONNOUSERSITE`),
+/// then the base prefix's `site-packages`, plus Debian's `dist-packages`
+/// (`/usr/local/lib/pythonX.Y/dist-packages` for the `/usr` prefix, then
+/// `<prefix>/lib/python3/dist-packages`). Only the venv's own `X.Y` is
+/// probed: another interpreter's site dirs under the same prefix are never
+/// on its path. Only existing directories are returned.
+fn base_site_dirs(
+    prefix: &Path,
+    version: Option<&str>,
+    framework: bool,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let user_site = var("PYTHONNOUSERSITE").is_none_or(|v| v.is_empty());
+    if let (true, Some(v)) = (user_site, version) {
+        let user_base = var("PYTHONUSERBASE")
+            .filter(|base| !base.is_empty())
+            .map(PathBuf::from);
+        if cfg!(windows) {
+            let user_base = user_base
+                .or_else(|| var("APPDATA").map(|appdata| Path::new(&appdata).join("Python")));
+            if let Some(base) = user_base {
+                dirs.push(
+                    base.join(format!("Python{}", v.replace('.', "")))
+                        .join("site-packages"),
+                );
+            }
+        } else if framework {
+            let user_base = user_base
+                .or_else(|| env_home(var).map(|home| home.join("Library").join("Python").join(v)));
+            if let Some(base) = user_base {
+                dirs.push(base.join("lib").join("python").join("site-packages"));
+            }
+        } else if let Some(base) = user_base.or_else(|| env_home(var).map(|h| h.join(".local"))) {
+            dirs.push(
+                base.join("lib")
+                    .join(format!("python{v}"))
+                    .join("site-packages"),
+            );
+        }
+    }
+    if cfg!(windows) {
+        dirs.push(prefix.join("Lib").join("site-packages"));
+    } else {
+        if let Some(v) = version {
+            let py = format!("python{v}");
+            if prefix == Path::new("/usr") {
+                dirs.push(Path::new("/usr/local/lib").join(&py).join("dist-packages"));
+            }
+            dirs.push(prefix.join("lib64").join(&py).join("site-packages"));
+            dirs.push(prefix.join("lib").join(&py).join("site-packages"));
+        }
+        dirs.push(prefix.join("lib").join("python3").join("dist-packages"));
+        if let Some(v) = version {
+            dirs.push(
+                prefix
+                    .join("lib")
+                    .join(format!("python{v}"))
+                    .join("dist-packages"),
+            );
+        }
+    }
+    let mut seen = HashSet::new();
+    dirs.retain(|dir| dir.is_dir() && seen.insert(dir.clone()));
+    dirs
+}
+
+/// The base interpreter's site dirs behind the venv at `root` (see
+/// [`base_site_dirs`]), or nothing when its `pyvenv.cfg` does not include
+/// system site-packages. `site` is one of the venv's own site dirs, whose
+/// `pythonX.Y` parent supplies the version a `pyvenv.cfg` leaves out.
+///
+/// Derived from `pyvenv.cfg` and the filesystem only: the venv's
+/// interpreter is project content and is never run.
+fn system_site_dirs_of_venv(
+    root: &Path,
+    site: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let Ok(text) = read_regular_to_string_sync(&root.join("pyvenv.cfg")) else {
+        return Vec::new();
+    };
+    let cfg = parse_pyvenv_cfg(&text);
+    if !cfg.system_site_packages {
+        return Vec::new();
+    }
+    let Some(home) = cfg.home.filter(|home| home.is_absolute()) else {
+        return Vec::new();
+    };
+    let version = cfg.version.or_else(|| {
+        site.parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("python"))
+            .filter(|v| v.contains('.'))
+            .map(str::to_string)
+    });
+    let prefix = base_prefix_of_home(&home, version.as_deref());
+    let framework = cfg!(target_os = "macos")
+        && prefix
+            .components()
+            .any(|c| c.as_os_str() == "Python.framework");
+    base_site_dirs(&prefix, version.as_deref(), framework, var)
+}
+
+/// Appends, after `sites`, the base interpreter's site dirs of every venv
+/// among them created with `--system-site-packages` (#409). pip treats a
+/// release in those dirs as already installed and leaves it there, so it is
+/// the copy the venv imports, and the copy every installed-bytes check
+/// (agent apply, the stale-install guards, `vex`) must see. Copies the venv
+/// shadows are filtered out at lookup (see [`PythonCrawler::set_search_order`]).
+fn add_system_site_packages(sites: &mut Vec<PathBuf>, var: &impl Fn(&str) -> Option<String>) {
+    let own = sites.clone();
+    for site in &own {
+        let Some(root) = venv_root_of_site(site) else {
+            continue;
+        };
+        for dir in system_site_dirs_of_venv(&root, site, var) {
+            if !sites.contains(&dir) {
+                sites.push(dir);
+            }
+        }
+    }
+}
+
+/// For each base site dir in `sites` that a `--system-site-packages` venv
+/// earlier in `sites` reaches (see [`add_system_site_packages`]), the
+/// canonical names it hides: those installed in the venv itself or in an
+/// earlier base site dir. Python imports the first copy of a package on
+/// `sys.path`, and pip treats that copy as the installed one, so a hidden
+/// copy is never consumed and never the one an install replaces.
+fn shadowed_names_sync(
+    sites: &[PathBuf],
+    var: &impl Fn(&str) -> Option<String>,
+) -> HashMap<PathBuf, HashSet<String>> {
+    let mut shadowed: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut venvs: Vec<(PathBuf, Vec<&PathBuf>)> = Vec::new();
+    for site in sites {
+        let Some(root) = venv_root_of_site(site) else {
+            continue;
+        };
+        match venvs.iter_mut().find(|(r, _)| *r == root) {
+            Some((_, own)) => own.push(site),
+            None => venvs.push((root, vec![site])),
+        }
+    }
+    let names_in = |site: &Path| -> Vec<String> {
+        list_dist_info_packages_sync(site)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    for (root, own) in venvs {
+        let bases = system_site_dirs_of_venv(&root, own[0], var);
+        if bases.is_empty() {
+            continue;
+        }
+        let mut hidden: HashSet<String> = own.iter().flat_map(|site| names_in(site)).collect();
+        for base in bases {
+            if !sites.contains(&base) {
+                continue;
+            }
+            let here = names_in(&base);
+            shadowed
+                .entry(base)
+                .or_default()
+                .extend(hidden.iter().cloned());
+            hidden.extend(here);
+        }
+    }
+    shadowed
+}
+
 /// Find local virtual environment `site-packages` directories.
 ///
 /// Checks (in order):
@@ -340,6 +625,9 @@ async fn find_site_packages_under(
 ///    [`super::hatch_env::hatch_environments`]), added to whichever of the
 ///    above answered: `hatch run` never uses an env another manager
 ///    records or activates, so its envs stay the project's (#335)
+/// 7. For every venv above created with `--system-site-packages`, its base
+///    interpreter's site dirs, after the venv's own (see
+///    [`add_system_site_packages`], #409)
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
     find_local_venv_site_packages_with(cwd, &var).await
@@ -353,15 +641,19 @@ async fn find_local_venv_site_packages_with(
 ) -> Vec<PathBuf> {
     let mut found = managed_or_local_site_packages(cwd, var).await;
     add_hatch_site_packages(cwd, var, &mut found).await;
+    add_system_site_packages(&mut found, var);
     found
 }
 
-/// Steps 0-5 of [`find_local_venv_site_packages`] (no Hatch envs): the env
-/// a package manager records or activates, else the project's local venvs.
+/// Steps 0-5 and 7 of [`find_local_venv_site_packages`] (no Hatch envs):
+/// the env a package manager records or activates, else the project's local
+/// venvs, plus the base site dirs a `--system-site-packages` one reaches.
 /// What a non-Hatch manager's own reinstall reaches, e.g. Pipenv's venv.
 pub async fn non_hatch_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
-    managed_or_local_site_packages(cwd, &var).await
+    let mut found = managed_or_local_site_packages(cwd, &var).await;
+    add_system_site_packages(&mut found, &var);
+    found
 }
 
 /// Steps 0-5 of [`find_local_venv_site_packages`]: the env a package
@@ -3121,12 +3413,48 @@ async fn local_site_packages_with(
 // ---------------------------------------------------------------------------
 
 /// Python ecosystem crawler for discovering packages in `site-packages`.
-pub struct PythonCrawler;
+pub struct PythonCrawler {
+    /// Per site dir, the canonical names a venv in front of it hides (see
+    /// [`Self::set_search_order`]). Lookups skip them.
+    shadowed: std::sync::Mutex<HashMap<PathBuf, HashSet<String>>>,
+}
 
 impl PythonCrawler {
     /// Create a new `PythonCrawler`.
     pub fn new() -> Self {
-        Self
+        Self {
+            shadowed: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Declares `sites` as one project's search order, as the local
+    /// discovery functions return it: a `--system-site-packages` venv's own
+    /// site dirs, then its base interpreter's (#409). Later lookups in a
+    /// base site dir skip every package the venv (or an earlier base site
+    /// dir) also installs, by canonical name: Python imports the first copy
+    /// on `sys.path`, so the hidden one is neither consumed nor replaced by
+    /// an install. [`Self::get_site_packages_paths`] declares its own
+    /// answer; callers that discover sites through the free functions
+    /// declare them here before looking packages up.
+    pub async fn set_search_order(&self, sites: &[PathBuf]) {
+        let var = |name: &str| std::env::var(name).ok();
+        let sites = sites.to_vec();
+        let shadowed = run_blocking(move || shadowed_names_sync(&sites, &var)).await;
+        *self.shadowed_lock() = shadowed;
+    }
+
+    fn shadowed_lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, HashSet<String>>> {
+        self.shadowed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `listing` of `site` without the packages a venv in front of it hides.
+    fn visible(&self, site: &Path, mut listing: Vec<(String, String)>) -> Vec<(String, String)> {
+        if let Some(hidden) = self.shadowed_lock().get(site) {
+            listing.retain(|(name, _)| !hidden.contains(name));
+        }
+        listing
     }
 
     /// Get `site-packages` paths based on options.
@@ -3151,13 +3479,16 @@ impl PythonCrawler {
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         if options.global || options.global_prefix.is_some() {
+            self.shadowed_lock().clear();
             if let Some(ref custom) = options.global_prefix {
                 return Ok(vec![custom.clone()]);
             }
             return Ok(get_global_python_site_packages().await);
         }
         let var = |name: &str| std::env::var(name).ok();
-        Ok(local_site_packages_with(&options.cwd, &var).await)
+        let sites = local_site_packages_with(&options.cwd, &var).await;
+        self.set_search_order(&sites).await;
+        Ok(sites)
     }
 
     /// Crawl all discovered `site-packages` and return every package found.
@@ -3171,7 +3502,8 @@ impl PythonCrawler {
             .unwrap_or_default();
 
         for sp_path in &sp_paths {
-            for (name, version) in list_dist_info_packages(sp_path).await {
+            let listing = self.visible(sp_path, list_dist_info_packages(sp_path).await);
+            for (name, version) in listing {
                 let purl = format!("pkg:pypi/{name}@{version}");
                 if !seen.insert(purl.clone()) {
                     continue;
@@ -3207,7 +3539,10 @@ impl PythonCrawler {
         if purl_lookup.is_empty() {
             return Ok(HashMap::new());
         }
-        let listing = list_dist_info_packages(site_packages_path).await;
+        let listing = self.visible(
+            site_packages_path,
+            list_dist_info_packages(site_packages_path).await,
+        );
         Ok(match_listing(&purl_lookup, site_packages_path, &listing))
     }
 
@@ -3224,7 +3559,8 @@ impl PythonCrawler {
         if purl_lookup.is_empty() {
             return HashMap::new();
         }
-        match_listing(&purl_lookup, site_packages_path, listing)
+        let listing = self.visible(site_packages_path, listing.to_vec());
+        match_listing(&purl_lookup, site_packages_path, &listing)
     }
 }
 
@@ -3294,7 +3630,11 @@ impl PythonCrawler {
         // key -> the LAST listed entry with that key (find_by_purls's
         // insert-overwrites order).
         let mut installed: HashMap<String, (String, String)> = HashMap::new();
-        for (name, version) in list_dist_info_packages(site_packages_path).await {
+        let listing = self.visible(
+            site_packages_path,
+            list_dist_info_packages(site_packages_path).await,
+        );
+        for (name, version) in listing {
             installed.insert(format!("{name}@{version}"), (name, version));
         }
         keys.into_iter()
@@ -3510,6 +3850,316 @@ mod tests {
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.clone())
         }
+    }
+
+    // ---- #409: `--system-site-packages` venvs ----------------------------
+
+    /// One installed distribution in `site`.
+    fn install_dist(site: &Path, name: &str, version: &str) {
+        let dist = site.join(format!("{name}-{version}.dist-info"));
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+        )
+        .unwrap();
+    }
+
+    /// A base interpreter at `root/base` (its stdlib landmark and an empty
+    /// `site-packages`) and a project at `root/project` whose `.venv`
+    /// names it in `pyvenv.cfg` with `include-system-site-packages =
+    /// {include}`. Returns `(project, venv_site, base_site)`.
+    fn system_site_layout(root: &Path, include: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = root.join("base");
+        let (home, base_site) = if cfg!(windows) {
+            std::fs::create_dir_all(base.join("Lib")).unwrap();
+            std::fs::write(base.join("Lib").join("os.py"), "").unwrap();
+            (base.clone(), base.join("Lib").join("site-packages"))
+        } else {
+            let lib = base.join("lib").join("python3.12");
+            std::fs::create_dir_all(&lib).unwrap();
+            std::fs::write(lib.join("os.py"), "").unwrap();
+            std::fs::create_dir_all(base.join("bin")).unwrap();
+            (base.join("bin"), lib.join("site-packages"))
+        };
+        std::fs::create_dir_all(&base_site).unwrap();
+        let project = root.join("project");
+        let venv_site = fake_venv(&project, ".venv");
+        std::fs::write(
+            project.join(".venv").join("pyvenv.cfg"),
+            format!(
+                "home = {}\ninclude-system-site-packages = {include}\nversion = 3.12.4\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        (project, venv_site, base_site)
+    }
+
+    #[test]
+    fn pyvenv_cfg_is_read_like_site_py() {
+        let cfg = parse_pyvenv_cfg(
+            "home = /usr/bin\nInclude-System-Site-Packages =  True \nversion = 3.11.4\n",
+        );
+        assert!(cfg.system_site_packages);
+        assert_eq!(cfg.home, Some(PathBuf::from("/usr/bin")));
+        assert_eq!(cfg.version.as_deref(), Some("3.11"));
+        // virtualenv's and uv's spelling of the version.
+        let cfg = parse_pyvenv_cfg("version_info = 3.13.0.final.0\n");
+        assert_eq!(cfg.version.as_deref(), Some("3.13"));
+        // Only `true` turns it on, and the last line wins.
+        assert!(!parse_pyvenv_cfg("include-system-site-packages = yes\n").system_site_packages);
+        assert!(
+            !parse_pyvenv_cfg(
+                "include-system-site-packages = true\ninclude-system-site-packages = false\n"
+            )
+            .system_site_packages
+        );
+        assert_eq!(parse_pyvenv_cfg("no equals sign\n"), PyvenvCfg::default());
+    }
+
+    #[tokio::test]
+    async fn system_site_venv_adds_base_site_dirs_after_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, venv_site, base_site) = system_site_layout(tmp.path(), "true");
+        let no_env = env_of(&[]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![venv_site.clone(), base_site.clone()]
+        );
+        assert_eq!(
+            local_site_packages_with(&project, &no_env).await,
+            vec![venv_site, base_site]
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_venv_never_reaches_its_base_interpreter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, venv_site, _) = system_site_layout(tmp.path(), "false");
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &env_of(&[])).await,
+            vec![venv_site]
+        );
+    }
+
+    #[tokio::test]
+    async fn system_site_venv_reaches_the_user_site_unless_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, venv_site, base_site) = system_site_layout(tmp.path(), "true");
+        let user_base = tmp.path().join("userbase");
+        let user_site = if cfg!(windows) {
+            user_base.join("Python312").join("site-packages")
+        } else {
+            user_base
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages")
+        };
+        std::fs::create_dir_all(&user_site).unwrap();
+        let user_base = user_base.to_string_lossy().into_owned();
+        let with_user = env_of(&[("PYTHONUSERBASE", user_base.clone())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &with_user).await,
+            vec![venv_site.clone(), user_site, base_site.clone()]
+        );
+        let no_user = env_of(&[
+            ("PYTHONUSERBASE", user_base),
+            ("PYTHONNOUSERSITE", "1".to_string()),
+        ]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_user).await,
+            vec![venv_site, base_site]
+        );
+    }
+
+    #[tokio::test]
+    async fn base_copy_behind_a_system_site_venv_is_crawled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, _, base_site) = system_site_layout(tmp.path(), "true");
+        install_dist(&base_site, "six", "1.16.0");
+        let crawler = PythonCrawler::new();
+        let options = CrawlerOptions {
+            cwd: project,
+            ..Default::default()
+        };
+        let sites = crawler.get_site_packages_paths(&options).await.unwrap();
+        assert!(sites.contains(&base_site), "{sites:?}");
+        let purl = "pkg:pypi/six@1.16.0".to_string();
+        let found = crawler
+            .find_by_purls(&base_site, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        assert_eq!(found[&purl].path, base_site);
+        let crawled = crawler.crawl_all(&options).await;
+        assert!(
+            crawled
+                .iter()
+                .any(|pkg| pkg.purl == purl && pkg.path == base_site),
+            "{crawled:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn venv_copy_hides_the_base_copy_of_the_same_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, venv_site, base_site) = system_site_layout(tmp.path(), "true");
+        // `pip install --force-reinstall` in the venv: a copy in each.
+        install_dist(&venv_site, "six", "1.16.0");
+        install_dist(&base_site, "six", "1.16.0");
+        // A different release in the venv hides the base one too: imports
+        // and pip resolve by name.
+        install_dist(&venv_site, "idna", "3.7");
+        install_dist(&base_site, "idna", "3.6");
+        // Not in the venv: the base copy is the one imported.
+        install_dist(&base_site, "certifi", "2024.2.2");
+        let crawler = PythonCrawler::new();
+        let options = CrawlerOptions {
+            cwd: project,
+            ..Default::default()
+        };
+        let sites = crawler.get_site_packages_paths(&options).await.unwrap();
+        let purls: Vec<String> = [
+            "pkg:pypi/six@1.16.0",
+            "pkg:pypi/idna@3.6",
+            "pkg:pypi/certifi@2024.2.2",
+        ]
+        .map(String::from)
+        .to_vec();
+        let in_base = crawler.find_by_purls(&base_site, &purls).await.unwrap();
+        assert_eq!(
+            in_base.keys().collect::<Vec<_>>(),
+            vec!["pkg:pypi/certifi@2024.2.2"]
+        );
+        let each = crawler.find_each_by_purl(&base_site, &purls).await;
+        assert!(each[0].is_none() && each[1].is_none() && each[2].is_some());
+        let listed = list_dist_info_packages(&base_site).await;
+        assert_eq!(
+            crawler
+                .find_by_purls_listed(&base_site, &listed, &purls)
+                .len(),
+            1
+        );
+        let in_venv = crawler.find_by_purls(&venv_site, &purls).await.unwrap();
+        assert!(in_venv.contains_key("pkg:pypi/six@1.16.0"));
+        let crawled = crawler.crawl_all(&options).await;
+        assert!(
+            !crawled.iter().any(|pkg| pkg.purl == "pkg:pypi/idna@3.6"),
+            "{crawled:?}"
+        );
+        assert!(crawled
+            .iter()
+            .any(|pkg| pkg.purl == "pkg:pypi/six@1.16.0" && pkg.path == venv_site));
+
+        // Without the project's search order (a global crawl), every copy
+        // is visible.
+        let global = PythonCrawler::new();
+        assert_eq!(
+            global
+                .find_by_purls(&base_site, &purls)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        crawler.set_search_order(&[base_site.clone()]).await;
+        assert_eq!(
+            crawler
+                .find_by_purls(&base_site, &purls)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        crawler.set_search_order(&sites).await;
+        assert_eq!(
+            crawler
+                .find_by_purls(&base_site, &purls)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn earlier_base_site_dir_hides_a_later_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, venv_site, base_site) = system_site_layout(tmp.path(), "true");
+        let user_base = tmp.path().join("userbase");
+        let user_site = if cfg!(windows) {
+            user_base.join("Python312").join("site-packages")
+        } else {
+            user_base
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages")
+        };
+        install_dist(&user_site, "six", "1.17.0");
+        install_dist(&base_site, "six", "1.16.0");
+        let var = env_of(&[("PYTHONUSERBASE", user_base.to_string_lossy().into_owned())]);
+        let sites = vec![venv_site, user_site.clone(), base_site.clone()];
+        let shadowed = shadowed_names_sync(&sites, &var);
+        assert!(shadowed[&base_site].contains("six"), "{shadowed:?}");
+        assert!(!shadowed[&user_site].contains("six"), "{shadowed:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn base_prefix_falls_back_to_the_parent_of_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("py").join("bin");
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(
+            base_prefix_of_home(&home, Some("3.12")),
+            tmp.path().join("py")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn base_prefix_follows_a_symlinked_interpreter_to_its_stdlib() {
+        // Homebrew: `opt/python@3.12/bin/python3.12` links into the
+        // framework, whose prefix holds the stdlib and site-packages.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_prefix = tmp.path().join("Frameworks").join("3.12");
+        std::fs::create_dir_all(real_prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(real_prefix.join("lib").join("python3.12")).unwrap();
+        std::fs::write(real_prefix.join("lib").join("python3.12").join("os.py"), "").unwrap();
+        std::fs::write(real_prefix.join("bin").join("python3.12"), "").unwrap();
+        let home = tmp.path().join("opt").join("bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(
+            real_prefix.join("bin").join("python3.12"),
+            home.join("python3.12"),
+        )
+        .unwrap();
+        assert_eq!(
+            base_prefix_of_home(&home, Some("3.12")),
+            std::fs::canonicalize(&real_prefix).unwrap()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn base_site_dirs_cover_debian_dist_packages_for_the_venv_version_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path();
+        let dirs = [
+            prefix.join("lib/python3.12/site-packages"),
+            prefix.join("lib/python3/dist-packages"),
+            prefix.join("lib/python3.12/dist-packages"),
+            // Another interpreter under the same prefix: not on the path.
+            prefix.join("lib/python3.11/site-packages"),
+        ];
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let no_env = env_of(&[]);
+        assert_eq!(
+            base_site_dirs(prefix, Some("3.12"), false, &no_env),
+            dirs[..3].to_vec()
+        );
     }
 
     /// #335: Hatch keeps a project's envs out of tree, under
