@@ -3536,6 +3536,194 @@ mod tests {
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
     }
 
+    /// #988: a comment the user appended to the wired Gemfile line keeps the
+    /// line ours. Vendor's in-sync check already reads it as wired, so revert
+    /// must too: both files go back to the registry form, the user's comment
+    /// survives on the restored line, and the artifact is removed.
+    #[tokio::test]
+    async fn revert_commented_gemfile_line_restores_both_files() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+        let wired_line = format!("gem \"rack\", \"3.2.6\", path: \"{}\"", copy_rel());
+        assert!(wired.contains(&format!("{wired_line}\n")), "{wired}");
+        let annotated = wired.replace(
+            &wired_line,
+            &format!("{wired_line}  # CVE fix, do not bump"),
+        );
+        tokio::fs::write(root.join(GEMFILE), &annotated)
+            .await
+            .unwrap();
+
+        // Vendor still reads the annotated line as wired.
+        let (rerun, rerun_entry, _) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(rerun.success, "{:?}", rerun.error);
+        assert!(rerun_entry.is_none(), "in sync: no new entry");
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "an annotated wired line is not drift: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT.replace(
+                "gem \"rack\", \"~> 3.1\"\n",
+                "gem \"rack\", \"~> 3.1\"  # CVE fix, do not bump\n"
+            ),
+            "registry declaration restored, the user's comment kept"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    /// #988: a comment vendor carried over from the original line, then
+    /// edited by the user, is replaced by the user's version on revert;
+    /// an untouched carried comment restores the original line verbatim.
+    #[tokio::test]
+    async fn revert_edited_carried_comment_keeps_the_users_comment() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\", require: false # pinned\n";
+        for (edit, expected_line) in [
+            (None, "gem \"rack\", \"~> 3.1\", require: false # pinned"),
+            (
+                Some("# pinned for CVE-2026-1"),
+                "gem \"rack\", \"~> 3.1\", require: false # pinned for CVE-2026-1",
+            ),
+            (Some(""), "gem \"rack\", \"~> 3.1\", require: false"),
+        ] {
+            let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            let wired = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+            assert!(wired.contains("require: false # pinned\n"), "{wired}");
+            if let Some(comment) = edit {
+                let edited = if comment.is_empty() {
+                    wired.replace(" # pinned\n", "\n")
+                } else {
+                    wired.replace("# pinned\n", &format!("{comment}\n"))
+                };
+                assert_ne!(edited, wired);
+                tokio::fs::write(root.join(GEMFILE), &edited).await.unwrap();
+            }
+
+            let outcome = revert_gem(&entry, &root, false).await;
+            assert!(outcome.success, "{edit:?}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{edit:?}: {:?}", outcome.warnings);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                gemfile.replace(
+                    "gem \"rack\", \"~> 3.1\", require: false # pinned",
+                    expected_line
+                ),
+                "{edit:?}"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                LOCK_DIRECT,
+                "{edit:?}"
+            );
+        }
+    }
+
+    /// #988: a CRLF Gemfile whose wired line gained a comment restores with
+    /// its CRLF ending intact.
+    #[tokio::test]
+    async fn revert_commented_gemfile_line_keeps_crlf() {
+        let gemfile = GEMFILE_DIRECT.replace('\n', "\r\n");
+        let (_tmp, root, installed, blobs, record) = fixture(&gemfile, LOCK_DIRECT).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+        let wired_line = format!("gem \"rack\", \"3.2.6\", path: \"{}\"\r\n", copy_rel());
+        assert!(wired.contains(&wired_line), "{wired:?}");
+        let annotated = wired.replace(
+            &wired_line,
+            &wired_line.replace("\r\n", " # keep\r\n"),
+        );
+        tokio::fs::write(root.join(GEMFILE), &annotated)
+            .await
+            .unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile.replace(
+                "gem \"rack\", \"~> 3.1\"\r\n",
+                "gem \"rack\", \"~> 3.1\" # keep\r\n"
+            )
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// #988: genuine Gemfile drift (the `path:` now points at a user fork)
+    /// leaves BOTH files byte-identical and keeps the artifact. Reverting
+    /// the lock alone would pair a Gemfile `path:` with a rubygems.org lock,
+    /// which `bundle install --frozen` refuses. A second revert does the same.
+    #[tokio::test]
+    async fn revert_drifted_gemfile_line_writes_neither_file() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+        let drifted = wired.replace(&copy_rel(), "../forks/rack");
+        assert_ne!(drifted, wired);
+        tokio::fs::write(root.join(GEMFILE), &drifted)
+            .await
+            .unwrap();
+        let wired_lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+
+        for pass in 0..2 {
+            let outcome = revert_gem(&entry, &root, false).await;
+            assert!(outcome.success, "pass {pass}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "pass {pass}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "pass {pass}");
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                drifted,
+                "pass {pass}: Gemfile untouched"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                wired_lock,
+                "pass {pass}: no half-revert of the lock"
+            );
+            assert!(root.join(copy_rel()).exists(), "pass {pass}");
+        }
+    }
+
     /// A `bundle update` regenerated both files back to their pre-vendor
     /// registry form: that is CONVERGENCE (the reverted state is already on
     /// disk), not drift — revert stays silent (LIVENESS CONTRACT), leaves the
