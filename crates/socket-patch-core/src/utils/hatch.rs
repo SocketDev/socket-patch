@@ -11,17 +11,37 @@ use crate::vendor::common::{pep508_name, pyproject_dependency_specs, DeclTable};
 /// exactly these from the candidate set, so the lists cannot drift.
 pub const HATCH_FILES: [&str; 2] = ["pyproject.toml", "hatch.toml"];
 
-/// The first character of `root`'s absolute path that Hatch's `{root:uri}`
-/// expands into a broken file URL (#547). Hatchling's `path_to_uri` escapes
-/// only spaces, so pip percent-decodes `%`, cuts the path at a `#` fragment
-/// or `?` query, and the PEP 508 parser rejects a `;` in the URL. `None`
+/// The first character of `root`'s path that Hatch's `{root:uri}` expands
+/// into a broken file URL (#547). Hatchling's `path_to_uri` escapes only
+/// the space, so pip percent-decodes a `%XX` escape, cuts the path at a
+/// `#` fragment or `?` query, and the PEP 508 parser stops at a `;`, a tab
+/// or any other whitespace or control character. Hatch builds the URL from
+/// the real path (symlinks resolved), so that is the path checked; only its
+/// named components are, so a Windows `\\?\` prefix never counts. `None`
 /// when the expansion is a usable URL.
 pub fn root_uri_unsafe_char(root: &std::path::Path) -> Option<char> {
-    let absolute = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-    absolute
-        .to_string_lossy()
-        .chars()
-        .find(|c| matches!(c, '%' | '#' | '?' | ';'))
+    let real = std::fs::canonicalize(root)
+        .or_else(|_| std::path::absolute(root))
+        .unwrap_or_else(|_| root.to_path_buf());
+    real.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+        .find_map(|name| {
+            let chars: Vec<char> = name.chars().collect();
+            chars.iter().enumerate().find_map(|(i, &c)| {
+                let escape = c == '%'
+                    && chars
+                        .get(i + 1..i + 3)
+                        .is_some_and(|hex| hex.iter().all(char::is_ascii_hexdigit));
+                (escape
+                    || matches!(c, '#' | '?' | ';')
+                    || c.is_control()
+                    || (c.is_whitespace() && c != ' '))
+                    .then_some(c)
+            })
+        })
 }
 
 pub fn is_hatch(files: &BTreeMap<String, String>) -> bool {

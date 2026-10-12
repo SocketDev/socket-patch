@@ -131,7 +131,7 @@ fn require_expandable_root(root: &Path) -> Result<(), Failure> {
         Some(c) => Err((
             "pypi_hatch_unsupported",
             format!(
-                "the project path contains '{c}', which Hatch's {{root:uri}} does not escape, so vendored references would not install from this checkout; move the checkout to a path without '%', '#', '?' or ';', or use hosted or agent mode"
+                "the project path contains {c:?}, which Hatch's {{root:uri}} does not escape, so vendored references would not install from this checkout; move the checkout to a path without it, or use hosted or agent mode"
             ),
         )),
         None => Ok(()),
@@ -456,14 +456,29 @@ mod tests {
         assert!(held(format!("\u{feff}\u{feff}{live}")));
     }
 
+    /// A symlink in `dir` to `target` (Unix), else `target` itself.
+    fn linked(dir: &Path, target: &Path) -> std::path::PathBuf {
+        #[cfg(unix)]
+        {
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            link
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            target.to_path_buf()
+        }
+    }
+
     /// #547: `load` and `preflight` refuse a project root Hatch's
     /// `{root:uri}` expands into a broken URL, and accept the characters it
     /// handles (`@`, `'`, a space).
     #[tokio::test]
     async fn root_hatch_cannot_expand_is_refused() {
-        let mut unsafe_names = vec!["feature%2Fx", "a#b", "semi;colon"];
+        let mut unsafe_names = vec!["feature%2Fx", "p%20q", "a#b", "semi;colon"];
         if cfg!(unix) {
-            unsafe_names.push("q?x");
+            unsafe_names.extend(["q?x", "tab\tbed"]);
         }
         for name in unsafe_names {
             let temp = tempfile::tempdir().unwrap();
@@ -477,13 +492,19 @@ mod tests {
             };
             assert_eq!(code, "pypi_hatch_unsupported", "{name}");
             assert!(detail.contains("{root:uri}"), "{name}: {detail}");
+            let Err((_, through_link)) = load(&linked(temp.path(), &root), "one", "1", UUID).await
+            else {
+                panic!("{name}: a symlink to the checkout must not hide its real path");
+            };
+            assert_eq!(through_link, detail, "{name}");
             assert_eq!(
                 preflight(&root, "one").await.map_err(|(code, _)| code),
                 Err("pypi_hatch_unsupported"),
                 "{name}"
             );
         }
-        for name in ["at@sign", "quo'te", "sp ace"] {
+        // pip leaves a `%` that starts no `%XX` escape as it is.
+        for name in ["at@sign", "quo'te", "sp ace", "100%", "50%off"] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join(name);
             tokio::fs::create_dir_all(&root).await.unwrap();
