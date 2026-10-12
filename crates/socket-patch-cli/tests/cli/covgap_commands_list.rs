@@ -64,7 +64,7 @@ fn write_empty_manifest(root: &Path) {
 /// fixture and the config layer re-enabled. `debug` adds the `--debug`
 /// flag under test.
 fn list_cmd(project: &Path, data_dir: &Path, debug: bool) -> Command {
-    let mut cmd = common::hermetic::binary_command();
+    let mut cmd = common::hermetic_command(&common::binary());
     cmd.arg("list");
     if debug {
         cmd.arg("--debug");

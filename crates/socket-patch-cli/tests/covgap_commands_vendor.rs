@@ -205,18 +205,6 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
         }
     }
     cmd.args(&filtered).current_dir(cwd);
-    // In-process tests in this binary `std::env::set_var` these via
-    // `apply_env_toggles`; one set by a parallel test between the
-    // builder's scrub and the spawn would be inherited, so remove them
-    // unconditionally (see in_process_vendor.rs `run_cli`).
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
-    ] {
-        cmd.env_remove(key);
-    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -763,8 +751,6 @@ fn npm_only_human_vendor_does_not_read_composer_lock() {
         .env("SOCKET_VENDOR_URL", &fixture.uri)
         .args(["vendor", "--cwd", fx.root().to_str().unwrap()])
         .current_dir(fx.root())
-        .env_remove("SOCKET_OFFLINE")
-        .env_remove("SOCKET_API_URL")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

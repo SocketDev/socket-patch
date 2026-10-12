@@ -47,8 +47,6 @@ use std::path::Path;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
-
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const OLD_UUID: &str = "99999999-9999-4999-8999-999999999999";
@@ -78,13 +76,6 @@ fn write_npm_package(root: &Path, name: &str, version: &str, content: &[u8]) {
 fn run_scan(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
     cmd.arg("scan").args(args).current_dir(cwd);
-    // The `mode_fold` tests below clear and restore the flag-bound vars
-    // in-process; one restored by a parallel test between the builder's
-    // scrub and the spawn would be inherited, so remove the whole
-    // flag-bound surface unconditionally too.
-    for var in GLOBAL_ARG_ENV_VARS.iter().chain(LOCAL_ARG_ENV_VARS.iter()) {
-        cmd.env_remove(var);
-    }
     // The unconditional python crawl consults VIRTUAL_ENV first, so an
     // activated host virtualenv would make "empty project" scans non-empty.
     cmd.env_remove("VIRTUAL_ENV");

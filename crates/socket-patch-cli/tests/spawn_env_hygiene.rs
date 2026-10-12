@@ -342,6 +342,7 @@ fn workflow_env_copies_carry_every_opt_out() {
 fn command_never_leaks_its_hostile_seeds() {
     let env = effective_env(&hermetic::command(Path::new("socket-patch")));
     for key in [
+        "SOCKET_CWD",
         "SOCKET_GLOBAL",
         "SOCKET_GLOBAL_PREFIX",
         "SOCKET_DRY_RUN",
@@ -355,6 +356,34 @@ fn command_never_leaks_its_hostile_seeds() {
     ] {
         assert_eq!(get(&env, key), None, "{key} seed must be scrubbed");
     }
+}
+
+/// In-process tests set flag-bound vars in the test binary's own
+/// environment (`apply_env_toggles`, save/restore helpers). One set after
+/// the builder's sweep but before the spawn must still not reach the child.
+#[test]
+#[serial]
+fn command_drops_flag_bound_vars_set_after_it_is_built() {
+    let cmd = hermetic::command(Path::new("socket-patch"));
+    with_ambient(
+        &[
+            ("SOCKET_OFFLINE", "true"),
+            ("SOCKET_DEBUG", "1"),
+            ("SOCKET_PROXY_URL", "http://ambient.invalid"),
+            ("SOCKET_SKIP_ROLLBACK", "true"),
+        ],
+        || {
+            let env = effective_env(&cmd);
+            for key in [
+                "SOCKET_OFFLINE",
+                "SOCKET_DEBUG",
+                "SOCKET_PROXY_URL",
+                "SOCKET_SKIP_ROLLBACK",
+            ] {
+                assert_eq!(get(&env, key), None, "{key} set after build leaked");
+            }
+        },
+    );
 }
 
 #[test]

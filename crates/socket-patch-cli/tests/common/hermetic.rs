@@ -35,6 +35,7 @@ use std::process::Command;
 /// developer's ambient shell, which the suites can't rely on) turns the tests
 /// red immediately.
 const HOSTILE_SEEDS: &[(&str, &str)] = &[
+    ("SOCKET_CWD", "/nonexistent"),
     ("SOCKET_GLOBAL", "true"),
     ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
     ("SOCKET_DRY_RUN", "true"),
@@ -48,17 +49,28 @@ const HOSTILE_SEEDS: &[(&str, &str)] = &[
 ];
 
 /// A `Command` for `bin` with the hermetic `SOCKET_*` environment: the
-/// hostile seeds scrubbed, every other ambient `SOCKET_*` removed (removing
-/// `SOCKET_API_TOKEN` also forces the public proxy), and the three opt-outs
-/// (config layer, update notifier, telemetry) forced on. Callers add args,
-/// cwd and their own env afterwards; caller env lands last, so explicit
-/// injections survive the scrub.
+/// hostile seeds scrubbed, every flag-bound `SOCKET_*` and every other
+/// ambient `SOCKET_*` removed (removing `SOCKET_API_TOKEN` also forces the
+/// public proxy), and the three opt-outs (config layer, update notifier,
+/// telemetry) forced on. Callers add args, cwd and their own env
+/// afterwards; caller env lands last, so explicit injections survive the
+/// scrub.
 pub fn command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     for (k, v) in HOSTILE_SEEDS {
         cmd.env(k, v);
     }
     for (k, _) in HOSTILE_SEEDS {
+        cmd.env_remove(k);
+    }
+    // The flag-bound vars are removed by name, not only when the sweep below
+    // finds them: in-process tests in the same binary set some of them
+    // (`apply_env_toggles`, env save/restore helpers), and one set between
+    // this sweep and the spawn would otherwise reach the child.
+    for k in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS
+        .iter()
+        .chain(socket_patch_cli::args::LOCAL_ARG_ENV_VARS)
+    {
         cmd.env_remove(k);
     }
     cmd.env_remove("SOCKET_API_TOKEN");

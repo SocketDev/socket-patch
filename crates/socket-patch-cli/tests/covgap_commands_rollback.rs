@@ -248,7 +248,8 @@ fn readonly_dir_enforced(dir: &Path) -> bool {
 
 /// Spawn the binary WITHOUT waiting (the lock-choreography tests mutate
 /// the fixture while the child is blocked on the apply lock), with the
-/// same hermetic environment as `common::run`.
+/// same hermetic `SOCKET_*` environment as `common::run` (not its JVM
+/// isolation; no test here spawns a JVM fixture this way).
 fn spawn_scrubbed(cwd: &Path, args: &[&str]) -> std::process::Child {
     let mut cmd = common::hermetic_command(&common::binary());
     cmd.args(args).current_dir(cwd);
