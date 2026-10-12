@@ -322,10 +322,20 @@ async fn cargo_crawler_crawl_all_empty_returns_empty() {
     )
     .await
     .unwrap();
-    // The vendor tree is only scanned when cwd is a Rust project.
+    // The vendor tree is only scanned when cwd is a Rust project whose
+    // cargo config replaces crates.io with it (#338).
     tokio::fs::write(
         populated.path().join("Cargo.toml"),
         "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::create_dir_all(populated.path().join(".cargo"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        populated.path().join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n",
     )
     .await
     .unwrap();

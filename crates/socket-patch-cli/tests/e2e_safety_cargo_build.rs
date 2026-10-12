@@ -381,6 +381,102 @@ fn apply_then_cargo_check_succeeds() {
     manifestless_agent_patch_is_not_attested(&consumer, &cargo_home);
 }
 
+/// Move the consumer's directory source to `dir` (relative to `root`),
+/// wired by `root/.cargo/config.toml`, as `cargo vendor <dir>` lays it
+/// out when run there.
+fn relocate_vendor(consumer: &Path, root: &Path, dir: &str) {
+    std::fs::create_dir_all(root.join(dir).parent().unwrap()).unwrap();
+    std::fs::rename(consumer.join("vendor"), root.join(dir)).unwrap();
+    std::fs::remove_dir_all(consumer.join(".cargo")).unwrap();
+    std::fs::create_dir_all(root.join(".cargo")).unwrap();
+    std::fs::write(
+        root.join(".cargo/config.toml"),
+        format!(
+            "[source.crates-io]\nreplace-with = \"vendored-test\"\n\n\
+             [source.vendored-test]\ndirectory = \"{dir}\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Apply in `cwd`, then prove the copy at `vendored` (the directory
+/// source cargo builds from) is patched and `cargo check --frozen
+/// --offline` accepts it.
+fn apply_patches_directory_source(cwd: &Path, vendored: &Path, cargo_home: &Path) {
+    let (stdout, _stderr) = assert_run_ok(
+        cwd,
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ],
+        "socket-patch apply",
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "success", "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(vendored.join("src/lib.rs")).unwrap(),
+        PATCHED_LIB_RS,
+        "the directory source cargo builds from must be patched: {stdout}"
+    );
+    let out = cargo_check(cwd, cargo_home);
+    assert!(
+        out.status.success(),
+        "cargo check after apply:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// #338 shape 1: `cargo vendor third_party/rust` — a directory source
+/// with a custom name. Apply must patch that copy, not look for
+/// `<cwd>/vendor` and fall back to the registry cache.
+#[test]
+#[ignore]
+fn apply_patches_a_custom_named_vendor_dir() {
+    if !cargo_e2e_matrix::cargo_available("e2e_safety_cargo_build") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let consumer = stage_consumer(root.path());
+    relocate_vendor(&consumer, &consumer, "third_party/rust");
+    let cargo_home = root.path().join(".cargo-home");
+    generate_lockfile(&consumer, &cargo_home);
+    assert!(cargo_check(&consumer, &cargo_home).status.success());
+    stage_socket_manifest(&consumer);
+
+    let vendored = consumer.join("third_party/rust/safety-fixture");
+    apply_patches_directory_source(&consumer, &vendored, &cargo_home);
+}
+
+/// #338 shape 2: apply run from a workspace member, with the vendor
+/// directory and its config at the workspace root.
+#[test]
+#[ignore]
+fn apply_from_a_member_patches_the_workspace_vendor_dir() {
+    if !cargo_e2e_matrix::cargo_available("e2e_safety_cargo_build") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"consumer\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    let consumer = stage_consumer(&ws);
+    relocate_vendor(&consumer, &ws, "vendor");
+    let cargo_home = root.path().join(".cargo-home");
+    generate_lockfile(&ws, &cargo_home);
+    assert!(cargo_check(&consumer, &cargo_home).status.success());
+    stage_socket_manifest(&consumer);
+
+    apply_patches_directory_source(&consumer, &ws.join("vendor/safety-fixture"), &cargo_home);
+}
+
 /// Step 5 of the module doc: the agent-mode patch attests only through the
 /// manifest; with it deleted nothing in the lockfile / config wires a
 /// Socket patch (the `[source.crates-io] replace-with` directory source is

@@ -27,6 +27,7 @@
 
 pub(crate) mod hosted;
 pub mod manifest;
+pub mod source_replacement;
 
 use std::ops::Range;
 

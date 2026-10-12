@@ -89,7 +89,8 @@ pub async fn cargo_copies_still_patched<'a>(
 /// The copies of the Cargo `purls` [`find_all_packages_for_rollback`]
 /// locates (the roots rollback restores), plus, with `shadowed_registry`,
 /// the shared `$CARGO_HOME/registry/src` copies of a local Cargo project
-/// with a `cargo vendor` dir, whose crawl searches only that dir — where
+/// whose cargo config replaces crates.io with a `cargo vendor` directory,
+/// whose crawl searches only that dir — where
 /// an apply from before `cargo vendor` may have left the patch. The prune
 /// only reads them (its keep decision); rollback restores them only for a
 /// vendored crate whose record it is about to drop (#336).
@@ -103,7 +104,14 @@ pub async fn find_cargo_copies(
     let local = !options.global && options.global_prefix.is_none();
     let cargo_project =
         options.cwd.join("Cargo.toml").is_file() || options.cwd.join("Cargo.lock").is_file();
-    if shadowed_registry && local && cargo_project && options.cwd.join("vendor").is_dir() {
+    if shadowed_registry
+        && local
+        && cargo_project
+        && CargoCrawler::new()
+            .directory_source(&options.cwd)
+            .await
+            .is_some()
+    {
         let registry = CrawlerOptions {
             cwd: options.cwd.clone(),
             global: true,

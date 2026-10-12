@@ -214,6 +214,13 @@ async fn gc_scan_crawls_the_unselected_ecosystems() {
     let tmp = tempfile::tempdir().unwrap();
     stage_project(tmp.path());
     let krate = tmp.path().join("vendor").join(INSTALLED_CRATE);
+    // `cargo vendor`'s source replacement makes `vendor/` cargo's source (#338).
+    std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
+    std::fs::write(
+        tmp.path().join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(&krate).unwrap();
     std::fs::write(
         krate.join("Cargo.toml"),

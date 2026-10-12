@@ -41,6 +41,23 @@ async fn stage_vendor_crate(src: &Path, name: &str, version: &str) -> std::path:
     pkg
 }
 
+/// `<root>/.cargo/config.toml` replacing crates.io with directory `dir`,
+/// as `cargo vendor <dir>` prints it.
+async fn write_vendor_config(root: &Path, dir: &str) {
+    tokio::fs::create_dir_all(root.join(".cargo"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        root.join(".cargo").join("config.toml"),
+        format!(
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+             [source.vendored-sources]\ndirectory = \"{dir}\"\n"
+        ),
+    )
+    .await
+    .unwrap();
+}
+
 // ── package_name_version ──────────────────────────────
 
 #[test]
@@ -412,13 +429,15 @@ async fn get_crate_source_paths_with_vendor_dir_returns_vendor() {
     tokio::fs::create_dir(&vendor).await.unwrap();
     // `vendor/` is only treated as cargo sources once we've confirmed
     // this is a Rust project (`vendor/` is also Composer's and Go's
-    // convention) — so a root Cargo.toml is required.
+    // convention) — so a root Cargo.toml is required — and once a cargo
+    // config replaces crates.io with it, as `cargo vendor` asks (#338).
     tokio::fs::write(
         tmp.path().join("Cargo.toml"),
         "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
     )
     .await
     .unwrap();
+    write_vendor_config(tmp.path(), "vendor").await;
 
     let crawler = CargoCrawler;
     let paths = crawler
@@ -834,4 +853,248 @@ async fn get_crate_source_paths_local_cargo_toml_with_registry_src() {
     // Only one index dir was staged, so the result must be exactly it —
     // not merely "contains" it among arbitrary extras.
     assert_eq!(paths, vec![index_dir]);
+}
+
+// ── source replacement (#338, #455) ────────────────────────────
+
+/// Points `CARGO_HOME` at a fresh dir whose registry cache holds `cfg-if`
+/// 1.0.0, restoring the old value on drop.
+struct CargoHomeGuard {
+    prev: Option<String>,
+    home: tempfile::TempDir,
+}
+
+impl CargoHomeGuard {
+    async fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        stage_registry_crate(&Self::index(home.path()), "cfg-if", "1.0.0").await;
+        let prev = std::env::var("CARGO_HOME").ok();
+        std::env::set_var("CARGO_HOME", home.path());
+        Self { prev, home }
+    }
+
+    fn index(home: &Path) -> std::path::PathBuf {
+        home.join("registry")
+            .join("src")
+            .join("index.crates.io-stub")
+    }
+}
+
+impl Drop for CargoHomeGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var("CARGO_HOME", v),
+            None => std::env::remove_var("CARGO_HOME"),
+        }
+    }
+}
+
+async fn write_app(dir: &Path) {
+    tokio::fs::create_dir_all(dir).await.unwrap();
+    tokio::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .await
+    .unwrap();
+}
+
+async fn crawled_paths(cwd: &Path) -> Vec<std::path::PathBuf> {
+    CargoCrawler
+        .crawl_all(&options_at(cwd))
+        .await
+        .into_iter()
+        .filter(|p| p.purl == "pkg:cargo/cfg-if@1.0.0")
+        .map(|p| p.path)
+        .collect()
+}
+
+/// #338 shape 1: `cargo vendor third_party` wired by the project config.
+/// The crawl must find the crate in `third_party/`, the copy cargo builds,
+/// not in the registry cache.
+#[tokio::test]
+#[serial_test::serial]
+async fn custom_vendor_dir_named_by_source_replacement_is_crawled() {
+    let cargo_home = CargoHomeGuard::new().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path()).await;
+    let vendored = stage_vendor_crate(&tmp.path().join("third_party"), "cfg-if", "1.0.0").await;
+    write_vendor_config(tmp.path(), "third_party").await;
+
+    let paths = CargoCrawler
+        .get_crate_source_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![tmp.path().join("third_party")]);
+    assert_eq!(crawled_paths(tmp.path()).await, vec![vendored]);
+    drop(cargo_home);
+}
+
+/// #338 shape 2: run from a workspace member, the root's `vendor/` wired
+/// by the root's config is what cargo builds from.
+#[tokio::test]
+#[serial_test::serial]
+async fn workspace_root_source_replacement_applies_to_a_member() {
+    let cargo_home = CargoHomeGuard::new().await;
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"m\"]\n",
+    )
+    .await
+    .unwrap();
+    let member = tmp.path().join("m");
+    write_app(&member).await;
+    let vendored = stage_vendor_crate(&tmp.path().join("vendor"), "cfg-if", "1.0.0").await;
+    write_vendor_config(tmp.path(), "vendor").await;
+
+    assert_eq!(crawled_paths(&member).await, vec![vendored]);
+    drop(cargo_home);
+}
+
+/// #338 shape 3, and its non-cargo `vendor/` variant: a `vendor/` no
+/// source replacement names is not where cargo builds from, so the
+/// registry cache is crawled.
+#[tokio::test]
+#[serial_test::serial]
+async fn unwired_vendor_dir_falls_back_to_the_registry_cache() {
+    let cargo_home = CargoHomeGuard::new().await;
+    let cached = CargoHomeGuard::index(cargo_home.home.path()).join("cfg-if-1.0.0");
+
+    // A stale `cargo vendor` tree with no config.
+    let stale = tempfile::tempdir().unwrap();
+    write_app(stale.path()).await;
+    stage_vendor_crate(&stale.path().join("vendor"), "cfg-if", "1.0.0").await;
+    assert_eq!(crawled_paths(stale.path()).await, vec![cached.clone()]);
+
+    // C sources in `vendor/`.
+    let c_lib = tempfile::tempdir().unwrap();
+    write_app(c_lib.path()).await;
+    tokio::fs::create_dir_all(c_lib.path().join("vendor/zlib"))
+        .await
+        .unwrap();
+    tokio::fs::write(c_lib.path().join("vendor/zlib/zlib.c"), "int x;")
+        .await
+        .unwrap();
+    assert_eq!(crawled_paths(c_lib.path()).await, vec![cached]);
+    drop(cargo_home);
+}
+
+/// A source replacement naming a directory that isn't there (a checkout
+/// that didn't commit it): cargo can't build from the registry cache
+/// either, so nothing is crawled rather than a copy cargo ignores.
+#[tokio::test]
+#[serial_test::serial]
+async fn missing_replacement_directory_crawls_nothing() {
+    let cargo_home = CargoHomeGuard::new().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path()).await;
+    write_vendor_config(tmp.path(), "third_party").await;
+    assert!(crawled_paths(tmp.path()).await.is_empty());
+    drop(cargo_home);
+}
+
+/// A replacement set in `$CARGO_HOME/config.toml` resolves its relative
+/// directory against the parent of `$CARGO_HOME`, as cargo does.
+#[tokio::test]
+#[serial_test::serial]
+async fn cargo_home_source_replacement_is_honoured() {
+    let cargo_home = CargoHomeGuard::new().await;
+    let home = cargo_home.home.path();
+    let shared = home.parent().unwrap().join(format!(
+        "shared-vendor-{}",
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    let vendored = stage_vendor_crate(&shared, "cfg-if", "1.0.0").await;
+    tokio::fs::write(
+        home.join("config.toml"),
+        format!(
+            "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"{}\"\n",
+            shared.file_name().unwrap().to_string_lossy()
+        ),
+    )
+    .await
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path()).await;
+
+    let got = crawled_paths(tmp.path()).await;
+    let _ = std::fs::remove_dir_all(&shared);
+    assert_eq!(got, vec![vendored]);
+    drop(cargo_home);
+}
+
+/// A `..` in the cwd is folded before the config walk: `b/../app` reads
+/// `app`'s ancestors, never `b/.cargo/config.toml`.
+#[tokio::test]
+#[serial_test::serial]
+async fn parent_dir_in_cwd_does_not_read_a_sibling_config() {
+    let cargo_home = CargoHomeGuard::new().await;
+    let cached = CargoHomeGuard::index(cargo_home.home.path()).join("cfg-if-1.0.0");
+    let tmp = tempfile::tempdir().unwrap();
+    let app = tmp.path().join("app");
+    write_app(&app).await;
+    let sibling = tmp.path().join("b");
+    stage_vendor_crate(&sibling.join("vendor"), "cfg-if", "1.0.0").await;
+    write_vendor_config(&sibling, "vendor").await;
+
+    let dotted = sibling.join("..").join("app");
+    assert_eq!(crawled_paths(&dotted).await, vec![cached]);
+    drop(cargo_home);
+}
+
+/// A directory source under a cwd given with `..` is reported under that
+/// cwd as given: path-scoped commands strip it as a prefix.
+#[tokio::test]
+#[serial_test::serial]
+async fn directory_source_keeps_the_given_cwd_prefix() {
+    let cargo_home = CargoHomeGuard::new().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let app = tmp.path().join("app");
+    write_app(&app).await;
+    stage_vendor_crate(&app.join("vendor"), "cfg-if", "1.0.0").await;
+    write_vendor_config(&app, "vendor").await;
+    std::fs::create_dir_all(tmp.path().join("b")).unwrap();
+
+    let dotted = tmp.path().join("b").join("..").join("app");
+    // The cwd as path-scoped commands see it: `absolute` keeps the `..`
+    // on Unix and folds it on Windows.
+    let given = std::path::absolute(&dotted).unwrap();
+    let paths = CargoCrawler
+        .get_crate_source_paths(&options_at(&dotted))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![given.join("vendor")]);
+    let crawled = crawled_paths(&dotted).await;
+    assert_eq!(crawled, vec![given.join("vendor").join("cfg-if")]);
+    drop(cargo_home);
+}
+
+/// #455 review: the process-level resolve the hosted scan uses sees a
+/// monorepo root's source replacement from a nested Cargo project.
+#[test]
+#[serial_test::serial]
+fn resolve_for_reads_a_monorepo_root_config() {
+    use socket_patch_core::formats::cargo::source_replacement::CratesIoSource;
+    let tmp = tempfile::tempdir().unwrap();
+    let rust = tmp.path().join("rust");
+    std::fs::create_dir_all(&rust).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
+    std::fs::write(
+        tmp.path().join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n",
+    )
+    .unwrap();
+    let empty_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var("CARGO_HOME").ok();
+    std::env::set_var("CARGO_HOME", empty_home.path());
+    let got = CargoCrawler::crates_io_source_for(&rust);
+    match prev {
+        Some(v) => std::env::set_var("CARGO_HOME", v),
+        None => std::env::remove_var("CARGO_HOME"),
+    }
+    assert_eq!(
+        got,
+        CratesIoSource::Directory(std::path::absolute(tmp.path()).unwrap().join("vendor"))
+    );
 }
