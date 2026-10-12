@@ -433,6 +433,40 @@ mod equivalence_tests {
         }
     }
 
+    /// A package pinned to a private index already carries that index as a
+    /// `[package.source]` in the lock. The rewriter refuses it as a
+    /// user-authored source, as before #1282: the source-pin refusal (whose
+    /// remedy is to drop the `source` key) must not take it over.
+    #[test]
+    fn private_index_pin_keeps_the_user_authored_source_refusal() {
+        for version in ["1.8.5", "2.2.1", "2.4.3"] {
+            let lock = fixture(version).replacen(
+                "\n[metadata]",
+                "\n[package.source]\ntype = \"legacy\"\nurl = \"https://pypi.corp.example/simple\"\nreference = \"corp\"\n\n[metadata]",
+                1,
+            );
+            let files = BTreeMap::from([
+                ("poetry.lock".to_string(), lock),
+                (
+                    "pyproject.toml".to_string(),
+                    "[tool.poetry.dependencies]\nurllib3 = {version = \"1.26.18\", source = \"corp\"}\n"
+                        .to_string(),
+                ),
+            ]);
+            let deps = [dep("urllib3", "1.26.18", Some(SHA), 0)];
+            let got = run(rewrite_poetry, &files, &deps);
+            assert!(got.files.is_empty(), "{version}: {:?}", got.warnings);
+            assert_eq!(got.warnings.len(), 1, "{version}: {:?}", got.warnings);
+            let detail = &got.warnings[0].detail;
+            assert_eq!(got.warnings[0].code, "redirect_poetry_lock_unsupported");
+            assert!(
+                detail.contains("refusing to replace an existing Poetry source"),
+                "{version}: {detail}"
+            );
+            assert!(!detail.contains("source ="), "{version}: {detail}");
+        }
+    }
+
     /// A dozen patched packages in one lock cost one whole-lock render and
     /// re-parse, not one per package (#760).
     #[test]

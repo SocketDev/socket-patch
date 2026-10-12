@@ -254,8 +254,11 @@ pub fn pyproject_source_constraints(pyproject: &str) -> BTreeMap<String, String>
 }
 
 /// What `lock_text` already wires for `name` (PEP 503-canonical) at
-/// `version`, or `None` when the lock doesn't list it there (a rewrite
-/// would not touch the lock).
+/// `version`. `None` when the lock doesn't list it there (a rewrite would
+/// not touch the lock), or when its `[package.source]` is one socket-patch
+/// didn't write (a private index, a user's own path or URL): the rewriter
+/// refuses that as a user-authored source on its own, and the source-pin
+/// remedy (drop the `source` key) would be the wrong advice for it.
 pub fn lock_wiring(lock_text: &str, name: &str, version: &str) -> Option<Wired> {
     let lock = lock_text.parse::<DocumentMut>().ok()?;
     let canon = canonicalize_pypi_name(name);
@@ -268,16 +271,15 @@ pub fn lock_wiring(lock_text: &str, name: &str, version: &str) -> Option<Wired> 
                 .is_some_and(|candidate| canonicalize_pypi_name(candidate) == canon)
                 && package.get("version").and_then(Item::as_str) == Some(version)
         })?;
-    let source_type = package
-        .get("source")
-        .and_then(Item::as_table_like)
-        .and_then(|source| source.get("type"))
-        .and_then(Item::as_str);
-    Some(match source_type {
-        Some("url") => Wired::Hosted,
-        Some("file") => Wired::Vendored,
-        _ => Wired::No,
-    })
+    let Some(source) = package.get("source").and_then(Item::as_table_like) else {
+        return Some(Wired::No);
+    };
+    let url = source.get("url").and_then(Item::as_str).unwrap_or("");
+    match source.get("type").and_then(Item::as_str) {
+        Some("file") if url.starts_with(".socket/vendor/pypi/") => Some(Wired::Vendored),
+        Some("url") if url.contains("/patch/pypi/") => Some(Wired::Hosted),
+        _ => None,
+    }
 }
 
 /// The refusal detail for a source-pinned package over a lock that
