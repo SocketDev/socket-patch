@@ -10,7 +10,7 @@ use crate::utils::python_lock::{
     is_python_lock_name, python_lock_paths, rewrite_python_lock, script_of_lock, ArtifactSource,
 };
 use crate::utils::python_script::{
-    replace_script_metadata, rewrite_script_metadata, script_metadata,
+    refuse_uv_no_sources, replace_script_metadata, rewrite_script_metadata, script_metadata,
 };
 
 use super::common::{record, refuse_symlinked};
@@ -241,6 +241,12 @@ async fn load_listed_locks(
                 return Err(("pypi_script_multiple_versions", format!("{path} resolves multiple versions of {name}; a script source override cannot select only {version}")));
             }
             let script = read_file(&root.join(script_name)).await?;
+            refuse_uv_no_sources(
+                &script,
+                true,
+                super::pypi_uv::read_uv_toml(root).await?.as_deref(),
+            )
+            .map_err(|detail| ("pypi_uv_no_sources", format!("{script_name}: {detail}")))?;
             let script_wheel = source_path(package).unwrap_or(&placeholder);
             if rewrite_script_metadata(&script, name, version, ArtifactSource::Path(script_wheel))
                 .map_err(|error| {
@@ -1231,6 +1237,48 @@ mod tests {
             packages.get(1).unwrap()["metadata"]["requires-dist"][0]["specifier"].as_str(),
             Some(">=1")
         );
+    }
+
+    /// #564: a script lock whose script (or the uv.toml beside it) sets
+    /// `no-sources = true` is refused before anything is written, since uv
+    /// would ignore the vendored `[tool.uv.sources]` entry.
+    #[tokio::test]
+    async fn script_no_sources_refuses_before_writing() {
+        let lock = "version = 1\n[[package]]\nname = \"two\"\nversion = \"2\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        let plain = "# /// script\n# dependencies = [\"two==2\"]\n# ///\n";
+        let no_sources =
+            "# /// script\n# dependencies = [\"two==2\"]\n#\n# [tool.uv]\n# no-sources = true\n# ///\n";
+        for (script, uv_toml) in [(no_sources, None), (plain, Some("no-sources = true\n"))] {
+            let temp = tempfile::tempdir().unwrap();
+            tokio::fs::write(temp.path().join("job.py.lock"), lock)
+                .await
+                .unwrap();
+            tokio::fs::write(temp.path().join("job.py"), script)
+                .await
+                .unwrap();
+            if let Some(uv_toml) = uv_toml {
+                tokio::fs::write(temp.path().join("uv.toml"), uv_toml)
+                    .await
+                    .unwrap();
+            }
+            let Err(error) = load_python_locks(
+                temp.path(),
+                "two",
+                "2",
+                "11111111-1111-4111-8111-111111111111",
+            )
+            .await
+            else {
+                panic!("{script:?} with uv.toml {uv_toml:?} must refuse");
+            };
+            assert_eq!(error.0, "pypi_uv_no_sources", "{}", error.1);
+            assert_eq!(
+                tokio::fs::read_to_string(temp.path().join("job.py"))
+                    .await
+                    .unwrap(),
+                script
+            );
+        }
     }
 
     #[tokio::test]

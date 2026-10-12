@@ -37,6 +37,7 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::line_endings::terminator;
 use crate::utils::purl::purl_name_version;
 use crate::utils::python_lock::preserve_line_endings;
+use crate::utils::python_script::{refuse_uv_no_sources, UV_TOML};
 
 use super::common::{
     ensure_unchanged, item_get, pep508_name, pyproject_dependency_specs, record, refuse_symlinked,
@@ -95,6 +96,19 @@ pub(super) struct UvProject {
     pub lock_revision: Option<u64>,
     /// Non-fatal advisories raised during load (untested lock revision).
     pub warnings: Vec<VendorWarning>,
+}
+
+/// The project's `uv.toml` beside `root`'s pyproject.toml (or a script),
+/// `None` when there is none, for [`refuse_uv_no_sources`].
+pub(super) async fn read_uv_toml(root: &Path) -> Result<Option<String>, (&'static str, String)> {
+    match read_regular_to_string(&root.join(UV_TOML)).await {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err((
+            "pypi_uv_lock_parse_failed",
+            format!("cannot read {UV_TOML}: {e}"),
+        )),
+    }
 }
 
 /// Read + parse the pair and run every project-level guard. Refuses before
@@ -211,6 +225,11 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
             ));
         }
     }
+
+    // uv ignores every [tool.uv.sources] entry under no-sources = true, so
+    // the vendored source would be dropped by the next `uv sync` (#564).
+    refuse_uv_no_sources(&pyproject_text, false, read_uv_toml(root).await?.as_deref())
+        .map_err(|detail| ("pypi_uv_no_sources", detail))?;
 
     // PEP 621 dynamic dependencies are resolved by a build backend at lock
     // time — there is no static dependency list to classify against.
@@ -2869,6 +2888,26 @@ wheels = [
         .await;
         let err = load_uv_project(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_uv_dynamic_dependencies");
+
+        // #564: uv ignores [tool.uv.sources] under no-sources = true, set in
+        // pyproject's [tool.uv] or in a project uv.toml (which replaces it).
+        let tmp = write_pair(
+            &format!("{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\nno-sources = true\n"),
+            DIRECT_REGISTRY_LOCK,
+        )
+        .await;
+        let err = load_uv_project(tmp.path()).await.unwrap_err();
+        assert_eq!(err.0, "pypi_uv_no_sources", "{}", err.1);
+        tokio::fs::write(tmp.path().join("uv.toml"), "offline = false\n")
+            .await
+            .unwrap();
+        load_uv_project(tmp.path()).await.unwrap();
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        tokio::fs::write(tmp.path().join("uv.toml"), "no-sources = true\n")
+            .await
+            .unwrap();
+        let err = load_uv_project(tmp.path()).await.unwrap_err();
+        assert_eq!(err.0, "pypi_uv_no_sources", "{}", err.1);
 
         // forked package (six at two versions)
         let fork = format!(

@@ -113,6 +113,8 @@ const REGISTRY: &[FormatFile] = &[
     row("Pipfile", "pypi", HOSTED | PRESENCE_ONLY),
     row("pyproject.toml", "pypi", HOSTED | VENDORED | PROBE),
     row("hatch.toml", "pypi", HOSTED | VENDORED | PROBE),
+    // Never edited: uv's project settings, read for `no-sources` (#564).
+    row("uv.toml", "pypi", HOSTED),
     // ── cargo ──
     row("Cargo.toml", "cargo", HOSTED | VENDORED | PROBE),
     row("Cargo.lock", "cargo", HOSTED | VENDORED | ROOT),

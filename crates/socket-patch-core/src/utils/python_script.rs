@@ -304,6 +304,65 @@ fn contains_dependency(item: Option<&Item>, name: &str) -> bool {
     })
 }
 
+/// The project-level uv settings file, read beside `pyproject.toml` (and
+/// beside a PEP 723 script, from uv's working directory).
+pub const UV_TOML: &str = "uv.toml";
+
+/// Refuse to wire a `[tool.uv.sources]` entry that uv would ignore (#564).
+///
+/// Under `no-sources = true` uv drops every source, so a wired entry fails
+/// `uv sync --locked`, and a plain `uv sync` relocks the package to the
+/// registry and installs the unpatched wheel. `metadata` is pyproject.toml,
+/// or a PEP 723 script when `script` is set; `uv_toml` is the project's
+/// `uv.toml`, if there is one. The precedence is uv's (checked against uv
+/// 0.11): a `uv.toml` replaces pyproject's `[tool.uv]` settings outright,
+/// while a script's own `[tool.uv]` wins over `uv.toml`. Metadata that does
+/// not parse is left for the rewriters to report.
+pub fn refuse_uv_no_sources(
+    metadata: &str,
+    script: bool,
+    uv_toml: Option<&str>,
+) -> Result<(), String> {
+    let declared = || -> Option<bool> {
+        let toml = if script {
+            script_metadata(metadata).ok()?.1
+        } else {
+            metadata.to_string()
+        };
+        let document: DocumentMut = toml.parse().ok()?;
+        document
+            .get("tool")?
+            .as_table_like()?
+            .get("uv")?
+            .as_table_like()?
+            .get("no-sources")?
+            .as_bool()
+    };
+    let config = uv_toml
+        .map(|text| {
+            text.parse::<DocumentMut>()
+                .map(|document| document.get("no-sources").and_then(Item::as_bool))
+                .map_err(|error| format!("{UV_TOML} does not parse: {error}"))
+        })
+        .transpose()?;
+    let (file, no_sources) = match (script, config) {
+        (false, Some(setting)) => (UV_TOML, setting),
+        (false, None) => ("pyproject.toml [tool.uv]", declared()),
+        (true, config) => match declared() {
+            Some(setting) => ("the script's [tool.uv]", Some(setting)),
+            None => (UV_TOML, config.flatten()),
+        },
+    };
+    if no_sources == Some(true) {
+        return Err(format!(
+            "{file} sets no-sources = true, so uv ignores [tool.uv.sources] and a plain \
+             `uv sync` would install the unpatched registry wheel; remove the setting to \
+             wire a patch"
+        ));
+    }
+    Ok(())
+}
+
 pub fn rewrite_project_metadata(
     text: &str,
     name: &str,
