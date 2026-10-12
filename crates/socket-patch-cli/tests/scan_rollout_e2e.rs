@@ -5,13 +5,12 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic_command};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path, path_regex};
@@ -273,14 +272,8 @@ fn run(root: &Path, mock: &MockServer, args: &[&str]) -> (i32, String, String) {
         ORG,
     ];
     argv.extend_from_slice(args);
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(&argv).current_dir(root);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch");
     (
         out.status.code().unwrap_or(-1),
@@ -797,18 +790,12 @@ async fn a_malformed_env_cap_is_a_usage_error_unless_the_flag_overrides_it() {
     mount_api(&mock, |_| Grant::Granted).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path(), &["roll-a", "roll-b"]);
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(["scan", "--json", "--api-url"])
         .arg(mock.uri())
         .args(["--api-token", "t", "--org", ORG])
         .current_dir(tmp.path());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_MAX_NEW_PATCHES", "lots");
+    cmd.env("SOCKET_MAX_NEW_PATCHES", "lots");
     let out = cmd.output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     // Under --json the coded usage error goes to stdout (#704).
@@ -822,7 +809,7 @@ async fn a_malformed_env_cap_is_a_usage_error_unless_the_flag_overrides_it() {
     );
 
     // A flag overrides the env value without reading it.
-    let mut with_flag = Command::new(binary());
+    let mut with_flag = hermetic_command(&binary());
     with_flag
         .args([
             "scan",
@@ -835,14 +822,7 @@ async fn a_malformed_env_cap_is_a_usage_error_unless_the_flag_overrides_it() {
         .arg(mock.uri())
         .args(["--api-token", "t", "--org", ORG])
         .current_dir(tmp.path());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            with_flag.env_remove(&key);
-        }
-    }
-    with_flag
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_MAX_NEW_PATCHES", "lots");
+    with_flag.env("SOCKET_MAX_NEW_PATCHES", "lots");
     let out = with_flag.output().unwrap();
     assert_eq!(
         out.status.code(),

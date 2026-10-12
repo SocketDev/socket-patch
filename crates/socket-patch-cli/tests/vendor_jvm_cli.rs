@@ -10,7 +10,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::git_sha256;
+use common::{git_sha256, hermetic};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -18,7 +18,6 @@ mod prebuilt_common;
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
 
 use sha2::{Digest as _, Sha256};
 
@@ -151,12 +150,7 @@ fn fixture(root: &Path, shape: Shape, packages: &[(&str, &str)]) {
 
 /// `socket-patch <args> --json --offline --cwd <root>/proj`; `(exit, envelope)`.
 fn socket(root: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
+    let mut cmd = hermetic::binary_command();
     let proj = root.join("proj");
     let _fixture = prebuilt_common::prepare_command(
         &mut cmd,
@@ -166,8 +160,6 @@ fn socket(root: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
     );
     let out = cmd
         .args(["--json", "--cwd", proj.to_str().unwrap()])
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("MAVEN_REPO_LOCAL", root.join("m2"))
         .env_remove("M2_HOME")
         .output()
@@ -751,12 +743,7 @@ const FOO_MAVEN_TREE: &str = "proj/.socket/vendor/maven2/org/example/foo/1.0-soc
 /// `socket(root, args)` run from `cwd` (relative to `root`) instead of
 /// the project root; the fixture service reads `cwd`'s manifest.
 fn socket_in(root: &Path, cwd: &str, args: &[&str]) -> (Option<i32>, serde_json::Value) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
+    let mut cmd = hermetic::binary_command();
     let dir = root.join(cwd);
     let _fixture = prebuilt_common::prepare_command(
         &mut cmd,
@@ -766,8 +753,6 @@ fn socket_in(root: &Path, cwd: &str, args: &[&str]) -> (Option<i32>, serde_json:
     );
     let out = cmd
         .args(["--json", "--cwd", dir.to_str().unwrap()])
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("MAVEN_REPO_LOCAL", root.join("m2"))
         .env_remove("M2_HOME")
         .output()

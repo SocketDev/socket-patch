@@ -26,8 +26,10 @@
 //! vendored mode. The package names are fixtures no interpreter on the
 //! machine has installed, so every hit is a lock-only one.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -63,10 +65,9 @@ fn run_scan(
         ORG_SLUG,
     ];
     argv.extend_from_slice(extra);
-    let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let out = hermetic::binary_command()
         .args(&argv)
         .current_dir(root)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env_remove("VIRTUAL_ENV")
         .env_remove("CONDA_PREFIX")
         .envs(envs.iter().copied())
