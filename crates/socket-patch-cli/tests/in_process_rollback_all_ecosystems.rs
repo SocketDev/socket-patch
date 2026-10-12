@@ -358,6 +358,13 @@ version = "1.0.0"
 
     // Cargo crawler needs a Cargo.toml in cwd to engage.
     std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+    // `cargo vendor`'s source replacement makes `vendor/` cargo's source (#338).
+    std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
+    std::fs::write(
+        tmp.path().join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n",
+    )
+    .unwrap();
 
     assert_ne!(original.to_vec(), patched.to_vec());
     assert_eq!(

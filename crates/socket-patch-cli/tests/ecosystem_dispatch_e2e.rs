@@ -686,13 +686,20 @@ fn rollback_dispatch_branch_cargo() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_root_package_json(root);
-    // Cargo crawler uses the vendor layout when `vendor/` exists.
+    // Cargo crawler uses the vendor layout when a config wires `vendor/`.
     std::fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
     )
     .unwrap();
     let purl = "pkg:cargo/__rollback_dispatch__@1.0.0";
+    // `cargo vendor`'s source replacement makes `vendor/` cargo's source (#338).
+    std::fs::create_dir_all(root.join(".cargo")).unwrap();
+    std::fs::write(
+        root.join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n",
+    )
+    .unwrap();
     let crate_dir = root.join("vendor").join("__rollback_dispatch__");
     std::fs::create_dir_all(crate_dir.join("src")).unwrap();
     std::fs::write(
