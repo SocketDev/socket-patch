@@ -165,6 +165,8 @@ async fn get_vendor_paths_global_composer_cli_nonexistent_home_falls_back() {
     let _composer_home = EnvVarGuard::remove("COMPOSER_HOME");
     let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
     let _path = EnvVarGuard::set("PATH", shim_dir.path().as_os_str());
+    // `$XDG_CONFIG_HOME/composer` would outrank the HOME candidate here.
+    let _xdg = EnvVarGuard::remove("XDG_CONFIG_HOME");
 
     let crawler = ComposerCrawler;
     let paths = crawler
@@ -176,5 +178,73 @@ async fn get_vendor_paths_global_composer_cli_nonexistent_home_falls_back() {
         paths,
         vec![dot_composer_vendor],
         "a CLI answer naming a nonexistent home must fall through to HOME/.composer"
+    );
+}
+
+/// #586: on an XDG system Composer 2 looks for its home in the XDG config
+/// dir first and only then in `~/.composer` (`Factory::getHomeDir`). A
+/// leftover `~/.composer` (Composer 1 era, even an empty one) must not
+/// hide the real global install under `~/.config/composer` when the
+/// `composer` CLI can't be asked.
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_xdg_home_outranks_stale_dot_composer() {
+    let home = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir_all(home.path().join(".composer"))
+        .await
+        .unwrap();
+    let xdg_vendor = home.path().join(".config").join("composer").join("vendor");
+    tokio::fs::create_dir_all(&xdg_vendor).await.unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    let _composer_home = EnvVarGuard::remove("COMPOSER_HOME");
+    let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
+    let _path = EnvVarGuard::set("PATH", empty_path.path().as_os_str());
+    let _xdg_config = EnvVarGuard::remove("XDG_CONFIG_HOME");
+    // Any `XDG_*` variable makes Composer treat the system as XDG.
+    let _xdg_marker = EnvVarGuard::set("XDG_SESSION_TYPE", std::ffi::OsStr::new("tty"));
+
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_options_at(home.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![xdg_vendor],
+        "Composer 2 picks ~/.config/composer over ~/.composer on an XDG system"
+    );
+}
+
+/// The same layout with `XDG_CONFIG_HOME` set: Composer 2 uses
+/// `$XDG_CONFIG_HOME/composer`, still ahead of a stale `~/.composer`.
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_xdg_config_home_outranks_stale_dot_composer() {
+    let home = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir_all(home.path().join(".composer").join("vendor"))
+        .await
+        .unwrap();
+    let xdg = tempfile::tempdir().unwrap();
+    let xdg_vendor = xdg.path().join("composer").join("vendor");
+    tokio::fs::create_dir_all(&xdg_vendor).await.unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    let _composer_home = EnvVarGuard::remove("COMPOSER_HOME");
+    let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
+    let _path = EnvVarGuard::set("PATH", empty_path.path().as_os_str());
+    let _xdg_config = EnvVarGuard::set("XDG_CONFIG_HOME", xdg.path().as_os_str());
+
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_options_at(home.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![xdg_vendor],
+        "Composer 2 picks $XDG_CONFIG_HOME/composer over ~/.composer"
     );
 }
