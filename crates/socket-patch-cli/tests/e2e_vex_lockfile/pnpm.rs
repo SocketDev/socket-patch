@@ -37,7 +37,6 @@
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::Value;
 use sha2::{Digest, Sha512};
@@ -185,18 +184,11 @@ fn install(root: &Path, index: &[u8]) {
 }
 
 fn socket(root: &Path, args: &[&str]) -> (Option<i32>, Value, String) {
-    let mut cmd = Command::new(binary());
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(k);
-        }
-    }
+    let mut cmd = crate::hermetic::binary_command();
     let _fixture = prebuilt_common::prepare_command(&mut cmd, root, args, &[]);
     let out = cmd
         .arg("--cwd")
         .arg(root)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .current_dir(root)
         .output()
         .expect("spawn socket-patch");

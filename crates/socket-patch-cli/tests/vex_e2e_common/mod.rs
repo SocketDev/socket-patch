@@ -70,7 +70,6 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::Value;
 
@@ -107,6 +106,11 @@ mod oracle;
 // Not every includer uses these.
 #[allow(unused_imports)]
 pub use oracle::{binary, git_sha256};
+
+/// The hermetic `SOCKET_*` environment [`run_vex`] spawns the binary with;
+/// suites that load no `common` reach it through here.
+#[path = "../common/hermetic.rs"]
+pub mod hermetic;
 
 // ── Project shaping ───────────────────────────────────────────────────
 
@@ -419,16 +423,9 @@ pub fn run_vex(bin: &Path, project: &Path, run: &VexRun) -> VexOutcome {
     }
     args.extend(run.extra_args.iter().map(OsString::from));
 
-    let mut cmd = Command::new(bin);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_NO_API_TOKEN", "1")
-        .env_remove("VIRTUAL_ENV");
+    let mut cmd = hermetic::command(bin);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    cmd.env("SOCKET_NO_API_TOKEN", "1");
     for (key, value) in &run.envs {
         cmd.env(key, value);
     }

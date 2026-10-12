@@ -32,7 +32,6 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
 
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
@@ -100,13 +99,7 @@ fn write_hosted_package_lock(cwd: &Path, deps: &[(&str, &str, &str)], pinned: bo
 /// CLI invocation with the ambient `SOCKET_*` environment scrubbed (explicit
 /// flags must be the sole source of truth).
 fn cli() -> Command {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
+    common::hermetic::binary_command()
 }
 
 /// Patch record with one npm-shaped file (`package/…`) and one vulnerability.

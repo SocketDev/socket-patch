@@ -12,7 +12,6 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -41,13 +40,7 @@ use socket_patch_core::manifest::schema::{
 /// need no serialization) makes the explicit CLI flags the sole source of
 /// truth.
 fn cli() -> Command {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
+    common::hermetic::binary_command()
 }
 
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {

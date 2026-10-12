@@ -74,16 +74,9 @@ const CVE: &str = "CVE-2026-7100";
 /// global packages folder pinned to `store` — an ambient `~/.nuget/packages`
 /// must never become installed evidence.
 fn cli(store: &Path) -> Command {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("NUGET_PACKAGES", store.join("nuget"))
-        .env_remove("VIRTUAL_ENV");
+    let mut cmd = crate::hermetic::binary_command();
+    crate::hermetic::scrub_extra(&mut cmd, &[crate::hermetic::Extra::Venv]);
+    cmd.env("NUGET_PACKAGES", store.join("nuget"));
     cmd
 }
 
