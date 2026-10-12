@@ -770,6 +770,7 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
         move |name: &str| {
             vars.iter()
