@@ -1057,12 +1057,15 @@ async fn directory_source_keeps_the_given_cwd_prefix() {
     std::fs::create_dir_all(tmp.path().join("b")).unwrap();
 
     let dotted = tmp.path().join("b").join("..").join("app");
+    // The cwd as path-scoped commands see it: `absolute` keeps the `..`
+    // on Unix and folds it on Windows.
+    let given = std::path::absolute(&dotted).unwrap();
     let paths = CargoCrawler
         .get_crate_source_paths(&options_at(&dotted))
         .await
         .unwrap();
-    assert_eq!(paths, vec![dotted.join("vendor")]);
+    assert_eq!(paths, vec![given.join("vendor")]);
     let crawled = crawled_paths(&dotted).await;
-    assert_eq!(crawled, vec![dotted.join("vendor").join("cfg-if")]);
+    assert_eq!(crawled, vec![given.join("vendor").join("cfg-if")]);
     drop(cargo_home);
 }
