@@ -124,7 +124,7 @@ fn pnpm_command(pm: &str) -> Command {
     if let Some(bin) = std::env::var_os("SOCKET_PATCH_PNPM_E2E_BIN") {
         Command::new(bin)
     } else {
-        let mut cmd = Command::new("corepack");
+        let mut cmd = hermetic::tool_command("corepack");
         cmd.arg(pm);
         cmd
     }

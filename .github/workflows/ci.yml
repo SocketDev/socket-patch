@@ -1704,8 +1704,7 @@ jobs:
           # the matching matrix key, which the suites treat as unset.
           SOCKET_PATCH_NPM_E2E_REQUIRED: ${{ matrix.npm_required || '' }}
           # `pnpm_required` does the same for the pnpm-family suites
-          # (corepack pnpm / pnpm on PATH). Set on the Linux rows only; the
-          # Windows and macOS rows have not been checked against it yet.
+          # (corepack pnpm / pnpm on PATH), on every OS that runs them.
           SOCKET_PATCH_PNPM_E2E_REQUIRED: ${{ matrix.pnpm_required || '' }}
           SOCKET_PATCH_CARGO_E2E_REQUIRED: ${{ matrix.suite == 'e2e_safety_cargo_build' && '1' || '' }}
           SOCKET_PATCH_UV_E2E_REQUIRED: ${{ matrix.uv != '' && '1' || '' }}
@@ -1946,11 +1945,13 @@ jobs:
         include:
           - os: windows-latest
             suite: e2e_safety_pnpm
+            pnpm_required: '1'
           - os: windows-latest
             suite: e2e_redirect_npm_build
             npm_required: '1'
           - os: windows-latest
             suite: e2e_redirect_rush_sim
+            pnpm_required: '1'
           - os: windows-latest
             suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.4.2'
@@ -1963,7 +1964,7 @@ jobs:
           - {os: windows-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
           - {os: windows-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: windows-latest, suite: e2e_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix', pnpm_required: '1'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: gradle, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
@@ -1983,11 +1984,13 @@ jobs:
         include:
           - os: macos-latest
             suite: e2e_safety_pnpm
+            pnpm_required: '1'
           - os: macos-latest
             suite: e2e_redirect_npm_build
             npm_required: '1'
           - os: macos-latest
             suite: e2e_redirect_rush_sim
+            pnpm_required: '1'
           - os: macos-latest
             suite: e2e_redirect_bun_build
             bun: '1.4.2'
@@ -2005,7 +2008,7 @@ jobs:
           - {os: macos-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: macos-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
           - {os: macos-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          - {os: macos-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix', pnpm_required: '1'}
           - {os: macos-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
           - {os: macos-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
           - {os: macos-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}

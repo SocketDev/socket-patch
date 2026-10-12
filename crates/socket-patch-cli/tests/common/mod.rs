@@ -279,7 +279,7 @@ pub fn vlt_run(cwd: &Path, vlt_js: &Path, args: &[&str], extra_env: &[(&str, &st
 }
 
 fn run_toolchain(cwd: &Path, exe: &str, args: &[&str], extra_env: &[(&str, &str)]) {
-    let mut cmd = Command::new(exe);
+    let mut cmd = hermetic::tool_command(exe);
     cmd.args(args).current_dir(cwd);
     // Sandbox the caches first so `extra_env` can still override any
     // individual one (`Command` env ops are last-write-wins per name).

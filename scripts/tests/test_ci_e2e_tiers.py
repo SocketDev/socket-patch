@@ -275,8 +275,8 @@ class GradleRows(unittest.TestCase):
 
 class PnpmRequiredGate(unittest.TestCase):
     """The pnpm-family suites soft-skip when pnpm is missing, and libtest
-    counts a skip as `ok`, so their Linux rows must set the fail-instead-of-
-    skip gate (#1054)."""
+    counts a skip as `ok`, so every row that runs them, on every OS, must set
+    the fail-instead-of-skip gate (#1054)."""
 
     suites = {"e2e_redirect_pnpm_build", "e2e_safety_pnpm", "e2e_redirect_rush_sim"}
     jobs = ("e2e", "e2e-full", "e2e-extended", "e2e-windows", "e2e-macos")
@@ -285,19 +285,41 @@ class PnpmRequiredGate(unittest.TestCase):
         run = dict(rows_mod.steps(JOBS["e2e"]))["Run e2e tests"]
         self.assertIn("SOCKET_PATCH_PNPM_E2E_REQUIRED: ${{ matrix.pnpm_required || '' }}", run)
 
-    def test_every_linux_pnpm_row_sets_the_gate(self):
-        gated = set()
+    def test_every_pnpm_row_sets_the_gate(self):
+        gated = {}
         for job in self.jobs:
             for row in rows(job):
-                if self.suites & set(row["suite"].split()) and row["os"].startswith("ubuntu"):
+                if self.suites & set(row["suite"].split()):
                     with self.subTest(job=job, row=row):
                         self.assertEqual(row.get("pnpm_required"), "1")
-                    gated |= self.suites & set(row["suite"].split())
+                    for suite in self.suites & set(row["suite"].split()):
+                        gated.setdefault(suite, set()).add(row["os"].split("-")[0])
                 elif "pnpm_required" in row:
                     self.fail(f"{job} row outside the checked set sets pnpm_required: {row}")
-        self.assertEqual(gated, self.suites)
+        self.assertEqual(gated, {s: {"ubuntu", "windows", "macos"} for s in self.suites})
         self.assertIn("e2e_redirect_pnpm_build", {r["suite"] for r in rows("e2e") if r.get("pnpm_required")},
                       "the PR tier must keep its gated pnpm row")
+
+    def test_suites_resolve_windows_shims(self):
+        # A bare `Command::new("pnpm")` / `Command::new("corepack")` can't
+        # spawn the `.cmd` shims npm and Node install on Windows, so every
+        # Windows test skipped (passed in 0.02 s) until the gate made that a
+        # failure. `hermetic::tool_command` resolves them through PATHEXT.
+        for suite in sorted(self.suites):
+            with self.subTest(suite=suite):
+                src = (TESTS / f"{suite}.rs").read_text(encoding="utf-8")
+                self.assertNotRegex(src, r'Command::new\("(pnpm|corepack|npm)(\.cmd)?"\)')
+                if "fn has_command(" in src:
+                    # A suite-local probe must resolve shims itself...
+                    local = src[src.index("fn has_command("):]
+                    self.assertIn("hermetic::tool_command(cmd)", local[:local.index("\n}\n")])
+                else:
+                    # ...and `common::has_command` does not.
+                    self.assertNotRegex(src, r'has_command\("(pnpm|corepack|npm)"\)')
+        # `pnpm_run` goes through the shared runner.
+        common = (TESTS / "common" / "mod.rs").read_text(encoding="utf-8")
+        runner = common[common.index("fn run_toolchain("):]
+        self.assertIn("hermetic::tool_command(exe)", runner[:runner.index("\n}\n")])
 
     def test_every_gated_suite_honours_the_gate(self):
         for suite in sorted(self.suites):
