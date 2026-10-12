@@ -336,8 +336,18 @@ fn empty_venv(project: &Path) {
 /// `six.py` bytes from a pristine install in a scratch sibling. `None`
 /// (after [`skip`]) when PyPI is unreachable.
 fn locked_project(poetry: &Poetry, project: &Path, probe: &Path) -> Option<(Vec<u8>, String)> {
+    locked_project_with(poetry, project, probe, PYPROJECT)
+}
+
+/// [`locked_project`] of an arbitrary `pyproject`.
+fn locked_project_with(
+    poetry: &Poetry,
+    project: &Path,
+    probe: &Path,
+    pyproject: &str,
+) -> Option<(Vec<u8>, String)> {
     std::fs::create_dir_all(project).unwrap();
-    std::fs::write(project.join("pyproject.toml"), PYPROJECT).unwrap();
+    std::fs::write(project.join("pyproject.toml"), pyproject).unwrap();
     let out = poetry.run(project, &["lock", "-n"]);
     if !out.status.success() {
         skip(&format!("poetry lock (needs PyPI): {}", text(&out)));
@@ -1163,4 +1173,94 @@ fn poetry_vendored_revendors_to_a_superseding_patch() {
         pristine_lock,
         "revert restores the pristine lock"
     );
+}
+
+/// `six = {version = "1.16.0", source = "pypi"}` leaves no trace in the
+/// lock, and Poetry 1.4 – 2.2 refuse to install a lock that then sources six
+/// from a URL or file ("Repository \"pypi\" does not exist."). Over a lock
+/// one of them wrote, both modes refuse and leave the lock installable;
+/// other releases install the rewired lock, with a warning (#1282).
+#[test]
+#[ignore = "real Poetry + PyPI; run by the CI e2e matrix per Poetry release"]
+fn poetry_source_pypi_constraint_never_breaks_install() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let Some(poetry) = Poetry::find(&home) else {
+        return;
+    };
+    if poetry.major_minor() < (1, 1) {
+        println!("Poetry {} predates per-dependency sources", poetry.version);
+        return;
+    }
+    let pyproject = PYPROJECT.replace(
+        "six = \"1.16.0\"",
+        "six = {version = \"1.16.0\", source = \"pypi\"}",
+    );
+    let project = tmp.path().join("proj");
+    let Some((pristine, pristine_lock)) =
+        locked_project_with(&poetry, &project, &tmp.path().join("probe"), &pyproject)
+    else {
+        return;
+    };
+    // The lock was written by this Poetry, so it is also the installer.
+    let refused = ((1, 4)..(2, 3)).contains(&poetry.major_minor());
+    let mut patched = pristine.clone();
+    patched.extend_from_slice(MARKER);
+    let wheel = build_wheel(&patched);
+
+    for (mode, uuid, refusal) in [
+        ("hosted", HOSTED_UUID, "redirect_poetry_lock_unsupported"),
+        ("vendored", VENDORED_UUID, "pypi_poetry_source_constraint"),
+    ] {
+        let work = tmp.path().join(mode);
+        fresh_checkout(&project, &work);
+        let service = PatchService::start(uuid, &pristine, &patched, &wheel);
+        let out = poetry.install(&work);
+        assert!(
+            out.status.success(),
+            "{mode}: pristine install: {}",
+            text(&out)
+        );
+        let mut args = vec!["scan", "--mode", mode];
+        if mode == "vendored" {
+            args.extend(["--vendor-source", "service"]);
+        }
+        let (code, env) = socket_patch(&work, &poetry, &service, &args);
+        let lock = std::fs::read_to_string(work.join("poetry.lock")).unwrap();
+        let report = env.to_string();
+        if refused {
+            assert_eq!(
+                lock, pristine_lock,
+                "{mode}: refused before any write: {env}"
+            );
+            assert!(
+                report.contains(refusal) && report.contains("source ="),
+                "{mode}: names the constraint ({code:?}): {env}"
+            );
+        } else {
+            assert_eq!(code, Some(0), "{mode}: {env}");
+            assert_ne!(lock, pristine_lock, "{mode}: rewired: {env}");
+            assert!(
+                report.contains("source_constraint"),
+                "{mode}: warns about Poetry 1.4 – 2.2: {env}"
+            );
+        }
+        // Either way a fresh install works, and installs the patch whenever
+        // the lock was rewired.
+        let fresh = tmp.path().join(format!("{mode}-fresh"));
+        fresh_checkout(&work, &fresh);
+        let out = poetry.install(&fresh);
+        assert!(
+            out.status.success(),
+            "{mode}: fresh install: {}",
+            text(&out)
+        );
+        let installed = std::fs::read(installed_six(&fresh).expect("six installed")).unwrap();
+        assert_eq!(
+            installed,
+            *if refused { &pristine } else { &patched },
+            "{mode}: installed six"
+        );
+    }
 }
