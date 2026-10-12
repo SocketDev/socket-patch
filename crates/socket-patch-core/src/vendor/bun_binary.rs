@@ -936,7 +936,7 @@ fn mirror_uuid_dir_rel(rel: &str) -> Option<String> {
 }
 
 /// The member uuid dirs (`<member>/.socket/vendor/npm/<uuid>`) a
-/// `bun.lockb` workspace mirrors `uuid`'s tarball into, as [`vendor`]'s
+/// `bun.lockb` workspace mirrors `uuid`'s tarball into, as the backend's
 /// pre-flight lists them; empty when no readable binary lock drives the
 /// installs.
 pub(crate) fn workspace_mirror_dirs(root: &Path, uuid: &str) -> Vec<String> {
