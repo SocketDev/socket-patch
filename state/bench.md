@@ -1,148 +1,143 @@
 [agent] Bench: progress log for the `socket-patch scan` benchmark suite (`crates/socket-patch-bench`, `.github/workflows/bench.yml`). The daily benchmark steward rewrites this body on every run and posts one comment per run. Machine-readable history is in `history.json` on the [`bench/ledger`](https://github.com/SocketDev/socket-patch/tree/bench/ledger) branch. The first run (2026-10-02) was logged in #580 and backfilled there.
 
 ## Last run
-- **When:** 2026-10-09, about 06:35–08:45 UTC
-- **main:** `f3c6313a` (Fix open npm issues, #1008). That is 37 first-parent commits since `ea097142`, including #1051 (bun lock re-parse fix), #1008 (npm/bun/vlt lock rework), #1183 (NuGet restore-scoped crawl), #1205 (Cargo.lock-scoped crawl), #1058 (hosted pins decided through lockfile discovery) and #1031 (removes `scan --apply/--vendor`; the suite never used them).
-- **Suite source:** `main`, 45 scenarios. #1250 updates the nuget fixture; it was measured separately and is not in today's numbers.
-- **Runner:** 4 vCPU, Intel(R) Xeon(R) Processor @ 2.80GHz, cloud sandbox. Verdicts come only from same-machine interleaved `compare`. The 3a `run` was noisy today (pnpm/hosted ranged 224–396 ms; npm/hosted's 515 ms median is about 330 ms in every `compare`), so treat today's absolute medians loosely.
-- **Validation:** 45/45 scenarios are valid on today's main. Request counts are unchanged in every scenario.
-- **Daily A/B** (`ea097142` → `f3c6313a`):
-  - **Big wins:** bun/hosted -53.3%, bun/rescan -61.7%, bun-isolated -52% / -56% (#1051). vlt/hosted -51.2%, vlt/rescan -52.3%. npm/rescan -25.5%, yarn-classic/rescan -22.8%, gradle/rescan -31.1%, composer/rescan -18.9%, pdm/rescan -17.1%, nuget/rescan -12.9%, and pnpm, yarn-berry, uv and pylock rescans 10–14% faster.
-  - **Peak RSS +15–17% on npm-family hosted scans** (confirmed): npm/hosted +16.6% (44.0 → 50.6 MiB), yarn-classic/hosted +16.5%, npm/public-proxy +15.2% and npm/latency +15.6%. npm/dry-run +13.4% and yarn-berry/hosted +11.1% are under the 15% gate. Wall time is flat. Bisected with 3 builds: #1008 is cleared (identical RSS before and after). About half the growth is in `ea097142..ef48495c` (13 commits; #1051, #1027 and #1147 are candidates) and half is #1058 (`4d06019b`). This is under the 30% RSS issue gate, so it's ledger only.
-- **Weekly A/B** (`61cfb9b2`, which predates #472, → `f3c6313a`). The base fails validation on yarn-berry, bun-isolated and gradle (it predates those fixtures), so those have no weekly ratio.
-  - **bun is back to its pre-#472 baseline:** bun/hosted -8.1% (≈), bun/rescan -26.3%. That's run 1 of 2 for closing #578 (evidence commented).
-  - **vlt:** +13.9% and +17.3% vs pre-#472 (it was about +110% yesterday). This is the accepted #472 residual (#579).
-  - **Confirmed, below the issue gate:** hatch/hosted wall +11.1% → **+19.3%** [+12.1, +25.0] in round 2 (~19 ms, just under the 20% gate). maven/hosted +10.2% → +14.7% [+7.4, +18.3] (~17 ms). Neither is bisected (the build budget went to RSS). npm-family RSS is +22–25%.
-  - **Not confirmed:** bundler/rescan +10.6% → +8.3%, golang/hosted +14.0% → +6.6%, and npm/dry-run wall +10.0% → +1.0%.
-  - Faster: poetry -44% / -52%, pdm -40% / -51% (#877), nuget/hosted -21.2%, npm/rescan -20.1%, yarn-classic/rescan -19.2%.
-- **A/A sanity check:** clean. npm/hosted +2.4%, hatch/hosted +1.9% and maven/hosted -1.0%, all ≈.
-- **Full `compare` wall time:** 21.7 min for the daily run (45 scenarios plus 4 confirmation rounds) on this runner. That is still over the ~12-minute budget.
+- **When:** 2026-10-12, about 06:50–08:10 UTC. No runs on 10-10 or 10-11.
+- **main:** `17793173`, 161 commits since `f3c6313a`. They include the v5.0 JSON envelope (#1369), #1328 (yarn classic sha1 pins from served tarballs), #1403 (Go replace for unselected versions), #1340/#1341/#1344 (NuGet locks, sources and stale-cache warning), #1361 (Maven project-mode crawl) and #1049 (`--download-mode` removed; the suite never used it).
+- **Suite source:** `main` plus **#1422**. Without #1422, 4 scenarios are INVALID on `main`: yarn-classic (60 unexpected served-tarball GETs from #1328) and nuget (the new `redirect_nuget_stale_global_package` warning from #1344). Both are legitimate behavior changes, and the fixtures are updated in #1422.
+- **Runner:** 4 vCPU, Intel(R) Xeon(R) Processor @ 2.10GHz, cloud sandbox.
+- **Validation:** 45/45 scenarios valid with #1422 (41/45 on plain `main`). The only request-count change is yarn-classic/hosted, 127 → 187.
+- **A/A:** clean (npm/hosted -3.6%, pip/rescan +0.4%, golang/rescan +2.6%, all ≈). A second A/A on the #1422 scenarios was also all ≈.
+- **Daily A/B** (`f3c6313a` → `17793173`), each regression confirmed in a second round with 20+10 pairs:
+  - **yarn-classic/hosted +164.8%** [+149, +178] and **yarn-classic/rescan +152.7%**, from #1328 (`5096c41a`). Filed as **#1423**.
+  - **golang/rescan +34.3%** and **golang/hosted +23.4%**, from #1403 (`1d523d30`). Filed as **#1424**.
+  - **nuget/rescan +30.7%** and **nuget/hosted +28.2%**. Candidates are #1340 and #1341; not bisected. Filed as **#1425**.
+  - Below the gate (ledger only): yarn-berry/rescan +13.6%, bun-isolated/rescan +14.0%, and maven/rescan CPU +22.1% (its wall is -8.8%).
+  - Did not confirm: pip/rescan, +17.0% → +7.4%.
+- **Weekly A/B** (`045d7ec7` → `17793173`, 8 pairs plus an 8-pair confirmation round). The base predates gradle support, so gradle has no weekly ratio.
+  - Faster: bun -59% / -64%, bun-isolated -49% / -57%, vlt -50% / -51%, poetry -44% / -54%, pdm -38% / -44%, npm/rescan -24%.
+  - Slower: yarn-classic (+155% / +116%) and golang (+25% / +20%), the same regressions as the daily A/B. hatch/hosted +11.2% and hatch/rescan +12.3%. maven/hosted CPU +30.8% (its wall is -1.3%).
+  - **npm-family hosted peak RSS is +19% to +27%:** npm/hosted +24.8%, yarn-classic/hosted +27.4%, yarn-berry/hosted +20.5%, pnpm/hosted +19.2%, npm/latency +25.4%. This is still below the 30% issue gate and keeps creeping up. Watch it.
+- **Pre-#472 check** (`61cfb9b2` → head): bun/hosted -10.8%, bun/rescan -16.1%, npm/hosted -1.4%, npm/dry-run -1.5%. That's the 2nd consecutive run within 5%, so **#578 and #993 are closed** with evidence.
+- **Issue cap:** 3 new issues this run. hatch/hosted (≥10% in 2 consecutive runs) and maven CPU are the overflow. File them next run if they persist.
 
 ## Scoreboard
-Day: wall ratio vs `ea097142`. Week: wall ratio vs `61cfb9b2`. The median ms/pkg across `*/hosted` is 0.1716 today (from the noisy 3a run).
+Day: wall ratio vs `f3c6313a`. Week: wall ratio vs `045d7ec7`. From today's 3a run (3 runs per scenario). The median ms/pkg across `*/hosted` is 0.1622, which is yarn-classic/hosted's regressed value. Without that regression the median would be about 0.13.
 
 | scenario | median wall (ms) | ms/pkg | day | week | status |
 |---|---:|---:|---:|---:|---|
-| `npm/hosted` | 514.9 | 0.1716 | 1.004 | 0.999 | OK; RSS +16.6% day (ledger) |
-| `npm/rescan` | 253.6 | 0.0845 | 0.745 | 0.799 | OK |
-| `pnpm/hosted` | 313.0 | 0.1043 | 0.892 | 1.031 | OK |
-| `pnpm/rescan` | 202.1 | 0.0674 | 0.862 | 0.902 | OK |
-| `yarn-classic/hosted` | 332.8 | 0.1109 | 0.936 | 1.009 | OK; RSS +16.5% day (ledger) |
-| `yarn-classic/rescan` | 221.2 | 0.0737 | 0.772 | 0.808 | OK |
-| `yarn-berry/hosted` | 312.1 | 0.1040 | 0.908 | — | OK |
-| `yarn-berry/rescan` | 269.5 | 0.0898 | 0.866 | — | OK |
-| `bun/hosted` | 234.0 | 0.0780 | 0.467 | 0.919 | recovered (#578, run 1/2) |
-| `bun/rescan` | 187.8 | 0.0626 | 0.383 | 0.737 | recovered (#578, run 1/2) |
-| `bun-isolated/hosted` | 218.9 | 0.0730 | 0.482 | — | OK (faster, #1051) |
-| `bun-isolated/rescan` | 223.1 | 0.0744 | 0.440 | — | OK (faster, #1051) |
-| `vlt/hosted` | 635.9 | 0.4239 | 0.488 | 1.139 | slow; -51% day, week +13.9% (accepted #472 residual) |
-| `vlt/rescan` | 598.9 | 0.3993 | 0.477 | 1.173 | slow; -52% day, week +17.3% (accepted #472 residual) |
-| `pip/hosted` | 138.4 | 0.1384 | 1.072 | 1.069 | OK |
-| `pip/rescan` | 122.6 | 0.1226 | 1.005 | 0.985 | OK |
-| `uv/hosted` | 339.3 | 0.8482 | 1.010 | 1.036 | slow (#836) |
-| `uv/rescan` | 210.8 | 0.5271 | 0.865 | 0.901 | slow (#836) |
-| `pylock/hosted` | 213.2 | 0.5331 | 1.044 | 1.032 | slow (#836) |
-| `pylock/rescan` | 202.6 | 0.5064 | 0.877 | 0.881 | slow (#836) |
-| `poetry/hosted` | 197.3 | 0.4932 | 0.978 | 0.557 | slow (2.9x, 2 runs since #877) |
-| `poetry/rescan` | 138.5 | 0.3463 | 0.945 | 0.482 | OK |
-| `pipenv/hosted` | 181.4 | 0.4535 | 0.971 | 1.069 | slow (#1246) |
-| `pipenv/rescan` | 139.4 | 0.3485 | 0.981 | 0.986 | OK |
-| `pdm/hosted` | 170.1 | 0.4254 | 1.001 | 0.600 | slow (2.5x, 2 runs since #877) |
-| `pdm/rescan` | 139.1 | 0.3478 | 0.829 | 0.489 | OK |
-| `hatch/hosted` | 96.3 | 0.0963 | 1.020 | 1.111 | regressed, week +19.3% confirmed (ledger) |
-| `hatch/rescan` | 94.9 | 0.0949 | 0.969 | 1.014 | OK |
-| `bundler/hosted` | 246.2 | 0.3078 | 1.033 | 1.092 | OK |
-| `bundler/rescan` | 220.0 | 0.2751 | 0.938 | 1.106 | OK |
-| `composer/hosted` | 218.7 | 0.2733 | 1.047 | 1.099 | OK |
-| `composer/rescan` | 180.7 | 0.2259 | 0.811 | 0.864 | OK |
-| `cargo/hosted` | 340.5 | 0.5675 | 1.057 | 1.038 | slow (#761) |
-| `cargo/rescan` | 325.5 | 0.5425 | 1.000 | 0.976 | slow (#761) |
-| `golang/hosted` | 141.2 | 0.1176 | 1.088 | 1.140 | OK |
-| `golang/rescan` | 101.3 | 0.0844 | 0.916 | 0.997 | OK |
-| `nuget/hosted` | 106.6 | 0.1184 | 1.056 | 0.788 | OK (fixture updated in #1250) |
-| `nuget/rescan` | 116.1 | 0.1290 | 0.871 | 0.886 | OK (faster, #1183; fixture updated in #1250) |
-| `maven/hosted` | 124.7 | 0.1247 | 1.093 | 1.102 | regressed, week +14.7% confirmed (ledger) |
-| `maven/rescan` | 87.9 | 0.0879 | 1.017 | 0.977 | OK |
-| `gradle/hosted` | 215.0 | 0.2150 | 0.954 | — | OK |
-| `gradle/rescan` | 219.7 | 0.2197 | 0.689 | — | OK |
-| `npm/dry-run` | 282.3 | 0.0941 | 0.966 | 1.100 | OK; RSS +13.4% day |
-| `npm/public-proxy` | 391.1 | 0.1304 | 1.036 | 1.060 | OK; RSS +15.2% day (ledger) |
-| `npm/latency` | 786.4 | 0.2621 | 1.002 | 1.015 | OK; RSS +15.6% day (ledger) |
+| `npm/hosted` | 230.6 | 0.0769 | 1.063 | 1.045 | OK |
+| `npm/rescan` | 188.5 | 0.0628 | 0.968 | 0.765 | OK |
+| `pnpm/hosted` | 158.2 | 0.0527 | 1.075 | 0.962 | OK |
+| `pnpm/rescan` | 147.8 | 0.0493 | 1.083 | 0.854 | OK |
+| `yarn-classic/hosted` | 486.6 | 0.1622 | 2.592 | 2.545 | regressed (#1423), +60 requests |
+| `yarn-classic/rescan` | 325.2 | 0.1084 | 2.537 | 2.159 | regressed (#1423) |
+| `yarn-berry/hosted` | 215.5 | 0.0718 | 1.101 | 0.992 | OK |
+| `yarn-berry/rescan` | 200.4 | 0.0668 | 1.154 | 0.957 | regressed day +13.6% (ledger) |
+| `bun/hosted` | 143.8 | 0.0479 | 1.010 | 0.409 | OK |
+| `bun/rescan` | 112.9 | 0.0376 | 1.140 | 0.358 | OK |
+| `bun-isolated/hosted` | 168.1 | 0.0560 | 1.089 | 0.515 | OK |
+| `bun-isolated/rescan` | 152.9 | 0.0510 | 1.150 | 0.432 | regressed day +14.0% (ledger) |
+| `vlt/hosted` | 477.4 | 0.3183 | 1.004 | 0.500 | OK |
+| `vlt/rescan` | 414.6 | 0.2764 | 1.038 | 0.488 | OK |
+| `pip/hosted` | 93.3 | 0.0933 | 0.973 | 1.026 | OK |
+| `pip/rescan` | 89.5 | 0.0895 | 1.170 | 0.992 | OK |
+| `uv/hosted` | 169.8 | 0.4246 | 0.985 | 1.002 | slow (#836) |
+| `uv/rescan` | 134.2 | 0.3356 | 1.016 | 0.956 | slow (#836) |
+| `pylock/hosted` | 145.0 | 0.3625 | 1.070 | 1.168 | slow (#836) |
+| `pylock/rescan` | 134.4 | 0.3360 | 1.057 | 0.878 | slow (#836) |
+| `poetry/hosted` | 129.9 | 0.3247 | 0.966 | 0.556 | slow (#760) |
+| `poetry/rescan` | 93.7 | 0.2342 | 0.956 | 0.459 | OK |
+| `pipenv/hosted` | 105.9 | 0.2646 | 0.998 | 1.213 | OK |
+| `pipenv/rescan` | 119.6 | 0.2991 | 0.983 | 1.011 | OK |
+| `pdm/hosted` | 115.8 | 0.2896 | 1.030 | 0.621 | OK |
+| `pdm/rescan` | 90.0 | 0.2250 | 1.117 | 0.558 | OK |
+| `hatch/hosted` | 72.8 | 0.0728 | 1.116 | 1.112 | week +11.2% (ledger; 2nd run >=10%) |
+| `hatch/rescan` | 63.0 | 0.0630 | 0.977 | 1.123 | week +12.3% (ledger) |
+| `bundler/hosted` | 172.4 | 0.2155 | 1.061 | 1.068 | OK |
+| `bundler/rescan` | 159.9 | 0.1999 | 1.051 | 1.066 | OK |
+| `composer/hosted` | 169.0 | 0.2113 | 1.027 | 1.087 | OK |
+| `composer/rescan` | 103.8 | 0.1297 | 1.064 | 0.869 | OK |
+| `cargo/hosted` | 287.9 | 0.4799 | 0.995 | 1.052 | slow (#761) |
+| `cargo/rescan` | 227.1 | 0.3785 | 0.986 | 1.042 | slow (#761) |
+| `golang/hosted` | 106.9 | 0.0891 | 1.273 | 1.250 | regressed (#1424) |
+| `golang/rescan` | 91.5 | 0.0762 | 1.455 | 1.204 | regressed (#1424) |
+| `nuget/hosted` | 117.8 | 0.1309 | 1.284 | 0.983 | regressed (#1425) |
+| `nuget/rescan` | 79.3 | 0.0881 | 1.345 | 1.039 | regressed (#1425) |
+| `maven/hosted` | 88.0 | 0.0880 | 0.880 | 0.987 | CPU +31% week, wall flat (ledger) |
+| `maven/rescan` | 74.5 | 0.0745 | 0.862 | 0.923 | CPU +22% day, wall -9% (ledger) |
+| `gradle/hosted` | 187.0 | 0.1870 | 1.123 | — | OK |
+| `gradle/rescan` | 170.4 | 0.1704 | 1.013 | — | OK |
+| `npm/dry-run` | 227.0 | 0.0757 | 1.086 | 0.959 | OK |
+| `npm/public-proxy` | 229.8 | 0.0766 | 0.985 | 1.050 | OK |
+| `npm/latency` | 674.3 | 0.2248 | 1.014 | 0.980 | OK |
 
 ## Trends
-Median `<pm>/hosted` wall time per run, oldest → newest (ms). Runners differ between runs (10-05, 10-07 and 10-09 ran on slower or noisier sandboxes), so read these as trends only. The poetry and pdm drop on 10-08 is #877. The bun drop on 10-09 is #1051. The 10-09 npm value is a noisy outlier.
+Median `<pm>/hosted` wall time per run, oldest → newest (ms). Runners differ between runs, so read these as trends only. The 10-12 yarn-classic jump is #1423.
 
-| pm | 10-02 | 10-03 | 10-04 | 10-05 | 10-06 | 10-07 | 10-08 | 10-09 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| npm | 198.6 | 204.0 | 198.3 | 296.1 | 233.5 | 439.7 | 222.4 | 514.9 |
-| pnpm | 153.6 | 180.5 | 162.1 | 234.8 | 197.4 | 216.5 | 188.2 | 313.0 |
-| yarn-classic | 179.9 | 195.4 | 166.9 | 227.5 | 181.9 | 303.1 | 199.8 | 332.8 |
-| yarn-berry | 219.5 | 228.8 | 208.6 | 293.5 | 242.0 | 412.8 | 231.0 | 312.1 |
-| bun | 289.7 | 303.6 | 321.5 | 394.6 | 297.0 | 396.5 | 350.7 | 234.0 |
-| bun-isolated | — | — | 336.6 | 392.4 | 342.4 | 465.8 | 359.2 | 218.9 |
-| vlt | 843.8 | 894.2 | 764.0 | 1109.7 | 840.0 | 1246.6 | 840.7 | 635.9 |
-| pip | 102.2 | 97.0 | 81.8 | 125.8 | 136.1 | 126.3 | 104.5 | 138.4 |
-| uv | 136.0 | 143.9 | 127.1 | 244.0 | 156.6 | 220.3 | 165.0 | 339.3 |
-| pylock | 113.6 | 142.1 | 126.2 | 179.8 | 122.1 | 194.8 | 127.8 | 213.2 |
-| poetry | 187.6 | 221.4 | 201.6 | 342.9 | 261.7 | 369.5 | 111.3 | 197.3 |
-| pipenv | 106.2 | 96.5 | 86.5 | 143.9 | 100.2 | 133.8 | 105.3 | 181.4 |
-| pdm | 180.4 | 180.5 | 162.4 | 260.3 | 193.6 | 309.5 | 133.2 | 170.1 |
-| hatch | — | — | — | — | — | 86.1 | 78.0 | 96.3 |
-| bundler | 136.0 | 180.4 | 141.5 | 205.9 | 165.6 | 204.7 | 149.9 | 246.2 |
-| composer | 122.2 | 123.0 | 115.4 | 180.8 | 122.9 | 175.7 | 136.0 | 218.7 |
-| cargo | 228.4 | 262.5 | 258.5 | 364.1 | 255.1 | 332.4 | 254.0 | 340.5 |
-| golang | 68.5 | 71.4 | 64.3 | 110.3 | 80.5 | 95.1 | 104.8 | 141.2 |
-| nuget | 90.9 | 90.1 | 87.2 | 133.3 | 91.3 | 98.5 | 73.4 | 106.6 |
-| maven | 79.3 | 81.6 | 62.0 | 87.4 | 73.5 | 98.8 | 67.8 | 124.7 |
-| gradle | — | — | — | — | 170.5 | — | 197.6 | 215.0 |
+| pm | 10-02 | 10-03 | 10-04 | 10-05 | 10-06 | 10-07 | 10-08 | 10-09 | 10-12 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| npm | 198.6 | 204.0 | 198.3 | 296.1 | 233.5 | 439.7 | 222.4 | 514.9 | 230.6 |
+| pnpm | 153.6 | 180.5 | 162.1 | 234.8 | 197.4 | 216.5 | 188.2 | 313.0 | 158.2 |
+| yarn-classic | 179.9 | 195.4 | 166.9 | 227.5 | 181.9 | 303.1 | 199.8 | 332.8 | 486.6 |
+| yarn-berry | 219.5 | 228.8 | 208.6 | 293.5 | 242.0 | 412.8 | 231.0 | 312.1 | 215.5 |
+| bun | 289.7 | 303.6 | 321.5 | 394.6 | 297.0 | 396.5 | 350.7 | 234.0 | 143.8 |
+| bun-isolated | — | — | 336.6 | 392.4 | 342.4 | 465.8 | 359.2 | 218.9 | 168.1 |
+| vlt | 843.8 | 894.2 | 764.0 | 1109.7 | 840.0 | 1246.6 | 840.7 | 635.9 | 477.4 |
+| pip | 102.2 | 97.0 | 81.8 | 125.8 | 136.1 | 126.3 | 104.5 | 138.4 | 93.3 |
+| uv | 136.0 | 143.9 | 127.1 | 244.0 | 156.6 | 220.3 | 165.0 | 339.3 | 169.8 |
+| pylock | 113.6 | 142.1 | 126.2 | 179.8 | 122.1 | 194.8 | 127.8 | 213.2 | 145.0 |
+| poetry | 187.6 | 221.4 | 201.6 | 342.9 | 261.7 | 369.5 | 111.3 | 197.3 | 129.9 |
+| pipenv | 106.2 | 96.5 | 86.5 | 143.9 | 100.2 | 133.8 | 105.3 | 181.4 | 105.9 |
+| pdm | 180.4 | 180.5 | 162.4 | 260.3 | 193.6 | 309.5 | 133.2 | 170.1 | 115.8 |
+| hatch | — | — | — | — | — | 86.1 | 78.0 | 96.3 | 72.8 |
+| bundler | 136.0 | 180.4 | 141.5 | 205.9 | 165.6 | 204.7 | 149.9 | 246.2 | 172.4 |
+| composer | 122.2 | 123.0 | 115.4 | 180.8 | 122.9 | 175.7 | 136.0 | 218.7 | 169.0 |
+| cargo | 228.4 | 262.5 | 258.5 | 364.1 | 255.1 | 332.4 | 254.0 | 340.5 | 287.9 |
+| golang | 68.5 | 71.4 | 64.3 | 110.3 | 80.5 | 95.1 | 104.8 | 141.2 | 106.9 |
+| nuget | 90.9 | 90.1 | 87.2 | 133.3 | 91.3 | 98.5 | 73.4 | 106.6 | 117.8 |
+| maven | 79.3 | 81.6 | 62.0 | 87.4 | 73.5 | 98.8 | 67.8 | 124.7 | 88.0 |
+| gradle | — | — | — | — | 170.5 | — | 197.6 | 215.0 | 187.0 |
 
 ## Open issues and PR
-- #578: Perf regression: bun/hosted wall +110% (1169ae68, #472). Recovered today: -53% day, ≈ vs pre-#472. It closes after a 2nd run within 5%. #1009 (bun fixes) is still open.
-- #1246 (**new**): Slow scan: pipenv. Flagged in 3 consecutive runs. Hot spot: `redirect::pipenv::entries`, 61%.
-- #761: Slow scan: cargo.
-- #836: Slow scan: uv/pylock.
-- #993: closed (npm drift; #1008 merged). Today npm/hosted is ≈ day and week, and npm/dry-run's wall did not confirm.
-- #579 (closed): the vlt #472 cost is accepted. Most of it is gone today.
+- **#1423** (new): Perf regression: yarn-classic/hosted wall +165% (`5096c41a`, #1328). Hot spot: `hosted::engine::classic_locks_registry_copy`, which runs `scan_blocks` per dep (61% Ir).
+- **#1424** (new): Perf regression: golang/rescan wall +34% (`1d523d30`, #1403). Hot spot: `GoSumEditor::zip_versions` per dep (30% Ir).
+- **#1425** (new): Perf regression: nuget/rescan wall +31% (#1340/#1341 candidates). Hot spot: `presence::groups_present` in `engine::confirm` (35% Ir), and `project.assets.json` parsed 4 times.
+- #1246: Slow scan: pipenv. #836: Slow scan: uv/pylock. #761: Slow scan: cargo. #760: Slow scan: poetry. #762: Slow scan: pdm.
+- #578 (bun) and #993 (npm drift): **closed today**, recovered 2 runs in a row.
 - #580: Benchmark tracking.
-- **PR #1250** (`bench/refresh`): the nuget fixture gets `obj/project.assets.json`, so the suite times #1183's restore-scoped crawl.
+- **PR #1422** (`bench/refresh`): serve real npm tarballs for yarn classic; allow the NuGet stale-cache warning.
 
 ## Standing slow-systems list
-A package manager is slow when its hosted ms/pkg is more than 2x the median across `*/hosted`, or when any of its scenarios takes over 500 ms (`npm/latency` is excluded). An issue opens after 3 consecutive runs, capped at 3 new issues per run. Today's 3a run was noisy, so the same ranking was cross-checked against the daily `compare` head samples (median 0.143 ms/pkg). Both put the same 7 package managers over 2x.
+A package manager is slow when its hosted ms/pkg is more than 2x the median across `*/hosted`, or when any of its scenarios takes over 500 ms (`npm/latency` is excluded). The median is inflated today by the yarn-classic regression, so the borderline package managers are noted below.
 
-| pm | x median today (3a / compare) | consecutive runs | issue | hot spot |
+| pm | x median today | consecutive runs | issue | hot spot |
 |---|---|---:|---|---|
-| uv | 4.9x / 3.9x | 8 | #836 | `PythonLockSession::rewrite` 39%: the whole lock is re-serialized per patched dep (callgrind 10-05) |
-| cargo | 3.3x / 4.9x | 8 | #761 | `formats::cargo::CargoLock::parse` inside `rewrite_cargo`, 79% (callgrind 10-04). #1205 scoped the crawl but not the rewrite |
-| pylock | 3.1x / 3.7x | 8 | #836 | Same as uv (callgrind 10-05) |
-| poetry | 2.9x / 3.3x | 2 since #877 | none | Likely the batched-rewrite and VEX lock-extract split, as for pdm (not profiled) |
-| pipenv | 2.6x / 2.8x | 3 | **#1246** | `patch::redirect::pipenv::entries` 61% inclusive (`properties` 40%): `plan()` re-tokenizes Pipfile.lock once per patch (callgrind 10-09) |
-| pdm | 2.5x / 2.9x | 2 since #877 | none | `lock_fragments::rewrite_batch` 45%, vex `pypi_locks::extract` 26% (callgrind 10-08) |
-| vlt | 2.5x / 2.9x | 8 | none (#579 accepted) | Halved today. Its two scenarios are still over 500 ms (636 / 599 ms) |
+| cargo | 2.96x | 9 | #761 | `formats::cargo::CargoLock::parse` inside `rewrite_cargo`, 79% (callgrind 10-04) |
+| uv | 2.62x | 9 | #836 | `PythonLockSession::rewrite` 39%: the lock is re-serialized per patched dep (callgrind 10-05) |
+| pylock | 2.23x | 9 | #836 | Same as uv |
+| poetry | 2.00x | 3 since #877 | #760 | Not re-profiled. Likely the batched-rewrite and VEX lock-extract split, as for pdm |
+| vlt | 1.96x (under) | was 8 | none (#579 accepted) | Just under 2x today. vlt/hosted is 477 ms, under 500 ms |
+| pdm | 1.79x (under) | was 3 | #762 | `lock_fragments::rewrite_batch` 45% (callgrind 10-08) |
+| pipenv | 1.63x (under) | was 4 | #1246 | `redirect::pipenv::entries` 61% (callgrind 10-09) |
 
-If poetry and pdm are still over 2x tomorrow, that's their 3rd run since #877 and each gets an issue. No scenario's peak RSS is above 2x the median (34.2 MiB). Scenarios over 500 ms: vlt/hosted and vlt/rescan (npm/hosted's 515 ms in the 3a run is noise; it was about 330 ms in every `compare`).
+No scenario's peak RSS is above 2x the median (37.5 MiB). No scenario is over 500 ms other than npm/latency.
 
 ## Coverage-gap backlog
-New since 10-08 (from `ea097142..f3c6313a`):
-- **Covered by #1250:** NuGet restore-scoped crawl (#1183).
-- **Cargo.lock-scoped crawl** (#1205): already exercised. The fixture has a `Cargo.lock` and no `vendor/`, so it takes the new lookup. Uncovered: extra crates in `~/.cargo/registry` that the lock doesn't name (the scope's whole point), which would need a fixture change that the base can't validate.
-- **Non-UTF-8 requirements files** (#1152): Latin-1 with a PEP 263 coding line, or UTF-16 with a BOM. Uncovered.
-- **Gem lock re-sort on re-scan** (#1190): a superseding patch or rotated grant moves a GEM section. The rescan only covers the same grant. Uncovered.
+New since 10-09 (from `f3c6313a..17793173`):
+- **Covered by #1422:** yarn classic served-tarball manifest check (#1328, #558/#591), and the NuGet stale global-packages warning (#1344).
+- **Maven reactor / multi-module hosted** (#1349, #261): the maven fixture is single-module.
+- **NuGet member and named locks** (#1340) and **inherited nuget.config sources** (#1341): the fixture has one project and one config.
+- **Go workspaces:** `go.work` replaces (#1393) and pre-1.17 graphs that select unselected versions (#1403, #509). The golang fixture is a single go ≥ 1.17 module.
+- **uv workspace member dir** scans (#1335), and **Pipenv/uv vendored pylock co-wiring** (#1399, #1390).
+- **Yarn berry pin beside a later registry entry** (#1397).
+- **OS trust store / SSL_CERT_FILE** (#1326): the mock is plain HTTP, so TLS setup isn't timed.
 
-Carried over:
-- **Yarn classic offline mirror** (#1083), **multi-lockfile governance** (#1044) and **patch-generation re-pin** (#1035).
-- **Hatch variants:** `[tool.hatch.envs]` in pyproject only, hatch + `requirements.txt`, uv-installer refusal.
-- **Gradle variants:** Kotlin DSL, multi-project builds, version catalogs, `verification-metadata.xml`, `mavenLocal()` (#646).
-- **Yarn 4 pnpm linker** (#496); **yarn berry re-pin of `__archiveUrl` pins** (#465).
-- **bun.lockb** binary lockfile (#472); **bundled copies** (`redirect_*_bundled_instance_skipped`, #472/#669).
-- **pnpm global store / modulesDir store** (#829, #698); **vlt 1.3 brotli lock nodes** (#820).
-- **Python env discovery:** `UV_PROJECT_ENVIRONMENT` / PDM venvs (#540), `.egg-info` (#452), Poetry `envs.toml` (#527), lock-only `requirements.txt` (#530).
-- **pnpm-workspace.yaml append** (#414): the non-fresh-file case.
-- **Gemfile multi-layer `.bundle/config`** (#532, #577), `gems.locked` (#750), Bundler 4 standalone (#797).
-- **Suite runtime:** a full `compare` takes 16–22 min on a 4 vCPU sandbox. Before more scenarios land, shrink something, e.g. fewer `--runs` for the npm family's `*/rescan` twins, or merge `bun/rescan` into `bun-isolated/rescan`.
-- deno: no hosted rewrite, so no scenario is needed.
+Carried over: non-UTF-8 requirements (#1152); gem section re-sort on re-scan (#1190); yarn classic offline mirror (#1083); multi-lockfile governance (#1044); Hatch and Gradle variants; Yarn 4 pnpm linker (#496); bun.lockb (#472); pnpm global store (#829, #698); vlt brotli lock nodes (#820); Python env discovery variants (#540, #452, #527, #530); Gemfile multi-layer `.bundle/config` (#532, #577). deno has no hosted rewrite, so it needs no scenario.
+
+**Suite runtime:** the full daily `compare` took 16.5 min (15 pairs, 45 scenarios, 9 confirmation rounds), still over the ~12-minute budget. Before adding scenarios, shrink something, e.g. fewer `--runs` for the npm family's `*/rescan` twins.
 
 ## Stale / redundant scenarios
-None removed. #1031 removed `scan --apply/--vendor`, and no scenario used them. Merging hosted/rescan pairs needs 14+ days of history; there are 8 days so far. Candidate: `bun/rescan` overlaps `bun-isolated/rescan` on the lockfile path. Both moved together today (-62% / -56%).
+None removed. No scenario uses `--download-mode` (#1049 removed it). Merging the hosted/rescan pairs needs 14+ days of history; there are 9 runs so far. Candidate: `bun/rescan` and `bun-isolated/rescan` moved together again today (+14.0% vs +15.0% day; only bun-isolated crossed the gate).
 
 ---
 _Generated by [Claude Code](https://claude.ai/code)_
