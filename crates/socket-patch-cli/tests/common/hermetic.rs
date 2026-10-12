@@ -88,9 +88,8 @@ pub fn binary_command() -> Command {
     command(Path::new(env!("CARGO_BIN_EXE_socket-patch")))
 }
 
-/// A `Command` for the package-manager tool `name` on `PATH`, resolved the
-/// way the CLI resolves its own tools (every `PATHEXT` extension on
-/// Windows). npm and Node install `pnpm`, `corepack` and `npm` as `.cmd`
+/// A `Command` for the package-manager tool `name` on `PATH`, resolved with
+/// the CLI's `resolve_tool` (every `PATHEXT` extension on Windows). npm and Node install `pnpm`, `corepack` and `npm` as `.cmd`
 /// shims there, and a bare `Command::new("corepack")` only finds
 /// `corepack.exe`, so the pnpm suites' probes reported the tool missing and
 /// every Windows test skipped. A tool that isn't on `PATH` keeps the bare

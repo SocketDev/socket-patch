@@ -306,8 +306,18 @@ class PnpmRequiredGate(unittest.TestCase):
         for suite in sorted(self.suites):
             with self.subTest(suite=suite):
                 src = (TESTS / f"{suite}.rs").read_text(encoding="utf-8")
-                self.assertNotRegex(src, r'Command::new\("(pnpm|corepack|npm)"\)')
-                self.assertNotIn('has_command("pnpm")', src)
+                self.assertNotRegex(src, r'Command::new\("(pnpm|corepack|npm)(\.cmd)?"\)')
+                if "fn has_command(" in src:
+                    # A suite-local probe must resolve shims itself...
+                    local = src[src.index("fn has_command("):]
+                    self.assertIn("hermetic::tool_command(cmd)", local[:local.index("\n}\n")])
+                else:
+                    # ...and `common::has_command` does not.
+                    self.assertNotRegex(src, r'has_command\("(pnpm|corepack|npm)"\)')
+        # `pnpm_run` goes through the shared runner.
+        common = (TESTS / "common" / "mod.rs").read_text(encoding="utf-8")
+        runner = common[common.index("fn run_toolchain("):]
+        self.assertIn("hermetic::tool_command(exe)", runner[:runner.index("\n}\n")])
 
     def test_every_gated_suite_honours_the_gate(self):
         for suite in sorted(self.suites):

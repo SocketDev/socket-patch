@@ -45,9 +45,11 @@ fn pnpm_required() -> bool {
     std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some_and(|v| !v.is_empty())
 }
 
-/// pnpm is on `PATH`. Probed through [`hermetic::tool_command`]: on Windows
-/// pnpm is the `pnpm.cmd` shim `npm install -g` writes, which
-/// `common::has_command`'s bare `Command::new` never finds.
+/// `pnpm --version` succeeds. Probed through [`hermetic::tool_command`]: on
+/// Windows pnpm is the `pnpm.cmd` shim `npm install -g` writes, which
+/// `common::has_command`'s bare `Command::new` never finds. The exit status
+/// counts too, since a resolved `.cmd` spawns through `cmd.exe` even when
+/// the shim itself is broken.
 fn has_pnpm() -> bool {
     let mut probe = hermetic::tool_command("pnpm");
     probe.arg("--version");
@@ -56,7 +58,7 @@ fn has_pnpm() -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .is_ok_and(|s| s.success())
 }
 
 /// Print the SKIP line for a missing pnpm, or panic under [`pnpm_required`].
