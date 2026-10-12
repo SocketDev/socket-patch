@@ -45,6 +45,7 @@ impl RubyCrawler {
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         Ok(Self::gem_paths_and_discovery(
             options,
+            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
             std::env::var_os("BUNDLE_PATH").as_deref(),
             ambient_path_system_env().as_deref(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
@@ -71,6 +72,7 @@ impl RubyCrawler {
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         Ok(Self::gem_paths_and_discovery(
             options,
+            None,
             bundle_path_env,
             None,
             app_config_env,
@@ -88,6 +90,7 @@ impl RubyCrawler {
     /// (`skipped_config_path`) does not probe the roots a second time.
     async fn gem_paths_and_discovery(
         options: &CrawlerOptions,
+        gemfile_env: Option<&OsStr>,
         bundle_path_env: Option<&OsStr>,
         path_system_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
@@ -105,6 +108,7 @@ impl RubyCrawler {
         // Local mode: probe the Bundler install roots first.
         let discovery = Self::discover_bundle_stores_impl(
             &options.cwd,
+            gemfile_env,
             bundle_path_env,
             path_system_env,
             app_config_env,
@@ -132,7 +136,9 @@ impl RubyCrawler {
         // `Gem.path`, and a gem the project loads routinely lives in a
         // non-`gemdir` home (rvm keeps shared gems in the `@global` gemset;
         // `--user-install` puts them under `~/.gem`/`$XDG_DATA_HOME`).
-        if !discovery.default_root_has_stores && Self::has_bundler_manifest(&options.cwd).await {
+        if !discovery.default_root_has_stores
+            && (discovery.bundler_root.is_some() || Self::has_bundler_manifest(&options.cwd).await)
+        {
             let mut seen: HashSet<PathBuf> = paths.iter().cloned().collect();
             for gems_dir in Self::gem_env_gems_dirs().await {
                 if seen.insert(gems_dir.clone()) {
@@ -162,6 +168,7 @@ impl RubyCrawler {
 
         let (gem_paths, discovery) = Self::gem_paths_and_discovery(
             options,
+            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
             std::env::var_os("BUNDLE_PATH").as_deref(),
             ambient_path_system_env().as_deref(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
@@ -388,6 +395,7 @@ impl RubyCrawler {
     /// shadows nothing. (Callers already drop `global_config` then.)
     async fn discover_bundle_stores_impl(
         cwd: &Path,
+        gemfile_env: Option<&OsStr>,
         bundle_path_env: Option<&OsStr>,
         path_system_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
@@ -396,6 +404,25 @@ impl RubyCrawler {
         ignore_config: bool,
     ) -> BundleStoreDiscovery {
         let home = home_env.map(Path::new);
+        // Every root below is relative to `Bundler.root`, which a
+        // `BUNDLE_GEMFILE` naming a gemfile in another directory moves
+        // there (#952): the app config, a relative `BUNDLE_PATH`, the
+        // standalone and default stores all follow it. A configured
+        // gemfile that exists also makes this a Ruby project for the
+        // gates below, whatever the project root itself holds.
+        let bundler_root = bundler_moved_root(
+            cwd,
+            BundlerEnv {
+                gemfile: gemfile_env,
+                lockfile: None,
+                app_config: app_config_env,
+                ignore_config,
+                global_config,
+            },
+        )
+        .await;
+        let has_manifest = bundler_root.is_some() || Self::has_bundler_manifest(cwd).await;
+        let cwd = bundler_root.as_deref().unwrap_or(cwd);
         let default_root = cwd.join("vendor").join("bundle");
         let default_root = normalize_lexically(&default_root).unwrap_or(default_root);
 
@@ -407,7 +434,7 @@ impl RubyCrawler {
         // copy lives (#915). Gated like the explicit roots: config only
         // counts for a Ruby project. (A recorded local path never coexists
         // with it: [`parse_bundle_config_path`] already drops it.)
-        let path_tier = if Self::has_bundler_manifest(cwd).await {
+        let path_tier = if has_manifest {
             Self::bundler_path_tier(
                 cwd,
                 bundle_path_env,
@@ -425,7 +452,7 @@ impl RubyCrawler {
         let mut roots: Vec<PathBuf> = Vec::new();
         let mut skipped_config_path = None;
         let mut skipped_config_root = None;
-        if Self::has_bundler_manifest(cwd).await {
+        if has_manifest {
             if let Some(value) =
                 Self::app_config_bundle_path(cwd, app_config_env, ignore_config, home).await
             {
@@ -522,6 +549,7 @@ impl RubyCrawler {
             default_root_has_stores,
             skipped_config_path,
             skipped_config_root,
+            bundler_root,
         }
     }
 
@@ -534,6 +562,7 @@ impl RubyCrawler {
     pub async fn discover_bundle_stores(cwd: &Path) -> BundleStoreDiscovery {
         Self::discover_bundle_stores_impl(
             cwd,
+            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
             std::env::var_os("BUNDLE_PATH").as_deref(),
             ambient_path_system_env().as_deref(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
@@ -556,6 +585,7 @@ impl RubyCrawler {
     ) -> BundleStoreDiscovery {
         Self::discover_bundle_stores_impl(
             cwd,
+            None,
             bundle_path_env,
             None,
             app_config_env,
@@ -583,6 +613,7 @@ impl RubyCrawler {
         );
         Self::discover_bundle_stores_impl(
             cwd,
+            None,
             bundle_path_env,
             path_system_env,
             None,
@@ -609,6 +640,7 @@ impl RubyCrawler {
     pub async fn verification_only_gem_paths(&self, options: &CrawlerOptions) -> Vec<PathBuf> {
         self.verification_only_gem_paths_with_env(
             options,
+            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
             std::env::var_os("BUNDLE_PATH").as_deref(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
@@ -624,6 +656,7 @@ impl RubyCrawler {
     pub async fn verification_only_gem_paths_with_env(
         &self,
         options: &CrawlerOptions,
+        gemfile_env: Option<&OsStr>,
         bundle_path_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
         home_env: Option<&OsStr>,
@@ -639,6 +672,7 @@ impl RubyCrawler {
         // config root this reads, so the env flag is not needed here.
         let discovery = Self::discover_bundle_stores_impl(
             &options.cwd,
+            gemfile_env,
             bundle_path_env,
             None,
             app_config_env,
@@ -725,13 +759,15 @@ impl RubyCrawler {
     /// ([`Self::bundler_install_homes`]) and `vex`
     /// ([`Self::bundler_unused_system_gem_homes`]) use.
     async fn bundler_uses_system_gems(cwd: &Path, discovery: &BundleStoreDiscovery) -> bool {
-        if discovery.default_root_has_stores || !Self::has_bundler_manifest(cwd).await {
+        if discovery.default_root_has_stores
+            || (discovery.bundler_root.is_none() && !Self::has_bundler_manifest(cwd).await)
+        {
             return false;
         }
         let ignore_config = bundler_ignores_config();
         !bundler_sets_explicit_path(BundlerPathTiers {
             local: read_app_config(
-                cwd,
+                discovery.bundler_root.as_deref().unwrap_or(cwd),
                 std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
                 ignore_config,
             )
@@ -1416,6 +1452,10 @@ pub struct BundleStoreDiscovery {
     /// normalized). Never a write target: only
     /// [`RubyCrawler::verification_only_gem_paths`] probes it, read-only.
     pub skipped_config_root: Option<PathBuf>,
+    /// `Bundler.root` when the configured `BUNDLE_GEMFILE` moves it out of
+    /// the project root ([`bundler_moved_root`]); every root above was
+    /// probed under it. `None` when Bundler's root is the project root.
+    pub bundler_root: Option<PathBuf>,
 }
 
 /// The stable warning `(code, detail)` for a config-sourced `BUNDLE_PATH`
@@ -1808,6 +1848,45 @@ pub async fn bundler_loaded_manifest_with_env(
         global.and_then(manifest::config_lockfile).as_deref(),
         gems_rb_present,
     )
+}
+
+/// `Bundler.root` when the configured `BUNDLE_GEMFILE` moves it out of
+/// `root`, else `None`. Bundler's root is the directory of the gemfile it
+/// loads (`SharedHelpers#root`), so a gemfile in another directory (the
+/// Appraisal layout, `BUNDLE_GEMFILE=gemfiles/rails_7.gemfile`) makes
+/// Bundler read that directory's `.bundle/config` and resolve a relative
+/// bundle path against it (#952). Only an existing file moves the root:
+/// Bundler refuses a missing gemfile, so nothing installs from there.
+///
+/// The env and global config values are the user's own machine state; a
+/// value from the app config is project input, so it only moves the root
+/// to a directory inside `root`: the moved root's stores become apply
+/// write targets.
+pub(crate) async fn bundler_moved_root(root: &Path, env: BundlerEnv<'_>) -> Option<PathBuf> {
+    use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
+    let LoadedManifest::Unsupported { value, by } =
+        bundler_loaded_manifest_with_env(root, env).await
+    else {
+        return None;
+    };
+    let absolute = |p: &Path| {
+        std::path::absolute(p)
+            .ok()
+            .and_then(|p| normalize_lexically(&p))
+    };
+    let gemfile = absolute(&root.join(&value))?;
+    let is_file = tokio::fs::metadata(&gemfile)
+        .await
+        .is_ok_and(|m| m.is_file());
+    let dir = gemfile.parent().filter(|_| is_file)?;
+    let here = absolute(root)?;
+    if dir == here || same_file::is_same_file(dir, &here).unwrap_or(false) {
+        return None;
+    }
+    if by == GemfileSetting::AppConfig && !dir.starts_with(&here) {
+        return None;
+    }
+    Some(dir.to_path_buf())
 }
 
 /// The Bundler mirror setting that captures one of the patch-registry
@@ -2311,6 +2390,75 @@ async fn bundle_config_dir_reading(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #952: only an existing gemfile in another directory moves
+    /// `Bundler.root`; one in the project root, a missing file, or an app
+    /// config value (project input) naming a directory outside the
+    /// project leaves discovery at the project root.
+    #[tokio::test]
+    async fn moved_root_follows_an_existing_gemfile_in_another_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let outside = tmp.path().join("elsewhere");
+        for dir in [root.join("gemfiles"), outside.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for file in [
+            root.join("Gemfile"),
+            root.join("Gemfile.next"),
+            root.join("gemfiles/alt.gemfile"),
+            outside.join("Gemfile"),
+        ] {
+            std::fs::write(file, "gem \"foo\"\n").unwrap();
+        }
+        let moved = |gemfile: Option<&'static str>| {
+            let root = root.clone();
+            async move {
+                bundler_moved_root(
+                    &root,
+                    BundlerEnv {
+                        gemfile: gemfile.map(OsStr::new),
+                        ..BundlerEnv::default()
+                    },
+                )
+                .await
+            }
+        };
+        let gemfiles = std::path::absolute(root.join("gemfiles")).unwrap();
+        assert_eq!(
+            moved(Some("gemfiles/alt.gemfile")).await,
+            Some(gemfiles.clone())
+        );
+        assert_eq!(
+            moved(Some("./gemfiles/../gemfiles/alt.gemfile")).await,
+            Some(gemfiles.clone())
+        );
+        assert_eq!(moved(None).await, None);
+        assert_eq!(moved(Some("Gemfile")).await, None);
+        assert_eq!(moved(Some("Gemfile.next")).await, None);
+        assert_eq!(moved(Some("gemfiles/missing.gemfile")).await, None);
+        assert_eq!(moved(Some("gemfiles")).await, None, "a directory");
+        // The user's own environment may point anywhere.
+        assert_eq!(
+            moved(Some("../elsewhere/Gemfile")).await,
+            Some(std::path::absolute(&outside).unwrap())
+        );
+
+        // A committed app config may move the root inside the project
+        // only: the moved root's stores become apply write targets.
+        std::fs::create_dir_all(root.join(".bundle")).unwrap();
+        for (value, expected) in [
+            ("gemfiles/alt.gemfile", Some(gemfiles.clone())),
+            ("../elsewhere/Gemfile", None),
+        ] {
+            std::fs::write(
+                root.join(".bundle/config"),
+                format!("---\nBUNDLE_GEMFILE: \"{value}\"\n"),
+            )
+            .unwrap();
+            assert_eq!(moved(None).await, expected, "{value}");
+        }
+    }
 
     #[tokio::test]
     async fn loaded_manifest_reads_the_app_config_file() {
@@ -4168,7 +4316,7 @@ mod tests {
             discovery.stores
         );
         let verify = crawler
-            .verification_only_gem_paths_with_env(&options, None, None, None, None, false)
+            .verification_only_gem_paths_with_env(&options, None, None, None, None, None, false)
             .await;
         let gems = normalize_lexically(&gems).unwrap();
         assert_eq!(verify, vec![gems.clone()]);
@@ -4190,6 +4338,7 @@ mod tests {
                 &options,
                 None,
                 None,
+                None,
                 Some(outside.path().as_os_str()),
                 None,
                 false,
@@ -4204,6 +4353,7 @@ mod tests {
                 &options,
                 None,
                 None,
+                None,
                 Some(outside.path().as_os_str()),
                 None,
                 true,
@@ -4216,6 +4366,7 @@ mod tests {
         let verify = crawler
             .verification_only_gem_paths_with_env(
                 &options,
+                None,
                 Some(outside.path().as_os_str()),
                 None,
                 Some(outside.path().as_os_str()),
@@ -4231,7 +4382,7 @@ mod tests {
             ..options
         };
         assert!(crawler
-            .verification_only_gem_paths_with_env(&global, None, None, None, None, false)
+            .verification_only_gem_paths_with_env(&global, None, None, None, None, None, false)
             .await
             .is_empty());
     }
