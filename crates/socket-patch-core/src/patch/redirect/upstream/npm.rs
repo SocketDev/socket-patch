@@ -2745,6 +2745,43 @@ mod tests {
     };
     use crate::patch::redirect::upstream::client::NpmDist;
 
+    /// #1220: a restore with many npm pins never has more lookups in
+    /// flight than `registry_concurrency()`, and still runs them
+    /// concurrently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restore_lookups_never_exceed_the_registry_cap() {
+        use crate::patch::redirect::upstream::client::{peak_server::PeakServer, UpstreamClient};
+        use crate::patch::redirect::upstream::{Ctx, FormatResult};
+        let server = PeakServer::start(
+            r#"{"dist":{"tarball":"http://registry.test/x.tgz"}}"#,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        let client = UpstreamClient::new(false);
+        let ctx = Ctx {
+            client: &client,
+            origins: &[],
+            bun_lockb: false,
+        };
+        let wanted: std::collections::BTreeSet<(String, String, String)> = (0..40)
+            .map(|i| (format!("uuid-{i}"), format!("pkg{i}"), "1.0.0".to_string()))
+            .collect();
+        let mut result = FormatResult::default();
+        let base = server.base.clone();
+        let dists = super::fetch_dists_on(&wanted, |_| Some(base.clone()), &ctx, &mut result).await;
+        assert!(result.refused.is_empty(), "{:?}", result.refused);
+        assert_eq!(dists.len(), 40);
+        assert!(dists.values().all(|d| d.from_project));
+        assert_eq!(server.requests(), 40);
+        let cap = crate::utils::concurrent::registry_concurrency();
+        assert!(server.peak() <= cap, "peak {} > cap {cap}", server.peak());
+        // Still concurrent, not serial: a slow runner may not line up
+        // every slot at once, so this only asks for overlap.
+        if cap > 1 {
+            assert!(server.peak() > 1, "the restore ran serially");
+        }
+    }
+
     /// #1435: what still declares a descriptor the hosted restore keys
     /// the registry entry by.
     #[test]

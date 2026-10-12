@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 use crate::vendor::registry_fetch::{
     build_registry_client, npm_registry_base, pypi_json_api_base, RegistryClient,
@@ -164,8 +164,18 @@ type RegistryCache<T> = Mutex<HashMap<(String, Option<String>, String, String), 
 
 /// One client per restore run; every lookup is cached (success and
 /// failure alike) so a pin wired in several files costs one request.
+///
+/// The restorers start every pin's lookup at once (`join_all`), so the cap
+/// on requests in flight lives here, at the one place they are sent: each
+/// request holds a [`Self::permits`] slot from send to the end of its body
+/// (#1220).
 pub(crate) struct UpstreamClient {
     http: RegistryClient,
+    /// At most [`crate::utils::concurrent::registry_concurrency`] requests
+    /// in flight at once. Every request this client sends takes a slot: the
+    /// public registries, a project's private registry or mirror, and the
+    /// patch service's upstream checksum metadata alike.
+    permits: Semaphore,
     offline: bool,
     npm: RegistryCache<NpmDist>,
     npm_berry: Cache<String>,
@@ -179,8 +189,14 @@ pub(crate) struct UpstreamClient {
 
 impl UpstreamClient {
     pub(crate) fn new(offline: bool) -> Self {
+        Self::with_concurrency(offline, crate::utils::concurrent::registry_concurrency())
+    }
+
+    /// [`Self::new`] with at most `limit` requests in flight (0 counts as 1).
+    pub(crate) fn with_concurrency(offline: bool, limit: usize) -> Self {
         UpstreamClient {
             http: build_registry_client(),
+            permits: Semaphore::new(limit.max(1)),
             offline,
             npm: Mutex::default(),
             npm_berry: Mutex::default(),
@@ -191,6 +207,21 @@ impl UpstreamClient {
             pypi: Mutex::default(),
             nuget: Mutex::default(),
         }
+    }
+
+    /// A slot to send one request in. The semaphore is never closed, so
+    /// the wait always ends in a permit.
+    async fn permit(&self) -> SemaphorePermit<'_> {
+        self.permits
+            .acquire()
+            .await
+            .expect("the upstream request semaphore is never closed")
+    }
+
+    /// `url`'s bytes, sent under a [`Self::permit`].
+    async fn download(&self, url: &str) -> Result<Vec<u8>, String> {
+        let _permit = self.permit().await;
+        crate::vendor::registry_fetch::download(&self.http, url).await
     }
 
     async fn get_json(&self, url: &str) -> Result<Value, String> {
@@ -205,6 +236,7 @@ impl UpstreamClient {
         url: &str,
         authorization: Option<&str>,
     ) -> Result<Value, String> {
+        let _permit = self.permit().await;
         let mut request = self.http.get(url).header("accept", "application/json");
         if let Some(authorization) = authorization {
             let mut value =
@@ -230,7 +262,7 @@ impl UpstreamClient {
     }
 
     async fn get_text(&self, url: &str) -> Result<String, String> {
-        let bytes = crate::vendor::registry_fetch::download(&self.http, url).await?;
+        let bytes = self.download(url).await?;
         String::from_utf8(bytes).map_err(|_| format!("{url} is not UTF-8"))
     }
 
@@ -352,8 +384,7 @@ impl UpstreamClient {
                 .as_deref()
                 .is_some_and(|s| s.split_whitespace().any(|v| v == integrity))
             {
-                let bytes =
-                    crate::vendor::registry_fetch::download(&self.http, &dist.tarball).await?;
+                let bytes = self.download(&dist.tarball).await?;
                 crate::vendor::registry_fetch::verify_sri(&bytes, integrity)?;
                 if let Some(sri) = dist.integrity.as_deref() {
                     crate::vendor::registry_fetch::verify_sri(&bytes, sri)?;
@@ -474,11 +505,9 @@ impl UpstreamClient {
             let escaped = crate::crawlers::go_crawler::encode_module_path(module);
             let escaped_version = crate::crawlers::go_crawler::encode_module_path(version);
             let base = format!("{proxy}/{escaped}/@v/{escaped_version}");
-            let zip =
-                crate::vendor::registry_fetch::download(&self.http, &format!("{base}.zip")).await?;
+            let zip = self.download(&format!("{base}.zip")).await?;
             let zip_h1 = crate::vendor::registry_fetch::go_h1_of_zip(&zip)?;
-            let go_mod =
-                crate::vendor::registry_fetch::download(&self.http, &format!("{base}.mod")).await?;
+            let go_mod = self.download(&format!("{base}.mod")).await?;
             Ok(GoSums {
                 zip_h1,
                 mod_h1: go_mod_h1(&go_mod),
@@ -587,7 +616,7 @@ impl UpstreamClient {
                 "{}/v3-flatcontainer/{id_seg}/{version_seg}/{id_seg}.{version_seg}.nupkg",
                 nuget_api_base(),
             );
-            let bytes = crate::vendor::registry_fetch::download(&self.http, &url).await?;
+            let bytes = self.download(&url).await?;
             crate::formats::nuget::package::package_content_hash(&bytes)
                 .map_err(|why| format!("{url}: {why}"))
         }
@@ -699,9 +728,114 @@ impl UpstreamClient {
     }
 }
 
+/// A local registry that counts how many requests it holds open at once
+/// (#1220). Each request is answered after a fixed delay with the same
+/// JSON body, over HTTP/1.1 keep-alive, so a client that pipelines several
+/// requests per connection is counted as accurately as one that opens a
+/// connection per request.
+#[cfg(test)]
+pub(crate) mod peak_server {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    pub(crate) struct PeakServer {
+        pub base: String,
+        requests: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl PeakServer {
+        pub(crate) async fn start(body: &'static str, delay: Duration) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let live = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let (l, p, r) = (live.clone(), peak.clone(), requests.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (live, peak, requests) = (l.clone(), p.clone(), r.clone());
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            // One request: a GET has no body, so its head
+                            // ends the request.
+                            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                match sock.read(&mut chunk).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                }
+                            }
+                            let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                            buf.drain(..end + 4);
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(delay).await;
+                            live.fetch_sub(1, Ordering::SeqCst);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                 content-length: {}\r\n\r\n{body}",
+                                body.len()
+                            );
+                            if sock.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            PeakServer {
+                base,
+                requests,
+                peak,
+            }
+        }
+
+        /// How many requests the server has answered or is answering.
+        pub(crate) fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+
+        /// The most requests the server ever held open at once.
+        pub(crate) fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1220: a client built with a cap of 1 (what a tight
+    /// `RLIMIT_NOFILE` gives) sends its lookups strictly one at a time,
+    /// however many the caller starts at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cap_of_one_sends_lookups_one_at_a_time() {
+        let server = peak_server::PeakServer::start(
+            r#"{"dist":{"tarball":"http://registry.test/x.tgz"}}"#,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        let client = UpstreamClient::with_concurrency(false, 1);
+        let names: Vec<String> = (0..10).map(|i| format!("pkg{i}")).collect();
+        let lookups = names
+            .iter()
+            .map(|name| client.npm_dist_on(&server.base, name, "1.0.0"));
+        for found in futures_util::future::join_all(lookups).await {
+            found.unwrap();
+        }
+        assert_eq!(server.requests(), 10);
+        assert_eq!(server.peak(), 1);
+    }
 
     #[test]
     fn crates_index_paths_follow_cargo_layout() {
