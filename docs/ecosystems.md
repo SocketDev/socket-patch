@@ -179,7 +179,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `pnpm install --merge-git-branch-lockfiles`, then re-run. With no branch
   lock, `pnpm-lock.yaml` is the lock pnpm installs from and is pinned as usual.
   With the `lockfile` setting off (`lockfile: false` in `pnpm-workspace.yaml`
-  on pnpm 11 and newer, `lockfile=false` in `.npmrc` on pnpm 10 and older),
+  on pnpm 11 and newer, `lockfile=false` in `.npmrc` on pnpm 10 and older,
+  or npm's `package-lock=false` that pnpm falls back to),
   pnpm never reads `pnpm-lock.yaml` and installs from the registry, so hosted
   mode refuses the pnpm pins with `redirect_pnpm_lockfile_disabled` and
   lock-only `vex` attests no hosted pin from that lock. Use `--mode vendored`,

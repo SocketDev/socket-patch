@@ -3146,6 +3146,12 @@ mod tests {
         p.write(".npmrc", "lockfile=false\n");
         withheld(&run(&p).await, "`lockfile=false` in .npmrc");
 
+        // npm's `package-lock=false`, which pnpm falls back to.
+        let p = Project::new();
+        p.write("pnpm-lock.yaml", &wired);
+        p.write(".npmrc", "package-lock=false\n");
+        withheld(&run(&p).await, "`package-lock=false` in .npmrc");
+
         let p = Project::new();
         p.write(
             "pnpm-workspace.yaml",

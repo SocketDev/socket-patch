@@ -571,7 +571,8 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     })
 }
 
-/// Where pnpm's `lockfile` setting is turned off (#1074), as a refusal
+/// Where pnpm's `lockfile` setting (or the `package-lock` it falls back
+/// to, see [`lockfile_off`]) is turned off (#1074), as a refusal
 /// names it (e.g. `` `lockfile: false` in pnpm-workspace.yaml ``); `None`
 /// when it is on (the default). With it off pnpm neither reads nor writes
 /// `pnpm-lock.yaml` (or a member's own lock): `pnpm install` resolves
@@ -592,19 +593,13 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
 /// fingerprinted reader, so a re-scan read cache stays valid; a workspace
 /// member with no settings file of its own is not related to its root's.
 pub async fn lockfile_disabled(view: &ProjectView<'_>, env: bool) -> Option<String> {
-    const KEY: &str = "lockfile";
-    let off = |setting: Option<PnpmSetting>| {
-        setting
-            .filter(|setting| setting.as_bool() == Some(false))
-            .map(|setting| setting.source)
-    };
     let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
     let npmrc = view.read_text(".npmrc").await.ok();
-    let yaml = off(pnpm_setting(workspace.as_deref(), None, KEY, KEY));
-    let rc = off(pnpm_setting(None, npmrc.as_deref(), KEY, KEY));
+    let yaml = lockfile_off(|key, _| pnpm_setting(workspace.as_deref(), None, key, key));
+    let rc = lockfile_off(|_, key| pnpm_setting(None, npmrc.as_deref(), key, key));
     let env = match view {
         ProjectView::Disk(_) | ProjectView::Snapshot(_) if env => {
-            off(env_setting(KEY, |var| std::env::var(var).ok()))
+            lockfile_off(|_, key| env_setting(key, |var| std::env::var(var).ok()))
         }
         _ => None,
     };
@@ -618,6 +613,18 @@ pub async fn lockfile_disabled(view: &ProjectView<'_>, env: bool) -> Option<Stri
         None => yaml.or(rc),
     }
     .or(env)
+}
+
+/// Where one settings source turns pnpm's lock off: its `lockfile` when
+/// that reads as a boolean, else npm's `package-lock`, which every pnpm
+/// (7 through 11) falls back to for `useLockfile`. `setting` looks a key
+/// up in the source by its YAML spelling and its `.npmrc` spelling.
+fn lockfile_off(setting: impl Fn(&str, &str) -> Option<PnpmSetting>) -> Option<String> {
+    let off = |found: PnpmSetting| (found.as_bool() == Some(false)).then_some(found.source);
+    match setting("lockfile", "lockfile") {
+        Some(found) if found.as_bool().is_some() => off(found),
+        _ => setting("packageLock", "package-lock").and_then(off),
+    }
 }
 
 /// The pnpm major whose settings reading applies to the project at `view`

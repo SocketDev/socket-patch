@@ -5751,6 +5751,46 @@ snapshots:
         }
     }
 
+    /// pnpm reads `lockfile` only when it is a boolean, else falls back to
+    /// npm's `package-lock` (`useLockfile` in every pnpm 7–11): the common
+    /// npm-era `package-lock=false` turns pnpm's lock off too, unless
+    /// `lockfile=true` says otherwise.
+    #[tokio::test]
+    async fn package_lock_false_disables_the_lockfile() {
+        for (npmrc, refused) in [
+            ("package-lock=false\n", true),
+            ("lockfile=true\npackage-lock=false\n", false),
+            ("package-lock=true\n", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_branch_lock_project(tmp.path(), "packages:\n  - '.'\n", true);
+            std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+            write_rel(tmp.path(), ".npmrc", npmrc);
+            write_pinned_manifest(tmp.path(), "pnpm@10.33.0");
+            let (read, done) = member_rewrite(tmp.path()).await;
+            if refused {
+                assert_disabled_lockfile_refused(&read, &done, "`package-lock=false` in .npmrc");
+            } else {
+                assert!(
+                    done.rewrite.files.contains_key("pnpm-lock.yaml"),
+                    "{npmrc}: {:?}",
+                    done.rewrite.warnings
+                );
+            }
+        }
+        // pnpm 11+ reads the YAML spelling.
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "packageLock: false\n", true);
+        std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+        write_pinned_manifest(tmp.path(), "pnpm@11.28.5");
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_disabled_lockfile_refused(
+            &read,
+            &done,
+            "`packageLock: false` in pnpm-workspace.yaml",
+        );
+    }
+
     /// With no pnpm lock the remedy cannot be vendored mode (its pnpm
     /// backend needs a lock to wire), and an npm project's `.npmrc`
     /// `lockfile=false` is no pnpm setting at all: it keeps npm's hints.
