@@ -470,12 +470,16 @@ async fn workspace_issues(project_root: &Path, replaces: &[ReplaceEntry]) -> Vec
 }
 
 /// A directory as go matches a module root against the workspace's `use`
-/// list: absolute, with symlinks resolved when it exists, else lexically
-/// normalized.
+/// list: absolute, with symlinks resolved when it exists. A path that only
+/// exists once folded (`./x/../app` with no `x`, which go's `filepath.Join`
+/// folds) is folded lexically and then resolved, so it still matches a
+/// project under a symlinked dir (macOS `/var` -> `/private/var`).
 fn same_dir_key(dir: &Path) -> PathBuf {
     let abs = std::env::current_dir().unwrap_or_default().join(dir);
-    std::fs::canonicalize(&abs)
-        .unwrap_or_else(|_| crate::utils::relpath::normalize_lexically_keeping_escapes(&abs))
+    std::fs::canonicalize(&abs).unwrap_or_else(|_| {
+        let folded = crate::utils::relpath::normalize_lexically_keeping_escapes(&abs);
+        std::fs::canonicalize(&folded).unwrap_or(folded)
+    })
 }
 
 /// Where a replace sends the module, compared as go compares replacements
@@ -927,6 +931,26 @@ mod tests {
                 "go.work",
                 &format!("go 1.21\n\nuse (\n\t{use_dir}\n)\n"),
             );
+            assert_eq!(audit(&root, &none).await, vec![], "{use_dir}");
+        }
+    }
+
+    /// A workspace reached through a symlink (macOS temp dirs live under
+    /// `/var` -> `/private/var`) still counts the project as a member when
+    /// the `use` path only exists once folded (`./x/../app`, no `x`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_work_member_matches_through_a_symlinked_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let ws = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &ws).unwrap();
+        let root = ws.join("app");
+        consumer(&root, REPLACE);
+        let none = HashMap::new();
+        for use_dir in ["./app", "./x/../app"] {
+            write(&ws, "go.work", &format!("go 1.21\n\nuse {use_dir}\n"));
             assert_eq!(audit(&root, &none).await, vec![], "{use_dir}");
         }
     }
