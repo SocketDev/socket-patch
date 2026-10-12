@@ -463,12 +463,15 @@ async fn workspace_issues(project_root: &Path, replaces: &[ReplaceEntry]) -> Vec
 }
 
 /// A directory as go matches a module root against the workspace's `use`
-/// list: absolute, with symlinks resolved when it exists, else lexically
-/// normalized.
+/// list: absolute and lexically normalized (go's `filepath.Join` folds
+/// `x/../app` even when `x` does not exist), then with symlinks resolved
+/// when it exists. Folding first keeps `./x/../app` comparable with the
+/// project under a symlinked temp dir (macOS `/var` -> `/private/var`).
 fn same_dir_key(dir: &Path) -> PathBuf {
-    let abs = std::env::current_dir().unwrap_or_default().join(dir);
-    std::fs::canonicalize(&abs)
-        .unwrap_or_else(|_| crate::utils::relpath::normalize_lexically_keeping_escapes(&abs))
+    let abs = crate::utils::relpath::normalize_lexically_keeping_escapes(
+        &std::env::current_dir().unwrap_or_default().join(dir),
+    );
+    std::fs::canonicalize(&abs).unwrap_or(abs)
 }
 
 /// Where a replace sends the module, compared as go compares replacements
