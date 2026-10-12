@@ -115,13 +115,23 @@ pub(crate) async fn mode_from_project_state(
             manifest_path.display(),
         )),
         (true, false) => {
-            let pins = socket_patch_core::patch::redirect::upstream::HostedPin::recorded(
-                &discover_wiring(common, &project_root).await,
-            );
-            if pins.is_empty() {
+            // Lockless cargo/nuget pins are never refs, so
+            // `HostedPin::recorded` drops them; they are hosted state too.
+            let discovery = discover_wiring(common, &project_root).await;
+            let mut purls: Vec<String> =
+                socket_patch_core::patch::redirect::upstream::HostedPin::recorded(&discovery)
+                    .into_iter()
+                    .map(|pin| pin.purl)
+                    .chain(
+                        discovery
+                            .unlocked_pins
+                            .iter()
+                            .map(|pin| format!("pkg:{}/{}", pin.ecosystem, pin.name)),
+                    )
+                    .collect();
+            if purls.is_empty() {
                 return Ok(scan::ScanMode::Vendored);
             }
-            let mut purls: Vec<&str> = pins.iter().map(|pin| pin.purl.as_str()).collect();
             purls.sort_unstable();
             purls.dedup();
             let more = purls.len().saturating_sub(3);
@@ -131,7 +141,7 @@ pub(crate) async fn mode_from_project_state(
                 named.push_str(&format!(" and {more} more"));
             }
             Err(format!(
-                "{} holds both hosted pins in its lockfiles ({named}) and vendored \
+                "{} holds both hosted pins in its dependency files ({named}) and vendored \
                  patches (.socket/vendor/state.json): pass --mode hosted, --mode vendored \
                  or --mode agent to choose the mode this run uses",
                 project_root.display(),
@@ -532,6 +542,30 @@ mod tests {
         write_hosted_lock(tmp.path(), "left-pad", "1.3.0");
         let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
         assert!(mode.is_err(), "{mode:?}");
+    }
+
+    /// A lockless hosted pin (a nuget source no lock records yet) is
+    /// hosted state too, though `HostedPin::recorded` never lists it.
+    #[tokio::test]
+    async fn a_lockless_hosted_pin_beside_a_ledger_is_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ledger(tmp.path()).await;
+        let key = format!("socket-patch-{UUID}");
+        std::fs::write(
+            tmp.path().join("nuget.config"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  \
+                 <packageSources>\n    <add key=\"{key}\" value=\"https://patch.socket.dev/\
+                 patch-registry/nuget/tok/{UUID}/index.json\" />\n  </packageSources>\n  \
+                 <packageSourceMapping>\n    <packageSource key=\"{key}\">\n      \
+                 <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
+                 </packageSourceMapping>\n</configuration>\n"
+            ),
+        )
+        .unwrap();
+        let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
+        let err = mode.expect_err("vendored and lockless hosted state together");
+        assert!(err.contains("pkg:nuget/Newtonsoft.Json"), "{err}");
     }
 
     /// Hosted pins alone are a hosted project, and need no ledger.

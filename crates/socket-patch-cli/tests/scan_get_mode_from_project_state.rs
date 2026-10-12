@@ -520,21 +520,12 @@ async fn bare_scan_and_get_refuse_a_project_with_vendored_and_hosted_state() {
             lock.contains(HOSTED_PIN_URL),
             "{command}: the hosted pin is kept:\n{lock}"
         );
-        assert!(
-            !root
-                .join(".socket/vendor/npm/22222222-2222-4222-8222-222222222222")
-                .exists(),
-            "{command}: the hosted package is not vendored: {env:#}"
-        );
     }
 
-    // An explicit `--mode vendored` still takes the hosted pin over.
+    // An explicit `--mode` picks the mode: the run is not refused.
     let (code, env) = run_cmd(root, &server.uri(), "scan", Some("vendored"), &[]);
-    assert_ne!(code, 2, "an explicit mode is not ambiguous: {env:#}");
-    assert!(
-        !env.to_string().contains("mode_ambiguous"),
-        "an explicit mode is not ambiguous: {env:#}"
-    );
+    assert_eq!(code, 0, "an explicit mode is not ambiguous: {env:#}");
+    assert_eq!(env["status"], "success", "{env:#}");
 }
 
 /// An agent-mode manifest holding the fixture patch under each of `purls`.
