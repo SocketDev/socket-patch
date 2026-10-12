@@ -19,7 +19,7 @@
 //! network: every host effect (locking, probes, record fetches, the commit
 //! of the rewritten files) stays with the caller.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -1212,40 +1212,47 @@ pub fn yarn_classic_artifact_targets<'a>(
     if crate::patch::redirect::yarn_classic_hosted_refused(files, yarn_outer) {
         return Vec::new();
     }
+    // The pinned-artifact test is a substring search; the registry-copy
+    // test reads every block, so it runs once per lock, after it, and only
+    // when some dep still needs it (#1423).
+    let mut registry_copies: Option<HashSet<(String, String)>> = None;
     let mut seen = BTreeSet::new();
     candidates
         .iter()
         .map(|c| &c.dep)
         .filter(|dep| dep.ecosystem == "npm" && dep.integrity.sha512.is_some())
         .filter(|dep| {
-            classic_locks_registry_copy(lock, &crate::patch::redirect::full_name(dep), &dep.version)
+            dep.integrity.sha1.is_none() || !lock.contains(&format!("\"{}#", dep.artifact_url))
         })
         .filter(|dep| {
-            dep.integrity.sha1.is_none() || !lock.contains(&format!("\"{}#", dep.artifact_url))
+            registry_copies
+                .get_or_insert_with(|| classic_registry_copies(lock))
+                .contains(&(crate::patch::redirect::full_name(dep), dep.version.clone()))
         })
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
 }
 
-/// Whether a classic `lock` has a registry block of `name@version`: the
-/// only copy a hosted pin rewrites (a git, `file:`, `link:` or remote
+/// The `(name, version)` of every registry block in a classic `lock`: the
+/// only copies a hosted pin rewrites (a git, `file:`, `link:` or remote
 /// tarball copy is skipped by name, so it needs no served tarball). Read
 /// by the blocks' real names, as the rewriter does, so `lodash` never
 /// matches a `lodash.debounce` block.
-fn classic_locks_registry_copy(lock: &str, name: &str, version: &str) -> bool {
+fn classic_registry_copies(lock: &str) -> HashSet<(String, String)> {
     use crate::formats::yarn::blocks::{classic_field, scan_blocks};
     use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
     use crate::formats::yarn::source::{classic_copy_source, CopySource};
-    if !lock.contains(name) {
-        return false;
-    }
-    scan_blocks(lock).iter().any(|block| {
-        let patterns = split_key_patterns(&block.key);
-        classic_key_real_name(&patterns) == Some(name)
-            && classic_field(&block.lines, "version") == Some(version)
-            && classic_copy_source(&patterns, classic_field(&block.lines, "resolved"))
-                == CopySource::Registry
-    })
+    scan_blocks(lock)
+        .iter()
+        .filter_map(|block| {
+            let patterns = split_key_patterns(&block.key);
+            let name = classic_key_real_name(&patterns)?;
+            let version = classic_field(&block.lines, "version")?;
+            (classic_copy_source(&patterns, classic_field(&block.lines, "resolved"))
+                == CopySource::Registry)
+                .then(|| (name.to_string(), version.to_string()))
+        })
+        .collect()
 }
 
 /// Record what the served tarball at `url` yielded: its sha1 on every
@@ -3088,15 +3095,83 @@ mod tests {
                     resolved \"git+https://github.com/x/left-pad.git#abc\"\n\n\
                     is-odd@^3.0.0:\n  version \"3.0.1\"\n  \
                     resolved \"https://registry.yarnpkg.com/is-odd/-/is-odd-3.0.1.tgz#bb\"\n";
-        assert!(!classic_locks_registry_copy(lock, "lodash", "4.17.21"));
-        assert!(!classic_locks_registry_copy(lock, "left-pad", "1.3.0"));
-        assert!(!classic_locks_registry_copy(lock, "is-odd", "3.0.0"));
-        assert!(classic_locks_registry_copy(lock, "is-odd", "3.0.1"));
-        assert!(classic_locks_registry_copy(
-            lock,
-            "lodash.debounce",
-            "4.17.21"
-        ));
+        let copies = classic_registry_copies(lock);
+        let has = |name: &str, version: &str| copies.contains(&(name.into(), version.into()));
+        assert!(!has("lodash", "4.17.21"));
+        assert!(!has("left-pad", "1.3.0"));
+        assert!(!has("is-odd", "3.0.0"));
+        assert!(has("is-odd", "3.0.1"));
+        assert!(has("lodash.debounce", "4.17.21"));
+        assert_eq!(copies.len(), 2);
+    }
+
+    fn classic_candidate(name: &str, version: &str, sha1: Option<&str>) -> Candidate {
+        let url = format!("https://h/serve/{GRANT}/{name}-{version}.tgz");
+        let mut dep = grant_dep("npm", url);
+        dep.name = name.into();
+        dep.version = version.into();
+        dep.integrity.sha512 = Some("sha512-x".into());
+        dep.integrity.sha1 = sha1.map(Into::into);
+        Candidate {
+            purl: format!("pkg:npm/{name}@{version}"),
+            dep,
+        }
+    }
+
+    /// #1423: the served tarball is read only for a dep the lock locks as
+    /// a registry copy and doesn't pin to the artifact yet; a big lock
+    /// whose deps are all pinned already (a rescan) selects none, and many
+    /// deps over a big lock stay cheap (the lock is read once, not once
+    /// per dep).
+    #[test]
+    fn classic_artifact_targets_select_unpinned_registry_copies() {
+        let mut lock = String::from("# yarn lockfile v1\n\n");
+        let n = 3000;
+        for i in 0..n {
+            lock.push_str(&format!(
+                "pkg-{i}@^1.0.0:\n  version \"1.0.{i}\"\n  \
+                 resolved \"https://registry.yarnpkg.com/pkg-{i}/-/pkg-{i}-1.0.{i}.tgz#aa\"\n\n"
+            ));
+        }
+        lock.push_str(
+            "gitdep@git+https://github.com/x/gitdep.git:\n  version \"2.0.0\"\n  \
+             resolved \"git+https://github.com/x/gitdep.git#abc\"\n",
+        );
+        let mut candidates: Vec<Candidate> = (0..n)
+            .map(|i| classic_candidate(&format!("pkg-{i}"), &format!("1.0.{i}"), Some("s1")))
+            .collect();
+        // Every dep pinned to its artifact already: nothing to fetch.
+        let mut pinned = lock.clone();
+        for c in &candidates {
+            pinned.push_str(&format!("# \"{}#s1\"\n", c.dep.artifact_url));
+        }
+        let files = BTreeMap::from([("yarn.lock".to_string(), pinned)]);
+        let outer = OuterYarnMirror::default();
+        let start = std::time::Instant::now();
+        assert!(yarn_classic_artifact_targets(&candidates, &files, &outer).is_empty());
+
+        // Unpinned: every registry copy is selected once per artifact; a
+        // version the lock doesn't lock, a git copy and a non-npm dep never.
+        candidates.push(classic_candidate("pkg-0", "9.9.9", None));
+        candidates.push(classic_candidate("gitdep", "2.0.0", None));
+        candidates.push(classic_candidate("pkg-1", "1.0.1", Some("s1")));
+        let mut pypi = classic_candidate("pkg-2", "1.0.2", None);
+        pypi.dep.ecosystem = "pypi".into();
+        candidates.push(pypi);
+        let files = BTreeMap::from([("yarn.lock".to_string(), lock)]);
+        let got: Vec<String> = yarn_classic_artifact_targets(&candidates, &files, &outer)
+            .into_iter()
+            .map(|d| format!("{}@{}", d.name, d.version))
+            .collect();
+        assert_eq!(got.len(), n);
+        assert_eq!(got[0], "pkg-0@1.0.0");
+        assert_eq!(got[n - 1], format!("pkg-{}@1.0.{}", n - 1, n - 1));
+        // Per-dep lock scans took minutes here in a debug build.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
