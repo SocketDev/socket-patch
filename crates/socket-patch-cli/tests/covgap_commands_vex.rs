@@ -12,7 +12,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic_command};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -37,20 +37,13 @@ const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 /// `e2e_vex_vendor.rs`.
 const STALE_OPENVEX_DOC: &str = r#"{"@context":"https://openvex.dev/ns/v0.2.0","@id":"urn:uuid:stale","author":"Socket","timestamp":"2020-01-01T00:00:00Z","version":1,"statements":[]}"#;
 
-/// CLI invocation with the ambient `SOCKET_*` environment scrubbed (same
+/// CLI invocation in the hermetic env: ambient `SOCKET_*` scrubbed (same
 /// rationale as `e2e_vex.rs`: explicit flags must be the sole source of
-/// truth; the parent env is never mutated so tests need no serialization).
+/// truth; the parent env is never mutated so tests need no serialization)
+/// and telemetry off (`vex` failures otherwise POST a real event to the
+/// production proxy endpoint on every run).
 fn cli() -> Command {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    // Keep telemetry off: `vex` failures otherwise POST a real event to the
-    // production proxy endpoint on every run.
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
-    cmd
+    hermetic_command(&binary())
 }
 
 /// Write `manifest` to `<cwd>/.socket/manifest.json`.

@@ -22,23 +22,16 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic_command};
 
 use std::path::Path;
-use std::process::Command;
-
-use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
 
 /// Run `socket-patch apply` in `cwd` with a scrubbed SOCKET_* environment
 /// so ambient developer/CI configuration (tokens, silent toggles) can't
 /// change the branch under test.
 fn run_apply(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("apply").args(args).current_dir(cwd);
-    for var in GLOBAL_ARG_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch apply");
     (
         out.status.code().unwrap_or(-1),

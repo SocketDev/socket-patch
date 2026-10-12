@@ -8,7 +8,7 @@
 //! count). Each test runs the released binary in a tempdir against
 //! the mock URI.
 
-use crate::common::binary;
+use crate::common::{binary, hermetic_command};
 
 use std::path::Path;
 use std::process::Command;
@@ -97,45 +97,20 @@ fn build_cmd_with_token(
         ORG_SLUG,
     ];
     args.extend_from_slice(extra_args);
-    let mut cmd = Command::new(binary());
-    cmd.args(&args).current_dir(cwd);
     // The binary binds a wide `SOCKET_*` env surface; an ambient value
     // silently changes what these tests exercise — SOCKET_ECOSYSTEMS=cargo
     // makes scan skip the npm fixture (scannedPackages 0), SOCKET_CWD aims
-    // the crawl outside the tempdir, SOCKET_GLOBAL flips to global mode.
-    // The highest-risk vars are seeded with hostile values and then
-    // scrubbed — `env_remove` clears the seed too, so the child never sees
-    // it, but if a scrub line is ever dropped the seed (rather than a
-    // developer's ambient shell, which this suite can't rely on) turns the
-    // tests red immediately. Same pattern as `common::run_with_env`.
-    cmd.env("SOCKET_CWD", "/nonexistent")
-        .env("SOCKET_ECOSYSTEMS", "cargo")
-        .env("SOCKET_GLOBAL", "true")
-        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
-        .env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
-        .env_remove("SOCKET_CWD")
-        .env_remove("SOCKET_ECOSYSTEMS")
-        .env_remove("SOCKET_GLOBAL")
-        .env_remove("SOCKET_GLOBAL_PREFIX")
-        .env_remove("SOCKET_DRY_RUN")
-        .env_remove("SOCKET_MANIFEST_PATH");
-    // Prefix-scrub whatever else the ambient shell carries (SOCKET_YES,
-    // SOCKET_STRICT, SOCKET_VENDOR_SOURCE, ...). Unlike common/mod.rs this
-    // scrub covers the telemetry opt-outs too: this suite's entire point is
-    // asserting telemetry POSTs against a local wiremock, so an opted-out
-    // dev shell must not vacuously green the count-0 asserts.
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&key);
-        }
-    }
-    // Default: disable the test-environment short-circuit
-    // (`is_telemetry_disabled()` flips on `VITEST=true`).
+    // the crawl outside the tempdir, SOCKET_GLOBAL flips to global mode. The
+    // hermetic builder scrubs all of them.
+    let mut cmd = hermetic_command(&binary());
+    cmd.args(&args).current_dir(cwd);
+    // This suite's entire point is asserting telemetry POSTs against a
+    // local wiremock, so undo the builder's forced opt-out (an opted-out
+    // dev shell must not vacuously green the count-0 asserts), and disable
+    // the test-environment short-circuit (`is_telemetry_disabled()` flips
+    // on `VITEST=true`).
     cmd.env_remove("VITEST");
     cmd.env_remove("SOCKET_TELEMETRY_DISABLED");
-    cmd.env_remove("SOCKET_OFFLINE");
     // An ambient VIRTUAL_ENV hijacks the python crawler (its site-packages
     // get crawled as project packages), breaking the exact
     // `scannedPackages` oracles below.

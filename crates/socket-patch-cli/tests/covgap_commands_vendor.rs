@@ -13,6 +13,8 @@
 
 #[path = "common/envelope.rs"]
 mod envelope;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 use envelope::{events, find_event};
@@ -182,10 +184,10 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
 
 // ───────────────────────── subprocess runner ─────────────────────────
 
-/// Run the built `socket-patch` binary with every ambient `SOCKET_*` env var
-/// scrubbed from the child and telemetry hard-disabled.
+/// Run the built `socket-patch` binary in the hermetic env (every ambient
+/// `SOCKET_*` env var scrubbed from the child, telemetry hard-disabled).
 fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     let fixture = (!args
         .iter()
         .any(|a| matches!(*a, "--api-url" | "--vendor-url"))
@@ -203,14 +205,9 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
         }
     }
     cmd.args(&filtered).current_dir(cwd);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
     // In-process tests in this binary `std::env::set_var` these via
-    // `apply_env_toggles`; one set by a parallel test between the scan
-    // above and the spawn would be inherited, so remove them
+    // `apply_env_toggles`; one set by a parallel test between the
+    // builder's scrub and the spawn would be inherited, so remove them
     // unconditionally (see in_process_vendor.rs `run_cli`).
     for key in [
         "SOCKET_OFFLINE",
@@ -220,7 +217,6 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
     ] {
         cmd.env_remove(key);
     }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -763,11 +759,10 @@ fn npm_only_human_vendor_does_not_read_composer_lock() {
         .unwrap()
         .success());
     let fixture = prebuilt_common::Server::project(fx.root());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let mut child = hermetic::binary_command()
         .env("SOCKET_VENDOR_URL", &fixture.uri)
         .args(["vendor", "--cwd", fx.root().to_str().unwrap()])
         .current_dir(fx.root())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env_remove("SOCKET_OFFLINE")
         .env_remove("SOCKET_API_URL")
         .stdin(std::process::Stdio::null())

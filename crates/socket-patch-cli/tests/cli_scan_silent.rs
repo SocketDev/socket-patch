@@ -17,18 +17,15 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic_command};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -56,14 +53,8 @@ fn write_npm_package(root: &Path, name: &str, version: &str, content: &[u8]) {
 /// so ambient developer/CI configuration (tokens, silent toggles) can't
 /// change the branch under test.
 fn run_scan(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("scan").args(args).current_dir(cwd);
-    for var in GLOBAL_ARG_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    cmd.env_remove("SOCKET_BATCH_SIZE");
-    cmd.env_remove("SOCKET_ALL_RELEASES");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch scan");
     (
         out.status.code().unwrap_or(-1),

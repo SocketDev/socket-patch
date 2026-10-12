@@ -248,37 +248,10 @@ fn readonly_dir_enforced(dir: &Path) -> bool {
 
 /// Spawn the binary WITHOUT waiting (the lock-choreography tests mutate
 /// the fixture while the child is blocked on the apply lock), with the
-/// exact same seed-then-scrub environment as `common::run`.
+/// same hermetic environment as `common::run`.
 fn spawn_scrubbed(cwd: &Path, args: &[&str]) -> std::process::Child {
-    let mut cmd = std::process::Command::new(common::binary());
+    let mut cmd = common::hermetic_command(&common::binary());
     cmd.args(args).current_dir(cwd);
-    cmd.env("SOCKET_GLOBAL", "true")
-        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
-        .env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
-        .env("SOCKET_JSON", "true")
-        .env("SOCKET_SILENT", "true")
-        .env("SOCKET_VERBOSE", "true")
-        .env_remove("SOCKET_GLOBAL")
-        .env_remove("SOCKET_GLOBAL_PREFIX")
-        .env_remove("SOCKET_DRY_RUN")
-        .env_remove("SOCKET_MANIFEST_PATH")
-        .env_remove("SOCKET_JSON")
-        .env_remove("SOCKET_SILENT")
-        .env_remove("SOCKET_VERBOSE")
-        .env_remove("SOCKET_API_TOKEN");
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_")
-            && !name.contains("TELEMETRY")
-            && name != "SOCKET_NO_CONFIG"
-            && name != "SOCKET_NO_UPDATE_CHECK"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_NO_CONFIG", "1");
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     cmd.spawn().expect("spawn socket-patch binary")

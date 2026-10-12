@@ -34,7 +34,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic_command};
 
 #[path = "common/pty_io.rs"]
 mod pty_io;
@@ -43,7 +43,6 @@ mod vlt_hosted_common;
 #[path = "vlt_hosted_common/vendored.rs"]
 mod vlt_vendored;
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -73,19 +72,22 @@ fn write_npm_package(root: &Path, name: &str, version: &str, content: &[u8]) {
     std::fs::write(pkg_dir.join("index.js"), content).unwrap();
 }
 
-/// Run `socket-patch scan` in `cwd` with the whole flag-bound `SOCKET_*`
-/// environment scrubbed, so the CLI arguments are the sole source of truth
-/// (telemetry stays disabled so no run phones home).
+/// Run `socket-patch scan` in `cwd` in the hermetic env, so the CLI
+/// arguments are the sole source of truth (telemetry stays disabled so no
+/// run phones home).
 fn run_scan(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("scan").args(args).current_dir(cwd);
+    // The `mode_fold` tests below clear and restore the flag-bound vars
+    // in-process; one restored by a parallel test between the builder's
+    // scrub and the spawn would be inherited, so remove the whole
+    // flag-bound surface unconditionally too.
     for var in GLOBAL_ARG_ENV_VARS.iter().chain(LOCAL_ARG_ENV_VARS.iter()) {
         cmd.env_remove(var);
     }
     // The unconditional python crawl consults VIRTUAL_ENV first, so an
     // activated host virtualenv would make "empty project" scans non-empty.
     cmd.env_remove("VIRTUAL_ENV");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch scan");
     (
         out.status.code().unwrap_or(-1),

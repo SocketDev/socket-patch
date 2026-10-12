@@ -9,26 +9,16 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic_command};
 
 use std::path::Path;
-use std::process::Command;
-
-use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
 
 /// Run `socket-patch get` in `cwd` with a scrubbed SOCKET_* environment
 /// so ambient developer/CI configuration (tokens, org slugs, silent
 /// toggles) can't change the branch under test.
 fn run_get(cwd: &Path, args: &[&str]) -> (i32, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("get").args(args).current_dir(cwd);
-    for var in GLOBAL_ARG_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    for var in ["SOCKET_SAVE_ONLY", "SOCKET_ALL_RELEASES"] {
-        cmd.env_remove(var);
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch get");
     (
         out.status.code().unwrap_or(-1),

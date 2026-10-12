@@ -28,8 +28,6 @@ use crate::vlt_vendored;
 // `--debug` provenance echoes (GlobalArgs::telemetry_credentials, config layer)
 // ---------------------------------------------------------------------------
 
-const BINARY: &str = env!("CARGO_BIN_EXE_socket-patch");
-
 /// The platform env var that positions the socket-cli data dir.
 const DATA_DIR_VAR: &str = if cfg!(windows) {
     "LOCALAPPDATA"
@@ -60,28 +58,20 @@ fn write_empty_manifest(root: &Path) {
     std::fs::write(dir.join("manifest.json"), r#"{ "patches": {} }"#).unwrap();
 }
 
-/// `socket-patch list` against `project`, hermetic like
-/// cli_config_fallback.rs's `list_cmd`: every ambient `SOCKET_*` scrubbed,
-/// the data dir pointed at the fixture, the config layer re-enabled,
-/// telemetry off (the provenance test re-enables it), the update notifier
-/// off. `debug` adds the `--debug` flag under test.
+/// `socket-patch list` against `project` in the shared hermetic env (every
+/// ambient `SOCKET_*` scrubbed, telemetry and the update notifier off; the
+/// provenance test re-enables telemetry), with the data dir pointed at the
+/// fixture and the config layer re-enabled. `debug` adds the `--debug`
+/// flag under test.
 fn list_cmd(project: &Path, data_dir: &Path, debug: bool) -> Command {
-    let mut cmd = Command::new(BINARY);
+    let mut cmd = common::hermetic::binary_command();
     cmd.arg("list");
     if debug {
         cmd.arg("--debug");
     }
     cmd.arg("--cwd").arg(project);
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") {
-            cmd.env_remove(&key);
-        }
-    }
     cmd.env(DATA_DIR_VAR, data_dir);
     cmd.env("SOCKET_NO_CONFIG", "0");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
     cmd
 }
 

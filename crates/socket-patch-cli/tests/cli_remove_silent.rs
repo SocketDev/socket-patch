@@ -14,12 +14,9 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic_command};
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-
-use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
 
 const ONE_PATCH_MANIFEST: &str = r#"{
   "patches": {
@@ -46,13 +43,8 @@ fn make_socket_dir(root: &Path) -> PathBuf {
 /// so ambient developer/CI configuration (tokens, silent toggles) can't
 /// change the branch under test.
 fn run_remove(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("remove").args(args).current_dir(cwd);
-    for var in GLOBAL_ARG_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    cmd.env_remove("SOCKET_SKIP_ROLLBACK");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch remove");
     (
         out.status.code().unwrap_or(-1),

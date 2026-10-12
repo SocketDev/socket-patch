@@ -17,9 +17,9 @@
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::process::Command;
 
-const BINARY: &str = env!("CARGO_BIN_EXE_socket-patch");
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
 /// An argument that is valid on the OS level but not valid UTF-8.
 fn non_utf8_arg() -> &'static OsStr {
@@ -28,15 +28,12 @@ fn non_utf8_arg() -> &'static OsStr {
 
 /// Run the binary with the given args in a hermetic env and capture output.
 fn run(args: &[&OsStr]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(BINARY);
+    // Hermetic env: ambient SOCKET_* vars can never perturb where the
+    // invocation fails (the assertion is about the argv path, not env
+    // handling).
+    let mut cmd = hermetic::binary_command();
     for a in args {
         cmd.arg(a);
-    }
-    // Scrub the global env-var surface so ambient SOCKET_* vars can never
-    // perturb where the invocation fails (the assertion is about the argv
-    // path, not env handling).
-    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
-        cmd.env_remove(var);
     }
     let out = cmd.output().expect("spawn socket-patch");
     (
