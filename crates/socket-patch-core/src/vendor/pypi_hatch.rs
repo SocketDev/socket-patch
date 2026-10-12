@@ -41,6 +41,7 @@ pub(super) async fn load(
 ) -> Result<HatchProject, Failure> {
     let files = read_files(root).await?;
     require_pip_installer()?;
+    require_expandable_root(root)?;
     let prefix = format!("{{root:uri}}/.socket/vendor/pypi/{uuid}/");
     let state = super::state::load_state_shared(root)
         .await
@@ -107,18 +108,34 @@ pub(super) async fn load(
 }
 
 /// The guards vendoring applies whatever the project's wiring: the pip
-/// installer (environment variable and environment settings), and
-/// Hatch >=1.2 when `name` is an environment dependency. Checked before a
+/// installer (environment variable and environment settings), a project
+/// path `{root:uri}` can expand, and Hatch >=1.2 when `name` is an
+/// environment dependency. Checked before a
 /// superseded patch's wiring is unwound, so a refusal unrelated to that
 /// wiring never touches the project's files.
 pub(super) async fn preflight(root: &Path, name: &str) -> Result<(), Failure> {
     let files = read_files(root).await?;
     require_pip_installer()?;
+    require_expandable_root(root)?;
     hatch::require_pip_installer(&files).map_err(|error| ("pypi_hatch_unsupported", error))?;
     if hatch::has_environment_dependency(&files, name) {
         require_environment_context_support(root).await?;
     }
     Ok(())
+}
+
+/// Refuse a project root Hatch's `{root:uri}` cannot expand into a usable
+/// file URL (#547): every vendored reference would fail to install there.
+fn require_expandable_root(root: &Path) -> Result<(), Failure> {
+    match hatch::root_uri_unsafe_char(root) {
+        Some(c) => Err((
+            "pypi_hatch_unsupported",
+            format!(
+                "the project path contains '{c}', which Hatch's {{root:uri}} does not escape, so vendored references would not install from this checkout; move the checkout to a path without '%', '#', '?' or ';', or use hosted or agent mode"
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 fn require_pip_installer() -> Result<(), Failure> {
@@ -437,6 +454,45 @@ mod tests {
         assert!(held(live.to_string()));
         assert!(held(format!("\u{feff}{live}")));
         assert!(held(format!("\u{feff}\u{feff}{live}")));
+    }
+
+    /// #547: `load` and `preflight` refuse a project root Hatch's
+    /// `{root:uri}` expands into a broken URL, and accept the characters it
+    /// handles (`@`, `'`, a space).
+    #[tokio::test]
+    async fn root_hatch_cannot_expand_is_refused() {
+        let mut unsafe_names = vec!["feature%2Fx", "a#b", "semi;colon"];
+        if cfg!(unix) {
+            unsafe_names.push("q?x");
+        }
+        for name in unsafe_names {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(name);
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            tokio::fs::write(root.join("pyproject.toml"), ORIGINAL)
+                .await
+                .unwrap();
+            let Err((code, detail)) = load(&root, "one", "1", UUID).await else {
+                panic!("{name}: load must refuse");
+            };
+            assert_eq!(code, "pypi_hatch_unsupported", "{name}");
+            assert!(detail.contains("{root:uri}"), "{name}: {detail}");
+            assert_eq!(
+                preflight(&root, "one").await.map_err(|(code, _)| code),
+                Err("pypi_hatch_unsupported"),
+                "{name}"
+            );
+        }
+        for name in ["at@sign", "quo'te", "sp ace"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(name);
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            tokio::fs::write(root.join("pyproject.toml"), ORIGINAL)
+                .await
+                .unwrap();
+            assert!(load(&root, "one", "1", UUID).await.is_ok(), "{name}");
+            assert!(preflight(&root, "one").await.is_ok(), "{name}");
+        }
     }
 
     #[tokio::test]

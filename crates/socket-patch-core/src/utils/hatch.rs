@@ -11,6 +11,19 @@ use crate::vendor::common::{pep508_name, pyproject_dependency_specs, DeclTable};
 /// exactly these from the candidate set, so the lists cannot drift.
 pub const HATCH_FILES: [&str; 2] = ["pyproject.toml", "hatch.toml"];
 
+/// The first character of `root`'s absolute path that Hatch's `{root:uri}`
+/// expands into a broken file URL (#547). Hatchling's `path_to_uri` escapes
+/// only spaces, so pip percent-decodes `%`, cuts the path at a `#` fragment
+/// or `?` query, and the PEP 508 parser rejects a `;` in the URL. `None`
+/// when the expansion is a usable URL.
+pub fn root_uri_unsafe_char(root: &std::path::Path) -> Option<char> {
+    let absolute = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    absolute
+        .to_string_lossy()
+        .chars()
+        .find(|c| matches!(c, '%' | '#' | '?' | ';'))
+}
+
 pub fn is_hatch(files: &BTreeMap<String, String>) -> bool {
     files.contains_key("hatch.toml")
         || files.get("pyproject.toml").is_some_and(|text| {

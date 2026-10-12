@@ -5,7 +5,11 @@ PEP 508 declarations in `project.dependencies`, optional dependencies, and
 Hatch environment `dependencies` / `extra-dependencies`. External
 `hatch.toml` tables override the corresponding top-level `tool.hatch` keys.
 Project references enable Hatchling's `allow-direct-references` setting.
-Vendored references use `{root:uri}` so checkouts remain relocatable.
+Vendored references use `{root:uri}` so checkouts remain relocatable,
+except to a path containing `%`, `#`, `?` or `;`: Hatch's `{root:uri}`
+escapes only spaces, so pip reads the expanded URL as an escape, fragment or
+query, or rejects it (#547). A vendored scan or `vendor` run from such a path
+is refused before writing; hosted and agent mode are unaffected.
 Vendored environment references require Hatch >=1.2 on PATH; preflight verifies the
 installed version because Hatch 1.0 and 1.1 do not expand that context.
 Vendored Hatch requires the pip installer; uv currently ignores hash
