@@ -99,6 +99,7 @@ def build(toolchain, units, sample, order, preserve=False):
             'opt_level_s': 'opt-level=s' in invocation,
             'strip_enabled': 'strip=' in invocation and 'strip=none' not in invocation,
             'lto_enabled': ('linker-plugin-lto' in invocation or
+                            ' -C lto ' in invocation or '-Clto' in invocation or
                             bool(re.search(r'\blto(?:%3D|=)(?:thin|fat|true)', invocation))),
         }
         row['effective_flags'] = effective
@@ -263,7 +264,10 @@ for toolchain in TOOLCHAINS:
         raise SystemExit(1)
 sizes = [row['binary_bytes'] for row in RESULTS]
 REPORT['binary_size_bytes'] = {'minimum': min(sizes), 'maximum': max(sizes), 'all_equal': len(set(sizes)) == 1}
-if all(value['pairs'] >= 5 and value['median_improvement_percent'] >= 5 and value['each_pair_faster'] and value['units1_no_larger'] for value in comparisons.values()):
+if (REPORT['cli_output_equivalence'] and
+        all(value['pairs'] >= 5 and value['median_improvement_percent'] >= 5 and
+            value['each_pair_faster'] and value['units1_no_larger']
+            for value in comparisons.values())):
     REPORT['conclusion'] = 'units1 meets the timing threshold on both toolchains; inspect size and correctness before considering a production change'
 else:
     REPORT['conclusion'] = 'no demonstrated units1 benefit across both toolchains; no production change supported'
