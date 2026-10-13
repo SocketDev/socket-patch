@@ -1613,6 +1613,85 @@ async fn scan_redirect_npm_bundled_copy_is_not_attested_in_run() {
     }
 }
 
+/// REGRESSION (#1481): npm's half of #935. A workspace member depends on a
+/// `file:` copy of the patched `name@version` (a packed tarball, or a
+/// source directory npm links), beside the registry entry the run pins.
+/// npm installs that copy from its spec, so it stays unpatched: the run
+/// keeps pinning the registry copy (the warnings are pinned by the core
+/// rewriter tests), and its in-run `--vex` must not attest the purl.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_npm_file_copy_is_not_attested_in_run() {
+    let registry = format!(
+        r#""node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "resolved": "https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}"#
+    );
+    // npm 10's lock for `"{NAME}": "file:../../vendor/{NAME}-{VERSION}.tgz"`.
+    let tarball = format!(
+        r#""packages/b": {{ "version": "1.0.0", "dependencies": {{ "{NAME}": "file:../../vendor/{NAME}-{VERSION}.tgz" }} }},
+    "packages/b/node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "resolved": "file:vendor/{NAME}-{VERSION}.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}"#
+    );
+    // npm 10's lock for `"{NAME}": "file:../../lpdir"`: a link entry and
+    // the directory's own entry, which alone carries the version.
+    let directory = format!(
+        r#""lpdir": {{ "name": "{NAME}", "version": "{VERSION}" }},
+    "packages/b": {{ "version": "1.0.0", "dependencies": {{ "{NAME}": "file:../../lpdir" }} }},
+    "packages/b/node_modules/{NAME}": {{ "resolved": "lpdir", "link": true }}"#
+    );
+    for (shape, copy) in [("tarball", tarball), ("directory", directory)] {
+        let lock = format!(
+            r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "workspaces": ["packages/*"], "dependencies": {{ "{NAME}": "{VERSION}" }} }},
+    "node_modules/b": {{ "resolved": "packages/b", "link": true }},
+    {registry},
+    {copy}
+  }}
+}}
+"#
+        );
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        mock_reference(&server).await;
+        mock_view(&server).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        std::fs::write(tmp.path().join("package-lock.json"), &lock).unwrap();
+
+        let out = tmp.path().join("out.vex.json");
+        let mut args = redirect_args(tmp.path(), server.uri());
+        args.vex.vex = Some(out.clone());
+        args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+        let _ = run(args).await;
+
+        let rewritten = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+        assert!(
+            rewritten.contains(HOSTED_URL),
+            "{shape}: the registry entry is redirected:\n{rewritten}"
+        );
+        let attested = std::fs::read_to_string(&out)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|doc| doc.to_string().contains(PURL));
+        assert!(
+            !attested,
+            "{shape}: in-run VEX must not attest a purl whose file: copy stays unpatched"
+        );
+    }
+}
+
 /// npm 7+ installs from the v2 `packages` map. An ignored legacy bundled
 /// flag must not block the hosted in-run attestation before that install.
 #[tokio::test]
