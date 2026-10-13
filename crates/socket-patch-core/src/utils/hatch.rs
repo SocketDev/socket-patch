@@ -688,10 +688,14 @@ pub fn rewrite_all(files: &BTreeMap<String, String>, deps: &[HatchDep]) -> Hatch
             };
         }
     }
-    HatchBatch {
-        files: render(files, documents),
-        steps,
-    }
+    // As with `rewrite`, a batch that wired no dep writes nothing: a render
+    // can differ from the original (line endings) with no edit made.
+    let files = if steps.iter().any(Result::is_ok) {
+        render(files, documents)
+    } else {
+        BTreeMap::new()
+    };
+    HatchBatch { files, steps }
 }
 
 pub struct HatchPermission {
@@ -1472,6 +1476,25 @@ mod tests {
         let edits = batch.steps[0].as_ref().unwrap();
         assert_eq!(edits.len(), 2);
         assert_eq!(edits[1].original, "allow-direct-references = false");
+    }
+
+    /// #1471: when no dep is wired, nothing is written, even for a
+    /// hatch.toml whose render is not byte-identical (mixed line endings).
+    #[test]
+    fn batch_rewrite_writes_nothing_when_every_dep_is_refused() {
+        let mut mixed = files("[project]\nname = \"app\"\ndependencies = [\"six==1.16.0\"]\n");
+        mixed.insert(
+            "hatch.toml".into(),
+            "[envs.default]\ndependencies = [\"click==8.1.7\"]\n\r\n[envs.docs]\nextra-dependencies = [\"six==1.16.0\"]\r\n".into(),
+        );
+        let absent = [HatchDep {
+            name: "absent",
+            version: "1.0.0",
+            url: "https://patch.test/absent.whl",
+        }];
+        assert_batch_matches_sequential(&mixed, &absent);
+        assert!(rewrite_all(&mixed, &absent).files.is_empty());
+        assert!(rewrite_all(&mixed, &[]).files.is_empty());
     }
 
     /// #1471: vendored `{root:uri}` deps keep their pip-installer and
