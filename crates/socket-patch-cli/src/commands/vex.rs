@@ -1783,8 +1783,8 @@ fn omission_phrase(reason: &str) -> &'static str {
         }
         "stale_install" => "the installed copy is not patched",
         DEPENDENCY_NOT_INSTALLED => {
-            "the patched package.json declares a dependency that is not installed (the \
-             lockfile does not lock it)"
+            "the patched package.json declares a dependency that is not installed beside \
+             the package"
         }
         "mirror_overrides_source" => {
             "a Bundler mirror overrides the hosted source and installed bytes were not verified"

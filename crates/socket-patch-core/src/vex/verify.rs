@@ -507,48 +507,35 @@ fn touches_npm_manifest(record: &PatchRecord) -> bool {
 
 /// The first `dependencies` entry of the installed npm copy at `pkg_path`
 /// that node cannot resolve from it: no `node_modules/<name>` in the copy
-/// or in any directory above it (node's lookup, which also finds a
-/// bundled, hoisted or pnpm-sibling copy). Optional dependencies may be
-/// absent, and a copy outside a `node_modules` tree (a Plug'n'Play
-/// install), an unreadable manifest or a name that is not a plain package
-/// name is never evidence.
+/// or in any directory above its real path (node's lookup, which also
+/// finds a bundled, hoisted or pnpm/bun store-sibling copy behind a
+/// root-linked symlink). Optional dependencies may be absent, and a copy
+/// outside a `node_modules` tree (a Plug'n'Play install), an unreadable
+/// manifest or a name that is not a safe package name is never evidence.
 async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
-    if !pkg_path
-        .components()
-        .any(|c| c.as_os_str() == "node_modules")
-    {
-        return None;
-    }
-    let text = tokio::fs::read_to_string(pkg_path.join("package.json"))
-        .await
-        .ok()?;
-    let pkg: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let optional = pkg
-        .get("optionalDependencies")
-        .and_then(serde_json::Value::as_object);
-    pkg.get("dependencies")?
-        .as_object()?
-        .keys()
-        .filter(|name| optional.is_none_or(|o| !o.contains_key(*name)))
-        .filter(|name| plain_npm_name(name))
-        .find(|name| !node_resolves(pkg_path, name))
-        .cloned()
-}
-
-/// `name` is `pkg` or `@scope/pkg`, with no empty, `.` or `..` component
-/// and no backslash, so joining it under `node_modules` stays there.
-fn plain_npm_name(name: &str) -> bool {
-    let parts: Vec<&str> = name.split('/').collect();
-    let shape_ok = match parts.as_slice() {
-        [_] => true,
-        [scope, _] => scope.starts_with('@') && scope.len() > 1,
-        _ => false,
-    };
-    shape_ok
-        && !name.contains('\\')
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && *p != "." && *p != "..")
+    let pkg_path = pkg_path.to_path_buf();
+    crate::utils::fs::run_blocking(move || {
+        if !pkg_path
+            .components()
+            .any(|c| c.as_os_str() == "node_modules")
+        {
+            return None;
+        }
+        let text = std::fs::read_to_string(pkg_path.join("package.json")).ok()?;
+        let pkg: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let real = std::fs::canonicalize(&pkg_path).ok()?;
+        let optional = pkg
+            .get("optionalDependencies")
+            .and_then(serde_json::Value::as_object);
+        pkg.get("dependencies")?
+            .as_object()?
+            .keys()
+            .filter(|name| optional.is_none_or(|o| !o.contains_key(*name)))
+            .filter(|name| crate::vendor::npm_common::is_safe_npm_name(name))
+            .find(|name| !node_resolves(&real, name))
+            .cloned()
+    })
+    .await
 }
 
 /// Whether node resolves the package `name` from the package directory
@@ -1947,8 +1934,9 @@ mod tests {
     }
 
     /// #1462: node's lookup from an installed copy finds a bundled,
-    /// hoisted or pnpm-sibling dependency; an optional one may be absent,
-    /// and a copy outside `node_modules` or an unsafe name is no evidence.
+    /// hoisted or pnpm-sibling dependency, also through a root-linked
+    /// symlink; an optional one may be absent, and a copy outside
+    /// `node_modules` is no evidence.
     #[tokio::test]
     async fn unresolved_npm_dependency_follows_node_lookup() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1992,17 +1980,16 @@ mod tests {
             None
         );
 
-        for (name, plain) in [
-            ("a", true),
-            ("@s/b", true),
-            ("@/b", false),
-            ("s/b", false),
-            ("../x", false),
-            ("@s/..", false),
-            ("a\\b", false),
-            ("", false),
-        ] {
-            assert_eq!(plain_npm_name(name), plain, "{name}");
+        // A root-linked symlink into the store (pnpm, bun isolated, npm
+        // linked): the lookup starts from the real path.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join(store).join("lp"), root.join("node_modules/lp2"))
+                .unwrap();
+            assert_eq!(
+                unresolved_npm_dependency(&root.join("node_modules/lp2")).await,
+                None
+            );
         }
     }
 
