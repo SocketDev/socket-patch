@@ -11,7 +11,7 @@ use crate::utils::python_lock::{
 };
 use crate::utils::python_script::{
     find_ancestor_uv_config, refuse_uv_script_no_sources, replace_script_metadata,
-    rewrite_script_metadata, script_metadata, UvConfig,
+    rewrite_script_metadata, root_governs_script, script_metadata, UvConfig,
 };
 
 use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
@@ -249,15 +249,18 @@ async fn load_listed_locks(
             let script = read_file(&root.join(script_name)).await?;
             let (pyproject, uv_toml, ancestor) = match &project_config {
                 Some(config) => config,
-                None => project_config.insert((
-                    read_regular_to_string(&root.join("pyproject.toml"))
+                None => {
+                    let pyproject = read_regular_to_string(&root.join("pyproject.toml"))
                         .await
-                        .ok(),
-                    super::pypi_uv::read_uv_toml(root).await,
+                        .ok();
+                    let uv_toml = super::pypi_uv::read_uv_toml(root).await;
                     // uv applies a parent's settings to the script when
                     // the root holds none (#1501).
-                    find_ancestor_uv_config(root),
-                )),
+                    let ancestor = (!root_governs_script(pyproject.as_deref(), uv_toml.as_deref()))
+                        .then(|| find_ancestor_uv_config(root))
+                        .flatten();
+                    project_config.insert((pyproject, uv_toml, ancestor))
+                }
             };
             refuse_uv_script_no_sources(
                 name,

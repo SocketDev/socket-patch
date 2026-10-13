@@ -393,6 +393,20 @@ pub struct UvConfig {
     pub text: String,
 }
 
+impl UvConfig {
+    /// Whether the file is a `uv.toml` (settings at its top level) rather
+    /// than a `pyproject.toml` (settings under `[tool.uv]`).
+    pub fn is_uv_toml(&self) -> bool {
+        Path::new(&self.rel).file_name() == Some(UV_TOML.as_ref())
+    }
+}
+
+/// Whether a PEP 723 script in a root holding `pyproject` and `uv_toml`
+/// takes uv's settings from the root itself, so uv looks no further up.
+pub fn root_governs_script(pyproject: Option<&str>, uv_toml: Option<&str>) -> bool {
+    uv_toml.is_some() || pyproject.is_some_and(pyproject_has_uv_settings)
+}
+
 /// Whether uv takes a script's settings from `pyproject`: it has a
 /// `[tool.uv]` table. One that does not parse counts, since uv stops its
 /// lookup there and reports it.
@@ -416,11 +430,15 @@ fn pyproject_has_uv_settings(pyproject: &str) -> bool {
 /// (`~/.config/uv`) is the installing machine's and is not looked up.
 pub fn find_ancestor_uv_config(root: &Path) -> Option<UvConfig> {
     for (rel, path) in ancestor_uv_config_files(root) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+        let text = match crate::utils::fs::read_regular_to_string_sync(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // uv stops at a settings file it cannot read and reports it.
+            Err(_) => return None,
         };
-        if rel.ends_with(&format!("/{UV_TOML}")) || pyproject_has_uv_settings(&text) {
-            return Some(UvConfig { rel, text });
+        let config = UvConfig { rel, text };
+        if config.is_uv_toml() || pyproject_has_uv_settings(&config.text) {
+            return Some(config);
         }
     }
     None
@@ -497,10 +515,9 @@ pub fn refuse_uv_script_no_sources(
     uv_toml: Option<&str>,
     ancestor: Option<&UvConfig>,
 ) -> Result<(), String> {
-    let root_governs = uv_toml.is_some() || pyproject.is_some_and(pyproject_has_uv_settings);
     match ancestor {
-        Some(config) if !root_governs => {
-            let project = if config.rel.ends_with(&format!("/{UV_TOML}")) {
+        Some(config) if !root_governs_script(pyproject, uv_toml) => {
+            let project = if config.is_uv_toml() {
                 (config.rel.clone(), config.text.as_str(), &[][..])
             } else {
                 (
@@ -1351,6 +1368,10 @@ mod ancestor_config_tests {
                 text: "offline = true\n".into(),
             })
         );
+        // uv stops at a settings file it cannot read (here a directory),
+        // so the farther one is never reached.
+        std::fs::create_dir(temp.path().join("a/b/uv.toml")).unwrap();
+        assert_eq!(find_ancestor_uv_config(&root), None);
     }
 
     #[test]

@@ -720,6 +720,12 @@ pub async fn read_candidate_files(
         .files
         .keys()
         .any(|path| crate::utils::python_lock::is_script_lock_name(path))
+        && !crate::utils::python_script::root_governs_script(
+            out.files.get("pyproject.toml").map(String::as_str),
+            out.files
+                .get(crate::utils::python_script::UV_TOML)
+                .map(String::as_str),
+        )
     {
         let files = view
             .disk_root_reading(std::iter::empty::<&std::path::Path>())
