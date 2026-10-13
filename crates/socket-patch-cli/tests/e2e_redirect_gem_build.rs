@@ -152,8 +152,9 @@ const TINY_LIB: &str = "module TinyDep\n  VALUE = \"tiny-ok\"\nend\n";
 
 /// Run the socket-patch binary in the hermetic environment
 /// (`tests/common/hermetic.rs`: a developer's `SOCKET_DRY_RUN=1` must not
-/// steer the assertions) with `VIRTUAL_ENV` (crawler discovery input)
-/// removed.
+/// steer the assertions) with `VIRTUAL_ENV` (crawler discovery input) and
+/// every ambient `BUNDLE_*` var (the crawler reads `BUNDLE_GEMFILE`,
+/// `BUNDLE_PATH`, mirrors, ...) removed.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     run_socket_env(cwd, args, &[])
 }
@@ -161,13 +162,8 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// [`run_socket`] with extra environment on top of the scrubbed surface.
 fn run_socket_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
     cmd.args(args).current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("BUNDLE_MIRROR__") {
-            cmd.env_remove(key);
-        }
-    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
