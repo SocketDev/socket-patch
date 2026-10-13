@@ -80,9 +80,20 @@ pub fn skip(suite: &str, why: &str) -> bool {
     true
 }
 
+/// `net.retry` for the children of a [`required`] leg. Cargo retries only
+/// the transfers it classifies as spurious (connect failures, timeouts,
+/// 5xx) and backs off ~1s, 3.5s, 6.5s, 9.5s, then 10s per attempt, so 10
+/// rides out a ~80s crates.io / runner network blip where the default 3
+/// gave up after ~11s and failed the leg (a fresh-CARGO_HOME baseline build
+/// hit "Could not connect to static.crates.io" in the lock-v4 leg).
+const REQUIRED_NET_RETRY: &str = "10";
+
 /// A `cargo` child with the fixture's private `CARGO_HOME`, the pinned
 /// toolchain, and no ambient `CARGO_TARGET_DIR` (shared-build-cache setups
-/// would redirect child builds out of the fixture).
+/// would redirect child builds out of the fixture). On a [`required`] leg
+/// it also widens cargo's own network retry (an explicit ambient
+/// `CARGO_NET_RETRY` wins); an optional run keeps the default so an
+/// offline machine still skips quickly.
 pub fn cargo_command(cwd: &Path, cargo_home: &Path) -> Command {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(cwd)
@@ -90,6 +101,9 @@ pub fn cargo_command(cwd: &Path, cargo_home: &Path) -> Command {
         .env_remove("CARGO_TARGET_DIR");
     if let Some(tc) = toolchain() {
         cmd.env("RUSTUP_TOOLCHAIN", tc);
+    }
+    if required() && env_nonempty("CARGO_NET_RETRY").is_none() {
+        cmd.env("CARGO_NET_RETRY", REQUIRED_NET_RETRY);
     }
     cmd
 }
