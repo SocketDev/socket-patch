@@ -1591,10 +1591,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
             global: args.common.global,
             global_prefix: args.common.global_prefix.clone(),
         };
-        let discovered = find_all_packages_for_rollback(
+        let discovered = crate::ecosystem_dispatch::find_package_paths_for_path_scope(
             &partitioned,
             &crawler_options,
             args.common.silent || args.common.json,
+            None,
         )
         .await;
         // One single-pattern scope per raw pattern, compiled once (not per

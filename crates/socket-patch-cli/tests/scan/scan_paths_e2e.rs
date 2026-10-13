@@ -982,14 +982,15 @@ async fn assert_member_alias_link_in_scope(store: &str, lp_entry: &str, lp_dir: 
             "scan {pattern} must not select member b's is-number; body: {}",
             bodies[0]
         );
+        if pattern == "packages/a" {
+            assert!(
+                bodies[0].contains("pkg:npm/ms@2.1.2"),
+                "scan packages/a must still select the plain-name link; body: {}",
+                bodies[0]
+            );
+            assert_eq!(v["scannedPackages"], 2, "scan packages/a: {v}");
+        }
     }
-    let (bodies, v) = scoped_agent_scan(root, "packages/a").await;
-    assert!(
-        bodies[0].contains("pkg:npm/ms@2.1.2"),
-        "scan packages/a must still select the plain-name link; body: {}",
-        bodies[0]
-    );
-    assert_eq!(v["scannedPackages"], 2, "scan packages/a: {v}");
 }
 
 /// #1266, pnpm's default isolated linker.
@@ -1006,4 +1007,62 @@ async fn paths_scope_selects_pnpm_member_alias_link() {
 async fn paths_scope_selects_npm_linked_member_alias_link() {
     assert_member_alias_link_in_scope(".store", "left-pad@1.3.0-0a1b2c3d", "left-pad").await;
     assert_member_alias_link_in_scope(".store", "lp@1.3.0-0a1b2c3d", "lp").await;
+}
+
+/// #1266: the root's own `left-pad` link resolves to one pnpm peer
+/// variant, member a's alias `lp` to another. The crawl stops at the
+/// root's copy and never lists member a's variant, yet member a loads it,
+/// so scoping to member a must still select left-pad.
+#[cfg(unix)]
+#[tokio::test]
+async fn paths_scope_selects_member_alias_link_to_a_peer_variant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0", "private": true, "dependencies": { "left-pad": "1.3.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages: ['packages/*']\n",
+    )
+    .unwrap();
+    for variant in ["left-pad@1.3.0_react@17.0.2", "left-pad@1.3.0_react@18.2.0"] {
+        write_npm_package_at(
+            root,
+            &format!("node_modules/.pnpm/{variant}"),
+            "left-pad",
+            "1.3.0",
+        );
+    }
+    std::os::unix::fs::symlink(
+        ".pnpm/left-pad@1.3.0_react@17.0.2/node_modules/left-pad",
+        root.join("node_modules/left-pad"),
+    )
+    .unwrap();
+    let member_dir = root.join("packages/a");
+    std::fs::create_dir_all(member_dir.join("node_modules")).unwrap();
+    std::fs::write(
+        member_dir.join("package.json"),
+        r#"{ "name": "a", "version": "1.0.0", "dependencies": { "lp": "npm:left-pad@1.3.0" } }"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../../../node_modules/.pnpm/left-pad@1.3.0_react@18.2.0/node_modules/left-pad",
+        member_dir.join("node_modules/lp"),
+    )
+    .unwrap();
+
+    let (bodies, v) = scoped_agent_scan(root, "packages/a").await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "scan packages/a must query the batch API once; envelope {v}"
+    );
+    assert!(
+        bodies[0].contains("pkg:npm/left-pad@1.3.0"),
+        "scan packages/a must select the peer variant member a's alias loads; body: {}",
+        bodies[0]
+    );
 }

@@ -634,33 +634,49 @@ pub async fn find_all_packages_for_rollback(
 }
 
 /// [`find_all_packages_for_rollback`], taking the npm `node_modules` roots
-/// from `prior` as [`find_packages_for_rollback_reusing`] does. Used by
-/// `scan`'s path scoping, which must see the same copies `rollback`'s path
-/// targets do.
-///
-/// An npm package's copies here also include each link in a `node_modules`
-/// root that resolves to one of them ([`add_npm_links_to_copies`]): path
-/// scoping asks which install paths reach a package, and pnpm's isolated
-/// linker or npm's `install-strategy=linked` reach a workspace member's
-/// ALIAS dependency only through such a link (#1266).
+/// from `prior` as [`find_packages_for_rollback_reusing`] does.
 pub async fn find_all_packages_for_rollback_reusing(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
     prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, Vec<PathBuf>> {
-    let prior_roots = prior
+    let npm_roots = prior
         .filter(|p| p.taken_with(options))
-        .map(|p| p.roots.clone());
-    let npm_roots = match prior_roots {
-        Some(roots) => Some(roots),
-        None if partitioned
-            .get(&Ecosystem::Npm)
-            .is_some_and(|p| !p.is_empty()) =>
-        {
-            NpmCrawler.get_node_modules_paths(options).await.ok()
-        }
-        None => None,
+        .map(|p| p.roots.as_slice());
+    dispatch_find(partitioned, options, silent, merge_qualified, npm_roots).await
+}
+
+/// The install paths that reach each purl, for `scan`'s and `rollback`'s
+/// path targets: [`find_all_packages_for_rollback_reusing`]'s physical
+/// copies, plus each npm package link directly in a `node_modules` root
+/// (scoped ones one level down) that resolves to one of them or to one
+/// of their store peer variants.
+///
+/// The crawler records a plain-name link at its own path
+/// (`packages/a/node_modules/ms`), but never an alias link
+/// (`packages/a/node_modules/lp -> …/.pnpm/left-pad@1.3.0/node_modules/left-pad`):
+/// links are not physical copies, and apply and VEX must see each copy
+/// once (#856). Path scoping asks which paths install the package
+/// instead, and pnpm's isolated linker or npm's `install-strategy=linked`
+/// reach a workspace member's ALIAS dependency only through such a link
+/// (#1266). The member's link can resolve to a peer variant the crawl
+/// skipped once it found the root's copy, so the variants count too.
+/// The result is for path matching only: it can name one physical copy
+/// more than once.
+pub async fn find_package_paths_for_path_scope(
+    partitioned: &HashMap<Ecosystem, Vec<String>>,
+    options: &CrawlerOptions,
+    silent: bool,
+    prior: Option<&NpmCrawlSnapshot>,
+) -> HashMap<String, Vec<PathBuf>> {
+    let has_npm = partitioned
+        .get(&Ecosystem::Npm)
+        .is_some_and(|purls| !purls.is_empty());
+    let npm_roots = match prior.and_then(|p| p.roots_for(options)) {
+        Some(roots) if has_npm => Some(roots.to_vec()),
+        None if has_npm => NpmCrawler.get_node_modules_paths(options).await.ok(),
+        _ => None,
     };
     let mut found = dispatch_find(
         partitioned,
@@ -670,40 +686,43 @@ pub async fn find_all_packages_for_rollback_reusing(
         npm_roots.as_deref(),
     )
     .await;
-    if let Some(roots) = npm_roots {
-        found = tokio::task::spawn_blocking(move || {
-            add_npm_links_to_copies(&mut found, &roots);
-            found
-        })
-        .await
-        .expect("npm link enumeration does not panic");
-    }
-    found
-}
-
-/// Add to each npm purl's `copies` every package link directly in one of
-/// `roots` (scoped ones one level down) that resolves to one of its
-/// copies. The crawler records a plain-name link at its own path
-/// (`packages/a/node_modules/ms`), but never an alias link
-/// (`packages/a/node_modules/lp -> …/.pnpm/left-pad@1.3.0/node_modules/left-pad`):
-/// links are not physical copies, and apply and VEX must see each physical
-/// copy once. Path scoping instead needs every path that installs the
-/// package, so the alias link is added here (#1266).
-fn add_npm_links_to_copies(copies: &mut HashMap<String, Vec<PathBuf>>, roots: &[PathBuf]) {
+    let Some(roots) = npm_roots else {
+        return found;
+    };
     let mut by_target: HashMap<PathBuf, Vec<String>> = HashMap::new();
-    for (purl, paths) in copies.iter() {
-        if !purl.starts_with("pkg:npm/") {
+    for (purl, paths) in &found {
+        if Ecosystem::from_purl(purl) != Some(Ecosystem::Npm) {
             continue;
         }
-        for path in paths {
-            if let Ok(target) = std::fs::canonicalize(path) {
+        for path in with_store_peer_variant_copies(paths.clone()).await {
+            if let Ok(target) = tokio::fs::canonicalize(&path).await {
                 by_target.entry(target).or_default().push(purl.clone());
             }
         }
     }
     if by_target.is_empty() {
-        return;
+        return found;
     }
+    // A failed enumeration only loses the extra links; the copies stand.
+    let links = tokio::task::spawn_blocking(move || npm_links_to(&by_target, &roots))
+        .await
+        .unwrap_or_default();
+    for (purl, link) in links {
+        let paths = found.entry(purl).or_default();
+        if !paths.contains(&link) {
+            paths.push(link);
+        }
+    }
+    found
+}
+
+/// Every package link directly in one of `roots` (scoped ones one level
+/// down) that resolves to a key of `by_target`, paired with each purl
+/// that key belongs to.
+fn npm_links_to(
+    by_target: &HashMap<PathBuf, Vec<String>>,
+    roots: &[PathBuf],
+) -> Vec<(String, PathBuf)> {
     let entries = |dir: &Path| -> Vec<(String, PathBuf, std::fs::FileType)> {
         let Ok(read) = std::fs::read_dir(dir) else {
             return Vec::new();
@@ -716,6 +735,7 @@ fn add_npm_links_to_copies(copies: &mut HashMap<String, Vec<PathBuf>>, roots: &[
             })
             .collect()
     };
+    let mut out = Vec::new();
     for root in roots {
         let mut links = Vec::new();
         for (name, path, file_type) in entries(root) {
@@ -735,13 +755,11 @@ fn add_npm_links_to_copies(copies: &mut HashMap<String, Vec<PathBuf>>, roots: &[
                 continue;
             };
             for purl in by_target.get(&target).into_iter().flatten() {
-                let paths = copies.get_mut(purl).expect("keyed from copies");
-                if !paths.contains(&link) {
-                    paths.push(link.clone());
-                }
+                out.push((purl.clone(), link.clone()));
             }
         }
     }
+    out
 }
 
 /// Qualified-aware PURL resolution for rollback, vendor, repair and
