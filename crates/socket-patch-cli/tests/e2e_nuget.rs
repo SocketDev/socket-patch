@@ -59,7 +59,7 @@ async fn run(args: &[&str], cwd: &Path, nuget_packages: &Path, proxy_url: &str) 
     let nuget_packages = nuget_packages.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut cmd = common::hermetic_command(&binary());
+        let mut cmd = hermetic::command(&binary());
         hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
         common::jvm_env::isolate_cli(&mut cmd);
         cmd.args(&arg_refs)

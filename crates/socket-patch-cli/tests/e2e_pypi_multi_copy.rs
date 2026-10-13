@@ -47,7 +47,7 @@ const DISCOVERY_VARS: &[&str] = &[
 /// Run the binary in `cwd` with the `SOCKET_*` and discovery env scrubbed
 /// and exactly `env` added.
 fn run(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = common::hermetic_command(&common::binary());
+    let mut cmd = common::hermetic::command(&common::binary());
     cmd.args(args).current_dir(cwd);
     for name in DISCOVERY_VARS {
         cmd.env_remove(name);

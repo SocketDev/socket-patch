@@ -15,7 +15,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -57,10 +57,13 @@ fn git_sha256_file(path: &Path) -> String {
 /// site-packages, while `SOCKET_MANIFEST_PATH` relocates `.socket/` (verified
 /// to fail `get` outright) and `SOCKET_DRY_RUN` / `SOCKET_SAVE_ONLY` turn the
 /// apply steps into silent no-ops. An activated venv is scrubbed too, so the
-/// crawler patches the suite's own `.venv` rather than the developer's.
+/// crawler patches the suite's own `.venv` rather than the developer's, and
+/// `HOME` points at a stand-in (`jvm_env::isolate_cli`) so the user site
+/// under the real `~` stays out of the scans.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = common::hermetic_command(&binary());
-    common::hermetic::scrub_extra(&mut cmd, &[common::hermetic::Extra::Venv]);
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    common::jvm_env::isolate_cli(&mut cmd);
     cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
 
