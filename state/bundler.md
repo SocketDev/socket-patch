@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-13 (run 39), main `15c2c83`, latest release v5.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
+Last updated: 2026-10-13 (run 40), main `aa85c6c`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
 
 ## Coverage matrix
 
@@ -368,6 +368,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Same → frozen install of the restored pair | **fail #1476** (exit 16) | pass (warning only) |
 | Gemfile `lockfile "custom.lock"` DSL → hosted scan refused | **fail #1477** | **fail #1477** |
 
+### Run 40 (main `aa85c6c`, v5.0.1; Linux Ruby 3.3.6; scratch copy of `gem_hosted_unwind_keeps_a_source_block_bang`, real `bundle install`)
+
+| Cell | 4.0.22 | 2.6.9 |
+| --- | --- | --- |
+| #1476 fix: `x = while/until/unless … end`, endless def, one-line `x = if … then … end` in a source block (unit probe) | pass | — |
+| Paren multi-line `source(\n "…"\n) do` → `rollback` / `remove` keeps the `!` | **fail #1509** (exit 16) | **fail #1509** (warning) |
+| Brace `source("…") { … }` → `rollback` / `remove` | **fail #1509** (exit 16, Gemfile not byte-restored) | **fail #1509** |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -390,10 +398,10 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. #1477 neighbour: vendored mode with the Gemfile `lockfile` DSL, and `lockfile false`.
-2. #1476 neighbours: `x = while/until/unless … end`, endless `def x = 1`, one-line `x = if c then 1 else 2 end` inside a source block.
+1. #1509 neighbours once it's fixed: a brace block nested in `group … do`, a `do` on the line after the `source(...)` call, `source` after `;`.
+2. #1477 neighbour: vendored mode with the Gemfile `lockfile` DSL (e2e check of the #1479 refusal), and `lockfile false`.
 3. H→V takeover with the hosted patched archive in `vendor/cache`, then `vendor --revert` / `remove` (no stale-cache check on that path).
-4. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1295 warning with `D:/…` plugin paths, the #1260 stale-cache warning.
+4. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1260 stale-cache warning.
 5. Re-run #985 / #1109 (`agent:needs-human`) when fixes merge.
 
 ## Known non-bugs
@@ -509,3 +517,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - `bughunt/bundler/20261012-win-mac-recheck` is also left behind (`git push --delete` hangs up), and no run ever triggered on it; its workflow is push-triggered only.
 - Bundler 4.0.18 only warns ("Cannot write a changed lockfile while frozen.", exit 0) when a source-block gem's DEPENDENCIES `!` is missing. 4.0.19+ fails with exit 16. Use 4.0.22 to show the frozen-install impact of `!` bugs (run 39).
 - The `bundle` / `bundle_env` helpers in `e2e_redirect_gem_build.rs` strip `GEM_*`, so a Bundler installed into a scratch `GEM_HOME` is silently not used. `gem install bundler -v <v>` into the system gems, then set `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION` (run 39).
+- `source "…", type: "rubygems" do` isn't a valid Bundler source (`type:` selects a plugin source; Bundler fails with "Could not find gem 'bundler-source-rubygems'"). Use a paren multi-line opener to test multi-line `source` shapes (run 40).
+- The #1478 source-block scanner misses a regex after a predicate method with no parentheses (`x.match? /end/`) and a `%w[end]` argument with no parentheses. Both are contrived, so they're not filed (run 40).
