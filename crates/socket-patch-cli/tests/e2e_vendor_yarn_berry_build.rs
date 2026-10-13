@@ -881,3 +881,178 @@ fn yarn_berry_vendor_refuses_a_gitignored_socket_dir() {
     );
     assert!(!proj.join(format!(".socket/vendor/npm/{UUID}")).exists());
 }
+
+// ── #759: revert after the lock moved on ──────────────────────────────
+
+/// What changes in the project while left-pad is vendored, before the
+/// revert.
+#[derive(Clone, Copy, Debug)]
+enum LockChange {
+    /// Member `b` starts depending on `left-pad@1.3.0` beside the root's
+    /// `^1.3.0`.
+    MemberAddsDescriptor,
+    /// Member `b` stops depending on its `left-pad@1.3.0`; the root keeps
+    /// `^1.3.0`.
+    MemberRemovesDescriptor,
+    /// Vendored under yarn 4.0.2 (bare checksums), then installed with a
+    /// 4.1+ yarn, which respells every checksum `10c0/<hex>`.
+    YarnUpgrade,
+}
+
+/// #759: `vendor --revert` after the lock changed since vendoring leaves a
+/// lock a fresh checkout installs with `yarn install --immutable`. The
+/// revert used to write the recorded pre-vendor entry back verbatim (its
+/// old key, its old checksum spelling), and yarn rejected it (YN0028).
+#[test]
+fn issue_759_revert_after_a_member_adds_a_descriptor() {
+    run_revert_after_lock_change(LockChange::MemberAddsDescriptor);
+}
+
+#[test]
+fn issue_759_revert_after_a_member_removes_a_descriptor() {
+    run_revert_after_lock_change(LockChange::MemberRemovesDescriptor);
+}
+
+#[test]
+fn issue_759_revert_after_a_yarn_upgrade_respells_checksums() {
+    run_revert_after_lock_change(LockChange::YarnUpgrade);
+}
+
+fn run_revert_after_lock_change(change: LockChange) {
+    // The upgrade case pins its own pair of releases: the last bare-hex
+    // writer, then the one under test (or the first prefixed writer when
+    // that is a bare-hex one itself).
+    let (vendor_yarn, after_yarn) = match change {
+        LockChange::YarnUpgrade => (
+            "yarn@4.0.2",
+            match yarn_berry() {
+                "yarn@4.0.0" | "yarn@4.0.1" | "yarn@4.0.2" => "yarn@4.1.0",
+                current => current,
+            },
+        ),
+        _ => (yarn_berry(), yarn_berry()),
+    };
+    for pm in [vendor_yarn, after_yarn] {
+        if !has_corepack_pm(pm) {
+            skip!(
+                "SKIP e2e_vendor_yarn_berry_build (#759 {change:?}): `corepack {pm}` unavailable"
+            );
+            return;
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let global = tmp.path().join("yarn-global");
+    let yarn = |pm: &str, dir: &Path, args: &[&str]| {
+        let out = corepack(
+            dir,
+            pm,
+            args,
+            &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
+        );
+        (out.status.success(), yarn_berry_common::yarn_output(&out))
+    };
+    let member = |dep: Option<&str>| {
+        let deps = dep
+            .map(|r| format!(r#","dependencies":{{"{DEP}":"{r}"}}"#))
+            .unwrap_or_default();
+        std::fs::write(
+            proj.join("packages/b/package.json"),
+            format!(r#"{{"name":"b","version":"1.0.0"{deps}}}"#),
+        )
+        .unwrap();
+    };
+    std::fs::create_dir_all(proj.join("packages/b")).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"root","version":"0.0.0","private":true,"workspaces":["packages/*"],"dependencies":{{"{DEP}":"^{DEP_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join(".yarnrc.yml"),
+        "nodeLinker: node-modules\nenableGlobalCache: false\n",
+    )
+    .unwrap();
+    member(match change {
+        LockChange::MemberRemovesDescriptor => Some(DEP_VERSION),
+        _ => None,
+    });
+    let (ok, out) = yarn(vendor_yarn, &proj, &["install"]);
+    if !ok {
+        skip!("SKIP e2e_vendor_yarn_berry_build (#759 {change:?}): fixture install failed:\n{out}");
+        return;
+    }
+
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    stage_patch(
+        &proj,
+        &format!("pkg:npm/{DEP}@{DEP_VERSION}"),
+        "package/index.js",
+        &orig,
+        &patched,
+    );
+    let cwd = proj.to_str().unwrap();
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    match change {
+        LockChange::MemberAddsDescriptor => member(Some(DEP_VERSION)),
+        LockChange::MemberRemovesDescriptor => member(None),
+        LockChange::YarnUpgrade => {}
+    }
+    let (ok, out) = yarn(after_yarn, &proj, &["install"]);
+    assert!(ok, "{change:?}: install while vendored failed:\n{out}");
+    let vendored = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    if let LockChange::YarnUpgrade = change {
+        assert!(
+            vendored.contains("checksum: 10c0/"),
+            "{after_yarn} respells the vendored lock's checksums:\n{vendored}"
+        );
+    }
+
+    let (code, stdout, stderr) = run_socket(&proj, &["vendor", "--revert", "--json", "--cwd", cwd]);
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let reverted = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+
+    // Fresh checkout of the committable files, empty global folder.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(fresh.join("packages/b")).unwrap();
+    for file in [
+        "package.json",
+        "yarn.lock",
+        ".yarnrc.yml",
+        "packages/b/package.json",
+    ] {
+        std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+    }
+    let out = corepack(
+        &fresh,
+        after_yarn,
+        &["install", "--immutable"],
+        &[(
+            "YARN_GLOBAL_FOLDER",
+            tmp.path().join("fresh-global").to_str().unwrap(),
+        )],
+    );
+    assert!(
+        out.status.success(),
+        "{change:?}: the reverted lock must pass `{after_yarn} install --immutable`:\n{}\n\
+         reverted yarn.lock:\n{reverted}",
+        yarn_berry_common::yarn_output(&out)
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        orig,
+        "the reverted project installs the registry bytes"
+    );
+}
