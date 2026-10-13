@@ -972,7 +972,7 @@ jobs:
 
       - name: Run npm schema tests
         # The `./schema` export's zod tests. `npm install --no-save`, not
-        # `npm ci`, for the reason publish-npm.yml gives (a version-synced
+        # `npm ci`, for the reason release.yml's npm-publish job gives (a version-synced
         # lock can name platform packages not yet on the registry); the
         # platform binaries are optional and not needed here. The pack
         # test runs again once `npm test` has built dist/, so it also

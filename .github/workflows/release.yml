@@ -1,41 +1,40 @@
 name: Release
 
-# One-dispatch release orchestrator: version gate, build matrix, tag, and
-# GitHub release live here; each registry publish lives in its own
-# independently-runnable workflow (publish-cargo.yml, publish-npm.yml).
-# The fan-out jobs below dispatch each at the release tag via `gh workflow run`
-# (scripts/dispatch-publish.sh) and watch the dispatched run to completion,
-# so this run's job graph still reflects every registry's real outcome and
-# "Re-run failed jobs" re-dispatches exactly the failed legs. A failed leg
-# can also be retried without this run at all: fix the cause and dispatch
-# that registry's workflow manually with the release version — no rebuild
-# happens either way. The npm leg takes the prebuilt binaries from
-# the GitHub release's assets (verified against SHA256SUMS, pinned by digest
-# on the fan-out path), which is why it waits on `github-release` below.
+# One-dispatch release orchestrator: version gate, build matrix, tag, GitHub
+# release, and the npm publish all live here; the crates.io publish lives in
+# its own independently-runnable workflow (publish-cargo.yml). The
+# cargo-publish job below dispatches it at the release tag via `gh workflow
+# run` (scripts/dispatch-publish.sh) and watches the dispatched run to
+# completion, so this run's job graph still reflects its real outcome and
+# "Re-run failed jobs" re-dispatches it. A failed cargo leg can also be
+# retried without this run: fix the cause and dispatch publish-cargo.yml
+# manually with the release version — no rebuild happens either way.
 #
-# Why dispatch instead of `uses:` (reusable workflows) — two GitHub/registry
-# facts, verified 2026-08-21 against the registries' docs and source:
-#   1. npm and crates.io OIDC trusted publishers match the top-level
-#      workflow filename (`workflow_ref` claim). npm additionally
-#      allows only ONE trusted publisher per package, so a leg that is
-#      sometimes `uses:`-called (top-level = release.yml) and sometimes
-#      dispatched (top-level = its own file) can never be authorized for
-#      both paths. Dispatching makes every leg ALWAYS the top-level workflow
-#      of its own run, so both claims name the leg's file and one publisher
-#      registration per package covers everything, on every registry.
-#   2. GitHub suppresses events caused by this workflow's own GITHUB_TOKEN —
-#      a `release: published` (or `push: tags:`) trigger in another file
-#      would never fire — but workflow_dispatch (and repository_dispatch) events
-#      are documented exceptions, so `gh workflow run` with GITHUB_TOKEN
-#      works without a PAT/GitHub App token.
+# Why npm is inline but crates.io is dispatched — registries' OIDC trusted
+# publishers match the TOP-LEVEL workflow filename (`workflow_ref` claim):
+#   - npm allows only ONE trusted publisher per package, and every
+#     socket-patch package's publisher is registered against release.yml.
+#     Publishing from a job of this file keeps that registration valid.
+#     A failed npm job is retried with "Re-run failed jobs" on the release
+#     run, or — after the run is gone or when a workflow fix is needed — by
+#     dispatching this workflow with `npm-retry-version` set, which skips
+#     the version gate, build, tag, GitHub release and crates.io jobs and
+#     re-stages npm from the existing release's assets. Both paths run as
+#     release.yml, so the one registration covers them.
+#   - crates.io allows several publishers per crate, and publish-cargo.yml
+#     is registered for both crates; dispatching keeps it the top-level
+#     workflow of its own run, whether this run or a maintainer started it.
+# GitHub suppresses events caused by this workflow's own GITHUB_TOKEN — a
+# `release: published` (or `push: tags:`) trigger in another file would never
+# fire — but workflow_dispatch events are a documented exception, so `gh
+# workflow run` with GITHUB_TOKEN works without a PAT/GitHub App token.
 #
 # Registry credentials:
-#   - crates.io:     OIDC trusted publishing (rust-lang/crates-io-auth-action);
-#                    no long-lived secret, no environment.
-#   - npm:           OIDC via `npm stage publish`; staged versions require
-#                    manual 2FA approval (see the npm run's step summary).
-# Every registry's trusted publisher is keyed on the repo + the publish
-# workflow's own filename (see each publish-*.yml header), NOT release.yml.
+#   - crates.io:     OIDC trusted publishing (rust-lang/crates-io-auth-action),
+#                    publisher = publish-cargo.yml; no secret, no environment.
+#   - npm:           OIDC via `npm stage publish`, publisher = release.yml;
+#                    staged versions require manual 2FA approval (see the
+#                    npm-publish job's step summary).
 
 on:
   workflow_dispatch:
@@ -44,11 +43,19 @@ on:
         description: 'Dry run (build only, skip publish)'
         type: boolean
         default: false
+      npm-retry-version:
+        description: 'Retry ONLY the npm publish of an existing release (X.Y.Z; the v<version> GitHub release must exist with binaries + SHA256SUMS). Skips build, tag, GitHub release and crates.io. Leave blank for a normal release.'
+        required: false
+        default: ''
+        type: string
 
 permissions: {}
 
 jobs:
   version:
+    # An npm-only retry skips this job, and with it (via `needs`) everything
+    # but npm-publish.
+    if: ${{ inputs.npm-retry-version == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -280,18 +287,17 @@ jobs:
               artifacts/*
           fi
 
-  # ── Publish fan-out ────────────────────────────────────────────────────────
-  # Each job dispatches one registry's publish workflow at the release tag
-  # and watches the dispatched run to completion (scripts/dispatch-publish.sh),
-  # failing iff that run fails — see this file's header for why the legs run
-  # as separate workflow_dispatch runs. The step summary links each leg's
-  # run. timeout-minutes bounds the watch; a timed-out watch does NOT cancel
-  # the leg, which finishes (and stays retryable) on its own. If a watcher
-  # fails while its leg is still alive (watch timeout, correlation miss),
-  # re-running it dispatches a second run of the same leg — safe, because
-  # each publish workflow serializes same-version runs with a concurrency
-  # group, so the duplicate queues behind the live run and then no-ops on
-  # the already-published probes.
+  # ── Publish ────────────────────────────────────────────────────────────────
+  # cargo-publish dispatches publish-cargo.yml at the release tag and watches
+  # the dispatched run to completion (scripts/dispatch-publish.sh), failing
+  # iff that run fails; its step summary links the run. timeout-minutes
+  # bounds the watch; a timed-out watch does NOT cancel the leg, which
+  # finishes (and stays retryable) on its own. If the watcher fails while
+  # the leg is still alive (watch timeout, correlation miss), re-running it
+  # dispatches a second run — safe, because publish-cargo.yml serializes
+  # same-version runs with a concurrency group, so the duplicate queues
+  # behind the live run and then no-ops on the already-published probes.
+  # npm-publish runs inline — see this file's header for why.
 
   cargo-publish:
     needs: [version, build, tag]
@@ -313,32 +319,219 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: bash scripts/dispatch-publish.sh publish-cargo.yml "$VERSION"
 
-  # npm takes the prebuilt binaries from the GitHub release's assets,
-  # so it waits on `github-release`.
+  # npm takes the prebuilt binaries from the GitHub release's assets, so it
+  # waits on `github-release`. With `npm-retry-version` set, every other job
+  # is skipped and this one re-stages that existing release.
   npm-publish:
     needs: [version, github-release]
-    if: ${{ !inputs.dry-run }}
+    if: >-
+      ${{ !cancelled() && !inputs.dry-run && (
+        inputs.npm-retry-version != '' || needs.github-release.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Serialize same-version publishes: the already-published/already-staged
+    # probes below are check-then-act, so two concurrent runs for one version
+    # (a release run and a retry) could race them.
+    concurrency:
+      group: release-npm-${{ inputs.npm-retry-version || needs.version.outputs.version }}
     permissions:
       contents: read
-      actions: write
+      id-token: write
+    env:
+      VERSION: ${{ inputs.npm-retry-version || needs.version.outputs.version }}
+      # Pins SHA256SUMS to what this run's build produced (github-release's
+      # output). Empty on an npm-only retry, where nothing was built: the
+      # assets are then checked for integrity only.
+      SUMS_DIGEST: ${{ needs.github-release.outputs.sums-digest }}
+      NPM_RETRY: ${{ inputs.npm-retry-version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Dispatch and watch Publish npm
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.version.outputs.version }}
-          SUMS_DIGEST: ${{ needs.github-release.outputs.sums-digest }}
+      - name: Validate version
         run: |
-          # Fail closed: an empty digest would silently downgrade the leg's
-          # asset check from provenance-pinned to integrity-only.
-          if [ -z "$SUMS_DIGEST" ]; then
-            echo "::error::github-release produced no SHA256SUMS digest; refusing to dispatch an unpinned publish"
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'${VERSION}' is not a plain X.Y.Z release version"
             exit 1
           fi
-          bash scripts/dispatch-publish.sh publish-npm.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
+          # Fail closed: a full release run must pin the assets it built; an
+          # empty digest would silently downgrade to integrity-only.
+          if [ -z "$NPM_RETRY" ] && [ -z "$SUMS_DIGEST" ]; then
+            echo "::error::github-release produced no SHA256SUMS digest; refusing an unpinned publish"
+            exit 1
+          fi
+
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/tags/v${{ env.VERSION }}
+          persist-credentials: false
+
+      - name: Verify tag carries the requested version
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::error::tag v${VERSION} carries workspace version ${CARGO_VERSION} — refusing to publish"
+            exit 1
+          fi
+
+      - name: Configure git for HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Download binaries from the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir artifacts
+          gh release download "v${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir artifacts \
+            --pattern '*.tar.gz' --pattern '*.zip' --pattern 'SHA256SUMS'
+          cd artifacts
+          # Release assets are mutable (contents:write can clobber them), and
+          # SHA256SUMS is itself an asset of the same release — so a full
+          # release run pins the sums file by digest, binding this publish to
+          # exactly what its build produced.
+          if [ -n "$SUMS_DIGEST" ]; then
+            echo "${SUMS_DIGEST}  SHA256SUMS" | sha256sum -c -
+          fi
+          # -c also fails on a file that SHA256SUMS lists but the download
+          # missed, so this doubles as a completeness check: the sums file
+          # was generated from the full 14-target artifact set.
+          sha256sum -c SHA256SUMS
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22.22.1'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Update npm for staged publishing
+        run: npm install -g npm@11.15.0
+
+      - name: Stage binaries into platform packages
+        run: |
+          # Unix platforms: extract binary into each platform package directory
+          stage_unix() {
+            local artifact="$1" pkg_dir="$2"
+            tar xzf "artifacts/${artifact}.tar.gz" -C "${pkg_dir}/"
+          }
+
+          # Windows platforms: extract .exe into each platform package directory
+          stage_win() {
+            local artifact="$1" pkg_dir="$2"
+            unzip -o "artifacts/${artifact}.zip" -d "${pkg_dir}/"
+          }
+
+          stage_unix socket-patch-aarch64-apple-darwin       npm/socket-patch-darwin-arm64
+          stage_unix socket-patch-x86_64-apple-darwin        npm/socket-patch-darwin-x64
+          stage_unix socket-patch-x86_64-unknown-linux-gnu      npm/socket-patch-linux-x64-gnu
+          stage_unix socket-patch-x86_64-unknown-linux-musl     npm/socket-patch-linux-x64-musl
+          stage_unix socket-patch-aarch64-unknown-linux-gnu     npm/socket-patch-linux-arm64-gnu
+          stage_unix socket-patch-aarch64-unknown-linux-musl    npm/socket-patch-linux-arm64-musl
+          stage_unix socket-patch-arm-unknown-linux-gnueabihf   npm/socket-patch-linux-arm-gnu
+          stage_unix socket-patch-arm-unknown-linux-musleabihf  npm/socket-patch-linux-arm-musl
+          stage_unix socket-patch-i686-unknown-linux-gnu        npm/socket-patch-linux-ia32-gnu
+          stage_unix socket-patch-i686-unknown-linux-musl       npm/socket-patch-linux-ia32-musl
+          stage_unix socket-patch-aarch64-linux-android      npm/socket-patch-android-arm64
+
+          stage_win socket-patch-x86_64-pc-windows-msvc      npm/socket-patch-win32-x64
+          stage_win socket-patch-i686-pc-windows-msvc        npm/socket-patch-win32-ia32
+          stage_win socket-patch-aarch64-pc-windows-msvc     npm/socket-patch-win32-arm64
+
+      - name: Stage-publish platform packages
+        id: stage-platform
+        run: |
+          : > "${RUNNER_TEMP}/staged-packages.txt"
+          for pkg_dir in npm/socket-patch-*/; do
+            pkg_name="@socketsecurity/$(basename "$pkg_dir")"
+            echo "Staging ${pkg_name}..."
+            if npm stage publish "./${pkg_dir}" --access public; then
+              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+            elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
+              # Already fully published (approved) — a clean re-run.
+              echo "Already published, skipping."
+            elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
+              # Staged but not yet 2FA-approved: `npm view` can't see staged
+              # versions, so without this check a re-run after a mid-job
+              # failure could never succeed. Best-effort match on the stage
+              # listing (format unverified against a live staged state — if it
+              # misses we still fail loudly below).
+              echo "Already staged awaiting approval, skipping."
+              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+            else
+              exit 1
+            fi
+          done
+
+      - name: Copy README for npm package
+        run: cp README.md npm/socket-patch/README.md
+
+      - name: Install main-package devDependencies
+        # `npm stage publish` (like `npm pack`) runs the package's `prepack`
+        # script, which compiles the `./schema` export with tsc — the
+        # `typescript` devDependency must be installed for that build.
+        #
+        # NOT `npm ci`: version-sync.sh (the offline stamp) drops the lock's
+        # platform-package entries for any other version, and the release's
+        # platform packages are not yet on the registry when it runs, so the
+        # lock has no entries for them and `npm ci` refuses it
+        # ("lock file's ...@ does not satisfy ...@X.Y.Z"). `npm install`
+        # tolerates the stubs and skips unresolvable optional platform
+        # packages (verified for both the published and unpublished-version
+        # states); --no-save keeps the runner from touching package.json.
+        working-directory: npm/socket-patch
+        run: npm install --no-save --ignore-scripts --no-audit --no-fund
+
+      - name: Stage-publish main package
+        run: |
+          pkg_name="@socketsecurity/socket-patch"
+          if npm stage publish ./npm/socket-patch --access public; then
+            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+          elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
+            echo "Already published, skipping."
+          elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
+            # See the platform-package step: staged-not-approved versions are
+            # invisible to `npm view`; tolerate them so re-runs can succeed.
+            echo "Already staged awaiting approval, skipping."
+            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+          else
+            exit 1
+          fi
+
+      - name: Summarize staged versions awaiting approval
+        if: always()
+        run: |
+          STAGED_FILE="${RUNNER_TEMP}/staged-packages.txt"
+          if [ ! -s "$STAGED_FILE" ]; then
+            echo "No packages staged this run (all versions already published or publish step failed before staging)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## npm staged versions awaiting approval"
+            echo ""
+            echo "Version \`${VERSION}\` is staged on npm. A maintainer must approve each package with 2FA before it becomes installable."
+            echo ""
+            echo "**Approve platform packages first**, then the main \`@socketsecurity/socket-patch\` package, so install-time \`optionalDependencies\` resolution sees the platform binaries already live."
+            echo ""
+            echo "**Approve from the web** (signs in + 2FA prompts inline):"
+            echo ""
+            echo "- Org dashboard: <https://www.npmjs.com/settings/socketsecurity/staged-packages>"
+            echo ""
+            echo "Per-package review pages:"
+            echo ""
+            while IFS= read -r pkg_name; do
+              [ -z "$pkg_name" ] && continue
+              # npmjs.com renders staged versions inline on the package page;
+              # the access page exposes the "Staged" tab and the approve button.
+              echo "- \`${pkg_name}@${VERSION}\` — <https://www.npmjs.com/package/${pkg_name}/access>"
+            done < "$STAGED_FILE"
+            echo ""
+            echo "**Approve from the CLI** (requires \`npm@11.15.0+\` locally, signed in to the \`socketsecurity\` org with 2FA):"
+            echo ""
+            echo '```sh'
+            echo "npm stage list"
+            echo "# then, for each stage id printed above (platform packages first, main package last):"
+            echo "npm stage approve <stage-id>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Mirror to step log so it's also visible in the raw run output.
+          echo "::notice title=npm staged versions awaiting approval::Review and approve at https://www.npmjs.com/settings/socketsecurity/staged-packages"
