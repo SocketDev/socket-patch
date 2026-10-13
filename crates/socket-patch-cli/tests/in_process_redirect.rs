@@ -1681,6 +1681,8 @@ async fn scan_redirect_npm_file_copy_is_not_attested_in_run() {
             rewritten.contains(HOSTED_URL),
             "{shape}: the registry entry is redirected:\n{rewritten}"
         );
+        // No document is written when no statement survives, so a missing
+        // file is the expected "attests nothing" outcome here.
         let attested = std::fs::read_to_string(&out)
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())

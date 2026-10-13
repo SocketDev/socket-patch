@@ -1384,17 +1384,25 @@ impl From<NpmLockEntry<'_>> for NpmLockTarget {
 
 /// The `(name, version)` of the source directory an npm `packages` link
 /// entry (at `pointer`) points at: the entry its `resolved` path names,
-/// by that entry's `name` field, else its directory's basename (npm omits
-/// `name` when they agree). `None` when the lock records no version.
+/// by that entry's `name` field, else its folder name, which keeps an
+/// `@scope/` parent as npm's `nameFromFolder` does (npm omits `name` when
+/// they agree). `None` when the lock records no version.
 fn npm_link_source_identity(lock: &Value, pointer: &str) -> Option<(String, String)> {
     let resolved = lock.pointer(pointer)?.get("resolved")?.as_str()?;
     let source = lock.get("packages")?.get(resolved)?;
     let version = source.get("version")?.as_str()?;
     let name = match source.get("name").and_then(Value::as_str) {
-        Some(name) => name,
-        None => resolved.rsplit('/').next().unwrap_or(resolved),
+        Some(name) => name.to_string(),
+        None => {
+            let mut segments = resolved.rsplit('/');
+            let base = segments.next().unwrap_or(resolved);
+            match segments.next() {
+                Some(scope) if scope.starts_with('@') => format!("{scope}/{base}"),
+                _ => base.to_string(),
+            }
+        }
     };
-    Some((name.to_string(), version.to_string()))
+    Some((name, version.to_string()))
 }
 
 /// Rewrite a single npm lockfile (`package-lock.json` or `npm-shrinkwrap.json`)
@@ -1429,18 +1437,22 @@ fn rewrite_one_npm_lock(
         .filter(NpmLockEntry::is_dependency)
         .map(NpmLockTarget::from)
         .collect();
+    // Entries npm installs from a git / url / `file:` spec: see
+    // `vendor::npm_origin` (#326).
+    let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
     // A `file:` directory dependency is a versionless link entry whose
     // source directory's own entry carries the package (#1481): give the
-    // link that identity, so a copy of a patched release is seen.
-    for target in targets.iter_mut().filter(|t| t.link && t.version.is_none()) {
+    // link that identity, so a copy of a patched release is seen. A plain
+    // workspace-member link is first-party source, never a copy.
+    for target in targets
+        .iter_mut()
+        .filter(|t| t.link && t.version.is_none() && non_registry.contains_key(&t.key))
+    {
         if let Some((name, version)) = npm_link_source_identity(&lock, &target.pointer) {
             target.name = name;
             target.version = Some(version);
         }
     }
-    // Entries npm installs from a git / url / `file:` spec: see
-    // `vendor::npm_origin` (#326).
-    let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
     // Entries npm 7–11 install from a dependency's own shrinkwrap (#753).
     let shrinkwrapped = npm_shrinkwrapped_entries(&lock);
     // The legacy mirror of an entry the `packages` scan skips (and warns
@@ -19410,6 +19422,59 @@ mod tests {
                 "{shape}: the in-run VEX must not assume the patch applied"
             );
         }
+    }
+
+    /// #1481: a scoped `file:` directory whose source entry has no `name`
+    /// (npm omits it when the folder spells the name) is still matched,
+    /// while a workspace member that shares a patched package's identity
+    /// is first-party source, not a copy.
+    #[test]
+    fn issue_1481_npm_link_identity_scoped_folder_and_workspace_member() {
+        let ovr = npm_override(
+            "pkg",
+            "1.0.0",
+            "http://patch.test/pkg.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut ovr_scoped = ovr.clone();
+        ovr_scoped.namespace = Some("@scope".into());
+        let scoped = json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "dependencies": { "@scope/pkg": "file:vendor/@scope/pkg" } },
+                "vendor/@scope/pkg": { "version": "1.0.0" },
+                "node_modules/@scope/pkg": { "resolved": "vendor/@scope/pkg", "link": true }
+            }
+        });
+        let mut files = BTreeMap::new();
+        files.insert("package-lock.json".to_string(), scoped.to_string());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr_scoped));
+        assert!(r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_npm_link_entry_skipped"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.bundled_skipped_uuids.contains(&ovr_scoped.patch_uuid));
+
+        let workspace = json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "workspaces": ["packages/*"] },
+                "packages/pkg": { "version": "1.0.0" },
+                "node_modules/pkg": { "resolved": "packages/pkg", "link": true }
+            }
+        });
+        files.insert("package-lock.json".to_string(), workspace.to_string());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_npm_entry_not_found"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.bundled_skipped_uuids.is_empty());
     }
 
     /// #326, lockfileVersion 2: the legacy `dependencies` mirror of a
