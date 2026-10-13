@@ -52,6 +52,10 @@ pub(crate) fn metadata_files<'d>(lock: &'d Table, name: &str) -> Vec<&'d dyn Tab
 /// Whether a `[metadata.files]` entry is laid out one file per line, which is
 /// how Poetry 1.0/1.1 write every NON-empty entry (tomlkit `multiline(True)`);
 /// an empty one is `[]`.
+///
+/// Reads the array's layout, so `item` must come from a `DocumentMut`: a
+/// read-only `toml_edit::Document` keeps layout as spans into its source
+/// and this would answer `false` for every entry.
 pub(crate) fn is_multiline_array(item: &Item) -> bool {
     item.as_array().is_some_and(|array| {
         let has_break = |raw: Option<&str>| raw.is_some_and(|s| s.contains('\n'));

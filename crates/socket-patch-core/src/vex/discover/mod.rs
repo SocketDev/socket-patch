@@ -2251,8 +2251,11 @@ pub(crate) enum TomlDiag {
 /// value and comment out of it the way a [`toml_edit::DocumentMut`] does.
 /// On a large `poetry.lock` that copy, and freeing it, cost more than the
 /// parse itself (#1473). Values read the same either way (`as_str` and
-/// friends return the decoded value); only re-rendering an item needs the
-/// source, and no extractor renders one.
+/// friends return the decoded value); only an item's layout (its raw
+/// decor, as `poetry_lock::is_multiline_array` reads) needs the source.
+/// The PyPI lock extractors read this document directly; the cargo and
+/// pyproject/hatch readers still convert it with `into_mut`, as their
+/// helpers take a `DocumentMut`.
 pub(crate) fn toml_or_diag<S: AsRef<str>>(
     file: &str,
     text: S,
