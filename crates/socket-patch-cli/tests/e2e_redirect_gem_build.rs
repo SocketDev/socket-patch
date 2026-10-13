@@ -466,6 +466,11 @@ enum Driver {
     /// run must redirect nothing and attest nothing. Bundler >= 4 only; the
     /// fixture asserts the contract itself and yields `None`.
     ScanVexCustomLockfile,
+    /// [`Driver::ScanVexCustomLockfile`] with the lock named by a
+    /// `lockfile "custom.lock"` call at the top of the Gemfile instead of
+    /// the config (#1477): bundler 4's DSL spelling, which outranks every
+    /// `BUNDLE_LOCKFILE` tier. Bundler >= 4 only.
+    ScanVexCustomLockfileDsl,
     /// [`Driver::ScanVex`] on a `Gemfile` + `gems.rb` twin (#751): bundler
     /// 1.x loads the `Gemfile` and >= 2 loads `gems.rb`, and the scan cannot
     /// see which runs, so it must redirect and attest nothing and leave all
@@ -523,6 +528,9 @@ impl Driver {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
             }
             Driver::ScanVexCustomLockfile => "scan --mode hosted (lockfile custom.lock)",
+            Driver::ScanVexCustomLockfileDsl => {
+                "scan --mode hosted (Gemfile `lockfile \"custom.lock\"` call)"
+            }
             Driver::ScanVexTwin => "scan --mode hosted (Gemfile + gems.rb twin)",
             Driver::ScanVexGroupBlock => "scan --mode hosted (gem in a group block)",
             Driver::ScanVexSourceBlock => "scan --mode hosted (gem in a source block)",
@@ -641,7 +649,9 @@ async fn redirect_scanned_project(
     })?;
     // Drivers that only mean something on one bundler line.
     let only = match driver {
-        Driver::ScanVexCustomLockfile if !bundler.at_least(4, 0) => {
+        Driver::ScanVexCustomLockfile | Driver::ScanVexCustomLockfileDsl
+            if !bundler.at_least(4, 0) =>
+        {
             Some("custom lockfiles need bundler >= 4")
         }
         _ => None,
@@ -976,7 +986,7 @@ async fn redirect_scanned_project(
     }
     // The pre-redirect (registry) pair — what reverting the patch commit
     // restores; the manifest-less VEX legs revert to it.
-    let pristine_gemfile = std::fs::read(proj.join(gemfile_name)).unwrap();
+    let mut pristine_gemfile = std::fs::read(proj.join(gemfile_name)).unwrap();
     let pristine_lock = lock_before.clone().into_bytes();
     // Drop the pristine materialization before redirecting: bundler never
     // refetches an already-installed gem, so with it in place the scan
@@ -1010,8 +1020,18 @@ async fn redirect_scanned_project(
             String::from_utf8_lossy(&cfg.stderr)
         );
     }
-    let custom_lockfile = driver == Driver::ScanVexCustomLockfile;
-    if custom_lockfile {
+    let custom_lockfile_dsl = driver == Driver::ScanVexCustomLockfileDsl;
+    if custom_lockfile_dsl {
+        // The Gemfile's own `lockfile "custom.lock"` call, as a bundler 4
+        // project writes it; the default lock stays behind as a leftover.
+        std::fs::copy(proj.join(lock_name), proj.join("custom.lock")).unwrap();
+        let mut gemfile = b"lockfile \"custom.lock\"\n".to_vec();
+        gemfile.extend_from_slice(&pristine_gemfile);
+        std::fs::write(proj.join(gemfile_name), &gemfile).unwrap();
+        pristine_gemfile = gemfile;
+    }
+    let custom_lockfile = driver == Driver::ScanVexCustomLockfile || custom_lockfile_dsl;
+    if driver == Driver::ScanVexCustomLockfile {
         // `bundle config set --local lockfile custom.lock`; the default
         // lock stays behind as a leftover bundler 4 ignores.
         std::fs::copy(proj.join(lock_name), proj.join("custom.lock")).unwrap();
@@ -1064,6 +1084,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexMirrorSourceEnv
         | Driver::ScanVexMirrorAllEnv
         | Driver::ScanVexCustomLockfile
+        | Driver::ScanVexCustomLockfileDsl
         | Driver::ScanVexTwin
         | Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
@@ -1287,6 +1308,7 @@ async fn redirect_scanned_project(
         Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexCustomLockfile
+        | Driver::ScanVexCustomLockfileDsl
         | Driver::ScanVexTwin
         | Driver::ScanVexDuplicateDeclaration
         | Driver::ScanVexEvalGemfile
@@ -2610,6 +2632,27 @@ async fn gem_hosted_bundler4_custom_lockfile_redirects_nothing() {
         true,
         None,
         Driver::ScanVexCustomLockfile,
+    )
+    .await;
+    assert!(fx.is_none(), "the custom-lockfile driver asserts in place");
+}
+
+/// #1477: bundler 4's Gemfile `lockfile "custom.lock"` call makes bundler
+/// read `custom.lock` just like the setting. The hosted scan used to pin
+/// the leftover `Gemfile.lock`, rewrite the Gemfile, leave `custom.lock`
+/// untouched and report no refusal, so every frozen install then failed;
+/// it must refuse, write nothing, and still install frozen.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 4.0 for this arm); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_bundler4_gemfile_lockfile_call_redirects_nothing() {
+    let fx = redirect_scanned_project(
+        "custom-lockfile-dsl",
+        Spelling::Gemfile,
+        true,
+        true,
+        None,
+        Driver::ScanVexCustomLockfileDsl,
     )
     .await;
     assert!(fx.is_none(), "the custom-lockfile driver asserts in place");

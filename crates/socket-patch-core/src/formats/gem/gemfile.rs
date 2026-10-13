@@ -121,7 +121,7 @@ fn split_args(code: &str) -> Option<Vec<(usize, &str)>> {
 
 /// A leading quoted literal of `s`: `(content, rest after the closing
 /// quote)`.
-fn leading_quoted(s: &str) -> Option<(&str, &str)> {
+pub(crate) fn leading_quoted(s: &str) -> Option<(&str, &str)> {
     let q = s.chars().next().filter(|c| *c == '"' || *c == '\'')?;
     let body = &s[1..];
     let mut escaped = false;

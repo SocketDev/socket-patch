@@ -1712,12 +1712,13 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
 }
 
 /// The files [`bundler_loaded_manifest`] reads for `root`: the app config,
-/// the global config when there is one, and the `gems.rb` its pair choice
-/// probes.
+/// the global config when there is one, the `gems.rb` its pair choice
+/// probes, and the manifest whose `lockfile` call it reads.
 fn bundler_config_files(root: &Path) -> Vec<PathBuf> {
     let app = bundler_app_config_dir(root, std::env::var_os("BUNDLE_APP_CONFIG").as_deref())
         .join("config");
-    [app, PathBuf::from("gems.rb")]
+    // The manifests too: bundler 4's `lockfile` DSL call lives in them.
+    [app, PathBuf::from("gems.rb"), PathBuf::from("Gemfile")]
         .into_iter()
         .chain(ambient_bundler_global_config_file(root))
         .collect()
@@ -1781,18 +1782,39 @@ pub(crate) async fn bundler_loaded_manifest_in(
             let root = Path::new("/");
             let gems_rb = view.is_file("gems.rb");
             let loaded = manifest::classify_lexical(root, gemfile.as_deref());
+            // Bundler 4's `lockfile` DSL call outranks the config (#1477).
+            let call = match loaded.pair(gems_rb) {
+                Some((manifest_name, _)) => view
+                    .read_text(manifest_name)
+                    .await
+                    .ok()
+                    .and_then(|text| manifest::gemfile_lockfile(&text)),
+                None => None,
+            };
+            let (value, by) = match &call {
+                Some(manifest::GemfileLockfile::Path(value)) => {
+                    (Some(value.as_str()), manifest::GemfileSetting::GemfileCall)
+                }
+                Some(manifest::GemfileLockfile::Other(_)) => {
+                    (None, manifest::GemfileSetting::GemfileCall)
+                }
+                None => (lockfile.as_deref(), manifest::GemfileSetting::AppConfig),
+            };
             // `/` only stands in for the project root: bundler opens an
             // absolute lockfile as is, never the project's own lock, so
             // it must not compare equal to the pair's lock at `/`.
-            if let Some(value) = lockfile.as_deref() {
+            if let Some(value) = value {
                 if Path::new(value).has_root() && loaded.pair(gems_rb).is_some() {
                     return manifest::LoadedManifest::UnsupportedLockfile {
                         value: value.to_string(),
-                        by: manifest::GemfileSetting::AppConfig,
+                        by,
                     };
                 }
             }
-            loaded.with_lockfile_lexical(root, lockfile.as_deref(), gems_rb)
+            match call {
+                Some(call) => loaded.with_gemfile_lockfile_lexical(root, &call, gems_rb),
+                None => loaded.with_lockfile_lexical(root, lockfile.as_deref(), gems_rb),
+            }
         }
     }
 }
@@ -1861,19 +1883,31 @@ pub async fn bundler_loaded_manifest_with_env(
         .is_ok_and(|m| m.is_file());
     let global = read_global_config(env.global_config, env.ignore_config).await;
     let global = global.as_deref();
-    manifest::classify(
+    let loaded = manifest::classify(
         root,
         env.gemfile,
         gemfile.as_deref(),
         global.and_then(manifest::config_gemfile).as_deref(),
-    )
-    .with_lockfile(
-        root,
-        env.lockfile,
-        lockfile.as_deref(),
-        global.and_then(manifest::config_lockfile).as_deref(),
-        gems_rb_present,
-    )
+    );
+    // Bundler 4's `lockfile` DSL call in the manifest bundler loads
+    // outranks every `BUNDLE_LOCKFILE` tier (#1477).
+    let call = match loaded.pair(gems_rb_present) {
+        Some((manifest_name, _)) => tokio::fs::read_to_string(root.join(manifest_name))
+            .await
+            .ok()
+            .and_then(|text| manifest::gemfile_lockfile(&text)),
+        None => None,
+    };
+    match call {
+        Some(call) => loaded.with_gemfile_lockfile(root, &call, gems_rb_present),
+        None => loaded.with_lockfile(
+            root,
+            env.lockfile,
+            lockfile.as_deref(),
+            global.and_then(manifest::config_lockfile).as_deref(),
+            gems_rb_present,
+        ),
+    }
 }
 
 /// `Bundler.root` when the configured `BUNDLE_GEMFILE` moves it out of
@@ -2690,6 +2724,71 @@ mod tests {
         let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
         assert!(matches!(m, LoadedManifest::UnsupportedLockfile { .. }));
         config("./gems.locked");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(m, LoadedManifest::Default);
+    }
+
+    /// #1477: bundler 4's `lockfile` call in the loaded manifest outranks
+    /// `BUNDLE_LOCKFILE` from the environment and the app config, in either
+    /// direction; it is read from `gems.rb` when that is the manifest.
+    #[tokio::test]
+    async fn loaded_manifest_reads_the_gemfile_lockfile_call() {
+        use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
+        let dir = tempfile::tempdir().unwrap();
+        let gemfile = |text: &str| std::fs::write(dir.path().join("Gemfile"), text).unwrap();
+        gemfile("lockfile \"custom.lock\"\ngem \"rack\"\n");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(
+            m,
+            LoadedManifest::UnsupportedLockfile {
+                value: "custom.lock".into(),
+                by: GemfileSetting::GemfileCall
+            }
+        );
+        // The environment naming the default lock does not override it.
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                lockfile: Some(std::ffi::OsStr::new("Gemfile.lock")),
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            m,
+            LoadedManifest::UnsupportedLockfile {
+                by: GemfileSetting::GemfileCall,
+                ..
+            }
+        ));
+        // A call naming the default lock wins over a custom config value.
+        gemfile("lockfile \"Gemfile.lock\"\ngem \"rack\"\n");
+        std::fs::create_dir(dir.path().join(".bundle")).unwrap();
+        std::fs::write(
+            dir.path().join(".bundle/config"),
+            "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n",
+        )
+        .unwrap();
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(m, LoadedManifest::Default);
+        // `lockfile false`: bundler reads no lock at all.
+        gemfile("lockfile false\n");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(
+            matches!(m, LoadedManifest::UnsupportedLockfile { .. }),
+            "{m:?}"
+        );
+        // The call lives in the manifest bundler loads: gems.rb over Gemfile.
+        std::fs::remove_file(dir.path().join(".bundle/config")).unwrap();
+        gemfile("gem \"rack\"\n");
+        std::fs::write(dir.path().join("gems.rb"), "lockfile \"x.lock\"\n").unwrap();
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(
+            matches!(m, LoadedManifest::UnsupportedLockfile { .. }),
+            "{m:?}"
+        );
+        std::fs::write(dir.path().join("gems.rb"), "gem \"rack\"\n").unwrap();
+        gemfile("lockfile \"x.lock\"\n");
         let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
         assert_eq!(m, LoadedManifest::Default);
     }
