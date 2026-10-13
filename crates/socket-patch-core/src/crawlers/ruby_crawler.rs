@@ -1711,9 +1711,9 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
     value.to_path_buf()
 }
 
-/// The files [`bundler_loaded_manifest`] reads for `root`: the app config,
-/// the global config when there is one, and the `gems.rb` its pair choice
-/// probes.
+/// The files [`bundler_settings`] reads for `root`: the app config, the
+/// global config when there is one, and the `gems.rb` its pair choice
+/// probes. The manifest's own `lockfile` call is read through the view.
 fn bundler_config_files(root: &Path) -> Vec<PathBuf> {
     let app = bundler_app_config_dir(root, std::env::var_os("BUNDLE_APP_CONFIG").as_deref())
         .join("config");
@@ -1725,9 +1725,18 @@ fn bundler_config_files(root: &Path) -> Vec<PathBuf> {
 
 /// [`crate::formats::gem::manifest::classify`] for `root` on disk: the
 /// manifest bundler loads, reading the ambient `BUNDLE_GEMFILE` /
-/// `BUNDLE_LOCKFILE` / `BUNDLE_APP_CONFIG` and the app config file.
+/// `BUNDLE_LOCKFILE` / `BUNDLE_APP_CONFIG`, the app config file and the
+/// manifest's own `lockfile` call.
 pub async fn bundler_loaded_manifest(root: &Path) -> crate::formats::gem::manifest::LoadedManifest {
-    bundler_loaded_manifest_with_env(
+    bundler_settings(root)
+        .await
+        .resolve_in(root, &ProjectView::Disk(root))
+        .await
+}
+
+/// [`bundler_settings_with_env`] with the ambient environment.
+async fn bundler_settings(root: &Path) -> BundlerSettings {
+    bundler_settings_with_env(
         root,
         BundlerEnv {
             gemfile: std::env::var_os("BUNDLE_GEMFILE").as_deref(),
@@ -1759,7 +1768,8 @@ pub struct BundlerEnv<'a> {
 /// (or a snapshot of one) reads the ambient environment and the app config
 /// like bundler; a memory view has no environment, so only its own
 /// `.bundle/config` counts (its `BUNDLE_GEMFILE` and bundler 4's
-/// `BUNDLE_LOCKFILE`).
+/// `BUNDLE_LOCKFILE`). Either way the manifest's own `lockfile` call is
+/// read through the view.
 pub(crate) async fn bundler_loaded_manifest_in(
     view: &ProjectView<'_>,
 ) -> crate::formats::gem::manifest::LoadedManifest {
@@ -1767,34 +1777,120 @@ pub(crate) async fn bundler_loaded_manifest_in(
     match view {
         ProjectView::Disk(root) => bundler_loaded_manifest(root).await,
         ProjectView::Snapshot(snap) => {
-            // The only files the probe reads: the app config, the global
-            // config and `gems.rb` (the environment it also reads is fixed
-            // for the run, and the directory identity of a configured
+            // The only files the settings probe reads: the app config, the
+            // global config and `gems.rb` (the environment it also reads is
+            // fixed for the run, and the directory identity of a configured
             // absolute path is not a file the snapshot fingerprints).
             let root = snap.root_reading(bundler_config_files(snap.root_reading::<&Path>([])));
-            bundler_loaded_manifest(root).await
+            bundler_settings(root).await.resolve_in(root, view).await
         }
         ProjectView::Memory(_) => {
             let config = view.read_text(".bundle/config").await.ok();
             let gemfile = config.as_deref().and_then(manifest::config_gemfile);
-            let lockfile = config.as_deref().and_then(manifest::config_lockfile);
+            // `/` only stands in for the project root, so paths compare
+            // lexically.
             let root = Path::new("/");
-            let gems_rb = view.is_file("gems.rb");
-            let loaded = manifest::classify_lexical(root, gemfile.as_deref());
-            // `/` only stands in for the project root: bundler opens an
-            // absolute lockfile as is, never the project's own lock, so
-            // it must not compare equal to the pair's lock at `/`.
-            if let Some(value) = lockfile.as_deref() {
-                if Path::new(value).has_root() && loaded.pair(gems_rb).is_some() {
-                    return manifest::LoadedManifest::UnsupportedLockfile {
-                        value: value.to_string(),
-                        by: manifest::GemfileSetting::AppConfig,
-                    };
-                }
+            BundlerSettings {
+                loaded: manifest::classify_lexical(root, gemfile.as_deref()),
+                lockfile_env: None,
+                lockfile_config: config.as_deref().and_then(manifest::config_lockfile),
+                lockfile_global: None,
+                gems_rb_present: view.is_file("gems.rb"),
+                lexical: true,
             }
-            loaded.with_lockfile_lexical(root, lockfile.as_deref(), gems_rb)
+            .resolve_in(root, view)
+            .await
         }
     }
+}
+
+/// What bundler's settings say about a project, short of the manifest's
+/// own `lockfile` call: the manifest it loads and the `BUNDLE_LOCKFILE`
+/// tiers.
+struct BundlerSettings {
+    loaded: crate::formats::gem::manifest::LoadedManifest,
+    lockfile_env: Option<std::ffi::OsString>,
+    lockfile_config: Option<String>,
+    lockfile_global: Option<String>,
+    gems_rb_present: bool,
+    /// The root only stands in for a project not on this disk.
+    lexical: bool,
+}
+
+impl BundlerSettings {
+    /// The manifest bundler loads, with its lock: bundler 4's `lockfile`
+    /// call in the loaded manifest (read through `view`) outranks every
+    /// `BUNDLE_LOCKFILE` tier, as `Dsl#to_definition` does (#1477).
+    async fn resolve_in(
+        self,
+        root: &Path,
+        view: &ProjectView<'_>,
+    ) -> crate::formats::gem::manifest::LoadedManifest {
+        let gems_rb = self.gems_rb_present;
+        let call = match self.loaded.pair(gems_rb) {
+            Some((manifest_name, _)) => gemfile_lockfile_call_in(view, manifest_name).await,
+            None => None,
+        };
+        match (call, self.lexical) {
+            (Some(call), false) => self.loaded.with_gemfile_lockfile(root, &call, gems_rb),
+            (Some(call), true) => self
+                .loaded
+                .with_gemfile_lockfile_lexical(root, &call, gems_rb),
+            (None, false) => self.loaded.with_lockfile(
+                root,
+                self.lockfile_env.as_deref(),
+                self.lockfile_config.as_deref(),
+                self.lockfile_global.as_deref(),
+                gems_rb,
+            ),
+            (None, true) => {
+                self.loaded
+                    .with_lockfile_lexical(root, self.lockfile_config.as_deref(), gems_rb)
+            }
+        }
+    }
+}
+
+/// The `lockfile` call bundler evaluates for `manifest` (root-relative):
+/// the manifest's own, merged with those of the files it `eval_gemfile`s
+/// by a literal path inside the project, followed to a bounded depth.
+/// Read through `view` and decoded lossily, so a Gemfile in a legacy
+/// encoding is still scanned.
+async fn gemfile_lockfile_call_in(
+    view: &ProjectView<'_>,
+    manifest: &str,
+) -> Option<crate::formats::gem::manifest::GemfileLockfile> {
+    use crate::formats::gem::manifest::{eval_gemfile_paths, gemfile_lockfile};
+    use crate::utils::relpath::{is_anchored, resolve_rel};
+    const MAX_FILES: usize = 32;
+    let mut queue = std::collections::VecDeque::from([manifest.to_string()]);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut found: Option<crate::formats::gem::manifest::GemfileLockfile> = None;
+    while let Some(rel) = queue.pop_front() {
+        if seen.len() >= MAX_FILES || !seen.insert(rel.clone()) {
+            continue;
+        }
+        let Ok(bytes) = view.read_bytes(&rel).await else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(call) = gemfile_lockfile(&text) {
+            found = Some(match found.take() {
+                None => call,
+                Some(prev) => prev.merge(call),
+            });
+        }
+        let dir = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+        for path in eval_gemfile_paths(&text) {
+            if is_anchored(&path) {
+                continue;
+            }
+            if let Some(next) = resolve_rel(dir, &path, 0) {
+                queue.push_back(next);
+            }
+        }
+    }
+    found
 }
 
 /// The ONE lockfile bundler reads for the project `view` shows: the lock of
@@ -1848,11 +1944,18 @@ pub async fn bundler_loaded_manifest_with_env(
     root: &Path,
     env: BundlerEnv<'_>,
 ) -> crate::formats::gem::manifest::LoadedManifest {
+    bundler_settings_with_env(root, env)
+        .await
+        .resolve_in(root, &ProjectView::Disk(root))
+        .await
+}
+
+/// The [`BundlerSettings`] of `root` under `env`.
+async fn bundler_settings_with_env(root: &Path, env: BundlerEnv<'_>) -> BundlerSettings {
     use crate::formats::gem::manifest;
     let config = read_app_config(root, env.app_config, env.ignore_config).await;
     let config = config.as_deref();
     let gemfile = config.and_then(manifest::config_gemfile);
-    let lockfile = config.and_then(manifest::config_lockfile);
     // Bundler's `File.file?`, which the lock readers' `is_file` mirrors: a
     // regular file, through symlinks. A directory or a dangling symlink
     // named `gems.rb` leaves the `Gemfile` pair loaded.
@@ -1861,19 +1964,19 @@ pub async fn bundler_loaded_manifest_with_env(
         .is_ok_and(|m| m.is_file());
     let global = read_global_config(env.global_config, env.ignore_config).await;
     let global = global.as_deref();
-    manifest::classify(
-        root,
-        env.gemfile,
-        gemfile.as_deref(),
-        global.and_then(manifest::config_gemfile).as_deref(),
-    )
-    .with_lockfile(
-        root,
-        env.lockfile,
-        lockfile.as_deref(),
-        global.and_then(manifest::config_lockfile).as_deref(),
+    BundlerSettings {
+        loaded: manifest::classify(
+            root,
+            env.gemfile,
+            gemfile.as_deref(),
+            global.and_then(manifest::config_gemfile).as_deref(),
+        ),
+        lockfile_env: env.lockfile.map(OsStr::to_os_string),
+        lockfile_config: config.and_then(manifest::config_lockfile),
+        lockfile_global: global.and_then(manifest::config_lockfile),
         gems_rb_present,
-    )
+        lexical: false,
+    }
 }
 
 /// `Bundler.root` when the configured `BUNDLE_GEMFILE` moves it out of
@@ -2692,6 +2795,106 @@ mod tests {
         config("./gems.locked");
         let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
         assert_eq!(m, LoadedManifest::Default);
+    }
+
+    /// #1477: bundler 4's `lockfile` call in the loaded manifest outranks
+    /// `BUNDLE_LOCKFILE` from the environment and the app config, in either
+    /// direction; it is read from `gems.rb` when that is the manifest.
+    #[tokio::test]
+    async fn loaded_manifest_reads_the_gemfile_lockfile_call() {
+        use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
+        let dir = tempfile::tempdir().unwrap();
+        let gemfile = |text: &str| std::fs::write(dir.path().join("Gemfile"), text).unwrap();
+        gemfile("lockfile \"custom.lock\"\ngem \"rack\"\n");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(
+            m,
+            LoadedManifest::UnsupportedLockfile {
+                value: "custom.lock".into(),
+                by: GemfileSetting::GemfileCall
+            }
+        );
+        // The environment naming the default lock does not override it.
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                lockfile: Some(std::ffi::OsStr::new("Gemfile.lock")),
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            m,
+            LoadedManifest::UnsupportedLockfile {
+                by: GemfileSetting::GemfileCall,
+                ..
+            }
+        ));
+        // A call naming the default lock wins over a custom config value.
+        gemfile("lockfile \"Gemfile.lock\"\ngem \"rack\"\n");
+        std::fs::create_dir(dir.path().join(".bundle")).unwrap();
+        std::fs::write(
+            dir.path().join(".bundle/config"),
+            "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n",
+        )
+        .unwrap();
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(m, LoadedManifest::Default);
+        // `lockfile false`: bundler reads no lock at all.
+        gemfile("lockfile false\n");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(
+            matches!(m, LoadedManifest::UnsupportedLockfile { .. }),
+            "{m:?}"
+        );
+        // The call lives in the manifest bundler loads: gems.rb over Gemfile.
+        std::fs::remove_file(dir.path().join(".bundle/config")).unwrap();
+        gemfile("gem \"rack\"\n");
+        std::fs::write(dir.path().join("gems.rb"), "lockfile \"x.lock\"\n").unwrap();
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(
+            matches!(m, LoadedManifest::UnsupportedLockfile { .. }),
+            "{m:?}"
+        );
+        std::fs::write(dir.path().join("gems.rb"), "gem \"rack\"\n").unwrap();
+        gemfile("lockfile \"x.lock\"\n");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(m, LoadedManifest::Default);
+        std::fs::remove_file(dir.path().join("gems.rb")).unwrap();
+        // A call in an `eval_gemfile`d file runs in the same builder,
+        // relative to the evaluating file's directory.
+        std::fs::create_dir(dir.path().join("gemfiles")).unwrap();
+        gemfile("eval_gemfile \"gemfiles/common.rb\"\ngem \"rack\"\n");
+        std::fs::write(
+            dir.path().join("gemfiles/common.rb"),
+            "eval_gemfile \"lock.rb\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("gemfiles/lock.rb"),
+            "lockfile \"custom.lock\"\n",
+        )
+        .unwrap();
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(
+            matches!(
+                m,
+                LoadedManifest::UnsupportedLockfile {
+                    by: GemfileSetting::GemfileCall,
+                    ..
+                }
+            ),
+            "{m:?}"
+        );
+        // A Gemfile in a legacy encoding is still read.
+        let mut latin1 = b"# encoding: iso-8859-1\n# caf\xe9\n".to_vec();
+        latin1.extend_from_slice(b"lockfile \"custom.lock\"\n");
+        std::fs::write(dir.path().join("Gemfile"), latin1).unwrap();
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(
+            matches!(m, LoadedManifest::UnsupportedLockfile { .. }),
+            "{m:?}"
+        );
     }
 
     /// #483: bundler's cache dir is the `cache_path` setting — the app

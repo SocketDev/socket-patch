@@ -3021,6 +3021,40 @@ mod tests {
         assert!(!root.join(".socket/vendor").exists());
     }
 
+    /// #1477: bundler 4's Gemfile `lockfile "custom.lock"` call makes
+    /// bundler read `custom.lock` just like the setting does, so it is
+    /// refused the same way, before any write.
+    #[tokio::test]
+    async fn a_bundler4_gemfile_lockfile_call_is_refused() {
+        let gemfile = format!("lockfile \"custom.lock\"\n{GEMFILE_DIRECT}");
+        let (_tmp, root, installed, blobs, record) = fixture(&gemfile, LOCK_DIRECT).await;
+        tokio::fs::write(root.join("custom.lock"), LOCK_DIRECT)
+            .await
+            .unwrap();
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "gemfile_not_loaded");
+        assert!(detail.contains("custom.lock"), "{detail}");
+        assert!(
+            detail.contains("remove the `lockfile` call from the Gemfile"),
+            "{detail}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Gemfile"))
+                .await
+                .unwrap(),
+            gemfile
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(".socket/vendor").exists());
+    }
+
     /// `BUNDLE_GEMFILE` naming the project's own Gemfile beside a `gems.rb`
     /// makes bundler load the Gemfile, so vendoring wires it as usual.
     #[tokio::test]

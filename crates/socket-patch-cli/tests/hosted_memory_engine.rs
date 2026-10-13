@@ -1096,6 +1096,29 @@ async fn a_bundler4_custom_lockfile_is_refused() {
     assert_gem_lock_unsupported(&output);
 }
 
+/// #1477: bundler 4's Gemfile `lockfile "custom.lock"` call names the
+/// lock bundler reads just like the setting, so the project is refused the
+/// same way, with nothing written.
+#[tokio::test]
+async fn a_bundler4_gemfile_lockfile_call_is_refused() {
+    let (server, input) = gem_server_and_input().await;
+    let mut files = input.clone();
+    files.insert("custom.lock".to_string(), input["Gemfile.lock"].clone());
+    let mut gemfile = b"lockfile \"custom.lock\"\n".to_vec();
+    gemfile.extend_from_slice(&input["Gemfile"]);
+    files.insert("Gemfile".to_string(), gemfile);
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(project.error.is_none(), "{:?}", project.error);
+    assert!(project.redirected.is_empty(), "{:?}", project.redirected);
+    assert!(
+        changed_paths(&output).is_empty(),
+        "{:?}",
+        changed_paths(&output)
+    );
+    assert_gem_lock_unsupported(&output);
+}
+
 /// The run says the project's gems were not scanned, rather than finding
 /// none: the lock inventory's `gem_lock_unsupported` diagnosis.
 fn assert_gem_lock_unsupported(output: &HostedScanOutput) {

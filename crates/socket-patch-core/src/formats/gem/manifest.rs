@@ -67,6 +67,9 @@ pub enum GemfileSetting {
     AppConfig,
     /// `BUNDLE_GEMFILE:` in the user's global bundler config file.
     GlobalConfig,
+    /// A `lockfile "<path>"` call in the loaded manifest itself (bundler 4's
+    /// Gemfile DSL). Only ever names a lockfile.
+    GemfileCall,
 }
 
 impl GemfileSetting {
@@ -80,6 +83,7 @@ impl GemfileSetting {
             GemfileSetting::GlobalConfig => {
                 "BUNDLE_GEMFILE in the global bundler config (~/.bundle/config)"
             }
+            GemfileSetting::GemfileCall => "the `lockfile` call in the Gemfile",
         }
     }
 }
@@ -137,6 +141,7 @@ impl LoadedManifest {
                         "run `bundle config unset --global gemfile`, or point it at the \
                          project's Gemfile"
                     }
+                    GemfileSetting::GemfileCall => "remove the `lockfile` call from the Gemfile",
                 };
                 Some(format!(
                     "bundler loads `{value}` ({}), not the project's Gemfile or gems.rb; \
@@ -158,6 +163,10 @@ impl LoadedManifest {
                     GemfileSetting::GlobalConfig => (
                         "BUNDLE_LOCKFILE in the global bundler config (~/.bundle/config)",
                         "run `bundle config unset --global lockfile`",
+                    ),
+                    GemfileSetting::GemfileCall => (
+                        "the `lockfile` call in the Gemfile",
+                        "remove the `lockfile` call from the Gemfile",
                     ),
                 };
                 Some(format!(
@@ -200,13 +209,22 @@ impl LoadedManifest {
 
     /// [`LoadedManifest::with_lockfile`] for a `root` that only stands in
     /// for a project not on this disk (an in-memory view): paths compare
-    /// lexically, never through this host's directories.
+    /// lexically, never through this host's directories, and an absolute
+    /// value never names the stand-in root's lock (bundler opens it as is).
     pub(crate) fn with_lockfile_lexical(
         self,
         root: &Path,
         lockfile_config: Option<&str>,
         gems_rb_present: bool,
     ) -> LoadedManifest {
+        if let Some(value) = lockfile_config.filter(|v| Path::new(v).has_root()) {
+            if self.pair(gems_rb_present).is_some() {
+                return LoadedManifest::UnsupportedLockfile {
+                    value: value.to_string(),
+                    by: GemfileSetting::AppConfig,
+                };
+            }
+        }
         self.with_lockfile_by(
             root,
             None,
@@ -241,7 +259,85 @@ impl LoadedManifest {
         if value.as_os_str().is_empty() {
             return self;
         }
-        let target = resolve_against(root, &value);
+        self.lockfile_against(root, &value, by, lock, same_dir)
+    }
+
+    /// Layer a `lockfile` call read from the manifest bundler loads
+    /// ([`gemfile_lockfile`]) onto `self`, in place of
+    /// [`LoadedManifest::with_lockfile`]: bundler 4's `Dsl#to_definition`
+    /// uses the call's value over the lockfile `Bundler::CLI` picked from
+    /// `BUNDLE_LOCKFILE` and the config files, so the call decides alone. A
+    /// literal path is read against `root` like the settings; one naming the
+    /// pair's own lock leaves `self` unchanged. Any other call (another
+    /// lock, `lockfile false`, a computed value) is
+    /// [`LoadedManifest::UnsupportedLockfile`] (#1477).
+    pub fn with_gemfile_lockfile(
+        self,
+        root: &Path,
+        call: &GemfileLockfile,
+        gems_rb_present: bool,
+    ) -> LoadedManifest {
+        self.with_gemfile_lockfile_by(root, call, gems_rb_present, same_dir_on_disk)
+    }
+
+    /// [`LoadedManifest::with_gemfile_lockfile`] for a `root` that only
+    /// stands in for a project not on this disk, as
+    /// [`LoadedManifest::with_lockfile_lexical`] compares.
+    pub(crate) fn with_gemfile_lockfile_lexical(
+        self,
+        root: &Path,
+        call: &GemfileLockfile,
+        gems_rb_present: bool,
+    ) -> LoadedManifest {
+        if let GemfileLockfile::Path(value) = call {
+            if Path::new(value).has_root() && self.pair(gems_rb_present).is_some() {
+                return LoadedManifest::UnsupportedLockfile {
+                    value: value.clone(),
+                    by: GemfileSetting::GemfileCall,
+                };
+            }
+        }
+        self.with_gemfile_lockfile_by(root, call, gems_rb_present, |a, b| a == b)
+    }
+
+    fn with_gemfile_lockfile_by(
+        self,
+        root: &Path,
+        call: &GemfileLockfile,
+        gems_rb_present: bool,
+        same_dir: SameDir,
+    ) -> LoadedManifest {
+        let Some((_, lock)) = self.pair(gems_rb_present) else {
+            return self;
+        };
+        match call {
+            GemfileLockfile::Path(value) if !value.is_empty() => self.lockfile_against(
+                root,
+                Path::new(value),
+                GemfileSetting::GemfileCall,
+                lock,
+                same_dir,
+            ),
+            GemfileLockfile::Path(value) | GemfileLockfile::Other(value) => {
+                LoadedManifest::UnsupportedLockfile {
+                    value: value.clone(),
+                    by: GemfileSetting::GemfileCall,
+                }
+            }
+        }
+    }
+
+    /// `self` when `value` (read against `root`) names `lock`, the pair's
+    /// own lock, else [`LoadedManifest::UnsupportedLockfile`].
+    fn lockfile_against(
+        self,
+        root: &Path,
+        value: &Path,
+        by: GemfileSetting,
+        lock: &str,
+        same_dir: SameDir,
+    ) -> LoadedManifest {
+        let target = resolve_against(root, value);
         let expected = resolve_against(root, Path::new(lock));
         if let (Some(target), Some(expected)) = (target, expected) {
             if same_entry(&target, &expected, same_dir) {
@@ -253,6 +349,248 @@ impl LoadedManifest {
             by,
         }
     }
+}
+
+/// A `lockfile` call in a Gemfile / `gems.rb` (bundler 4's DSL), as
+/// [`gemfile_lockfile`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GemfileLockfile {
+    /// `lockfile "<path>"`: one plain string literal.
+    Path(String),
+    /// Any call whose lock cannot be read statically: `lockfile false` or
+    /// `lockfile nil` (bundler then reads and writes no lock), a computed
+    /// or interpolated value, a modifier (`lockfile "x" if …`), a call
+    /// that is not the first thing on its line, or two calls that
+    /// disagree. The call's line.
+    Other(String),
+}
+
+impl GemfileLockfile {
+    /// The answer for two calls bundler evaluates in turn: one when they
+    /// agree, else [`GemfileLockfile::Other`] (which one wins depends on
+    /// control flow a line scan cannot follow).
+    pub fn merge(self, later: GemfileLockfile) -> GemfileLockfile {
+        match (self, later) {
+            (a, b) if a == b => a,
+            (_, GemfileLockfile::Other(line)) | (GemfileLockfile::Other(line), _) => {
+                GemfileLockfile::Other(line)
+            }
+            (_, GemfileLockfile::Path(value)) => {
+                GemfileLockfile::Other(format!("lockfile \"{value}\""))
+            }
+        }
+    }
+}
+
+/// The `lockfile` call of a Gemfile / `gems.rb`, if it makes one. Bundler
+/// evaluates the DSL anywhere in the file (inside `group`/`platforms`
+/// blocks and conditionals too), so every `lockfile` call in code counts.
+/// One that starts its statement with a plain string literal is a
+/// [`GemfileLockfile::Path`]; every other call is
+/// [`GemfileLockfile::Other`], so callers fail closed rather than pin a
+/// lock bundler may not read. Comments, strings, heredoc bodies,
+/// `=begin`/`=end` blocks, the `__END__` data section, a longer name, a
+/// symbol or method of that name, and a local variable used at the start
+/// of a line (`lockfile = …`, `lockfile ||= …`, `lockfile.foo`) are not
+/// calls. `eval_gemfile`d files are the caller's to read
+/// ([`eval_gemfile_paths`]).
+pub fn gemfile_lockfile(contents: &str) -> Option<GemfileLockfile> {
+    let mut found: Option<GemfileLockfile> = None;
+    for_each_code_line(contents, |line, code| {
+        let lead = code.len() - code.trim_start().len();
+        for at in ident_positions(code, "lockfile") {
+            let this = if at == lead {
+                match statement_call(&code[at + "lockfile".len()..]) {
+                    Some(this) => this,
+                    None => continue,
+                }
+            } else {
+                GemfileLockfile::Other(line.trim().to_string())
+            };
+            found = Some(match found.take() {
+                None => this,
+                Some(prev) => prev.merge(this),
+            });
+        }
+    });
+    found
+}
+
+/// The literal paths a Gemfile hands to `eval_gemfile`, as written
+/// (bundler reads a relative one against the evaluating file's directory).
+/// A computed path is left out.
+pub fn eval_gemfile_paths(contents: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for_each_code_line(contents, |_, code| {
+        for at in ident_positions(code, "eval_gemfile") {
+            let arg = code[at + "eval_gemfile".len()..].trim_start();
+            let arg = arg.strip_prefix('(').map(str::trim_start).unwrap_or(arg);
+            if let Some((value, _)) = plain_literal(arg) {
+                out.push(value.to_string());
+            }
+        }
+    });
+    out
+}
+
+/// What follows a `lockfile` that starts its statement: the call it makes,
+/// or `None` when the name is a local variable here (assigned, compared,
+/// or a method receiver).
+fn statement_call(rest: &str) -> Option<GemfileLockfile> {
+    let arg = rest.trim_start();
+    let spaced = arg.len() != rest.len();
+    let operator = |c: char| "=|&+-*/<>!%?^~.".contains(c);
+    if arg.starts_with(['.', '=']) || (spaced && arg.starts_with(operator)) {
+        return None;
+    }
+    let call = format!("lockfile{}", rest.trim_end());
+    let inner = arg
+        .strip_prefix('(')
+        .and_then(|c| c.strip_suffix(')'))
+        .map(str::trim)
+        .unwrap_or(arg);
+    Some(match plain_literal(inner) {
+        Some((value, after)) if after.trim().is_empty() => GemfileLockfile::Path(value.to_string()),
+        _ => GemfileLockfile::Other(call),
+    })
+}
+
+/// A leading string literal of `s` whose value is its text as written (no
+/// escapes, no `#{…}` interpolation in a double-quoted one): `(value, rest
+/// after the closing quote)`.
+fn plain_literal(s: &str) -> Option<(&str, &str)> {
+    use crate::formats::gem::gemfile::leading_quoted;
+    let (value, rest) = leading_quoted(s)?;
+    let interpolated = s.starts_with('"') && value.contains("#{");
+    (!value.contains('\\') && !interpolated).then_some((value, rest))
+}
+
+/// Run `f(line, code)` over each line of Ruby source that holds code:
+/// `code` is the line before any `#` comment. Skips `=begin`/`=end`
+/// blocks and heredoc bodies, and stops at `__END__`. A leading BOM is
+/// dropped, as Ruby does.
+fn for_each_code_line(contents: &str, mut f: impl FnMut(&str, &str)) {
+    use crate::formats::gem::gemfile::code_of;
+    let contents = crate::formats::text::strip_bom(contents);
+    let mut in_comment_block = false;
+    let mut heredocs: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        if let Some(id) = heredocs.first() {
+            if line.trim() == id {
+                heredocs.remove(0);
+            }
+            continue;
+        }
+        if in_comment_block {
+            in_comment_block = !line.starts_with("=end");
+            continue;
+        }
+        if line.starts_with("=begin") {
+            in_comment_block = true;
+            continue;
+        }
+        if line.trim_end() == "__END__" {
+            break;
+        }
+        let code = code_of(line).unwrap_or(line);
+        heredocs.extend(heredoc_ids(code));
+        f(line, code);
+    }
+}
+
+/// The byte offsets in `code` where `name` appears as a bare identifier
+/// outside strings: not part of a longer name, a symbol (`:name`), an
+/// instance/global variable, or a method called on a receiver
+/// (`x.name`).
+fn ident_positions(code: &str, name: &str) -> Vec<usize> {
+    let bytes = code.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if ident(b) {
+            let start = i;
+            while i < bytes.len() && ident(bytes[i]) {
+                i += 1;
+            }
+            let prev = start.checked_sub(1).map(|p| bytes[p]);
+            let next = bytes.get(i).copied();
+            if &code[start..i] == name
+                && !matches!(prev, Some(b'.' | b':' | b'@' | b'$'))
+                && !matches!(next, Some(b'?' | b'!' | b':'))
+            {
+                out.push(start);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The terminators of the heredocs a line of code opens (`<<~ID`, `<<-ID`,
+/// `<<ID`, with or without quotes around `ID`), outside strings.
+fn heredoc_ids(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut chars = code.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '<' if code[i..].starts_with("<<") => {
+                let rest = &code[i + 2..];
+                let rest = rest.strip_prefix(['~', '-']).unwrap_or(rest);
+                let (rest, close) = match rest.chars().next() {
+                    Some(q @ ('"' | '\'' | '`')) => (&rest[1..], Some(q)),
+                    _ => (rest, None),
+                };
+                let len = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                let id = &rest[..len];
+                let starts_ident = id
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+                if starts_ident && close.is_none_or(|q| rest[len..].starts_with(q)) {
+                    out.push(id.to_string());
+                }
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The `BUNDLE_LOCKFILE:` value of a bundler config file (bundler 4's
@@ -397,6 +735,175 @@ fn classify_by(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1477: bundler 4's Gemfile `lockfile` call, in every spelling a
+    /// Gemfile uses; anything not a plain literal fails closed.
+    #[test]
+    fn gemfile_lockfile_reads_the_dsl_call() {
+        let path = |v: &str| Some(GemfileLockfile::Path(v.into()));
+        let other = |v: &str| Some(GemfileLockfile::Other(v.into()));
+        assert_eq!(
+            gemfile_lockfile("source \"https://rubygems.org\"\ngem \"rack\"\n"),
+            None
+        );
+        assert_eq!(
+            gemfile_lockfile("lockfile \"custom.lock\"\nsource \"https://rubygems.org\"\n"),
+            path("custom.lock")
+        );
+        assert_eq!(
+            gemfile_lockfile("lockfile 'custom.lock' # why\n"),
+            path("custom.lock")
+        );
+        assert_eq!(
+            gemfile_lockfile("lockfile(\"custom.lock\")\r\n"),
+            path("custom.lock")
+        );
+        assert_eq!(
+            gemfile_lockfile("lockfile( 'a/b.lock' )\n"),
+            path("a/b.lock")
+        );
+        assert_eq!(
+            gemfile_lockfile("group :dev do\n  lockfile \"x.lock\"\nend\n"),
+            path("x.lock")
+        );
+        // Two identical calls are one answer; disagreeing ones are not.
+        assert_eq!(
+            gemfile_lockfile("lockfile \"a\"\nlockfile \"a\"\n"),
+            path("a")
+        );
+        assert_eq!(
+            gemfile_lockfile("lockfile \"a\"\nlockfile \"b\"\n"),
+            other("lockfile \"b\"")
+        );
+        // Bundler reads and writes no lock, or the value is not static.
+        assert_eq!(
+            gemfile_lockfile("lockfile false\n"),
+            other("lockfile false")
+        );
+        assert_eq!(
+            gemfile_lockfile("lockfile ENV.fetch(\"L\")\n"),
+            other("lockfile ENV.fetch(\"L\")")
+        );
+        assert_eq!(
+            gemfile_lockfile("lockfile \"#{x}.lock\"\n"),
+            other("lockfile \"#{x}.lock\"")
+        );
+        assert_eq!(
+            gemfile_lockfile("lockfile \"x.lock\" if ENV[\"CI\"]\n"),
+            other("lockfile \"x.lock\" if ENV[\"CI\"]")
+        );
+        // `lockfile nil` replaces the CLI's lock with none at all (bundler
+        // 4's `Dsl.evaluate` seeds `@lockfile` with it first).
+        assert_eq!(gemfile_lockfile("lockfile nil\n"), other("lockfile nil"));
+        // A call later in a line, which a statement read cannot pin down.
+        for text in [
+            "group(:ci) { lockfile \"ci.lock\" }\n",
+            "source \"https://rubygems.org\"; lockfile \"custom.lock\"\n",
+            "ENV[\"CI\"] && lockfile(\"ci.lock\")\n",
+            "if ENV[\"CI\"] then lockfile \"a\" end\n",
+        ] {
+            assert!(
+                matches!(gemfile_lockfile(text), Some(GemfileLockfile::Other(_))),
+                "{text:?}"
+            );
+        }
+        // Ruby skips a leading BOM.
+        assert_eq!(
+            gemfile_lockfile("\u{feff}lockfile \"custom.lock\"\n"),
+            path("custom.lock")
+        );
+        // Not calls: comments, strings, heredoc bodies, the data section, a
+        // variable (assigned, compared, a receiver), a symbol or method of
+        // that name, a longer name.
+        for text in [
+            "# lockfile \"x\"\n",
+            "=begin\nlockfile \"x\"\n=end\n",
+            "lockfile = \"x\"\n",
+            "lockfile=\"x\"\n",
+            "lockfile ||= \"x\"\n",
+            "lockfile += \"x\"\n",
+            "lockfile == other\n",
+            "lockfile.freeze\n",
+            "lockfiles \"x\"\n",
+            "gem \"lockfile\"\n",
+            "gem \"x\", require: \"lockfile\" # lockfile \"y\"\n",
+            "x = :lockfile\n",
+            "Bundler.lockfile\n",
+            "puts <<~TXT\n  lockfile \"x\"\nTXT\n",
+            "puts <<-'TXT'\nlockfile \"x\"\n  TXT\n",
+            "gem \"rack\"\n__END__\nlockfile \"x\"\n",
+        ] {
+            assert_eq!(gemfile_lockfile(text), None, "{text:?}");
+        }
+        // Code after a heredoc closes is read again.
+        assert_eq!(
+            gemfile_lockfile("puts <<~TXT\n  hi\nTXT\nlockfile \"x\"\n"),
+            path("x")
+        );
+    }
+
+    #[test]
+    fn eval_gemfile_paths_reads_literal_paths() {
+        assert_eq!(
+            eval_gemfile_paths(
+                "eval_gemfile \"Gemfile.common\"\neval_gemfile('a/b.rb')\n\
+                 eval_gemfile File.join(x)\n# eval_gemfile \"c\"\n"
+            ),
+            vec!["Gemfile.common".to_string(), "a/b.rb".to_string()]
+        );
+    }
+
+    /// #1477: the Gemfile call outranks the `BUNDLE_LOCKFILE` tiers, as
+    /// bundler 4's `Dsl#to_definition` does; naming the pair's own lock is a
+    /// no-op and anything else is refused with the call's own remedy.
+    #[test]
+    fn with_gemfile_lockfile_accepts_only_the_pairs_own_lock() {
+        let call = |v: &str| GemfileLockfile::Path(v.into());
+        let m = LoadedManifest::Default.with_gemfile_lockfile(&root(), &call("custom.lock"), false);
+        assert_eq!(
+            m,
+            LoadedManifest::UnsupportedLockfile {
+                value: "custom.lock".into(),
+                by: GemfileSetting::GemfileCall,
+            }
+        );
+        assert_eq!(m.pair(false), None);
+        let detail = m.unsupported_detail().unwrap();
+        assert!(detail.contains("custom.lock"), "{detail}");
+        assert!(detail.contains("remove the `lockfile` call"), "{detail}");
+        for own in ["Gemfile.lock", "./Gemfile.lock", "/proj/Gemfile.lock"] {
+            assert_eq!(
+                LoadedManifest::Default.with_gemfile_lockfile(&root(), &call(own), false),
+                LoadedManifest::Default,
+                "{own}"
+            );
+        }
+        // With a gems.rb the pair's lock is gems.locked.
+        assert!(matches!(
+            LoadedManifest::Default.with_gemfile_lockfile(&root(), &call("Gemfile.lock"), true),
+            LoadedManifest::UnsupportedLockfile { .. }
+        ));
+        assert_eq!(
+            LoadedManifest::Default.with_gemfile_lockfile(&root(), &call("gems.locked"), true),
+            LoadedManifest::Default
+        );
+        let off = GemfileLockfile::Other("lockfile false".into());
+        assert_eq!(
+            LoadedManifest::Default.with_gemfile_lockfile(&root(), &off, false),
+            LoadedManifest::UnsupportedLockfile {
+                value: "lockfile false".into(),
+                by: GemfileSetting::GemfileCall,
+            }
+        );
+        // An unsupported manifest stays the answer.
+        let unsupported = classify(&root(), None, Some("Gemfile.next"), None);
+        assert_eq!(
+            unsupported
+                .clone()
+                .with_gemfile_lockfile(&root(), &call("custom.lock"), false),
+            unsupported
+        );
+    }
 
     fn root() -> PathBuf {
         std::path::absolute("/proj").unwrap()
