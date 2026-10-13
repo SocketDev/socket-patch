@@ -567,6 +567,12 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
     let mut block_comment = false;
     // Pending heredoc terminators: (identifier, may be indented).
     let mut heredocs: std::collections::VecDeque<(String, bool)> = Default::default();
+    // A string or `%`-literal still open at the end of the last line.
+    let mut literal: Option<Literal> = None;
+    // The code of the statement the last line left unfinished (a trailing
+    // `,`, `\`, `=`, …), and the start of the line it began on.
+    let mut carried = String::new();
+    let mut statement_line = 0;
     let mut start = 0;
     for raw in text[..at].split_inclusive('\n') {
         let line_start = start;
@@ -589,18 +595,23 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
             }
             continue;
         }
-        if marker("=begin") {
+        if literal.is_none() && marker("=begin") {
             block_comment = true;
             continue;
         }
-        let code = ruby_code(line);
-        let masked = masked_ruby_code(code);
-        heredocs.extend(heredoc_openers(code, &masked));
+        let continues = literal.is_some() || !carried.is_empty();
+        if !continues {
+            statement_line = line_start;
+        }
+        let masked = masked_ruby_code(line, &mut literal);
+        heredocs.extend(heredoc_openers(line, &masked));
         let masked = masked.trim();
-        let mut source_do = masked
-            .strip_prefix("source")
-            .is_some_and(|rest| rest.starts_with([' ', '\t', '(']));
-        for statement in masked.split(';') {
+        let mut source_do = !continues
+            && masked
+                .strip_prefix("source")
+                .is_some_and(|rest| rest.starts_with([' ', '\t', '(']));
+        for (n, statement) in masked.split(';').enumerate() {
+            let lead = if n == 0 { carried.as_str() } else { "" };
             // A `while`/`until`/`for` takes its optional `do` as part of
             // the loop, not as a block of its own.
             let mut loop_do = false;
@@ -610,11 +621,12 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                 if std::mem::take(&mut method_name) {
                     continue;
                 }
+                let expression = || starts_expression(&format!("{lead} {}", &statement[..start]));
                 let opens = match word {
                     "do" => !std::mem::take(&mut loop_do),
-                    "if" | "unless" => starts_expression(&statement[..start]),
+                    "if" | "unless" => expression(),
                     "while" | "until" => {
-                        let opens = starts_expression(&statement[..start]);
+                        let opens = expression();
                         loop_do |= opens;
                         opens
                     }
@@ -636,11 +648,23 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                 if opens {
                     open.push(Frame {
                         source: word == "do" && std::mem::take(&mut source_do),
-                        line: line_start,
+                        line: statement_line,
                     });
                 }
             }
         }
+        let unfinished = literal.is_some()
+            || masked.ends_with(['\\', ',', '(', '[', '+', '-', '*', '='])
+            || masked.ends_with("||")
+            || masked.ends_with("&&");
+        carried = if unfinished {
+            let tail = masked.rsplit(';').next().unwrap_or_default();
+            format!("{carried} {}", tail.trim_end_matches('\\'))
+                .trim()
+                .to_string()
+        } else {
+            String::new()
+        };
     }
     open
 }
@@ -688,8 +712,8 @@ fn starts_expression(before: &str) -> bool {
         return true;
     };
     match last {
-        b'=' | b'(' | b'[' | b'{' | b',' | b'|' | b'&' | b'>' | b'<' | b'+' | b'-' | b'*'
-        | b'~' => true,
+        b'=' | b'(' | b'[' | b'{' | b',' | b';' | b'|' | b'&' | b'>' | b'<' | b'+' | b'-'
+        | b'*' | b'~' => true,
         // A unary `!`, not a bang method (`x.save! if y`).
         b'!' => before.len() == 1 || !is_ident_byte(before.as_bytes()[before.len() - 2]),
         // A label (`require: if …`) or a ternary's `:`, not `Foo::`.
@@ -729,22 +753,39 @@ fn starts_expression(before: &str) -> bool {
 }
 
 /// Whether `rest` (what follows `def`) is an endless method (`def x = 1`,
-/// `def x(a) = a`), which Ruby closes without an `end`. A setter
-/// (`def x=(v)`) is not.
+/// `def x(a = f()) = a`, `def ==(o) = …`), which Ruby closes without an
+/// `end`. A setter (`def x=(v)`) is not.
 fn endless_def(rest: &str) -> bool {
     let rest = rest.trim_start();
-    let name_len = rest
-        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '?' | '!')))
-        .unwrap_or(rest.len());
-    let (name, mut tail) = rest.split_at(name_len);
-    if name.is_empty() {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let name_len = if rest.starts_with(ident) {
+        // `x`, `self.x`, `x?`, `x!`.
+        let len = rest
+            .find(|c: char| !(ident(c) || c == '.'))
+            .unwrap_or(rest.len());
+        len + usize::from(rest[len..].starts_with(['?', '!']))
+    } else {
+        // An operator method: `==`, `<=>`, `[]=`, `+@`, ….
+        rest.find(|c: char| !"[]=!<>+-*/%~^&|@".contains(c))
+            .unwrap_or(rest.len())
+    };
+    if name_len == 0 {
         return false;
     }
-    if let Some(params) = tail.strip_prefix('(') {
-        let Some(close) = params.find(')') else {
+    let mut tail = &rest[name_len..];
+    if tail.starts_with('(') {
+        let mut depth = 0usize;
+        let Some(close) = tail.find(|c: char| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        }) else {
             return false;
         };
-        tail = &params[close + 1..];
+        tail = &tail[close + 1..];
     } else if !tail.starts_with([' ', '\t']) {
         return false;
     }
@@ -753,83 +794,150 @@ fn endless_def(rest: &str) -> bool {
         .is_some_and(|t| !t.starts_with(['=', '~', '>']))
 }
 
-/// `code` (a comment-stripped line) with the contents of every string,
+/// A string or `%`-literal left open at the end of a line.
+#[derive(Clone, Copy)]
+struct Literal {
+    open: u8,
+    close: u8,
+    /// Nesting of `open` inside a bracketed literal (`%w[a [b] c]`).
+    depth: usize,
+}
+
+/// `line` up to its `#` comment, with the contents of every string,
 /// backtick, `%`-literal (`%w[…]`, `%i(…)`, `%q{…}`, …) and regexp literal
-/// masked as `x`, byte for byte, so a keyword inside one never counts as
-/// code. The delimiters stay.
-fn masked_ruby_code(code: &str) -> String {
-    let bytes = code.as_bytes();
+/// masked as `x`, byte for byte, so a keyword or `#` inside one never counts
+/// as code. The delimiters stay. A string or `%`-literal still open at the
+/// end of the line is carried in `literal` to mask the next line from its
+/// start.
+fn masked_ruby_code(line: &str, literal: &mut Option<Literal>) -> String {
+    let bytes = line.as_bytes();
     let mut out = bytes.to_vec();
     let mut i = 0;
+    if let Some(lit) = literal.take() {
+        match mask_literal(bytes, &mut out, 0, lit) {
+            Ok(end) => i = end + 1,
+            Err(lit) => {
+                *literal = Some(lit);
+                i = bytes.len();
+            }
+        }
+    }
     while i < bytes.len() {
         let b = bytes[i];
-        let (open, close, body) = match b {
-            b'"' | b'\'' | b'`' => (b, b, i + 1),
-            b'/' if starts_expression(&code[..i]) => (b, b, i + 1),
-            b'%' if starts_expression(&code[..i]) => {
+        let before = std::str::from_utf8(&out[..i]).unwrap_or_default();
+        let (lit, body) = match b {
+            b'#' => {
+                out.truncate(i);
+                break;
+            }
+            b'"' | b'\'' | b'`' => (
+                Literal {
+                    open: b,
+                    close: b,
+                    depth: 0,
+                },
+                i + 1,
+            ),
+            b'/' if starts_expression(before) => (
+                Literal {
+                    open: b,
+                    close: b,
+                    depth: 0,
+                },
+                i + 1,
+            ),
+            b'%' if starts_expression(before) => {
                 let mut j = i + 1;
-                if matches!(
-                    bytes.get(j),
-                    Some(b'w' | b'W' | b'i' | b'I' | b'q' | b'Q' | b'r')
-                ) {
+                if bytes.get(j).is_some_and(|c| b"wWiIqQrsx".contains(c)) {
                     j += 1;
                 }
-                let Some(&open) = bytes.get(j) else {
-                    break;
-                };
-                if open.is_ascii_alphanumeric() || open.is_ascii_whitespace() || !open.is_ascii() {
-                    i += 1;
-                    continue;
+                match bytes.get(j) {
+                    Some(&open) if open.is_ascii_punctuation() => {
+                        let close = match open {
+                            b'(' => b')',
+                            b'[' => b']',
+                            b'{' => b'}',
+                            b'<' => b'>',
+                            _ => open,
+                        };
+                        (
+                            Literal {
+                                open,
+                                close,
+                                depth: 0,
+                            },
+                            j + 1,
+                        )
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
                 }
-                let close = match open {
-                    b'(' => b')',
-                    b'[' => b']',
-                    b'{' => b'}',
-                    b'<' => b'>',
-                    _ => open,
-                };
-                (open, close, j + 1)
             }
             _ => {
                 i += 1;
                 continue;
             }
         };
-        let mut depth = 0usize;
-        let mut j = body;
-        while j < bytes.len() {
-            let c = bytes[j];
-            if c == b'\\' {
-                out[j] = b'x';
-                if j + 1 < bytes.len() {
-                    out[j + 1] = b'x';
-                }
-                j += 2;
-                continue;
+        match mask_literal(bytes, &mut out, body, lit) {
+            Ok(end) => i = end + 1,
+            // An unclosed `/` was a division after all.
+            Err(_) if b == b'/' => {
+                out[body..].copy_from_slice(&bytes[body..]);
+                i += 1;
             }
-            if c == close && depth == 0 {
+            Err(lit) => {
+                *literal = Some(lit);
                 break;
             }
-            if open != close && c == open {
-                depth += 1;
-            } else if open != close && c == close {
-                depth -= 1;
-            }
-            out[j] = b'x';
-            j += 1;
         }
-        i = j + 1;
     }
     // The delimiters are ASCII, so a masked run never cuts a multi-byte
     // character: the result is still UTF-8.
-    String::from_utf8(out).unwrap_or_else(|_| code.to_string())
+    String::from_utf8(out).unwrap_or_default()
 }
 
-/// The heredocs a line opens (`<<~EOS`, `<<-"EOS"`, `<<EOS`), in order, as
-/// (terminator, may be indented). `masked` is `code` through
-/// [`masked_ruby_code`], so an opener inside a literal does not count; an
-/// append (`list << x`, `a<<B`) is not an opener.
-fn heredoc_openers(code: &str, masked: &str) -> Vec<(String, bool)> {
+/// Masks `lit`'s body in `out` from byte `from` of `bytes`: `Ok` with the
+/// closing delimiter's index, or `Err` with the literal still open at the
+/// end of the line.
+fn mask_literal(
+    bytes: &[u8],
+    out: &mut [u8],
+    from: usize,
+    mut lit: Literal,
+) -> Result<usize, Literal> {
+    let mut j = from;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if c == b'\\' {
+            out[j] = b'x';
+            if let Some(next) = out.get_mut(j + 1) {
+                *next = b'x';
+            }
+            j += 2;
+            continue;
+        }
+        if c == lit.close && lit.depth == 0 {
+            return Ok(j);
+        }
+        if lit.open != lit.close && c == lit.open {
+            lit.depth += 1;
+        } else if lit.open != lit.close && c == lit.close {
+            lit.depth -= 1;
+        }
+        out[j] = b'x';
+        j += 1;
+    }
+    Err(lit)
+}
+
+/// The heredocs a line opens (`<<~EOS`, `<<-"EOS"`, `x = <<EOS`), in
+/// order, as (terminator, may be indented). `masked` is `line` through
+/// [`masked_ruby_code`], so an opener inside a literal or comment does not
+/// count, and neither does an append (`list << x`, `a<<B`, `class <<self`):
+/// a bare `<<NAME` must start an expression.
+fn heredoc_openers(line: &str, masked: &str) -> Vec<(String, bool)> {
     let bytes = masked.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -844,15 +952,18 @@ fn heredoc_openers(code: &str, masked: &str) -> Vec<(String, bool)> {
             j += 1;
         }
         let id = match bytes.get(j) {
-            Some(&q @ (b'"' | b'\'' | b'`')) => code[j + 1..]
+            Some(&q @ (b'"' | b'\'' | b'`')) => masked[j + 1..]
                 .find(q as char)
-                .map(|end| &code[j + 1..j + 1 + end]),
-            Some(&b) if b.is_ascii_alphabetic() || b == b'_' => {
+                .map(|end| &line[j + 1..j + 1 + end]),
+            Some(&b)
+                if (b.is_ascii_alphabetic() || b == b'_')
+                    && (indented || starts_expression(&masked[..at])) =>
+            {
                 let len = masked[j..]
                     .bytes()
                     .position(|b| !is_ident_byte(b))
                     .unwrap_or(masked.len() - j);
-                Some(&code[j..j + len])
+                Some(&line[j..j + len])
             }
             _ => None,
         };
@@ -862,26 +973,6 @@ fn heredoc_openers(code: &str, masked: &str) -> Vec<(String, bool)> {
         }
     }
     out
-}
-
-/// `line` without its trailing `#` comment. A `#` inside a quoted string
-/// (`"https://#{host}/"` interpolation, a URL fragment) is code, not a
-/// comment.
-fn ruby_code(line: &str) -> &str {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (i, c) in line.char_indices() {
-        match quote {
-            Some(_) if escaped => escaped = false,
-            Some(_) if c == '\\' => escaped = true,
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if c == '#' => return &line[..i],
-            None => {}
-        }
-    }
-    line
 }
 
 /// How the gem comes back into the manifest.
@@ -1411,6 +1502,12 @@ mod tests {
             run(&t, &direct),
             "group :test do\n  if x\n    gem \"a\"\n  end\n\n  gem \"rails\", \"7.0.0\"\n  gem \"b\"\nend\n"
         );
+        // A multi-line opener: the indent of the statement's first line.
+        let t = format!("group :development,\n      :test do\n  if x\n  end\n{block}\nend\n");
+        assert_eq!(
+            run(&t, &direct),
+            "group :development,\n      :test do\n  if x\n  end\n  gem \"rails\", \"7.0.0\"\nend\n"
+        );
         let t = format!("gem \"puma\"\n{block}\n");
         assert_eq!(
             run(&t, &Decl::Direct(constraint_args("rails (>= 6, ~> 7.0)"))),
@@ -1851,6 +1948,43 @@ mod tests {
         assert!(at(
             "source \"https://x\" do\n  list << FOO\n  end_marker = 1\n  gem \"rails\"\nend\n"
         ));
+        // A multi-line `%w[` array or string is masked across lines.
+        assert!(!at(
+            "source \"https://x\" do\n  gem \"a\", require: %w[\n    active_support/core_ext/module\n  ]\nend\ngem \"rails\"\n"
+        ));
+        assert!(!at(
+            "source \"https://x\" do\n  NOTE = \"if\n  case\"\nend\ngem \"rails\"\n"
+        ));
+        // `class <<self` and `list <<name` are no heredocs.
+        assert!(at(
+            "source \"https://x\" do\n  class <<self\n  end\n  list <<name\n  gem \"rails\"\nend\n"
+        ));
+        // A modifier on a `\`-continued line is still a modifier; after a
+        // trailing `,` or `=` the keyword starts an expression.
+        assert!(!at(
+            "source \"https://x\" do\n  gem \"pry\" \\\n    if ENV[\"DEBUG\"]\nend\ngem \"rails\"\n"
+        ));
+        assert!(at(
+            "source \"https://x\" do\n  gem \"pry\",\n    require: if ENV[\"D\"]\n      true\n    end\n  gem \"rails\"\nend\n"
+        ));
+        // The comment starts where the literals say it does.
+        assert!(!at(
+            "source \"https://x\" do\n  gem \"a\" if RUBY_PLATFORM =~ /x'/ # we're at the end\nend\ngem \"rails\"\n"
+        ));
+        assert!(at(
+            "source \"https://x\", path: %q(#a) do\n  gem \"rails\"\nend\n"
+        ));
+        // `%s()` / `%x()` literals and operator / nested-paren endless defs.
+        for line in [
+            "v = %x(echo begin)",
+            "sym = %s(class)",
+            "def ==(other) = id == other.id",
+            "def x(a = foo()) = a",
+            "def self.x = 1",
+        ] {
+            let t = format!("source \"https://x\" do\n  {line}\nend\ngem \"rails\"\n");
+            assert!(!at(&t), "{t}");
+        }
         // A setter `def x=(v)` still needs its `end`.
         assert!(at(
             "source \"https://x\" do\n  def x=(v)\n  end\n  gem \"rails\"\nend\n"
