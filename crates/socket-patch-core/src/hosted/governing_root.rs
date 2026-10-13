@@ -27,7 +27,7 @@ use crate::formats::text::strip_bom;
 use crate::formats::yarn::berry_gates::YARN_LOCK;
 use crate::formats::yarn::is_berry_lock;
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
-use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
+use crate::utils::fs::{open_regular_file, read_regular_to_string, read_regular_to_string_sync};
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::workspace_globs::{workspaces_include, workspaces_include_as, WorkspacesDialect};
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
@@ -583,12 +583,13 @@ async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
 /// it looks for sit in the first lines.
 const LOCK_HEAD_BYTES: u64 = 4096;
 
-/// The first [`LOCK_HEAD_BYTES`] of a file, lossily decoded; empty when it
-/// cannot be read.
+/// The first [`LOCK_HEAD_BYTES`] of a regular file, lossily decoded; empty
+/// when it cannot be read or is not a regular file (a FIFO fails fast
+/// instead of blocking in open(2), Bugbot on #1480).
 async fn read_head(path: &Path) -> String {
     use tokio::io::AsyncReadExt;
     let mut head = Vec::new();
-    if let Ok(file) = tokio::fs::File::open(path).await {
+    if let Ok((file, _)) = open_regular_file(path).await {
         let _ = file.take(LOCK_HEAD_BYTES).read_to_end(&mut head).await;
     }
     String::from_utf8_lossy(&head).into_owned()
@@ -1300,6 +1301,28 @@ mod tests {
         assert!(member_stray_lock(&tmp.path().join("packages/a"))
             .await
             .is_some());
+    }
+
+    /// Bugbot on #1480: the lock head is read through the FIFO-safe
+    /// opener, so a FIFO reads as empty instead of hanging the run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_head_read_does_not_block_on_a_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("yarn.lock");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let head = tokio::time::timeout(std::time::Duration::from_secs(10), read_head(&fifo))
+            .await
+            .expect("read_head must not block on a FIFO");
+        assert_eq!(head, "");
+        write(tmp.path(), "bun.lock", "{\n  \"configVersion\": 1,\n}\n");
+        assert!(read_head(&tmp.path().join("bun.lock"))
+            .await
+            .contains("configVersion"));
     }
 
     /// #1097 (review on #1480): only a top-level `configVersion` marks Bun
