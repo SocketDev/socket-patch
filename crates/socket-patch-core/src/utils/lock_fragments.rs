@@ -286,11 +286,16 @@ pub(crate) fn finish<'a>(
 /// The start of each of `needles` in `haystack`, found in one pass; `None`
 /// unless every needle occurs exactly once.
 ///
-/// Occurrences are counted overlapping, so a needle that overlaps itself
-/// may count more than its non-overlapping `matches` would. That only ever
-/// rejects a batch the step-by-step rewrite would also have finished (the
-/// caller then goes step by step), never accepts one it would refuse.
+/// The pass looks for each needle's first [`PREFIX`] bytes (a small
+/// automaton, where the whole fragments would make a large one) and checks
+/// the full needle at every place its prefix occurs. Every occurrence starts
+/// with its prefix, so none is missed. They are counted overlapping, so a
+/// needle that overlaps itself may count more than its non-overlapping
+/// `matches` would; that only ever sends the batch to the step-by-step
+/// rewrite, never accepts one that path would refuse.
 fn sole_occurrences(haystack: &str, needles: &[&str]) -> Option<Vec<usize>> {
+    /// Enough of a lock fragment to name its package.
+    const PREFIX: usize = 64;
     if needles.is_empty() {
         return Some(Vec::new());
     }
@@ -299,14 +304,20 @@ fn sole_occurrences(haystack: &str, needles: &[&str]) -> Option<Vec<usize>> {
     }
     #[cfg(test)]
     tick(&SCANS);
-    let finder = aho_corasick::AhoCorasick::new(needles).ok()?;
+    let prefixes = needles
+        .iter()
+        .map(|needle| &needle.as_bytes()[..needle.len().min(PREFIX)]);
+    let finder = aho_corasick::AhoCorasick::new(prefixes).ok()?;
+    let haystack = haystack.as_bytes();
     let mut starts: Vec<Option<usize>> = vec![None; needles.len()];
     for found in finder.find_overlapping_iter(haystack) {
-        let start = &mut starts[found.pattern().as_usize()];
-        if start.is_some() {
+        let index = found.pattern().as_usize();
+        if !haystack[found.start()..].starts_with(needles[index].as_bytes()) {
+            continue;
+        }
+        if starts[index].replace(found.start()).is_some() {
             return None;
         }
-        *start = Some(found.start());
     }
     starts.into_iter().collect()
 }
@@ -492,6 +503,26 @@ mod tests {
         let mut span = span;
         extend_span(lock["unit"].as_table().unwrap(), &mut span);
         Ok(vec![text[span].to_string()])
+    }
+
+    #[test]
+    fn sole_occurrences_finds_each_needle_once_or_refuses() {
+        // Long needles sharing their first 64+ bytes are told apart by the
+        // full comparison.
+        let shared = "x".repeat(80);
+        let (a, b) = (format!("{shared}A"), format!("{shared}B"));
+        let haystack = format!("[{a}]\n[{b}]\n");
+        assert_eq!(
+            sole_occurrences(&haystack, &[&b, &a, "]\n["]),
+            Some(vec![haystack.find(&b).unwrap(), 1, a.len() + 1])
+        );
+        assert_eq!(sole_occurrences(&haystack, &[]), Some(vec![]));
+        // Missing, repeated, empty and self-overlapping needles all refuse.
+        assert_eq!(sole_occurrences(&haystack, &[&a, "missing"]), None);
+        assert_eq!(sole_occurrences(&haystack, &[&shared]), None);
+        assert_eq!(sole_occurrences(&haystack, &["]\n"]), None);
+        assert_eq!(sole_occurrences(&haystack, &[""]), None);
+        assert_eq!(sole_occurrences("aaa", &["aa"]), None);
     }
 
     #[test]
