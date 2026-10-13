@@ -23,6 +23,55 @@ a version without a non-empty section in this file.
 
 ## [Unreleased]
 
+## [5.0.1] — 2026-10-13
+
+### Fixed
+
+- **5.0.1 is the first v5 release on npm and crates.io.** v5.0.0 was tagged
+  and its standalone binaries were published on GitHub, but its npm and
+  crates.io publishes failed on a trusted-publisher mismatch, so
+  `@socketsecurity/socket-patch` and the Cargo crates stayed on 4.0.0. npm
+  now publishes from the Release workflow its trusted publisher names.
+  Upgrading from 4.x through npm or Cargo goes straight to 5.0.1; read the
+  [v5 migration guide](docs/migrating-to-v5.md) and the 5.0.0 notes below
+  first.
+- Hosted `rollback` / `remove` behind a registry mirror that passes npmjs
+  tarball URLs through keep Yarn Berry's `::__archiveUrl=` binding and
+  pnpm's `tarball:` field, so the next cold install no longer 404s (#1465).
+- A Yarn Berry vendored revert rebuilds the restored `yarn.lock` entry from
+  the live lock instead of the one recorded at vendor time, so
+  `yarn install --immutable` keeps passing after later lock changes (#759).
+- Hosted pnpm reads `npm_config_*` / `pnpm_config_*` environment settings
+  only where the project's pnpm major reads them, so an npm-era
+  `package-lock=false` under `npx` no longer blocks pinning a lock pnpm 11/12
+  installs from (#1460).
+- A yarn classic pin written by v4 for a patch that adds a dependency the
+  lock never locked is no longer confirmed on rescan
+  (`redirect_yarn_classic_dep_manifest_unlocked`), and `vex` omits hosted
+  npm-family copies whose new dependencies aren't installed
+  (`dependency_not_installed`) (#1462).
+- uv: after `uv remove` or an upgrade of a hosted-pinned transitive
+  package's parent, `list` warns `hosted_resolution_orphaned` and `rollback`
+  / `remove` retire the leftover override wiring instead of failing with
+  `hosted_wiring_contested` (#1445). Reverting a vendored PEP 723 script lock
+  restores the specifier the script declares now, not the one recorded at
+  vendor time (#869).
+- Poetry 1.3 locks are refused for a `source = "pypi"` dependency, like
+  1.4–2.2 locks, since Poetry 1.3 can't solve the rewired lock (#1447).
+- The stale-install remedy for a Pipenv `--site-packages` venv importing a
+  base-interpreter copy installs over it inside the venv, instead of an
+  uninstall pip refuses (#1450).
+- `vendor --check` explains a missing or changed vendored artifact in plain
+  words, naming the file and the `repair` step, in human output and the
+  `--json` event `reason` (#1467).
+
+### Maintenance
+
+- Release binaries build with one codegen unit, about 16% smaller.
+- npm publishing runs inline in `release.yml` (`publish-npm.yml` is removed),
+  and the Release workflow gains an `npm-retry-version` input that re-stages
+  npm from an existing GitHub release.
+
 ## [5.0.0] — 2026-10-12
 
 v5 centers the workflow on `scan` (hosted patches), `vex` (OpenVEX attestations),
