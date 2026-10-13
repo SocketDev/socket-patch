@@ -376,19 +376,12 @@ fn b64(bytes: &[u8]) -> String {
 /// Run socket-patch (`args`) with a scrubbed environment and the crawler's
 /// global packages folder pinned to `store` → (exit, envelope, stderr).
 fn socket_patch(cwd: &Path, store: &Path, args: &[&str]) -> (Option<i32>, Value, String) {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     let out = cmd
         .args(args)
         .current_dir(cwd)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("NUGET_PACKAGES", store)
-        .env_remove("VIRTUAL_ENV")
         .output()
         .expect("spawn socket-patch");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

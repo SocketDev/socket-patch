@@ -30,16 +30,9 @@ use serial_test::serial;
 /// scrubs by hand.
 const PENDING_RAW_SPAWNS: &[&str] = &[
     "apply/apply_network.rs",
-    "e2e_cargo.rs",
-    "e2e_composer.rs",
-    "e2e_composer_version_identity.rs",
     "e2e_hosted_production.rs",
     "e2e_maven.rs",
     "e2e_npm.rs",
-    "e2e_nuget.rs",
-    "e2e_nuget_dotnet_build.rs",
-    "e2e_pypi.rs",
-    "e2e_pypi_multi_copy.rs",
     "e2e_redirect_bun_build.rs",
     "e2e_redirect_cargo_shapes.rs",
     "e2e_scan.rs",
@@ -268,19 +261,7 @@ fn workflow_env_copies_carry_every_opt_out() {
 #[serial]
 fn command_never_leaks_its_hostile_seeds() {
     let env = effective_env(&hermetic::command(Path::new("socket-patch")));
-    for key in [
-        "SOCKET_CWD",
-        "SOCKET_GLOBAL",
-        "SOCKET_GLOBAL_PREFIX",
-        "SOCKET_DRY_RUN",
-        "SOCKET_ECOSYSTEMS",
-        "SOCKET_MANIFEST_PATH",
-        "SOCKET_JSON",
-        "SOCKET_SILENT",
-        "SOCKET_VERBOSE",
-        "SOCKET_UPDATE_BASE_URL",
-        "SOCKET_UPDATE_STATE_DIR",
-    ] {
+    for (key, _) in hermetic::HOSTILE_SEEDS {
         assert_eq!(get(&env, key), None, "{key} seed must be scrubbed");
     }
 }
@@ -450,6 +431,39 @@ fn bundle_extra_sweeps_every_bundler_override() {
             // A suite's own BUNDLE_PATH, set after the scrub, survives.
             cmd.env("BUNDLE_PATH", "/store");
             assert_eq!(get(&effective_env(&cmd), "BUNDLE_PATH"), Some("/store"));
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn composer_extra_sweeps_overrides_and_pins_an_empty_home() {
+    with_ambient(
+        &[
+            ("COMPOSER_VENDOR_DIR", "third"),
+            ("COMPOSER_HOME", "/ambient/composer"),
+            ("COMPOSER_CACHE_DIR", "/ambient/composer-cache"),
+            ("XDG_CONFIG_HOME", "/ambient/config"),
+        ],
+        || {
+            let mut cmd = Command::new("socket-patch");
+            hermetic::scrub_extra(&mut cmd, &[Extra::Composer]);
+            let env = effective_env(&cmd);
+            assert_eq!(get(&env, "COMPOSER_VENDOR_DIR"), None);
+            assert_eq!(get(&env, "COMPOSER_CACHE_DIR"), None);
+            // The pin outranks XDG_CONFIG_HOME in the Composer home lookup.
+            assert_eq!(
+                get(&env, "COMPOSER_HOME"),
+                Some("/nonexistent/composer-home")
+            );
+            assert_eq!(get(&env, "XDG_CONFIG_HOME"), Some("/ambient/config"));
+
+            // A suite's own COMPOSER_HOME, set after the scrub, survives.
+            cmd.env("COMPOSER_HOME", "/fixture/home");
+            assert_eq!(
+                get(&effective_env(&cmd), "COMPOSER_HOME"),
+                Some("/fixture/home")
+            );
         },
     );
 }

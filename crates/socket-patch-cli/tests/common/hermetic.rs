@@ -34,11 +34,12 @@ use std::process::Command;
 /// never sees it, but if a scrub line is ever dropped the seed (rather than a
 /// developer's ambient shell, which the suites can't rely on) turns the tests
 /// red immediately.
-const HOSTILE_SEEDS: &[(&str, &str)] = &[
+pub const HOSTILE_SEEDS: &[(&str, &str)] = &[
     ("SOCKET_CWD", "/nonexistent"),
     ("SOCKET_GLOBAL", "true"),
     ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
     ("SOCKET_DRY_RUN", "true"),
+    ("SOCKET_SAVE_ONLY", "true"),
     ("SOCKET_ECOSYSTEMS", "cargo"),
     ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
     ("SOCKET_JSON", "true"),
@@ -209,6 +210,14 @@ pub enum Extra {
     /// Every `POETRY_*` var: Poetry reads any config key from
     /// `POETRY_<KEY>` (`POETRY_VIRTUALENVS_PATH`, repository URLs, ...).
     Poetry,
+    /// Every `COMPOSER_*` var, then `COMPOSER_HOME` pinned to a missing
+    /// directory. The crawler resolves a project's vendor directory from
+    /// `COMPOSER_VENDOR_DIR`, else the user-level `config.json` in the
+    /// Composer home, which it finds through `COMPOSER_HOME` or an
+    /// absolute `XDG_CONFIG_HOME`; any of them moves the crawl off the
+    /// fixture's `vendor/`. The pin outranks `XDG_CONFIG_HOME` and holds
+    /// no config. Run it before the suite sets its own `COMPOSER_*` values.
+    Composer,
 }
 
 /// Apply each of `extras` to `cmd` (see [`Extra`]). Run it before
@@ -278,6 +287,14 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                         cmd.env_remove(&key);
                     }
                 }
+            }
+            Extra::Composer => {
+                for (key, _) in std::env::vars_os() {
+                    if key.to_string_lossy().starts_with("COMPOSER_") {
+                        cmd.env_remove(&key);
+                    }
+                }
+                cmd.env("COMPOSER_HOME", "/nonexistent/composer-home");
             }
         }
     }

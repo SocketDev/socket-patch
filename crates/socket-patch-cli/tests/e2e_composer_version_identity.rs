@@ -9,6 +9,8 @@
 //! `scan --redirect` repoints the lock entry. Each test runs the built binary
 //! against a wiremock API that serves only the padded spelling.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -180,17 +182,19 @@ async fn mount_api(server: &MockServer, prebuilt: bool) {
         .await;
 }
 
-/// The built binary with every ambient `SOCKET_*` variable scrubbed and
-/// telemetry off, so the assertions reflect only the argv.
+/// The built binary in the hermetic `SOCKET_*` environment, so the
+/// assertions reflect only the argv. Its scans and `vex` runs crawl every
+/// ecosystem, so an activated venv is scrubbed and `HOME` points at a
+/// stand-in (`jvm_env::isolate_cli`), and `Extra::Composer` keeps an
+/// ambient `COMPOSER_VENDOR_DIR` or user-level Composer config from moving
+/// the vendor directory off the fixture's.
 fn cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let mut cmd = hermetic::binary_command();
+    hermetic::scrub_extra(
+        &mut cmd,
+        &[hermetic::Extra::Venv, hermetic::Extra::Composer],
+    );
+    prebuilt_common::jvm_env::isolate_cli(&mut cmd);
     cmd
 }
 
