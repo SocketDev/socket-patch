@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha512_256};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
 const HEADER: &[u8] = b"#!/usr/bin/env bun\nbun-lockfile-format-v0\n";
@@ -48,6 +49,91 @@ const NORMALIZED_MAGIC: &[u8; 7] = b"sktpnrm";
 pub(crate) const NORMALIZED_FORMAT_1: u8 = 1;
 /// Workspace dependency behaviors were normalized (not invertible).
 pub(crate) const NORMALIZED_WORKSPACE: u8 = 2;
+
+/// Bun's `configVersion` from a binary lock's `cNfGvRsN` extension (the
+/// twin of the text lock's top-level key, #1492), or `None` for a lock
+/// that is not binary, is untagged (Bun 1.3.0 and earlier) or does not
+/// hold together. Walks only the structure (the header, the six buffer
+/// descriptors and the extension tags), seeking past every array, so
+/// neither package records nor the order of the extensions matters (Bun
+/// writes `sCoPdOvR` after the tag), and a large lock costs a few small
+/// reads. Like [`BunLockb::parse`], it stops at an unknown tag.
+pub(crate) fn read_config_version<R: Read + Seek>(lock: &mut R) -> Option<u64> {
+    let mut head = [0; PACKAGES_AT + 40];
+    lock.read_exact(&mut head).ok()?;
+    if !head.starts_with(HEADER) {
+        return None;
+    }
+    let total = usize_at(&head, TOTAL_AT).ok()?;
+    let mut pos = usize_at(&head, PACKAGES_AT + 32).ok()?;
+    for _ in 0..6 {
+        pos = skip_array(lock, pos, total)?.end;
+    }
+    if read_u64(lock, pos, total)? != 0 {
+        return None;
+    }
+    pos += 8;
+    while pos.checked_add(8).is_some_and(|end| end <= total) {
+        let mut tag = [0; 8];
+        read_at(lock, pos, &mut tag, total)?;
+        let n = match &tag {
+            b"wOrKsPaC" => 4,
+            b"tRuStEDd" => 1,
+            b"eMpTrUsT" => 0,
+            b"oVeRriDs" | b"pAtChEdD" => 2,
+            b"sCoPdOvR" => 3,
+            b"cNfGvRsN" => return read_u64(lock, pos + 8, total),
+            b"cAtAlOgS" => {
+                pos += 8;
+                let mut groups = 0;
+                for _ in 0..3 {
+                    let array = skip_array(lock, pos, total)?;
+                    groups = array.len() / 8;
+                    pos = array.end;
+                }
+                for _ in 0..groups * 2 {
+                    pos = skip_array(lock, pos, total)?.end;
+                }
+                continue;
+            }
+            _ => return None,
+        };
+        pos += 8;
+        for _ in 0..n {
+            pos = skip_array(lock, pos, total)?.end;
+        }
+    }
+    None
+}
+
+fn read_at<R: Read + Seek>(lock: &mut R, at: usize, buf: &mut [u8], total: usize) -> Option<()> {
+    if at.checked_add(buf.len())? > total {
+        return None;
+    }
+    lock.seek(SeekFrom::Start(at as u64)).ok()?;
+    lock.read_exact(buf).ok()
+}
+
+fn read_u64<R: Read + Seek>(lock: &mut R, at: usize, total: usize) -> Option<u64> {
+    let mut bytes = [0; 8];
+    read_at(lock, at, &mut bytes, total)?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// The data range of the array whose descriptor is at `descriptor`, with
+/// [`read_array`]'s checks; each array starts past its descriptor, so a
+/// walk over them always moves forward.
+fn skip_array<R: Read + Seek>(
+    lock: &mut R,
+    descriptor: usize,
+    total: usize,
+) -> Option<Range<usize>> {
+    let mut bytes = [0; 16];
+    read_at(lock, descriptor, &mut bytes, total)?;
+    let start = usize_at(&bytes, 0).ok()?;
+    let end = usize_at(&bytes, 8).ok()?;
+    (start >= descriptor + 16 && start <= end && end <= total).then_some(start..end)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BinaryPackage {
@@ -2278,6 +2364,41 @@ mod tests {
 
     fn digest() -> String {
         format!("sha512-{}", STANDARD.encode([42; 64]))
+    }
+
+    fn config_version_of(lock: &[u8]) -> Option<u64> {
+        read_config_version(&mut std::io::Cursor::new(lock))
+    }
+
+    /// #1492: Bun writes a `cNfGvRsN` config-version extension (the twin
+    /// of the text lock's `configVersion`) since a 1.3 patch release, after
+    /// the workspace and catalog extensions of a workspace root and before
+    /// the scoped-overrides one; 1.3.0 and earlier writers do not.
+    #[test]
+    fn config_version_is_read_from_tagged_locks_only() {
+        let extra = [
+            "prerelease-pair-1.3.14",
+            "1.4.2-extensions",
+            "1.4.2-scoped-overrides",
+            "1.2.23-extensions",
+        ];
+        for version in VERSIONS.iter().chain(&extra) {
+            let lock = fixture(version);
+            let tagged = version.contains("1.3.14") || version.starts_with("1.4.2");
+            assert_eq!(config_version_of(&lock), tagged.then_some(1), "{version}");
+        }
+        for name in ["1.3.9-ws-deps-late.lockb", "1.4.2-ws-adder.lockb"] {
+            let lock = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/bun-lockb/late-dependent")
+                    .join(name),
+            )
+            .unwrap();
+            assert_eq!(config_version_of(&lock), Some(1), "{name}");
+        }
+        // Not a binary lock, or a header with nothing after it.
+        assert_eq!(config_version_of(b"\0"), None);
+        assert_eq!(config_version_of(HEADER), None);
     }
 
     #[test]
