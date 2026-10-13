@@ -2639,3 +2639,123 @@ fn hosted_pin_count(doc: &serde_json::Value) -> u64 {
         })
         .count() as u64
 }
+
+/// #935: one workspace member depends on the registry release and another
+/// on a `file:` copy of the same `name@version` (an unpacked directory, or
+/// a tarball whose lock entry records the version). pnpm installs that copy
+/// from the user's source whatever the registry entry's `resolution:` says,
+/// so lockfile discovery withholds the pin from attestation. The scan must
+/// skip it as `redirect_unattributable` and leave the lock alone, not pin
+/// the registry entry and stay silent about the copy (the regression from
+/// #1008, where the withheld ref started counting as an attributed pin).
+async fn assert_file_copy_vetoes_the_pin(copy_key: &str, copy_entry: &str, spec: &str) {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "0.0.0", "private": true }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .unwrap();
+    for (member, dep) in [("a", VERSION.to_string()), ("b", spec.to_string())] {
+        let dir = root.join("packages").join(member);
+        std::fs::create_dir_all(dir.join("node_modules").join(NAME)).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(
+                r#"{{ "name": "{member}", "version": "0.0.0", "dependencies": {{ "{NAME}": "{dep}" }} }}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("node_modules").join(NAME).join("package.json"),
+            format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir_all(root.join("forks").join(NAME)).unwrap();
+    std::fs::write(
+        root.join("forks").join(NAME).join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    let lock = format!(
+        "lockfileVersion: '9.0'
+
+importers:
+  .: {{}}
+  packages/a:
+    dependencies:
+      {NAME}:
+        specifier: {VERSION}
+        version: {VERSION}
+  packages/b:
+    dependencies:
+      {NAME}:
+        specifier: {spec}
+        version: {copy_key}
+
+packages:
+  {NAME}@{VERSION}:
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+  {NAME}@{copy_key}:
+{copy_entry}
+snapshots:
+  {NAME}@{VERSION}: {{}}
+  {NAME}@{copy_key}: {{}}
+"
+    );
+    std::fs::write(root.join("pnpm-lock.yaml"), &lock).unwrap();
+    let workspace = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap();
+
+    let code = run(hosted_args(root, server.uri())).await;
+    assert_eq!(code, 0, "{copy_key}: an unattributable pin is a skip");
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+        lock,
+        "{copy_key}: the registry entry must not be pinned beside the file: copy"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+        workspace,
+        "{copy_key}: no trust key is written for a pin that was not written"
+    );
+    let discovery = socket_patch_core::vex::discover_patched_refs(root).await;
+    assert!(
+        socket_patch_core::patch::redirect::upstream::HostedInventory::of(&discovery).is_empty(),
+        "{copy_key}: no hosted wiring is left behind"
+    );
+    assert_no_ledger(root);
+}
+
+#[tokio::test]
+#[serial]
+async fn hosted_pnpm_file_directory_copy_vetoes_the_registry_pin() {
+    assert_file_copy_vetoes_the_pin(
+        &format!("file:forks/{NAME}"),
+        &format!("    resolution: {{directory: forks/{NAME}, type: directory}}\n"),
+        &format!("file:../../forks/{NAME}"),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn hosted_pnpm_file_tarball_copy_vetoes_the_registry_pin() {
+    assert_file_copy_vetoes_the_pin(
+        &format!("file:forks/{NAME}-{VERSION}.tgz"),
+        &format!(
+            "    resolution: {{integrity: {UPSTREAM_SHA512}, tarball: file:forks/{NAME}-{VERSION}.tgz}}\n    version: {VERSION}\n"
+        ),
+        &format!("file:../../forks/{NAME}-{VERSION}.tgz"),
+    )
+    .await;
+}

@@ -1883,21 +1883,43 @@ async fn unattributed_pins(
         .filter(|c| c.lockless.is_empty())
         .map(|c| c.uuid.as_str())
         .collect();
+    // A pin discovery withholds from attestation because its own lock also
+    // installs an unpatched copy of the same `name@version` (a pnpm or npm
+    // `file:` dependency, #935) is one package version's pin, so the
+    // inventory counts it as attributed (#828: rollback still unwinds it).
+    // But the run would write wiring that `vex` refuses to attest while that
+    // copy stays unpatched, so it is vetoed like contested wiring, unless
+    // the same uuid is attested through another ref.
+    let attested: BTreeSet<&str> = discovery
+        .refs
+        .iter()
+        .filter(|r| r.mode == crate::vex::discover::WiringMode::Hosted)
+        .map(|r| r.uuid.as_str())
+        .collect();
+    let shadowed: BTreeSet<&str> = discovery
+        .shadowed
+        .iter()
+        .filter(|r| r.mode == crate::vex::discover::WiringMode::Hosted)
+        .map(|r| r.uuid.as_str())
+        .filter(|uuid| !attested.contains(uuid))
+        .collect();
     // vlt's bundled copies live only in its installed store, which the
     // rewriters never read (the scan warns about them after the writes).
     let vlt_bundled: BTreeSet<String> = match view.disk_root() {
-        Some(root) if !contested.is_empty() => crate::vendor::vlt_bundled::bundled_copies(root)
-            .await
-            .into_keys()
-            .collect(),
+        Some(root) if !contested.is_empty() || !shadowed.is_empty() => {
+            crate::vendor::vlt_bundled::bundled_copies(root)
+                .await
+                .into_keys()
+                .collect()
+        }
         _ => BTreeSet::new(),
     };
     let vetoed = done
         .confirmed
         .iter()
         .filter(|(purl, uuid)| {
-            !attributed.contains(uuid.as_str())
-                && contested.contains(uuid.as_str())
+            ((!attributed.contains(uuid.as_str()) && contested.contains(uuid.as_str()))
+                || shadowed.contains(uuid.as_str()))
                 && !done.rewrite.bundled_skipped_uuids.contains(uuid)
                 && !done.rewrite.alias_skipped_entries.contains_key(uuid)
                 && !exempt.contains(uuid)
