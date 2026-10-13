@@ -52,8 +52,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde_json::Value;
 
 use crate::vex_e2e_common::{
-    assert_attested, binary, git_sha256, purl_matches, run_vex, statements_for, Marker, PatchApi,
-    VexOutcome, VexRun, VexVia,
+    assert_attested, binary, git_sha256, hermetic, purl_matches, run_vex, statements_for, Marker,
+    PatchApi, VexOutcome, VexRun, VexVia,
 };
 
 pub const ORG: &str = "test-org";
@@ -215,22 +215,19 @@ pub fn pipfile_lock(category: &str, extras: Option<&[&str]>) -> String {
 
 // ── process + fs helpers ──────────────────────────────────────────────
 
-/// The CLI with the ambient environment neutralized: every `SOCKET_*` /
-/// `PIPENV_*` scrubbed, telemetry and socket-cli config off, no
-/// `VIRTUAL_ENV` (a python-crawler input), Pipenv's out-of-tree venv lookup
-/// pointed at an empty dir.
+/// The CLI with the hermetic `SOCKET_*` environment (`hermetic::command`:
+/// telemetry, socket-cli config and the update notifier off), every
+/// `PIPENV_*` scrubbed, no `VIRTUAL_ENV` (a python-crawler input), and
+/// Pipenv's out-of-tree venv lookup pointed at an empty dir.
 pub fn cli(scratch: &Path) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     for (key, _) in std::env::vars_os() {
-        let key = key.to_string_lossy().into_owned();
-        if key.starts_with("SOCKET_") || key.starts_with("PIPENV_") {
+        if key.to_string_lossy().starts_with("PIPENV_") {
             cmd.env_remove(&key);
         }
     }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("WORKON_HOME", workon_home(scratch))
-        .env_remove("VIRTUAL_ENV");
+    cmd.env("WORKON_HOME", workon_home(scratch));
     cmd
 }
 
