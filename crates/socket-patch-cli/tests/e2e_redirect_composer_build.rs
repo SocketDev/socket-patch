@@ -53,12 +53,13 @@
 //! release. `#[ignore]`-gated like the vendored twin: the unpinned `test` job
 //! skips it; the e2e job runs it with a pinned toolchain via `--ignored`.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha1::{Digest as _, Sha1};
 use wiremock::matchers::{method, path, path_regex};
@@ -304,19 +305,13 @@ fn lock_entry(proj: &Path, name: &str) -> serde_json::Value {
         .clone()
 }
 
-/// A socket-patch invocation with the ambient `SOCKET_*` surface scrubbed
-/// (telemetry off, no socket-cli config, `VIRTUAL_ENV` removed).
+/// A socket-patch invocation in the hermetic environment
+/// (`tests/common/hermetic.rs`: telemetry off, no socket-cli config) with
+/// `VIRTUAL_ENV` removed.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env_remove("VIRTUAL_ENV");
     let out = cmd.output().expect("run socket-patch");
     (
         out.status.code().unwrap_or(-1),
