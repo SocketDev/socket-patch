@@ -1716,6 +1716,7 @@ pub async fn rewrite(
         let Gated {
             vetoed,
             lockless,
+            copy_left,
             discovery,
         } = unattributed_pins(
             view,
@@ -1729,6 +1730,7 @@ pub async fn rewrite(
         if vetoed.is_empty() {
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
+            done.rewrite.warnings.extend(copy_left);
             done.final_discovery = discovery;
             return done;
         }
@@ -1739,8 +1741,10 @@ pub async fn rewrite(
 
 /// Lockfile discovery over the project as `done` would leave it, read as
 /// the management commands read it ([`HostedInventory`]): the skips for
-/// the confirmed candidates whose pin would be contested wiring, and a
-/// [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin. A lockless NuGet /
+/// the confirmed candidates whose pin would be contested wiring, a
+/// [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin, and a
+/// [`REDIRECT_COPY_UNPATCHED`] warning per unpatched copy a pin's own lock
+/// installs beside it that the rewriters did not report. A lockless NuGet /
 /// Cargo pin ([`UnlockedPin`]) is written as before — whether such a pin
 /// may be written at all is the open hosted-rollback decision (E45) — but
 /// the run says that nothing can manage it until a lockfile exists.
@@ -1873,6 +1877,54 @@ async fn unattributed_pins(
             )
         })
         .collect();
+    // A pin whose own lock also installs an unpatched copy of the same
+    // `name@version` (a pnpm `file:` directory or tarball dependency, #935)
+    // is written: the registry copy is patched, and discovery withholds the
+    // pin from attestation but still manages it ([`Discovery::shadowed`],
+    // #828). The run names the copy unless the rewriter already did (a
+    // bundled, git or `file:` copy it reports and records itself), so the
+    // user learns why `vex` will attest nothing for the package.
+    //
+    // [`Discovery::shadowed`]: crate::vex::discover::Discovery::shadowed
+    let mut copy_left: Vec<RewriteWarning> = Vec::new();
+    for r in &discovery.shadowed {
+        if r.mode != crate::vex::discover::WiringMode::Hosted
+            || done.rewrite.bundled_skipped_uuids.contains(&r.uuid)
+            || !done.confirmed.iter().any(|(_, uuid)| *uuid == r.uuid)
+        {
+            continue;
+        }
+        for c in discovery
+            .unpatched_copies
+            .iter()
+            .filter(|c| c.purl == r.purl && c.file == r.source_file)
+        {
+            let named = format!("`{}`", c.key);
+            if done
+                .rewrite
+                .warnings
+                .iter()
+                .any(|w| w.detail.contains(&named))
+                || copy_left.iter().any(|w| w.detail.contains(&named))
+            {
+                continue;
+            }
+            copy_left.push(warning(
+                REDIRECT_COPY_UNPATCHED,
+                format!(
+                    "{}: {} is pinned to patch {}, but lock entry `{}` {}; that copy stays \
+                     UNPATCHED, so `vex` attests nothing for {}. Depend on the registry \
+                     release instead of that copy to patch it",
+                    c.file.display(),
+                    r.purl,
+                    r.uuid,
+                    c.key,
+                    c.how,
+                    r.purl
+                ),
+            ));
+        }
+    }
     // Contested wiring (not a lockless pin, see above) is what the run must
     // never leave behind. A pin discovery does not see at all (a file it
     // does not read, such as a pre-2.6 bundler Gemfile the next `bundle
@@ -1883,43 +1935,21 @@ async fn unattributed_pins(
         .filter(|c| c.lockless.is_empty())
         .map(|c| c.uuid.as_str())
         .collect();
-    // A pin discovery withholds from attestation because its own lock also
-    // installs an unpatched copy of the same `name@version` (a pnpm or npm
-    // `file:` dependency, #935) is one package version's pin, so the
-    // inventory counts it as attributed (#828: rollback still unwinds it).
-    // But the run would write wiring that `vex` refuses to attest while that
-    // copy stays unpatched, so it is vetoed like contested wiring, unless
-    // the same uuid is attested through another ref.
-    let attested: BTreeSet<&str> = discovery
-        .refs
-        .iter()
-        .filter(|r| r.mode == crate::vex::discover::WiringMode::Hosted)
-        .map(|r| r.uuid.as_str())
-        .collect();
-    let shadowed: BTreeSet<&str> = discovery
-        .shadowed
-        .iter()
-        .filter(|r| r.mode == crate::vex::discover::WiringMode::Hosted)
-        .map(|r| r.uuid.as_str())
-        .filter(|uuid| !attested.contains(uuid))
-        .collect();
     // vlt's bundled copies live only in its installed store, which the
     // rewriters never read (the scan warns about them after the writes).
     let vlt_bundled: BTreeSet<String> = match view.disk_root() {
-        Some(root) if !contested.is_empty() || !shadowed.is_empty() => {
-            crate::vendor::vlt_bundled::bundled_copies(root)
-                .await
-                .into_keys()
-                .collect()
-        }
+        Some(root) if !contested.is_empty() => crate::vendor::vlt_bundled::bundled_copies(root)
+            .await
+            .into_keys()
+            .collect(),
         _ => BTreeSet::new(),
     };
     let vetoed = done
         .confirmed
         .iter()
         .filter(|(purl, uuid)| {
-            ((!attributed.contains(uuid.as_str()) && contested.contains(uuid.as_str()))
-                || shadowed.contains(uuid.as_str()))
+            !attributed.contains(uuid.as_str())
+                && contested.contains(uuid.as_str())
                 && !done.rewrite.bundled_skipped_uuids.contains(uuid)
                 && !done.rewrite.alias_skipped_entries.contains_key(uuid)
                 && !exempt.contains(uuid)
@@ -1963,6 +1993,7 @@ async fn unattributed_pins(
     Gated {
         vetoed,
         lockless,
+        copy_left,
         discovery,
     }
 }
@@ -1974,6 +2005,9 @@ struct Gated {
     vetoed: Vec<SkippedPatch>,
     /// A [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin.
     lockless: Vec<RewriteWarning>,
+    /// A [`REDIRECT_COPY_UNPATCHED`] warning per same-lock unpatched copy
+    /// beside a pin that the rewriters did not already report.
+    copy_left: Vec<RewriteWarning>,
     /// The discovery the verdict read, for [`Rewritten::final_discovery`].
     discovery: Option<FinalDiscovery>,
 }
@@ -1997,6 +2031,11 @@ fn reusable_prior(
 /// Warning: a confirmed pin no lockfile records a version for (a lockless
 /// NuGet / Cargo redirect), which no later command can attribute.
 pub const REDIRECT_PIN_LOCKLESS: &str = "redirect_pin_lockless";
+
+/// Warning: a confirmed pin's own lock also installs an unpatched copy of
+/// the same `name@version` from the user's source (a pnpm `file:`
+/// directory or tarball dependency, #935), which no rewrite reaches.
+pub const REDIRECT_COPY_UNPATCHED: &str = "redirect_copy_unpatched";
 
 /// `skipped[].reason` of a candidate whose pin lockfile discovery would not
 /// attribute (see [`rewrite`]).

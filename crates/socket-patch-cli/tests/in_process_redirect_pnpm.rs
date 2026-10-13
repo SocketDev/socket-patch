@@ -2643,12 +2643,11 @@ fn hosted_pin_count(doc: &serde_json::Value) -> u64 {
 /// #935: one workspace member depends on the registry release and another
 /// on a `file:` copy of the same `name@version` (an unpacked directory, or
 /// a tarball whose lock entry records the version). pnpm installs that copy
-/// from the user's source whatever the registry entry's `resolution:` says,
-/// so lockfile discovery withholds the pin from attestation. The scan must
-/// skip it as `redirect_unattributable` and leave the lock alone, not pin
-/// the registry entry and stay silent about the copy (the regression from
-/// #1008, where the withheld ref started counting as an attributed pin).
-async fn assert_file_copy_vetoes_the_pin(copy_key: &str, copy_entry: &str, spec: &str) {
+/// from the user's source whatever the registry entry's `resolution:` says.
+/// The scan pins the registry entry, like npm and yarn classic do, and names
+/// the unpatched copy with `redirect_copy_unpatched`. Before the fix it
+/// pinned silently, and only a later `vex` said anything about the copy.
+async fn assert_file_copy_is_named(copy_key: &str, copy_entry: &str, spec: &str) {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -2687,8 +2686,10 @@ async fn assert_file_copy_vetoes_the_pin(copy_key: &str, copy_entry: &str, spec:
         format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
     )
     .unwrap();
-    let lock = format!(
-        "lockfileVersion: '9.0'
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        format!(
+            "lockfileVersion: '9.0'
 
 importers:
   .: {{}}
@@ -2712,34 +2713,47 @@ snapshots:
   {NAME}@{VERSION}: {{}}
   {NAME}@{copy_key}: {{}}
 "
-    );
-    std::fs::write(root.join("pnpm-lock.yaml"), &lock).unwrap();
-    let workspace = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap();
+        ),
+    )
+    .unwrap();
 
-    let code = run(hosted_args(root, server.uri())).await;
-    assert_eq!(code, 0, "{copy_key}: an unattributable pin is a skip");
-    assert_eq!(
-        std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
-        lock,
-        "{copy_key}: the registry entry must not be pinned beside the file: copy"
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
-        workspace,
-        "{copy_key}: no trust key is written for a pin that was not written"
-    );
-    let discovery = socket_patch_core::vex::discover_patched_refs(root).await;
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "{copy_key}: {doc}");
+    let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
     assert!(
-        socket_patch_core::patch::redirect::upstream::HostedInventory::of(&discovery).is_empty(),
-        "{copy_key}: no hosted wiring is left behind"
+        lock.contains(&format!("tarball: {HOSTED_URL}")),
+        "{copy_key}: the registry entry is pinned: {lock}"
     );
-    assert_no_ledger(root);
+    fn named<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if m.values().any(|x| x == "redirect_copy_unpatched") {
+                    out.push(v);
+                }
+                m.values().for_each(|x| named(x, out));
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| named(x, out)),
+            _ => {}
+        }
+    }
+    let mut warnings = Vec::new();
+    named(&doc, &mut warnings);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "{copy_key}: exactly one warning names the copy: {doc}"
+    );
+    let detail = warnings[0].to_string();
+    assert!(
+        detail.contains(&format!("`{NAME}@{copy_key}`")) && detail.contains("UNPATCHED"),
+        "{copy_key}: the warning names the lock entry: {detail}"
+    );
 }
 
 #[tokio::test]
 #[serial]
-async fn hosted_pnpm_file_directory_copy_vetoes_the_registry_pin() {
-    assert_file_copy_vetoes_the_pin(
+async fn hosted_pnpm_file_directory_copy_is_named() {
+    assert_file_copy_is_named(
         &format!("file:forks/{NAME}"),
         &format!("    resolution: {{directory: forks/{NAME}, type: directory}}\n"),
         &format!("file:../../forks/{NAME}"),
@@ -2749,8 +2763,8 @@ async fn hosted_pnpm_file_directory_copy_vetoes_the_registry_pin() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_pnpm_file_tarball_copy_vetoes_the_registry_pin() {
-    assert_file_copy_vetoes_the_pin(
+async fn hosted_pnpm_file_tarball_copy_is_named() {
+    assert_file_copy_is_named(
         &format!("file:forks/{NAME}-{VERSION}.tgz"),
         &format!(
             "    resolution: {{integrity: {UPSTREAM_SHA512}, tarball: file:forks/{NAME}-{VERSION}.tgz}}\n    version: {VERSION}\n"
