@@ -1267,8 +1267,14 @@ fn respell_original(
         let array = array.unwrap_or(LockRequirementArray::RequiresDist);
         let specifier = entry_value(element, "specifier");
         let marker = entry_value(element, "marker");
-        if let Some(spec) = respell_lock_specifier(pyproject_text, array, canon, specifier, marker)?
-        {
+        if let Some(spec) = respell_lock_specifier(
+            pyproject_text,
+            "pyproject.toml",
+            array,
+            canon,
+            specifier,
+            marker,
+        )? {
             out.replace_range(s..e, &with_specifier(element, spec.as_deref()));
         }
     }

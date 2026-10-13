@@ -243,7 +243,9 @@ restores the `requires-dist`, `requires-dev` and `[manifest] constraints`
 entries with the specifier pyproject.toml declares at revert time, not the one
 recorded when vendoring. When uv's spelling can't be derived, as with a
 multi-clause range (uv orders clauses differently across releases), the edit is
-treated as drift and both files are kept. Tests also cover restoring one package while
+treated as drift and both files are kept. A PEP 723 script lock follows the
+same rule: its `[manifest]` entries are restored with the specifier the
+script's `# /// script` block declares at revert time. Tests also cover restoring one package while
 preserving another package's vendored entries.
 
 ## Reproduce the release-family matrix
