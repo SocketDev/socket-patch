@@ -714,6 +714,33 @@ pub async fn read_candidate_files(
             out.files.insert(rel.to_string(), text);
         }
     }
+    // A PEP 723 script also takes uv's settings from above the root when
+    // the root holds none (#1501); only a disk view has an above.
+    if out
+        .files
+        .keys()
+        .any(|path| crate::utils::python_lock::is_script_lock_name(path))
+        && !crate::utils::python_script::root_governs_script(
+            out.files.get("pyproject.toml").map(String::as_str),
+            out.files
+                .get(crate::utils::python_script::UV_TOML)
+                .map(String::as_str),
+        )
+    {
+        let files = view
+            .disk_root_reading(std::iter::empty::<&std::path::Path>())
+            .map(crate::utils::python_script::ancestor_uv_config_files)
+            .unwrap_or_default();
+        if let Some(config) = view
+            .disk_root_reading(files.iter().map(|(_, path)| path))
+            .and_then(crate::utils::python_script::find_ancestor_uv_config)
+        {
+            out.files.insert(
+                crate::patch::redirect::UV_ANCESTOR_CONFIG_KEY.to_string(),
+                format!("{}\n{}", config.rel, config.text),
+            );
+        }
+    }
 
     // Rush monorepos have no root package.json/lock pair: the single pnpm
     // source-of-truth lock lives at common/config/rush/pnpm-lock.yaml, and

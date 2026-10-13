@@ -864,6 +864,105 @@ async fn uv_no_sources_is_refused_in_both_modes() {
     }
 }
 
+/// #1501: a PEP 723 script takes uv's settings from the nearest directory
+/// at or above it that holds a `uv.toml` or a `pyproject.toml` with
+/// `[tool.uv]`. A parent project's `no-sources = true` therefore drops the
+/// script's source too, so both modes must refuse a script scanned from a
+/// subdirectory just as they do beside the setting. A parent pyproject
+/// without `[tool.uv]` sets nothing, and the script is still wired.
+#[tokio::test]
+async fn uv_script_no_sources_in_a_parent_is_refused_in_both_modes() {
+    let parent_pyproject = "[project]\nname = \"root\"\nversion = \"0.1.0\"\n";
+    for (file, setting, refused) in [
+        ("uv.toml", "no-sources = true\n".to_string(), true),
+        (
+            "pyproject.toml",
+            format!("{parent_pyproject}\n[tool.uv]\nno-sources = true\n"),
+            true,
+        ),
+        (
+            "pyproject.toml",
+            format!("{parent_pyproject}\n[tool.uv]\nno-sources-package = [\"Six\"]\n"),
+            true,
+        ),
+        ("pyproject.toml", parent_pyproject.to_string(), false),
+    ] {
+        let (_tmp, root) = project();
+        stage_script_lock(&root);
+        std::fs::write(root.parent().unwrap().join(file), &setting).unwrap();
+        let before = tree(&root);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted {file}: {env:#}");
+        if refused {
+            assert_eq!(hosted_pinned(&env), 0, "hosted {file}: {env:#}");
+            assert!(
+                env.to_string().contains("redirect_uv_script_unsupported")
+                    && env.to_string().contains(&format!("../{file}")),
+                "hosted {file}: {env:#}"
+            );
+            assert_eq!(tree(&root), before, "hosted {file} wrote nothing");
+        } else {
+            assert_eq!(hosted_pinned(&env), 1, "hosted {file}: {env:#}");
+            continue;
+        }
+
+        stage_manifest(&root);
+        let before = tree(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_ne!(code, 0, "vendored {file}: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_uv_no_sources")
+                && env.to_string().contains(&format!("../{file}")),
+            "vendored {file}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "vendored {file} wrote nothing");
+    }
+}
+
+/// In a uv workspace, uv takes a member's script settings from the
+/// workspace root, so a member's own `[tool.uv]` does not shield the script
+/// from the root's `no-sources`. The #1138 workspace-member guard refuses
+/// the run before the script lane's own lookup, in both modes.
+#[tokio::test]
+async fn uv_script_in_a_workspace_member_is_not_wired() {
+    let (_tmp, root) = project();
+    stage_script_lock(&root);
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"s\"\nversion = \"0.1.0\"\n\n[tool.uv]\npackage = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.parent().unwrap().join("pyproject.toml"),
+        "[project]\nname = \"b\"\nversion = \"0.1.0\"\n\n[tool.uv.workspace]\nmembers = [\"proj\"]\n\n[tool.uv]\nno-sources = true\n",
+    )
+    .unwrap();
+    let before = tree(&root);
+
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 1, "hosted: {env:#}");
+    assert_eq!(
+        env["error"]["code"], "redirect_workspace_lockfile_elsewhere",
+        "hosted: {env:#}"
+    );
+    assert_eq!(tree(&root), before, "hosted wrote nothing");
+
+    stage_manifest(&root);
+    let before = tree(&root);
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_ne!(code, 0, "vendored: {env:#}");
+    assert!(
+        env.to_string().contains("pypi_uv_workspace_unsupported"),
+        "vendored: {env:#}"
+    );
+    assert_eq!(tree(&root), before, "vendored wrote nothing");
+}
+
 /// A Hatch project; returns its wiring files.
 fn stage_hatch(root: &Path) -> &'static [&'static str] {
     std::fs::write(
