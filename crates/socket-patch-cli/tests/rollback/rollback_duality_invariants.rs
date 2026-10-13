@@ -905,3 +905,97 @@ fn uuid_and_purl_targets_still_work() {
     assert!(m["patches"].get("pkg:npm/dual-b@1.0.0").is_none(), "{m}");
     assert!(m["patches"].get("pkg:npm/dual-a@1.0.0").is_some(), "{m}");
 }
+
+// ---------------------------------------------------------------------------
+// #1266: a member's alias link into the root store is in the member's scope
+// ---------------------------------------------------------------------------
+
+/// pnpm's isolated linker (and npm `install-strategy=linked`) put a
+/// member's alias dependency (`"lp": "npm:path-alias-pkg@1.0.0"`) at
+/// `packages/a/node_modules/lp`, a symlink into the root store. That link is
+/// what member a loads, so `rollback packages/a` must restore the package,
+/// exactly as it does for a plain-name link.
+#[cfg(unix)]
+#[test]
+fn path_scoped_rollback_selects_member_alias_link() {
+    // pnpm's `.pnpm` store, then npm's linked `.store` (npm 10 names an
+    // alias's entry and dir after the alias).
+    for (store_entry, dir) in [
+        (".pnpm/path-alias-pkg@1.0.0", "path-alias-pkg"),
+        (".store/lp@1.0.0-0a1b2c3d", "lp"),
+    ] {
+        assert_member_alias_link_rolled_back(store_entry, dir);
+    }
+}
+
+#[cfg(unix)]
+fn assert_member_alias_link_rolled_back(store_entry: &str, dir: &str) {
+    let before: &[u8] = b"path-alias-original\n";
+    let after: &[u8] = b"path-alias-patched\n";
+    let before_hash = git_sha256(before);
+    let after_hash = git_sha256(after);
+    let purl = "pkg:npm/path-alias-pkg@1.0.0";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages: ['packages/*']\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    let store_pkg = tmp
+        .path()
+        .join(format!("node_modules/{store_entry}/node_modules/{dir}"));
+    std::fs::create_dir_all(&store_pkg).expect("create store package dir");
+    std::fs::write(
+        store_pkg.join("package.json"),
+        r#"{ "name": "path-alias-pkg", "version": "1.0.0" }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(store_pkg.join("index.js"), after).expect("write index.js");
+    let member_nm = tmp.path().join("packages/a/node_modules");
+    std::fs::create_dir_all(&member_nm).expect("create member node_modules");
+    std::fs::write(
+        tmp.path().join("packages/a/package.json"),
+        r#"{ "name": "a", "version": "1.0.0", "dependencies": { "lp": "npm:path-alias-pkg@1.0.0" } }"#,
+    )
+    .expect("write member package.json");
+    std::os::unix::fs::symlink(
+        format!("../../../node_modules/{store_entry}/node_modules/{dir}"),
+        member_nm.join("lp"),
+    )
+    .expect("link member alias");
+    let socket = write_socket_manifest(
+        tmp.path(),
+        &[manifest_entry(
+            purl,
+            "33333333-3333-4333-8333-333333333333",
+            &before_hash,
+            &after_hash,
+        )],
+        false,
+    );
+    stage_blob(&socket, &before_hash, before);
+    stage_blob(&socket, &after_hash, after);
+
+    let (code, stdout, stderr) = run(tmp.path(), &["--json", "--offline", "--yes", "packages/a"]);
+    assert_eq!(
+        code, 0,
+        "rollback of the member must select its alias link ({store_entry}); stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "success", "stdout=\n{stdout}");
+    assert_eq!(
+        crate::rollback_json::manifest_removed(&v),
+        serde_json::json!([purl]),
+        "the aliased entry is in scope; stdout=\n{stdout}"
+    );
+    let content = std::fs::read(member_nm.join("lp/index.js")).expect("read alias file");
+    assert_eq!(
+        git_sha256(&content),
+        before_hash,
+        "member a's alias restored"
+    );
+    let content = std::fs::read(store_pkg.join("index.js")).expect("read store file");
+    assert_eq!(git_sha256(&content), before_hash, "one physical copy");
+}

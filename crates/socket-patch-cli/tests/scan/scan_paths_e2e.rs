@@ -886,3 +886,124 @@ async fn paths_scope_selects_every_nested_member_copy() {
         assert_eq!(v["scannedPackages"], 1, "scan {pattern}: {v}");
     }
 }
+
+/// #1266: a workspace member's ALIAS dependency (`"lp":
+/// "npm:left-pad@1.3.0"`) under a linked layout is a symlink
+/// `packages/a/node_modules/lp` into the root store, just like its
+/// plain-name link `packages/a/node_modules/ms`. Scoping to the member must
+/// select the aliased package too, not only the plain-name one. Left-pad
+/// lives at `node_modules/<store>/<lp_entry>/node_modules/<lp_dir>`.
+#[cfg(unix)]
+async fn assert_member_alias_link_in_scope(store: &str, lp_entry: &str, lp_dir: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0", "private": true, "workspaces": ["packages/*"] }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages: ['packages/*']\n",
+    )
+    .unwrap();
+    // The aliased package's store copy: its own package.json names the
+    // real package, whatever the entry and dir are called.
+    let lp_pkg = root
+        .join("node_modules")
+        .join(store)
+        .join(lp_entry)
+        .join("node_modules")
+        .join(lp_dir);
+    std::fs::create_dir_all(&lp_pkg).unwrap();
+    std::fs::write(
+        lp_pkg.join("package.json"),
+        r#"{ "name": "left-pad", "version": "1.3.0" }"#,
+    )
+    .unwrap();
+    for (member, deps, links) in [
+        (
+            "a",
+            r#"{ "lp": "npm:left-pad@1.3.0", "ms": "2.1.2" }"#,
+            vec![
+                ("lp", format!("{store}/{lp_entry}/node_modules/{lp_dir}")),
+                ("ms", format!("{store}/ms@2.1.2/node_modules/ms")),
+            ],
+        ),
+        (
+            "b",
+            r#"{ "is-number": "7.0.0" }"#,
+            vec![(
+                "is-number",
+                format!("{store}/is-number@7.0.0/node_modules/is-number"),
+            )],
+        ),
+    ] {
+        let member_dir = root.join("packages").join(member);
+        std::fs::create_dir_all(member_dir.join("node_modules")).unwrap();
+        std::fs::write(
+            member_dir.join("package.json"),
+            format!(r#"{{ "name": "{member}", "version": "1.0.0", "dependencies": {deps} }}"#),
+        )
+        .unwrap();
+        for (link, target) in links {
+            std::os::unix::fs::symlink(
+                format!("../../../node_modules/{target}"),
+                member_dir.join("node_modules").join(link),
+            )
+            .unwrap();
+        }
+    }
+    for (prefix, name, version) in [
+        (format!("node_modules/{store}/ms@2.1.2"), "ms", "2.1.2"),
+        (
+            format!("node_modules/{store}/is-number@7.0.0"),
+            "is-number",
+            "7.0.0",
+        ),
+    ] {
+        write_npm_package_at(root, &prefix, name, version);
+    }
+
+    for pattern in ["packages/a", "packages/a/node_modules/lp"] {
+        let (bodies, v) = scoped_agent_scan(root, pattern).await;
+        assert_eq!(
+            bodies.len(),
+            1,
+            "scan {pattern} must query the batch API once; envelope {v}"
+        );
+        assert!(
+            bodies[0].contains("pkg:npm/left-pad@1.3.0"),
+            "scan {pattern} must select member a's aliased left-pad ({store}/{lp_entry}); body: {}",
+            bodies[0]
+        );
+        assert!(
+            !bodies[0].contains("is-number"),
+            "scan {pattern} must not select member b's is-number; body: {}",
+            bodies[0]
+        );
+    }
+    let (bodies, v) = scoped_agent_scan(root, "packages/a").await;
+    assert!(
+        bodies[0].contains("pkg:npm/ms@2.1.2"),
+        "scan packages/a must still select the plain-name link; body: {}",
+        bodies[0]
+    );
+    assert_eq!(v["scannedPackages"], 2, "scan packages/a: {v}");
+}
+
+/// #1266, pnpm's default isolated linker.
+#[cfg(unix)]
+#[tokio::test]
+async fn paths_scope_selects_pnpm_member_alias_link() {
+    assert_member_alias_link_in_scope(".pnpm", "left-pad@1.3.0", "left-pad").await;
+}
+
+/// #1266, npm `install-strategy=linked`: npm 11+ names the store entry
+/// after the real package, npm 10 after the alias.
+#[cfg(unix)]
+#[tokio::test]
+async fn paths_scope_selects_npm_linked_member_alias_link() {
+    assert_member_alias_link_in_scope(".store", "left-pad@1.3.0-0a1b2c3d", "left-pad").await;
+    assert_member_alias_link_in_scope(".store", "lp@1.3.0-0a1b2c3d", "lp").await;
+}

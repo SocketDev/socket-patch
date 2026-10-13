@@ -4,7 +4,7 @@ use socket_patch_core::crawlers::{
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::PurlKey;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::args::GlobalArgs;
 
@@ -637,16 +637,111 @@ pub async fn find_all_packages_for_rollback(
 /// from `prior` as [`find_packages_for_rollback_reusing`] does. Used by
 /// `scan`'s path scoping, which must see the same copies `rollback`'s path
 /// targets do.
+///
+/// An npm package's copies here also include each link in a `node_modules`
+/// root that resolves to one of them ([`add_npm_links_to_copies`]): path
+/// scoping asks which install paths reach a package, and pnpm's isolated
+/// linker or npm's `install-strategy=linked` reach a workspace member's
+/// ALIAS dependency only through such a link (#1266).
 pub async fn find_all_packages_for_rollback_reusing(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
     prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, Vec<PathBuf>> {
-    let npm_roots = prior
+    let prior_roots = prior
         .filter(|p| p.taken_with(options))
-        .map(|p| p.roots.as_slice());
-    dispatch_find(partitioned, options, silent, merge_qualified, npm_roots).await
+        .map(|p| p.roots.clone());
+    let npm_roots = match prior_roots {
+        Some(roots) => Some(roots),
+        None if partitioned
+            .get(&Ecosystem::Npm)
+            .is_some_and(|p| !p.is_empty()) =>
+        {
+            NpmCrawler.get_node_modules_paths(options).await.ok()
+        }
+        None => None,
+    };
+    let mut found = dispatch_find(
+        partitioned,
+        options,
+        silent,
+        merge_qualified,
+        npm_roots.as_deref(),
+    )
+    .await;
+    if let Some(roots) = npm_roots {
+        found = tokio::task::spawn_blocking(move || {
+            add_npm_links_to_copies(&mut found, &roots);
+            found
+        })
+        .await
+        .expect("npm link enumeration does not panic");
+    }
+    found
+}
+
+/// Add to each npm purl's `copies` every package link directly in one of
+/// `roots` (scoped ones one level down) that resolves to one of its
+/// copies. The crawler records a plain-name link at its own path
+/// (`packages/a/node_modules/ms`), but never an alias link
+/// (`packages/a/node_modules/lp -> …/.pnpm/left-pad@1.3.0/node_modules/left-pad`):
+/// links are not physical copies, and apply and VEX must see each physical
+/// copy once. Path scoping instead needs every path that installs the
+/// package, so the alias link is added here (#1266).
+fn add_npm_links_to_copies(copies: &mut HashMap<String, Vec<PathBuf>>, roots: &[PathBuf]) {
+    let mut by_target: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for (purl, paths) in copies.iter() {
+        if !purl.starts_with("pkg:npm/") {
+            continue;
+        }
+        for path in paths {
+            if let Ok(target) = std::fs::canonicalize(path) {
+                by_target.entry(target).or_default().push(purl.clone());
+            }
+        }
+    }
+    if by_target.is_empty() {
+        return;
+    }
+    let entries = |dir: &Path| -> Vec<(String, PathBuf, std::fs::FileType)> {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        read.filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let file_type = e.file_type().ok()?;
+                (!name.starts_with('.')).then(|| (name, e.path(), file_type))
+            })
+            .collect()
+    };
+    for root in roots {
+        let mut links = Vec::new();
+        for (name, path, file_type) in entries(root) {
+            if name.starts_with('@') && file_type.is_dir() {
+                links.extend(
+                    entries(&path)
+                        .into_iter()
+                        .filter(|(_, _, ft)| ft.is_symlink())
+                        .map(|(_, p, _)| p),
+                );
+            } else if file_type.is_symlink() {
+                links.push(path);
+            }
+        }
+        for link in links {
+            let Ok(target) = std::fs::canonicalize(&link) else {
+                continue;
+            };
+            for purl in by_target.get(&target).into_iter().flatten() {
+                let paths = copies.get_mut(purl).expect("keyed from copies");
+                if !paths.contains(&link) {
+                    paths.push(link.clone());
+                }
+            }
+        }
+    }
 }
 
 /// Qualified-aware PURL resolution for rollback, vendor, repair and
