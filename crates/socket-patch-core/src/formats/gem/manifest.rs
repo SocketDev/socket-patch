@@ -471,7 +471,7 @@ fn plain_literal(s: &str) -> Option<(&str, &str)> {
 /// dropped, as Ruby does.
 fn for_each_code_line(contents: &str, mut f: impl FnMut(&str, &str)) {
     use crate::formats::gem::gemfile::code_of;
-    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    let contents = crate::formats::text::strip_bom(contents);
     let mut in_comment_block = false;
     let mut heredocs: Vec<String> = Vec::new();
     for line in contents.lines() {
