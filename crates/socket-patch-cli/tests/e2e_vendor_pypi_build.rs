@@ -56,7 +56,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic, hermetic_command};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -113,18 +113,13 @@ const ORACLE: &str = "import six; print(six.SOCKET_PATCHED)";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-/// Run socket-patch with ambient `SOCKET_*` + `VIRTUAL_ENV` scrubbed
-/// (`VIRTUAL_ENV` is a python-crawler discovery input and must not leak from
-/// the developer's shell).
+/// Run socket-patch in the hermetic environment (`tests/common/hermetic.rs`)
+/// with `VIRTUAL_ENV` removed (a python-crawler discovery input that must
+/// not leak from the developer's shell).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (

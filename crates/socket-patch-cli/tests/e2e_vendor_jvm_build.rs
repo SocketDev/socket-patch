@@ -32,7 +32,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic_command};
 
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
@@ -48,7 +48,7 @@ mod jvm_fixture_repo;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use gradle_build_common::{
     assert_patched, configuration_reused, fixture_root, gradle_classpath, gradle_skip, init_script,
@@ -65,7 +65,7 @@ const SV: &str = "1.10.0-socket.1d3c1fd2";
 /// the local repository would break the plugin realm, not the project.
 const CLASSPATH_PLUGIN: &str = "org.apache.maven.plugins:maven-dependency-plugin:3.5.0";
 
-/// `socket-patch <args>` with ambient `SOCKET_*` scrubbed, `m2` as the Maven
+/// `socket-patch <args>` in the hermetic environment, `m2` as the Maven
 /// repo and, when given, `gradle_home` as the `GRADLE_USER_HOME` the CLI
 /// crawls (and the fixture registry serves).
 fn socket_in(
@@ -74,12 +74,7 @@ fn socket_in(
     gradle_home: Option<&Path>,
     args: &[&str],
 ) -> (Option<i32>, serde_json::Value, String) {
-    let mut cmd = Command::new(binary());
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
+    let mut cmd = hermetic_command(&binary());
     let mut caches = vec![("MAVEN_REPO_LOCAL", m2.to_str().unwrap())];
     if let Some(home) = gradle_home {
         caches.push(("GRADLE_USER_HOME", home.to_str().unwrap()));
@@ -87,8 +82,6 @@ fn socket_in(
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &caches);
     let out = cmd
         .current_dir(cwd)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("MAVEN_REPO_LOCAL", m2)
         .env_remove("M2_HOME")
         .env_remove("VIRTUAL_ENV")

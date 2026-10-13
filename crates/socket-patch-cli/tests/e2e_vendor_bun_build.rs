@@ -76,7 +76,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, parse_json_envelope};
+use common::{binary, git_sha256, hermetic_command, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -279,12 +279,13 @@ fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
     cmd.output().expect("failed to run bun")
 }
 
-/// The real binary with `--no-telemetry` appended: nothing in this suite
-/// should ever post a telemetry event, mocked API or not.
+/// The real binary in the hermetic environment (`tests/common/hermetic.rs`)
+/// plus the bun tool scrub, with `--no-telemetry` appended: nothing in this
+/// suite should ever post a telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.current_dir(cwd);
-    cache_env::scrub_ambient_bun_env(&mut cmd);
+    cache_env::scrub_ambient_bun_tool_env(&mut cmd);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     cmd.arg("--no-telemetry");
     let out = cmd.output().expect("failed to run socket-patch binary");
