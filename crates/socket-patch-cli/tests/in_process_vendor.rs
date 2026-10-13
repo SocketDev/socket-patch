@@ -4783,8 +4783,8 @@ async fn vendor_check_fails_when_lock_no_longer_wires_artifact() {
 /// REGRESSION (#1467): a missing or changed committed artifact failed
 /// `vendor --check` with the Rust Debug text of the health state
 /// (`Missing`, `Corrupt { reason: "vendor_sha256_mismatch" }`): no path,
-/// no remedy. The reason must name the artifact and point at `repair`,
-/// which then turns the check green again.
+/// no remedy. The reason must name the artifact and point at `repair`;
+/// restoring the committed bytes turns the check green again.
 #[tokio::test]
 async fn vendor_check_names_damaged_artifact_and_repair_remedy() {
     let fx = npm_fixture();

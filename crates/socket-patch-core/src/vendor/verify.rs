@@ -692,6 +692,16 @@ pub enum ArtifactHealth {
     UnknownFlavor { flavor: String },
 }
 
+impl ArtifactHealth {
+    /// Only a Bun member-relative copy of the canonical tarball is off;
+    /// `repair` rewrites it from the committed tarball.
+    pub fn is_workspace_copy_issue(&self) -> bool {
+        matches!(self, ArtifactHealth::Corrupt { reason }
+            if reason == "vendor_workspace_artifact_missing"
+                || reason == "vendor_workspace_artifact_corrupt")
+    }
+}
+
 /// Health-check one vendored artifact against its patch record: the
 /// per-file afterHash verification of [`verify_vendored_patch_record`]
 /// (which for dir-shaped artifacts includes the whole-tree fileInventory
@@ -782,10 +792,15 @@ pub async fn describe_artifact_failure(
     let path = &entry.artifact.path;
     Some(match health {
         ArtifactHealth::Healthy => return None,
+        // A JVM tree also counts as missing when only its marker is gone.
+        ArtifactHealth::Missing if super::jvm::apply::is_jvm_entry(entry) => format!(
+            "committed artifact {path} or its tree marker is missing (vendor_artifact_missing); \
+             {REPAIR}"
+        ),
         ArtifactHealth::Missing => {
             format!("committed artifact {path} is missing (vendor_artifact_missing); {REPAIR}")
         }
-        ArtifactHealth::Corrupt { reason } if reason.starts_with("vendor_workspace_artifact_") => {
+        ArtifactHealth::Corrupt { reason } if health.is_workspace_copy_issue() => {
             let mirror = super::bun_workspace::failing_mirror(project_root, entry)
                 .await
                 .unwrap_or_else(|| format!("of {path}"));
@@ -794,10 +809,14 @@ pub async fn describe_artifact_failure(
             } else {
                 "has different bytes"
             };
-            format!(
-                "Bun workspace copy {mirror} {cause} ({reason}); the committed artifact {path} \
-                 it mirrors is intact; {REPAIR}"
-            )
+            // The canonical tarball was checked against the ledger only
+            // when the ledger records its sha256.
+            let canonical = if entry.artifact.sha256.is_empty() {
+                String::new()
+            } else {
+                format!("; the committed artifact {path} it mirrors is intact")
+            };
+            format!("Bun workspace copy {mirror} {cause} ({reason}){canonical}; {REPAIR}")
         }
         ArtifactHealth::Corrupt { reason } => {
             let cause = match reason.as_str() {
@@ -811,12 +830,22 @@ pub async fn describe_artifact_failure(
             format!("committed artifact {path} {cause} ({reason}); {REPAIR}")
         }
         ArtifactHealth::StaleUuid => format!(
-            "committed artifact {path} is for a different patch than the vendor ledger records \
+            "the vendor ledger and the patch manifest name different patches for {path} \
              (vendor_uuid_mismatch); a re-vendor is pending: run `socket-patch vendor`"
         ),
+        ArtifactHealth::Unverifiable { reason }
+            if reason == "vendor_workspace_artifact_invalid" =>
+        {
+            format!(
+                "the Bun workspace copies of {path} cannot be checked because bun.lockb cannot be \
+                 read or names an unsafe path ({reason}); restore bun.lockb from version control \
+                 or re-run `socket-patch vendor`"
+            )
+        }
         ArtifactHealth::Unverifiable { reason } => format!(
-            "the vendor ledger entry for {path} cannot be verified ({reason}); fix \
-             .socket/vendor/state.json, for example by restoring it from version control"
+            "committed artifact {path} cannot be verified ({reason}), so `socket-patch repair` \
+             will not rebuild it; restore .socket/vendor/state.json and .socket/manifest.json \
+             from version control, or re-run `socket-patch vendor`"
         ),
         ArtifactHealth::UnknownFlavor { flavor } => format!(
             "{path} was vendored for the npm flavor `{flavor}`, which this socket-patch release \
@@ -1104,9 +1133,8 @@ mod tests {
             (
                 ArtifactHealth::StaleUuid,
                 format!(
-                    "committed artifact {rel} is for a different patch than the vendor ledger \
-                     records (vendor_uuid_mismatch); a re-vendor is pending: run \
-                     `socket-patch vendor`"
+                    "the vendor ledger and the patch manifest name different patches for {rel} \
+                     (vendor_uuid_mismatch); a re-vendor is pending: run `socket-patch vendor`"
                 ),
             ),
             (
@@ -1114,9 +1142,10 @@ mod tests {
                     reason: "vendor_artifact_path_invalid".into(),
                 },
                 format!(
-                    "the vendor ledger entry for {rel} cannot be verified \
-                     (vendor_artifact_path_invalid); fix .socket/vendor/state.json, for example \
-                     by restoring it from version control"
+                    "committed artifact {rel} cannot be verified (vendor_artifact_path_invalid), \
+                     so `socket-patch repair` will not rebuild it; restore \
+                     .socket/vendor/state.json and .socket/manifest.json from version control, \
+                     or re-run `socket-patch vendor`"
                 ),
             ),
             (
@@ -1139,9 +1168,13 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(
-            text.starts_with(&format!("Bun workspace copy of {rel} is missing")),
-            "{text}"
+        assert_eq!(
+            text,
+            format!(
+                "Bun workspace copy of {rel} is missing (vendor_workspace_artifact_missing); run \
+                 `socket-patch repair` to restore it, then commit it"
+            ),
+            "no recorded sha256: the canonical tarball is not claimed intact"
         );
         assert!(!text.contains('{') && !text.contains('"'), "{text}");
     }
