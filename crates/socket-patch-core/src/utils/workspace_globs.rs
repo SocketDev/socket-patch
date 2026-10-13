@@ -9,22 +9,125 @@
 //! ignored. A leading `!` negates; each caller applies negations the way
 //! its package manager does. pnpm's globber also never lets a wildcard
 //! match a component that starts with `.` ([`glob_matches_no_dot`]).
+//! npm and yarn also match extglobs (`@(a|b)`, `?(..)`, `*(..)`, `+(..)`,
+//! `!(..)`) within one component, and yarn classic ignores `!` patterns;
+//! [`WorkspacesDialect`] names what each package manager reads (#1097).
+
+/// How one package manager reads `package.json` (or `vlt.json`)
+/// `workspaces`, probed on npm 10.9, yarn 1.22.22, yarn 4.10, Bun 1.2.23
+/// and Bun 1.4.2 (#1097).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkspacesDialect {
+    /// What a pattern with a leading `!` does.
+    pub(crate) negation: Negation,
+    /// Extglob groups match (npm's minimatch, yarn's node-glob and
+    /// micromatch). Off, they are literal characters (Bun fails its
+    /// install on one, so its lock never lists such a member).
+    pub(crate) extglob: bool,
+}
+
+/// What a `workspaces` pattern with a leading `!` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Negation {
+    /// It excludes what earlier patterns matched; a later pattern can
+    /// list the directory again (npm, Bun 1.3+, vlt).
+    LastMatchWins,
+    /// It excludes the directory whatever the order (yarn berry's
+    /// globby), and a leading `!(` is an extglob group, not a negation.
+    Unordered,
+    /// It is ignored: it neither excludes nor lists anything (yarn
+    /// classic, Bun before 1.3).
+    Ignored,
+}
+
+impl WorkspacesDialect {
+    /// npm (`package-lock.json`, `npm-shrinkwrap.json`).
+    pub(crate) const NPM: Self = Self {
+        negation: Negation::LastMatchWins,
+        extglob: true,
+    };
+    /// yarn classic (a `yarn.lock` without berry's `__metadata`).
+    pub(crate) const YARN_CLASSIC: Self = Self {
+        negation: Negation::Ignored,
+        extglob: true,
+    };
+    /// yarn berry (a `yarn.lock` with `__metadata`).
+    pub(crate) const YARN_BERRY: Self = Self {
+        negation: Negation::Unordered,
+        extglob: true,
+    };
+    /// Bun 1.3 and later (a `bun.lock` with `configVersion`).
+    pub(crate) const BUN: Self = Self {
+        negation: Negation::LastMatchWins,
+        extglob: false,
+    };
+    /// Bun before 1.3: it lists `!`-negated directories anyway.
+    pub(crate) const BUN_PRE_1_3: Self = Self {
+        negation: Negation::Ignored,
+        extglob: false,
+    };
+    /// vlt, as #942 read it.
+    pub(crate) const VLT: Self = Self {
+        negation: Negation::LastMatchWins,
+        extglob: false,
+    };
+    /// Every dialect, for a root whose package manager is unknown: it lists
+    /// a directory when any of them does.
+    pub(crate) const ALL: [Self; 6] = [
+        Self::NPM,
+        Self::YARN_CLASSIC,
+        Self::YARN_BERRY,
+        Self::BUN,
+        Self::BUN_PRE_1_3,
+        Self::VLT,
+    ];
+}
 
 /// Whether the member path (`rel`, relative to the workspace root, one
 /// entry per component) matches a `workspaces` pattern and no later
-/// `!`-negated one (npm and yarn: the last matching pattern wins).
+/// `!`-negated one (npm and yarn: the last matching pattern wins), in vlt's
+/// dialect.
 pub(crate) fn workspaces_include(patterns: &[String], rel: &[String]) -> bool {
+    workspaces_include_as(patterns, rel, WorkspacesDialect::VLT)
+}
+
+/// [`workspaces_include`] in a given package manager's dialect.
+pub(crate) fn workspaces_include_as(
+    patterns: &[String],
+    rel: &[String],
+    dialect: WorkspacesDialect,
+) -> bool {
     if rel.is_empty() {
         return false;
     }
-    let mut included = false;
-    for pattern in patterns {
-        let (negated, pattern) = split_negation(pattern);
-        if glob_matches(pattern, rel) {
-            included = !negated;
+    let matches = |pattern: &str| pattern_matches(pattern, rel, true, dialect.extglob);
+    match dialect.negation {
+        Negation::LastMatchWins => {
+            let mut included = false;
+            for pattern in patterns {
+                let (negated, pattern) = split_negation(pattern);
+                if matches(pattern) {
+                    included = !negated;
+                }
+            }
+            included
         }
+        Negation::Unordered => {
+            let (mut listed, mut excluded) = (false, false);
+            for pattern in patterns {
+                match split_negation(pattern) {
+                    (true, rest) if !(dialect.extglob && rest.starts_with('(')) => {
+                        excluded |= matches(rest)
+                    }
+                    _ => listed |= matches(pattern),
+                }
+            }
+            listed && !excluded
+        }
+        Negation::Ignored => patterns
+            .iter()
+            .any(|pattern| !pattern.starts_with('!') && matches(pattern)),
     }
-    included
 }
 
 /// `(true, rest)` for a `!`-negated pattern, `(false, pattern)` otherwise.
@@ -38,7 +141,7 @@ pub(crate) fn split_negation(pattern: &str) -> (bool, &str) {
 /// Whether one (un-negated) pattern matches `rel`. A pattern with no
 /// components left (`""`, `.`, `./`) matches nothing.
 pub(crate) fn glob_matches(pattern: &str, rel: &[String]) -> bool {
-    pattern_matches(pattern, rel, true)
+    pattern_matches(pattern, rel, true, false)
 }
 
 /// [`glob_matches`] the way pnpm's globber reads `packages:` (`dot: false`,
@@ -47,10 +150,10 @@ pub(crate) fn glob_matches(pattern: &str, rel: &[String]) -> bool {
 /// `packages/*` does not list `packages/.hidden`. A pattern component that
 /// itself starts with `.` (`.github/**`) still matches it.
 pub(crate) fn glob_matches_no_dot(pattern: &str, rel: &[String]) -> bool {
-    pattern_matches(pattern, rel, false)
+    pattern_matches(pattern, rel, false, false)
 }
 
-fn pattern_matches(pattern: &str, rel: &[String], dot: bool) -> bool {
+fn pattern_matches(pattern: &str, rel: &[String], dot: bool, extglob: bool) -> bool {
     let rel: Vec<Vec<char>> = rel.iter().map(|c| c.chars().collect()).collect();
     expand_braces(pattern.trim()).iter().any(|alternative| {
         let segments: Vec<Vec<char>> = alternative
@@ -58,7 +161,7 @@ fn pattern_matches(pattern: &str, rel: &[String], dot: bool) -> bool {
             .filter(|s| !s.is_empty() && *s != ".")
             .map(|s| s.chars().collect())
             .collect();
-        !segments.is_empty() && path_glob_matches(&segments, &rel, dot)
+        !segments.is_empty() && path_glob_matches(&segments, &rel, dot, extglob)
     })
 }
 
@@ -197,21 +300,26 @@ fn brace_sequence(body: &str) -> Option<Vec<String>> {
 }
 
 /// `dot: false` keeps wildcards off components starting with `.`.
-fn path_glob_matches(pattern: &[Vec<char>], path: &[Vec<char>], dot: bool) -> bool {
+fn path_glob_matches(pattern: &[Vec<char>], path: &[Vec<char>], dot: bool, ext: bool) -> bool {
     let hidden = |component: &Vec<char>| !dot && component.first() == Some(&'.');
     match pattern.split_first() {
         None => path.is_empty(),
         Some((first, rest)) if first.as_slice() == ['*', '*'] => (0..=path.len())
             .take_while(|&skip| skip == 0 || !hidden(&path[skip - 1]))
-            .any(|skip| path_glob_matches(rest, &path[skip..], dot)),
+            .any(|skip| path_glob_matches(rest, &path[skip..], dot, ext)),
         Some((first, rest)) => path.split_first().is_some_and(|(head, tail)| {
             (!hidden(head) || first.first() == Some(&'.'))
-                && segment_glob_matches(first, head)
-                && path_glob_matches(rest, tail, dot)
+                && if ext {
+                    ExtglobMatcher::default().segment(first, head)
+                } else {
+                    segment_glob_matches(first, head)
+                }
+                && path_glob_matches(rest, tail, dot, ext)
         }),
     }
 }
 
+/// Whether one component matches a component pattern, without extglobs.
 pub(crate) fn segment_glob_matches(pattern: &[char], name: &[char]) -> bool {
     match pattern.split_first() {
         None => name.is_empty(),
@@ -225,6 +333,153 @@ pub(crate) fn segment_glob_matches(pattern: &[char], name: &[char]) -> bool {
         },
         Some((c, rest)) => name.first() == Some(c) && segment_glob_matches(rest, &name[1..]),
     }
+}
+
+/// One component matched against a pattern with extglob groups (`@(a|b)`,
+/// `?(..)`, `*(..)`, `+(..)`, `!(..)`), as minimatch reads them. Every
+/// (sub-pattern, name suffix) pair is decided once, so an ambiguous group
+/// (`*(a|aa)`) costs polynomial time, not exponential.
+#[derive(Default)]
+struct ExtglobMatcher {
+    memo: std::collections::HashMap<(usize, usize, usize, usize), bool>,
+}
+
+impl ExtglobMatcher {
+    fn segment(&mut self, pattern: &[char], name: &[char]) -> bool {
+        let key = (
+            pattern.as_ptr() as usize,
+            pattern.len(),
+            name.as_ptr() as usize,
+            name.len(),
+        );
+        if let Some(&known) = self.memo.get(&key) {
+            return known;
+        }
+        let matched = self.segment_uncached(pattern, name);
+        self.memo.insert(key, matched);
+        matched
+    }
+
+    fn segment_uncached(&mut self, pattern: &[char], name: &[char]) -> bool {
+        if let Some(group) = extglob_group(pattern) {
+            return self.group(&group, name);
+        }
+        match pattern.split_first() {
+            None => name.is_empty(),
+            Some(('*', rest)) => (0..=name.len()).any(|skip| self.segment(rest, &name[skip..])),
+            Some(('?', rest)) => !name.is_empty() && self.segment(rest, &name[1..]),
+            Some(('[', rest)) => match char_class(rest) {
+                Some((class, after)) => name
+                    .split_first()
+                    .is_some_and(|(c, tail)| class.matches(*c) && self.segment(after, tail)),
+                None => name.first() == Some(&'[') && self.segment(rest, &name[1..]),
+            },
+            Some((c, rest)) => name.first() == Some(c) && self.segment(rest, &name[1..]),
+        }
+    }
+
+    fn group(&mut self, group: &ExtglobGroup<'_>, name: &[char]) -> bool {
+        let rest = group.rest;
+        match group.kind {
+            '@' => self.alternative_then(group, name, |m, tail| m.segment(rest, tail)),
+            '?' => {
+                self.segment(rest, name)
+                    || self.alternative_then(group, name, |m, tail| m.segment(rest, tail))
+            }
+            '*' => self.repeat(group, name),
+            '+' => self.alternative_then(group, name, |m, tail| m.repeat(group, tail)),
+            // minimatch: `!(a|b)rest` matches when no alternative followed
+            // by `rest` matches the whole name, and some prefix followed
+            // by `rest` does.
+            _ => {
+                !self.alternative_then(group, name, |m, tail| m.segment(rest, tail))
+                    && (0..=name.len()).any(|skip| self.segment(rest, &name[skip..]))
+            }
+        }
+    }
+
+    /// Some alternative matches a prefix of `name` and `then` the rest.
+    fn alternative_then(
+        &mut self,
+        group: &ExtglobGroup<'_>,
+        name: &[char],
+        then: impl Fn(&mut Self, &[char]) -> bool,
+    ) -> bool {
+        (0..=name.len()).any(|split| {
+            group
+                .alternatives
+                .iter()
+                .any(|alt| self.segment(alt, &name[..split]))
+                && then(self, &name[split..])
+        })
+    }
+
+    /// Zero or more non-empty alternatives, then the group's `rest`.
+    fn repeat(&mut self, group: &ExtglobGroup<'_>, name: &[char]) -> bool {
+        // A group's `rest` starts right after its own `)`, so its address
+        // names the group within the pattern.
+        let key = (
+            group.rest.as_ptr() as usize,
+            usize::MAX,
+            name.as_ptr() as usize,
+            name.len(),
+        );
+        if let Some(&known) = self.memo.get(&key) {
+            return known;
+        }
+        let matched = self.segment(group.rest, name)
+            || (1..=name.len()).any(|split| {
+                group
+                    .alternatives
+                    .iter()
+                    .any(|alt| self.segment(alt, &name[..split]))
+                    && self.repeat(group, &name[split..])
+            });
+        self.memo.insert(key, matched);
+        matched
+    }
+}
+
+/// An extglob group at the start of a component pattern: its kind
+/// (`@`, `?`, `*`, `+`, `!`), its `|`-separated alternatives and the
+/// pattern after its `)`.
+struct ExtglobGroup<'a> {
+    kind: char,
+    alternatives: Vec<&'a [char]>,
+    rest: &'a [char],
+}
+
+/// The group starting `pattern`, or `None` when it starts no group or the
+/// group never closes (its characters are then read as usual, as in
+/// minimatch).
+fn extglob_group(pattern: &[char]) -> Option<ExtglobGroup<'_>> {
+    let kind = *pattern.first()?;
+    if !matches!(kind, '@' | '?' | '*' | '+' | '!') || pattern.get(1) != Some(&'(') {
+        return None;
+    }
+    let body = &pattern[2..];
+    let (mut depth, mut start) = (0usize, 0usize);
+    let mut alternatives = Vec::new();
+    for (i, &c) in body.iter().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                alternatives.push(&body[start..i]);
+                return Some(ExtglobGroup {
+                    kind,
+                    alternatives,
+                    rest: &body[i + 1..],
+                });
+            }
+            ')' => depth -= 1,
+            '|' if depth == 0 => {
+                alternatives.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// A parsed `[...]` character class.
@@ -351,6 +606,164 @@ mod tests {
         assert!(!workspaces_include(
             &pats(&["packages/*", "!packages/{b,c}"]),
             &rel("packages/b")
+        ));
+    }
+
+    /// #1097: npm (minimatch) and yarn (classic node-glob, berry
+    /// micromatch) match extglobs in `workspaces`; probed on npm 10.9,
+    /// yarn 1.22.22 and yarn 4.10.
+    #[test]
+    fn extglob_dialects_match_like_npm_and_yarn() {
+        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
+        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let npm = WorkspacesDialect::NPM;
+        let yes = |p: &str, r: &str| {
+            assert!(
+                workspaces_include_as(&pats(&[p]), &rel(r), npm),
+                "{p} ~ {r}"
+            )
+        };
+        let no = |p: &str, r: &str| {
+            assert!(
+                !workspaces_include_as(&pats(&[p]), &rel(r), npm),
+                "{p} !~ {r}"
+            )
+        };
+        yes("packages/@(a|b)", "packages/a");
+        yes("packages/@(a|b)", "packages/b");
+        no("packages/@(a|b)", "packages/c");
+        no("packages/@(a|b)", "packages/ab");
+        yes("packages/+(a|c)", "packages/c");
+        yes("packages/+(a|c)", "packages/aca");
+        no("packages/+(a|c)", "packages/b");
+        yes("packages/*(a|b)", "packages/ab");
+        no("packages/*(a|b)", "packages/c");
+        yes("packages/?(a)", "packages/a");
+        no("packages/?(a)", "packages/aa");
+        yes("packages/!(z)", "packages/a");
+        yes("packages/!(z)", "packages/zz");
+        no("packages/!(z)", "packages/z");
+        yes("packages/!(z)-x", "packages/a-x");
+        no("packages/!(z)-x", "packages/z-x");
+        // Globs, classes and nesting inside the alternatives.
+        yes("packages/@(pkg-*|[xy])", "packages/pkg-one");
+        yes("packages/@(pkg-*|[xy])", "packages/y");
+        yes("packages/@(a|@(b|c))d", "packages/cd");
+        yes("packages/pre-@(a|b)-post", "packages/pre-b-post");
+        // An unclosed group is literal; braces expand around a group.
+        yes("packages/@(a", "packages/@(a");
+        yes("{apps,packages}/@(a|b)", "apps/b");
+        // Without extglobs (Bun, vlt, uv, pnpm) the group is literal.
+        assert!(!workspaces_include(
+            &pats(&["packages/@(a|b)"]),
+            &rel("packages/a")
+        ));
+        assert!(!glob_matches("packages/@(a|b)", &rel("packages/a")));
+        assert!(!workspaces_include_as(
+            &pats(&["packages/@(a|b)"]),
+            &rel("packages/a"),
+            WorkspacesDialect::BUN
+        ));
+    }
+
+    /// #1097: yarn classic and Bun before 1.3 ignore `!` patterns, so a
+    /// negated directory the positive patterns match stays a member; npm
+    /// and Bun 1.3+ drop it unless a later pattern lists it again, and
+    /// yarn berry drops it whatever the order. Probed on npm 10.9, yarn
+    /// 1.22.22, yarn 4.10, Bun 1.2.23 and Bun 1.4.2.
+    #[test]
+    fn negation_is_per_dialect() {
+        use WorkspacesDialect as D;
+        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
+        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let negated_last = pats(&["packages/*", "!packages/b"]);
+        let negated_first = pats(&["!packages/b", "packages/*"]);
+        let relisted = pats(&["packages/*", "!packages/b", "packages/b"]);
+        for (dialect, last, first, again) in [
+            (D::NPM, false, true, true),
+            (D::BUN, false, true, true),
+            (D::VLT, false, true, true),
+            (D::YARN_BERRY, false, false, false),
+            (D::YARN_CLASSIC, true, true, true),
+            (D::BUN_PRE_1_3, true, true, true),
+        ] {
+            let b = rel("packages/b");
+            assert_eq!(
+                workspaces_include_as(&negated_last, &b, dialect),
+                last,
+                "{dialect:?}"
+            );
+            assert_eq!(
+                workspaces_include_as(&negated_first, &b, dialect),
+                first,
+                "{dialect:?}"
+            );
+            assert_eq!(
+                workspaces_include_as(&relisted, &b, dialect),
+                again,
+                "{dialect:?}"
+            );
+            assert!(workspaces_include_as(
+                &negated_last,
+                &rel("packages/a"),
+                dialect
+            ));
+        }
+        // A leading `!(` is an extglob to yarn berry (every top-level
+        // directory but `internal`), a negation of `(internal)` to npm,
+        // and lists nothing to yarn classic.
+        let bang_group = pats(&["!(internal)"]);
+        assert!(workspaces_include_as(
+            &bang_group,
+            &rel("tools"),
+            D::YARN_BERRY
+        ));
+        assert!(!workspaces_include_as(
+            &bang_group,
+            &rel("internal"),
+            D::YARN_BERRY
+        ));
+        assert!(!workspaces_include_as(&bang_group, &rel("tools"), D::NPM));
+        assert!(!workspaces_include_as(
+            &bang_group,
+            &rel("tools"),
+            D::YARN_CLASSIC
+        ));
+        // A lone negation lists nothing in any dialect.
+        for dialect in D::ALL {
+            assert!(
+                !workspaces_include_as(&pats(&["!packages/b"]), &rel("packages/b"), dialect),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// An ambiguous extglob decides in polynomial time (a review finding
+    /// on #1480: plain backtracking took ~2^40 steps here).
+    #[test]
+    fn ambiguous_extglobs_stay_fast() {
+        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
+        let long = format!("packages/{}b", "a".repeat(60));
+        for pattern in [
+            "packages/*(a|aa)c",
+            "packages/+(*)x",
+            "packages/!(*(a|aa))b",
+        ] {
+            let started = std::time::Instant::now();
+            assert!(!workspaces_include_as(
+                &[pattern.to_string()],
+                &rel(&long),
+                WorkspacesDialect::NPM
+            ));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{pattern}"
+            );
+        }
+        assert!(workspaces_include_as(
+            &["packages/*(a|aa)b".to_string()],
+            &rel(&long),
+            WorkspacesDialect::NPM
         ));
     }
 
