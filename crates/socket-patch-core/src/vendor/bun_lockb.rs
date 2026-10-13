@@ -88,6 +88,9 @@ pub(crate) struct BunLockb {
     extensions: Vec<Array>,
     total: usize,
     unknown_extension: bool,
+    /// The `cNfGvRsN` extension's value: Bun's `configVersion`, which
+    /// Bun 1.3+ writes (#1492).
+    config_version: Option<u64>,
 }
 
 impl BunLockb {
@@ -152,6 +155,7 @@ impl BunLockb {
         }
         pos += 8;
         let mut extensions = Vec::new();
+        let mut config_version = None;
         // These are the append-only extension tags understood by Bun 1.x.
         // Unknown suffixes are retained verbatim instead of being discarded.
         while pos.checked_add(8).is_some_and(|end| end <= total) {
@@ -165,6 +169,7 @@ impl BunLockb {
                     if pos + 16 > total {
                         return Err("bun.lockb: truncated config extension".into());
                     }
+                    config_version = Some(u64_at(input, pos + 8)?);
                     pos += 16;
                     continue;
                 }
@@ -211,11 +216,18 @@ impl BunLockb {
             extensions,
             total,
             unknown_extension: pos < total,
+            config_version,
         };
         // All strings exposed to inventory/editing must be valid before a
         // caller can stage any changes to the lockfile.
         lock.packages()?;
         Ok(lock)
+    }
+
+    /// Bun's `configVersion` (the binary twin of the text lock's
+    /// top-level key): set only in locks written by Bun 1.3+.
+    pub(crate) fn config_version(&self) -> Option<u64> {
+        self.config_version
     }
 
     pub(crate) fn bytes(&self) -> Vec<u8> {
@@ -2278,6 +2290,18 @@ mod tests {
 
     fn digest() -> String {
         format!("sha512-{}", STANDARD.encode([42; 64]))
+    }
+
+    /// #1492: Bun writes a `cNfGvRsN` config-version extension (the
+    /// twin of the text lock's `configVersion`) since a 1.3 patch
+    /// release; 1.3.0 and earlier writers do not.
+    #[test]
+    fn config_version_is_read_from_tagged_locks_only() {
+        for version in VERSIONS.iter().chain(&["prerelease-pair-1.3.14"]) {
+            let lock = BunLockb::parse(&fixture(version)).unwrap();
+            let tagged = version.ends_with("1.3.14") || *version == "1.4.2";
+            assert_eq!(lock.config_version().is_some(), tagged, "{version}");
+        }
     }
 
     #[test]

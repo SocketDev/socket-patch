@@ -1347,6 +1347,50 @@ mod tests {
         );
     }
 
+    /// #1492: Bun 1.2+ still writes a binary `bun.lockb` under
+    /// `saveTextLockfile = false`, and Bun 1.3+ marks it with a
+    /// `cNfGvRsN` config-version tag (the twin of the text lock's
+    /// `configVersion`). A tagged lone `bun.lockb` honours `!`, so the
+    /// excluded member's own lock is the one Bun reads; an untagged one
+    /// (Bun 1.2.23 here) or one that does not parse keeps the wider
+    /// pre-1.3 reading.
+    #[tokio::test]
+    async fn bun_lockb_with_a_config_version_tag_honours_negated_workspaces() {
+        const BUN_1_3_14: &[u8] = include_bytes!("../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+        const BUN_1_2_23: &[u8] = include_bytes!("../../tests/fixtures/bun-lockb/1.2.23/bun.lockb");
+        let refused = Some(WORKSPACE_LOCKFILE_ELSEWHERE);
+        for (lock, expected) in [
+            (BUN_1_3_14, None),
+            (BUN_1_2_23, refused),
+            (&b"\0"[..], refused),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/*","!packages/b"]}"#,
+            );
+            std::fs::write(tmp.path().join("bun.lockb"), lock).unwrap();
+            write(tmp.path(), "packages/b/package.json", "{}");
+            let member = tmp.path().join("packages/b");
+            assert_eq!(
+                code(&member, "npm").await.as_deref(),
+                expected,
+                "bun.lockb of {} bytes",
+                lock.len()
+            );
+            // The member's own binary lock is a stray only when the
+            // root's Bun lists the member.
+            std::fs::write(member.join("bun.lockb"), lock).unwrap();
+            assert_eq!(
+                member_stray_lock(&member).await.is_some(),
+                expected.is_some(),
+                "bun.lockb of {} bytes",
+                lock.len()
+            );
+        }
+    }
+
     /// #1097: a lockless intermediate root reads its `workspaces` in the
     /// widest dialect, so a member it lists only through an extglob, or
     /// excludes only with `!`, still reaches the outer root's lock.
