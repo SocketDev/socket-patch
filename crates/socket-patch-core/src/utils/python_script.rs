@@ -408,10 +408,10 @@ pub fn root_governs_script(pyproject: Option<&str>, uv_toml: Option<&str>) -> bo
 }
 
 /// Whether uv takes a script's settings from `pyproject`: it has a
-/// `[tool.uv]` table. One that does not parse counts, since uv stops its
-/// lookup there and reports it.
+/// `[tool.uv]` table. One that does not parse does not: uv warns and goes
+/// on to the parent directory.
 fn pyproject_has_uv_settings(pyproject: &str) -> bool {
-    pyproject.parse::<DocumentMut>().map_or(true, |document| {
+    pyproject.parse::<DocumentMut>().is_ok_and(|document| {
         document
             .get("tool")
             .and_then(Item::as_table_like)
@@ -1368,6 +1368,13 @@ mod ancestor_config_tests {
                 text: "offline = true\n".into(),
             })
         );
+        // A pyproject that does not parse is skipped, as uv warns and walks
+        // on to the parent.
+        std::fs::write(temp.path().join("a/b/pyproject.toml"), "[project\n").unwrap();
+        assert_eq!(
+            find_ancestor_uv_config(&root.join("../scripts")).map(|config| config.rel),
+            Some("../../uv.toml".into())
+        );
         // uv stops at a settings file it cannot read (here a directory),
         // so the farther one is never reached.
         std::fs::create_dir(temp.path().join("a/b/uv.toml")).unwrap();
@@ -1403,6 +1410,16 @@ mod ancestor_config_tests {
             error.starts_with("../pyproject.toml [tool.uv] sets no-sources-package naming six"),
             "{error}"
         );
+
+        // A root pyproject that does not parse does not govern either.
+        assert!(refuse_uv_script_no_sources(
+            "six",
+            SCRIPT,
+            Some("[project\n"),
+            None,
+            Some(&parent_uv)
+        )
+        .is_err());
 
         // The root's own settings stop uv's lookup at the root.
         let root_uv = format!("{PYPROJECT}[tool.uv]\noffline = true\n");
