@@ -297,7 +297,6 @@ jobs:
       - name: Lint release readiness
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_REF: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
@@ -310,8 +309,13 @@ jobs:
           fi
           if [ "$EVENT_NAME" = "pull_request" ]; then
             # Compare the workspace version against the PR base to detect a
-            # version bump. The shallow checkout doesn't have the base
-            # commit; fetch just that object.
+            # version bump. Take the base from the first parent of the
+            # checked-out refs/pull/N/merge commit, i.e. the main commit this
+            # merge was built on: github.event.pull_request.base.sha can lag
+            # behind it, so a PR that merged main across a release saw a
+            # phantom bump and failed --tag-check. The shallow checkout
+            # doesn't have the parent; fetch just that object.
+            BASE_SHA="$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -1)"
             git fetch --quiet --depth 1 origin "$BASE_SHA"
             BASE_VERSION="$(git show "$BASE_SHA:Cargo.toml" | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/')"
             HEAD_VERSION="$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
