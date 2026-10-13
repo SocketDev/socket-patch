@@ -57,11 +57,14 @@ pub(super) async fn stale_install_warnings(
     } else {
         socket_patch_core::crawlers::hatch_env::hatch_environments(&common.cwd).await
     };
-    let paths = if common.is_global() {
-        crawler
+    // The base interpreter dirs a `--site-packages` venv inherits: a copy
+    // there survives Pipenv's usual remedies (#1450).
+    let (paths, inherited) = if common.is_global() {
+        let paths = crawler
             .get_site_packages_paths(&common.crawler_options())
             .await
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (paths, Default::default())
     } else {
         let sites =
             socket_patch_core::crawlers::python_crawler::find_local_venv_site_packages(&common.cwd)
@@ -69,7 +72,21 @@ pub(super) async fn stale_install_warnings(
         // A `--system-site-packages` venv's own copy hides its base
         // interpreter's (#409).
         crawler.set_search_order(&sites).await;
-        sites
+        // Only Pipenv's remedy reads this, over the venvs Pipenv itself
+        // resolves (a `.venv` it shares with Hatch included): a base dir
+        // only a Hatch env reaches is not one `pipenv run` fixes.
+        let inherited = if pipenv_uuids.is_empty() {
+            Default::default()
+        } else {
+            let pipenv_sites =
+                socket_patch_core::crawlers::python_crawler::non_hatch_local_venv_site_packages(
+                    &common.cwd,
+                )
+                .await;
+            socket_patch_core::crawlers::python_crawler::inherited_base_site_dirs(&pipenv_sites)
+                .await
+        };
+        (sites, inherited)
     };
 
     #[derive(Default)]
@@ -114,7 +131,7 @@ pub(super) async fn stale_install_warnings(
             }
         }
     }
-    for ((site, _, _), judgment) in judgments {
+    for ((site, _, version), judgment) in judgments {
         if judgment.patched || !judgment.stale {
             continue;
         }
@@ -133,17 +150,47 @@ pub(super) async fn stale_install_warnings(
                     .and_then(|rest| rest.split('@').next())
                     .unwrap_or("<package>")
                     .to_string();
-                let remedy = socket_patch_core::vendor::pypi_pipenv::stale_install_remedy(
-                    pipenv_lock.as_ref(),
-                    &name,
-                );
-                format!(
-                    "Pipenv does not reinstall a release that is already present (`pipenv \
-                     install`, `pipenv install --deploy` and `pipenv sync` all keep those \
-                     bytes), so the rewritten Pipfile.lock only protects fresh installs. \
-                     {remedy}; then `socket-patch vex --product <purl>` re-verifies the \
-                     installed files."
-                )
+                if inherited.contains(&site) {
+                    let remedy =
+                        socket_patch_core::vendor::pypi_pipenv::base_site_stale_install_remedy(
+                            pipenv_lock.as_ref(),
+                            &name,
+                            &site.display().to_string(),
+                        );
+                    format!(
+                        "{remedy}; then `socket-patch vex --product <purl>` re-verifies the \
+                         installed files."
+                    )
+                } else if let Some(base) =
+                    socket_patch_core::crawlers::python_crawler::inherited_same_release(
+                        &site, &name, &version,
+                    )
+                    .await
+                {
+                    let remedy =
+                        socket_patch_core::vendor::pypi_pipenv::shadowing_stale_install_remedy(
+                            pipenv_lock.as_ref(),
+                            &name,
+                            &site.display().to_string(),
+                            &base.display().to_string(),
+                        );
+                    format!(
+                        "{remedy}; then `socket-patch vex --product <purl>` re-verifies the \
+                         installed files."
+                    )
+                } else {
+                    let remedy = socket_patch_core::vendor::pypi_pipenv::stale_install_remedy(
+                        pipenv_lock.as_ref(),
+                        &name,
+                    );
+                    format!(
+                        "Pipenv does not reinstall a release that is already present (`pipenv \
+                         install`, `pipenv install --deploy` and `pipenv sync` all keep those \
+                         bytes), so the rewritten Pipfile.lock only protects fresh installs. \
+                         {remedy}; then `socket-patch vex --product <purl>` re-verifies the \
+                         installed files."
+                    )
+                }
             } else {
                 "Reinstall from the rewritten lock in this interpreter and verify with \
                  `socket-patch vex`. Poetry before 1.4 may keep same-version packages: \
@@ -368,6 +415,136 @@ mod tests {
         assert!(
             docs.contains("`pipenv --rm && pipenv sync --categories \"packages docs\"`"),
             "{docs}"
+        );
+    }
+
+    /// #1450: a `--site-packages` venv imports the upstream release from its
+    /// base interpreter. pip refuses to uninstall that copy from the venv
+    /// and `pipenv sync` (also in a recreated venv) counts it as installed,
+    /// so the warning names an install over it inside the venv instead, and
+    /// does not claim the lock protects fresh installs.
+    #[tokio::test]
+    async fn pipenv_base_site_copy_gets_an_install_over_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        let venv = project.join(".venv");
+        let base = tmp.path().join("base");
+        let (home, venv_site, base_site) = if cfg!(windows) {
+            std::fs::create_dir_all(base.join("Lib")).unwrap();
+            std::fs::write(base.join("Lib").join("os.py"), "").unwrap();
+            (
+                base.clone(),
+                venv.join("Lib").join("site-packages"),
+                base.join("Lib").join("site-packages"),
+            )
+        } else {
+            let lib = base.join("lib").join("python3.12");
+            std::fs::create_dir_all(&lib).unwrap();
+            std::fs::write(lib.join("os.py"), "").unwrap();
+            std::fs::create_dir_all(base.join("bin")).unwrap();
+            (
+                base.join("bin"),
+                venv.join("lib").join("python3.12").join("site-packages"),
+                lib.join("site-packages"),
+            )
+        };
+        std::fs::create_dir_all(&venv_site).unwrap();
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            format!(
+                "home = {}\ninclude-system-site-packages = true\nversion = 3.12.4\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        let dist = base_site.join("six-1.16.0.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
+        std::fs::write(base_site.join("six.py"), b"upstream").unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: project.clone(),
+            ..Default::default()
+        };
+        let purl = "pkg:pypi/six@1.16.0";
+        let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
+        let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
+        let pipenv = BTreeSet::from(["six-uuid".to_string()]);
+        let lock = r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {}}}"#;
+        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
+        assert_eq!(out.warnings.len(), 1);
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains(&base_site.display().to_string()),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(
+                "`pipenv requirements --dev > pipenv-locked.txt && pipenv run pip install \
+                 --no-deps --ignore-installed -r pipenv-locked.txt`"
+            ),
+            "{detail}"
+        );
+        for broken in [
+            "pip uninstall",
+            "pipenv --rm",
+            "only protects fresh installs",
+        ] {
+            assert!(!detail.contains(broken), "{broken}: {detail}");
+        }
+
+        // The venv's own stale copy hides the same release in the base dir:
+        // uninstalling it would only expose the base copy to `pipenv sync`,
+        // so it gets the install-over remedy too.
+        let dist = venv_site.join("six-1.16.0.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
+        std::fs::write(venv_site.join("six.py"), b"upstream").unwrap();
+        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        assert_eq!(out.warnings.len(), 1);
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains(&format!(
+                "hides the same release in {}",
+                base_site.display()
+            )),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("pipenv run pip install --no-deps --ignore-installed"),
+            "{detail}"
+        );
+        assert!(!detail.contains("pip uninstall -y six"), "{detail}");
+
+        // A different release in the base dir is not one `pipenv sync`
+        // counts as installed: the usual remedy replaces the venv's copy.
+        let base_dist = base_site.join("six-1.16.0.dist-info");
+        std::fs::write(base_dist.join("METADATA"), "Name: six\nVersion: 1.15.0\n").unwrap();
+        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        assert_eq!(out.warnings.len(), 1);
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("`pipenv run pip uninstall -y six && pipenv sync --dev`"),
+            "{detail}"
+        );
+        std::fs::write(base_dist.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
+
+        // A `.venv` Pipenv shares with Hatch (`path = ".venv"`) is still
+        // Pipenv's: its inherited base copy keeps the install-over remedy.
+        std::fs::remove_file(venv_site.join("six.py")).unwrap();
+        std::fs::remove_dir_all(venv_site.join("six-1.16.0.dist-info")).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n[tool.hatch.envs.default]\npath = \".venv\"\n",
+        )
+        .unwrap();
+        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        assert_eq!(out.warnings.len(), 1);
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("pipenv run pip install --no-deps --ignore-installed"),
+            "{detail}"
         );
     }
 }

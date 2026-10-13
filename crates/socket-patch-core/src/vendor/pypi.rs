@@ -765,21 +765,65 @@ async fn pipenv_stale_install_warning(
     if stale_dirs.is_empty() {
         return None;
     }
-    let name = parse_pypi_purl(strip_purl_qualifiers(purl))
-        .map(|(name, _)| name.to_string())
-        .unwrap_or_else(|| purl.to_string());
-    let listed = stale_dirs
+    let (name, version) = parse_pypi_purl(strip_purl_qualifiers(purl))
+        .map(|(name, version)| (name.to_string(), version.to_string()))
+        .unwrap_or_else(|| (purl.to_string(), String::new()));
+    let join = |dirs: &[&std::path::PathBuf]| {
+        dirs.iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let listed = join(&stale_dirs.iter().collect::<Vec<_>>());
+    // A base interpreter's copy a `--site-packages` venv inherits survives
+    // both the uninstall-and-sync and the recreate-and-sync remedies (#1450).
+    let inherited = crate::crawlers::python_crawler::inherited_base_site_dirs(&sites).await;
+    let (base, own): (Vec<_>, Vec<_>) = stale_dirs.iter().partition(|d| inherited.contains(*d));
+    // A venv copy that hides the same release in its base interpreter: the
+    // uninstall-and-sync remedy would only expose that base copy.
+    let mut shadowing = Vec::new();
+    let mut plain = Vec::new();
+    for dir in own {
+        match crate::crawlers::python_crawler::inherited_same_release(dir, &name, &version).await {
+            Some(base_dir) => shadowing.push((dir, base_dir)),
+            None => plain.push(dir),
+        }
+    }
+    let own = plain;
+    let mut detail =
+        format!("{purl}: the UNPATCHED upstream release is still installed in {listed}.");
+    let several = [!own.is_empty(), !shadowing.is_empty(), !base.is_empty()]
         .iter()
-        .map(|d| d.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let remedy = super::pypi_pipenv::stale_install_remedy(Some(lock), &name);
-    Some(VendorWarning::new(
-        "pypi_pipenv_stale_install",
-        format!(
-            "{purl}: the UNPATCHED upstream release is still installed in {listed}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}; then `socket-patch vex` re-verifies the installed files."
-        ),
-    ))
+        .filter(|kind| **kind)
+        .count()
+        > 1;
+    if !own.is_empty() {
+        let remedy = super::pypi_pipenv::stale_install_remedy(Some(lock), &name);
+        let lead = if !several {
+            String::new()
+        } else {
+            format!("For {}: ", join(&own))
+        };
+        detail.push_str(&format!(
+            " {lead}Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}."
+        ));
+    }
+    for (dir, base_dir) in &shadowing {
+        let remedy = super::pypi_pipenv::shadowing_stale_install_remedy(
+            Some(lock),
+            &name,
+            &dir.display().to_string(),
+            &base_dir.display().to_string(),
+        );
+        detail.push_str(&format!(" {remedy}."));
+    }
+    if !base.is_empty() {
+        let remedy =
+            super::pypi_pipenv::base_site_stale_install_remedy(Some(lock), &name, &join(&base));
+        detail.push_str(&format!(" {remedy}."));
+    }
+    detail.push_str(" Then `socket-patch vex` re-verifies the installed files.");
+    Some(VendorWarning::new("pypi_pipenv_stale_install", detail))
 }
 
 /// The Hatch twin of [`pipenv_stale_install_warning`]: Hatch keeps the
@@ -4187,6 +4231,186 @@ mod tests {
                 .contains("`pipenv --rm && pipenv sync --dev` for a clean virtualenv"),
             "{}",
             warning.detail
+        );
+    }
+
+    /// #1450: when the stale upstream copy is the one a `--site-packages`
+    /// venv inherits from its base interpreter, neither uninstall-and-sync
+    /// nor recreate-and-sync can replace it, so the warning names an
+    /// install over it inside the venv instead.
+    #[tokio::test]
+    async fn pipenv_stale_install_in_a_base_site_dir_installs_over_it() {
+        let fx = e2e_fixture().await;
+        let venv = fx.root.join(".venv");
+        let base = fx.root.join("base");
+        let (home, venv_site, base_site) = if cfg!(windows) {
+            tokio::fs::create_dir_all(base.join("Lib")).await.unwrap();
+            touch(&base.join("Lib"), "os.py", "").await;
+            (
+                base.clone(),
+                venv.join("Lib").join("site-packages"),
+                base.join("Lib").join("site-packages"),
+            )
+        } else {
+            tokio::fs::create_dir_all(base.join("lib").join("python3.12"))
+                .await
+                .unwrap();
+            touch(&base.join("lib").join("python3.12"), "os.py", "").await;
+            tokio::fs::create_dir_all(base.join("bin")).await.unwrap();
+            (
+                base.join("bin"),
+                fx.site_packages.clone(),
+                base.join("lib").join("python3.12").join("site-packages"),
+            )
+        };
+        // The venv holds no six of its own; the base interpreter's upstream
+        // copy is the one it imports.
+        let _ = tokio::fs::remove_dir_all(&fx.site_packages).await;
+        tokio::fs::create_dir_all(&venv_site).await.unwrap();
+        let di = base_site.join("six-1.16.0.dist-info");
+        tokio::fs::create_dir_all(&di).await.unwrap();
+        tokio::fs::write(base_site.join("six.py"), ORIG)
+            .await
+            .unwrap();
+        touch(
+            &di,
+            "METADATA",
+            "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+        )
+        .await;
+        touch(
+            &venv,
+            "pyvenv.cfg",
+            &format!(
+                "home = {}\ninclude-system-site-packages = true\nversion = 3.12.4\n",
+                home.display()
+            ),
+        )
+        .await;
+        let lock: serde_json::Value = serde_json::from_str(
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {"six": {"version": "==1.16.0"}}, "develop": {}}"#,
+        )
+        .unwrap();
+        let warning = pipenv_stale_install_warning(
+            &fx.root,
+            "pkg:pypi/six@1.16.0",
+            &fx.record,
+            &InstalledSiteListings::default(),
+            &lock,
+        )
+        .await
+        .expect("the inherited upstream six.py is reported");
+        assert_eq!(warning.code, "pypi_pipenv_stale_install");
+        assert!(
+            warning.detail.contains(&base_site.display().to_string()),
+            "{}",
+            warning.detail
+        );
+        assert!(
+            warning
+                .detail
+                .contains("pipenv run pip install --no-deps --ignore-installed"),
+            "{}",
+            warning.detail
+        );
+        for broken in [
+            "pip uninstall",
+            "pipenv --rm",
+            "only protects fresh installs",
+        ] {
+            assert!(
+                !warning.detail.contains(broken),
+                "{broken}: {}",
+                warning.detail
+            );
+        }
+
+        // A second venv with its own stale copy keeps the usual remedy for
+        // that copy, beside the base-copy one.
+        let other = if cfg!(windows) {
+            fx.root.join("venv").join("Lib").join("site-packages")
+        } else {
+            fx.root
+                .join("venv")
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages")
+        };
+        let di = other.join("six-1.16.0.dist-info");
+        tokio::fs::create_dir_all(&di).await.unwrap();
+        tokio::fs::write(other.join("six.py"), ORIG).await.unwrap();
+        touch(
+            &di,
+            "METADATA",
+            "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+        )
+        .await;
+        // Without system site-packages, so the host's own base dirs stay out.
+        touch(
+            &fx.root.join("venv"),
+            "pyvenv.cfg",
+            "home = /usr/bin\ninclude-system-site-packages = false\n",
+        )
+        .await;
+        let warning = pipenv_stale_install_warning(
+            &fx.root,
+            "pkg:pypi/six@1.16.0",
+            &fx.record,
+            &InstalledSiteListings::default(),
+            &lock,
+        )
+        .await
+        .expect("both stale copies are reported");
+        let detail = &warning.detail;
+        assert!(
+            detail.contains(&format!("For {}: ", other.display())),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`pipenv run pip uninstall -y six && pipenv sync`"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("pipenv run pip install --no-deps --ignore-installed"),
+            "{detail}"
+        );
+
+        // The inheriting venv's own stale copy of the same release hides the
+        // base one: uninstalling it would only expose the base copy to
+        // `pipenv sync`, so that copy gets the install-over remedy too.
+        let di = venv_site.join("six-1.16.0.dist-info");
+        tokio::fs::create_dir_all(&di).await.unwrap();
+        tokio::fs::write(venv_site.join("six.py"), ORIG)
+            .await
+            .unwrap();
+        touch(
+            &di,
+            "METADATA",
+            "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+        )
+        .await;
+        let warning = pipenv_stale_install_warning(
+            &fx.root,
+            "pkg:pypi/six@1.16.0",
+            &fx.record,
+            &InstalledSiteListings::default(),
+            &lock,
+        )
+        .await
+        .expect("both venv copies are reported");
+        let detail = &warning.detail;
+        assert!(
+            detail.contains(&format!(
+                "The upstream six in {} hides the same release in {}",
+                venv_site.display(),
+                base_site.display()
+            )),
+            "{detail}"
+        );
+        // The non-inheriting venv keeps the usual remedy.
+        assert!(
+            detail.contains(&format!("For {}: ", other.display())),
+            "{detail}"
         );
     }
 
