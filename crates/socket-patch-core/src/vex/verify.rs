@@ -1946,6 +1946,66 @@ mod tests {
         dir
     }
 
+    /// #1462: node's lookup from an installed copy finds a bundled,
+    /// hoisted or pnpm-sibling dependency; an optional one may be absent,
+    /// and a copy outside `node_modules` or an unsafe name is no evidence.
+    #[tokio::test]
+    async fn unresolved_npm_dependency_follows_node_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let manifest = r#"{"name":"lp","dependencies":{"a":"1","@s/b":"1","opt":"1",
+            "../../escape":"1"},"optionalDependencies":{"opt":"1"}}"#;
+
+        // Hoisted layout: `a` and `@s/b` at the root; `@s/b` missing first.
+        put("node_modules/lp/package.json", manifest);
+        put("node_modules/a/package.json", "{}");
+        let hoisted = root.join("node_modules/lp");
+        assert_eq!(
+            unresolved_npm_dependency(&hoisted).await.as_deref(),
+            Some("@s/b")
+        );
+        // Bundled inside the package itself.
+        put("node_modules/lp/node_modules/@s/b/package.json", "{}");
+        assert_eq!(unresolved_npm_dependency(&hoisted).await, None);
+
+        // pnpm's isolated store: dependencies are siblings of the package.
+        let store = "node_modules/.pnpm/lp@1.0.0/node_modules";
+        put(&format!("{store}/lp/package.json"), manifest);
+        put(&format!("{store}/a/package.json"), "{}");
+        let isolated = root.join(store).join("lp");
+        assert_eq!(
+            unresolved_npm_dependency(&isolated).await.as_deref(),
+            Some("@s/b")
+        );
+        put(&format!("{store}/@s/b/package.json"), "{}");
+        assert_eq!(unresolved_npm_dependency(&isolated).await, None);
+
+        // Not in a node_modules tree: never evidence.
+        put("unplugged/lp/package.json", manifest);
+        assert_eq!(
+            unresolved_npm_dependency(&root.join("unplugged/lp")).await,
+            None
+        );
+
+        for (name, plain) in [
+            ("a", true),
+            ("@s/b", true),
+            ("@/b", false),
+            ("s/b", false),
+            ("../x", false),
+            ("@s/..", false),
+            ("a\\b", false),
+            ("", false),
+        ] {
+            assert_eq!(plain_npm_name(name), plain, "{name}");
+        }
+    }
+
     fn hosted_ctx(purl: &str, copies: HostedCopies) -> VendorContext {
         VendorContext {
             hosted: [(purl.to_string(), copies)].into_iter().collect(),
