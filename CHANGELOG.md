@@ -64,6 +64,32 @@ a version without a non-empty section in this file.
 - `vendor --check` explains a missing or changed vendored artifact in plain
   words, naming the file and the `repair` step, in human output and the
   `--json` event `reason` (#1467).
+- A hosted pin beside a `file:` copy of the same release (tarball or
+  directory) no longer passes silently. The registry entry is still pinned,
+  but the in-run `--vex` no longer attests the package `not_affected`, since
+  npm and pnpm keep installing the `file:` copy unpatched. npm now also
+  warns about the directory shape (#1481), and pnpm warns
+  `redirect_copy_unpatched` naming the lock and entry (#935; vendored pnpm
+  still writes its override silently beside such a copy).
+- Path-scoped `scan --mode agent <member>` and `rollback <member>` reach an
+  npm alias dependency (`"lp": "npm:left-pad@1.3.0"`) that pnpm's isolated
+  linker or npm's `install-strategy=linked` links into the member, instead
+  of reporting `success` with the copy unpatched (#1266).
+- A hosted `scan` / `get` from a workspace member reads the root's
+  `workspaces` globs the way the lock's package manager does (yarn classic
+  ignores `!` negation, yarn Berry supports extglobs), so it refuses with
+  `redirect_workspace_lockfile_elsewhere` instead of reporting success with
+  nothing pinned (#1097).
+- Bundler: a Gemfile `lockfile "custom.lock"` call is honored, so hosted
+  `scan` pins the lock bundler actually reads instead of a leftover
+  `Gemfile.lock` (#1477). Hosted `rollback` / `remove` keep the
+  `DEPENDENCIES` `!` for a gem in the user's own `source … do` block after
+  an assignment-form `if` / `case` / `begin` construct, so frozen installs
+  on Bundler 4.0.19+ keep passing (#1476).
+- Hosted scans of Hatch, Poetry and PDM projects with many patched
+  dependencies are much faster: the Hatch files and the `poetry.lock` /
+  `pdm.lock` are rewritten in one pass instead of once per package
+  (#1471, #1473).
 
 ### Maintenance
 
