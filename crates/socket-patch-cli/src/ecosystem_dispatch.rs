@@ -4,12 +4,12 @@ use socket_patch_core::crawlers::{
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::PurlKey;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::args::GlobalArgs;
 
 use socket_patch_core::crawlers::npm_crawler::{
-    retain_live_store_copies, with_store_peer_variant_copies,
+    build_npm_purl, parse_package_name, retain_live_store_copies, with_store_peer_variant_copies,
 };
 use socket_patch_core::crawlers::walk_pool;
 use socket_patch_core::crawlers::CargoCrawler;
@@ -634,9 +634,7 @@ pub async fn find_all_packages_for_rollback(
 }
 
 /// [`find_all_packages_for_rollback`], taking the npm `node_modules` roots
-/// from `prior` as [`find_packages_for_rollback_reusing`] does. Used by
-/// `scan`'s path scoping, which must see the same copies `rollback`'s path
-/// targets do.
+/// from `prior` as [`find_packages_for_rollback_reusing`] does.
 pub async fn find_all_packages_for_rollback_reusing(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
@@ -647,6 +645,131 @@ pub async fn find_all_packages_for_rollback_reusing(
         .filter(|p| p.taken_with(options))
         .map(|p| p.roots.as_slice());
     dispatch_find(partitioned, options, silent, merge_qualified, npm_roots).await
+}
+
+/// The install paths that reach each purl, for `scan`'s and `rollback`'s
+/// path targets: [`find_all_packages_for_rollback_reusing`]'s physical
+/// copies, plus each npm package link directly in a `node_modules` root
+/// (scoped ones one level down) whose target's `package.json` names one
+/// of the npm purls asked for.
+///
+/// The crawler records a plain-name link at its own path
+/// (`packages/a/node_modules/ms`), but never an alias link
+/// (`packages/a/node_modules/lp -> …/.pnpm/left-pad@1.3.0/node_modules/left-pad`):
+/// links are not physical copies, and apply and VEX must see each copy
+/// once (#856). Path scoping asks which paths install the package
+/// instead, and pnpm's isolated linker or npm's `install-strategy=linked`
+/// reach a workspace member's ALIAS dependency only through such a link
+/// (#1266). A link is matched by its target's own identity, not against
+/// the crawled copies, so a link to a store peer variant the crawl
+/// skipped still counts, and the cost is one pass over the root links
+/// however many purls are asked for. The result is for path matching
+/// only: it can name one physical copy more than once.
+pub async fn find_package_paths_for_path_scope(
+    partitioned: &HashMap<Ecosystem, Vec<String>>,
+    options: &CrawlerOptions,
+    silent: bool,
+    prior: Option<&NpmCrawlSnapshot>,
+) -> HashMap<String, Vec<PathBuf>> {
+    let mut wanted: HashMap<PurlKey, Vec<String>> = HashMap::new();
+    for purl in partitioned.get(&Ecosystem::Npm).into_iter().flatten() {
+        wanted
+            .entry(PurlKey::new(purl))
+            .or_default()
+            .push(purl.clone());
+    }
+    let npm_roots = match prior.and_then(|p| p.roots_for(options)) {
+        _ if wanted.is_empty() => None,
+        Some(roots) => Some(roots.to_vec()),
+        None => NpmCrawler.get_node_modules_paths(options).await.ok(),
+    };
+    let mut found = dispatch_find(
+        partitioned,
+        options,
+        silent,
+        merge_qualified,
+        npm_roots.as_deref(),
+    )
+    .await;
+    let Some(roots) = npm_roots else {
+        return found;
+    };
+    // A failed enumeration only loses the extra links; the copies stand.
+    let links = tokio::task::spawn_blocking(move || npm_links_to(&wanted, &roots))
+        .await
+        .unwrap_or_default();
+    for (purl, link) in links {
+        let paths = found.entry(purl).or_default();
+        if !paths.contains(&link) {
+            paths.push(link);
+        }
+    }
+    found
+}
+
+/// Every package link directly in one of `roots` (scoped ones one level
+/// down) whose target directory's `package.json` `name@version` is a key
+/// of `wanted`, paired with each purl spelling that key stands for.
+fn npm_links_to(
+    wanted: &HashMap<PurlKey, Vec<String>>,
+    roots: &[PathBuf],
+) -> Vec<(String, PathBuf)> {
+    let entries = |dir: &Path| -> Vec<(String, PathBuf, std::fs::FileType)> {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        read.filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let file_type = e.file_type().ok()?;
+                (!name.starts_with('.')).then(|| (name, e.path(), file_type))
+            })
+            .collect()
+    };
+    let identity = |link: &Path| -> Option<PurlKey> {
+        let target = std::fs::canonicalize(link).ok()?;
+        let text =
+            socket_patch_core::utils::fs::read_regular_to_string_sync(&target.join("package.json"))
+                .ok()?;
+        let pkg: serde_json::Value =
+            serde_json::from_str(socket_patch_core::formats::text::strip_bom(&text)).ok()?;
+        let name = pkg.get("name")?.as_str()?;
+        let version = pkg.get("version")?.as_str()?;
+        if name.is_empty() || version.is_empty() {
+            return None;
+        }
+        let (namespace, leaf) = parse_package_name(name);
+        Some(PurlKey::new(&build_npm_purl(
+            namespace.as_deref(),
+            &leaf,
+            version,
+        )))
+    };
+    let mut out = Vec::new();
+    for root in roots {
+        let mut links = Vec::new();
+        for (name, path, file_type) in entries(root) {
+            if name.starts_with('@') && file_type.is_dir() {
+                links.extend(
+                    entries(&path)
+                        .into_iter()
+                        .filter(|(_, _, ft)| ft.is_symlink())
+                        .map(|(_, p, _)| p),
+                );
+            } else if file_type.is_symlink() {
+                links.push(path);
+            }
+        }
+        for link in links {
+            let Some(key) = identity(&link) else {
+                continue;
+            };
+            for purl in wanted.get(&key).into_iter().flatten() {
+                out.push((purl.clone(), link.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// Qualified-aware PURL resolution for rollback, vendor, repair and
