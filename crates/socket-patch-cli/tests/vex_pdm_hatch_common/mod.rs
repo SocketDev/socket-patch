@@ -176,11 +176,12 @@ pub fn cells(flavors: &[Flavor]) -> Vec<(Flavor, Mode)> {
 // ── process + fs helpers ──────────────────────────────────────────────
 
 /// The CLI with the hermetic `SOCKET_*` environment (`hermetic::command`:
-/// telemetry, socket-cli config and the update notifier off) and no
-/// `VIRTUAL_ENV` (a python-crawler input).
+/// telemetry, socket-cli config and the update notifier off), no
+/// `VIRTUAL_ENV` and no `PDM_*` / `UV_PROJECT_ENVIRONMENT` (python-crawler
+/// inputs that move the venv it reads).
 pub fn cli() -> Command {
     let mut cmd = hermetic::command(&binary());
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pdm]);
     cmd
 }
 
