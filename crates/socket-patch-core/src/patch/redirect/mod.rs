@@ -1114,7 +1114,12 @@ fn rewrite_hatch(
                 for edit in edits {
                     result.edits.push(FileEdit {
                         path: edit.file,
-                        kind: "redirect_hatch_requirement".into(),
+                        kind: if edit.permission {
+                            "redirect_hatch_permission"
+                        } else {
+                            "redirect_hatch_requirement"
+                        }
+                        .into(),
                         action: "rewritten".into(),
                         key: Some(format!("{}@{}", dep.name, dep.version)),
                         original: Some(Value::String(edit.original)),

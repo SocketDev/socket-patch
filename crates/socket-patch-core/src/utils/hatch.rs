@@ -257,6 +257,11 @@ pub struct HatchEdit {
     pub file: String,
     pub original: String,
     pub new: String,
+    /// The direct-reference permission a project-table reference needs
+    /// (`allow-direct-references = true`, see [`permission_keys`]) rather
+    /// than a requirement; `original` is the setting it replaced, empty
+    /// when there was none.
+    pub permission: bool,
 }
 
 /// What [`rewrite_all`] made of a batch: the Hatch files it changed (path →
@@ -345,6 +350,7 @@ fn rewrite_array(
                         file: file.to_owned(),
                         original: text.to_owned(),
                         new: rewritten.clone(),
+                        permission: false,
                     });
                     let decoration = entry.decor().clone();
                     *entry = Value::from(rewritten);
@@ -550,12 +556,39 @@ fn run_round(documents: &mut BTreeMap<&'static str, DocumentMut>, round: &mut Ro
         round.fail_rest(&error);
         return;
     }
-    if round.targets.iter().any(needs_permission) {
-        if let Some(document) = documents.get_mut(permission_file) {
-            // Judged grantable above.
-            let _ = enable_permission(document, external);
-        }
+    let Some(index) = round.targets.iter().position(needs_permission) else {
+        return;
+    };
+    let Some(document) = documents.get_mut(permission_file) else {
+        return;
+    };
+    let previous = permission_setting(document, external);
+    if previous.as_ref().and_then(Item::as_bool) == Some(true) {
+        return;
     }
+    // Judged grantable on the copy above, and no requirement rewrite
+    // touches these tables.
+    if enable_permission(document, external).is_ok() {
+        // Recorded on the first dep that needs it, the one a sequential
+        // run would have granted it for.
+        round.targets[index].edits.push(HatchEdit {
+            file: permission_file.to_owned(),
+            original: previous
+                .map(|item| format!("allow-direct-references = {}", item.to_string().trim()))
+                .unwrap_or_default(),
+            new: "allow-direct-references = true".into(),
+            permission: true,
+        });
+    }
+}
+
+/// The `allow-direct-references` item at [`permission_keys`]' table, if set.
+fn permission_setting(document: &DocumentMut, external: bool) -> Option<Item> {
+    let mut item = document.as_item();
+    for key in permission_keys(external) {
+        item = item.get(key)?;
+    }
+    item.get("allow-direct-references").cloned()
 }
 
 fn permission_file(external: bool) -> &'static str {
@@ -1336,8 +1369,29 @@ mod tests {
         // stays as written.
         assert!(batch.steps[1].is_err());
         assert!(batch.files["pyproject.toml"].contains("\"attrs==23.1.0\""));
-        // pyproject's shadowed environment is not rewritten.
-        assert!(batch.files["pyproject.toml"].contains("dependencies = [\"click==8.1.7\"]"));
+        // Pinned output, independent of the shared walk: pyproject's
+        // shadowed environment is not rewritten, the project reference gets
+        // its permission, and hatch.toml keeps its majority line ending.
+        assert_eq!(
+            batch.files["pyproject.toml"],
+            "[project]\nname = \"app\"\ndependencies = [\"six @ https://patch.test/six.whl\", \"attrs==23.1.0\"]\n[tool.hatch.envs.default]\ndependencies = [\"click==8.1.7\"]\n\n[tool.hatch.metadata]\nallow-direct-references = true\n"
+        );
+        assert_eq!(
+            batch.files["hatch.toml"],
+            "[envs.default]\ndependencies = [\"click @ https://patch.test/click.whl\", \"attrs>=23\"]\n\n[envs.docs]\nextra-dependencies = [\"six @ https://patch.test/six.whl\"]\n"
+        );
+        let six = batch.steps[0].as_ref().unwrap();
+        assert_eq!(
+            six.iter()
+                .map(|edit| (edit.file.as_str(), edit.original.as_str(), edit.permission))
+                .collect::<Vec<_>>(),
+            [
+                ("pyproject.toml", "six==1.16.0", false),
+                ("hatch.toml", "six==1.16.0", false),
+                ("pyproject.toml", "", true),
+            ]
+        );
+        assert_eq!(batch.steps[2].as_ref().unwrap().len(), 1);
 
         let structural = files(concat!(
             "[project]\nname = \"app\"\n",
@@ -1378,6 +1432,46 @@ mod tests {
             .steps
             .iter()
             .all(|step| step.as_ref().unwrap_err().starts_with("hatch.toml:")));
+    }
+
+    /// #1471: a re-run whose only change is restoring the direct-reference
+    /// permission the user removed still rewrites the file and records the
+    /// permission edit, and an already-granted permission records nothing.
+    #[test]
+    fn batch_rewrite_records_a_permission_only_change() {
+        let wired = files(
+            "[project]\nname = \"app\"\ndependencies = [\"six @ https://patch.test/six.whl\"]\n",
+        );
+        let deps = [HatchDep {
+            name: "six",
+            version: "1.16.0",
+            url: "https://patch.test/six.whl",
+        }];
+        assert_batch_matches_sequential(&wired, &deps);
+        let batch = rewrite_all(&wired, &deps);
+        assert!(batch.files["pyproject.toml"]
+            .ends_with("[tool.hatch.metadata]\nallow-direct-references = true\n"));
+        assert_eq!(
+            batch.steps[0].as_ref().unwrap(),
+            &[HatchEdit {
+                file: "pyproject.toml".into(),
+                original: String::new(),
+                new: "allow-direct-references = true".into(),
+                permission: true,
+            }]
+        );
+        let mut granted = wired.clone();
+        granted.extend(batch.files);
+        let again = rewrite_all(&granted, &deps);
+        assert!(again.files.is_empty());
+        assert_eq!(again.steps, [Ok(Vec::new())]);
+        // A `false` the user set is replaced, and recorded as such.
+        let denied = files("[project]\nname = \"app\"\ndependencies = [\"six==1.16.0\"]\n[tool.hatch.metadata]\nallow-direct-references = false\n");
+        assert_batch_matches_sequential(&denied, &deps);
+        let batch = rewrite_all(&denied, &deps);
+        let edits = batch.steps[0].as_ref().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[1].original, "allow-direct-references = false");
     }
 
     /// #1471: vendored `{root:uri}` deps keep their pip-installer and
