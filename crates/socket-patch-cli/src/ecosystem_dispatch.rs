@@ -619,8 +619,9 @@ pub async fn find_all_packages_for_purls(
     // `merge_qualified`'s `push_path`. Cargo keeps every registry index
     // copy (`merge_cargo_copies`); the single-copy ecosystems keep true
     // first-wins via their own `merge_first_wins` wiring in
-    // `dispatch_find`.
-    dispatch_find(partitioned, options, silent, merge_variant_copies, None).await
+    // `dispatch_find`. A workspace member's npm alias link is a copy too
+    // (#1494); apply collapses it onto the store copy it names.
+    dispatch_find_with_npm_links(partitioned, options, silent, merge_variant_copies, None).await
 }
 
 /// Multi-copy variant of `find_packages_for_rollback` (qualified-aware
@@ -634,41 +635,53 @@ pub async fn find_all_packages_for_rollback(
 }
 
 /// [`find_all_packages_for_rollback`], taking the npm `node_modules` roots
-/// from `prior` as [`find_packages_for_rollback_reusing`] does.
+/// from `prior` as [`find_packages_for_rollback_reusing`] does. A workspace
+/// member's npm alias link is a copy too (#1494), as for apply.
 pub async fn find_all_packages_for_rollback_reusing(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
     prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, Vec<PathBuf>> {
-    let npm_roots = prior
-        .filter(|p| p.taken_with(options))
-        .map(|p| p.roots.as_slice());
-    dispatch_find(partitioned, options, silent, merge_qualified, npm_roots).await
+    dispatch_find_with_npm_links(partitioned, options, silent, merge_qualified, prior).await
 }
 
 /// The install paths that reach each purl, for `scan`'s and `rollback`'s
-/// path targets: [`find_all_packages_for_rollback_reusing`]'s physical
-/// copies, plus each npm package link directly in a `node_modules` root
-/// (scoped ones one level down) whose target's `package.json` names one
-/// of the npm purls asked for.
-///
-/// The crawler records a plain-name link at its own path
-/// (`packages/a/node_modules/ms`), but never an alias link
-/// (`packages/a/node_modules/lp -> …/.pnpm/left-pad@1.3.0/node_modules/left-pad`):
-/// links are not physical copies, and apply and VEX must see each copy
-/// once (#856). Path scoping asks which paths install the package
-/// instead, and pnpm's isolated linker or npm's `install-strategy=linked`
-/// reach a workspace member's ALIAS dependency only through such a link
-/// (#1266). A link is matched by its target's own identity, not against
-/// the crawled copies, so a link to a store peer variant the crawl
-/// skipped still counts, and the cost is one pass over the root links
-/// however many purls are asked for. The result is for path matching
-/// only: it can name one physical copy more than once.
+/// path targets: [`find_all_packages_for_rollback_reusing`]'s copies, link
+/// spellings included. The result is for path matching only: it can name
+/// one physical copy more than once.
 pub async fn find_package_paths_for_path_scope(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
+    prior: Option<&NpmCrawlSnapshot>,
+) -> HashMap<String, Vec<PathBuf>> {
+    dispatch_find_with_npm_links(partitioned, options, silent, merge_qualified, prior).await
+}
+
+/// [`dispatch_find`]'s copies, plus each npm package link directly in a
+/// `node_modules` root (scoped ones one level down) whose target's
+/// `package.json` names one of the npm purls asked for, after the copies.
+///
+/// The crawler records a plain-name link at its own path
+/// (`packages/a/node_modules/ms`), but never an alias link
+/// (`packages/a/node_modules/lp -> …/.pnpm/left-pad@1.3.0/node_modules/left-pad`):
+/// links are not physical copies, and the resolver must see each copy
+/// once (#856). Yet pnpm's isolated linker, vlt and npm's
+/// `install-strategy=linked` reach a workspace member's ALIAS dependency
+/// only through such a link. Path scoping needs it to select the member
+/// (#1266), and a run from inside the member, whose `node_modules` is the
+/// only root, has no other route to the copy at all (#1494). A link is
+/// matched by its target's own identity, not against the crawled copies,
+/// so a link to a store peer variant the crawl skipped still counts, and
+/// the cost is one pass over the root links however many purls are asked
+/// for. A link can name a copy the resolver also found: apply and
+/// rollback act on each physical copy once ([`distinct_npm_copies`]).
+async fn dispatch_find_with_npm_links(
+    partitioned: &HashMap<Ecosystem, Vec<String>>,
+    options: &CrawlerOptions,
+    silent: bool,
+    variant_merge: MergeFn,
     prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, Vec<PathBuf>> {
     let mut wanted: HashMap<PurlKey, Vec<String>> = HashMap::new();
@@ -687,7 +700,7 @@ pub async fn find_package_paths_for_path_scope(
         partitioned,
         options,
         silent,
-        merge_qualified,
+        variant_merge,
         npm_roots.as_deref(),
     )
     .await;
@@ -2056,6 +2069,54 @@ mod tests {
             find_packages_for_purls(&partitioned, &local_options(tmp.path().to_path_buf()), true)
                 .await;
         assert_eq!(single.get("pkg:npm/dup@1.0.0"), Some(&root_copy));
+    }
+
+    /// #1494: run from a workspace member, a member's alias link into the
+    /// root store (`packages/a/node_modules/lp`, vlt's layout here) is the
+    /// only route to the copy, so apply's and rollback's lookups must
+    /// return it; a link to another version must not count. From the root
+    /// the link rides after the store copy, which apply and rollback
+    /// collapse onto one physical dir.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multi_copy_lookups_take_a_member_alias_link_into_the_root_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = root.join("node_modules/.vlt");
+        let store_copy = write_npm_package(&store.join("~npm~left-pad@1.3.0"), "left-pad", "1.3.0");
+        write_npm_package(&store.join("~npm~left-pad@1.2.0"), "left-pad", "1.2.0");
+        let member_nm = root.join("packages/a/node_modules");
+        std::fs::create_dir_all(&member_nm).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../node_modules/.vlt/~npm~left-pad@1.3.0/node_modules/left-pad",
+            member_nm.join("lp"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../../../node_modules/.vlt/~npm~left-pad@1.2.0/node_modules/left-pad",
+            member_nm.join("old"),
+        )
+        .unwrap();
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let partitioned = partition_purls(std::slice::from_ref(&purl), None);
+
+        let member = local_options(root.join("packages/a"));
+        let link = vec![member_nm.join("lp")];
+        let applied = find_all_packages_for_purls(&partitioned, &member, true).await;
+        assert_eq!(applied.get(&purl), Some(&link), "{applied:?}");
+        let rolled = find_all_packages_for_rollback(&partitioned, &member, true).await;
+        assert_eq!(rolled.get(&purl), Some(&link), "{rolled:?}");
+
+        let mut from_root =
+            find_all_packages_for_purls(&partitioned, &local_options(root.to_path_buf()), true)
+                .await;
+        assert_eq!(
+            from_root.get(&purl),
+            Some(&vec![store_copy.clone(), member_nm.join("lp")]),
+            "{from_root:?}"
+        );
+        distinct_npm_copies(&mut from_root).await;
+        assert_eq!(from_root.get(&purl), Some(&vec![store_copy]));
     }
 
     /// Multi-copy for gem (mirrors the npm test above): bundler's scoped
