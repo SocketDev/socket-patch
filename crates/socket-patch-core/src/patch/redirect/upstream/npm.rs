@@ -4024,7 +4024,10 @@ mod tests {
         );
     }
 
+    // Serial: the default-registry fallback reads `SOCKET_NPM_REGISTRY`,
+    // which the serial bun and vlt restore tests point at a mock server.
     #[test]
+    #[serial_test::serial]
     fn project_registry_decides_a_mirrors_tarball_urls() {
         // A metadata mirror that hands back the project registry's own URLs:
         // the package manager derives them, so they stay out of the lock.
