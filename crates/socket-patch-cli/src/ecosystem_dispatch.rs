@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::args::GlobalArgs;
 
 use socket_patch_core::crawlers::npm_crawler::{
-    retain_live_store_copies, with_store_peer_variant_copies,
+    build_npm_purl, parse_package_name, retain_live_store_copies, with_store_peer_variant_copies,
 };
 use socket_patch_core::crawlers::walk_pool;
 use socket_patch_core::crawlers::CargoCrawler;
@@ -650,8 +650,8 @@ pub async fn find_all_packages_for_rollback_reusing(
 /// The install paths that reach each purl, for `scan`'s and `rollback`'s
 /// path targets: [`find_all_packages_for_rollback_reusing`]'s physical
 /// copies, plus each npm package link directly in a `node_modules` root
-/// (scoped ones one level down) that resolves to one of them or to one
-/// of their store peer variants.
+/// (scoped ones one level down) whose target's `package.json` names one
+/// of the npm purls asked for.
 ///
 /// The crawler records a plain-name link at its own path
 /// (`packages/a/node_modules/ms`), but never an alias link
@@ -660,23 +660,28 @@ pub async fn find_all_packages_for_rollback_reusing(
 /// once (#856). Path scoping asks which paths install the package
 /// instead, and pnpm's isolated linker or npm's `install-strategy=linked`
 /// reach a workspace member's ALIAS dependency only through such a link
-/// (#1266). The member's link can resolve to a peer variant the crawl
-/// skipped once it found the root's copy, so the variants count too.
-/// The result is for path matching only: it can name one physical copy
-/// more than once.
+/// (#1266). A link is matched by its target's own identity, not against
+/// the crawled copies, so a link to a store peer variant the crawl
+/// skipped still counts, and the cost is one pass over the root links
+/// however many purls are asked for. The result is for path matching
+/// only: it can name one physical copy more than once.
 pub async fn find_package_paths_for_path_scope(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
     prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, Vec<PathBuf>> {
-    let has_npm = partitioned
-        .get(&Ecosystem::Npm)
-        .is_some_and(|purls| !purls.is_empty());
+    let mut wanted: HashMap<PurlKey, Vec<String>> = HashMap::new();
+    for purl in partitioned.get(&Ecosystem::Npm).into_iter().flatten() {
+        wanted
+            .entry(PurlKey::new(purl))
+            .or_default()
+            .push(purl.clone());
+    }
     let npm_roots = match prior.and_then(|p| p.roots_for(options)) {
-        Some(roots) if has_npm => Some(roots.to_vec()),
-        None if has_npm => NpmCrawler.get_node_modules_paths(options).await.ok(),
-        _ => None,
+        _ if wanted.is_empty() => None,
+        Some(roots) => Some(roots.to_vec()),
+        None => NpmCrawler.get_node_modules_paths(options).await.ok(),
     };
     let mut found = dispatch_find(
         partitioned,
@@ -689,22 +694,8 @@ pub async fn find_package_paths_for_path_scope(
     let Some(roots) = npm_roots else {
         return found;
     };
-    let mut by_target: HashMap<PathBuf, Vec<String>> = HashMap::new();
-    for (purl, paths) in &found {
-        if Ecosystem::from_purl(purl) != Some(Ecosystem::Npm) {
-            continue;
-        }
-        for path in with_store_peer_variant_copies(paths.clone()).await {
-            if let Ok(target) = tokio::fs::canonicalize(&path).await {
-                by_target.entry(target).or_default().push(purl.clone());
-            }
-        }
-    }
-    if by_target.is_empty() {
-        return found;
-    }
     // A failed enumeration only loses the extra links; the copies stand.
-    let links = tokio::task::spawn_blocking(move || npm_links_to(&by_target, &roots))
+    let links = tokio::task::spawn_blocking(move || npm_links_to(&wanted, &roots))
         .await
         .unwrap_or_default();
     for (purl, link) in links {
@@ -717,10 +708,10 @@ pub async fn find_package_paths_for_path_scope(
 }
 
 /// Every package link directly in one of `roots` (scoped ones one level
-/// down) that resolves to a key of `by_target`, paired with each purl
-/// that key belongs to.
+/// down) whose target directory's `package.json` `name@version` is a key
+/// of `wanted`, paired with each purl spelling that key stands for.
 fn npm_links_to(
-    by_target: &HashMap<PathBuf, Vec<String>>,
+    wanted: &HashMap<PurlKey, Vec<String>>,
     roots: &[PathBuf],
 ) -> Vec<(String, PathBuf)> {
     let entries = |dir: &Path| -> Vec<(String, PathBuf, std::fs::FileType)> {
@@ -734,6 +725,25 @@ fn npm_links_to(
                 (!name.starts_with('.')).then(|| (name, e.path(), file_type))
             })
             .collect()
+    };
+    let identity = |link: &Path| -> Option<PurlKey> {
+        let target = std::fs::canonicalize(link).ok()?;
+        let text =
+            socket_patch_core::utils::fs::read_regular_to_string_sync(&target.join("package.json"))
+                .ok()?;
+        let pkg: serde_json::Value =
+            serde_json::from_str(socket_patch_core::formats::text::strip_bom(&text)).ok()?;
+        let name = pkg.get("name")?.as_str()?;
+        let version = pkg.get("version")?.as_str()?;
+        if name.is_empty() || version.is_empty() {
+            return None;
+        }
+        let (namespace, leaf) = parse_package_name(name);
+        Some(PurlKey::new(&build_npm_purl(
+            namespace.as_deref(),
+            &leaf,
+            version,
+        )))
     };
     let mut out = Vec::new();
     for root in roots {
@@ -751,10 +761,10 @@ fn npm_links_to(
             }
         }
         for link in links {
-            let Ok(target) = std::fs::canonicalize(&link) else {
+            let Some(key) = identity(&link) else {
                 continue;
             };
-            for purl in by_target.get(&target).into_iter().flatten() {
+            for purl in wanted.get(&key).into_iter().flatten() {
                 out.push((purl.clone(), link.clone()));
             }
         }
