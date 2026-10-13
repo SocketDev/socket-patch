@@ -420,16 +420,13 @@ pub fn gemfile_lockfile(contents: &str) -> Option<GemfileLockfile> {
 /// (bundler reads a relative one against the evaluating file's directory).
 /// A computed path is left out.
 pub fn eval_gemfile_paths(contents: &str) -> Vec<String> {
-    use crate::formats::gem::gemfile::leading_quoted;
     let mut out = Vec::new();
     for_each_code_line(contents, |_, code| {
         for at in ident_positions(code, "eval_gemfile") {
             let arg = code[at + "eval_gemfile".len()..].trim_start();
             let arg = arg.strip_prefix('(').map(str::trim_start).unwrap_or(arg);
-            if let Some((value, _)) = leading_quoted(arg) {
-                if !value.contains('\\') && !(arg.starts_with('"') && value.contains("#{")) {
-                    out.push(value.to_string());
-                }
+            if let Some((value, _)) = plain_literal(arg) {
+                out.push(value.to_string());
             }
         }
     });
@@ -440,7 +437,6 @@ pub fn eval_gemfile_paths(contents: &str) -> Vec<String> {
 /// or `None` when the name is a local variable here (assigned, compared,
 /// or a method receiver).
 fn statement_call(rest: &str) -> Option<GemfileLockfile> {
-    use crate::formats::gem::gemfile::leading_quoted;
     let arg = rest.trim_start();
     let spaced = arg.len() != rest.len();
     let operator = |c: char| "=|&+-*/<>!%?^~.".contains(c);
@@ -453,16 +449,20 @@ fn statement_call(rest: &str) -> Option<GemfileLockfile> {
         .and_then(|c| c.strip_suffix(')'))
         .map(str::trim)
         .unwrap_or(arg);
-    Some(match leading_quoted(inner) {
-        Some((value, after))
-            if after.trim().is_empty()
-                && !value.contains('\\')
-                && !(inner.starts_with('"') && value.contains("#{")) =>
-        {
-            GemfileLockfile::Path(value.to_string())
-        }
+    Some(match plain_literal(inner) {
+        Some((value, after)) if after.trim().is_empty() => GemfileLockfile::Path(value.to_string()),
         _ => GemfileLockfile::Other(call),
     })
+}
+
+/// A leading string literal of `s` whose value is its text as written (no
+/// escapes, no `#{…}` interpolation in a double-quoted one): `(value, rest
+/// after the closing quote)`.
+fn plain_literal(s: &str) -> Option<(&str, &str)> {
+    use crate::formats::gem::gemfile::leading_quoted;
+    let (value, rest) = leading_quoted(s)?;
+    let interpolated = s.starts_with('"') && value.contains("#{");
+    (!value.contains('\\') && !interpolated).then_some((value, rest))
 }
 
 /// Run `f(line, code)` over each line of Ruby source that holds code:
