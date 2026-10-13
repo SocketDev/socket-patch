@@ -60,19 +60,14 @@ fn go_env<'a>(modcache: &'a str, proxy_url: &'a str) -> Vec<(&'a str, &'a str)> 
     ]
 }
 
-/// Run socket-patch with ambient `SOCKET_*` scrubbed + the fixture GOMODCACHE
-/// (the go crawler resolves installed modules through it). Every global flag
-/// is env-backed (`SOCKET_DRY_RUN`, `SOCKET_GLOBAL`, `SOCKET_MANIFEST_PATH`,
-/// …), so an unscrubbed ambient value would silently reconfigure `apply` /
-/// `--check` out from under the assertions.
+/// Run socket-patch with the hermetic `SOCKET_*` environment + the fixture
+/// GOMODCACHE (the go crawler resolves installed modules through it). Every
+/// global flag is env-backed (`SOCKET_DRY_RUN`, `SOCKET_GLOBAL`,
+/// `SOCKET_MANIFEST_PATH`, …), so an unscrubbed ambient value would silently
+/// reconfigure `apply` / `--check` out from under the assertions.
 fn run_socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = common::hermetic::command(&binary());
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
     cmd.env("GOMODCACHE", modcache);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (

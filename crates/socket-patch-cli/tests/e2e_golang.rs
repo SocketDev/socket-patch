@@ -53,11 +53,11 @@ async fn mount_batch(server: &MockServer) {
 /// Run the binary as a blocking subprocess (off the async runtime so the
 /// wiremock server can service the request concurrently).
 ///
-/// The environment is pinned hard: `GOMODCACHE` fixes the crawl root, the
-/// token/url/org steer the API at the in-test server, and every variable that
-/// could redirect the API elsewhere or disable it (`GOPATH`, `SOCKET_OFFLINE`,
-/// the proxy URLs) is scrubbed so an ambient value in the test environment
-/// can't quietly change what the crawler discovers or whether it calls home.
+/// The environment is pinned hard: `hermetic::command` scrubs every ambient
+/// `SOCKET_*` (so `SOCKET_OFFLINE`, `SOCKET_ECOSYSTEMS`, `SOCKET_GLOBAL*` and
+/// the output-mode trio can't change what the crawler discovers or whether it
+/// calls home), `GOMODCACHE` fixes the crawl root with `GOPATH` removed, and
+/// the token/url/org steer the API at the in-test server.
 async fn run(args: &[&str], cwd: &Path, gomodcache: &Path, api_url: &str) -> Output {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let cwd = cwd.to_path_buf();
@@ -65,38 +65,14 @@ async fn run(args: &[&str], cwd: &Path, gomodcache: &Path, api_url: &str) -> Out
     let api_url = api_url.to_string();
     tokio::task::spawn_blocking(move || {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        std::process::Command::new(binary())
+        common::hermetic::command(&binary())
             .args(&arg_refs)
             .current_dir(&cwd)
             .env("GOMODCACHE", &gomodcache)
             .env("SOCKET_API_URL", &api_url)
             .env("SOCKET_API_TOKEN", "sktsec_dummy_e2e_golang_token_api")
             .env("SOCKET_ORG_SLUG", ORG)
-            // Ambient-pollution regression guard: seed a hostile value for
-            // each scan-affecting variable, then scrub it below. `env_remove`
-            // clears explicitly-set values too, so the child never sees the
-            // seeds — but if a scrub line is ever dropped, the seed (rather
-            // than a developer's ambient shell, which this suite can't rely
-            // on) turns the tests red immediately. Each seed was verified to
-            // break the suite when inherited: `SOCKET_ECOSYSTEMS` filters the
-            // go crawler out entirely, `SOCKET_GLOBAL` / `SOCKET_GLOBAL_PREFIX`
-            // redirect the crawl away from the pinned `GOMODCACHE`, and
-            // `SOCKET_JSON` / `SOCKET_SILENT` replace or suppress the human
-            // output the tests assert on.
-            .env("SOCKET_ECOSYSTEMS", "npm")
-            .env("SOCKET_GLOBAL", "true")
-            .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
-            .env("SOCKET_JSON", "true")
-            .env("SOCKET_SILENT", "true")
-            .env_remove("SOCKET_ECOSYSTEMS")
-            .env_remove("SOCKET_GLOBAL")
-            .env_remove("SOCKET_GLOBAL_PREFIX")
-            .env_remove("SOCKET_JSON")
-            .env_remove("SOCKET_SILENT")
             .env_remove("GOPATH")
-            .env_remove("SOCKET_OFFLINE")
-            .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")
     })
@@ -328,14 +304,6 @@ async fn scan_finds_the_cache_named_by_the_go_env_file() {
             .env("SOCKET_ORG_SLUG", ORG)
             .env_remove("GOMODCACHE")
             .env_remove("GOPATH")
-            .env_remove("SOCKET_ECOSYSTEMS")
-            .env_remove("SOCKET_GLOBAL")
-            .env_remove("SOCKET_GLOBAL_PREFIX")
-            .env_remove("SOCKET_JSON")
-            .env_remove("SOCKET_SILENT")
-            .env_remove("SOCKET_OFFLINE")
-            .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")
     })
