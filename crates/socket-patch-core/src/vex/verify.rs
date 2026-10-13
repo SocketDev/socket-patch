@@ -521,7 +521,8 @@ async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
         {
             return None;
         }
-        let text = std::fs::read_to_string(pkg_path.join("package.json")).ok()?;
+        let text =
+            crate::utils::fs::read_regular_to_string_sync(&pkg_path.join("package.json")).ok()?;
         let pkg: serde_json::Value = serde_json::from_str(&text).ok()?;
         let real = std::fs::canonicalize(&pkg_path).ok()?;
         let optional = pkg
@@ -1979,6 +1980,18 @@ mod tests {
             unresolved_npm_dependency(&root.join("unplugged/lp")).await,
             None
         );
+
+        // A FIFO where the manifest should be is never opened (it would
+        // block): no evidence.
+        #[cfg(unix)]
+        {
+            let fifo_dir = root.join("node_modules/fifo");
+            std::fs::create_dir_all(&fifo_dir).unwrap();
+            let c =
+                std::ffi::CString::new(fifo_dir.join("package.json").to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+            assert_eq!(unresolved_npm_dependency(&fifo_dir).await, None);
+        }
 
         // A root-linked symlink into the store (pnpm, bun isolated, npm
         // linked): the lookup starts from the real path.
