@@ -930,6 +930,99 @@ fn apply_and_rollback_reach_a_member_alias_link_from_the_member() {
     }
 }
 
+/// #1494 / #633: the root's `dupvuln` link resolves to one pnpm peer
+/// variant and member a's alias `dv` to another. Run from the root, the
+/// apply engine's store fan-out from the root copy already patches the
+/// member's variant, so the member's alias link must not add a second
+/// visit (a phantom `already_patched` / already-original event).
+#[cfg(unix)]
+#[test]
+fn apply_and_rollback_visit_a_member_alias_peer_variant_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let name = "dupvuln";
+    let purl = "pkg:npm/dupvuln@1.0.0";
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0", "private": true, "dependencies": { "dupvuln": "1.0.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\n",
+    )
+    .unwrap();
+    let variants = ["dupvuln@1.0.0_react@17.0.2", "dupvuln@1.0.0_react@18.2.0"].map(|v| {
+        write_copy(
+            &root
+                .join("node_modules/.pnpm")
+                .join(v)
+                .join("node_modules")
+                .join(name),
+            name,
+            "1.0.0",
+            original,
+        )
+    });
+    std::os::unix::fs::symlink(
+        ".pnpm/dupvuln@1.0.0_react@17.0.2/node_modules/dupvuln",
+        root.join("node_modules").join(name),
+    )
+    .unwrap();
+    let member = root.join("packages").join("a");
+    std::fs::create_dir_all(member.join("node_modules")).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{ "name": "a", "version": "1.0.0", "dependencies": { "dv": "npm:dupvuln@1.0.0" } }"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../../../node_modules/.pnpm/dupvuln@1.0.0_react@18.2.0/node_modules/dupvuln",
+        member.join("node_modules").join("dv"),
+    )
+    .unwrap();
+    stage_manifest_and_blob(
+        root,
+        purl,
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    );
+    std::fs::write(
+        root.join(".socket")
+            .join("blobs")
+            .join(git_sha256(original)),
+        original,
+    )
+    .unwrap();
+
+    let (code, v) = run_apply(root);
+    assert_eq!(code, 0, "apply; envelope={v}");
+    for variant in &variants {
+        assert_eq!(std::fs::read(variant).unwrap(), patched, "{variant:?}");
+    }
+    assert_eq!(
+        dupvuln_events(&v),
+        vec![("applied".to_string(), String::new())],
+        "apply; envelope={v}"
+    );
+
+    let (code, v) = run_rollback(root);
+    assert_eq!(code, 0, "rollback; envelope={v}");
+    for variant in &variants {
+        assert_eq!(std::fs::read(variant).unwrap(), original, "{variant:?}");
+    }
+    assert_eq!(v["summary"]["rolledBack"], 1, "rollback; envelope={v}");
+    assert_eq!(
+        crate::rollback_json::already_original(&v),
+        0,
+        "rollback; envelope={v}"
+    );
+}
+
 /// One pnpm 11+ isolated global install, `<v11>/<hash>/node_modules`, with
 /// its own `.pnpm` holding a real `dupvuln@1.0.0`, linked at the top level
 /// (`direct`) or reached only through `wrapper` (transitive-only).
