@@ -13,6 +13,8 @@ use crate::utils::python_script::{
     refuse_uv_no_sources, replace_script_metadata, rewrite_script_metadata, script_metadata,
 };
 
+use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
+
 use super::common::{record, refuse_symlinked};
 use super::parse_memo::ParseMemo;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -955,6 +957,97 @@ fn without_package(text: &str, name: &str) -> Result<String, String> {
     Ok(doc.to_string())
 }
 
+/// The recorded pre-vendor script lock `original` with every `[manifest]`
+/// requirement entry for `name` (PEP 503) re-spelled to the specifier the
+/// live `script`'s PEP 723 block declares now ([`respell_lock_specifier`],
+/// the rule the uv.lock lane uses for pyproject.toml, #840). Entries whose
+/// declaration still agrees, and every other entry, come back unchanged,
+/// so an untouched script still reverts byte for byte. `Err` when the
+/// declaration changed but uv's spelling of it isn't derivable.
+fn respell_script_lock(original: &str, script: &str, name: &str) -> Result<String, String> {
+    let (Ok((_, metadata)), Ok(mut doc)) =
+        (script_metadata(script), original.parse::<DocumentMut>())
+    else {
+        return Ok(original.to_string());
+    };
+    let mut changed = false;
+    if let Some(manifest) = doc.get_mut("manifest").and_then(Item::as_table_like_mut) {
+        for (key, item) in manifest.iter_mut() {
+            let key = key.get().to_string();
+            if !matches!(
+                key.as_str(),
+                "requirements" | "constraints" | "build-constraints" | "overrides"
+            ) {
+                continue;
+            }
+            let Some(array) = item.as_array_mut() else {
+                continue;
+            };
+            for value in array.iter_mut() {
+                let Some(entry) = value.as_inline_table_mut() else {
+                    continue;
+                };
+                if entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|n| canonicalize_pypi_name(n) != name)
+                {
+                    continue;
+                }
+                let field = |k: &str| entry.get(k).and_then(Value::as_str).map(str::to_string);
+                let (specifier, marker) = (field("specifier"), field("marker"));
+                let Some(spec) = respell_lock_specifier(
+                    &metadata,
+                    LockRequirementArray::Manifest(&key),
+                    name,
+                    specifier.as_deref(),
+                    marker.as_deref(),
+                )?
+                else {
+                    continue;
+                };
+                match (spec, entry.get_mut("specifier")) {
+                    (Some(spec), Some(value)) => {
+                        let decor = value.decor().clone();
+                        *value = Value::from(spec);
+                        *value.decor_mut() = decor;
+                    }
+                    (Some(spec), None) => {
+                        // Appended last, where uv writes it, taking over
+                        // the padding before the closing brace.
+                        let mut value = Value::from(spec);
+                        if let Some((_, last)) = entry.iter_mut().last() {
+                            if let Some(suffix) = last.decor().suffix().cloned() {
+                                last.decor_mut().set_suffix("");
+                                value.decor_mut().set_suffix(suffix);
+                            }
+                        }
+                        entry.insert("specifier", value);
+                    }
+                    (None, _) => {
+                        // The padding before the closing brace moves to
+                        // the entry's new last value.
+                        let was_last = entry.iter().last().is_some_and(|(k, _)| k == "specifier");
+                        let removed = entry.remove("specifier");
+                        let suffix = removed.and_then(|v| v.decor().suffix().cloned());
+                        if let (true, Some(suffix), Some((_, last))) =
+                            (was_last, suffix, entry.iter_mut().last())
+                        {
+                            last.decor_mut().set_suffix(suffix);
+                        }
+                    }
+                }
+                changed = true;
+            }
+        }
+    }
+    Ok(if changed {
+        crate::utils::python_lock::preserve_line_endings(original, doc.to_string())
+    } else {
+        original.to_string()
+    })
+}
+
 pub(super) async fn revert_python_locks(
     entry: &VendorEntry,
     root: &Path,
@@ -1101,6 +1194,36 @@ pub(super) async fn revert_python_locks(
             }
         } else {
             (original, new)
+        };
+        // #869: a path source records no specifier, so a requirement the
+        // user changed in the PEP 723 block while vendored left the script
+        // lock byte-identical: restore the specifier the script declares
+        // NOW, never the recorded one blindly (the script-lock twin of
+        // #840).
+        let respelled;
+        let original = match (
+            record.kind == KIND,
+            script_texts.get(record.file.as_str()),
+            package_name.as_deref(),
+        ) {
+            (true, Some(script), Some(name)) => match respell_script_lock(original, script, name) {
+                Ok(text) => {
+                    respelled = text;
+                    respelled.as_str()
+                }
+                Err(reason) => {
+                    warnings.push(VendorWarning::new(
+                        "vendor_lock_entry_drifted",
+                        format!(
+                            "{} entry for {name} can't be restored to match its script \
+                             ({reason}); left untouched",
+                            record.file
+                        ),
+                    ));
+                    continue;
+                }
+            },
+            _ => original,
         };
         let restored = if record.kind == SCRIPT_KIND {
             (|| {
@@ -2198,6 +2321,129 @@ mod tests {
             std::fs::read_to_string(root.join("job.py")).unwrap(),
             wired_script,
             "drift writes nothing"
+        );
+    }
+
+    /// #869: a path source records no specifier, so a user who changes the
+    /// vendored package's requirement in the PEP 723 block while it is
+    /// vendored (`uv add --script job.py "one>=0.9"`) leaves the script
+    /// lock byte-identical. The revert must restore the `[manifest]
+    /// requirements` element with the specifier the script declares NOW,
+    /// not the one recorded when vendoring, or `uv run --locked --script`
+    /// fails on the restored lock.
+    #[tokio::test]
+    async fn script_revert_respells_a_requirement_changed_while_vendored() {
+        for (declared, element) in [
+            ("one>=0.9", "{name = \"one\", specifier = \">=0.9\"}"),
+            ("one==1.*", "{name = \"one\", specifier = \"==1.*\"}"),
+            ("one", "{name = \"one\"}"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let (entry, wired_script, wired_lock) = vendor_script_pair(root).await;
+            let edited = wired_script.replace("\"one==1\"", &format!("\"{declared}\""));
+            assert_ne!(edited, wired_script);
+            tokio::fs::write(root.join("job.py"), &edited)
+                .await
+                .unwrap();
+
+            let outcome = revert_python_locks(&entry, root, false).await;
+            assert!(outcome.success, "{declared}: {outcome:?}");
+            assert!(
+                outcome.warnings.is_empty(),
+                "{declared}: {:?}",
+                outcome.warnings
+            );
+            let script = std::fs::read_to_string(root.join("job.py")).unwrap();
+            let lock = std::fs::read_to_string(root.join("job.py.lock")).unwrap();
+            assert_eq!(
+                script,
+                format!(
+                    "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"{declared}\", \"attrs>=20\"]\n# ///\nimport one\n"
+                ),
+                "{declared}"
+            );
+            assert!(!lock.contains(UUID), "{declared}: {lock}");
+            assert!(
+                lock.contains(&format!("requirements = [{element}]")),
+                "{declared}: {lock}"
+            );
+            assert_ne!(lock, wired_lock);
+        }
+    }
+
+    /// #869: when the script now declares a multi-clause range, uv's
+    /// spelling of it in the lock is not derivable, so the revert keeps
+    /// both files and their recovery state (`vendor_lock_entry_drifted`)
+    /// rather than restoring a stale or guessed specifier.
+    #[tokio::test]
+    async fn script_revert_keeps_drift_for_an_underivable_new_requirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (entry, wired_script, wired_lock) = vendor_script_pair(root).await;
+        let edited = wired_script.replace("\"one==1\"", "\"one>=0.9,<2\"");
+        tokio::fs::write(root.join("job.py"), &edited)
+            .await
+            .unwrap();
+
+        let outcome = revert_python_locks(&entry, root, false).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert_eq!(
+            std::fs::read_to_string(root.join("job.py")).unwrap(),
+            edited
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("job.py.lock")).unwrap(),
+            wired_lock
+        );
+    }
+
+    /// #869: a requirement recorded bare (`dependencies = ["six"]`) that the
+    /// user pinned while vendored gets its specifier back last, where uv
+    /// writes it; a marker entry is matched by its marker; other packages'
+    /// entries keep their bytes.
+    #[test]
+    fn respell_script_lock_inserts_a_specifier_where_uv_writes_it() {
+        let original = "version = 1\r\nrevision = 3\r\n\r\n[manifest]\r\nrequirements = [\r\n    { name = \"attrs\", specifier = \">=20\" },\r\n    { name = \"six\" },\r\n    { name = \"six\", marker = \"sys_platform == 'win32'\", specifier = \"==1.16.0\" },\r\n]\r\n";
+        let script = "# /// script\n# dependencies = [\"attrs>=20\", \"six>=1.15\", \"six==1.16.*; sys_platform == 'win32'\"]\n# ///\n";
+        let respelled = respell_script_lock(original, script, "six").unwrap();
+        assert_eq!(
+            respelled,
+            original
+                .replace(
+                    "{ name = \"six\" }",
+                    "{ name = \"six\", specifier = \">=1.15\" }"
+                )
+                .replace("\"==1.16.0\"", "\"==1.16.*\"")
+        );
+        let bare = "# /// script\n# dependencies = [\"attrs>=20\", \"six\", \"six; sys_platform == 'win32'\"]\n# ///\n";
+        assert_eq!(
+            respell_script_lock(original, bare, "six").unwrap(),
+            original.replace(", specifier = \"==1.16.0\" }", " }")
+        );
+        let unchanged = "# /// script\n# dependencies = [\"attrs>=20\", \"six\", \"six==1.16.0; sys_platform == 'win32'\"]\n# ///\n";
+        assert_eq!(
+            respell_script_lock(original, unchanged, "six").unwrap(),
+            original
+        );
+    }
+
+    /// The respell leaves an unchanged declaration alone: the script lock
+    /// reverts to the recorded original byte for byte.
+    #[tokio::test]
+    async fn script_revert_with_an_unchanged_requirement_is_byte_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"one\", specifier = \"==1\"}]\n\n[[package]]\nname = \"one\"\nversion = \"1\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        let (entry, ..) = vendor_script_pair(root).await;
+
+        let outcome = revert_python_locks(&entry, root, false).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            std::fs::read_to_string(root.join("job.py.lock")).unwrap(),
+            lock
         );
     }
 
