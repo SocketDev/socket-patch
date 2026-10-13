@@ -312,7 +312,7 @@ async fn read_toml(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) -> Op
 }
 
 fn parse_toml(file: &str, text: &str, out: &mut Discovery) -> Option<DocumentMut> {
-    toml_or_diag(file, text, TomlDiag::TrimEnd, out)
+    toml_or_diag(file, text, TomlDiag::TrimEnd, out).map(toml_edit::Document::into_mut)
 }
 
 /// The config file cargo actually reads ([`effective_config_rel_in`]), parsed,

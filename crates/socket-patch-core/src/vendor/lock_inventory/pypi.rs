@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use serde_json::Value;
-use toml_edit::{DocumentMut, Item, TableLike};
+use toml_edit::{Item, Table, TableLike};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::formats::text::strip_bom;
@@ -326,7 +326,7 @@ pub(super) fn portable_wheel_artifact(
 }
 
 pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
-    let document: DocumentMut = text.parse().ok()?;
+    let document = read_only_toml(&text)?;
     let (collection, pep751) = lock_package_collection(&document);
     // Only the lock formats the fetch layer understands.
     let supported = if pep751 {
@@ -395,7 +395,7 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 /// can be chosen there). A lock that is not TOML contributes nothing.
 async fn inventory_poetry_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
     let text = view.read_text("poetry.lock").await.ok()?;
-    let document: DocumentMut = text.parse().ok()?;
+    let document = read_only_toml(&text)?;
     let pure_wheel_sha = |files: Vec<&dyn TableLike>| {
         files.into_iter().find_map(|entry| {
             let file = entry.get("file")?.as_str()?;
@@ -427,9 +427,16 @@ async fn inventory_poetry_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEnt
     Some(out)
 }
 
+/// `text` parsed for reading only: spans into `text` rather than the owned
+/// copy of every key and value a `DocumentMut` makes, which on a large lock
+/// costs more than the parse (#1473). Nothing here edits or re-renders it.
+fn read_only_toml(text: &str) -> Option<toml_edit::Document<&str>> {
+    toml_edit::Document::parse(text).ok()
+}
+
 /// `(canonical name, version, purl, table)` of every path-safe `[[package]]`
 /// of a poetry.lock / pdm.lock document.
-fn toml_package_coords(document: &DocumentMut) -> Vec<(String, String, String, &toml_edit::Table)> {
+fn toml_package_coords(document: &Table) -> Vec<(String, String, String, &Table)> {
     let Some(packages) = document.get("package").and_then(Item::as_array_of_tables) else {
         return Vec::new();
     };
@@ -588,7 +595,7 @@ async fn inventory_pipfile_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEn
 /// does not probe, so a lock-only vendored path would not survive a re-scan.
 async fn inventory_pdm_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
     let text = view.read_text("pdm.lock").await.ok()?;
-    let document: DocumentMut = text.parse().ok()?;
+    let document = read_only_toml(&text)?;
     let out: Vec<LockfileEntry> = toml_package_coords(&document)
         .into_iter()
         .map(|(name, version, purl, _)| LockfileEntry {

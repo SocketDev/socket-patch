@@ -33,7 +33,7 @@ pub(crate) fn package_files(package: &Table) -> Vec<&dyn TableLike> {
 
 /// The lock-wide `[metadata.files]` entry for package `name` (lock
 /// 1.0/1.1; keys compared PEP 503-canonical).
-pub(crate) fn metadata_files<'d>(lock: &'d DocumentMut, name: &str) -> Vec<&'d dyn TableLike> {
+pub(crate) fn metadata_files<'d>(lock: &'d Table, name: &str) -> Vec<&'d dyn TableLike> {
     let canon = canonicalize_pypi_name(name);
     let entry = lock
         .get("metadata")
@@ -135,13 +135,10 @@ fn multiline_files(files: Array) -> Item {
 /// bumps the minor additively — 2.0 → 2.1 kept every shape we rewrite, and the
 /// vendored loader already accepts newer minors with an advisory; the hosted
 /// path must not refuse what the vendored path accepts).
-pub fn lock_version(lock: &DocumentMut) -> Result<&str, String> {
-    lock_version_of(lock)
-}
-
-/// [`lock_version`] of a parsed lock's root table (a `DocumentMut` or a
-/// spanned `Document`).
-fn lock_version_of(lock: &Table) -> Result<&str, String> {
+///
+/// Takes the root table of either a `DocumentMut` or a read-only spanned
+/// `Document`.
+pub fn lock_version(lock: &Table) -> Result<&str, String> {
     let metadata = lock
         .get("metadata")
         .filter(|item| item.is_table_like())
@@ -616,7 +613,7 @@ fn rewrite_poetry_lock_batch(
         &names,
         |index, lock| {
             if version.is_none() {
-                *version = lock_version_of(lock).ok().map(str::to_string);
+                *version = lock_version(lock).ok().map(str::to_string);
             }
             let dep = &deps[index];
             let sha256 = checked_sha256(
@@ -690,7 +687,7 @@ fn plan_poetry_rewrite(
     source_url: &str,
     sha256: &str,
 ) -> Result<Option<PoetryLockPlan>, String> {
-    let format = lock_version_of(lock)?.to_string();
+    let format = lock_version(lock)?.to_string();
     if format == "0" && source_type == "url" {
         return Err("Poetry 0.x ignores URL sources; hosted patches require Poetry >= 1.0".into());
     }
