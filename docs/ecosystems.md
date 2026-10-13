@@ -289,7 +289,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   registry entry and names the copy (`redirect_copy_unpatched`, unless a yarn classic
   skip warning already names it); vendored mode still wires the registry entry and names
   it (`vendor_copy_unpatched` for berry; the yarn classic codes below for classic); and
-  `vex` never attests the package from that lock while the copy is there.
+  `vex` never attests the package from that lock while the copy is there. When the
+  package is installed only through such copies, vendoring refuses with
+  `vendor_lock_entry_not_rewritable` naming them, since `yarn install` can't help.
 - **yarn classic and yarn 2+** — installing with yarn 2+ (berry) migrates a classic (v1)
   `yarn.lock` and re-resolves every entry from the registry, dropping hosted pins and
   vendored wiring alike, so the packages install unpatched. A run that leaves such a pin
