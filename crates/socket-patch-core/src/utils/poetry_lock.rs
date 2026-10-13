@@ -345,7 +345,8 @@ pub enum Wired {
 
 /// The advisory for a source-pinned package rewired over a lock that
 /// [`source_constraint_break`] admits: lock format 2.1+, not written by
-/// Poetry 2.0 – 2.2. Poetry 1.x can't read that format at all.
+/// Poetry 1.3 – 2.2. Poetry 1.3 – 1.8 also read a 2.1 lock (with a
+/// compatibility warning) and refuse the constraint like 2.0 – 2.2 do.
 pub fn source_constraint_advisory(
     pyproject_path: &str,
     lock_path: &str,
@@ -354,7 +355,7 @@ pub fn source_constraint_advisory(
 ) -> String {
     format!(
         "{pyproject_path} pins {name} to the {source:?} source (`source = {source:?}`): \
-         Poetry 2.0 – 2.2 refuse to install {lock_path} with that constraint (2.3+ install \
+         Poetry 1.3 – 2.2 refuse to install {lock_path} with that constraint (2.3+ install \
          it); drop the `source` key if this project is installed with one of them"
     )
 }
@@ -1052,7 +1053,7 @@ grouped = {version = "*", source = "pypi"}
             );
         }
         let advisory = source_constraint_advisory("pyproject.toml", "poetry.lock", "six", "pypi");
-        assert!(advisory.contains("Poetry 2.0 – 2.2 refuse"), "{advisory}");
+        assert!(advisory.contains("Poetry 1.3 – 2.2 refuse"), "{advisory}");
         assert!(!advisory.contains("1.1 – 1.2"), "{advisory}");
     }
 

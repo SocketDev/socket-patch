@@ -54,7 +54,7 @@ X.Y` stamp, or, with no versioned stamp, `lock-version = "2.0"`, which only
 or 1.1; the detail says which. Over a 2.3+ lock (or vendored, a 0.x one)
 they rewire it and warn
 (`redirect_poetry_source_constraint` / `pypi_poetry_source_constraint`) that
-a 2.0 – 2.2 installer would refuse the lock. The header names the writer,
+a 1.3 – 2.2 installer would refuse the lock. The header names the writer,
 which is usually but not always the installer.
 
 ## Installer boundaries (measured)

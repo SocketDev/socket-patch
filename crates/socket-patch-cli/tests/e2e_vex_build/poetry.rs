@@ -1249,7 +1249,7 @@ fn poetry_source_pypi_constraint_never_breaks_install() {
             assert_ne!(lock, pristine_lock, "{mode}: rewired: {env}");
             assert!(
                 report.contains("source_constraint"),
-                "{mode}: warns about Poetry 2.0 – 2.2: {env}"
+                "{mode}: warns about Poetry 1.3 – 2.2: {env}"
             );
         }
         // Either way a fresh install works, and installs the patch whenever

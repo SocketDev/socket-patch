@@ -197,7 +197,7 @@ fn source_constraint(p: &PoetryProject, canon_name: &str) -> Option<String> {
 }
 
 /// The advisory for a source-constrained package wired over a lock Poetry
-/// 2.3+ wrote: the writer installs it, but a 2.0 – 2.2 installer would
+/// 2.3+ wrote: the writer installs it, but a 1.3 – 2.2 installer would
 /// refuse it. [`check_target_guards`] refuses the locks every 1.3+ (or the
 /// 1.3 – 2.2 writer) would refuse outright.
 pub(super) fn source_constraint_warning(
