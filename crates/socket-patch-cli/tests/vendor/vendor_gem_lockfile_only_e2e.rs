@@ -1,9 +1,8 @@
 //! Service vendoring of portable gems without a local install or registry fetch.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic};
 
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -126,11 +125,14 @@ async fn mount_gem_download(mock: &MockServer, gem: Vec<u8>) {
 }
 
 /// `vendor --json --vendor-source <source>` through the built binary, with
-/// every ambient `SOCKET_*` var scrubbed and the API pointed at a
+/// the hermetic `SOCKET_*` environment, every ambient `BUNDLE_*` var
+/// scrubbed (an ambient `BUNDLE_PATH` or app config moves the gem store the
+/// crawler reads) and the API pointed at a
 /// guaranteed-dead endpoint (patch staging is satisfied from
 /// `.socket/blobs`, so nothing should reach it).
 fn run_vendor(root: &Path, source: &str, api_url: &str) -> (i32, serde_json::Value, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle]);
     cmd.args([
         "vendor",
         "--json",
@@ -146,12 +148,6 @@ fn run_vendor(root: &Path, source: &str, api_url: &str) -> (i32, serde_json::Val
         "test-org",
     ])
     .current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let fixture = crate::prebuilt_common::Server::project(root);
     fixture.command(&mut cmd);
     let out = cmd.output().expect("run socket-patch vendor");
