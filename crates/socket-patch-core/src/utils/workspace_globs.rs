@@ -311,7 +311,8 @@ fn picomatch_as_extglob(p: &[char], every_group: bool, in_group: bool) -> Option
                     continue;
                 };
                 let end = p.len() - after.len();
-                if after.first() == Some(&'+') {
+                // `+(` after a class opens an extglob, not a quantifier.
+                if after.first() == Some(&'+') && after.get(1) != Some(&'(') {
                     out.extend(['+', '(']);
                     out.extend_from_slice(&p[i..end]);
                     out.push(')');
@@ -344,8 +345,9 @@ fn picomatch_as_extglob(p: &[char], every_group: bool, in_group: bool) -> Option
                 }
                 let mut next = close + 1;
                 if !led {
+                    // `?(` / `+(` after the group opens an extglob instead.
                     let kind = match p.get(next) {
-                        Some(&q @ ('?' | '+')) => {
+                        Some(&q @ ('?' | '+')) if p.get(next + 1) != Some(&'(') => {
                             next += 1;
                             q
                         }
@@ -1024,6 +1026,14 @@ mod tests {
         no(&["packages/[ab]+"], "packages/abc");
         yes(&["packages/(a+|c)"], "packages/aaa");
         no(&["packages/(a+|c)"], "packages/a+");
+        // `?(` / `+(` right after a group or class opens an extglob.
+        yes(&["packages/(a|b)?(c|d)"], "packages/a");
+        yes(&["packages/(a|b)?(c|d)"], "packages/ac");
+        yes(&["packages/(a|b)?(c|d)"], "packages/bd");
+        yes(&["packages/(a|b)+(c)"], "packages/acc");
+        yes(&["packages/[ab]+(c)"], "packages/bc");
+        no(&["packages/[ab]+(c)"], "packages/b");
+        no(&["packages/*", "!packages/(a|b)?(c)"], "packages/ac");
         // A group without `|` in a static pattern (fast-glob reads it as
         // a path) never lists the directory its group names; listing the
         // literal `(a)` fails closed. In a dynamic one it is a group.
