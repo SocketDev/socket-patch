@@ -892,18 +892,22 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
 
     /// A pyproject `source = "pypi"` constraint on the vendored package has
     /// no trace in the lock. Rewiring it to a file source breaks every
-    /// `poetry install` on Poetry 1.3 – 2.2, so a lock one of those wrote is
-    /// refused before the wheel is built; other writers wire it with a
-    /// warning (#1282, #1447).
+    /// `poetry install` on Poetry 1.3 – 2.2, and on every Poetry 1.3+ over a
+    /// lock older than format 2.1, so such a lock is refused before the wheel
+    /// is built; Poetry 2.3+'s locks wire it with a warning (#1282, #1447,
+    /// #1503).
     #[tokio::test]
     async fn source_constrained_dependency_is_refused_for_poetry_1_3_to_2_2() {
         const PYPROJECT: &str = "[tool.poetry.dependencies]\n\
             python = \">=3.8\"\n\
             urllib3 = {version = \"1.26.18\", source = \"pypi\"}\n";
         for (version, broken) in [
-            ("0.12.17", false),
-            ("1.1.15", false),
-            ("1.2.2", false),
+            // Locks older than format 2.1: every Poetry 1.3+ re-solves them
+            // on install and then refuses the constraint (#1503).
+            ("0.12.17", true),
+            ("1.0.10", true),
+            ("1.1.15", true),
+            ("1.2.2", true),
             ("1.3.2", true),
             ("1.4.2", true),
             ("1.6.1", true),

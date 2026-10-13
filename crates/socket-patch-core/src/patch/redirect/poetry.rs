@@ -359,10 +359,11 @@ mod equivalence_tests {
 
     /// A dependency the pyproject pins to a named source (`source = "pypi"`)
     /// has no trace in the lock. Rewriting it to a URL source breaks every
-    /// `poetry install` on Poetry 1.3 – 2.2, so a lock one of those wrote is
-    /// refused before any write; other writers are rewritten with a warning
-    /// (#1282, #1447). A sibling lock whose pyproject has no constraint is
-    /// rewritten as before.
+    /// `poetry install` on Poetry 1.3 – 2.2, and on every Poetry 1.3+ over a
+    /// lock older than format 2.1 (which they re-solve), so such a lock is
+    /// refused before any write; Poetry 2.3+'s locks are rewritten with a
+    /// warning (#1282, #1447, #1503). A sibling lock whose pyproject has no
+    /// constraint is rewritten as before.
     #[test]
     fn source_constrained_dependency_is_refused_for_poetry_1_3_to_2_2() {
         const PYPROJECTS: &[&str] = &[
@@ -374,18 +375,23 @@ mod equivalence_tests {
             "[[tool.poetry.dependencies.urllib3]]\nversion = \"1.26.18\"\npython = \">=3.8\"\nsource = \"pypi\"\n\n[[tool.poetry.dependencies.urllib3]]\nversion = \"1.26.17\"\npython = \"<3.8\"\n",
         ];
         for version in VERSIONS.iter().filter(|version| !version.starts_with("0.")) {
-            let broken = matches!(
-                *version,
-                "1.3.2"
-                    | "1.4.2"
-                    | "1.5.1"
-                    | "1.6.1"
-                    | "1.7.1"
-                    | "1.8.5"
-                    | "2.0.1"
-                    | "2.1.4"
-                    | "2.2.1"
-            );
+            // Every lock older than format 2.1 (Poetry < 1.3 writes 1.0 /
+            // 1.1) is re-solved by any Poetry 1.3+ on install, which then
+            // refuses the constraint like 1.3 – 2.2 do (#1503).
+            let old_format = matches!(*version, "1.0.10" | "1.1.15" | "1.2.2");
+            let broken = old_format
+                || matches!(
+                    *version,
+                    "1.3.2"
+                        | "1.4.2"
+                        | "1.5.1"
+                        | "1.6.1"
+                        | "1.7.1"
+                        | "1.8.5"
+                        | "2.0.1"
+                        | "2.1.4"
+                        | "2.2.1"
+                );
             for pyproject in PYPROJECTS {
                 let lock = fixture(version);
                 let files = BTreeMap::from([
@@ -425,6 +431,11 @@ mod equivalence_tests {
                     );
                     assert_eq!(codes, ["redirect_poetry_lock_unsupported"], "{what}");
                     assert!(got.warnings[0].detail.contains("source ="), "{what}");
+                    assert_eq!(
+                        got.warnings[0].detail.contains("lock-version"),
+                        old_format,
+                        "{what}"
+                    );
                     // Nothing is wired yet, so re-locking is the whole remedy.
                     assert!(!got.warnings[0].detail.contains("rollback"), "{what}");
                 } else {

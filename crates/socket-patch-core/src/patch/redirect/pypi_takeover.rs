@@ -357,7 +357,8 @@ mod tests {
     }
 
     /// #1282: hosted mode refuses a source-pinned package over a lock
-    /// Poetry 1.3 – 2.2 wrote, so the takeover must keep it vendored rather
+    /// Poetry 1.3 – 2.2 wrote, or one older than format 2.1 (#1503), so the
+    /// takeover must keep it vendored rather
     /// than revert it into neither mode. Other writers are admitted.
     #[tokio::test]
     async fn poetry_source_pinned_package_follows_the_writer() {
@@ -375,7 +376,11 @@ mod tests {
              by hand.\n\n{}",
             POETRY_2.replace("lock-version = \"2.1\"", "lock-version = \"2.0\"")
         );
+        // Poetry 1.1 / 1.2 stamp nothing and write lock 1.1, which every
+        // Poetry 1.3+ re-solves and refuses (#1503).
+        let poetry_1_2 = POETRY_2.replace("lock-version = \"2.1\"", "lock-version = \"1.1\"");
         for (stamp, lock, refused) in [
+            ("1.2.2", poetry_1_2, true),
             ("1.3.2", poetry_1_3, true),
             ("1.8.5", stamp("1.8.5"), true),
             ("2.2.1", stamp("2.2.1"), true),
