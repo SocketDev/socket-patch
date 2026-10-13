@@ -2444,6 +2444,144 @@ async fn hosted_scan_refuses_a_git_branch_lockfile_project() {
     }
 }
 
+/// Like [`run_hosted_json`], with pnpm's `lockfile` / `package-lock` /
+/// `git-branch-lockfile` environment spellings cleared and then `env` set.
+fn run_hosted_json_env(
+    cwd: &Path,
+    api_url: &str,
+    env: &[(&str, &str)],
+) -> (Option<i32>, serde_json::Value) {
+    let mut cmd = scrubbed_cli();
+    for prefix in ["npm_config_", "pnpm_config_"] {
+        for key in ["lockfile", "package_lock", "git_branch_lockfile"] {
+            cmd.env_remove(format!("{prefix}{key}"));
+        }
+    }
+    cmd.envs(env.iter().copied());
+    let out = cmd
+        .args([
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--api-url",
+            api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let doc = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("stdout must be the JSON envelope ({e});\nstdout=\n{stdout}\nstderr=\n{stderr}")
+    });
+    (out.status.code(), doc)
+}
+
+/// #1460: each pnpm major reads one family of environment variables,
+/// `npm_config_*` on pnpm 10 and older and `pnpm_config_*` on pnpm 11 and
+/// newer. A setting in the family the project's pnpm ignores (e.g. the
+/// `npm_config_package_lock=` that `npx` exports from an npm-era `.npmrc`
+/// on a pnpm 12 project) used to refuse with
+/// `redirect_pnpm_lockfile_disabled` / `redirect_pnpm_git_branch_lockfile`
+/// and leave the lock unpinned; it now pins. The family that major reads
+/// still refuses.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_reads_pnpm_env_settings_for_the_project_pnpm_major() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    const OFF: &str = "redirect_pnpm_lockfile_disabled";
+    const BRANCH: &str = "redirect_pnpm_git_branch_lockfile";
+    for (pm, var, value, refusal) in [
+        ("pnpm@12.11.2", "npm_config_package_lock", "", None),
+        ("pnpm@12.11.2", "npm_config_lockfile", "false", None),
+        ("pnpm@11.28.3", "npm_config_lockfile", "false", None),
+        ("pnpm@10.34.6", "pnpm_config_lockfile", "false", None),
+        ("pnpm@9.15.9", "pnpm_config_lockfile", "false", None),
+        (
+            "pnpm@12.11.2",
+            "npm_config_git_branch_lockfile",
+            "true",
+            None,
+        ),
+        (
+            "pnpm@10.34.6",
+            "pnpm_config_git_branch_lockfile",
+            "true",
+            None,
+        ),
+        // Controls: the family the major reads.
+        ("pnpm@11.28.3", "pnpm_config_lockfile", "false", Some(OFF)),
+        ("pnpm@10.34.6", "npm_config_lockfile", "false", Some(OFF)),
+        (
+            "pnpm@12.11.2",
+            "pnpm_config_git_branch_lockfile",
+            "true",
+            Some(BRANCH),
+        ),
+        (
+            "pnpm@10.34.6",
+            "npm_config_git_branch_lockfile",
+            "true",
+            Some(BRANCH),
+        ),
+    ] {
+        let case = format!("{pm} {var}={value}");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pnpm_project(root);
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "{pm}", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+            ),
+        )
+        .unwrap();
+        // A leftover branch lock: live only while the setting is on.
+        let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        std::fs::write(root.join("pnpm-lock.feature.yaml"), &lock).unwrap();
+
+        let (code, doc) = run_hosted_json_env(root, &server.uri(), &[(var, value)]);
+        assert_eq!(code, Some(0), "{case}: {doc}");
+        let codes: Vec<&str> = doc["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|w| w["code"].as_str())
+            .collect();
+        match refusal {
+            Some(refusal) => {
+                assert_eq!(hosted_pin_count(&doc), 0, "{case}: {doc}");
+                assert!(codes.contains(&refusal), "{case}: {codes:?}");
+                assert!(warning_texts(&doc).contains(var), "{case}: {doc}");
+                assert_eq!(
+                    std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+                    lock,
+                    "{case}"
+                );
+            }
+            None => {
+                assert_eq!(hosted_pin_count(&doc), 1, "{case}: {doc}");
+                assert!(
+                    !codes.contains(&OFF) && !codes.contains(&BRANCH),
+                    "{case}: {codes:?}"
+                );
+                let pinned = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+                assert!(pinned.contains(HOSTED_URL), "{case}: {pinned}");
+            }
+        }
+    }
+}
+
 /// #1094: an npm workspace member holding a stray `package-lock.json` /
 /// `npm-shrinkwrap.json` of its own (one npm never reads; members install
 /// from the root lock) used to skip the #884 refusal. `scan` and `get`
