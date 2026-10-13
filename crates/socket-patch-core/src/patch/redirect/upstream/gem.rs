@@ -502,12 +502,13 @@ fn provably_appended(text: &str, block: &Block) -> bool {
 /// The blank line + indent to put before a declaration restored in place of
 /// `block`. The rewriter's `^\s*gem` match swallowed whatever whitespace
 /// preceded the original line, which no file records, so this re-derives the
-/// conventional layout from the neighbors: right after the line that opens
-/// the enclosing block (`group … do`), that line's indent + 2; anywhere
-/// else inside a block (after an `end`, a statement, #1476), or right after
-/// another declaration or a comment, the neighbor's indent and no blank
-/// line; after anything else at the top level (`source`, `ruby`, `end`, …)
-/// one blank line and the indent of the declaration that follows, if any.
+/// conventional layout from the neighbors: right after another declaration
+/// or a comment, the neighbor's indent and no blank line; anywhere else
+/// inside a block (right after its `group … do`, after an `end` or a
+/// statement, #1476), the indent of the line that opened the enclosing
+/// block + 2 and no blank line; after anything else at the top level
+/// (`source`, `ruby`, `end`, …) one blank line and the indent of the
+/// declaration that follows, if any.
 fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
     let Some(prev) = line_before(text, block.start) else {
         return String::new();
@@ -516,12 +517,18 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let depth = block_stack(text, block.start).len();
-    if depth > block_stack(text, line_before_start(text, block.start)).len() {
-        return format!("{}  ", indent_of(prev));
-    }
-    if depth > 0 || trimmed.starts_with('#') || gem_declaration_any(trimmed).is_some() {
+    let enclosing = block_stack(text, block.start)
+        .last()
+        .map(|&(_, indent)| indent);
+    let opened_by_prev = || {
+        block_stack(text, block.start).len()
+            > block_stack(text, line_before_start(text, block.start)).len()
+    };
+    if (trimmed.starts_with('#') || gem_declaration_any(trimmed).is_some()) && !opened_by_prev() {
         return indent_of(prev).to_string();
+    }
+    if let Some(indent) = enclosing {
+        return format!("{indent}  ");
     }
     let next = text[block.end..].split('\n').next().unwrap_or_default();
     let indent = if gem_declaration_any(next.trim()).is_some() {
@@ -537,18 +544,19 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
 /// Bundler records a dependency declared there with a `!` source pin in the
 /// lock's `DEPENDENCIES`, whichever URL the block names (#1056).
 fn in_source_block(text: &str, at: usize) -> bool {
-    block_stack(text, at).contains(&true)
+    block_stack(text, at).iter().any(|&(source, _)| source)
 }
 
 /// The Ruby constructs still open at byte `at` of the manifest, outermost
-/// first: `true` for a `source … do` block, `false` for anything else that
-/// Ruby closes with `end` (`group … do`, `if`, `case`, `def`, …). A
+/// first, each with the indent of the line that opened it: `true` for a
+/// `source … do` block, `false` for anything else that Ruby closes with
+/// `end` (`group … do`, `if`, `case`, `def`, …). A
 /// word-level count over each line's code: a construct opened and closed
 /// on one line nets out, and a keyword opens one wherever it starts an
 /// expression (`v = if …`, `(case …`, #1476), not only at the start of a
 /// line, so its `end` never closes an enclosing block.
-fn block_stack(text: &str, at: usize) -> Vec<bool> {
-    let mut open: Vec<bool> = Vec::new();
+fn block_stack(text: &str, at: usize) -> Vec<(bool, &str)> {
+    let mut open: Vec<(bool, &str)> = Vec::new();
     for line in text[..at].lines() {
         let code = masked_ruby_code(line);
         let code = code.trim();
@@ -585,7 +593,10 @@ fn block_stack(text: &str, at: usize) -> Vec<bool> {
                 _ => false,
             };
             if opens {
-                open.push(word == "do" && std::mem::take(&mut source_do));
+                open.push((
+                    word == "do" && std::mem::take(&mut source_do),
+                    indent_of(line),
+                ));
             }
         }
     }
@@ -1492,6 +1503,10 @@ mod tests {
             "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource \"https://rubygems.org\" do\n  \
              x ||= unless ENV[\"ZZ\"]\n    1\n  end\n  y = (while false\n  end)\n  \
              gem \"rails\", \"7.0.0\"\nend\n",
+            // An `end` indented deeper than the block's body: the
+            // declaration takes the block's body indent, not the `end`'s.
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource \"https://rubygems.org\" do\n  \
+             w = case ENV[\"ZZ\"]\n      when \"x\" then \"a\"\n      end\n  gem \"rails\", \"7.0.0\"\nend\n",
         ] {
             let lock = format!(
                 "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    \
