@@ -34,11 +34,12 @@ use std::process::Command;
 /// never sees it, but if a scrub line is ever dropped the seed (rather than a
 /// developer's ambient shell, which the suites can't rely on) turns the tests
 /// red immediately.
-const HOSTILE_SEEDS: &[(&str, &str)] = &[
+pub const HOSTILE_SEEDS: &[(&str, &str)] = &[
     ("SOCKET_CWD", "/nonexistent"),
     ("SOCKET_GLOBAL", "true"),
     ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
     ("SOCKET_DRY_RUN", "true"),
+    ("SOCKET_SAVE_ONLY", "true"),
     ("SOCKET_ECOSYSTEMS", "cargo"),
     ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
     ("SOCKET_JSON", "true"),

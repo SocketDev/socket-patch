@@ -37,10 +37,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "e2e_hosted_production.rs",
     "e2e_maven.rs",
     "e2e_npm.rs",
-    "e2e_nuget.rs",
-    "e2e_nuget_dotnet_build.rs",
-    "e2e_pypi.rs",
-    "e2e_pypi_multi_copy.rs",
     "e2e_redirect_bun_build.rs",
     "e2e_redirect_cargo_shapes.rs",
     "e2e_scan.rs",
@@ -271,19 +267,7 @@ fn workflow_env_copies_carry_every_opt_out() {
 #[serial]
 fn command_never_leaks_its_hostile_seeds() {
     let env = effective_env(&hermetic::command(Path::new("socket-patch")));
-    for key in [
-        "SOCKET_CWD",
-        "SOCKET_GLOBAL",
-        "SOCKET_GLOBAL_PREFIX",
-        "SOCKET_DRY_RUN",
-        "SOCKET_ECOSYSTEMS",
-        "SOCKET_MANIFEST_PATH",
-        "SOCKET_JSON",
-        "SOCKET_SILENT",
-        "SOCKET_VERBOSE",
-        "SOCKET_UPDATE_BASE_URL",
-        "SOCKET_UPDATE_STATE_DIR",
-    ] {
+    for (key, _) in hermetic::HOSTILE_SEEDS {
         assert_eq!(get(&env, key), None, "{key} seed must be scrubbed");
     }
 }
